@@ -280,9 +280,14 @@ create_goal({ objective: "...", token_budget: 150000 })  # 自设
 
 ## Fallback 与错误处理
 
-- `config.json` 的 `fallbackModels` 仅用于模型层错误
+- `config.json` 的 `fallbackModels` 仅用于模型层错误（含 **GLM 套餐/额度上限**、429、鉴权、网络）
+- 子 agent 失败时工具结果会带结构化块：`[subagent-failure kind=USAGE_CAP|…]`、`tried_models=…`、`error=…`
+- **kind=USAGE_CAP**（套餐/用量到顶）时，主 agent **必须**：
+  1. 不要用同一模型盲目重试
+  2. 用 `/model`（或 `setModel`）把**主会话**切到更高阶/其他 provider
+  3. 重跑失败步骤时传 `model=` 覆盖，或更新 `/sub-models` 默认值；避开 `tried_models`
 - 逻辑/测试失败 → 审查或重规划，不换模型掩盖
-- `isError: true` → 中止当前阶段并报告
+- `isError: true` → 中止当前阶段并报告；若是 USAGE_CAP，先换模再决定是否重跑
 
 ## 中断处理（Ctrl+C / abort）
 

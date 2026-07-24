@@ -2,7 +2,7 @@
 
 Windows-friendly pi subagent package: single / parallel / async runs, role agents, workflow-orchestrator skill, and optional external CLI backends (Claude Code / Codex / Antigravity).
 
-**Version:** 0.1.6
+**Version:** 0.1.7
 
 ## Features
 
@@ -12,7 +12,7 @@ Windows-friendly pi subagent package: single / parallel / async runs, role agent
 - **Per-call model override**: pass `model` field with `provider/id` or short alias
 - **External CLI backends**: `cli:claude` / `cli:codex` / `cli:agy` (always each CLI's own default model; no model override)
 - **Model alias expansion**: short names like `glm-5.2` auto-resolve from `~/.pi/agent/models.json`
-- **Smart fallback**: retry on model/auth/rate-limit errors using `fallbackModels` chain (also accepts external CLI refs)
+- **Smart fallback**: retry on model/auth/rate-limit/**usage-cap (GLM 套餐上限等)** errors using `fallbackModels`; failures return structured `USAGE_CAP` guidance so the main agent can `/model` switch to a higher-tier model
 - **Timeout handling**: per-task timeout with partial output preservation
 - **Smart text selection**: picks best final answer across multi-turn conversations
 - **TUI integration**: rich rendering of calls and results with model/usage info

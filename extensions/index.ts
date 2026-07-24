@@ -92,11 +92,92 @@ function reloadConfig(): AgentConfig {
 
 function isRetryableModelFailure(result: SubagentResult): boolean {
 	if (result.status !== "failed" || !result.error) return false;
-	const message = result.error.toLowerCase();
-	// Any error that is plausibly about the model/provider/CLI layer,
-	// not about the task content, should trigger fallback. This includes
-	// external CLI spawn/exit failures, timeouts, and agy-style errors.
-	return /(api key|authentication|unauthorized|forbidden|rate limit|too many requests|quota|credit|model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b401\b|\b403\b|\b404\b|\b408\b|\b429\b|econnreset|enotfound|fetch failed|network|overloaded|service unavailable|cli not found on path|timeout|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|location is not supported)/i.test(message);
+	return classifyModelFailure(result.error).retryable;
+}
+
+/**
+ * Classify provider/model-layer failures so the main agent can act
+ * (fallback chain + explicit "switch main model" guidance).
+ * Covers GLM package/usage caps, quota, rate limit, auth, and generic provider errors.
+ */
+function classifyModelFailure(error: string): {
+	retryable: boolean;
+	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "other";
+	label: string;
+} {
+	const message = error.toLowerCase();
+	// GLM / Zhipu package & account usage caps (CN + EN)
+	const usageCap =
+		/(用量|额度|套餐|资源包|余量|余额不足|欠费|over.?quota|quota.?exceed|exceeded.{0,40}quota|usage.?limit|limit.?exceed|token.?limit|out of credit|insufficient.?credit|insufficient.?balance|billing|package.?limit|plan.?limit|subscription.?limit|free.?tier|capacity.?exceed|resource.?exhausted|tokens?.{0,20}(用尽|耗尽|上限)|已达上限|到达上限|超出限额|\b1302\b|\b1113\b)/i.test(
+			error,
+		) ||
+		/\b(quota|credit)\b/i.test(message);
+	if (usageCap) {
+		return { retryable: true, kind: "usage_cap", label: "USAGE_CAP" };
+	}
+	if (/(rate.?limit|too many requests|\b429\b|throttl|overloaded)/i.test(message)) {
+		return { retryable: true, kind: "rate_limit", label: "RATE_LIMIT" };
+	}
+	if (/(api key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i.test(message)) {
+		return { retryable: true, kind: "auth", label: "AUTH" };
+	}
+	if (/(timeout|\b408\b|timed?\s*out)/i.test(message)) {
+		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
+	}
+	const providerish =
+		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|location is not supported)/i.test(
+			message,
+		);
+	if (providerish) {
+		return { retryable: true, kind: "provider", label: "PROVIDER" };
+	}
+	return { retryable: false, kind: "other", label: "OTHER" };
+}
+
+/**
+ * Build a main-agent-facing failure block: original error + what was tried +
+ * explicit instruction to switch the main session model when usage is capped.
+ */
+function formatFailureForMainAgent(result: SubagentResult, triedModels?: string[]): string {
+	const err = result.error || result.status || "failed";
+	const cls = classifyModelFailure(err);
+	const model =
+		result.requestedModel ||
+		result.model ||
+		"(unknown model)";
+	const tried =
+		triedModels && triedModels.length > 0
+			? triedModels
+			: [model].filter(Boolean);
+	const lines: string[] = [
+		`[subagent-failure kind=${cls.label} retryable=${cls.retryable}]`,
+		`agent=${result.agent ?? "(none)"}`,
+		`failed_model=${model}`,
+		`tried_models=${tried.join(" → ")}`,
+		`error=${err}`,
+	];
+	if (cls.kind === "usage_cap") {
+		lines.push(
+			"",
+			"ACTION_REQUIRED (main agent):",
+			"- This looks like a package/usage/quota cap (e.g. GLM 套餐用量上限), not a task logic error.",
+			"- Do NOT retry the same model blindly.",
+			"- Switch the main session to a higher-tier / different provider model via /model (or setModel),",
+			"  then re-run the failed subagent step with model override or updated /sub-models defaults.",
+			"- Prefer a model not on the tried_models list above.",
+		);
+	} else if (cls.retryable) {
+		lines.push(
+			"",
+			"ACTION_REQUIRED (main agent):",
+			"- Provider/model-layer failure after subagent fallback chain (if any).",
+			"- Switch main session model (/model) or pass a different model= override, then retry the step.",
+		);
+	}
+	if (result.text) {
+		lines.push("", "--- partial output ---", result.text);
+	}
+	return lines.join("\n");
 }
 
 /** Normalize free-form model requests into provider/id for pi --model, or cli:<backend> (default model only). */
@@ -330,6 +411,8 @@ interface SubagentResult {
 	model?: string;
 	/** The model ref actually passed to pi --model (after override + alias expansion). */
 	requestedModel?: string;
+	/** Models attempted in order (primary + fallbacks) for this dispatch. */
+	triedModels?: string[];
 	error?: string;
 	agent?: string;
 }
@@ -474,6 +557,30 @@ function parseJsonEvents(
 	}
 }
 
+/**
+ * Prefer structured errorMessage; append/replace with stderr when it carries
+ * quota/package wording the main agent needs (GLM 套餐上限 etc.).
+ */
+function mergeProviderError(
+	existing: string | undefined,
+	stderrBuf: string,
+	code: number | null,
+): string {
+	const stderr = stderrBuf.trim().slice(-4000); // tail — last lines usually have the real error
+	if (!existing && !stderr) return `exit ${code ?? 0}`;
+	if (!existing) return stderr || `exit ${code ?? 0}`;
+	if (!stderr) return existing;
+	// Avoid doubling the same text
+	if (stderr.includes(existing) || existing.includes(stderr.slice(0, 80))) {
+		return stderr.length > existing.length ? stderr : existing;
+	}
+	// If stderr looks like usage/quota, prefer it as primary (more actionable).
+	if (classifyModelFailure(stderr).kind === "usage_cap" && classifyModelFailure(existing).kind !== "usage_cap") {
+		return `${stderr}\n(from assistant: ${existing})`;
+	}
+	return `${existing}\n--- stderr ---\n${stderr}`;
+}
+
 async function runSingle(
 	agent: AgentDef | null,
 	task: string,
@@ -593,7 +700,7 @@ async function runSingle(
 				result.error = "timeout";
 			} else if (code !== 0 && result.status !== "completed") {
 				result.status = "failed";
-				result.error ??= stderrBuf || `exit ${code}`;
+				result.error = mergeProviderError(result.error, stderrBuf, code);
 			} else if (!timedOut && result.status !== "failed" && result.status !== "cancelled") {
 				// If the process exited cleanly after only toolUse turns (no stop), keep best partial
 				// and mark failed-incomplete so main agent doesn't treat narration as final answer.
@@ -602,8 +709,11 @@ async function runSingle(
 					result.error ??= "incomplete: no final stop turn";
 				} else if (result.status !== "completed") {
 					result.status = "failed";
-					result.error ??= stderrBuf || `exit ${code ?? 0}`;
+					result.error = mergeProviderError(result.error, stderrBuf, code);
 				}
+			} else if (result.status === "failed") {
+				// Enrich stopReason=error messages with stderr (often holds GLM 套餐/额度 detail).
+				result.error = mergeProviderError(result.error, stderrBuf, code);
 			}
 			result.agent = agent?.name;
 			// Prefer provider/id we requested when assistant only echoes bare id.
@@ -631,10 +741,16 @@ function totalUsage(events: SubagentUsageEvent[]): UsageSummary {
 }
 
 /** Return the final attempt while retaining billable events from every fallback attempt. */
-function withAllAttemptUsage(result: SubagentResult, events: SubagentUsageEvent[], dispatchRunId: string): SubagentResult {
+function withAllAttemptUsage(
+	result: SubagentResult,
+	events: SubagentUsageEvent[],
+	dispatchRunId: string,
+	triedModels?: string[],
+): SubagentResult {
 	result.runId = dispatchRunId;
 	result.usageEvents = events;
 	result.usage = totalUsage(events);
+	if (triedModels && triedModels.length > 0) result.triedModels = triedModels;
 	return result;
 }
 
@@ -645,7 +761,7 @@ async function runWithFallback(
 	model?: string,
 	timeoutMs?: number,
 	signal?: AbortSignal,
-	onUpdate?: (text: string) => void,
+	onUpdate?: (status: string, text?: string) => void,
 ): Promise<SubagentResult> {
 	// Explicit call-site model overrides agent default. Retryable failures still try fallbacks.
 	let primary: string | undefined;
@@ -674,24 +790,43 @@ async function runWithFallback(
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
 	if (candidates.length === 0) {
-		return runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate);
+		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate);
+		if (result.requestedModel) result.triedModels = [result.requestedModel];
+		return result;
 	}
 
 	let lastResult: SubagentResult | undefined;
 	const dispatchRunId = randomUUID();
 	const allUsageEvents: SubagentUsageEvent[] = [];
+	const tried: string[] = [];
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
+		tried.push(candidate);
 		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate);
 		result.requestedModel = candidate;
+		result.triedModels = [...tried];
 		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
 		lastResult = result;
-		if (result.status === "completed" || result.status === "cancelled") return withAllAttemptUsage(result, allUsageEvents, dispatchRunId);
-		if (!isRetryableModelFailure(result) || index === candidates.length - 1) return withAllAttemptUsage(result, allUsageEvents, dispatchRunId);
+		if (result.status === "completed" || result.status === "cancelled") {
+			return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried);
+		}
+		const cls = result.error ? classifyModelFailure(result.error) : null;
+		const more = index < candidates.length - 1 && isRetryableModelFailure(result);
+		if (more) {
+			const next = candidates[index + 1];
+			onUpdate?.(
+				cls?.kind === "usage_cap"
+					? `⚠ USAGE_CAP → ${next}`
+					: `⚠ model error → ${next}`,
+				candidate,
+			);
+			continue;
+		}
+		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried);
 	}
 	return lastResult
-		? withAllAttemptUsage(lastResult, allUsageEvents, dispatchRunId)
-		: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId: dispatchRunId, error: "no model attempt" };
+		? withAllAttemptUsage(lastResult, allUsageEvents, dispatchRunId, tried)
+		: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId: dispatchRunId, error: "no model attempt", triedModels: tried };
 }
 
 // ── 并行 ────────────────────────────────────────────────────────────
@@ -1163,6 +1298,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
+		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
@@ -1312,10 +1448,30 @@ export default function (pi: ExtensionAPI) {
 				for (const r of results) recordUsage(r.agent, r);
 				const parts = results.map(function(r, i) {
 					var icon = r.status === "completed" ? "\u2713" : "\u2717";
-					return "### " + icon + " " + (r.agent || "task-" + (i + 1)) + " (" + r.status + ")\n\n" + (r.text || r.error || "(no output)");
+					var body =
+						r.status === "completed"
+							? (r.text || "(no output)")
+							: formatFailureForMainAgent(r, r.triedModels);
+					return "### " + icon + " " + (r.agent || "task-" + (i + 1)) + " (" + r.status + ")\n\n" + body;
 				});
 				var okCount = results.filter(function(r) { return r.status === "completed"; }).length;
-				return { content: [{ type: "text", text: "Parallel: " + okCount + "/" + results.length + " succeeded\n\n" + parts.join("\n\n---\n\n") }], details: { results } };
+				var failed = results.filter(function(r) { return r.status === "failed"; });
+				var usageCaps = failed.filter(function(r) {
+					return r.error && classifyModelFailure(r.error).kind === "usage_cap";
+				});
+				var header =
+					"Parallel: " + okCount + "/" + results.length + " succeeded";
+				if (usageCaps.length > 0) {
+					header +=
+						"\n\n[subagent-failure kind=USAGE_CAP] " +
+						usageCaps.length +
+						" task(s) hit package/usage cap. ACTION_REQUIRED (main agent): switch main session model via /model to a higher-tier/different provider, then retry failed tasks with model= override (avoid tried_models)." ;
+				}
+				return {
+					content: [{ type: "text", text: header + "\n\n" + parts.join("\n\n---\n\n") }],
+					details: { results },
+					isError: failed.length > 0 && okCount === 0,
+				};
 			}
 
 			if (p.async) {
@@ -1344,16 +1500,15 @@ export default function (pi: ExtensionAPI) {
 					result.requestedModel ? `requested=${result.requestedModel}` : null,
 					result.model && result.model !== result.requestedModel ? `reported=${result.model}` : null,
 					p.model ? "source=call-override" : "source=agent-default",
-					result.error ? `error=${result.error}` : null,
+					result.triedModels?.length ? `tried=${result.triedModels.join(",")}` : null,
 				].filter(Boolean).join(" ");
 				const modelLine = modelBits ? `[subagent ${modelBits}]\n\n` : "";
 				// Timeout may still leave partial text; surface it instead of empty "(no output)".
 				if (result.status === "completed") {
 					return { content: [{ type: "text", text: modelLine + (result.text || "(no output)") }], details: { result } };
 				}
-				const body = result.text
-					? `${result.error || result.status}\n\n--- partial output ---\n${result.text}`
-					: (result.error || "failed");
+				// Failed: structured error for main agent (usage cap → switch higher-tier model).
+				const body = formatFailureForMainAgent(result, result.triedModels);
 				return { content: [{ type: "text", text: modelLine + body }], isError: true, details: { result } };
 			}
 
