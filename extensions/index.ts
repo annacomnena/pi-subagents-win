@@ -92,32 +92,53 @@ function reloadConfig(): AgentConfig {
 
 function isRetryableModelFailure(result: SubagentResult): boolean {
 	if (result.status !== "failed" || !result.error) return false;
-	return classifyModelFailure(result.error).retryable;
+	return classifyModelFailure(result.error, result.requestedModel ?? result.model).retryable;
 }
 
 /**
  * Classify provider/model-layer failures so the main agent can act
  * (fallback chain + explicit "switch main model" guidance).
- * Covers GLM package/usage caps, quota, rate limit, auth, and generic provider errors.
+ *
+ * Zhipu/GLM package exhaustion commonly surfaces as bare HTTP 429
+ * (not a Chinese "套餐" string) — treat those as USAGE_CAP, not soft rate-limit.
  */
-function classifyModelFailure(error: string): {
+function classifyModelFailure(
+	error: string,
+	modelHint?: string,
+): {
 	retryable: boolean;
 	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "other";
 	label: string;
 } {
 	const message = error.toLowerCase();
-	// GLM / Zhipu package & account usage caps (CN + EN)
-	const usageCap =
+	const model = (modelHint ?? "").toLowerCase();
+	const isZhipuFamily =
+		/(^|[\/\s_-])(zhipu|glm|智谱)/i.test(model) ||
+		/(zhipu|glm|智谱|bigmodel)/i.test(message);
+
+	// Explicit package / billing wording (CN + EN + common Zhipu codes)
+	const usageWording =
 		/(用量|额度|套餐|资源包|余量|余额不足|欠费|over.?quota|quota.?exceed|exceeded.{0,40}quota|usage.?limit|limit.?exceed|token.?limit|out of credit|insufficient.?credit|insufficient.?balance|billing|package.?limit|plan.?limit|subscription.?limit|free.?tier|capacity.?exceed|resource.?exhausted|tokens?.{0,20}(用尽|耗尽|上限)|已达上限|到达上限|超出限额|\b1302\b|\b1113\b)/i.test(
 			error,
-		) ||
-		/\b(quota|credit)\b/i.test(message);
-	if (usageCap) {
+		) || /\b(quota|credit)\b/i.test(message);
+
+	const is429 = /\b429\b|too many requests|rate.?limit|throttl/i.test(message);
+
+	// Zhipu: exhausted package almost always returns 429 → USAGE_CAP (switch model).
+	if (usageWording || (is429 && isZhipuFamily)) {
 		return { retryable: true, kind: "usage_cap", label: "USAGE_CAP" };
 	}
-	if (/(rate.?limit|too many requests|\b429\b|throttl|overloaded)/i.test(message)) {
-		return { retryable: true, kind: "rate_limit", label: "RATE_LIMIT" };
+
+	// Non-Zhipu bare 429 without quota wording: still often hard cap on free tiers;
+	// prefer USAGE_CAP guidance so main agent switches model rather than busy-waiting.
+	if (is429) {
+		// "retry-after" / pure overload → soft rate limit; otherwise treat as cap-like.
+		if (/(retry.?after|overloaded|temporarily|try again later)/i.test(message) && !usageWording) {
+			return { retryable: true, kind: "rate_limit", label: "RATE_LIMIT" };
+		}
+		return { retryable: true, kind: "usage_cap", label: "USAGE_CAP" };
 	}
+
 	if (/(api key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i.test(message)) {
 		return { retryable: true, kind: "auth", label: "AUTH" };
 	}
@@ -140,11 +161,11 @@ function classifyModelFailure(error: string): {
  */
 function formatFailureForMainAgent(result: SubagentResult, triedModels?: string[]): string {
 	const err = result.error || result.status || "failed";
-	const cls = classifyModelFailure(err);
 	const model =
 		result.requestedModel ||
 		result.model ||
 		"(unknown model)";
+	const cls = classifyModelFailure(err, model);
 	const tried =
 		triedModels && triedModels.length > 0
 			? triedModels
@@ -160,11 +181,11 @@ function formatFailureForMainAgent(result: SubagentResult, triedModels?: string[
 		lines.push(
 			"",
 			"ACTION_REQUIRED (main agent):",
-			"- This looks like a package/usage/quota cap (e.g. GLM 套餐用量上限), not a task logic error.",
-			"- Do NOT retry the same model blindly.",
+			"- This is treated as a package/usage cap (Zhipu/GLM often returns bare HTTP 429 when 套餐用量用尽).",
+			"- Do NOT retry the same model (waiting will not restore package quota).",
 			"- Switch the main session to a higher-tier / different provider model via /model (or setModel),",
-			"  then re-run the failed subagent step with model override or updated /sub-models defaults.",
-			"- Prefer a model not on the tried_models list above.",
+			"  then re-run the failed subagent step with model= override or updated /sub-models defaults.",
+			"- Prefer a model not on the tried_models list above (avoid Zhipu/glm if that is exhausted).",
 		);
 	} else if (cls.retryable) {
 		lines.push(
@@ -565,6 +586,7 @@ function mergeProviderError(
 	existing: string | undefined,
 	stderrBuf: string,
 	code: number | null,
+	modelHint?: string,
 ): string {
 	const stderr = stderrBuf.trim().slice(-4000); // tail — last lines usually have the real error
 	if (!existing && !stderr) return `exit ${code ?? 0}`;
@@ -574,8 +596,11 @@ function mergeProviderError(
 	if (stderr.includes(existing) || existing.includes(stderr.slice(0, 80))) {
 		return stderr.length > existing.length ? stderr : existing;
 	}
-	// If stderr looks like usage/quota, prefer it as primary (more actionable).
-	if (classifyModelFailure(stderr).kind === "usage_cap" && classifyModelFailure(existing).kind !== "usage_cap") {
+	// If stderr looks like usage/quota (or Zhipu 429), prefer it as primary.
+	if (
+		classifyModelFailure(stderr, modelHint).kind === "usage_cap" &&
+		classifyModelFailure(existing ?? "", modelHint).kind !== "usage_cap"
+	) {
 		return `${stderr}\n(from assistant: ${existing})`;
 	}
 	return `${existing}\n--- stderr ---\n${stderr}`;
@@ -700,7 +725,7 @@ async function runSingle(
 				result.error = "timeout";
 			} else if (code !== 0 && result.status !== "completed") {
 				result.status = "failed";
-				result.error = mergeProviderError(result.error, stderrBuf, code);
+				result.error = mergeProviderError(result.error, stderrBuf, code, resolvedModel);
 			} else if (!timedOut && result.status !== "failed" && result.status !== "cancelled") {
 				// If the process exited cleanly after only toolUse turns (no stop), keep best partial
 				// and mark failed-incomplete so main agent doesn't treat narration as final answer.
@@ -709,11 +734,11 @@ async function runSingle(
 					result.error ??= "incomplete: no final stop turn";
 				} else if (result.status !== "completed") {
 					result.status = "failed";
-					result.error = mergeProviderError(result.error, stderrBuf, code);
+					result.error = mergeProviderError(result.error, stderrBuf, code, resolvedModel);
 				}
 			} else if (result.status === "failed") {
 				// Enrich stopReason=error messages with stderr (often holds GLM 套餐/额度 detail).
-				result.error = mergeProviderError(result.error, stderrBuf, code);
+				result.error = mergeProviderError(result.error, stderrBuf, code, resolvedModel);
 			}
 			result.agent = agent?.name;
 			// Prefer provider/id we requested when assistant only echoes bare id.
@@ -810,7 +835,9 @@ async function runWithFallback(
 		if (result.status === "completed" || result.status === "cancelled") {
 			return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried);
 		}
-		const cls = result.error ? classifyModelFailure(result.error) : null;
+		const cls = result.error
+			? classifyModelFailure(result.error, result.requestedModel ?? result.model)
+			: null;
 		const more = index < candidates.length - 1 && isRetryableModelFailure(result);
 		if (more) {
 			const next = candidates[index + 1];
@@ -1457,7 +1484,7 @@ export default function (pi: ExtensionAPI) {
 				var okCount = results.filter(function(r) { return r.status === "completed"; }).length;
 				var failed = results.filter(function(r) { return r.status === "failed"; });
 				var usageCaps = failed.filter(function(r) {
-					return r.error && classifyModelFailure(r.error).kind === "usage_cap";
+					return r.error && classifyModelFailure(r.error, r.requestedModel ?? r.model).kind === "usage_cap";
 				});
 				var header =
 					"Parallel: " + okCount + "/" + results.length + " succeeded";
