@@ -1,0 +1,14 @@
+{
+  "models": {
+    "code-reviewer": "Zhipu/glm-5.2",
+    "searcher": "opencodego/deepseek-v4-flash"
+  },
+  "fallbackModels": {
+    "code-reviewer": ["krill/grok-4.5"],
+    "searcher": []
+  },
+  "thinking": {
+    "code-reviewer": "high",
+    "searcher": "low"
+  }
+}

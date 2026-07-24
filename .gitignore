@@ -1,0 +1,14 @@
+# ── 用户私有配置（含模型/fallback/thinking，不应进版本库）──
+config.json
+
+# ── Node / 构建产物 ──
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ── 系统 / 编辑器 ──
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
