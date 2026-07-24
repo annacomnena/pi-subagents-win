@@ -2,7 +2,7 @@
 
 Windows-friendly pi subagent package: single / parallel / async runs, role agents, workflow-orchestrator skill, and optional external CLI backends (Claude Code / Codex / Antigravity).
 
-**Version:** 0.1.5
+**Version:** 0.1.6
 
 ## Features
 
@@ -19,6 +19,7 @@ Windows-friendly pi subagent package: single / parallel / async runs, role agent
 - **Usage tracking**: per-agent daily token/cost logging
 - **`/today-usage` command**: aggregates all sessions + subagent runs for the local calendar day
 - **`/sub-models` command**: interactive primary-model, fallback-model, and thinking config via TUI (external CLIs listed first)
+- **`/codex-headers` command**: per-provider Codex request-header compat (`originator` / `User-Agent` / `OAI-Product-Sku`) for 公益站 / reverse proxies
 
 ## External CLI backends
 
@@ -60,6 +61,43 @@ Text form still works:
 /sub-models searcher cli:claude
 /sub-models code-reviewer fallback cli:codex,Zhipu/glm-5.2
 ```
+
+### Configure via `/codex-headers`
+
+Per-provider rewrite of outbound LLM request headers so pi looks more like Codex CLI (`originator=codex_cli_rs`, matching `User-Agent`, optional `OAI-Product-Sku: codex`). Useful for reverse proxies / 公益站 that fingerprint clients.
+
+**Config file (independent of agent `config.json`):** `~/.pi/agent/codex-headers.json`
+
+```json
+{
+  "enabled": true,
+  "providers": {
+    "my-proxy": {
+      "enabled": true,
+      "originator": "codex_cli_rs",
+      "userAgent": "codex_cli_rs/0.1.0 (Windows_NT 10.0; x64)",
+      "productSku": true
+    }
+  }
+}
+```
+
+1. Run `/codex-headers` in TUI
+2. Toggle global, or **Enable current provider**, or **Manage providers…**
+3. Per provider: enable/disable, edit originator / User-Agent, toggle product SKU
+
+Text form:
+
+```text
+/codex-headers status
+/codex-headers on|off
+/codex-headers current on
+/codex-headers my-proxy on|off
+```
+
+**How it works:** `before_provider_headers` marks the request; a lightweight `globalThis.fetch` wrap re-applies headers after pi-ai’s `openai-codex-responses` path hardcodes `originator: pi`. Marker never leaves on the wire. Changes apply immediately (no `/reload`). Default is **global OFF** — only listed providers are rewritten.
+
+**Not covered yet:** JWT/`chatgpt-account-id` extraction failures for non-JWT API keys (separate problem from header fingerprinting).
 
 ### Design notes
 

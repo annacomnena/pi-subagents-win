@@ -24,6 +24,7 @@ import {
 	runExternalCli,
 	type ExternalSubagentResult,
 } from "./external-cli.ts";
+import { registerCodexHeaders } from "./codex-headers.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
@@ -1124,6 +1125,9 @@ async function searchableSelect(
 
 export default function (pi: ExtensionAPI) {
 	const agents = discoverAgents();
+
+	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
+	registerCodexHeaders(pi);
 
 	// 注册包内 skill 路径
 	pi.on("resources_discover", async () => {

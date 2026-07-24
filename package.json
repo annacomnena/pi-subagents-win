@@ -1,8 +1,8 @@
 {
   "name": "subagent-win",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
-  "description": "Windows 兼容的轻量子 agent 扩展，支持单/并行/异步执行、per-call model 覆盖与外部 CLI（claude/codex/agy）",
+  "description": "Windows 兼容的轻量子 agent 扩展，支持单/并行/异步执行、per-call model 覆盖、外部 CLI（claude/codex/agy）、Codex 请求头兼容",
   "keywords": [
     "pi-package",
     "subagent",
