@@ -2,10 +2,11 @@
 
 Windows-friendly pi subagent package: single / parallel / async runs, role agents, workflow-orchestrator skill, and optional external CLI backends (Claude Code / Codex / Antigravity).
 
-**Version:** 0.1.7
+**Version:** 0.2.1
 
 ## Features
 
+- **Role agents**: searcher / planner / plan-reviewer / implementer / code-reviewer / **consultant**
 - **Single agent**: `{ agent, task, model? }`
 - **Parallel agents**: `{ tasks: [{agent, task, model?}, ...], concurrency? }`
 - **Async execution**: `{ agent, task, async: true }`
@@ -20,6 +21,7 @@ Windows-friendly pi subagent package: single / parallel / async runs, role agent
 - **`/today-usage` command**: aggregates all sessions + subagent runs for the local calendar day
 - **`/sub-models` command**: interactive primary-model, fallback-model, and thinking config via TUI (external CLIs listed first)
 - **`/codex-headers` command**: per-provider Codex request-header compat (`originator` / `User-Agent` / `OAI-Product-Sku`) for 公益站 / reverse proxies
+- **`/launch` command**: let the current agent analyze workflow tasks, then open independent Windows Terminal tabs in parallel (`-t` / `--direct` keeps an explicit single-tab escape hatch). **Three task modes**: `workflow` (full search→plan→implement→review pipeline), `research` (deep research only — parallel searchers, research report, Wiki maintenance, no implementation), and `execute` (conclusion already settled — skip search/planning, implement → review → Wiki wrap-up), selectable via `--research` / `--execute` / `mode` per task.
 
 ## External CLI backends
 
@@ -42,6 +44,21 @@ Prerequisites: the chosen CLI must be on `PATH` and authenticated. This package 
 subagent-win({ agent: "searcher", model: "cli:claude", task: "Map this repo read-only." })
 subagent-win({ agent: "code-reviewer", model: "cli:codex", task: "Review the diff." })
 subagent-win({ agent: "planner", model: "cli:agy", task: "Draft a plan." })
+```
+
+### Consultant — user-named model evaluation / screenshot design
+
+When the user names a specific model for evaluation, consultation, or screenshot-based design (e.g. “请glm来评估一下”, “请gpt5.6看看截图仿照一下进行设计”), dispatch the `consultant` agent and pass the user-named model as the `model` override. Short aliases like `glm` / `gpt5.6` / `opus4.6` auto-expand to `provider/id`. The consultant answers from that model's perspective and never touches business code (unless asked). For screenshots, include the image path(s) in the `task` — the consultant reads them with the `read` tool.
+
+```ts
+// User said: 请glm来评估一下这次重构的方案
+subagent-win({ agent: "consultant", model: "glm", task: "请以 glm 视角评估 plans/0712_refactor.md 的方案…" })
+
+// User said: 请gpt5.6看看截图仿照一下进行设计
+subagent-win({ agent: "consultant", model: "gpt5.6", task: "请看截图 C:/shots/ui_ref.png，提炼视觉语言并给出仿照设计方案…" })
+
+// No model named by the user → consultant runs its config default
+subagent-win({ agent: "consultant", task: "评估当前代码中缓存策略的风险点…" })
 ```
 
 ### Configure via `/sub-models`
@@ -108,9 +125,66 @@ Text form:
 - Windows-aware spawn: resolves `.exe` / `.cmd`, no process-group kill on win32.
 - **Windows proxy bridge**: explicit `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` inherited by pi take priority. When none exist, subagent-win reads an enabled Windows system proxy (WinINET) and forwards it as upper- and lower-case standard proxy variables to every external CLI, including agy. `ProxyOverride` is translated to `NO_PROXY`.
 
+## `/launch` command — workflow orchestration and visible tabs
+
+`/launch <request>` is an orchestration request. It sends a turn to the **current** agent, which can inspect the conversation, identify independent ready tasks, and call `launch-tabs` once to open all visible tabs in parallel. It does not open a tab for the natural-language request itself.
+
+### Usage
+
+```text
+/launch [--model <model>] <orchestration request>
+/launch --research [--model <model>] <orchestration request>
+/launch --execute [--model <model>] <orchestration request>
+/launch -t <title> [--model <model>] <single task>
+/launch -t <title> --research <single research task>
+/launch -t <title> --execute <single execute task>
+/launch --direct [--model <model>] <single task>
+/launch --direct --research <single research task>
+/launch --direct --execute <single execute task>
+```
+
+| Form | Description |
+|------|-------------|
+| `/launch <request>` | Let the current agent analyze the conversation and dispatch multiple ready tasks through `launch-tabs`. |
+| `/launch --research <request>` | Same orchestration, but research-type tasks must be dispatched with `mode: "research"` (deep research only). |
+| `/launch --execute <request>` | Same orchestration, but settled-conclusion tasks must be dispatched with `mode: "execute"` (skip search/planning). |
+| `/launch -t <title> <task>` | Explicitly launch one visible pi tab immediately. |
+| `/launch --direct <task>` | Explicitly launch one tab immediately; title is derived from the task. |
+| `-r` / `--research` | Deep-research mode: the tab (when bound to a task number) starts with `根据research进行工作<taskId>` and a research discipline block — parallel searchers, `plans/YYYYMMDD_research_<topic>.md` research report, Wiki theme-page maintenance; **no** planner/implementer/code-reviewer stages. |
+| `-e` / `--execute` | Quick-execute mode: the tab (when bound to a task number) starts with `根据execute进行工作<taskId>` and an execute discipline block — skip search and planning, implementer implements the settled conclusion, code-reviewer reviews, Wiki wrap-up; **no** searcher/planner/plan-reviewer stages. |
+| `--model <model>` | Optional model for directly launched sessions, or a constraint forwarded to the workflow dispatcher. |
+
+### Example
+
+```text
+# The current agent analyzes the ready tasks and opens three tabs, if justified
+/launch 你来并行启动已满足条件的任务
+
+# The three initial prompts are produced from the current workflow context,
+# and each starts with: 根据workflow进行工作1007 (or 1008 / 1009)
+
+# Explicit one-tab escape hatch; the -t value is only the label part,
+# and the final tab title is composed as <repo>[-worktree]-[<taskId>-]<label>
+/launch -t detector-lifecycle Fix 1004 detector lifecycle
+/launch --direct Clean up 1010 Provider deprecated enums
+```
+
+### How it works
+
+1. A no-title invocation is sent back to the current agent with its full conversation context.
+2. The agent analyzes dependencies and calls `launch-tabs` once with all independent tasks.
+3. `launch-tabs` normalizes every initial prompt to `根据workflow进行工作<taskId>` (or `根据research进行工作<taskId>` for `mode: "research"`, `根据execute进行工作<taskId>` for `mode: "execute"`), appends a **mandatory discipline block** (read the `workflow-orchestrator` skill, act as project manager and delegate stages to `subagent-win` agents — never complete the task in one shot; research mode delegates parallel searchers and writes a research report; execute mode skips search/planning and only runs implementer → code-reviewer → Wiki wrap-up), and guarantees the skill is visible in the tab via `--skill`. Then it starts one `wt.exe new-tab` per task.
+4. Each spawned pi session is visible, interactive, independent, and starts fresh with project context (`AGENTS.md`, Wiki, etc.).
+5. `-t` / `--direct` bypass the orchestration conversation step for an explicitly requested single tab. When the task text carries a task number (e.g. `Fix 1004 detector lifecycle`), the tab is still bound to the workflow discipline; without a number it stays a plain ad-hoc session.
+
 ## Knowledge rules
 
 - **Wiki/** = theme-oriented durable facts only (`Concepts|Modules|Architecture|Decisions|Workflows`, `status: current`)
+- **Search uses Wiki first** — only for a new/unlocated topic, the searcher splits it into short phrases, runs `keywords queries=[...]` exact checks, expands exact misses with `semantic-terms` only when configured, then `grep -rni` locates Wiki. It jumps to code via the confirmed page's `source_paths`, cross-checks with codegraph, **proactively maintains theme pages**, and returns every fact with a code location + a Wiki section reference (or `Wiki: none`) + a calibration status.
+- **Wiki is reused across agents** — a searcher-confirmed `Wiki/path.md#section` is the current workflow's canonical handoff. The main agent forwards that section list to planner/implementer/reviewer; they `read` it directly and do not rerun terminology discovery for already located topics. Task findings never go to Wiki.
+- **`wiki-nav` tool** — progressive navigation over `Wiki/_navigation.json`: `tree`/`around`/`path` fetch nearby nodes; `find` uses the v2 index over page metadata **and Markdown body**; `keywords` presents a capped, automatically generated **global searchable-term list only**. It contains no page mappings, source paths, or Markdown headings; select a term then use `grep -rni` to locate it. Tree output is explicitly trimmed; `tree node` accepts a real page id/title/unique alias, not merely a directory name.
+- **`wiki-nav rebuild`** — after any wiki page is created/updated/merged/deleted, run `wiki-nav rebuild` to regenerate `_navigation.json`, v2 full-text `_search.json`, and `_keywords.json` from `Wiki/*.md` (TS, self-contained, sub-second). `_keywords.json` derives high-signal terms only from page metadata, source-path file/symbol tails, inline symbols, and emphasis; it is not hand-maintained. `keywords queries=[...]` performs simultaneous exact checks; only misses may use `semantic-terms`.
+- **Optional semantic term expansion** — configure an OpenAI-compatible embedding provider in `~/.pi/agent/embeddings.json` using [examples/embeddings.json](examples/embeddings.json) as the provider/model registry template. `semantic-rebuild` is explicit and the only action that embeds all changed terms remotely; it persists a private local USearch HNSW index under `~/.pi/wiki-semantic/`. `semantic-terms` returns terms only, never Wiki paths or chunks; select one and `grep -rni` to locate it.
 - **Task findings** = agent replies or `plans/*_research.md` — not Wiki
 - **Plans** = `plans/` · **Progress** = `recentwork.md`
 - Goal mode: omit `token_budget` unless user sets one
@@ -135,7 +209,8 @@ in `~/.pi/agent/settings.json`.
 
 - `extensions/index.ts` — subagent-win tool + commands
 - `extensions/external-cli.ts` — Claude / Codex / Agy spawn runners (library, not a separate extension entry)
-- `agents/` — searcher, planner, plan-reviewer, implementer, code-reviewer
+- `extensions/wiki-semantic.ts` — optional remote embedding + local USearch HNSW term expansion
+- `agents/` — searcher, planner, plan-reviewer, implementer, code-reviewer, consultant
 - `skills/workflow-orchestrator/SKILL.md`
 - `config.json` — per-agent model/thinking defaults (edit after install with `/sub-models`)
 - `package.json` — pi package manifest (`pi.extensions` → `./extensions/index.ts` only)
@@ -145,10 +220,13 @@ in `~/.pi/agent/settings.json`.
 | Agent | Default Model | Context |
 |-------|--------------|---------|
 | searcher | opencodego/deepseek-v4-flash | 1000K |
-| planner | openai-codex/gpt-5.6-sol | 372K |
+| planner | Zhipu/glm-5.2 | 400K |
 | plan-reviewer | Zhipu/glm-5.2 | 400K |
-| implementer | opencodego/deepseek-v4-flash | 1000K |
-| code-reviewer | openai-codex/gpt-5.6-terra | 372K |
+| implementer | cli:agy | external-cli |
+| code-reviewer | openai-codex/gpt-5.6-luna | 372K |
+| consultant | shuai/gpt-5.6-terra | 272K (vision) |
+
+Consultant is special: its model is **user-driven**. When the user names a model (“请glm来评估一下”, “请gpt5.6看看截图”), dispatch `consultant` with that model as a per-call `model` override; the config default is only the fallback when no model is named.
 
 Override per call: `{ agent: "code-reviewer", model: "Zhipu/glm-5.2", task: "..." }`  
 Or external: `{ agent: "searcher", model: "cli:claude", task: "..." }`

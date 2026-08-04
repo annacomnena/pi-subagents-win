@@ -1,6 +1,6 @@
 {
   "name": "subagent-win",
-  "version": "0.1.7",
+  "version": "0.2.1",
   "type": "module",
   "description": "Windows 兼容的轻量子 agent 扩展，支持单/并行/异步执行、per-call model 覆盖、外部 CLI（claude/codex/agy）、Codex 请求头兼容",
   "keywords": [
@@ -19,5 +19,14 @@
     "skills": [
       "./skills"
     ]
+  },
+  "scripts": {
+    "prepare:test-deps": "node ./scripts/ensure-pi-test-deps.mjs",
+    "smoke:wiki-nav": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_nav.ts",
+    "smoke:wiki-semantic": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_semantic.ts",
+    "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts"
+  },
+  "dependencies": {
+    "usearch": "2.26.0"
   }
 }

@@ -25,11 +25,24 @@ import {
 	type ExternalSubagentResult,
 } from "./external-cli.ts";
 import { registerCodexHeaders } from "./codex-headers.ts";
+import { registerWikiNav } from "./wiki-nav.ts";
+import { sendWindowsToast } from "./notify-windows.ts";
+import {
+	buildWindowsTerminalArgs,
+	buildWorkflowTabPrompt,
+	launchTaskTitle,
+	parseLaunchRequest,
+	type LaunchMode,
+} from "./launch.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
 const RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
 const MAX_CONCURRENCY = 6;
+// 工作流技能：根目录与扩展 resources_discover 注册的是同一路径（--skill 传根目录可被按路径去重）；
+// 约束块里给的是精确 SKILL.md 路径，让新会话直接 read。
+const WORKFLOW_SKILL_ROOT = join(PKG_DIR, "skills");
+const WORKFLOW_SKILL_FILE = join(WORKFLOW_SKILL_ROOT, "workflow-orchestrator", "SKILL.md");
 
 // ── pi CLI 路径探测 ────────────────────────────────────────────────
 
@@ -57,12 +70,60 @@ function findPiCli(): string {
 	throw new Error("Cannot find pi CLI. Set PI_CLI_PATH env var.");
 }
 
+function findWindowsTerminal(): string | null {
+	try {
+		// WindowsApps is protected, so trust `where` rather than existsSync.
+		const result = execFileSync("where", ["wt.exe"], { encoding: "utf8", shell: true });
+		return result.split("\n")[0].trim() || null;
+	} catch {
+		return null;
+	}
+}
+
+interface LaunchDispatch {
+	title: string;
+	prompt: string;
+	model?: string;
+	error?: string;
+}
+
+function dispatchPiTab(
+	wtPath: string,
+	piCli: string,
+	cwd: string,
+	title: string,
+	prompt: string,
+	model?: string,
+	skills?: string[],
+): LaunchDispatch {
+	try {
+		const child = spawn(wtPath, buildWindowsTerminalArgs(title, prompt, {
+			cwd,
+			piCli,
+			execPath: process.execPath,
+			model,
+			skills,
+		}), { shell: false });
+		child.on("error", (err: Error) => {
+			// The caller gets an accepted dispatch immediately; this listener keeps
+			// the failure visible in the terminal process instead of becoming an
+			// unhandled child-process error.
+			console.error(`[subagent-win launch] ${title}: ${err.message}`);
+		});
+		child.unref();
+		return { title, prompt, model };
+	} catch (err) {
+		return { title, prompt, model, error: err instanceof Error ? err.message : String(err) };
+	}
+}
+
 // ── Agent 定义 ─────────────────────────────────────────────────────
 
 interface AgentConfig {
 	models: Record<string, string>;
 	fallbackModels: Record<string, string[]>;
 	thinking: Record<string, string>;
+	notifications?: boolean;
 }
 
 function configPath(): string {
@@ -76,9 +137,10 @@ function readConfig(): AgentConfig {
 			models: parsed.models ?? {},
 			fallbackModels: parsed.fallbackModels ?? {},
 			thinking: parsed.thinking ?? {},
+			notifications: parsed.notifications !== false,
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {} };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true };
 	}
 }
 
@@ -421,6 +483,15 @@ interface SubagentUsageEvent {
 	usage: UsageSummary;
 }
 
+interface AttemptFailure {
+	/** The model ref that was attempted. */
+	model: string;
+	/** Failure kind label (USAGE_CAP / RATE_LIMIT / AUTH / TIMEOUT / PROVIDER / OTHER). */
+	kind: string;
+	/** Error message from the failed attempt. */
+	error: string;
+}
+
 interface SubagentResult {
 	status: "completed" | "failed" | "cancelled";
 	text: string;
@@ -434,6 +505,8 @@ interface SubagentResult {
 	requestedModel?: string;
 	/** Models attempted in order (primary + fallbacks) for this dispatch. */
 	triedModels?: string[];
+	/** Earlier attempts that failed before a fallback succeeded (or before giving up). */
+	priorFailures?: AttemptFailure[];
 	error?: string;
 	agent?: string;
 }
@@ -771,12 +844,23 @@ function withAllAttemptUsage(
 	events: SubagentUsageEvent[],
 	dispatchRunId: string,
 	triedModels?: string[],
+	priorFailures?: AttemptFailure[],
 ): SubagentResult {
 	result.runId = dispatchRunId;
 	result.usageEvents = events;
 	result.usage = totalUsage(events);
 	if (triedModels && triedModels.length > 0) result.triedModels = triedModels;
+	if (priorFailures && priorFailures.length > 0) result.priorFailures = priorFailures;
 	return result;
+}
+
+/** Human-readable fallback chain, e.g. "cli:claude ✗ PROVIDER → miaomiao/...". Empty if no fallback occurred. */
+function fallbackChainText(result: SubagentResult): string {
+	const fails = result.priorFailures ?? [];
+	if (fails.length === 0) return "";
+	const ok = result.requestedModel ?? result.model ?? "?";
+	const segs = fails.map((f) => `${f.model} ✗(${f.kind})`);
+	return `${segs.join(" → ")} → ${ok}`;
 }
 
 async function runWithFallback(
@@ -824,6 +908,7 @@ async function runWithFallback(
 	const dispatchRunId = randomUUID();
 	const allUsageEvents: SubagentUsageEvent[] = [];
 	const tried: string[] = [];
+	const priorFailures: AttemptFailure[] = [];
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
 		tried.push(candidate);
@@ -833,11 +918,19 @@ async function runWithFallback(
 		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
 		lastResult = result;
 		if (result.status === "completed" || result.status === "cancelled") {
-			return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried);
+			return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
 		}
 		const cls = result.error
 			? classifyModelFailure(result.error, result.requestedModel ?? result.model)
 			: null;
+		// Record this failed attempt so downstream (main agent + TUI) can see WHY a fallback happened.
+		if (result.error) {
+			priorFailures.push({
+				model: candidate,
+				kind: cls?.label ?? "OTHER",
+				error: result.error,
+			});
+		}
 		const more = index < candidates.length - 1 && isRetryableModelFailure(result);
 		if (more) {
 			const next = candidates[index + 1];
@@ -849,11 +942,11 @@ async function runWithFallback(
 			);
 			continue;
 		}
-		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried);
+		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
 	}
 	return lastResult
-		? withAllAttemptUsage(lastResult, allUsageEvents, dispatchRunId, tried)
-		: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId: dispatchRunId, error: "no model attempt", triedModels: tried };
+		? withAllAttemptUsage(lastResult, allUsageEvents, dispatchRunId, tried, priorFailures)
+		: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId: dispatchRunId, error: "no model attempt", triedModels: tried, priorFailures };
 }
 
 // ── 并行 ────────────────────────────────────────────────────────────
@@ -1291,6 +1384,89 @@ export default function (pi: ExtensionAPI) {
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);
 
+	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
+	registerWikiNav(pi);
+
+	// ── Windows 通知 hook（受 config.json notifications 开关控制）──
+
+	function notifyEnabled(): boolean {
+		return readConfig().notifications !== false;
+	}
+
+	// subagent-win 工具开始执行时通知
+	pi.on("tool_execution_start", (event) => {
+		if (event.toolName !== "subagent-win") return;
+		if (!notifyEnabled()) return;
+		const args = event.args as Record<string, unknown> | undefined;
+		const agent = args?.agent ?? args?.tasks?.[0]?.agent ?? "subagent";
+		const task = (args?.task ?? args?.tasks?.[0]?.task ?? "") as string;
+		const preview = String(task).slice(0, 60);
+		sendWindowsToast({
+			title: `🤖 ${agent} 开始工作`,
+			body: preview || "(无任务描述)",
+			duration: "short",
+		});
+	});
+
+	// subagent-win 工具执行结束时通知
+	pi.on("tool_execution_end", (event) => {
+		if (event.toolName !== "subagent-win") return;
+		if (!notifyEnabled()) return;
+		const result = event.result as Record<string, unknown> | undefined;
+		const details = result?.details as Record<string, unknown> | undefined;
+		const results = details?.results as Array<Record<string, unknown>> | undefined;
+
+		if (results) {
+			// 并行模式
+			const ok = results.filter((r) => r.status === "completed").length;
+			const total = results.length;
+			const icon = ok === total ? "✅" : "⚠️";
+			sendWindowsToast({
+				title: `${icon} Parallel: ${ok}/${total}`,
+				body: ok === total ? "全部 task 完成" : `${total - ok} 个 task 失败`,
+				duration: ok === total ? "short" : "long",
+			});
+		} else {
+			// 单 agent 模式
+			const r = details?.result as Record<string, unknown> | undefined;
+			const agent = (r?.agent ?? "subagent") as string;
+			const status = (r?.status ?? "completed") as string;
+			const isOk = status === "completed";
+			const error = r?.error as string | undefined;
+			const usage = r?.usage as Record<string, unknown> | undefined;
+			const cost = usage?.cost as number | undefined;
+
+			sendWindowsToast({
+				title: isOk ? `✅ ${agent} 完成` : `❌ ${agent} 失败`,
+				body: isOk
+					? cost !== undefined
+						? `✓ 成功  ($${cost.toFixed(4)})`
+						: "✓ 成功"
+					: `✗ ${(error ?? "未知错误").slice(0, 100)}`,
+				duration: isOk ? "short" : "long",
+			});
+		}
+	});
+
+	// update_goal(complete) 时通知 goal 完成
+	pi.on("tool_execution_end", (event) => {
+		if (event.toolName !== "update_goal") return;
+		if (event.isError) return;
+		if (!notifyEnabled()) return;
+		const result = event.result as Record<string, unknown> | undefined;
+		const content = result?.content as Array<Record<string, unknown>> | undefined;
+		if (!content) return;
+		const text = content.map((c) => String(c.text ?? "")).join("");
+		// 检查输出是否包含 complete 状态的确认
+		if (/complete|完成|✅|✓/i.test(text)) {
+			sendWindowsToast({
+				title: "🎯 Goal 已完成",
+				body: text.slice(0, 120) || "所有目标达成",
+				duration: "long",
+			});
+		}
+	});
+
 	// 注册包内 skill 路径
 	pi.on("resources_discover", async () => {
 		return { skillPaths: [join(PKG_DIR, "skills")] };
@@ -1319,14 +1495,103 @@ export default function (pi: ExtensionAPI) {
 		lines.push("");
 		lines.push("Per-call model override: pass `model` on a single call or each parallel task. That value is what actually runs; the list above is only defaults.");
 		lines.push("Canonical form is `provider/id` (example: `Zhipu/glm-5.2`). Short aliases such as `glm-5.2` / `glm5.2` expand from ~/.pi/agent/models.json when unambiguous.");
-		lines.push("External CLI harnesses: `cli:claude`, `cli:codex`, `cli:agy` only. These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
+		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
-		lines.push("Example external: subagent-win({ agent: \"searcher\", model: \"cli:claude\", task: \"...\" })");
+		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
+		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
+		lines.push("Note: When dispatching the searcher, ask it to query `Wiki/` by keyword first, jump straight to code via each page's `source_paths` (e.g. `file#L49` / `file::Symbol`, no grep guessing), cross-check with codegraph, and PROACTIVELY maintain theme pages — update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a durable, source-verified cross-task theme is absent. Require each returned fact to carry a code location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a 'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
+		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
+		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
+		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
+		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), and `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`).");
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
+	});
+
+	pi.registerTool({
+		name: "launch-tabs",
+		label: "Launch Pi Tabs",
+		description: [
+			"在 Windows Terminal 中并行打开一个或多个可见、独立的 pi 交互标签页。",
+			"先分析当前会话并只提交彼此独立、启动条件已满足的任务；不要为编排请求本身打开标签页。",
+			"每项必须提供 taskId、具体 prompt；prompt 会自动以 `根据workflow进行工作<taskId>` 开头，并附加 workflow-orchestrator 强制约束块（先 read 技能、委派 subagent-win 各角色执行、禁止单 agent 一路干完）。",
+			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）。",
+			"一次调用传入全部任务以保证并行启动。",
+			"标签自动生成规范名 `<仓库名>[-worktree]-<taskId>-<标签>`（仓库名取自 git origin/toplevel，worktree 路径自动加 -worktree- 标记，标签取显式 title 或从 prompt 首行提取）；不再使用无意义的 wlc 默认名。",
+			"每项可传 cwd 指定新标签页工作目录（默认当前目录）；独立 worktree 场景必须显式传 cwd。",
+		].join(" "),
+		parameters: Type.Object({
+			tasks: Type.Array(Type.Object({
+				taskId: Type.String({ description: "任务编号，例如 1007" }),
+				prompt: Type.String({ description: "该任务的首轮 prompt；应包含 workflow 交接材料与具体范围" }),
+				cwd: Type.Optional(Type.String({ description: "新标签页工作目录；缺省用当前目录。独立 worktree 场景必填，如 G:/code/worktrees/GreenCAD-123" })),
+				model: Type.Optional(Type.String({ description: "仅用户明确要求或配置不适用时覆盖新 pi 会话模型" })),
+				title: Type.Optional(Type.String({ description: "标签名（可选）：仅作为标签部分，自动剥离开头的 pi-/wlc- 前缀；缺省从 prompt 首行提取" })),
+				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）" })),
+			})),
+		}),
+		renderCall(args, theme) {
+			const tasks = (args.tasks ?? []) as Array<{ taskId?: string }>;
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("launch-tabs"))} ${theme.fg("accent", `${tasks.length} tabs`)}${tasks.length ? `: ${tasks.map((task) => task.taskId ?? "?").join(", ")}` : ""}`,
+				0,
+				0,
+			);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { results?: LaunchDispatch[] } | undefined;
+			const results = details?.results ?? [];
+			const ok = results.filter((item) => !item.error).length;
+			const lines = results.map((item) => item.error
+				? `✗ ${item.title}: ${item.error}`
+				: `✓ ${item.title} ← ${item.prompt.slice(0, 80)}`);
+			return new Text(`${theme.fg(ok === results.length ? "success" : "warning", `launch-tabs ${ok}/${results.length}`)}${lines.length ? `\\n${lines.join("\\n")}` : ""}`, 0, 0);
+		},
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string }> };
+			const input = params.tasks ?? [];
+			if (input.length === 0) {
+				return { content: [{ type: "text", text: "launch-tabs requires at least one task" }], isError: true };
+			}
+			if (input.length > MAX_CONCURRENCY) {
+				return { content: [{ type: "text", text: `launch-tabs supports at most ${MAX_CONCURRENCY} tabs per call` }], isError: true };
+			}
+
+			const wtPath = findWindowsTerminal();
+			if (!wtPath) {
+				return { content: [{ type: "text", text: "未找到 Windows Terminal (wt.exe)，无法启动标签页" }], isError: true };
+			}
+			let piCli: string;
+			try {
+				piCli = findPiCli();
+			} catch (err) {
+				return { content: [{ type: "text", text: `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+			}
+
+			const results = input.map((item) => {
+				const taskId = (item.taskId ?? "").trim();
+				const prompt = (item.prompt ?? "").trim();
+				if (!taskId || !prompt) {
+					return { title: item.title ?? (taskId || "?"), prompt, model: item.model, error: "taskId and prompt are required" };
+				}
+				// workflow 绑定：前缀 + 强制约束块 + 原始 handoff；--skill 保证技能在标签会话里可见
+				const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
+				const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
+				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : "workflow";
+				const normalizedPrompt = buildWorkflowTabPrompt({ taskId, title: item.title, prompt, model: item.model }, skillRef, mode);
+				const cwd = (item.cwd ?? "").trim() || process.cwd();
+				return dispatchPiTab(wtPath, piCli, cwd, launchTaskTitle({ taskId, title: item.title, prompt: normalizedPrompt, model: item.model }, cwd), normalizedPrompt, item.model, skillArgs);
+			});
+			const ok = results.filter((item) => !item.error).length;
+			return {
+				content: [{ type: "text", text: `已并行启动 ${ok}/${results.length} 个 pi 标签页：${results.map((item) => item.title).join(", ")}` }],
+				details: { results },
+				isError: ok === 0,
+			};
+		},
 	});
 
 	pi.registerTool({
@@ -1339,7 +1604,8 @@ export default function (pi: ExtensionAPI) {
 			"异步: { agent, task, model?, async: true }",
 			"查状态: { action: \"status\", runId? }",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
-			"外部 CLI: model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\"（使用各 CLI 默认模型，不支持覆盖）。",
+			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\"（各 CLI 默认模型，不支持覆盖）。",
+			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",
 		].join(" "),
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String({ description: "agent 名称" })),
@@ -1408,8 +1674,12 @@ export default function (pi: ExtensionAPI) {
 						c.addChild(new Spacer(1));
 						const rIcon = r.status === "completed" ? theme.fg("success", "✓") : r.status === "cancelled" ? theme.fg("warning", "⛔") : theme.fg("error", "✗");
 						const modelTag = (r.requestedModel ?? r.model) ? ` ${theme.fg("muted", r.requestedModel ?? r.model)}` : "";
-						c.addChild(new Text(`${rIcon} ${theme.fg("accent", r.agent ?? "?")}${modelTag}`, 0, 0));
+						const fbMark = r.priorFailures?.length ? ` ${theme.fg("warning", `↺fallback×${r.priorFailures.length}`)}` : "";
+						c.addChild(new Text(`${rIcon} ${theme.fg("accent", r.agent ?? "?")}${modelTag}${fbMark}`, 0, 0));
 						c.addChild(new Text(theme.fg("dim", r.text?.slice(0, 200) ?? r.error ?? ""), 0, 0));
+						if (r.priorFailures?.length) {
+							for (const f of r.priorFailures) c.addChild(new Text(theme.fg("error", `fallback: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 200)}`), 0, 0));
+						}
 						if (r.usage?.turns) c.addChild(new Text(theme.fg("dim", `↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}`), 0, 0));
 					}
 					return c;
@@ -1417,7 +1687,8 @@ export default function (pi: ExtensionAPI) {
 				const lines = results.map((r) => {
 					const mark = r.status === "completed" ? "✓" : r.status === "cancelled" ? "⛔" : "✗";
 					const modelTag = (r.requestedModel ?? r.model) ? ` (${r.requestedModel ?? r.model})` : "";
-					return `${mark} ${r.agent ?? "?"}${modelTag}: ${(r.text ?? r.error ?? "").slice(0, 80)}`;
+					const fbMark = r.priorFailures?.length ? ` ↺fallback` : "";
+					return `${mark} ${r.agent ?? "?"}${modelTag}${fbMark}: ${(r.text ?? r.error ?? "").slice(0, 80)}`;
 				});
 				return new Text(`${icon} parallel ${ok}/${results.length}\n${lines.join("\n")}`, 0, 0);
 			}
@@ -1430,7 +1701,12 @@ export default function (pi: ExtensionAPI) {
 			const icon = isOk ? theme.fg("success", "✓") : r.status === "cancelled" ? theme.fg("warning", "⛔") : theme.fg("error", "✗");
 			// Prefer requestedModel (provider/id actually passed to pi); fall back to assistant-reported bare id.
 			const modelLabel = r.requestedModel ?? r.model ?? "";
-			const modelTag = modelLabel ? theme.fg("dim", modelLabel) : "";
+			const fbChain = r.priorFailures?.length ? fallbackChainText(r) : "";
+			// When a fallback happened, surface the chain (warning color) instead of just the final model,
+			// so it's clear the requested override failed and a fallback was used.
+			const modelTag = fbChain
+				? theme.fg("warning", fbChain)
+				: modelLabel ? theme.fg("dim", modelLabel) : "";
 			const usageTag = r.usage?.turns ? theme.fg("dim", `↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}`) : "";
 
 			// status line: agent name + actual requested model + usage
@@ -1439,6 +1715,11 @@ export default function (pi: ExtensionAPI) {
 			if (expanded) {
 				const c = new Container();
 				c.addChild(new Text(statusLine, 0, 0));
+				if (r.priorFailures?.length) {
+					for (const f of r.priorFailures) {
+						c.addChild(new Text(theme.fg("error", `fallback: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 300)}`), 0, 0));
+					}
+				}
 				if (r.error) c.addChild(new Text(theme.fg("error", r.error), 0, 0));
 				if (r.text) { c.addChild(new Spacer(1)); c.addChild(new Markdown(r.text.trim(), 0, 0, mdTheme)); }
 				return c;
@@ -1523,13 +1804,20 @@ export default function (pi: ExtensionAPI) {
 				const cb = onUpdate ? (s: string, t: string) => onUpdate({ content: [{ type: "text", text: s + " " + t }] }) : undefined;
 				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb);
 				recordUsage(agentDef?.name, result);
+				const fallbackBits = result.priorFailures?.length
+					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
+					: null;
 				const modelBits = [
 					result.requestedModel ? `requested=${result.requestedModel}` : null,
 					result.model && result.model !== result.requestedModel ? `reported=${result.model}` : null,
 					p.model ? "source=call-override" : "source=agent-default",
 					result.triedModels?.length ? `tried=${result.triedModels.join(",")}` : null,
+					fallbackBits ? `fallback_from=${fallbackBits}` : null,
 				].filter(Boolean).join(" ");
-				const modelLine = modelBits ? `[subagent ${modelBits}]\n\n` : "";
+				const fallbackHint = result.priorFailures?.length
+					? `⚠ Requested model failed and a fallback was used: ${fallbackChainText(result)}\n`
+					: "";
+				const modelLine = (modelBits || fallbackHint) ? `[subagent ${modelBits}]\n\n${fallbackHint}` : "";
 				// Timeout may still leave partial text; surface it instead of empty "(no output)".
 				if (result.status === "completed") {
 					return { content: [{ type: "text", text: modelLine + (result.text || "(no output)") }], details: { result } };
@@ -1569,8 +1857,8 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const day = localDayBounds();
 			const subTotal = collectSubagentUsage(day);
-			// Respect the resolved session directory (settings/env/CLI), not a hard-coded default.
-			const main = collectMainSessionUsage(day, ctx.sessionManager.getSessionDir() ?? DEFAULT_SESSIONS_ROOT);
+			// FIXED: now aggregates ALL sessions (root ~/.pi/agent/sessions/) instead of current project only
+			const main = collectMainSessionUsage(day, DEFAULT_SESSIONS_ROOT);
 			const mainTotal = main.total;
 
 			const grandTotal = {
@@ -1633,7 +1921,7 @@ export default function (pi: ExtensionAPI) {
 				let agentName: string | undefined = text || undefined;
 				if (!agentName) {
 					const agentLabels = names.map((name) =>
-						`${name}  [${cfg.models[name] ?? "pi default"}; fallback: ${(cfg.fallbackModels[name] ?? []).length}; thinking: ${cfg.thinking[name] ?? "default"}]`,
+						`${name}  [${cfg.models[name] ?? "pi default"}; fallback: ${(cfg.fallbackModels[name] ?? []).join(", ") || "none"}; thinking: ${cfg.thinking[name] ?? "default"}]`,
 					);
 					const selectedAgent = await ctx.ui.select("Choose subagent:", agentLabels);
 					if (!selectedAgent) return;
@@ -1833,6 +2121,102 @@ export default function (pi: ExtensionAPI) {
 			writeConfig(cfg);
 			reloadConfig();
 			ctx.ui.notify(`${agentName}.model = ${model}`, "info");
+		},
+	});
+
+	// ── /notify on|off 命令 ──
+	pi.registerCommand("notify", {
+		description: "Windows 通知开关（/notify on 或 /notify off）",
+		handler: async (args, ctx) => {
+			const val = (args ?? "").trim().toLowerCase();
+			const cfg = reloadConfig();
+			if (val === "on") {
+				cfg.notifications = true;
+				writeConfig(cfg);
+				ctx.ui.notify("🪟 Windows 通知已开启", "info");
+			} else if (val === "off") {
+				cfg.notifications = false;
+				writeConfig(cfg);
+				ctx.ui.notify("🪟 Windows 通知已关闭", "info");
+			} else {
+				const status = cfg.notifications !== false ? "🟢 已开启" : "🔴 已关闭";
+				ctx.ui.notify(
+					`🪟 Windows 通知：${status}\n用法：/notify on 或 /notify off`,
+					"info",
+				);
+			}
+		},
+	});
+
+	// ── /launch 命令 ──
+	pi.registerCommand("launch", {
+		description: "编排可见 pi 标签页；/launch -t <标题> 或 --direct 才直接启动单个任务",
+		handler: async (args, ctx) => {
+			const request = parseLaunchRequest(args ?? "");
+			if (!request.task) {
+				ctx.ui.notify("用法: /launch [--model <模型>] <编排请求>；单任务用 /launch -t <标题> <任务> 或 --direct <任务>", "error");
+				return;
+			}
+
+			// Natural-language /launch is deliberately a turn for the current agent.
+			// It has the full conversation (where the ready task IDs live), unlike a
+			// fresh terminal tab. The agent must call launch-tabs after analyzing it.
+			if (!request.direct) {
+				const modelHint = request.model
+					? `\n用户指定新 pi 会话模型为 \"${request.model}\"；只有在 launch-tabs 的每项需要时传入该 model。`
+					: "";
+				const modeHint = request.execute || request.research
+					? `\n用户请求为${request.execute ? "快速执行模式（--execute）：结论/方案已明确，跳过搜索与计划" : "深度研究模式（--research）：只要结论不要实现"}。把对应任务在 launch-tabs 里传 mode: ${request.execute ? "\"execute\"" : "\"research\""}；这些标签页将以 ${request.execute ? "`根据execute进行工作<taskId>`" : "`根据research进行工作<taskId>`"} 启动，只做${request.execute ? "实现 → 审查 → Wiki 收尾" : "并行搜索 + 研究报告 + Wiki 维护"}。`
+					: "";
+				pi.sendUserMessage([
+					"这是一个 /launch workflow 编排请求，不要把这句话直接作为新标签页任务。",
+					`用户请求：${request.task}`,
+					modelHint,
+					modeHint,
+					"请先分析当前会话上下文，找出用户明确表示启动条件已满足、且彼此独立的任务。",
+					"对每个任务调用 launch-tabs；一次调用提交全部任务以并行打开标签页。",
+					"每项必须有准确的 taskId（例如 1007）、具体且可执行的首轮 prompt，并保留 workflow 的 Wiki/plan/审查交接；不要把未满足条件的任务启动。",
+					"launch-tabs 会确保每个首轮 prompt 以 `根据workflow进行工作<taskId>` 开头并附带 workflow-orchestrator 强制约束块（先 read 技能、委派执行、禁止自己一路干完）；任务模式由每项 mode 决定——research（深度研究，前缀 `根据research进行工作<taskId>`，只做并行搜索+研究报告+Wiki 维护）或 execute（结论已明确，前缀 `根据execute进行工作<taskId>`，跳过搜索与计划，只做实现+审查+Wiki 收尾）。若没有足够明确的独立任务，先说明原因，不要开标签页。",
+				].filter(Boolean).join("\n"), { deliverAs: "followUp" });
+				ctx.ui.notify("🧭 已交给当前 agent 分析；它会在确认任务后通过 launch-tabs 并行打开标签页", "info");
+				return;
+			}
+
+			const wtPath = findWindowsTerminal();
+			if (!wtPath) {
+				ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。\n请从 Microsoft Store 安装 Windows Terminal。", "error");
+				return;
+			}
+
+			let piCli: string;
+			try {
+				piCli = findPiCli();
+			} catch (err) {
+				ctx.ui.notify(`❌ 未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}。请设置 PI_CLI_PATH 环境变量。`, "error");
+				return;
+			}
+
+			// 任务文本带任务序号（如 "Fix 1004 detector lifecycle"）时同样绑定 workflow 约束：
+			// 前缀 根据workflow进行工作<序号> / 根据research进行工作<序号> + 强制约束块 + 原始任务；无序号则保持直开（用户自定任务）。
+			const taskNum = request.task.match(/\b\d{3,5}\b/)?.[0] ?? "";
+			const workflowBound = taskNum !== "";
+			const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
+			const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
+			const mode: LaunchMode = request.execute ? "execute" : request.research ? "research" : "workflow";
+			const prompt = workflowBound
+				? buildWorkflowTabPrompt({ taskId: taskNum, title: request.title, prompt: request.task, model: request.model }, skillRef, mode)
+				: request.task;
+			const boundTitle = launchTaskTitle({ taskId: workflowBound ? taskNum : "", title: request.title, prompt, model: request.model }, request.cwd ?? process.cwd());
+
+			const result = dispatchPiTab(wtPath, piCli, request.cwd ?? process.cwd(), boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined);
+			if (result.error) {
+				ctx.ui.notify(`❌ 启动失败: ${result.error}`, "error");
+				return;
+			}
+			const modelHint = request.model ? ` (model: ${request.model})` : "";
+			const modeName = request.execute ? "快速执行" : request.research ? "深度研究" : "workflow";
+			const boundHint = workflowBound ? ` (workflow 约束已绑定 · ${modeName}模式)` : "";
+			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},
 	});
 }

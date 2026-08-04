@@ -1,0 +1,18 @@
+{
+  "providers": {
+    "my-embeddings": {
+      "baseUrl": "https://your-openai-compatible-endpoint.example.com/v1",
+      "api": "openai-embeddings",
+      "apiKey": "$WIKI_EMBEDDING_API_KEY",
+      "models": [
+        {
+          "id": "your-multilingual-embedding-model",
+          "name": "My Multilingual Embedding Model",
+          "dimensions": 1024,
+          "maxBatchSize": 64
+        }
+      ]
+    }
+  },
+  "default": "my-embeddings/your-multilingual-embedding-model"
+}
