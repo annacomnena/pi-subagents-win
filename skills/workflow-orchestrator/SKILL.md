@@ -363,7 +363,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
    - fallback 链也用尽（默认+所有 fallback 都失败，如整链 USAGE_CAP）；
    - **用户明确指定**某个模型/agent；
    - 配置模型对本任务**明显不合适**（上下文太小、能力不匹配）。
-3. override 时优先用普通 `provider/id`；**勿主动切外部 CLI**（`cli:claude/codex/agy`），除非该 agent 的配置本就用它、或用户明确要求——「存在某个 cli: 后端」本身绝不是用它的理由。
+3. override 时优先用普通 `provider/id`；**勿主动切外部 CLI**（`cli:claude/codex/agy/atomcode`），除非该 agent 的配置本就用它、或用户明确要求——「存在某个 cli: 后端」本身绝不是用它的理由。
 
 ### 机制
 

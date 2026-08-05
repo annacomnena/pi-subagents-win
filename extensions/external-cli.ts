@@ -5,9 +5,10 @@
  *   cli:claude
  *   cli:codex
  *   cli:agy
+ *   cli:atomcode
  *
  * Never pass --model to the external harness; users configure models inside
- * Claude Code / Codex / Antigravity themselves.
+ * Claude Code / Codex / Antigravity / AtomCode themselves.
  *
  * Spawns the local CLI harness instead of pi --mode json.
  * Windows-aware: resolves .exe/.cmd, process-group kill only on non-Windows.
@@ -19,7 +20,7 @@ import { randomUUID } from "node:crypto";
 
 // ── public types (kept compatible with index.ts SubagentResult) ────────────
 
-export type ExternalBackend = "claude" | "codex" | "agy";
+export type ExternalBackend = "claude" | "codex" | "agy" | "atomcode";
 
 export interface ExternalUsageSummary {
 	input: number;
@@ -49,7 +50,7 @@ export interface ExternalSubagentResult {
 }
 
 export interface RunExternalCliParams {
-	/** Backend selector only: cli:claude | cli:codex | cli:agy */
+	/** Backend selector only: cli:claude | cli:codex | cli:agy | cli:atomcode */
 	modelRef: string;
 	task: string;
 	/** Role system prompt (agent body / override). */
@@ -63,7 +64,7 @@ export interface RunExternalCliParams {
 }
 
 export const EXTERNAL_CLI_PREFIX = "cli:";
-export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy"];
+export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy", "atomcode"];
 
 const FORCE_KILL_DELAY_MS = 3000;
 const MAX_STDERR_CHARS = 128 * 1024;
@@ -105,12 +106,12 @@ export function normalizeExternalCliModel(raw?: string | null): string | undefin
 	if (!raw) return undefined;
 	const input = String(raw).trim();
 	if (!input) return undefined;
-	// Accept only: cli:claude | cli:codex | cli:agy (case-insensitive prefix/backend).
+	// Accept only: cli:claude | cli:codex | cli:agy | cli:atomcode (case-insensitive prefix/backend).
 	if (!isExternalCliModel(input)) return undefined;
 	const parsed = parseExternalCliModel(input);
 	if (!parsed) {
 		throw new Error(
-			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, or cli:agy (no model override; each CLI uses its own default model).`,
+			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, cli:agy, or cli:atomcode (no model override; each CLI uses its own default model).`,
 		);
 	}
 	return parsed.canonical;
@@ -122,19 +123,20 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 	for (const backend of EXTERNAL_BACKENDS) {
 		const ok = available[backend];
 		const status = ok ? "available" : "not on PATH";
-		const label =
-			backend === "claude"
-				? `cli:claude  — Claude Code CLI, default model (${status})`
-				: backend === "codex"
-					? `cli:codex  — Codex CLI, default model (${status})`
-					: `cli:agy  — Antigravity CLI, default model (${status})`;
+		const labelByBackend: Record<ExternalBackend, string> = {
+			claude: "Claude Code CLI",
+			codex: "Codex CLI",
+			agy: "Antigravity CLI",
+			atomcode: "AtomCode CLI",
+		};
+		const label = `cli:${backend}  — ${labelByBackend[backend]}, default model (${status})`;
 		opts.push({ ref: `${EXTERNAL_CLI_PREFIX}${backend}`, label });
 	}
 	return opts;
 }
 
 export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
-	const out = { claude: false, codex: false, agy: false } as Record<ExternalBackend, boolean>;
+	const out = { claude: false, codex: false, agy: false, atomcode: false } as Record<ExternalBackend, boolean>;
 	for (const b of EXTERNAL_BACKENDS) {
 		out[b] = Boolean(resolveExternalCommand(b));
 	}
@@ -146,9 +148,9 @@ export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
 function resolveExternalCommand(backend: ExternalBackend): string | undefined {
 	const candidates =
 		process.platform === "win32"
-			? backend === "codex"
-				? ["codex.cmd", "codex.exe", "codex"]
-				: [`${backend}.exe`, backend]
+			? backend === "claude"
+				? [`${backend}.exe`, backend]
+				: [`${backend}.cmd`, `${backend}.exe`, backend]
 			: [backend];
 
 	for (const name of candidates) {
@@ -598,6 +600,15 @@ function buildAgyArgs(prompt: string, thinking: string | undefined, timeoutMs?: 
 	return args;
 }
 
+// ── AtomCode ────────────────────────────────────────────────────────────────
+
+export function buildAtomcodeArgs(prompt: string): string[] {
+	// AtomCode headless mode writes its final answer to stdout and diagnostics
+	// to stderr. Match the other external backends' trusted-repo/no-approval
+	// policy, while keeping the prompt as one argv value.
+	return ["-y", "-p", prompt];
+}
+
 // ── shared spawn runner ────────────────────────────────────────────────────
 
 interface StreamRunOptions {
@@ -612,7 +623,7 @@ interface StreamRunOptions {
 	onUpdate?: (status: string, text: string) => void;
 	/** Line-oriented JSON event handler (claude/codex). */
 	onJsonLine?: (event: Record<string, unknown>) => void;
-	/** Accumulate raw stdout (agy). */
+	/** Accumulate raw stdout (plain-output backends such as agy and AtomCode). */
 	captureStdout?: boolean;
 }
 
@@ -698,7 +709,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 			child.stderr.on("data", (chunk: string) => {
 				stderrBuffer.append(String(chunk));
 				if (opts.captureStdout) {
-					// For capture-stdout backends (agy), relay stderr activity as
+					// For capture-stdout backends, relay stderr activity as
 					// progress so the user knows the CLI is alive even when stdout
 					// is silent during thinking / model calls.
 					stderrLineBuf += String(chunk);
@@ -819,7 +830,10 @@ export async function runExternalCli(params: RunExternalCliParams): Promise<Exte
 	if (backend === "codex") {
 		return runCodex({ ...params, backend, command, cwd, runId, base });
 	}
-	return runAgy({ ...params, backend, command, cwd, runId, base });
+	if (backend === "agy") {
+		return runAgy({ ...params, backend, command, cwd, runId, base });
+	}
+	return runAtomcode({ ...params, backend, command, cwd, runId, base });
 }
 
 interface BackendRunCtx extends RunExternalCliParams {
@@ -970,6 +984,36 @@ async function runAgy(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		sawTerminal: true, // agy has no JSON terminal event
 		outcome,
 		backendLabel: "agy",
+	});
+}
+
+async function runAtomcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
+	const { base, runId } = ctx;
+	// AtomCode has no separate system-prompt channel in headless mode, so use
+	// one prompt containing both the role instructions and the task.
+	const promptParts = [ctx.systemPrompt, ctx.task].filter(Boolean);
+	const taskPrompt = promptParts.join("\n\n");
+	const outcome = await spawnStreaming({
+		backend: "atomcode",
+		command: ctx.command,
+		args: buildAtomcodeArgs(taskPrompt),
+		cwd: ctx.cwd,
+		timeoutMs: ctx.timeoutMs,
+		signal: ctx.signal,
+		onUpdate: ctx.onUpdate,
+		captureStdout: true,
+	});
+
+	return finishStreamResult({
+		base,
+		runId,
+		modelLabel: base.requestedModel ?? "cli:atomcode",
+		usage: emptyUsage(),
+		resultText: outcome.stdout,
+		eventError: undefined,
+		sawTerminal: true,
+		outcome,
+		backendLabel: "atomcode",
 	});
 }
 

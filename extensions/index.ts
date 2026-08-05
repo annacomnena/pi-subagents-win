@@ -3,7 +3,7 @@
  *
  * 核心机制：
  *   - 默认：spawn("node", [piCliPath, "--mode", "json", ...])
- *   - 外部 CLI：model 为 cli:claude | cli:codex | cli:agy 时，spawn 本地 harness
+ *   - 外部 CLI：model 为 cli:claude | cli:codex | cli:agy | cli:atomcode 时，spawn 本地 harness
  * 支持单 agent、并行、异步三种模式。
  */
 
@@ -54,7 +54,6 @@ function findPiCli(): string {
 		join(piDir, "dist", "cli.js"),
 		join(piDir, "..", "dist", "cli.js"),
 		join(dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
-		join(homedir(), "AppData", "Local", "nvm", "v22.19.0", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
 	];
 	for (const c of candidates) {
 		if (existsSync(c)) return resolve(c);
@@ -208,7 +207,7 @@ function classifyModelFailure(
 		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
 	}
 	const providerish =
-		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|location is not supported)/i.test(
+		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|atomcode|location is not supported)/i.test(
 			message,
 		);
 	if (providerish) {
@@ -269,7 +268,7 @@ function normalizeModelRef(raw?: string | null): string | undefined {
 	const input = String(raw).trim();
 	if (!input) return undefined;
 
-	// External CLI harness: cli:claude | cli:codex | cli:agy (always CLI default model)
+	// External CLI harness: cli:claude | cli:codex | cli:agy | cli:atomcode (always CLI default model)
 	if (isExternalCliModel(input)) {
 		return normalizeExternalCliModel(input);
 	}
@@ -386,6 +385,12 @@ function displayModelForCall(override: string | undefined, agentName: string | u
 	if (!resolved) return "";
 	if (overrideRef && overrideRef !== defaultModel) return ` override:${resolved}`;
 	return ` ${resolved}`;
+}
+
+/** Resolve the requested checkout once and use it for both pi and external CLI children. */
+function resolveSubagentCwd(cwd?: string): string {
+	const requested = cwd?.trim();
+	return requested ? resolve(requested) : process.cwd();
 }
 
 interface AgentDef {
@@ -687,13 +692,15 @@ async function runSingle(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text: string) => void,
+	cwd?: string,
 ): Promise<SubagentResult> {
 	const finalPrompt = systemPrompt ?? agent?.body ?? "";
+	const workingDirectory = resolveSubagentCwd(cwd);
 	// model arg is already normalized by resolveCallModel / runWithFallback.
 	const resolvedModel = model ?? agentDefaultModel(agent);
 	const resolvedThinking = agentDefaultThinking(agent);
 
-	// External CLI backends (claude / codex / agy) — spawn local harness, not pi.
+	// External CLI backends (claude / codex / agy / atomcode) — spawn local harness, not pi.
 	if (resolvedModel && isExternalCliModel(resolvedModel)) {
 		const ext = await runExternalCli({
 			modelRef: resolvedModel,
@@ -702,6 +709,7 @@ async function runSingle(
 			thinking: resolvedThinking,
 			timeoutMs,
 			signal,
+			cwd: workingDirectory,
 			agentName: agent?.name,
 			onUpdate,
 		});
@@ -725,7 +733,7 @@ async function runSingle(
 	onUpdate?.(`🤖 ${resolvedModel ?? "default"}`, "starting...");
 
 	return new Promise((resolve_) => {
-		const child = spawn(process.execPath, argv, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(process.execPath, argv, { cwd: workingDirectory, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let buf = "", lineBuf = "", stderrBuf = "";
 		const result: SubagentResult = {
 			status: "failed",
@@ -871,6 +879,7 @@ async function runWithFallback(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text?: string) => void,
+	cwd?: string,
 ): Promise<SubagentResult> {
 	// Explicit call-site model overrides agent default. Retryable failures still try fallbacks.
 	let primary: string | undefined;
@@ -899,7 +908,7 @@ async function runWithFallback(
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
 	if (candidates.length === 0) {
-		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate);
+		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, cwd);
 		if (result.requestedModel) result.triedModels = [result.requestedModel];
 		return result;
 	}
@@ -912,7 +921,7 @@ async function runWithFallback(
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
 		tried.push(candidate);
-		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate);
+		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, cwd);
 		result.requestedModel = candidate;
 		result.triedModels = [...tried];
 		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
@@ -957,6 +966,8 @@ interface TaskInput {
 	systemPrompt?: string;
 	model?: string;
 	timeoutMs?: number;
+	/** Working directory / git worktree for this task. */
+	cwd?: string;
 }
 
 async function runParallel(
@@ -986,7 +997,7 @@ async function runParallel(
 			const taskCb = onUpdate
 				? (s: string, _t: string) => onUpdate(`[${idx + 1}/${tasks.length}] ${agentName} ${s}`, _t)
 				: undefined;
-			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb);
+			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, t.cwd);
 		}
 	};
 	await Promise.all(Array.from({ length: limit }, () => worker()));
@@ -1211,6 +1222,7 @@ interface AsyncRunRecord {
 	status: "running" | "completed" | "failed";
 	result?: SubagentResult;
 	startedAt: string;
+	cwd?: string;
 }
 
 function listAsyncRuns(): AsyncRunRecord[] {
@@ -1495,9 +1507,9 @@ export default function (pi: ExtensionAPI) {
 		lines.push("");
 		lines.push("Per-call model override: pass `model` on a single call or each parallel task. That value is what actually runs; the list above is only defaults.");
 		lines.push("Canonical form is `provider/id` (example: `Zhipu/glm-5.2`). Short aliases such as `glm-5.2` / `glm5.2` expand from ~/.pi/agent/models.json when unambiguous.");
-		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
+		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
-		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
+		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
@@ -1599,12 +1611,12 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Win",
 		description: [
 			"Windows 兼容的子 agent 工具。",
-			"单 agent: { agent, task, model? }",
-			"并行: { tasks: [{agent, task, model?}, ...], concurrency? }",
-			"异步: { agent, task, model?, async: true }",
+			"单 agent: { agent, task, model?, cwd? }",
+			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency? }",
+			"异步: { agent, task, model?, cwd?, async: true }",
 			"查状态: { action: \"status\", runId? }",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
-			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\"（各 CLI 默认模型，不支持覆盖）。",
+			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
 			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",
 		].join(" "),
 		parameters: Type.Object({
@@ -1615,8 +1627,9 @@ export default function (pi: ExtensionAPI) {
 				task: Type.String({ description: "任务描述" }),
 				systemPrompt: Type.Optional(Type.String()),
 				model: Type.Optional(Type.String({
-					description: "覆盖该 task 的模型。provider/id、短名，或外部 CLI 后端（cli:claude / cli:codex / cli:agy，均用 CLI 默认模型）",
+					description: "覆盖该 task 的模型。provider/id、短名，或外部 CLI 后端（cli:claude / cli:codex / cli:agy / cli:atomcode，均用 CLI 默认模型）",
 				})),
+				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number()),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
@@ -1625,8 +1638,9 @@ export default function (pi: ExtensionAPI) {
 			runId: Type.Optional(Type.String({ description: "异步 run id" })),
 			systemPrompt: Type.Optional(Type.String()),
 			model: Type.Optional(Type.String({
-				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy（使用 CLI 默认模型）",
+				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode（使用 CLI 默认模型）",
 			})),
+			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number()),
 		}),
 
@@ -1741,6 +1755,7 @@ export default function (pi: ExtensionAPI) {
 						`Run: ${target.id}`,
 						`Agent: ${target.agent ?? "(none)"}`,
 						`Task: ${target.task}`,
+						target.cwd ? `CWD: ${target.cwd}` : null,
 						`Status: ${target.status}`,
 						target.result ? `Output: ${target.result.text.slice(0, 500)}` : null,
 						target.result?.usage ? `Tokens: ↑${target.result.usage.input} ↓${target.result.usage.output} $${target.result.usage.cost.toFixed(4)}` : null,
@@ -1785,10 +1800,10 @@ export default function (pi: ExtensionAPI) {
 			if (p.async) {
 				const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
-				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString() };
+				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
 				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
-				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs).then((result) => {
+				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, p.cwd).then((result) => {
 					record.status = result.status; record.result = result;
 					recordUsage(agentDef?.name, result);
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
@@ -1802,7 +1817,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Unknown agent "${p.agent}". Available: ${agents.map((a) => a.name).join(", ")}` }], isError: true };
 				}
 				const cb = onUpdate ? (s: string, t: string) => onUpdate({ content: [{ type: "text", text: s + " " + t }] }) : undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb);
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, p.cwd);
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
@@ -1935,7 +1950,7 @@ export default function (pi: ExtensionAPI) {
 				const externalOpts = listExternalCliModelOptions();
 				// Labels layout:
 				//   [0] pi default
-				//   [1..E] external CLI backends (cli:claude / cli:codex / cli:agy)
+				//   [1..E] external CLI backends (cli:claude / cli:codex / cli:agy / cli:atomcode)
 				//   [E+1..] registry models
 				const modelLabels = [
 					`(use pi default)  [current: ${cfg.models[agentName] ?? "default"}]`,

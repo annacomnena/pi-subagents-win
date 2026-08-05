@@ -5,6 +5,10 @@ config.json
 node_modules/
 dist/
 *.tsbuildinfo
+package-lock.json
+
+# ── 任务计划 / 研究笔记（本地任务临时文件，不应进版本库）──
+plans/
 
 # ── 系统 / 编辑器 ──
 .DS_Store
