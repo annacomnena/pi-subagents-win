@@ -38,7 +38,9 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
 const RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
-const MAX_CONCURRENCY = 6;
+const MAX_CONCURRENCY = 50;
+/** 默认子 agent 超时：10 分钟（600 秒）。单次调用可通过 timeoutMs 覆盖。 */
+const DEFAULT_TIMEOUT_MS = 600_000;
 // 工作流技能：根目录与扩展 resources_discover 注册的是同一路径（--skill 传根目录可被按路径去重）；
 // 约束块里给的是精确 SKILL.md 路径，让新会话直接 read。
 const WORKFLOW_SKILL_ROOT = join(PKG_DIR, "skills");
@@ -881,6 +883,8 @@ async function runWithFallback(
 	onUpdate?: (status: string, text?: string) => void,
 	cwd?: string,
 ): Promise<SubagentResult> {
+	// 未显式设置超时时使用默认值（10 分钟），避免长时间无响应
+	if (timeoutMs === undefined) timeoutMs = DEFAULT_TIMEOUT_MS;
 	// Explicit call-site model overrides agent default. Retryable failures still try fallbacks.
 	let primary: string | undefined;
 	try {
