@@ -720,11 +720,12 @@ async function runSingle(
 
 	const cliPath = findPiCli();
 	// 保留项目 AGENTS.md / CLAUDE.md 注入（勿加 --no-context-files）。
-	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发。
+	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
+	// 同时排除 launch-tabs —— 子 agent 禁止开新标签页（launch 编排只属于主会话）。
 	const argv = [
 		cliPath,
 		"--mode", "json", "--print", "--no-session",
-		"--exclude-tools", "subagent-win",
+		"--exclude-tools", "subagent-win,launch-tabs",
 	];
 	if (resolvedModel) argv.push("--model", resolvedModel);
 	if (resolvedThinking) argv.push("--thinking", resolvedThinking);
@@ -735,7 +736,12 @@ async function runSingle(
 	onUpdate?.(`🤖 ${resolvedModel ?? "default"}`, "starting...");
 
 	return new Promise((resolve_) => {
-		const child = spawn(process.execPath, argv, { cwd: workingDirectory, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(process.execPath, argv, {
+			cwd: workingDirectory,
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, PI_SUBAGENT: "1" },
+		});
 		let buf = "", lineBuf = "", stderrBuf = "";
 		const result: SubagentResult = {
 			status: "failed",
@@ -1397,6 +1403,11 @@ async function searchableSelect(
 export default function (pi: ExtensionAPI) {
 	const agents = discoverAgents();
 
+	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
+	// 禁止注册 launch-tabs 工具与 /launch 命令，杜绝子 agent 开新标签页。
+	// （主会话不受影响；工具排除名单之外仍有兜底保护。）
+	const isSubagentProcess = process.env.PI_SUBAGENT === "1";
+
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);
 
@@ -1527,6 +1538,9 @@ export default function (pi: ExtensionAPI) {
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
+	if (isSubagentProcess) {
+		// 子 agent：跳过 launch-tabs 工具注册（双重防护，见 runSingle 的 --exclude-tools）
+	} else {
 	pi.registerTool({
 		name: "launch-tabs",
 		label: "Launch Pi Tabs",
@@ -1609,6 +1623,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 	});
+	}
 
 	pi.registerTool({
 		name: "subagent-win",
@@ -2167,7 +2182,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── /launch 命令 ──
+	// ── /launch 命令（子 agent 进程不注册）──
+	if (isSubagentProcess) {
+		// 子 agent：跳过 /launch 命令（双重防护）
+	} else {
 	pi.registerCommand("launch", {
 		description: "编排可见 pi 标签页；/launch -t <标题> 或 --direct 才直接启动单个任务",
 		handler: async (args, ctx) => {
@@ -2238,4 +2256,5 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},
 	});
+	}
 }
