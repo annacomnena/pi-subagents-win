@@ -38,7 +38,8 @@
     "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts",
     "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts",
     "test:tab-runs": "node --experimental-strip-types ./extensions/_test_tab_runs.ts",
-    "test:timers": "node --experimental-strip-types ./extensions/_test_timers.ts"
+    "test:timers": "node --experimental-strip-types ./extensions/_test_timers.ts",
+    "test:timers-runtime": "node --experimental-strip-types ./extensions/_test_timers_runtime.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

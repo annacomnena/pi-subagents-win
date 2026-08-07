@@ -27,6 +27,7 @@ import {
 import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
+import { registerTimers } from "./timers-runtime.ts";
 import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
@@ -1410,6 +1411,9 @@ export default function (pi: ExtensionAPI) {
 
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);
+
+	// 计时器：到期自动向目标会话发送用户消息推进工作（超长程任务基础设施）
+	registerTimers(pi);
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
