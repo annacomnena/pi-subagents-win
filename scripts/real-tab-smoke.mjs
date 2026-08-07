@@ -8,6 +8,8 @@
  *
  * 运行：node ./scripts/real-tab-smoke.mjs
  * 退出码 0 = PASS。需要网络与可用模型（默认 provider）。
+ * 注意：本 smoke 依赖真实 LLM 调用（模型必须在线可用），离线/配额耗尽时会失败——
+ * 这是测试环境制约，不是被测功能缺陷（P2-7）；离线 CI 请改用 _smoke_reclaim_loop.ts。
  */
 
 import { spawn } from "node:child_process";
