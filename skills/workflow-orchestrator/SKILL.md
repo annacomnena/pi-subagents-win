@@ -53,7 +53,7 @@ description: 使用 subagent-win 工具编排多步骤工作流（搜索→计�
 3. **任务临时发现不进 Wiki** — 搜索结论走回复或 `plans/*_research.md`；进度走 `recentwork.md`
 4. **正式 Wiki 仅主题/功能页** — 收尾阶段必须对照改动更新**对应功能**正式页；禁止 task/Item 叙事进 Wiki
 5. **积极分派搜索** — 多方向时并行 searcher
-6. **两种执行模式** — 单 agent 或并行 subagent
+6. **三种执行模式（自主选）** — 单 agent、并行 subagent、**异步（async: true）**。判据：结果马上要用 → 单 agent/并行（同步等待）；任务独立、分钟级+、当前回合不需要结果 → **async 派发**（立即拿 runId，稍后用 `action:"status"` 或 set-timer 推进）。长耗时探索/实现批次、以及不想阻塞主回合时优先 async
 7. **前置串行，独立并行** — 有依赖串行，无依赖并行
 8. **模型选择守配置优先** — 默认走各 agent 的 config 默认 + fallback 链，不主动 override；仅当 fallback 也用尽/用户指定/配置模型明显不合适才换；勿擅自用未配置的外部 CLI
 9. **Goal 默认不限预算** — `create_goal` 默认省略 `token_budget`
