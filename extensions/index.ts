@@ -29,6 +29,7 @@ import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
+import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
@@ -1446,6 +1447,9 @@ export default function (pi: ExtensionAPI) {
 	// 计时器：到期自动向目标会话发送用户消息推进工作（超长程任务基础设施）
 	registerTimers(pi);
 
+	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
+	registerAsyncPanel(pi);
+
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
@@ -1926,10 +1930,16 @@ export default function (pi: ExtensionAPI) {
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
 				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
+				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
+				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
+				refreshAsyncPanel();
 				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, p.cwd).then((result) => {
 					record.status = result.status; record.result = result;
 					recordUsage(agentDef?.name, result);
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+					// 方案 B：完成时刷新面板 + toast 通知
+					refreshAsyncPanel();
+					notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: p.task ?? "", status: result.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
 				});
 				return { content: [{ type: "text", text: `Async run started: ${runId}\nCheck with: subagent-win({ action: "status", runId: "${runId}" })` }] };
 			}
