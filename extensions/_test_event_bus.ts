@@ -53,11 +53,18 @@ function writeResult(runId: string, status = "completed") {
 	assert.deepEqual(firedSecond, [], "重复 poll 幂等");
 }
 
-// ── autoReclaim：注入用户消息 ────────────────────────────────────
+// ── autoReclaim：注入用户消息（带完整结果回报）────────────────────
 {
 	_resetEventBus();
 	const sent: string[] = [];
-	writeResult("tab_reclaim");
+	// 带 artifacts/reportPath 的结果
+	writeFileSync(join(dir, "tab_reclaim.result.json"), JSON.stringify({
+		id: "tab_reclaim", taskId: "1007", status: "completed", finishedAt: new Date().toISOString(),
+		summary: "批次完成",
+		artifacts: ["plans/20260806.md", "Wiki/Modules/xxx.md"],
+		reportPath: "plans/20260806_research.md",
+		usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.0123, turns: 1 },
+	}), "utf8");
 	const opts = {
 		runsDir: dir,
 		toast: false,
@@ -68,8 +75,11 @@ function writeResult(runId: string, status = "completed") {
 	assert.equal(sent.length, 1, "autoReclaim 应注入消息");
 	assert.ok(sent[0].includes("tab_reclaim"), sent[0]);
 	assert.ok(sent[0].includes("reclaim-tabs"), "应指引模型去回收");
+	assert.ok(sent[0].includes("批次完成"), "回报应带 summary");
+	assert.ok(sent[0].includes("plans/20260806.md"), "回报应带 artifacts");
+	assert.ok(sent[0].includes("plans/20260806_research.md"), "回报应带 reportPath");
+	assert.ok(sent[0].includes("$0.0123"), "回报应带 cost");
 
-	// 读取结果文件也被写入
 	const result = readTabResultFile(dir, "tab_reclaim");
 	assert.equal(result?.status, "completed");
 }

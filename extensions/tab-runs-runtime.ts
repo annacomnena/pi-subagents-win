@@ -15,6 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { sendWindowsToast } from "./notify-windows.ts";
 import {
 	buildTabStatusView,
 	defaultTabRunsDir,
@@ -198,6 +199,14 @@ export function registerTabTelemetry(
 			}
 			writeJsonAtomic(tabResultPath(runsDir, tabRunId), check.value);
 			finished = true;
+			// tab 侧也回报：本窗口用户可见（主会话侧由 event-bus 的 fs.watch 感知后再回报）
+			try {
+				sendWindowsToast({
+					title: `${status === "completed" ? "✅" : "❌"} tab ${tabRunId} ${status}`,
+					body: `${check.value.summary.slice(0, 100)}${check.value.artifacts?.length ? ` (${check.value.artifacts.length} artifacts)` : ""}`,
+					duration: "long",
+				});
+			} catch { /* toast 失败不阻塞 */ }
 			// 同步写终态 state（result 优先，state 仅作冗余）
 			writeTabState(runsDir, tabRunId, {
 				id: tabRunId,

@@ -65,11 +65,18 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 
 	const result = readTabResultFile(runsDir, runId);
 	const status = result?.status ?? "unknown";
-	const summary = result?.summary?.slice(0, 120) ?? "(no summary)";
+	const summary = result?.summary?.slice(0, 200) ?? "(no summary)";
+	const artifacts = result?.artifacts?.length ? result.artifacts.slice(0, 5).map((a) => `  • ${a}`).join("\n") : "";
+	const reportPath = result?.reportPath ? `
+  报告: ${result.reportPath}` : "";
+	const openIssues = result?.openIssues?.length ? `
+  未决: ${result.openIssues.slice(0, 3).join("; ")}` : "";
+	const cost = result?.usage?.cost ? ` ($${result.usage.cost.toFixed(4)})` : "";
+	const taskId = result?.taskId ? ` task=${result.taskId}` : "";
 
 	if (opts.toast !== false) {
 		const icon = status === "completed" ? "✅" : "❌";
-		sendWindowsToast({ title: `${icon} tab ${runId} ${status}`, body: summary, duration: "long" });
+		sendWindowsToast({ title: `${icon} tab ${runId} ${status}${taskId}${cost}`, body: summary.slice(0, 100), duration: "long" });
 	}
 
 	refreshAsyncPanel();
@@ -77,10 +84,15 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (opts.autoReclaim !== false) {
 		try {
 			// 注入用户消息唤醒模型去回收（followUp：主会话忙碌时排队，不打断工具循环）
-			opts.sendUserMessage?.(
-				`⏱ Tab ${runId} 已完成（${status}）：${summary}\n请用 reclaim-tabs({ runIds: ["${runId}"] }) 回收结果并决定下一步。`,
-				{ deliverAs: "followUp" },
-			);
+			const body = [
+				`⏱ Tab ${runId} 已完成（${status}${taskId}${cost}）`,
+				`摘要: ${summary}`,
+				artifacts ? `交付物:\n${artifacts}` : null,
+				reportPath || null,
+				openIssues || null,
+				`下一步: 用 reclaim-tabs({ runIds: ["${runId}"] }) 确认并编排后续。`,
+			].filter((l): l is string => Boolean(l)).join("\n");
+			opts.sendUserMessage?.(body, { deliverAs: "followUp" });
 		} catch {
 			/* 注入失败不阻塞 */
 		}
