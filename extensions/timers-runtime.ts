@@ -16,6 +16,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { recordLink, sessionIdentity } from "./links.ts";
 import {
 	MAX_PENDING_TIMERS,
 	cancelTimerFile,
@@ -231,6 +232,15 @@ export function registerTimers(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `timer 校验失败: ${check.errors.join("; ")}` }], isError: true };
 			}
 			writeTimerAtomic(timersDir, check.value, { tabRunId: scope.tabRunId });
+			// 溯源：记录「本会话创建了这个计时器」
+			try {
+				recordLink({
+					sessionId: sessionIdentity(null),
+					kind: "timer",
+					targetId: check.value.id,
+					detail: `${scope.tabRunId ? `tab:${scope.tabRunId}` : "self"}${check.value.label ? ` (${check.value.label})` : ""} ${check.value.message.slice(0, 50)}`,
+				});
+			} catch { /* 溯源可选 */ }
 			const where = scope.tabRunId ? `tab:${scope.tabRunId}` : "self";
 			return {
 				content: [{

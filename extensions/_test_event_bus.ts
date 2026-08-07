@@ -1,0 +1,89 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { onTabResultFile, pollNewResults, _resetEventBus, registerEventBus } from "./event-bus.ts";
+import { readTabResultFile } from "./tab-runs.ts";
+
+delete process.env.PI_SUBAGENT;
+delete process.env.PI_TAB_RUN_ID;
+
+const dir = mkdtempSync(join(tmpdir(), "event-bus-test-"));
+
+function writeResult(runId: string, status = "completed") {
+	writeFileSync(join(dir, `${runId}.result.json`), JSON.stringify({
+		id: runId, taskId: "1007", status, finishedAt: new Date().toISOString(), summary: "批次完成",
+	}), "utf8");
+}
+
+// ── 幂等：同一 result 只触发一次 ─────────────────────────────────
+{
+	const fired: string[] = [];
+	writeResult("tab_a");
+	const opts = { runsDir: dir, toast: false, autoReclaim: false, onTabFinished: (r: string) => fired.push(r) };
+
+	const first = onTabResultFile(dir, "tab_a.result.json", opts);
+	assert.equal(first, true, "首次应触发");
+	assert.deepEqual(fired, ["tab_a"]);
+
+	const second = onTabResultFile(dir, "tab_a.result.json", opts);
+	assert.equal(second, false, "重复文件不应再触发");
+	assert.deepEqual(fired, ["tab_a"], "幂等");
+}
+
+// ── pollNewResults：处理所有未见过的文件（snapshot 语义属于 registerEventBus）──
+{
+	_resetEventBus();
+	const fired: string[] = [];
+	const opts = { runsDir: dir, toast: false, autoReclaim: false, onTabFinished: (r: string) => fired.push(r) };
+
+	// 用独立子目录隔离本块
+	const dirPoll = join(dir, "poll");
+	const mkdirSync = (await import("node:fs")).mkdirSync;
+	mkdirSync(dirPoll, { recursive: true });
+	const writePoll = (rid: string) => writeFileSync(join(dirPoll, `${rid}.result.json`), JSON.stringify({ id: rid, taskId: "1", status: "completed", finishedAt: new Date().toISOString(), summary: "s" }), "utf8");
+	writePoll("tab_old");
+	writePoll("tab_new");
+
+	const firedFirst = pollNewResults(dirPoll, opts);
+	assert.deepEqual(firedFirst.sort(), ["tab_new.result.json", "tab_old.result.json"].sort(), "poll 处理全部未见文件");
+
+	// 再 poll → 已 seen，不再触发（幂等）
+	const firedSecond = pollNewResults(dirPoll, opts);
+	assert.deepEqual(firedSecond, [], "重复 poll 幂等");
+}
+
+// ── autoReclaim：注入用户消息 ────────────────────────────────────
+{
+	_resetEventBus();
+	const sent: string[] = [];
+	writeResult("tab_reclaim");
+	const opts = {
+		runsDir: dir,
+		toast: false,
+		autoReclaim: true,
+		sendUserMessage: (content: string, _o?: unknown) => { sent.push(content); },
+	};
+	onTabResultFile(dir, "tab_reclaim.result.json", opts);
+	assert.equal(sent.length, 1, "autoReclaim 应注入消息");
+	assert.ok(sent[0].includes("tab_reclaim"), sent[0]);
+	assert.ok(sent[0].includes("reclaim-tabs"), "应指引模型去回收");
+
+	// 读取结果文件也被写入
+	const result = readTabResultFile(dir, "tab_reclaim");
+	assert.equal(result?.status, "completed");
+}
+
+// ── registerEventBus：仅主会话注册 ───────────────────────────────
+{
+	_resetEventBus();
+	process.env.PI_SUBAGENT = "1";
+	const cleanup = registerEventBus({} as never, { runsDir: dir });
+	assert.ok(typeof cleanup === "function");
+	_resetEventBus();
+	delete process.env.PI_SUBAGENT;
+}
+
+rmSync(dir, { recursive: true, force: true });
+
+console.log("event-bus tests passed");

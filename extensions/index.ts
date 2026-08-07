@@ -30,6 +30,8 @@ import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
+import { registerEventBus } from "./event-bus.ts";
+import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
@@ -1450,6 +1452,9 @@ export default function (pi: ExtensionAPI) {
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
 	registerAsyncPanel(pi);
 
+	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）
+	registerEventBus(pi);
+
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
@@ -1632,7 +1637,7 @@ export default function (pi: ExtensionAPI) {
 				: `✓ ${item.title} ← ${item.prompt.slice(0, 80)}`);
 			return new Text(`${theme.fg(ok === results.length ? "success" : "warning", `launch-tabs ${ok}/${results.length}`)}${lines.length ? `\\n${lines.join("\\n")}` : ""}`, 0, 0);
 		},
-		async execute(_toolCallId, rawParams) {
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }> }> };
 			const input = params.tasks ?? [];
 			if (input.length === 0) {
@@ -1685,6 +1690,13 @@ export default function (pi: ExtensionAPI) {
 					dispatchStatus: "dispatched",
 				};
 				writeTabDispatch(runsDir, dispatch);
+				// 溯源：记录「本会话唤起了这个 tab」
+				recordLink({
+					sessionId: sessionIdentity(_ctx as never),
+					kind: "tab",
+					targetId: runId,
+					detail: `task=${taskId} mode=${mode} ${title}`,
+				});
 
 				// 2) 写入该标签页邮箱的计时器（到期自动发送推进消息）
 				for (const t of item.timers ?? []) {
@@ -1931,6 +1943,13 @@ export default function (pi: ExtensionAPI) {
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
 				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+				// 溯源：记录「本会话唤起了这个异步子 agent」
+				recordLink({
+					sessionId: sessionIdentity(_ctx as never),
+					kind: "async",
+					targetId: runId,
+					detail: `agent=${p.agent ?? "subagent"} ${String(p.task ?? "").slice(0, 60)}`,
+				});
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
@@ -1997,6 +2016,20 @@ export default function (pi: ExtensionAPI) {
 			const runs = listAsyncRuns().slice(0, 10);
 			if (runs.length === 0) { ctx.ui.notify("No async runs", "info"); return; }
 			ctx.ui.notify(`Recent runs:\n${runs.map((r) => `${r.id} | ${r.agent ?? "-"} | ${r.status} | ${r.task.slice(0, 60)}`).join("\n")}`, "info");
+		},
+	});
+
+	// ── /links 命令：会话溯源（哪个会话唤起了哪些任务）──
+	pi.registerCommand("links", {
+		description: "查看会话溯源：哪个会话唤起了哪些 tab/异步子 agent/计时器",
+		handler: async (args, ctx) => {
+			const links = listLinks();
+			if (links.length === 0) { ctx.ui.notify("No links recorded yet", "info"); return; }
+			const filter = (args ?? "").trim();
+			const filtered = filter ? links.filter((l) => l.sessionId.includes(filter) || l.kind === filter || l.targetId.includes(filter)) : links;
+			if (filtered.length === 0) { ctx.ui.notify(`No links matching "${filter}"`, "info"); return; }
+			const lines = filtered.slice(0, 20).map((l) => `${l.at.slice(11, 19)} [${l.sessionId.slice(0, 12)}] ${l.kind} ${l.targetId}: ${l.detail.slice(0, 50)}`);
+			ctx.ui.notify(`Links (${filtered.length}):\n${lines.join("\n")}`, "info");
 		},
 	});
 
