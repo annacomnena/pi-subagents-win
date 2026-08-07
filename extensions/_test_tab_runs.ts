@@ -1,16 +1,29 @@
 import assert from "node:assert/strict";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
+	buildTabStatusView,
 	classifyTabStatus,
+	composeTabStatus,
 	emptyTabUsage,
+	listTabDispatches,
 	listTabResults,
 	newTabRunId,
 	probeSessionFile,
+	probeSessionsForDispatch,
+	readTabDispatch,
 	readTabResultFile,
+	readTabState,
 	sessionBucketForCwd,
+	validateTabDispatchRecord,
 	validateTabResult,
+	validateTabState,
+	writeTabDispatch,
+	writeTabState,
+	type TabDispatchRecord,
+	type TabState,
 } from "./tab-runs.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -109,6 +122,28 @@ const WORKFLOW = "workflow" as const;
 	const s0 = classifyTabStatus(null);
 	assert.equal(s0.phase, "dispatched");
 	assert.equal(s0.terminal, false);
+
+	// P1-1：无匹配但超过 grace → orphaned（标签页早夭收敛）
+	const sOrphan = classifyTabStatus(null, {
+		dispatchedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+		graceMs: 5 * 60_000,
+	});
+	assert.equal(sOrphan.phase, "orphaned");
+	assert.equal(sOrphan.terminal, false);
+	// grace 内仍 dispatched
+	const sFresh = classifyTabStatus(null, {
+		dispatchedAt: new Date(Date.now() - 60_000).toISOString(),
+		graceMs: 5 * 60_000,
+	});
+	assert.equal(sFresh.phase, "dispatched");
+	// composeTabStatus 透传 dispatchedAt 同样收敛
+	const vOrphan = composeTabStatus({
+		runId: "tab_o1",
+		dispatch: { id: "tab_o1", version: 1, taskId: "1007", mode: "workflow", cwd: "G:\\x", dispatchedAt: new Date(Date.now() - 10 * 60_000).toISOString(), dispatchStatus: "dispatched" },
+		state: null, result: null, probe: null,
+		dispatchedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+	});
+	assert.equal(vOrphan.phase, "orphaned");
 }
 
 // ── 结果文件校验与读取 ────────────────────────────────────────────
@@ -149,6 +184,138 @@ const WORKFLOW = "workflow" as const;
 {
 	const u = emptyTabUsage();
 	assert.deepEqual(u, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+}
+
+// ── 派发账本：写/读/校验/列表 ─────────────────────────────────────
+{
+	const runsDir = mkdtempSync(join(tmpdir(), "tab-runs-dispatch-test-"));
+	const record: TabDispatchRecord = {
+		id: "tab_d1",
+		version: 1,
+		taskId: "1007",
+		mode: "workflow",
+		title: "MyRepo-1007-修复",
+		cwd: "G:\\code\\worktrees\\GreenCAD-219",
+		requestedModel: "anthropic/claude-sonnet-4",
+		dispatchedAt: "2026-08-06T03:45:15.433Z",
+		dispatchStatus: "dispatched",
+	};
+
+	writeTabDispatch(runsDir, record);
+	assert.deepEqual(readTabDispatch(runsDir, "tab_d1"), record);
+	assert.equal(readTabDispatch(runsDir, "tab_missing"), null);
+
+	const listed = listTabDispatches(runsDir);
+	assert.equal(listed.length, 1);
+	assert.equal(listed[0]?.id, "tab_d1");
+
+	// 校验
+	assert.equal(validateTabDispatchRecord(record).ok, true);
+	assert.equal(validateTabDispatchRecord({ ...record, id: undefined }).ok, false);
+	assert.equal(validateTabDispatchRecord({ ...record, dispatchStatus: "weird" }).ok, false);
+
+	// 损坏文件 → null
+	writeFileSync(join(runsDir, "tab_broken.json"), "{oops", "utf8");
+	assert.equal(readTabDispatch(runsDir, "tab_broken"), null);
+
+	rmSync(runsDir, { recursive: true, force: true });
+}
+
+// ── state 写/读/校验 ──────────────────────────────────────────────
+{
+	const runsDir = mkdtempSync(join(tmpdir(), "tab-runs-state-test-"));
+	const state: TabState = {
+		id: "tab_s1",
+		phase: "waiting",
+		turn: "idle",
+		terminal: false,
+		sessionPath: "C:\\pi\\sessions\\x.jsonl",
+		pid: 1234,
+		lastActivityAt: "2026-08-06T04:00:00.000Z",
+		lastAssistantText: "done",
+		lastStopReason: "stop",
+		usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1, turns: 5 },
+	};
+	writeTabState(runsDir, "tab_s1", state);
+	assert.deepEqual(readTabState(runsDir, "tab_s1"), state);
+	assert.equal(readTabState(runsDir, "tab_nope"), null);
+	assert.equal(validateTabState({ ...state, phase: "nonsense" }).ok, false);
+	assert.equal(validateTabState({ ...state, terminal: "yes" }).ok, false);
+	rmSync(runsDir, { recursive: true, force: true });
+}
+
+// ── 组合判态 composeTabStatus：result > state > probe ─────────────
+{
+	const dispatch: TabDispatchRecord = {
+		id: "tab_c1", version: 1, taskId: "1007", mode: "workflow", cwd: "G:\\code\\worktrees\\GreenCAD-219",
+		dispatchedAt: "2026-08-06T03:45:15.433Z", dispatchStatus: "dispatched",
+	};
+
+	// 1) result 优先 → 终态
+	const v1 = composeTabStatus({
+		runId: "tab_c1", dispatch, state: null, result: {
+			id: "tab_c1", taskId: "1007", status: "completed", finishedAt: "2026-08-06T05:00:00.000Z", summary: "done",
+		}, probe: null,
+	});
+	assert.equal(v1.phase, "completed");
+	assert.equal(v1.terminal, true);
+	assert.equal(v1.resultMissing, false);
+	assert.equal(v1.source, "result-file");
+
+	// 2) 无 result、有 state → 用 state（waiting 不是终态）
+	const v2 = composeTabStatus({
+		runId: "tab_c1", dispatch, state: { id: "tab_c1", phase: "waiting", turn: "idle", terminal: false }, result: null, probe: null,
+	});
+	assert.equal(v2.phase, "waiting");
+	assert.equal(v2.terminal, false);
+	assert.equal(v2.resultMissing, true);
+
+	// 3) 无 result/state、probe toolUse → working
+	const v3 = composeTabStatus({
+		runId: "tab_c1", dispatch, state: null, result: null,
+		probe: probeSessionFile(join(FIXTURES, "session-tooluse.jsonl"), "1007", "workflow"),
+	});
+	assert.equal(v3.phase, "working");
+
+	// 4) 无 result/state、probe stop → waiting（不是完成）
+	const v4 = composeTabStatus({
+		runId: "tab_c1", dispatch, state: null, result: null,
+		probe: probeSessionFile(join(FIXTURES, "session-stop.jsonl"), "1007", "workflow"),
+	});
+	assert.equal(v4.phase, "waiting");
+	assert.equal(v4.terminal, false, "stop 绝不等于工作流完成");
+}
+
+// ── probeSessionsForDispatch：按 cwd 桶 + taskId 前缀找匹配 ──────
+{
+	const sessionsRoot = mkdtempSync(join(tmpdir(), "tab-runs-sessions-test-"));
+	const bucket = join(sessionsRoot, "--G--code-worktrees-GreenCAD-219--");
+	mkdirSync(bucket, { recursive: true });
+	// 拷贝 fixtures 作为真实会话文件
+	for (const f of ["session-tooluse.jsonl", "session-stop.jsonl", "session-nomatch.jsonl"]) {
+		copyFileSync(join(FIXTURES, f), join(bucket, f));
+	}
+
+	const dispatch: TabDispatchRecord = {
+		id: "tab_p1", version: 1, taskId: "1007", mode: "workflow", cwd: "G:\\code\\worktrees\\GreenCAD-219",
+		dispatchedAt: "2026-08-06T03:00:00.000Z", dispatchStatus: "dispatched",
+	};
+	const probes = probeSessionsForDispatch(dispatch, sessionsRoot);
+	// 命中 tooluse + stop 两条（taskId 1007）；nomatch（9999）不命中
+	assert.equal(probes.length, 2, `expected 2 matches, got ${probes.length}`);
+	assert.ok(probes.every((p) => p.matched));
+
+	// buildTabStatusView：完整链路（state 缺失 → 用 probe，最新匹配 stop → waiting）
+	const runsDir = mkdtempSync(join(tmpdir(), "tab-runs-view-test-"));
+	writeTabDispatch(runsDir, dispatch);
+	const view = buildTabStatusView(runsDir, "tab_p1", sessionsRoot);
+	assert.equal(view.runId, "tab_p1");
+	assert.equal(view.dispatch?.taskId, "1007");
+	assert.equal(view.phase, "waiting", "最新匹配会话是 stop → waiting");
+	assert.equal(view.resultMissing, true);
+
+	rmSync(sessionsRoot, { recursive: true, force: true });
+	rmSync(runsDir, { recursive: true, force: true });
 }
 
 console.log("tab-runs tests passed");

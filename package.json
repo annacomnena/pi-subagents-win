@@ -35,9 +35,12 @@
     "prepare:test-deps": "node ./scripts/ensure-pi-test-deps.mjs",
     "smoke:wiki-nav": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_nav.ts",
     "smoke:wiki-semantic": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_semantic.ts",
+    "smoke:reclaim-loop": "node --experimental-strip-types ./extensions/_smoke_reclaim_loop.ts",
+    "smoke:real-tab": "node ./scripts/real-tab-smoke.mjs",
     "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts",
     "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts",
     "test:tab-runs": "node --experimental-strip-types ./extensions/_test_tab_runs.ts",
+    "test:tab-runs-runtime": "node --experimental-strip-types ./extensions/_test_tab_runs_runtime.ts",
     "test:timers": "node --experimental-strip-types ./extensions/_test_timers.ts",
     "test:timers-runtime": "node --experimental-strip-types ./extensions/_test_timers_runtime.ts"
   },

@@ -31,7 +31,7 @@ import {
 	type TimerRecord,
 } from "./timers.ts";
 
-const TICK_MS = 5000;
+const TICK_MS = 5000; // 调度器 tick；MIN_REPEAT_MS(10000) 必须 > 本值（P2-4）
 const STARTUP_FIRE_DELAY_MS = 1500;
 
 interface FireOutcome {
@@ -64,7 +64,7 @@ function fireOneTimer(
 	const claimed = casFireTimer(timersDir, record.id, { tabRunId: ownTabRunId });
 	if (!claimed) return { fired: false, reason: "already terminal" };
 
-	// 2) repeat：重置 dueAt 写回 pending
+	// 2) repeat：重置 dueAt 写回 pending（P2-3：保留 fireCount/lastFiredAt 历史）
 	if (record.repeatMs) {
 		const next: TimerRecord = {
 			...record,
@@ -72,6 +72,8 @@ function fireOneTimer(
 			dueAt: dueAtFromDelay(record.repeatMs),
 			firedAt: undefined,
 			firedLate: undefined,
+			fireCount: (record.fireCount ?? 0) + 1,
+			lastFiredAt: claimed.firedAt ?? claimed.lastFiredAt,
 		};
 		writeTimerAtomic(timersDir, next, { tabRunId: ownTabRunId });
 	}
@@ -341,7 +343,14 @@ export function registerTimers(pi: ExtensionAPI): void {
 				ctx.ui.notify("子 agent 中不可操作计时器", "warning");
 				return;
 			}
-			const filter = (args ?? "").trim() as TimerRecord["status"] | "";
+			const filterRaw = (args ?? "").trim();
+			// P2-6：校验 filter 集合，非法时提示用法
+			const validFilters: TimerRecord["status"][] = ["pending", "fired", "cancelled", "missed"];
+			if (filterRaw && !validFilters.includes(filterRaw as TimerRecord["status"])) {
+				ctx.ui.notify(`用法: /timers [pending|fired|cancelled|missed]`,"warning");
+				return;
+			}
+			const filter = filterRaw as TimerRecord["status"] | "";
 			const all = readAllTimers(timersDir, ownTabRunId).filter((t) => !filter || t.status === filter);
 			if (all.length === 0) {
 				ctx.ui.notify(`No timers${filter ? ` (${filter})` : ""}`, "info");

@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 export const MAX_TIMER_MESSAGE = 2048;
 /** 单进程最多 pending timer 数。 */
 export const MAX_PENDING_TIMERS = 50;
-/** repeatMs 下限（防止自触发风暴）。 */
+/** repeatMs 下限（防止自触发风暴）。必须 > 调度器 TICK_MS(5000)，否则同 tick 内可能重入（P2-4）。 */
 export const MIN_REPEAT_MS = 10_000;
 
 // ── 类型 ──────────────────────────────────────────────────────────
@@ -50,6 +50,10 @@ export interface TimerRecord {
 	firedAt?: string;
 	/** pi 未运行期间已到期，启动后补发。 */
 	firedLate?: boolean;
+	/** P2-3：累计触发次数（repeat 保留而非清空）。 */
+	fireCount?: number;
+	/** P2-3：最近一次触发时刻。 */
+	lastFiredAt?: string;
 	createdAt: string;
 }
 
@@ -151,6 +155,8 @@ export function validateTimerRecord(raw: unknown): { ok: boolean; errors: string
 		status,
 		firedAt: typeof record.firedAt === "string" ? record.firedAt : undefined,
 		firedLate: record.firedLate === true ? true : undefined,
+		fireCount: typeof record.fireCount === "number" && record.fireCount > 0 ? Math.floor(record.fireCount) : undefined,
+		lastFiredAt: typeof record.lastFiredAt === "string" ? record.lastFiredAt : undefined,
 		createdAt,
 	};
 	return { ok: true, errors, value };
@@ -179,11 +185,14 @@ export function isLate(record: TimerRecord, now: Date = new Date(), graceMs: num
 
 /** 纯函数：构造 fired 版本（不改原对象）。 */
 export function withFired(record: TimerRecord, now: Date = new Date(), opts?: { firedLate?: boolean }): TimerRecord {
+	const wasLate = opts?.firedLate === true || isLate(record, now);
 	return {
 		...record,
 		status: "fired",
 		firedAt: now.toISOString(),
-		firedLate: opts?.firedLate === true || isLate(record, now) ? true : undefined,
+		firedLate: wasLate ? true : undefined,
+		fireCount: (record.fireCount ?? 0) + 1,
+		lastFiredAt: now.toISOString(),
 	};
 }
 

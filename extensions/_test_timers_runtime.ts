@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pumpDueTimers } from "./timers-runtime.ts";
-import { readTimerFile, validateTimerRecord, writeTimerAtomic } from "./timers.ts";
+import { readTimerFile, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "./timers.ts";
+
+// P0-1：隔离进程环境（PI_SUBAGENT=1 时 pumpDueTimers 的调用方身份语义会被测试污染）
+delete process.env.PI_SUBAGENT;
+delete process.env.PI_TAB_RUN_ID;
+delete process.env.PI_TAB_RUNS_DIR;
 
 // ── fake pi（只实现 sendUserMessage，记录调用）────────────────────
 function makeFakePi() {
@@ -48,8 +53,11 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.ok(pi.calls[0]?.content.includes("检查批次结果并继续"), "消息应包含用户指令");
 	assert.deepEqual(pi.calls[0]?.opts, { deliverAs: "followUp" }, "忙碌时应 followUp 排队");
 
-	// 磁盘状态 fired
-	assert.equal(readTimerFile(dir, "t_fire1")?.status, "fired");
+	// 磁盘状态 fired + P2-3：fireCount 累计
+	const firedRec = readTimerFile(dir, "t_fire1");
+	assert.equal(firedRec?.status, "fired");
+	assert.equal(firedRec?.fireCount, 1, "首次触发 fireCount=1");
+	assert.ok(firedRec?.lastFiredAt, "应记录 lastFiredAt");
 
 	// 再次 pump → 不重复触发（防双发）
 	const again = pumpDueTimers(pi, dir);
@@ -97,11 +105,17 @@ function makeTimer(overrides: Record<string, unknown>) {
 	pumpDueTimers(pi, dir);
 	assert.equal(pi.calls.length, 1);
 
-	// 手动把 dueAt 拨回过去 → 第二次触发（模拟周期重发）
-	const back = makeTimer({ id: "t_repeat", repeatMs, dueAt: new Date(Date.now() - 1000).toISOString() });
+	// 手动把 dueAt 拨回过去 → 第二次触发（模拟周期重发）+ P2-3 fireCount 保留
+	const cur = readTimerFile(dir, "t_repeat");
+	assert.ok(cur, "repeat timer 应在磁盘上为 pending");
+	const back: TimerRecord = { ...cur, dueAt: new Date(Date.now() - 1000).toISOString() };
 	writeTimerAtomic(dir, back);
 	pumpDueTimers(pi, dir);
 	assert.equal(pi.calls.length, 2, "周期 timer 应可再次触发");
+	const after2 = readTimerFile(dir, "t_repeat");
+	assert.equal(after2?.status, "pending");
+	assert.equal(after2?.fireCount, 2, "第二次周期触发后 fireCount=2");
+	assert.ok(after2?.lastFiredAt, "lastFiredAt 应保留");
 }
 
 // ── 邮箱作用域：只 pump 自己的邮箱 ────────────────────────────────

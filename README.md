@@ -22,6 +22,8 @@ Windows-friendly pi subagent package: single / parallel / async runs, role agent
 - **`/sub-models` command**: interactive primary-model, fallback-model, and thinking config via TUI (external CLIs listed first)
 - **`/codex-headers` command**: per-provider Codex request-header compat (`originator` / `User-Agent` / `OAI-Product-Sku`) for 公益站 / reverse proxies
 - **`/launch` command**: let the current agent analyze workflow tasks, then open independent Windows Terminal tabs in parallel (`-t` / `--direct` keeps an explicit single-tab escape hatch). **Three task modes**: `workflow` (full search→plan→implement→review pipeline), `research` (deep research only — parallel searchers, research report, Wiki maintenance, no implementation), and `execute` (conclusion already settled — skip search/planning, implement → review → Wiki wrap-up), selectable via `--research` / `--execute` / `mode` per task.
+- **Tab reclaim** (ultra-long task infra): `launch-tabs` returns a stable `runId` per tab; `tab-status` inspects phase, `reclaim-tabs` collects results (`ready/pending/awaitingInput/failed/orphaned`) for the next batch; tabs report lifecycle via `PI_TAB_RUN_ID` and finish via the `tab-finish` tool.
+- **Auto-push timers**: `set-timer({message, delayMs, target})` — when the timer expires the system auto-sends a user message to advance work (`target=self` or a tab's `runId`); `launch-tabs` per-task `timers` param preloads a tab's mailbox.
 
 ## External CLI backends
 
@@ -200,6 +202,21 @@ Text form:
 - Goal mode: omit `token_budget` unless user sets one
 - Subagents load project `AGENTS.md` (no `--no-context-files`) when using the pi backend
 - Models with <200K context should split large exploration into parallel subtasks
+
+## Tab reclaim & timers — ultra-long task orchestration
+
+`launch-tabs` now returns a **`runId`** per dispatched tab (ledger at `~/.pi/agent/tab-runs/<runId>.json`). This enables a closed orchestration loop for hours-long, unattended pipelines:
+
+```text
+launch-tabs(batch N) → set-timer(advance message) → reclaim-tabs(batch N) → launch-tabs(batch N+1)
+```
+
+- **`tab-status`** `{ runId?, taskId? }` — phase: `dispatched | attached | working | waiting | completed | failed | cancelled | orphaned | unconfirmed`; only `completed/failed/cancelled` **with an explicit result** are terminal.
+- **`reclaim-tabs`** `{ runIds, wait?, timeoutMs?, intervalMs? }` — polls until terminal (never kills tabs, never fakes completion); returns `ready[] / pending[] / awaitingInput[] / failed[] / orphaned[]`. A `waiting` tab is **not** done; a terminal tab without a result is `resultMissing: true, completion: "unconfirmed"`.
+- **`tab-finish`** (inside the tab) — the only explicit workflow-terminal signal: writes `<runId>.result.json` with status/summary/artifacts. runId comes from the environment, so a tab cannot forge another run's result.
+- **Lifecycle telemetry** — the tab process (detected via `PI_TAB_RUN_ID`) writes `attached/working/waiting/orphaned` state from `session_start` / `agent_start` / `agent_settled` / `session_shutdown`; `stop`/`toolUse` are **never** treated as workflow completion.
+- **`set-timer` / `cancel-timer` / `list-timers` / `/timers`** — when a timer expires the system auto-sends a user message to advance work (`target=self`, or a tab via `launch-tabs` per-task `timers` param → mailbox `timers/mail/<runId>/`). Busy sessions queue the message (`followUp`), so tool loops are never interrupted. Subagents can neither set timers nor own tab identity.
+- **`/tabs`** — human-readable tab list.
 
 ## Install
 

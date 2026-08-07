@@ -28,6 +28,21 @@ import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
+import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
+import {
+	defaultTabRunsDir,
+	newTabRunId,
+	validateTabDispatchRecord,
+	writeTabDispatch,
+	type TabDispatchRecord,
+} from "./tab-runs.ts";
+import {
+	defaultTimersDir,
+	dueAtFromDelay,
+	newTimerId,
+	validateTimerRecord,
+	writeTimerAtomic,
+} from "./timers.ts";
 import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
@@ -87,6 +102,9 @@ interface LaunchDispatch {
 	prompt: string;
 	model?: string;
 	error?: string;
+	/** 标签页回收闭环令牌（launch-tabs 生成，供 tab-status / reclaim-tabs 使用）。 */
+	runId?: string;
+	taskId?: string;
 }
 
 function dispatchPiTab(
@@ -97,6 +115,10 @@ function dispatchPiTab(
 	prompt: string,
 	model?: string,
 	skills?: string[],
+	runId?: string,
+	runsDir?: string,
+	/** P1-2：异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
+	onSpawnError?: (err: Error) => void,
 ): LaunchDispatch {
 	try {
 		const child = spawn(wtPath, buildWindowsTerminalArgs(title, prompt, {
@@ -105,17 +127,20 @@ function dispatchPiTab(
 			execPath: process.execPath,
 			model,
 			skills,
-		}), { shell: false });
+		}), {
+			shell: false,
+			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程
+			env: runId ? { ...process.env, PI_TAB_RUN_ID: runId, PI_TAB_RUNS_DIR: runsDir } : undefined,
+		});
 		child.on("error", (err: Error) => {
-			// The caller gets an accepted dispatch immediately; this listener keeps
-			// the failure visible in the terminal process instead of becoming an
-			// unhandled child-process error.
+			// 同步 try/catch 只覆盖 spawn 本身的异常；异步 error（如 wt.exe 立即退出）也回写账本
 			console.error(`[subagent-win launch] ${title}: ${err.message}`);
+			onSpawnError?.(err);
 		});
 		child.unref();
-		return { title, prompt, model };
+		return { title, prompt, model, runId };
 	} catch (err) {
-		return { title, prompt, model, error: err instanceof Error ? err.message : String(err) };
+		return { title, prompt, model, error: err instanceof Error ? err.message : String(err), runId };
 	}
 }
 
@@ -741,7 +766,13 @@ async function runSingle(
 			cwd: workingDirectory,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, PI_SUBAGENT: "1" },
+			env: {
+				...process.env,
+				// P1-4：子 agent 永不继承标签页身份（避免继承父标签页的 PI_TAB_RUN_ID 造成身份混淆）
+				PI_SUBAGENT: "1",
+				PI_TAB_RUN_ID: "",
+				PI_TAB_RUNS_DIR: "",
+			},
 		});
 		let buf = "", lineBuf = "", stderrBuf = "";
 		const result: SubagentResult = {
@@ -1415,6 +1446,10 @@ export default function (pi: ExtensionAPI) {
 	// 计时器：到期自动向目标会话发送用户消息推进工作（超长程任务基础设施）
 	registerTimers(pi);
 
+	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
+	registerTabTelemetry(pi);
+	registerTabStatusTools(pi);
+
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
 
@@ -1539,6 +1574,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), and `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`).");
+		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
@@ -1555,6 +1591,7 @@ export default function (pi: ExtensionAPI) {
 			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）。",
 			"一次调用传入全部任务以保证并行启动。",
 			"标签自动生成规范名 `<仓库名>[-worktree]-<taskId>-<标签>`（仓库名取自 git origin/toplevel，worktree 路径自动加 -worktree- 标记，标签取显式 title 或从 prompt 首行提取）；不再使用无意义的 wlc 默认名。",
+			"每项返回 runId（回收令牌）：用 tab-status 查询状态、reclaim-tabs 回收结果后编排下一批；每项可传 timers: [{delayMs, message, label?, repeatMs?}] 写入该标签页邮箱，到期自动发送推进消息（超长程编排）。",
 			"每项可传 cwd 指定新标签页工作目录（默认当前目录）；独立 worktree 场景必须显式传 cwd。",
 		].join(" "),
 		parameters: Type.Object({
@@ -1565,6 +1602,12 @@ export default function (pi: ExtensionAPI) {
 				model: Type.Optional(Type.String({ description: "仅用户明确要求或配置不适用时覆盖新 pi 会话模型" })),
 				title: Type.Optional(Type.String({ description: "标签名（可选）：仅作为标签部分，自动剥离开头的 pi-/wlc- 前缀；缺省从 prompt 首行提取" })),
 				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）" })),
+				timers: Type.Optional(Type.Array(Type.Object({
+					delayMs: Type.Number({ description: "延时毫秒：到期后系统自动向该标签页发送消息推进工作" }),
+					message: Type.String({ description: "到期自动发送的推进指令" }),
+					label: Type.Optional(Type.String({ description: "可读说明" })),
+					repeatMs: Type.Optional(Type.Number({ description: "周期重发间隔（≥10000ms）" })),
+				}), { description: "派发时写入该标签页邮箱的计时器（超长程任务编排）" })),
 			})),
 		}),
 		renderCall(args, theme) {
@@ -1585,7 +1628,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(`${theme.fg(ok === results.length ? "success" : "warning", `launch-tabs ${ok}/${results.length}`)}${lines.length ? `\\n${lines.join("\\n")}` : ""}`, 0, 0);
 		},
 		async execute(_toolCallId, rawParams) {
-			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string }> };
+			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }> }> };
 			const input = params.tasks ?? [];
 			if (input.length === 0) {
 				return { content: [{ type: "text", text: "launch-tabs requires at least one task" }], isError: true };
@@ -1605,6 +1648,9 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
 			}
 
+			const runsDir = defaultTabRunsDir();
+			const timersDir = defaultTimersDir();
+
 			const results = input.map((item) => {
 				const taskId = (item.taskId ?? "").trim();
 				const prompt = (item.prompt ?? "").trim();
@@ -1616,12 +1662,66 @@ export default function (pi: ExtensionAPI) {
 				const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
 				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : "workflow";
 				const normalizedPrompt = buildWorkflowTabPrompt({ taskId, title: item.title, prompt, model: item.model }, skillRef, mode);
-				const cwd = (item.cwd ?? "").trim() || process.cwd();
-				return dispatchPiTab(wtPath, piCli, cwd, launchTaskTitle({ taskId, title: item.title, prompt: normalizedPrompt, model: item.model }, cwd), normalizedPrompt, item.model, skillArgs);
+				const cwdRaw = (item.cwd ?? "").trim() || process.cwd();
+				const cwd = resolve(cwdRaw);
+				const title = launchTaskTitle({ taskId, title: item.title, prompt: normalizedPrompt, model: item.model }, cwd);
+
+				// 1) 派发前写账本：回收闭环的 runId 唯一令牌
+				const runId = newTabRunId();
+				const dispatch: TabDispatchRecord = {
+					id: runId,
+					version: 1,
+					taskId,
+					mode,
+					title: item.title ?? title,
+					cwd,
+					requestedModel: item.model,
+					dispatchedAt: new Date().toISOString(),
+					dispatchStatus: "dispatched",
+				};
+				writeTabDispatch(runsDir, dispatch);
+
+				// 2) 写入该标签页邮箱的计时器（到期自动发送推进消息）
+				for (const t of item.timers ?? []) {
+					if (typeof t.delayMs !== "number" || !Number.isFinite(t.delayMs) || t.delayMs <= 0) continue;
+					if (typeof t.message !== "string" || !t.message.trim()) continue;
+					const timerRaw: Record<string, unknown> = {
+						id: newTimerId(),
+						version: 1,
+						dueAt: dueAtFromDelay(t.delayMs),
+						message: t.message.trim(),
+						target: { tabRunId: runId, taskId },
+						source: "launch-tabs",
+						label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : undefined,
+						repeatMs: t.repeatMs,
+						status: "pending",
+						createdAt: new Date().toISOString(),
+					};
+					const check = validateTimerRecord(timerRaw);
+					if (check.ok && check.value) writeTimerAtomic(timersDir, check.value, { tabRunId: runId });
+				}
+
+				// 3) spawn（env 携带 PI_TAB_RUN_ID / PI_TAB_RUNS_DIR）
+				const result = dispatchPiTab(wtPath, piCli, cwd, title, normalizedPrompt, item.model, skillArgs, runId, runsDir, (err) => {
+					// P1-2：异步 spawn 失败也回写 launch_failed（不静默卡 dispatched）
+					console.error(`[subagent-win launch] async spawn failed ${runId}: ${err.message}`);
+					writeTabDispatch(runsDir, { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
+				});
+				if (result.error) {
+					// 派发失败保留 launch_failed 记录（不静默消失）
+					writeTabDispatch(runsDir, { ...dispatch, dispatchStatus: "launch_failed", error: result.error });
+				}
+				return { ...result, runId, taskId, cwd };
 			});
 			const ok = results.filter((item) => !item.error).length;
+			const lines = results.map((item) => item.error
+				? `✗ ${item.title} [${item.runId}]: ${item.error}`
+				: `✓ ${item.title} [${item.runId}]: ${item.prompt.slice(0, 60)}`);
 			return {
-				content: [{ type: "text", text: `已并行启动 ${ok}/${results.length} 个 pi 标签页：${results.map((item) => item.title).join(", ")}` }],
+				content: [{
+					type: "text",
+					text: `已并行启动 ${ok}/${results.length} 个 pi 标签页（runId 见下，用 tab-status / reclaim-tabs 回收）:\n${lines.join("\n")}`,
+				}],
 				details: { results },
 				isError: ok === 0,
 			};
