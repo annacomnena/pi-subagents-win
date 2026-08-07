@@ -36,7 +36,8 @@
     "smoke:wiki-nav": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_nav.ts",
     "smoke:wiki-semantic": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_semantic.ts",
     "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts",
-    "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts"
+    "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts",
+    "test:tab-runs": "node --experimental-strip-types ./extensions/_test_tab_runs.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
