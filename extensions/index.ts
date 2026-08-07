@@ -194,12 +194,12 @@ function isRetryableModelFailure(result: SubagentResult): boolean {
  * Zhipu/GLM package exhaustion commonly surfaces as bare HTTP 429
  * (not a Chinese "套餐" string) — treat those as USAGE_CAP, not soft rate-limit.
  */
-function classifyModelFailure(
+export function classifyModelFailure(
 	error: string,
 	modelHint?: string,
 ): {
 	retryable: boolean;
-	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "other";
+	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "stall" | "other";
 	label: string;
 } {
 	const message = error.toLowerCase();
@@ -233,6 +233,10 @@ function classifyModelFailure(
 
 	if (/(api key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i.test(message)) {
 		return { retryable: true, kind: "auth", label: "AUTH" };
+	}
+	// 停顿超时（stall）不是模型/Provider 错误——任务卡住换模型也救不回来，不触发 fallback
+	if (/(stall|no output for|stall-timeout|\bstalled\b)/i.test(message)) {
+		return { retryable: false, kind: "stall", label: "STALL" };
 	}
 	if (/(timeout|\b408\b|timed?\s*out)/i.test(message)) {
 		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
@@ -791,21 +795,30 @@ async function runSingle(
 		let forceKill: ReturnType<typeof setTimeout> | null = null;
 		const kill = () => { child.kill("SIGTERM"); forceKill = setTimeout(() => child.kill("SIGKILL"), 2000); };
 		if (signal?.aborted) kill(); else signal?.addEventListener("abort", kill, { once: true });
-		const timer = timeoutMs
-			? setTimeout(() => {
+
+		// 停顿检测（inactivity/stall timeout）：不是给整个任务限时——
+		// 只要子进程持续有输出（有进展）就重置计时器；只有「卡住不动超过 timeoutMs」才判超时停止。
+		// 错误（exit≠0 / stopReason=error）走正常停止路径，不受此超时影响。
+		let stallTimer: ReturnType<typeof setTimeout> | null = null;
+		const resetStall = () => {
+			if (stallTimer) clearTimeout(stallTimer);
+			if (!timeoutMs) { stallTimer = null; return; }
+			stallTimer = setTimeout(() => {
 				timedOut = true;
 				result.status = "failed";
-				result.error = "timeout";
-				onUpdate?.("⏱ timeout", `killing ${resolvedModel ?? "default"}`);
+				result.error = "stall-timeout";
+				onUpdate?.("⏱ stalled", `killing ${resolvedModel ?? "default"} (no output for ${Math.round(timeoutMs / 1000)}s)`);
 				kill();
-			}, timeoutMs)
-			: null;
+			}, timeoutMs);
+		};
+		resetStall();
 
 		// 输出缓冲上限 5MB，防止子进程输出过大撑爆 RangeError
 		const MAX_BUF = 5_000_000;
 		const parseOpts = { timedOut: () => timedOut, candidates: textCandidates };
 
 		child.stdout.on("data", (chunk: Buffer) => {
+			resetStall(); // 有进展：重置停顿计时
 			const text = chunk.toString("utf8");
 			if (buf.length < MAX_BUF) buf += text;
 			lineBuf += text;
@@ -820,16 +833,18 @@ async function runSingle(
 			}
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
+			resetStall(); // 错误输出也算进展（至少进程还活着）
 			if (stderrBuf.length < MAX_BUF) stderrBuf += chunk.toString("utf8");
 		});
 		child.on("error", (err) => {
+			if (stallTimer) clearTimeout(stallTimer);
 			result.status = "failed";
 			result.error = err.message;
 			result.agent = agent?.name;
 			resolve_(result);
 		});
 		child.on("close", (code) => {
-			if (timer) clearTimeout(timer);
+			if (stallTimer) clearTimeout(stallTimer);
 			if (forceKill) clearTimeout(forceKill);
 			// 处理缓冲区中剩余行（即使中断也有部分结果）
 			if (lineBuf.trim()) parseJsonEvents(lineBuf + "\n", result, onUpdate, parseOpts);
@@ -1771,7 +1786,7 @@ export default function (pi: ExtensionAPI) {
 					description: "覆盖该 task 的模型。provider/id、短名，或外部 CLI 后端（cli:claude / cli:codex / cli:agy / cli:atomcode，均用 CLI 默认模型）",
 				})),
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
-				timeoutMs: Type.Optional(Type.Number()),
+				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行" })),
@@ -1782,7 +1797,7 @@ export default function (pi: ExtensionAPI) {
 				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode（使用 CLI 默认模型）",
 			})),
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
-			timeoutMs: Type.Optional(Type.Number()),
+			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
 		}),
 
 		// ── TUI 渲染 ──

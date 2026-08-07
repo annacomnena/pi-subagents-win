@@ -665,17 +665,25 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 		if (opts.signal?.aborted) kill();
 		else opts.signal?.addEventListener("abort", kill, { once: true });
 
-		const timer = opts.timeoutMs
-			? setTimeout(() => {
-					timedOut = true;
-					opts.onUpdate?.("⏱ timeout", `killing ${opts.backend}`);
-					kill();
-				}, opts.timeoutMs)
-			: null;
+		// 停顿检测（inactivity/stall timeout）：不是给整个任务限时——
+		// 只要 stdout/stderr 持续有输出（进程活着且有进展）就重置；
+		// 只有「卡住不动超过 timeoutMs」才判超时停止。
+		let stallTimer: ReturnType<typeof setTimeout> | null = null;
+		const resetStall = () => {
+			if (stallTimer) clearTimeout(stallTimer);
+			if (!opts.timeoutMs) { stallTimer = null; return; }
+			stallTimer = setTimeout(() => {
+				timedOut = true;
+				opts.onUpdate?.("⏱ stalled", `killing ${opts.backend} (no output for ${Math.round((opts.timeoutMs ?? 0) / 1000)}s)`);
+				kill();
+			}, opts.timeoutMs);
+		};
+		resetStall();
 
 		if (child.stdout) {
 			child.stdout.setEncoding("utf8");
 			child.stdout.on("data", (chunk: string) => {
+				resetStall(); // 有输出 = 进程活着且可能在做事，重置停顿计时
 				if (opts.captureStdout) {
 					if (stdout.length < MAX_BUF) stdout += chunk;
 					const first = stdout.split("\n").find((l) => l.trim());
@@ -707,6 +715,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 			child.stderr.setEncoding("utf8");
 			let stderrLineBuf = "";
 			child.stderr.on("data", (chunk: string) => {
+				resetStall(); // 错误输出也算进程存活信号
 				stderrBuffer.append(String(chunk));
 				if (opts.captureStdout) {
 					// For capture-stdout backends, relay stderr activity as
@@ -762,7 +771,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 		}
 
 		child.on("error", (err) => {
-			if (timer) clearTimeout(timer);
+			if (stallTimer) clearTimeout(stallTimer);
 			if (forceKill) clearTimeout(forceKill);
 			if (heartbeat) clearInterval(heartbeat);
 			resolve({
@@ -777,7 +786,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 		});
 
 		child.on("close", (code, signal) => {
-			if (timer) clearTimeout(timer);
+			if (stallTimer) clearTimeout(stallTimer);
 			if (forceKill) clearTimeout(forceKill);
 			if (heartbeat) clearInterval(heartbeat);
 			if (!opts.captureStdout && lineBuf.trim()) {
