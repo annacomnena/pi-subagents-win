@@ -31,6 +31,7 @@ import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus } from "./event-bus.ts";
+import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import {
 	defaultTabRunsDir,
@@ -1469,6 +1470,9 @@ export default function (pi: ExtensionAPI) {
 
 	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）
 	registerEventBus(pi);
+
+	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
+	registerReportListener(pi);
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);

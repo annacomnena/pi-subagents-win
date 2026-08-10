@@ -59,6 +59,7 @@ writeTabDispatch(runsDir, dispatch);
 	const pi2 = makeFakePi();
 	registerTabTelemetry(pi2, { runsDir });
 	assert.equal(pi2.findTool("tab-finish"), undefined, "无 PI_TAB_RUN_ID 时不注册 tab-finish");
+	assert.equal(pi2.findTool("tab-report"), undefined, "无 PI_TAB_RUN_ID 时不注册 tab-report");
 
 	// session_start → attached
 	await pi.emit("session_start", { reason: "startup" }, { sessionManager: { getSessionFile: () => "C:/pi/sess/x.jsonl" } });
@@ -93,6 +94,7 @@ writeTabDispatch(runsDir, dispatch);
 	// tab-finish：写入 result + 终态
 	const finishTool = pi.findTool("tab-finish");
 	assert.ok(finishTool, "应注册 tab-finish");
+	assert.ok(pi.findTool("tab-report"), "应注册 tab-report（tab → 主会话回报通道）");
 	const res = await finishTool.execute("", { status: "completed", summary: "全部完成", artifacts: ["plans/20260806.md"] });
 	assert.ok(!(res as { isError?: boolean }).isError, JSON.stringify(res));
 

@@ -16,6 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { sendWindowsToast } from "./notify-windows.ts";
+import { sendReportToMain } from "./report.ts";
 import {
 	buildTabStatusView,
 	defaultTabRunsDir,
@@ -218,6 +219,47 @@ export function registerTabTelemetry(
 				usage: check.value.usage ? { ...check.value.usage } : undefined,
 			});
 			return { content: [{ type: "text", text: `✓ tab-finish ${status}: result written for ${tabRunId}` }] };
+		},
+	});
+
+	// ── tab-report：tab 主动向主会话回报消息（反向注入通道）──
+	pi.registerTool({
+		name: "tab-report",
+		label: "Tab Report",
+		description: [
+			"（标签页内部工具）主动向主会话回报消息：写入 ~/.pi/agent/reports/，主会话感知后注入用户消息被模型处理。",
+			"用于工作完成、需要主会话决策/关注、或重要进展时主动联系主会话（不必等主会话轮询）。",
+			"参数：message（回报内容）、可选 taskId / summary。from 取自本标签页 runId。",
+		].join(" "),
+		parameters: Type.Object({
+			message: Type.String({ description: "回报消息（注入主会话的内容，≤1000 字符）" }),
+			taskId: Type.Optional(Type.String({ description: "关联任务号" })),
+			summary: Type.Optional(Type.String({ description: "简短摘要（≤200 字符）" })),
+		}),
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("tab-report"))} ${theme.fg("accent", `→main`)} ${theme.fg("dim", String(args.message ?? "").slice(0, 40))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			return new Text(result.isError ? theme.fg("error", text) : theme.fg("success", text), 0, 0);
+		},
+		async execute(_toolCallId, rawParams) {
+			const p = rawParams as { message?: string; taskId?: string; summary?: string };
+			const message = (p.message ?? "").trim();
+			if (!message) {
+				return { content: [{ type: "text", text: "message 必填" }], isError: true };
+			}
+			try {
+				sendReportToMain({
+					from: tabRunId,
+					message: message.slice(0, 1000),
+					taskId: p.taskId,
+					summary: p.summary?.slice(0, 200),
+				});
+				return { content: [{ type: "text", text: `✓ 已向主会话回报（runId=${tabRunId}）` }] };
+			} catch (err) {
+				return { content: [{ type: "text", text: `回报失败: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+			}
 		},
 	});
 }
