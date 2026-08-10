@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getTabRunId } from "./identity.ts";
 
 export type LinkKind = "tab" | "async" | "timer" | "subagent";
 
@@ -39,7 +40,8 @@ export function defaultLinksPath(agentDir: string = join(homedir(), ".pi", "agen
  * 都没有 → "unknown"。
  */
 export function sessionIdentity(ctx?: { sessionManager?: { sessionId?: string } } | null): string {
-	if (process.env.PI_TAB_RUN_ID) return process.env.PI_TAB_RUN_ID;
+	const tab = getTabRunId();
+	if (tab) return tab;
 	const sid = ctx?.sessionManager?.sessionId;
 	return sid && sid.length > 0 ? sid : "unknown";
 }

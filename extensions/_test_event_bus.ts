@@ -84,14 +84,26 @@ function writeResult(runId: string, status = "completed") {
 	assert.equal(result?.status, "completed");
 }
 
-// ── registerEventBus：仅主会话注册 ───────────────────────────────
+// ── registerEventBus：主会话才启动监听（惰性：session_start 时判定）──
 {
 	_resetEventBus();
+	const makePi = () => ({
+		on: (_evt: string, _h: unknown) => {},
+		sendUserMessage: (_c: string, _o?: unknown) => {},
+	});
+
+	// 子 agent → cleanup 存在，session_start 处理器不启动 watcher（不报错即可）
 	process.env.PI_SUBAGENT = "1";
-	const cleanup = registerEventBus({} as never, { runsDir: dir });
-	assert.ok(typeof cleanup === "function");
-	_resetEventBus();
+	const cleanup1 = registerEventBus(makePi() as never, { runsDir: dir });
+	assert.ok(typeof cleanup1 === "function");
+	cleanup1();
 	delete process.env.PI_SUBAGENT;
+
+	// 主会话 → 注册成功且返回 cleanup
+	const cleanup2 = registerEventBus(makePi() as never, { runsDir: dir });
+	assert.ok(typeof cleanup2 === "function");
+	cleanup2();
+	_resetEventBus();
 }
 
 rmSync(dir, { recursive: true, force: true });

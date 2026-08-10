@@ -46,7 +46,8 @@
     "test:async-panel": "node --experimental-strip-types ./extensions/_test_async_panel.ts",
     "test:links": "node --experimental-strip-types ./extensions/_test_links.ts",
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
-    "test:report": "node --experimental-strip-types ./extensions/_test_report.ts"
+    "test:report": "node --experimental-strip-types ./extensions/_test_report.ts",
+    "test:identity": "node --experimental-strip-types ./extensions/_test_identity.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { recordLink, sessionIdentity } from "./links.ts";
+import { getTabRunId, isSubagent } from "./identity.ts";
 import {
 	MAX_PENDING_TIMERS,
 	cancelTimerFile,
@@ -99,16 +100,16 @@ function fireOneTimer(
 export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	const timersDir = defaultTimersDir();
 
-	// 本进程身份
-	const isSubagent = process.env.PI_SUBAGENT === "1";
-	const ownTabRunId = process.env.PI_TAB_RUN_ID; // 阶段 2 前通常 undefined
+	// 本进程身份（惰性：CLI flag 在扩展加载后才就绪，不能在工厂缓存）
+	const isSubagentProcess = isSubagent();
 
 	// ── 进程内调度器（子 agent 不调度）──
 	let schedulerCleanup: (() => void) | undefined;
-	if (!isSubagent) {
+	if (!isSubagentProcess) {
 		const tick = (): void => {
 			try {
-				pumpDueTimers(pi, timersDir, ownTabRunId);
+				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
+				pumpDueTimers(pi, timersDir, getTabRunId());
 			} catch (err) {
 				console.error("[timers] tick failed:", err);
 			}
@@ -129,11 +130,12 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	const resolveWriteScope = (
 		target: string | { tabRunId?: string; taskId?: string } | undefined,
 	): { tabRunId?: string } | { error: string } => {
-		if (ownTabRunId) {
+		const myRunId = getTabRunId(); // 惰性：工具执行时 flag 已就绪
+		if (myRunId) {
 			// 标签页：只允许 self 或自己
 			if (target === undefined || target === "self") return {};
 			const t = target as { tabRunId?: string };
-			if (t.tabRunId === ownTabRunId) return { tabRunId: ownTabRunId };
+			if (t.tabRunId === myRunId) return { tabRunId: myRunId };
 			return { error: "标签页只能给自己设 timer；给其他 tab 设 timer 请用主会话" };
 		}
 		if (typeof target === "object" && target && (target as { tabRunId?: string }).tabRunId) {
@@ -189,7 +191,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			const message = typeof p.message === "string" ? p.message.trim() : "";
 			const source = "set-timer";
 
-			if (isSubagent) {
+			if (isSubagentProcess) {
 				return { content: [{ type: "text", text: "子 agent 中不可设置计时器" }], isError: true };
 			}
 			if (!message) {
@@ -274,7 +276,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 		},
 		async execute(_toolCallId, rawParams) {
 			const p = rawParams as { timerId?: string; tabRunId?: string };
-			if (isSubagent) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
+			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
 			const timerId = (p.timerId ?? "").trim();
 			if (!timerId) return { content: [{ type: "text", text: "timerId 必填" }], isError: true };
 
@@ -322,7 +324,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			const p = rawParams as { status?: string; tabRunId?: string };
-			if (isSubagent) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
+			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
 			const filter = p.status as TimerRecord["status"] | undefined;
 			const scope = resolveWriteScope(p.tabRunId ? { tabRunId: p.tabRunId } : undefined);
 			if ("error" in scope) return { content: [{ type: "text", text: scope.error }], isError: true };
@@ -354,7 +356,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	pi.registerCommand("timers", {
 		description: "列出当前进程的计时器（人类视角）",
 		handler: async (args, ctx) => {
-			if (isSubagent) {
+			if (isSubagentProcess) {
 				ctx.ui.notify("子 agent 中不可操作计时器", "warning");
 				return;
 			}
@@ -366,7 +368,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 				return;
 			}
 			const filter = filterRaw as TimerRecord["status"] | "";
-			const all = readAllTimers(timersDir, ownTabRunId).filter((t) => !filter || t.status === filter);
+			const all = readAllTimers(timersDir, getTabRunId()).filter((t) => !filter || t.status === filter);
 			if (all.length === 0) {
 				ctx.ui.notify(`No timers${filter ? ` (${filter})` : ""}`, "info");
 				return;
@@ -385,7 +387,6 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 
 /** 供 /timers 或调试使用：当前进程拥有的 timer 目录。 */
 export function ownedTimersDir(): string {
-	return process.env.PI_TAB_RUN_ID
-		? mailboxDirForTab(defaultTimersDir(), process.env.PI_TAB_RUN_ID)
-		: defaultTimersDir();
+	const tab = getTabRunId();
+	return tab ? mailboxDirForTab(defaultTimersDir(), tab) : defaultTimersDir();
 }

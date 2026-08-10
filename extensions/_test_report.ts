@@ -59,14 +59,24 @@ const reportsDir = join(dir, "reports");
 	assert.equal(injected.length, 1);
 }
 
-// ── registerReportListener：仅主会话 ──────────────────────────────
+// ── registerReportListener：主会话才启动监听（惰性：session_start 时判定）──
 {
 	_resetReportListener();
+	const makePi = () => ({
+		on: (_evt: string, _h: unknown) => {},
+		sendUserMessage: (_c: string, _o?: unknown) => {},
+	});
+
 	process.env.PI_SUBAGENT = "1";
-	const cleanup = registerReportListener({} as never, { reportsDir });
-	assert.ok(typeof cleanup === "function");
-	_resetReportListener();
+	const cleanup1 = registerReportListener(makePi() as never, { reportsDir });
+	assert.ok(typeof cleanup1 === "function");
+	cleanup1();
 	delete process.env.PI_SUBAGENT;
+
+	const cleanup2 = registerReportListener(makePi() as never, { reportsDir });
+	assert.ok(typeof cleanup2 === "function");
+	cleanup2();
+	_resetReportListener();
 }
 
 rmSync(dir, { recursive: true, force: true });

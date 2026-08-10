@@ -279,6 +279,8 @@ export interface PiLaunchArgsOptions {
 	 * guarantee rather than a duplicate).
 	 */
 	skills?: string[];
+	/** 标签页回收身份（--tab-run-id <runId>，可靠传递，不依赖 env 继承）。 */
+	tabRunId?: string;
 }
 
 /** Build argv as an array so prompts are never split or reinterpreted by a shell. */
@@ -290,6 +292,7 @@ export function buildWindowsTerminalArgs(
 	const piArgs = [options.piCli];
 	if (options.model) piArgs.push("--model", options.model);
 	for (const skill of options.skills ?? []) piArgs.push("--skill", skill);
+	if (options.tabRunId) piArgs.push("--tab-run-id", options.tabRunId);
 	piArgs.push(prompt);
 	return [
 		"-w", "0",

@@ -33,6 +33,7 @@ import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyn
 import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
+import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
@@ -131,6 +132,7 @@ function dispatchPiTab(
 			execPath: process.execPath,
 			model,
 			skills,
+			tabRunId: runId, // 可靠传递标签页身份（--tab-run-id），不依赖 env 继承
 		}), {
 			shell: false,
 			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程
@@ -1454,10 +1456,13 @@ async function searchableSelect(
 export default function (pi: ExtensionAPI) {
 	const agents = discoverAgents();
 
+	// 标签页身份 flag（--tab-run-id <runId>）：launch-tabs 派发时注入，可靠传递
+	registerIdentityFlag(pi);
+
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
 	// 禁止注册 launch-tabs 工具与 /launch 命令，杜绝子 agent 开新标签页。
 	// （主会话不受影响；工具排除名单之外仍有兜底保护。）
-	const isSubagentProcess = process.env.PI_SUBAGENT === "1";
+	const isSubagentProcess = isSubagent();
 
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);

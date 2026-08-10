@@ -18,6 +18,7 @@ import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
+import { isMainSession } from "./identity.ts";
 
 export interface ReportRecord {
 	/** 回报方身份：tab_<runId> 或 sessionId。 */
@@ -81,6 +82,7 @@ export function listReportIds(reportsDir: string): string[] {
 
 let seenReports = new Set<string>();
 let watcher: FSWatcher | null = null;
+let selfDisabled = false; // 旧实例 stale 后停止注入
 
 /** 启动时快照：已有报告视为已处理（重启不重复注入）。 */
 function snapshotExisting(reportsDir: string): void {
@@ -100,6 +102,7 @@ export interface ReportListenerOptions {
 
 /** 处理一份新回报（幂等）。返回是否已注入。 */
 export function onNewReport(reportsDir: string, id: string, opts: ReportListenerOptions): boolean {
+	if (selfDisabled) return false; // 旧实例已失效
 	if (seenReports.has(id)) return false;
 	seenReports.add(id);
 	const record = readReportFile(reportsDir, id);
@@ -124,7 +127,7 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 			{ deliverAs: "followUp" },
 		);
 	} catch {
-		/* 注入失败不阻塞 */
+		selfDisabled = true; // 旧实例 stale → 停止注入
 	}
 	return true;
 }
@@ -142,47 +145,50 @@ export function pollNewReports(reportsDir: string, opts: ReportListenerOptions):
 export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOptions = {}): () => void {
 	const reportsDir = opts.reportsDir ?? defaultReportsDir();
 
-	// 只主会话监听：标签页/子 agent 不注册（它们只发送，不消费）
-	if (process.env.PI_TAB_RUN_ID || process.env.PI_SUBAGENT === "1") {
-		return () => {};
-	}
+	// 延迟到 session_start 再判定身份并启动监听：
+	// CLI flag 在扩展加载完成后才就绪；只主会话消费（标签页/子 agent 只发送）。
+	let interval: ReturnType<typeof setInterval> | null = null;
+	pi.on("session_start", () => {
+		if (!isMainSession()) return;
 
-	snapshotExisting(reportsDir);
-	const fullOpts: ReportListenerOptions = {
-		...opts,
-		reportsDir,
-		sendUserMessage: pi.sendUserMessage?.bind(pi),
-	};
+		snapshotExisting(reportsDir);
+		const fullOpts: ReportListenerOptions = {
+			...opts,
+			reportsDir,
+			sendUserMessage: pi.sendUserMessage?.bind(pi),
+		};
 
-	if (existsSync(reportsDir)) {
-		try {
-			watcher = watch(reportsDir, (_event, fileName) => {
-				if (typeof fileName === "string") {
-					const id = fileName.endsWith(".json") ? fileName.slice(0, -".json".length) : fileName;
-					onNewReport(reportsDir, id, fullOpts);
-				}
-			});
-		} catch {
-			watcher = null;
+		if (existsSync(reportsDir)) {
+			try {
+				watcher = watch(reportsDir, (_event, fileName) => {
+					if (typeof fileName === "string") {
+						const id = fileName.endsWith(".json") ? fileName.slice(0, -".json".length) : fileName;
+						onNewReport(reportsDir, id, fullOpts);
+					}
+				});
+			} catch {
+				watcher = null;
+			}
 		}
-	}
 
-	// tick 兜底（Windows fs.watch 偶发丢事件）
-	const interval = setInterval(() => pollNewReports(reportsDir, fullOpts), 5000);
-	interval.unref?.();
+		// tick 兜底（Windows fs.watch 偶发丢事件）
+		interval = setInterval(() => pollNewReports(reportsDir, fullOpts), 5000);
+		interval.unref?.();
+	});
 
 	return () => {
 		try {
 			watcher?.close();
 		} catch { /* ignore */ }
 		watcher = null;
-		clearInterval(interval);
+		if (interval) clearInterval(interval);
 	};
 }
 
 /** 供测试重置内部状态。 */
 export function _resetReportListener(): void {
 	seenReports = new Set<string>();
+	selfDisabled = false;
 	try {
 		watcher?.close();
 	} catch { /* ignore */ }

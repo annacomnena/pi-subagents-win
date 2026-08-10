@@ -195,4 +195,14 @@ const argvSkill = buildWindowsTerminalArgs("t", "p", {
 assert.ok(argvSkill.includes("--skill") && argvSkill.includes("C:/pi-packages/subagent-win/skills"));
 assert.ok(argvSkill.indexOf("--skill") > argvSkill.indexOf("C:/pi/dist/cli.js") && argvSkill.indexOf("--skill") < argvSkill.indexOf("p"));
 
+// --tab-run-id 可靠传递标签页回收身份（不依赖 env 继承）
+const argvTab = buildWindowsTerminalArgs("t", "p", {
+	cwd: ".",
+	piCli: "C:/pi/dist/cli.js",
+	execPath: "C:/node/node.exe",
+	tabRunId: "tab_abc_1",
+});
+assert.ok(argvTab.includes("--tab-run-id") && argvTab.includes("tab_abc_1"), "应传 --tab-run-id");
+assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 prompt 之前");
+
 console.log("launch tests passed");

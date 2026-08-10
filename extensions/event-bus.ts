@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
+import { isMainSession } from "./identity.ts";
 
 export const EVENT_BUS_WATCH_KEY = "subagent-event-bus";
 
@@ -41,6 +42,7 @@ export interface EventBusOptions {
 
 let watcher: FSWatcher | null = null;
 let seenResults = new Set<string>();
+let selfDisabled = false; // 旧实例 stale 后停止注入，避免反复报错
 
 /** 启动时快照：已存在的 result 视为已处理，避免重启后重复触发。 */
 function snapshotExisting(runsDir: string): void {
@@ -53,6 +55,7 @@ function snapshotExisting(runsDir: string): void {
 
 /** 检查并处理一个新完成的 runId（幂等）。 */
 export function onTabResultFile(runsDir: string, fileName: string, opts: EventBusOptions): boolean {
+	if (selfDisabled) return false; // 旧实例已失效，不再注入
 	if (!fileName.endsWith(".result.json")) return false;
 	if (seenResults.has(fileName)) return false;
 	seenResults.add(fileName);
@@ -94,7 +97,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 			].filter((l): l is string => Boolean(l)).join("\n");
 			opts.sendUserMessage?.(body, { deliverAs: "followUp" });
 		} catch {
-			/* 注入失败不阻塞 */
+			selfDisabled = true; // 旧实例 stale → 停止注入
 		}
 	}
 	return true;
@@ -106,31 +109,33 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): () => void {
 	const runsDir = opts.runsDir ?? DEFAULT_TAB_RUNS_DIR;
 
-	// 只主会话注册：标签页/子 agent 不 watch，避免重复唤醒
-	if (process.env.PI_TAB_RUN_ID || process.env.PI_SUBAGENT === "1") {
-		return () => {};
-	}
+	// 延迟到 session_start 再判定身份并启动 watcher：
+	// CLI flag（--tab-run-id）在扩展加载完成后才就绪，工厂里 isMainSession() 不可靠；
+	// 非主会话（标签页/子 agent）进程不 watch，避免重复唤醒。
+	pi.on("session_start", () => {
+		if (!isMainSession()) return;
 
-	snapshotExisting(runsDir);
+		snapshotExisting(runsDir);
 
-	// sendUserMessage 从 pi 注入（EventBusOptions 里没有，闭包拿 pi）
-	const fullOpts: EventBusOptions = {
-		...opts,
-		runsDir,
-		sendUserMessage: pi.sendUserMessage?.bind(pi),
-	};
+		// sendUserMessage 从 pi 注入（EventBusOptions 里没有，闭包拿 pi）
+		const fullOpts: EventBusOptions = {
+			...opts,
+			runsDir,
+			sendUserMessage: pi.sendUserMessage?.bind(pi),
+		};
 
-	if (existsSync(runsDir)) {
-		try {
-			watcher = watch(runsDir, (_event, fileName) => {
-				if (typeof fileName === "string") {
-					onTabResultFile(runsDir, fileName, fullOpts);
-				}
-			});
-		} catch {
-			watcher = null;
+		if (existsSync(runsDir)) {
+			try {
+				watcher = watch(runsDir, (_event, fileName) => {
+					if (typeof fileName === "string") {
+						onTabResultFile(runsDir, fileName, fullOpts);
+					}
+				});
+			} catch {
+				watcher = null;
+			}
 		}
-	}
+	});
 
 	const cleanup = () => {
 		try {
@@ -158,6 +163,7 @@ export function pollNewResults(runsDir: string, opts: EventBusOptions): string[]
 /** 供测试重置内部状态。 */
 export function _resetEventBus(): void {
 	seenResults = new Set<string>();
+	selfDisabled = false;
 	try {
 		watcher?.close();
 	} catch {

@@ -55,11 +55,15 @@ writeTabDispatch(runsDir, dispatch);
 	const pi = makeFakePi();
 	registerTabTelemetry(pi, { tabRunId: TAB, runsDir });
 
-	// 没有身份时不注册任何东西
+	// 没有身份时工具仍注册（惰性判身份），但 execute 应拒绝
 	const pi2 = makeFakePi();
 	registerTabTelemetry(pi2, { runsDir });
-	assert.equal(pi2.findTool("tab-finish"), undefined, "无 PI_TAB_RUN_ID 时不注册 tab-finish");
-	assert.equal(pi2.findTool("tab-report"), undefined, "无 PI_TAB_RUN_ID 时不注册 tab-report");
+	const finishNoId = pi2.findTool("tab-finish");
+	const reportNoId = pi2.findTool("tab-report");
+	assert.ok(finishNoId, "tab-finish 总是注册（执行时惰性判身份）");
+	assert.ok(reportNoId, "tab-report 总是注册（执行时惰性判身份）");
+	const noIdRes = await finishNoId.execute("", { status: "completed", summary: "x" });
+	assert.ok((noIdRes as { isError?: boolean }).isError, "无 tab 身份时 tab-finish 必须拒绝");
 
 	// session_start → attached
 	await pi.emit("session_start", { reason: "startup" }, { sessionManager: { getSessionFile: () => "C:/pi/sess/x.jsonl" } });

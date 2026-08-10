@@ -1,8 +1,8 @@
 /**
- * real-tab-smoke.mjs — 真实进程验证：PI_TAB_RUN_ID 传递 → state 落盘 → tab-finish → result 落盘
+ * real-tab-smoke.mjs — 真实进程验证：--tab-run-id flag 传递 → state 落盘 → tab-finish → result 落盘
  *
  * spawn 一个真实 pi json 模式进程（非子 agent：不设 PI_SUBAGENT），
- * 注入 PI_TAB_RUN_ID / PI_TAB_RUNS_DIR，验证：
+ * 注入 --tab-run-id（launch-tabs 的可靠身份传递路径，不依赖 wt.exe env 继承）+ PI_TAB_RUNS_DIR，验证：
  *   1. session_start 遥测写入 <runId>.state.json（attached）
  *   2. agent 调用 tab-finish → <runId>.result.json（completed）
  *
@@ -43,11 +43,11 @@ async function main() {
 		"然后只回复一行：REAL_TAB_FINISHED。不要做其他事情。",
 	].join("");
 
-	const child = spawn(process.execPath, [PI_CLI, "--mode", "json", "--print", "--no-session", prompt], {
+	const child = spawn(process.execPath, [PI_CLI, "--mode", "json", "--print", "--no-session", "--tab-run-id", RUN_ID, prompt], {
 		env: {
 			...process.env,
-			PI_TAB_RUN_ID: RUN_ID,
 			PI_TAB_RUNS_DIR: runsDir,
+			// 不设 PI_TAB_RUN_ID —— 验证 flag 路径（launch-tabs 真实传递方式）
 		},
 		shell: false,
 		stdio: ["ignore", "pipe", "pipe"],
@@ -107,7 +107,7 @@ async function main() {
 	}
 
 	rmSync(runsDir, { recursive: true, force: true });
-	console.log("REAL-TAB SMOKE PASS ✅（真实 pi 进程：PI_TAB_RUN_ID 传递 + state 落盘 + tab-finish result 落盘）");
+	console.log("REAL-TAB SMOKE PASS ✅（真实 pi 进程：--tab-run-id flag 传递 + state 落盘 + tab-finish result 落盘）");
 }
 
 main().catch((e) => {

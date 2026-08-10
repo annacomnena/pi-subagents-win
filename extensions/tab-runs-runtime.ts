@@ -17,6 +17,7 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { sendReportToMain } from "./report.ts";
+import { getTabRunId, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import {
 	buildTabStatusView,
 	defaultTabRunsDir,
@@ -48,10 +49,16 @@ export function registerTabTelemetry(
 	pi: ExtensionAPI,
 	opts?: { tabRunId?: string; runsDir?: string },
 ): void {
-	const tabRunId = opts?.tabRunId ?? process.env.PI_TAB_RUN_ID;
-	if (!tabRunId) return;
-	if (process.env.PI_SUBAGENT === "1") return; // 子 agent 不拥有 tab 身份
+	// 不在此同步早退：CLI flag（--tab-run-id）在扩展加载完成后才就绪，
+	// 工厂里 getTabRunId() 可能返回 undefined。改为事件回调/工具执行时惰性解析。
+	// 非标签页进程里回调会因 resolveRunId() 返回 undefined 而直接跳过。
 	const runsDir = opts?.runsDir ?? process.env.PI_TAB_RUNS_DIR ?? defaultTabRunsDir();
+	const resolveRunId = (): string | undefined => {
+		if (opts?.tabRunId) return opts.tabRunId;
+		const id = getTabRunId();
+		if (id && !isSubagent()) return id; // 子 agent 不拥有 tab 身份
+		return undefined;
+	};
 
 	let finished = false; // tab-finish 已给出显式终态
 	let lastAssistantText = "";
@@ -61,8 +68,10 @@ export function registerTabTelemetry(
 
 	const writeState = (phase: TabState["phase"], turn: TabState["turn"], extra: Partial<TabState> = {}): void => {
 		if (finished) return; // 已终态不再覆盖
-		writeTabState(runsDir, tabRunId, {
-			id: tabRunId,
+		const runId = resolveRunId();
+		if (!runId) return; // 非标签页进程：身份未就绪/无身份，跳过
+		writeTabState(runsDir, runId, {
+			id: runId,
 			phase,
 			turn,
 			terminal: false,
@@ -122,9 +131,11 @@ export function registerTabTelemetry(
 	});
 
 	pi.on("session_shutdown", () => {
+		const runId = resolveRunId();
+		if (!runId) return;
 		if (!finished) {
-			writeTabState(runsDir, tabRunId, {
-				id: tabRunId,
+			writeTabState(runsDir, runId, {
+				id: runId,
 				phase: "orphaned",
 				turn: "unknown",
 				terminal: false,
@@ -172,6 +183,10 @@ export function registerTabTelemetry(
 			if (finished) {
 				return { content: [{ type: "text", text: "tab-finish 已调用过，结果只写一次" }], isError: true };
 			}
+			const runId = resolveRunId();
+			if (!runId) {
+				return { content: [{ type: "text", text: "当前进程不是标签页（无 tab-run-id）" }], isError: true };
+			}
 			const p = rawParams as Record<string, unknown>;
 			const status = String(p.status ?? "");
 			const summary = typeof p.summary === "string" ? p.summary.trim() : "";
@@ -181,9 +196,9 @@ export function registerTabTelemetry(
 			if (!summary) {
 				return { content: [{ type: "text", text: "summary 必填" }], isError: true };
 			}
-			const dispatch = readTabDispatch(runsDir, tabRunId);
+			const dispatch = readTabDispatch(runsDir, runId);
 			const raw: Record<string, unknown> = {
-				id: tabRunId,
+				id: runId,
 				taskId: dispatch?.taskId ?? "",
 				status,
 				finishedAt: new Date().toISOString(),
@@ -198,19 +213,19 @@ export function registerTabTelemetry(
 			if (!check.ok || !check.value) {
 				return { content: [{ type: "text", text: `结果校验失败: ${check.errors.join("; ")}` }], isError: true };
 			}
-			writeJsonAtomic(tabResultPath(runsDir, tabRunId), check.value);
+			writeJsonAtomic(tabResultPath(runsDir, runId), check.value);
 			finished = true;
 			// tab 侧也回报：本窗口用户可见（主会话侧由 event-bus 的 fs.watch 感知后再回报）
 			try {
 				sendWindowsToast({
-					title: `${status === "completed" ? "✅" : "❌"} tab ${tabRunId} ${status}`,
+					title: `${status === "completed" ? "✅" : "❌"} tab ${runId} ${status}`,
 					body: `${check.value.summary.slice(0, 100)}${check.value.artifacts?.length ? ` (${check.value.artifacts.length} artifacts)` : ""}`,
 					duration: "long",
 				});
 			} catch { /* toast 失败不阻塞 */ }
 			// 同步写终态 state（result 优先，state 仅作冗余）
-			writeTabState(runsDir, tabRunId, {
-				id: tabRunId,
+			writeTabState(runsDir, runId, {
+				id: runId,
 				phase: status === "completed" ? "completed" : status === "failed" ? "failed" : "cancelled",
 				turn: "idle",
 				terminal: true,
@@ -218,7 +233,7 @@ export function registerTabTelemetry(
 				lastAssistantText: check.value.finalText ?? check.value.summary,
 				usage: check.value.usage ? { ...check.value.usage } : undefined,
 			});
-			return { content: [{ type: "text", text: `✓ tab-finish ${status}: result written for ${tabRunId}` }] };
+			return { content: [{ type: "text", text: `✓ tab-finish ${status}: result written for ${runId}` }] };
 		},
 	});
 
@@ -244,6 +259,10 @@ export function registerTabTelemetry(
 			return new Text(result.isError ? theme.fg("error", text) : theme.fg("success", text), 0, 0);
 		},
 		async execute(_toolCallId, rawParams) {
+			const runId = resolveRunId();
+			if (!runId) {
+				return { content: [{ type: "text", text: "当前进程不是标签页（无 tab-run-id）" }], isError: true };
+			}
 			const p = rawParams as { message?: string; taskId?: string; summary?: string };
 			const message = (p.message ?? "").trim();
 			if (!message) {
@@ -251,12 +270,12 @@ export function registerTabTelemetry(
 			}
 			try {
 				sendReportToMain({
-					from: tabRunId,
+					from: runId,
 					message: message.slice(0, 1000),
 					taskId: p.taskId,
 					summary: p.summary?.slice(0, 200),
 				});
-				return { content: [{ type: "text", text: `✓ 已向主会话回报（runId=${tabRunId}）` }] };
+				return { content: [{ type: "text", text: `✓ 已向主会话回报（runId=${runId}）` }] };
 			} catch (err) {
 				return { content: [{ type: "text", text: `回报失败: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
 			}
@@ -326,8 +345,8 @@ export function registerTabStatusTools(
 ): void {
 	const runsDir = opts?.runsDir ?? defaultTabRunsDir();
 	const sessionsRoot = opts?.sessionsRoot ?? defaultSessionsRoot();
-	const isSubagent = process.env.PI_SUBAGENT === "1";
-	const ownTabRunId = process.env.PI_TAB_RUN_ID;
+	const isSubagentProcess = isSubagent();
+	const ownTabRunId = getTabRunId();
 
 	const scopedRunIds = (): string[] => {
 		if (ownTabRunId) return [ownTabRunId];
@@ -375,7 +394,7 @@ export function registerTabStatusTools(
 			return c;
 		},
 		async execute(_toolCallId, rawParams) {
-			if (isSubagent) return { content: [{ type: "text", text: "子 agent 中不可查询标签页回收" }], isError: true };
+			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可查询标签页回收" }], isError: true };
 			const p = rawParams as { runId?: string; taskId?: string; includeText?: boolean };
 			let ids = scopedRunIds();
 			if (p.runId) ids = ids.filter((id) => id === p.runId);
@@ -438,7 +457,7 @@ export function registerTabStatusTools(
 			return c;
 		},
 		async execute(_toolCallId, rawParams) {
-			if (isSubagent) return { content: [{ type: "text", text: "子 agent 中不可回收标签页" }], isError: true };
+			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可回收标签页" }], isError: true };
 			const p = rawParams as { runIds?: string[]; wait?: boolean; timeoutMs?: number; intervalMs?: number; includeText?: boolean };
 			const runIds = (p.runIds ?? []).filter((id) => typeof id === "string" && id);
 			if (runIds.length === 0) return { content: [{ type: "text", text: "runIds 必填" }], isError: true };
@@ -498,7 +517,7 @@ export function registerTabStatusTools(
 	pi.registerCommand("tabs", {
 		description: "列出标签页回收状态（人类视角）",
 		handler: async (_args, ctx) => {
-			if (isSubagent) {
+			if (isSubagentProcess) {
 				ctx.ui.notify("子 agent 中不可查看标签页", "warning");
 				return;
 			}
