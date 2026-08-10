@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	onNewReport,
+	listReportIds,
 	pollNewReports,
 	readReportFile,
 	registerReportListener,
@@ -77,6 +79,34 @@ const reportsDir = join(dir, "reports");
 	assert.ok(typeof cleanup2 === "function");
 	cleanup2();
 	_resetReportListener();
+}
+
+// ── 跨实例幂等：.notified 文件去重（根治双 watcher 双注入）───────
+{
+	_resetReportListener();
+	const sent: string[] = [];
+	const reportsDir3 = join(dir, "reports3");
+	const opts = {
+		reportsDir: reportsDir3,
+		toast: false,
+		sendUserMessage: (content: string, _o?: unknown) => { sent.push(content); },
+	};
+
+	sendReportToMain({ from: "tab_9", message: "完成 X", taskId: "9", summary: "s" }, reportsDir3);
+	const ids = listReportIds(reportsDir3);
+	assert.equal(ids.length, 1);
+	const id = ids[0];
+
+	const first = onNewReport(reportsDir3, id, opts);
+	assert.equal(first, true, "首实例应 claim 并注入");
+	assert.equal(sent.length, 1);
+	assert.equal(existsSync(join(reportsDir3, `${id}.notified`)), true, "应创建 .notified 标记");
+
+	// 第二实例（seenReports 已重置）：.notified 存在 → 跳过
+	_resetReportListener();
+	const second = onNewReport(reportsDir3, id, opts);
+	assert.equal(second, false, "第二实例看到 .notified 应跳过");
+	assert.equal(sent.length, 1, "不得重复注入");
 }
 
 rmSync(dir, { recursive: true, force: true });

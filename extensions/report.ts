@@ -13,7 +13,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, renameSync, watch, writeFileSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -100,7 +100,18 @@ export interface ReportListenerOptions {
 	toast?: boolean;
 }
 
-/** 处理一份新回报（幂等）。返回是否已注入。 */
+/** 原子领取「已消费」标记（跨进程/跨实例幂等，根治双 watcher 双注入）。 */
+export function claimReportNotified(reportsDir: string, id: string): boolean {
+	try {
+		const fd = openSync(join(reportsDir, `${id}.notified`), "wx");
+		try { closeSync(fd); } catch { /* ignore */ }
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** 处理一份新回报（幂等 + 跨实例去重）。返回是否已注入。 */
 export function onNewReport(reportsDir: string, id: string, opts: ReportListenerOptions): boolean {
 	if (selfDisabled) return false; // 旧实例已失效
 	if (seenReports.has(id)) return false;
@@ -111,6 +122,11 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	if (opts.onReport) {
 		opts.onReport(record, id);
 		return true;
+	}
+
+	// 跨实例幂等：原子领取消费权（双 watcher/双实例只有第一个注入）
+	if (!claimReportNotified(reportsDir, id)) {
+		return false; // 已被其他实例消费 → 静默跳过
 	}
 
 	if (opts.toast !== false) {

@@ -16,7 +16,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { watch, type FSWatcher } from "node:fs";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, openSync, closeSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
@@ -53,7 +53,24 @@ function snapshotExisting(runsDir: string): void {
 	}
 }
 
-/** 检查并处理一个新完成的 runId（幂等）。 */
+/**
+ * 原子领取「已通知」标记：跨进程/跨实例幂等——无论多少个 watcher/实例
+ * （reload 后旧 watcher 未 close 导致的双 watcher），第一个 open('wx') 成功者
+ * 获得注入权，其余看到标记直接跳过。根治「双 Follow-up 注入」。
+ */
+export function claimNotified(runsDir: string, runId: string): boolean {
+	try {
+		const fd = openSync(join(runsDir, `${runId}.notified`), "wx");
+		// 原子创建成功 → 本实例获得注入权
+		try { closeSync(fd); } catch { /* ignore */ }
+		return true;
+	} catch {
+		// EEXIST（已被别的实例通知过）或其他错误 → 放弃
+		return false;
+	}
+}
+
+/** 检查并处理一个新完成的 runId（幂等 + 跨实例去重）。 */
 export function onTabResultFile(runsDir: string, fileName: string, opts: EventBusOptions): boolean {
 	if (selfDisabled) return false; // 旧实例已失效，不再注入
 	if (!fileName.endsWith(".result.json")) return false;
@@ -64,6 +81,11 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (opts.onTabFinished) {
 		opts.onTabFinished(runId);
 		return true;
+	}
+
+	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
+	if (!claimNotified(runsDir, runId)) {
+		return false; // 已被其他实例通知过 → 静默跳过，不注入
 	}
 
 	const result = readTabResultFile(runsDir, runId);

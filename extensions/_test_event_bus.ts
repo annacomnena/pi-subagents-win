@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { onTabResultFile, pollNewResults, _resetEventBus, registerEventBus } from "./event-bus.ts";
@@ -104,6 +104,30 @@ function writeResult(runId: string, status = "completed") {
 	assert.ok(typeof cleanup2 === "function");
 	cleanup2();
 	_resetEventBus();
+}
+
+// ── 跨实例幂等：.notified 文件去重（根治双 watcher 双注入）───────
+{
+	_resetEventBus();
+	const sent: string[] = [];
+	const opts = {
+		runsDir: dir,
+		toast: false,
+		sendUserMessage: (content: string, _o?: unknown) => { sent.push(content); },
+	};
+
+	// 第一个实例：claim 成功 → 注入
+	writeFileSync(join(dir, "tab_dedup.result.json"), JSON.stringify({ id: "tab_dedup", taskId: "1", status: "completed", finishedAt: new Date().toISOString(), summary: "s" }), "utf8");
+	const first = onTabResultFile(dir, "tab_dedup.result.json", opts);
+	assert.equal(first, true, "首实例应 claim 并注入");
+	assert.equal(sent.length, 1);
+	assert.equal(existsSync(join(dir, "tab_dedup.notified")), true, "应创建 .notified 标记");
+
+	// 第二个实例（模拟 reload 后新 watcher，seenResults 已重置）：.notified 存在 → 跳过不注入
+	_resetEventBus();
+	const second = onTabResultFile(dir, "tab_dedup.result.json", opts);
+	assert.equal(second, false, "第二实例看到 .notified 应跳过");
+	assert.equal(sent.length, 1, "不得重复注入");
 }
 
 rmSync(dir, { recursive: true, force: true });
