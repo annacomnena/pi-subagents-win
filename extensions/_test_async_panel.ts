@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { refreshAsyncPanel, bindAsyncPanelUi, notifyAsyncCompletion, type AsyncPanelRecord } from "./async-panel.ts";
+import { refreshAsyncPanel, bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, type AsyncPanelRecord } from "./async-panel.ts";
 
 // P0-1 同款：隔离进程环境（本模块不读 PI_*，但保持测试可移植）
 delete process.env.PI_SUBAGENT;
@@ -80,6 +80,16 @@ const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json
 {
 	notifyAsyncCompletion({ id: "run_c", agent: "searcher", task: "x", status: "completed", startedAt: new Date().toISOString() });
 	notifyAsyncCompletion({ id: "run_d", agent: "implementer", task: "y", status: "failed", result: { error: "boom" }, startedAt: new Date().toISOString() });
+}
+
+// ── clearAsyncPanelUi：丢弃缓存 UI 引用（reload 后旧 ctx stale）─────
+{
+	const ui = makeFakeUi();
+	bindAsyncPanelUi(ui);
+	clearAsyncPanelUi();
+	// 清空后刷新静默（无 UI 引用），不抛错
+	refreshAsyncPanel();
+	assert.equal(typeof clearAsyncPanelUi, "function");
 }
 
 rmSync(dir, { recursive: true, force: true });

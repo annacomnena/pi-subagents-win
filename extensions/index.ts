@@ -29,7 +29,7 @@ import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
+import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
@@ -1462,17 +1462,33 @@ export default function (pi: ExtensionAPI) {
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);
 
+	// 收集后台资源（interval/watcher）的清理函数：
+	// reload/会话切换时 pi 会先发 session_shutdown，必须在此时清理，
+	// 否则旧实例的后台定时器/监听器仍持有 stale 的 pi 引用并继续触发 sendUserMessage，
+	// 导致新 turn 在旧扩展 ctx 上执行 → "This extension ctx is stale" 错误。
+	const cleanups: Array<() => void> = [];
+	const collect = (fn: (() => void) | undefined): void => { if (fn) cleanups.push(fn); };
+
 	// 计时器：到期自动向目标会话发送用户消息推进工作（超长程任务基础设施）
-	registerTimers(pi);
+	collect(registerTimers(pi));
 
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
-	registerAsyncPanel(pi);
+	collect(registerAsyncPanel(pi));
 
 	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）
-	registerEventBus(pi);
+	collect(registerEventBus(pi));
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
-	registerReportListener(pi);
+	collect(registerReportListener(pi));
+
+	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
+	pi.on("session_shutdown", () => {
+		for (const cleanup of cleanups) {
+			try { cleanup(); } catch { /* ignore */ }
+		}
+		cleanups.length = 0;
+		clearAsyncPanelUi(); // 丢弃缓存的 UI 引用（旧 ctx 已 stale）
+	});
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);

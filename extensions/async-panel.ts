@@ -44,6 +44,11 @@ export function bindAsyncPanelUi(ui: ExtensionUIContext | undefined | null): voi
 	if (ui) lastUi = ui;
 }
 
+/** reload/会话切换时清空缓存的 UI 引用（旧 ctx 已 stale，必须丢弃）。 */
+export function clearAsyncPanelUi(): void {
+	lastUi = null;
+}
+
 function readAsyncRecords(runsDir: string): AsyncPanelRecord[] {
 	if (!existsSync(runsDir)) return [];
 	return readdirSync(runsDir)
@@ -127,9 +132,12 @@ function formatAge(startedAt: string): string {
  * 注册 async 面板：10s 兜底定时器（会话空闲时面板也自愈刷新）。
  * 注意：只刷新 UI，不向 LLM 注入任何内容。
  */
-export function registerAsyncPanel(pi: ExtensionAPI): void {
+export function registerAsyncPanel(pi: ExtensionAPI): () => void {
 	const interval = setInterval(() => {
 		refreshAsyncPanel();
 	}, 10_000);
 	interval.unref?.();
+	return () => {
+		clearInterval(interval);
+	};
 }

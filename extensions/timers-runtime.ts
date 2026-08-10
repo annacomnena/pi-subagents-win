@@ -96,7 +96,7 @@ function fireOneTimer(
  * 注册计时器调度器与工具。
  * 调用点：主扩展入口（index.ts default 内）。
  */
-export function registerTimers(pi: ExtensionAPI): void {
+export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	const timersDir = defaultTimersDir();
 
 	// 本进程身份
@@ -104,6 +104,7 @@ export function registerTimers(pi: ExtensionAPI): void {
 	const ownTabRunId = process.env.PI_TAB_RUN_ID; // 阶段 2 前通常 undefined
 
 	// ── 进程内调度器（子 agent 不调度）──
+	let schedulerCleanup: (() => void) | undefined;
 	if (!isSubagent) {
 		const tick = (): void => {
 			try {
@@ -118,6 +119,10 @@ export function registerTimers(pi: ExtensionAPI): void {
 		bootTimer.unref?.();
 		const interval = setInterval(tick, TICK_MS);
 		interval.unref?.();
+		schedulerCleanup = () => {
+			clearTimeout(bootTimer);
+			clearInterval(interval);
+		};
 	}
 
 	// ── 写目标解析：主会话 → 根目录（self）或邮箱（tab）；标签页 → 仅自己邮箱 ──
@@ -374,6 +379,8 @@ export function registerTimers(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Timers (${all.length}):\n${lines.join("\n")}`, "info");
 		},
 	});
+
+	return schedulerCleanup;
 }
 
 /** 供 /timers 或调试使用：当前进程拥有的 timer 目录。 */
