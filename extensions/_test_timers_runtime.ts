@@ -135,6 +135,32 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.equal(readTimerFile(dir, "t_mail1", TAB)?.status, "fired");
 }
 
+// ── registerTimers：调度器推迟到 session_start（工厂零后台资源）──────
+{
+	const { registerTimers } = await import("./timers-runtime.ts");
+	const handlers: Record<string, Array<() => void>> = {};
+	const makePi = () => ({
+		on: (evt: string, h: () => void) => { (handlers[evt] ??= []).push(h); },
+		registerTool: () => {},
+		registerCommand: () => {},
+		sendUserMessage: (_c: string, _o?: unknown) => {},
+	});
+
+	// 非子 agent：注册 session_start handler，返回 cleanup
+	delete process.env.PI_SUBAGENT;
+	const cleanup = registerTimers(makePi() as never);
+	assert.ok(typeof cleanup === "function", "registerTimers 应返回 cleanup");
+	assert.ok((handlers["session_start"] ?? []).length >= 1, "应在 session_start 注册调度器");
+	cleanup?.();
+
+	// 子 agent：handler 仍注册但内部 isSubagent 检查跳过调度（工厂不返回调度器启动）
+	process.env.PI_SUBAGENT = "1";
+	const cleanupSub = registerTimers(makePi() as never);
+	assert.ok(typeof cleanupSub === "function", "子 agent 也返回 cleanup（幂等安全）");
+	cleanupSub?.();
+	delete process.env.PI_SUBAGENT;
+}
+
 // ── 清理 ──────────────────────────────────────────────────────────
 rmSync(dir, { recursive: true, force: true });
 

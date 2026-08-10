@@ -143,13 +143,20 @@ export function pollNewReports(reportsDir: string, opts: ReportListenerOptions):
 
 /** 注册主会话监听：fs.watch + tick 兜底。返回清理函数。 */
 export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOptions = {}): () => void {
+	// 工厂入口重置模块状态（P1：reload 重跑工厂时不继承旧实例的 selfDisabled/seen*）
+	_resetReportListener();
 	const reportsDir = opts.reportsDir ?? defaultReportsDir();
 
 	// 延迟到 session_start 再判定身份并启动监听：
 	// CLI flag 在扩展加载完成后才就绪；只主会话消费（标签页/子 agent 只发送）。
 	let interval: ReturnType<typeof setInterval> | null = null;
+	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
 	pi.on("session_start", () => {
 		if (!isMainSession()) return;
+
+		const myGen = ++sessionGen;
+		const closed = (): boolean => myGen !== sessionGen;
+		if (interval) clearInterval(interval); // 上次周期的 interval 引用不可再依赖
 
 		snapshotExisting(reportsDir);
 		const fullOpts: ReportListenerOptions = {
@@ -161,6 +168,7 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 		if (existsSync(reportsDir)) {
 			try {
 				watcher = watch(reportsDir, (_event, fileName) => {
+					if (closed()) return;
 					if (typeof fileName === "string") {
 						const id = fileName.endsWith(".json") ? fileName.slice(0, -".json".length) : fileName;
 						onNewReport(reportsDir, id, fullOpts);
@@ -172,11 +180,15 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 		}
 
 		// tick 兜底（Windows fs.watch 偶发丢事件）
-		interval = setInterval(() => pollNewReports(reportsDir, fullOpts), 5000);
+		interval = setInterval(() => {
+			if (closed()) return;
+			pollNewReports(reportsDir, fullOpts);
+		}, 5000);
 		interval.unref?.();
 	});
 
 	return () => {
+		sessionGen++; // 使当前周期 closed → 排队回调 no-op
 		try {
 			watcher?.close();
 		} catch { /* ignore */ }

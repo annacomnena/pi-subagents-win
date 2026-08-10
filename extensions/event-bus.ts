@@ -107,13 +107,19 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
  * 注册事件总线（主会话）。返回清理函数（测试用）。
  */
 export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): () => void {
+	// 工厂入口重置模块状态（P1：reload 重跑工厂时不继承旧实例的 selfDisabled/seen*，避免新会话静默失效）
+	_resetEventBus();
 	const runsDir = opts.runsDir ?? DEFAULT_TAB_RUNS_DIR;
 
 	// 延迟到 session_start 再判定身份并启动 watcher：
 	// CLI flag（--tab-run-id）在扩展加载完成后才就绪，工厂里 isMainSession() 不可靠；
 	// 非主会话（标签页/子 agent）进程不 watch，避免重复唤醒。
+	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
 	pi.on("session_start", () => {
 		if (!isMainSession()) return;
+
+		const myGen = ++sessionGen;
+		const closed = (): boolean => myGen !== sessionGen;
 
 		snapshotExisting(runsDir);
 
@@ -127,6 +133,7 @@ export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): 
 		if (existsSync(runsDir)) {
 			try {
 				watcher = watch(runsDir, (_event, fileName) => {
+					if (closed()) return;
 					if (typeof fileName === "string") {
 						onTabResultFile(runsDir, fileName, fullOpts);
 					}
@@ -138,6 +145,7 @@ export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): 
 	});
 
 	const cleanup = () => {
+		sessionGen++; // 使当前周期 closed → 排队回调 no-op
 		try {
 			watcher?.close();
 		} catch {

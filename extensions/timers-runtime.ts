@@ -96,17 +96,27 @@ function fireOneTimer(
 /**
  * 注册计时器调度器与工具。
  * 调用点：主扩展入口（index.ts default 内）。
+ *
+ * 调度器（interval/tick）推迟到 session_start 启动（pi 官方模式：工厂不启动
+ * 后台资源），并用 generation token 根除 reload/replacement 的排队 tick /
+ * 双实例瞬时窗口——过期周期的 tick 直接 no-op，绝不用旧 pi 发起 turn。
  */
 export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	const timersDir = defaultTimersDir();
 
-	// 本进程身份（惰性：CLI flag 在扩展加载后才就绪，不能在工厂缓存）
-	const isSubagentProcess = isSubagent();
-
 	// ── 进程内调度器（子 agent 不调度）──
-	let schedulerCleanup: (() => void) | undefined;
-	if (!isSubagentProcess) {
+	let sessionGen = 0; // 每 session 周期自增；tick 携带启动时 gen，过期 no-op
+	let bootTimer: ReturnType<typeof setTimeout> | null = null;
+	let interval: ReturnType<typeof setInterval> | null = null;
+
+	pi.on("session_start", () => {
+		if (isSubagent()) return; // 子 agent 不调度
+
+		const myGen = ++sessionGen;
+		const closed = (): boolean => myGen !== sessionGen; // 已清理/过期周期
+
 		const tick = (): void => {
+			if (closed()) return; // 过期周期：排队 tick 直接丢弃，绝不用旧 pi
 			try {
 				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
 				pumpDueTimers(pi, timersDir, getTabRunId());
@@ -116,15 +126,13 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 		};
 
 		// 启动稍后先补发一次（处理 pi 未运行期间到期的 timer → firedLate）
-		const bootTimer = setTimeout(tick, STARTUP_FIRE_DELAY_MS);
+		if (bootTimer) clearTimeout(bootTimer);
+		bootTimer = setTimeout(tick, STARTUP_FIRE_DELAY_MS);
 		bootTimer.unref?.();
-		const interval = setInterval(tick, TICK_MS);
+		if (interval) clearInterval(interval);
+		interval = setInterval(tick, TICK_MS);
 		interval.unref?.();
-		schedulerCleanup = () => {
-			clearTimeout(bootTimer);
-			clearInterval(interval);
-		};
-	}
+	});
 
 	// ── 写目标解析：主会话 → 根目录（self）或邮箱（tab）；标签页 → 仅自己邮箱 ──
 	const resolveWriteScope = (
@@ -382,7 +390,11 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 		},
 	});
 
-	return schedulerCleanup;
+	return () => {
+		sessionGen++; // 使当前周期 closed → 排队 tick no-op
+		if (bootTimer) clearTimeout(bootTimer);
+		if (interval) clearInterval(interval);
+	};
 }
 
 /** 供 /timers 或调试使用：当前进程拥有的 timer 目录。 */

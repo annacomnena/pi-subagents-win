@@ -133,11 +133,20 @@ function formatAge(startedAt: string): string {
  * 注意：只刷新 UI，不向 LLM 注入任何内容。
  */
 export function registerAsyncPanel(pi: ExtensionAPI): () => void {
-	const interval = setInterval(() => {
-		refreshAsyncPanel();
-	}, 10_000);
-	interval.unref?.();
+	// P2：interval 推迟到 session_start（pi 官方模式：工厂不启动后台资源）
+	let interval: ReturnType<typeof setInterval> | null = null;
+	let sessionGen = 0;
+	pi.on("session_start", () => {
+		clearAsyncPanelUi(); // 新周期丢弃旧 UI 引用
+		const myGen = ++sessionGen;
+		interval = setInterval(() => {
+			if (myGen !== sessionGen) return; // 过期周期 no-op
+			refreshAsyncPanel();
+		}, 10_000);
+		interval.unref?.();
+	});
 	return () => {
-		clearInterval(interval);
+		sessionGen++; // 使当前周期 closed
+		if (interval) clearInterval(interval);
 	};
 }
