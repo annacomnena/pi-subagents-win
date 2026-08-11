@@ -21,6 +21,27 @@ const FLAG_NAME = "tab-run-id";
 
 let cachedPi: ExtensionAPI | null = null;
 
+/** 当前进程的会话 UUID（session_start 时由 ctx.sessionManager 捕获）。 */
+let currentSessionId: string | undefined;
+
+/** session_start 时写入当前会话 UUID（标签页/子 agent 也会写入，但消费侧另有身份门槛）。 */
+export function setCurrentSessionId(id: string | undefined): void {
+	currentSessionId = id && id.length ? id : undefined;
+}
+
+/** 当前进程的会话 UUID（无 → undefined）。 */
+export function getCurrentSessionId(): string | undefined {
+	return currentSessionId;
+}
+
+/** 会话目录键（跨进程唯一身份）：tab_<runId> 或 sessionId；无身份 → undefined。 */
+export function sessionScopeKey(): string | undefined {
+	const tab = getTabRunId();
+	if (tab) return tab;
+	const sid = getCurrentSessionId();
+	return sid && sid.length ? sid : undefined;
+}
+
 /** 扩展入口调用：注册 flag 并保留 pi 引用（值在 getTabRunId 时惰性读取）。 */
 export function registerIdentityFlag(pi: ExtensionAPI): string | undefined {
 	cachedPi = pi;

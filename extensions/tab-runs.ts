@@ -39,6 +39,8 @@ export interface TabDispatchRecord {
 	dispatchedAt: string;
 	dispatchStatus: "dispatched" | "launch_failed";
 	error?: string;
+	/** 直开（/launch）标签页：无任务号、用户自定任务（身份仍需要 runId）。 */
+	direct?: boolean;
 }
 
 export interface TabUsage {
@@ -513,6 +515,7 @@ export function validateTabDispatchRecord(raw: unknown): { ok: boolean; errors: 
 	if (requestedModel !== undefined) value.requestedModel = requestedModel;
 	const error = str(record.error);
 	if (error !== undefined) value.error = error;
+	if (record.direct === true) value.direct = true;
 	return { ok: true, errors, value };
 }
 

@@ -2434,7 +2434,25 @@ export default function (pi: ExtensionAPI) {
 				: request.task;
 			const boundTitle = launchTaskTitle({ taskId: workflowBound ? taskNum : "", title: request.title, prompt, model: request.model }, request.cwd ?? process.cwd());
 
-			const result = dispatchPiTab(wtPath, piCli, request.cwd ?? process.cwd(), boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined);
+			// 修复 2026-08-11：直开标签页也要有身份（runId + 派发账本）。
+			// 此前 /launch 不带 runId → 标签页是无身份进程 → 会抢 root(self) timer、
+			// 且不能用 tab-report（回报通道要求 runId）。
+			const directRunId = newTabRunId();
+			const directCwd = request.cwd ?? process.cwd();
+			writeTabDispatch(defaultTabRunsDir(), {
+				id: directRunId,
+				version: 1,
+				taskId: workflowBound ? taskNum : "",
+				mode,
+				title: boundTitle,
+				cwd: directCwd,
+				requestedModel: request.model,
+				dispatchedAt: new Date().toISOString(),
+				dispatchStatus: "dispatched",
+				direct: true,
+			});
+
+			const result = dispatchPiTab(wtPath, piCli, directCwd, boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined, directRunId, defaultTabRunsDir());
 			if (result.error) {
 				ctx.ui.notify(`❌ 启动失败: ${result.error}`, "error");
 				return;

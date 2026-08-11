@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2] — 2026-08-11
+
+### Fixed
+- **Timer / report 投错对话（身份隔离）**：此前任何无 `--tab-run-id` 的 pi 进程（不同目录的主会话、直开标签页、手动打开的 pi 窗口）都被当作"主会话"，会抢 `~/.pi/agent/timers/*.json` 的 self timer 和 `~/.pi/agent/reports/*.json` 的回报，导致编排消息/任务回报落到无关目录的会话（实证：233 重复 timer 同秒双发、task 238 回报投到 subagent-win 会话）。
+  - `set-timer` 的 self timer 记录 `ownerCwd`（+ `ownerSessionId`）；identityless 进程只消费 `ownerCwd == 自己 cwd` 的 root timer，旧账本（无 ownerCwd）一律不消费（宁可静默不投错）；repeat 消费时重新盖章 `ownerSessionId`（重启后同目录新会话可接手）。
+  - 标签页内 `target=self` 的 timer 现在写入**自己的邮箱**（此前写根目录被主会话抢走）；标签页的 `cancel-timer` / `list-timers` 缺省也指向自己邮箱。
+  - `tab-report` 回报按派发溯源（links.jsonl：tab runId → 派发会话 UUID）定位接收方，只有派发该 tab 的会话消费；其他 identityless 进程不再抢（`.notified` 仍做跨实例去重）。
+  - `/launch` 直开标签页也注入 runId + 派发账本（`direct: true`），不再是无身份进程（可正常用 tab-report、不抢 root timer）。
+
 ## [0.2.1] — 2025-08-05
 
 ### Added

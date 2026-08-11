@@ -18,7 +18,8 @@ import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
-import { isMainSession } from "./identity.ts";
+import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
 	/** 回报方身份：tab_<runId> 或 sessionId。 */
@@ -54,6 +55,31 @@ export function sendReportToMain(
 	writeFileSync(`${file}.tmp`, JSON.stringify(record, null, 2) + "\n", "utf8");
 	renameSync(`${file}.tmp`, file);
 	return id;
+}
+
+/**
+ * 回报的预期接收会话 UUID：
+ *   - from 为 tab runId → 查 links.jsonl（kind=tab，targetId=from）拿派发方会话；
+ *   - from 本身是 sessionId → 直接视为接收方；
+ *   - 解析不到 → undefined（不消费：宁可留在 reports/ 等人工 / 编排会话处理）。
+ *
+ * 修复 2026-08-11：此前任何 identityless 进程都能抢回报（.notified 只去重不定位），
+ * 导致 task 238 的回报落到无关目录的会话。
+ */
+export function recipientSessionIdFor(record: Pick<ReportRecord, "from">, linksPath: string = defaultLinksPath()): string | undefined {
+	const from = record.from;
+	if (!from) return undefined;
+	if (!from.startsWith("tab_")) {
+		// sessionId 形态：直接作为接收方
+		return /^[0-9a-f-]{8,}$/i.test(from) ? from : undefined;
+	}
+	// tab runId：找最近一次派发记录
+	for (const link of listLinks(linksPath)) {
+		if (link.kind === "tab" && link.targetId === from && link.sessionId && link.sessionId !== "unknown") {
+			return link.sessionId;
+		}
+	}
+	return undefined;
 }
 
 /** 读取一份回报；缺失/损坏返回 null。 */
@@ -92,6 +118,8 @@ function snapshotExisting(reportsDir: string): void {
 
 export interface ReportListenerOptions {
 	reportsDir?: string;
+	/** 会话定位用的 links 路径（测试注入；缺省 ~/.pi/agent/links.jsonl）。 */
+	linksPath?: string;
 	/** 注入用户消息的实现（由 registerReportListener 绑定 pi.sendUserMessage）。 */
 	sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => void;
 	/** 供测试注入的钩子：新回报出现时回调（替代 sendUserMessage/toast）。 */
@@ -111,7 +139,7 @@ export function claimReportNotified(reportsDir: string, id: string): boolean {
 	}
 }
 
-/** 处理一份新回报（幂等 + 跨实例去重）。返回是否已注入。 */
+/** 处理一份新回报（幂等 + 跨实例去重 + 会话定位）。返回是否已注入。 */
 export function onNewReport(reportsDir: string, id: string, opts: ReportListenerOptions): boolean {
 	if (selfDisabled) return false; // 旧实例已失效
 	if (seenReports.has(id)) return false;
@@ -122,6 +150,13 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	if (opts.onReport) {
 		opts.onReport(record, id);
 		return true;
+	}
+
+	// 会话定位：只消费派发给「当前会话」的回报（不同目录的 identityless 进程不得抢）
+	const recipient = recipientSessionIdFor(record, opts.linksPath);
+	const mySession = getCurrentSessionId();
+	if (!recipient || !mySession || recipient !== mySession) {
+		return false; // 不是本会话的回报 → 不 claim、不注入（留给真正的编排会话）
 	}
 
 	// 跨实例幂等：原子领取消费权（双 watcher/双实例只有第一个注入）
@@ -167,8 +202,12 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 	// CLI flag 在扩展加载完成后才就绪；只主会话消费（标签页/子 agent 只发送）。
 	let interval: ReturnType<typeof setInterval> | null = null;
 	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		if (!isMainSession()) return;
+		// 捕获当前会话 UUID（回报会话定位的依据）
+		try {
+			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
+		} catch { /* ctx 不可用则保持 undefined（不消费任何回报，宁可静默） */ }
 
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen;

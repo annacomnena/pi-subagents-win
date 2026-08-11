@@ -54,6 +54,10 @@ export interface TimerRecord {
 	fireCount?: number;
 	/** P2-3：最近一次触发时刻。 */
 	lastFiredAt?: string;
+	/** 拥有方目录（root/self timer 的创建进程 cwd；标签页邮箱 timer 不需要）。 */
+	ownerCwd?: string;
+	/** 拥有方会话 UUID（root/self timer 的创建会话；消费时重新盖章）。 */
+	ownerSessionId?: string;
 	createdAt: string;
 }
 
@@ -157,6 +161,8 @@ export function validateTimerRecord(raw: unknown): { ok: boolean; errors: string
 		firedLate: record.firedLate === true ? true : undefined,
 		fireCount: typeof record.fireCount === "number" && record.fireCount > 0 ? Math.floor(record.fireCount) : undefined,
 		lastFiredAt: typeof record.lastFiredAt === "string" ? record.lastFiredAt : undefined,
+		ownerCwd: typeof record.ownerCwd === "string" && record.ownerCwd ? record.ownerCwd : undefined,
+		ownerSessionId: typeof record.ownerSessionId === "string" && record.ownerSessionId ? record.ownerSessionId : undefined,
 		createdAt,
 	};
 	return { ok: true, errors, value };
@@ -276,6 +282,25 @@ export function readAllTimers(timersDir: string, tabRunId?: string): TimerRecord
 export function collectDueTimers(timersDir: string, opts?: { tabRunId?: string; now?: Date }): TimerRecord[] {
 	const now = opts?.now ?? new Date();
 	return readAllTimers(timersDir, opts?.tabRunId).filter((r) => isDue(r, now));
+}
+
+// ── 所有权（修复：self timer 只能被创建它的会话目录消费，避免投错对话）────
+
+/** Windows 下 cwd 大小写不敏感；统一小写比较。 */
+export function normalizeCwd(cwd: string): string {
+	return cwd.replace(/[\\/]+$/, "").toLowerCase();
+}
+
+/**
+ * root（self）timer 是否可被当前 identityless 进程消费。
+ *
+ * 旧账本（无 ownerCwd）：一律不可消费——宁可静默也不投错对话
+ * （修复 2026-08-11：无身份的任意 pi 会话都会抢 root timer，导致
+ * 编排消息落到无关目录的会话）。需要的话重新 set-timer 即可。
+ */
+export function rootTimerConsumable(record: TimerRecord, cwd: string): boolean {
+	if (!record.ownerCwd) return false;
+	return normalizeCwd(record.ownerCwd) === normalizeCwd(cwd);
 }
 
 /** 统计 pending 数（用于 MAX_PENDING_TIMERS 限制）。 */

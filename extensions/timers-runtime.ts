@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { recordLink, sessionIdentity } from "./links.ts";
-import { getTabRunId, isSubagent } from "./identity.ts";
+import { getCurrentSessionId, getTabRunId, isSubagent, setCurrentSessionId } from "./identity.ts";
 import {
 	MAX_PENDING_TIMERS,
 	cancelTimerFile,
@@ -28,6 +28,7 @@ import {
 	dueAtFromDelay,
 	mailboxDirForTab,
 	readAllTimers,
+	rootTimerConsumable,
 	validateTimerRecord,
 	writeTimerAtomic,
 	type TimerRecord,
@@ -42,16 +43,42 @@ interface FireOutcome {
 	reason?: string;
 }
 
-/** 调度器单次 pump：到期即 CAS claim → repeat 重置 → sendUserMessage 注入。 */
+/** 调度器单次 pump 的消费范围（身份由调用方在 tick 时惰性解析）。 */
+export interface PumpScope {
+	/** 标签页 runId：只扫自己的邮箱（mail/<runId>/）。 */
+	tabRunId?: string;
+	/** identityless 进程：root(self) timer 的所有权匹配目录。 */
+	cwd?: string;
+	/** identityless 进程：消费后重新盖章的会话 UUID（repeat 续期归属）。 */
+	sessionId?: string;
+}
+
+/**
+ * 调度器单次 pump：到期即 CAS claim → repeat 重置 → sendUserMessage 注入。
+ *
+ * 身份语义（修复 2026-08-11 投错对话）：
+ *   - 标签页（tabRunId）→ 只扫自己邮箱；
+ *   - identityless 进程 → 只消费 ownerCwd 等于自己 cwd 的 root timer；
+ *     旧账本（无 ownerCwd）一律不消费（宁可静默，不投错）。
+ */
 export function pumpDueTimers(
 	pi: Pick<ExtensionAPI, "sendUserMessage">,
 	timersDir: string,
-	ownTabRunId?: string,
+	scope: PumpScope | string = {},
 ): FireOutcome[] {
-	const scanScope = ownTabRunId ? { tabRunId: ownTabRunId } : undefined;
+	const s: PumpScope = typeof scope === "string" ? { tabRunId: scope } : scope;
 	const outcomes: FireOutcome[] = [];
-	for (const due of collectDueTimers(timersDir, scanScope)) {
-		outcomes.push(fireOneTimer(pi, timersDir, due, ownTabRunId));
+	if (s.tabRunId) {
+		for (const due of collectDueTimers(timersDir, { tabRunId: s.tabRunId })) {
+			outcomes.push(fireOneTimer(pi, timersDir, due, s));
+		}
+		return outcomes;
+	}
+	// identityless：root timer 所有权过滤
+	const cwd = s.cwd ?? process.cwd();
+	for (const due of collectDueTimers(timersDir)) {
+		if (!rootTimerConsumable(due, cwd)) continue;
+		outcomes.push(fireOneTimer(pi, timersDir, due, s));
 	}
 	return outcomes;
 }
@@ -60,13 +87,14 @@ function fireOneTimer(
 	pi: Pick<ExtensionAPI, "sendUserMessage">,
 	timersDir: string,
 	record: TimerRecord,
-	ownTabRunId?: string,
+	scope: PumpScope = {},
 ): FireOutcome {
 	// 1) CAS claim：已 fired/cancelled 则跳过（防双发）
-	const claimed = casFireTimer(timersDir, record.id, { tabRunId: ownTabRunId });
+	const claimed = casFireTimer(timersDir, record.id, { tabRunId: scope.tabRunId });
 	if (!claimed) return { fired: false, reason: "already terminal" };
 
-	// 2) repeat：重置 dueAt 写回 pending（P2-3：保留 fireCount/lastFiredAt 历史）
+	// 2) repeat：重置 dueAt 写回 pending（P2-3：保留 fireCount/lastFiredAt 历史；
+	//    并把所有权重新盖章到当前消费会话，保证重启后由同目录新会话接手）
 	if (record.repeatMs) {
 		const next: TimerRecord = {
 			...record,
@@ -76,8 +104,9 @@ function fireOneTimer(
 			firedLate: undefined,
 			fireCount: (record.fireCount ?? 0) + 1,
 			lastFiredAt: claimed.firedAt ?? claimed.lastFiredAt,
+			ownerSessionId: scope.sessionId ?? record.ownerSessionId,
 		};
-		writeTimerAtomic(timersDir, next, { tabRunId: ownTabRunId });
+		writeTimerAtomic(timersDir, next, { tabRunId: scope.tabRunId });
 	}
 
 	// 3) 注入用户消息推进工作（followUp：忙碌时排队，不打断工具循环）
@@ -109,8 +138,12 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	let bootTimer: ReturnType<typeof setTimeout> | null = null;
 	let interval: ReturnType<typeof setInterval> | null = null;
 
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		if (isSubagent()) return; // 子 agent 不调度
+		// 捕获当前会话 UUID（身份：跨目录隔离 root timer 的所有权）
+		try {
+			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
+		} catch { /* ctx 不可用则保持 undefined（仍按 cwd 隔离） */ }
 
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen; // 已清理/过期周期
@@ -119,7 +152,10 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			if (closed()) return; // 过期周期：排队 tick 直接丢弃，绝不用旧 pi
 			try {
 				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
-				pumpDueTimers(pi, timersDir, getTabRunId());
+				const tabRunId = getTabRunId();
+				pumpDueTimers(pi, timersDir, tabRunId
+					? { tabRunId }
+					: { cwd: process.cwd(), sessionId: getCurrentSessionId() });
 			} catch (err) {
 				console.error("[timers] tick failed:", err);
 			}
@@ -140,8 +176,8 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 	): { tabRunId?: string } | { error: string } => {
 		const myRunId = getTabRunId(); // 惰性：工具执行时 flag 已就绪
 		if (myRunId) {
-			// 标签页：只允许 self 或自己
-			if (target === undefined || target === "self") return {};
+			// 标签页：只允许 self（=自己的邮箱）或自己
+			if (target === undefined || target === "self") return { tabRunId: myRunId };
 			const t = target as { tabRunId?: string };
 			if (t.tabRunId === myRunId) return { tabRunId: myRunId };
 			return { error: "标签页只能给自己设 timer；给其他 tab 设 timer 请用主会话" };
@@ -194,10 +230,13 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			if (result.isError) return new Text(theme.fg("error", text), 0, 0);
 			return new Text(theme.fg("success", text), 0, 0);
 		},
-		async execute(_toolCallId, rawParams) {
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
 			const p = rawParams as Record<string, unknown>;
 			const message = typeof p.message === "string" ? p.message.trim() : "";
 			const source = "set-timer";
+			// 创建者会话身份（root timer 所有权；标签页邮箱 timer 不需要）
+			const myRunId = getTabRunId();
+			const ownerSessionId = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
 
 			if (isSubagentProcess) {
 				return { content: [{ type: "text", text: "子 agent 中不可设置计时器" }], isError: true };
@@ -240,6 +279,8 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 				label: typeof p.label === "string" && p.label.trim() ? p.label.trim() : undefined,
 				repeatMs: p.repeatMs,
 				status: "pending",
+				ownerCwd: myRunId ? undefined : process.cwd(),
+				ownerSessionId: myRunId ? undefined : ownerSessionId,
 				createdAt: new Date().toISOString(),
 			};
 			const check = validateTimerRecord(raw);
@@ -250,7 +291,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			// 溯源：记录「本会话创建了这个计时器」
 			try {
 				recordLink({
-					sessionId: sessionIdentity(null),
+					sessionId: sessionIdentity(ctx as never),
 					kind: "timer",
 					targetId: check.value.id,
 					detail: `${scope.tabRunId ? `tab:${scope.tabRunId}` : "self"}${check.value.label ? ` (${check.value.label})` : ""} ${check.value.message.slice(0, 50)}`,

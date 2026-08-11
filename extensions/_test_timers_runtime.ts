@@ -32,6 +32,7 @@ function makeTimer(overrides: Record<string, unknown>) {
 		target: "self",
 		source: "test",
 		status: "pending",
+		ownerCwd: process.cwd(), // 修复后 root timer 必须带所有权目录
 		createdAt: new Date().toISOString(),
 		...overrides,
 	};
@@ -133,6 +134,49 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.equal(pi.calls.length, 1);
 	assert.ok(pi.calls[0]?.content.startsWith("⏰ Timer fired"));
 	assert.equal(readTimerFile(dir, "t_mail1", TAB)?.status, "fired");
+}
+
+// ── 所有权隔离：跨目录的 identityless 进程不得抢 root timer ──────
+{
+	const pi = makeFakePi();
+	const OTHER = "G:\\other\\dir";
+	writeTimerAtomic(dir, makeTimer({ id: "t_other_owned", ownerCwd: OTHER }));
+
+	// 本进程 cwd 不匹配 → 不消费
+	pumpDueTimers(pi, dir);
+	assert.equal(pi.calls.length, 0, "跨目录 root timer 不得被消费");
+	assert.equal(readTimerFile(dir, "t_other_owned")?.status, "pending", "不得被 claim");
+
+	// 匹配 cwd 的进程 → 消费
+	pumpDueTimers(pi, dir, { cwd: OTHER });
+	assert.equal(pi.calls.length, 1, "匹配所有权目录的进程应消费");
+	assert.equal(readTimerFile(dir, "t_other_owned")?.status, "fired");
+}
+
+// ── 旧账本（无 ownerCwd）：一律不消费（宁可静默，不投错对话）────
+{
+	const pi = makeFakePi();
+	writeTimerAtomic(dir, makeTimer({ id: "t_legacy", ownerCwd: undefined }));
+
+	pumpDueTimers(pi, dir);
+	assert.equal(pi.calls.length, 0, "旧账本 root timer 不得消费");
+	assert.equal(readTimerFile(dir, "t_legacy")?.status, "pending");
+}
+
+// ── repeat 所有权重新盖章：消费后 ownerSessionId 更新为当前会话 ──
+{
+	const pi = makeFakePi();
+	writeTimerAtomic(dir, makeTimer({
+		id: "t_reseat",
+		repeatMs: 60_000,
+		ownerSessionId: "session-old",
+	}));
+
+	pumpDueTimers(pi, dir, { cwd: process.cwd(), sessionId: "session-new" });
+	assert.equal(pi.calls.length, 1);
+	const after = readTimerFile(dir, "t_reseat");
+	assert.equal(after?.status, "pending");
+	assert.equal(after?.ownerSessionId, "session-new", "repeat 消费后应重新盖章所有权");
 }
 
 // ── registerTimers：调度器推迟到 session_start（工厂零后台资源）──────
