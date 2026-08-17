@@ -21,15 +21,20 @@ import { getCurrentSessionId, getTabRunId, isSubagent, setCurrentSessionId } fro
 import {
 	MAX_PENDING_TIMERS,
 	cancelTimerFile,
-	casFireTimer,
 	collectDueTimers,
 	countPending,
 	defaultTimersDir,
 	dueAtFromDelay,
+	isLate,
 	mailboxDirForTab,
 	readAllTimers,
+	readTimerFile,
 	rootTimerConsumable,
+	sweepStaleHeartbeats,
+	sweepTerminalTimers,
+	touchSessionHeartbeat,
 	validateTimerRecord,
+	withFired,
 	writeTimerAtomic,
 	type TimerRecord,
 } from "./timers.ts";
@@ -66,18 +71,18 @@ export function pumpDueTimers(
 	timersDir: string,
 	scope: PumpScope | string = {},
 ): FireOutcome[] {
-	const s: PumpScope = typeof scope === "string" ? { tabRunId: scope } : scope;
-	const outcomes: FireOutcome[] = [];
-	if (s.tabRunId) {
-		for (const due of collectDueTimers(timersDir, { tabRunId: s.tabRunId })) {
-			outcomes.push(fireOneTimer(pi, timersDir, due, s));
+		const s: PumpScope = typeof scope === "string" ? { tabRunId: scope } : scope;
+		const outcomes: FireOutcome[] = [];
+		if (s.tabRunId) {
+			for (const due of collectDueTimers(timersDir, { tabRunId: s.tabRunId })) {
+				outcomes.push(fireOneTimer(pi, timersDir, due, s));
+			}
+			return outcomes;
 		}
-		return outcomes;
-	}
-	// identityless：root timer 所有权过滤
-	const cwd = s.cwd ?? process.cwd();
-	for (const due of collectDueTimers(timersDir)) {
-		if (!rootTimerConsumable(due, cwd)) continue;
+		// identityless：root timer 所有权过滤（cwd + 会话心跳活性，2026-08-13）
+		const cwd = s.cwd ?? process.cwd();
+		for (const due of collectDueTimers(timersDir)) {
+			if (!rootTimerConsumable(due, cwd, { timersDir, sessionId: s.sessionId })) continue;
 		outcomes.push(fireOneTimer(pi, timersDir, due, s));
 	}
 	return outcomes;
@@ -89,13 +94,27 @@ function fireOneTimer(
 	record: TimerRecord,
 	scope: PumpScope = {},
 ): FireOutcome {
-	// 1) CAS claim：已 fired/cancelled 则跳过（防双发）
-	const claimed = casFireTimer(timersDir, record.id, { tabRunId: scope.tabRunId });
-	if (!claimed) return { fired: false, reason: "already terminal" };
+	// 0) 终态守卫：collectDue 后可能已被并发取消/其他进程消费（防竞态）
+	const current = readTimerFile(timersDir, record.id, scope.tabRunId);
+	if (!current || current.status !== "pending") return { fired: false, reason: "already terminal" };
 
-	// 2) repeat：重置 dueAt 写回 pending（P2-3：保留 fireCount/lastFiredAt 历史；
-	//    并把所有权重新盖章到当前消费会话，保证重启后由同目录新会话接手）
+	// 1) 先投递（2026-08-13 P1：at-least-once——原实现先置 fired 再 send，send 失败消息即丢且不重试；
+	//    现在投递失败保持 pending，下个 tick 自动重试。代价：send 成功但落账前崩溃可能重复投递一次，
+	//    对推进型 nudge 可接受）。
+	const label = record.label ? ` (${record.label})` : "";
+	const lateFlag = isLate(record);
+	const content = `⏰ Timer fired${label}${lateFlag ? " [晚发]" : ""}: ${record.message}`;
+	try {
+		pi.sendUserMessage(content, { deliverAs: "followUp" });
+	} catch (err) {
+		console.error(`[timers] send failed for ${record.id}（保持 pending，下轮重试）:`, err);
+		return { fired: false, reason: err instanceof Error ? err.message : String(err) };
+	}
+
+	// 2) 投递成功才落账
 	if (record.repeatMs) {
+		// repeat：重置 dueAt 写回 pending（P2-3：保留 fireCount/lastFiredAt 历史；
+		//    并把所有权重新盖章到当前消费会话，保证重启后由同目录新会话接手）
 		const next: TimerRecord = {
 			...record,
 			status: "pending",
@@ -103,23 +122,17 @@ function fireOneTimer(
 			firedAt: undefined,
 			firedLate: undefined,
 			fireCount: (record.fireCount ?? 0) + 1,
-			lastFiredAt: claimed.firedAt ?? claimed.lastFiredAt,
+			lastFiredAt: new Date().toISOString(),
 			ownerSessionId: scope.sessionId ?? record.ownerSessionId,
 		};
 		writeTimerAtomic(timersDir, next, { tabRunId: scope.tabRunId });
+		return { fired: true, record: next };
 	}
 
-	// 3) 注入用户消息推进工作（followUp：忙碌时排队，不打断工具循环）
-	const label = record.label ? ` (${record.label})` : "";
-	const late = claimed.firedLate ? " [晚发]" : "";
-	const content = `⏰ Timer fired${label}${late}: ${record.message}`;
-	try {
-		pi.sendUserMessage(content, { deliverAs: "followUp" });
-	} catch (err) {
-		console.error(`[timers] fire failed for ${record.id}:`, err);
-		return { fired: false, reason: err instanceof Error ? err.message : String(err) };
-	}
-	return { fired: true, record: claimed };
+	// one-shot：置 fired（firedLate/fireCount/lastFiredAt 由 withFired 计算）
+	const fired = withFired(record);
+	writeTimerAtomic(timersDir, fired, { tabRunId: scope.tabRunId });
+	return { fired: true, record: fired };
 }
 
 /**
@@ -130,13 +143,16 @@ function fireOneTimer(
  * 后台资源），并用 generation token 根除 reload/replacement 的排队 tick /
  * 双实例瞬时窗口——过期周期的 tick 直接 no-op，绝不用旧 pi 发起 turn。
  */
-export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
-	const timersDir = defaultTimersDir();
+export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }): (() => void) | undefined {
+	const timersDir = opts?.timersDir ?? defaultTimersDir();
+	const isSubagentProcess = isSubagent();
 
 	// ── 进程内调度器（子 agent 不调度）──
 	let sessionGen = 0; // 每 session 周期自增；tick 携带启动时 gen，过期 no-op
 	let bootTimer: ReturnType<typeof setTimeout> | null = null;
 	let interval: ReturnType<typeof setInterval> | null = null;
+	let tickCount = 0; // 定期维护计数（每 12 tick ≈ 60s 跑一次 GC/心跳清理）
+	let tickFailCount = 0; // 连续失败报警（2026-08-13 P2：tick 异常不再静默）
 
 	pi.on("session_start", (_event, ctx) => {
 		if (isSubagent()) return; // 子 agent 不调度
@@ -153,11 +169,28 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			try {
 				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
 				const tabRunId = getTabRunId();
-				pumpDueTimers(pi, timersDir, tabRunId
-					? { tabRunId }
-					: { cwd: process.cwd(), sessionId: getCurrentSessionId() });
+				if (tabRunId) {
+					pumpDueTimers(pi, timersDir, { tabRunId });
+				} else {
+					const sid = getCurrentSessionId();
+					if (sid) touchSessionHeartbeat(timersDir, sid); // 会话活性信号（所有权门槛依据）
+					pumpDueTimers(pi, timersDir, { cwd: process.cwd(), sessionId: sid });
+				}
+				// 定期维护（每 12 tick ≈ 60s）：终态 timer GC + 失活心跳清理
+				if (++tickCount % 12 === 0) {
+					sweepTerminalTimers(timersDir, tabRunId);
+					if (!tabRunId) sweepStaleHeartbeats(timersDir);
+				}
+				tickFailCount = 0;
 			} catch (err) {
+				// 2026-08-13 P2：连续失败不再静默——每 3 次连续失败向会话注入一条报警消息
 				console.error("[timers] tick failed:", err);
+				if (++tickFailCount >= 3) {
+					tickFailCount = 0;
+					const msg = `⚠️ Timer scheduler failing: ${err instanceof Error ? err.message : String(err)}`;
+					console.error("[timers]", msg);
+					try { pi.sendUserMessage(msg, { deliverAs: "followUp" }); } catch { /* 报警失败无碍 */ }
+				}
 			}
 		};
 
@@ -196,7 +229,7 @@ export function registerTimers(pi: ExtensionAPI): (() => void) | undefined {
 			"设置一个计时器：到期后系统自动向目标会话发送一条用户消息，推进工作（超长程任务基础设施）。",
 			"参数：message（到期自动发送的推进指令，≤2048 字符）；delayMs 或 dueAt（ISO，二选一）；target 缺省 self（当前会话）；也可传 { tabRunId, taskId? } 指向某标签页邮箱（仅主会话可写其他 tab）；label 可读说明；repeatMs ≥10000 可周期重发。",
 			"到期后消息以用户消息形态注入，TUI 可见、可人工接管；会话忙碌时自动排队不打断工具循环。",
-			"单进程最多 50 个 pending timer。",
+			"每个目标（self 或单个 tab 邮箱）最多 50 个 pending timer。",
 		].join(" "),
 		parameters: Type.Object({
 			message: Type.String({ description: "到期自动发送的用户消息（推进指令），≤2048 字符" }),

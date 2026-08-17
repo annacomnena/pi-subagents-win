@@ -22,7 +22,9 @@ import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
-import { isMainSession } from "./identity.ts";
+import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { defaultLinksPath } from "./links.ts";
+import { recipientSessionIdFor } from "./report.ts";
 
 export const EVENT_BUS_WATCH_KEY = "subagent-event-bus";
 
@@ -30,6 +32,8 @@ const DEFAULT_TAB_RUNS_DIR = join(homedir(), ".pi", "agent", "tab-runs");
 
 export interface EventBusOptions {
 	runsDir?: string;
+	/** 派发溯源用的 links 路径（测试注入；缺省 ~/.pi/agent/links.jsonl）。 */
+	linksPath?: string;
 	/** 完成时注入用户消息唤醒模型（默认 true）。 */
 	autoReclaim?: boolean;
 	/** 完成时 toast（默认 true）。 */
@@ -81,6 +85,16 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (opts.onTabFinished) {
 		opts.onTabFinished(runId);
 		return true;
+	}
+
+	// 会话定位（2026-08-13：与 report.ts 溯源对齐，防止 identityless 会话抢注入权）：
+	// 由 links.jsonl 找到派发该 tab 的会话，只有它才注入完成消息；
+	// 其他会话静默跳过（不 claim、不 toast、不注入），把唤醒权留给真正的编排会话。
+	// 溯源解析不到（旧账本无 sessionId / 非本插件派发）→ 回退 claim 先到先得。
+	const recipient = recipientSessionIdFor({ from: runId }, opts.linksPath ?? defaultLinksPath());
+	const mySession = getCurrentSessionId();
+	if (recipient && mySession && recipient !== mySession) {
+		return false;
 	}
 
 	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
@@ -137,8 +151,12 @@ export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): 
 	// CLI flag（--tab-run-id）在扩展加载完成后才就绪，工厂里 isMainSession() 不可靠；
 	// 非主会话（标签页/子 agent）进程不 watch，避免重复唤醒。
 	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		if (!isMainSession()) return;
+		// 捕获当前会话 UUID（完成消息会话定位的依据；与 report/timers 同模式）
+		try {
+			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
+		} catch { /* ctx 不可用则保持 undefined（不注入任何完成消息，宁可静默） */ }
 
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen;
@@ -149,6 +167,7 @@ export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): 
 		const fullOpts: EventBusOptions = {
 			...opts,
 			runsDir,
+			linksPath: opts.linksPath ?? defaultLinksPath(),
 			sendUserMessage: pi.sendUserMessage?.bind(pi),
 		};
 

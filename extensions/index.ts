@@ -3,7 +3,7 @@
  *
  * 核心机制：
  *   - 默认：spawn("node", [piCliPath, "--mode", "json", ...])
- *   - 外部 CLI：model 为 cli:claude | cli:codex | cli:agy | cli:atomcode 时，spawn 本地 harness
+ *   - 外部 CLI：model 为 cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode 时，spawn 本地 harness
  * 支持单 agent、并行、异步三种模式。
  */
 
@@ -53,6 +53,7 @@ import {
 	buildWorkflowTabPrompt,
 	launchTaskTitle,
 	parseLaunchRequest,
+	wtPromptArg,
 	type LaunchMode,
 } from "./launch.ts";
 
@@ -126,7 +127,7 @@ function dispatchPiTab(
 	onSpawnError?: (err: Error) => void,
 ): LaunchDispatch {
 	try {
-		const child = spawn(wtPath, buildWindowsTerminalArgs(title, prompt, {
+		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, runId), {
 			cwd,
 			piCli,
 			execPath: process.execPath,
@@ -245,7 +246,7 @@ export function classifyModelFailure(
 		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
 	}
 	const providerish =
-		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|atomcode|location is not supported)/i.test(
+		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|atomcode|zcode|location is not supported)/i.test(
 			message,
 		);
 	if (providerish) {
@@ -306,7 +307,7 @@ function normalizeModelRef(raw?: string | null): string | undefined {
 	const input = String(raw).trim();
 	if (!input) return undefined;
 
-	// External CLI harness: cli:claude | cli:codex | cli:agy | cli:atomcode (always CLI default model)
+	// External CLI harness: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode (always CLI default model)
 	if (isExternalCliModel(input)) {
 		return normalizeExternalCliModel(input);
 	}
@@ -1610,9 +1611,9 @@ export default function (pi: ExtensionAPI) {
 		lines.push("");
 		lines.push("Per-call model override: pass `model` on a single call or each parallel task. That value is what actually runs; the list above is only defaults.");
 		lines.push("Canonical form is `provider/id` (example: `Zhipu/glm-5.2`). Short aliases such as `glm-5.2` / `glm5.2` expand from ~/.pi/agent/models.json when unambiguous.");
-		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
+		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
-		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
+		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode/zcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
 		lines.push("Sync/async decision (you decide per dispatch): SYNC (no `async`) when the result is needed immediately to decide the next step; PARALLEL (`tasks: [...]`) for several independent tasks you must all wait for; ASYNC (`async: true`) for long independent work that does not block the current turn — the tool returns a runId instantly, you continue or finish, then poll `{action:\"status\", runId}` later (pair with set-timer / reclaim-tabs for batch orchestration). When in doubt, async is safe for anything minutes-long whose result you do not need in this turn; sync/parallel for anything whose result gates the next action.");
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
@@ -1797,7 +1798,7 @@ export default function (pi: ExtensionAPI) {
 			"查状态: { action: \"status\", runId? }",
 			"【async 决策准则——由你自主选择】同步（不传 async）：需要本次结果才能继续下一步（结果驱动下一步动作）。并行（tasks[]）：多个独立任务、要等全部完成再统一处理。异步（async: true）：任务独立、结果不阻塞当前回合——派发后工具立即返回 runId，你继续做别的事或结束回合，稍后用 { action: \"status\", runId } 或结合 set-timer/reclaim-tabs 查询推进。适合：长耗时（分钟级+）、可后台跑的探索/搜索/实现、编排多个批次。判据：如果这个任务的结果马上要用，用同步/并行；如果可以不阻塞地等它，用异步。",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
-			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
+			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\" | \"cli:zcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
 			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",
 		].join(" "),
 		parameters: Type.Object({
@@ -1808,7 +1809,7 @@ export default function (pi: ExtensionAPI) {
 				task: Type.String({ description: "任务描述" }),
 				systemPrompt: Type.Optional(Type.String()),
 				model: Type.Optional(Type.String({
-					description: "覆盖该 task 的模型。provider/id、短名，或外部 CLI 后端（cli:claude / cli:codex / cli:agy / cli:atomcode，均用 CLI 默认模型）",
+					description: "覆盖该 task 的模型。provider/id、短名，或外部 CLI 后端（cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode，均用 CLI 默认模型）",
 				})),
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
@@ -1819,7 +1820,7 @@ export default function (pi: ExtensionAPI) {
 			runId: Type.Optional(Type.String({ description: "异步 run id" })),
 			systemPrompt: Type.Optional(Type.String()),
 			model: Type.Optional(Type.String({
-				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode（使用 CLI 默认模型）",
+				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode（使用 CLI 默认模型）",
 			})),
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
@@ -2158,7 +2159,7 @@ export default function (pi: ExtensionAPI) {
 				const externalOpts = listExternalCliModelOptions();
 				// Labels layout:
 				//   [0] pi default
-				//   [1..E] external CLI backends (cli:claude / cli:codex / cli:agy / cli:atomcode)
+				//   [1..E] external CLI backends (cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode)
 				//   [E+1..] registry models
 				const modelLabels = [
 					`(use pi default)  [current: ${cfg.models[agentName] ?? "default"}]`,

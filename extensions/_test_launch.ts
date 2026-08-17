@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
+	cleanupWtPromptArg,
 	composeLaunchTitle,
 	deriveLaunchTitle,
 	isWorktreePath,
@@ -12,6 +14,7 @@ import {
 	repoName,
 	taskTitleLabel,
 	workflowDisciplineBlock,
+	wtPromptArg,
 } from "./launch.ts";
 
 const orchestration = parseLaunchRequest("你来并行启动这三个任务");
@@ -80,6 +83,7 @@ const bound = buildWorkflowTabPrompt({ taskId: "1007", prompt: "按计划实施"
 assert.ok(bound.startsWith("根据workflow进行工作1007\n\n> 【工作方式约束 · 强制】"), bound);
 assert.ok(bound.includes(skillPath), "约束块应给出技能绝对路径");
 assert.ok(bound.includes("你是项目经理") && bound.includes("禁止自己一路干完"), bound);
+assert.ok(bound.includes("tab-finish"), "约束块必须强提醒完成后 tab-finish 回报主会话");
 assert.ok(bound.endsWith("按计划实施"), "原始 handoff 应保留在末尾");
 
 // 已带前缀时不重复，约束块插在中间
@@ -97,6 +101,7 @@ const boundR = buildWorkflowTabPrompt({ taskId: "1007", prompt: "深度调研 Ag
 assert.ok(boundR.startsWith("根据research进行工作1007\n\n> 【工作方式约束 · 强制 · 深度研究】"), boundR);
 assert.ok(boundR.includes("深度研究模式（research-only）"), "研究约束块应指向技能的深度研究模式一节");
 assert.ok(boundR.includes("禁止进入 planner") && boundR.includes("研究报告"), boundR);
+assert.ok(boundR.includes("tab-finish"), "research 约束块也必须强提醒 tab-finish 回报");
 assert.ok(!boundR.includes("搜索 → 计划 → 审查 → 实现"), "研究模式不应出现完整链路流程");
 assert.ok(boundR.endsWith("深度调研 Agent 运行时安全"));
 // 已带 research 前缀时不重复
@@ -114,6 +119,7 @@ assert.ok(boundE.startsWith("根据execute进行工作1007\n\n> 【工作方式�
 assert.ok(boundE.includes("快速执行模式（execute-only）") && boundE.includes("跳过搜索与计划"), boundE);
 assert.ok(boundE.includes("implementer") && boundE.includes("code-reviewer") && boundE.includes("Wiki 收尾"), boundE);
 assert.ok(boundE.includes("不要凭空设计"), "execute 约束块应禁止无交接时自行设计");
+assert.ok(boundE.includes("tab-finish"), "execute 约束块也必须强提醒 tab-finish 回报");
 assert.ok(!boundE.includes("并行 searcher 最大化搜索"), "execute 模式不应出现研究流程");
 assert.ok(boundE.endsWith("按 plans/0810_agent_safety.md 实现"));
 // 已带 execute 前缀时不重复；无 taskId 时只前缀归一化
@@ -204,5 +210,28 @@ const argvTab = buildWindowsTerminalArgs("t", "p", {
 });
 assert.ok(argvTab.includes("--tab-run-id") && argvTab.includes("tab_abc_1"), "应传 --tab-run-id");
 assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 prompt 之前");
+
+// ── wt 命令行 prompt 物化：换行/引号/分号 prompt 不直接上 wt 命令行（防多开无用 tab）──
+{
+	// 多行 prompt（workflow 派发的常态）→ 物化为 @file，命令行上无换行
+	const multi = "根据workflow进行工作123\n\n> 【工作方式约束 · 强制】\n> 1. 按技能执行\n\n按计划实施";
+	const arg = wtPromptArg(multi, "tab_test_1");
+	assert.ok(arg.startsWith("@"), "多行 prompt 必须物化为 @file");
+	assert.ok(!/\r|\n/.test(arg), "命令行参数不得含换行");
+	const filePath = arg.slice(1);
+	assert.ok(existsSync(filePath), "临时 prompt 文件应存在");
+	assert.equal(readFileSync(filePath, "utf8"), multi, "文件内容应等于原始 prompt");
+	cleanupWtPromptArg(arg);
+	assert.equal(existsSync(filePath), false, "清理后文件应删除");
+
+	// 分号 / 引号 / 百分号同样触发物化（wt 会做 ; 命令分隔 / 引号解析 / %env% 展开）
+	assert.notEqual(wtPromptArg("先做 A;再做 B"), "先做 A;再做 B");
+	assert.notEqual(wtPromptArg("带\"引号\"的 prompt"), "带\"引号\"的 prompt");
+	assert.notEqual(wtPromptArg("进度 50% 完成"), "进度 50% 完成");
+
+	// 安全单行 prompt 保持内联（零行为变化）
+	assert.equal(wtPromptArg("单行安全 prompt"), "单行安全 prompt");
+	assert.equal(wtPromptArg("根据workflow进行工作123"), "根据workflow进行工作123");
+}
 
 console.log("launch tests passed");

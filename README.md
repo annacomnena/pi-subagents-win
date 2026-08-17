@@ -114,8 +114,9 @@ The async task panel (TUI widget + status bar + completion toast) shows running 
 | `cli:codex` | `codex exec --json` | stdin prompt, approvals bypassed, CLI default model |
 | `cli:agy` | `agy` | plain stdout capture, native `--effort`, CLI default model |
 | `cli:atomcode` | `atomcode -y -p <prompt>` | headless, no-approval, CLI default model |
+| `cli:zcode` | `node zcode.cjs` | plain stdout capture (-p), GLM-5.3 fixed |
 
-**Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one.
+**Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one. `cli:zcode` is special: it spawns `zcode.cjs` through `node` and always uses the fixed GLM-5.3 configured in `~/.zcode/cli/config.json`.
 
 ### 3.3 Consultant — user-named model evaluation
 
@@ -173,10 +174,17 @@ Tab titles: `<repo>[-worktree]-[<taskId>-]<label>`. Each tab returns a **`runId`
 // inspect one or all tabs
 tab-status({ runId: "tab_xxx" })
 
-// collect results, optionally wait for terminal states
-reclaim-tabs({ runIds: ["tab_xxx", "tab_yyy"], wait: true, timeoutMs: 120000 })
+// collect results — NEVER blocks: returns an immediate snapshot
+tab-status()                                  // full picture
+reclaim-tabs({ runIds: ["tab_xxx", "tab_yyy"] })
 // → { ready[], pending[], awaitingInput[], failed[], orphaned[] }
 ```
+
+**Never block (since 2026-08-13)** — `reclaim-tabs` does **not** wait/poll. It returns the current snapshot instantly (`wait`/`timeoutMs`/`intervalMs` are deprecated no-ops kept for backward compat). Waiting is replaced by two non-blocking mechanisms:
+- **Event bus**: a tab writing `result.json` wakes the main session sub-second with the full result (no polling needed).
+- **`set-timer`**: periodic self-nudge for check-ins when no completion is expected.
+
+The orchestration loop is therefore: `launch-tabs(batch)` → [event-bus wakes you on completion] → `reclaim-tabs()` snapshot → `launch-tabs(batch+1)`.
 
 **State machine** — `dispatched → attached → working → waiting → completed/failed/cancelled`, plus `orphaned` (no contact past grace) and `unconfirmed` (turn failed, no explicit result).
 
@@ -184,7 +192,7 @@ reclaim-tabs({ runIds: ["tab_xxx", "tab_yyy"], wait: true, timeoutMs: 120000 })
 - Only an explicit `result.json` (via `tab-finish`) is a workflow-terminal state.
 - `stop`/`length` means *waiting for input*, not done. `toolUse` means working.
 - A terminal phase without a result is `resultMissing: true, completion: "unconfirmed"` — never treated as success.
-- `reclaim-tabs` never kills a tab and never fakes completion; on timeout it returns `timedOut` and you can poll again.
+- `reclaim-tabs` never blocks, never kills a tab and never fakes completion; on a snapshot it reports exactly what the ledger/state says. `waiting`/`orphaned`/missing-result are never counted as done.
 
 `tab-finish` (inside the tab) is the only explicit terminal signal: status/summary/artifacts/reportPath. The `runId` comes from the environment, so a tab cannot forge another run's result.
 
@@ -200,6 +208,12 @@ cancel-timer({ timerId: "timer_xxx" })
 ```
 
 When a timer expires the system **auto-sends a user message** to the target session (TUI-visible, human-steerable; busy sessions queue it via `followUp` so tool loops are never interrupted). `target: "self"` = current session; `target: { tabRunId }` = that tab's mailbox (`timers/mail/<runId>/`, consumed only by that tab). `launch-tabs` per-task `timers: [{delayMs, message}]` preloads a tab's mailbox at dispatch. `/timers` lists them. Subagents can neither set timers nor own tab identity.
+
+**Reliability & ownership (since 2026-08-13):**
+- **At-least-once delivery** — the scheduler sends the message *before* persisting terminal state, so a transient send failure keeps the timer `pending` and the next tick retries (a crash between send and persist may duplicate a nudge once; acceptable for push messages).
+- **Session heartbeat ownership** — self timers carry `ownerCwd`+`ownerSessionId`; the scheduler writes a heartbeat (`timers/sessions/<id>.json`) every tick. A timer is consumable only by its owner while the owner's heartbeat is fresh, preventing double-fire when two main sessions share a cwd; a dead owner's timers are reclaimed by any same-cwd session after the grace (15s) — restart takeover preserved.
+- **GC** — terminal timers (`fired/cancelled/missed`) older than 24h and stale heartbeats are swept every ~60s, so the ledger does not grow unbounded.
+- **Capacity** — up to 50 pending timers per target (self or a single tab mailbox).
 
 ### 5.3 Event bus — completion is felt, not polled
 
@@ -345,7 +359,7 @@ npm run smoke:real-tab          # real pi process (needs network/model)
 | `event-bus.ts` | fs.watch completion detection (main session) |
 | `report.ts` | tab → main active-report channel |
 | `links.ts` | provenance log |
-| `external-cli.ts` | Claude/Codex/Agy/AtomCode spawn runners |
+| `external-cli.ts` | Claude/Codex/Agy/AtomCode/ZCode spawn runners |
 | `codex-headers.ts`, `notify-windows.ts`, `launch.ts`, `wiki-nav.ts`, `wiki-semantic.ts` | supporting modules |
 
 ### How the event layer works

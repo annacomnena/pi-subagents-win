@@ -163,18 +163,16 @@ writeTabDispatch(runsDir, dispatch);
 
 	const reclaimTool = pi.findTool("reclaim-tabs");
 	assert.ok(reclaimTool, "应注册 reclaim-tabs");
-	const rcRes = await reclaimTool.execute("", { runIds: [TAB], wait: false }) as {
-		details?: { ready?: unknown[]; timedOut?: boolean };
-		isError?: boolean;
+	const rcRes = await reclaimTool.execute("", { runIds: [TAB] }) as {
+		details?: { ready?: unknown[]; pending?: unknown[] };
 	};
+	// 2026-08-13：reclaim-tabs 永不阻塞（wait/timeoutMs 为废弃 no-op），单次快照立即返回
 	assert.ok(rcRes.details && (rcRes.details.ready?.length ?? 0) >= 1, "已完成 tab 应进 ready");
-	assert.equal(rcRes.isError, false);
 
 	const rcWait = await reclaimTool.execute("", { runIds: [TAB], wait: true, timeoutMs: 2000, intervalMs: 100 }) as {
-		details?: { ready?: unknown[]; timedOut?: boolean };
+		details?: { ready?: unknown[]; pending?: unknown[] };
 	};
-	assert.ok(rcWait.details && (rcWait.details.ready?.length ?? 0) >= 1);
-	assert.equal(rcWait.details.timedOut, false);
+	assert.ok(rcWait.details && (rcWait.details.ready?.length ?? 0) >= 1, "wait 为 no-op：仍立即返回快照");
 }
 
 // ── reclaim wait 超时路径（未终态 tab 不应伪造完成）──────────────

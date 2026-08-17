@@ -6,9 +6,12 @@
  *   cli:codex
  *   cli:agy
  *   cli:atomcode
+ *   cli:zcode
  *
  * Never pass --model to the external harness; users configure models inside
- * Claude Code / Codex / Antigravity / AtomCode themselves.
+ * Claude Code / Codex / Antigravity / AtomCode themselves. ZCode is an
+ * exception: it is a Node.js script (zcode.cjs) fixed on GLM-5.3, so no model
+ * override applies there either.
  *
  * Spawns the local CLI harness instead of pi --mode json.
  * Windows-aware: resolves .exe/.cmd, process-group kill only on non-Windows.
@@ -20,7 +23,7 @@ import { randomUUID } from "node:crypto";
 
 // ── public types (kept compatible with index.ts SubagentResult) ────────────
 
-export type ExternalBackend = "claude" | "codex" | "agy" | "atomcode";
+export type ExternalBackend = "claude" | "codex" | "agy" | "atomcode" | "zcode";
 
 export interface ExternalUsageSummary {
 	input: number;
@@ -50,7 +53,7 @@ export interface ExternalSubagentResult {
 }
 
 export interface RunExternalCliParams {
-	/** Backend selector only: cli:claude | cli:codex | cli:agy | cli:atomcode */
+	/** Backend selector only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode */
 	modelRef: string;
 	task: string;
 	/** Role system prompt (agent body / override). */
@@ -64,7 +67,7 @@ export interface RunExternalCliParams {
 }
 
 export const EXTERNAL_CLI_PREFIX = "cli:";
-export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy", "atomcode"];
+export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy", "atomcode", "zcode"];
 
 const FORCE_KILL_DELAY_MS = 3000;
 const MAX_STDERR_CHARS = 128 * 1024;
@@ -106,12 +109,12 @@ export function normalizeExternalCliModel(raw?: string | null): string | undefin
 	if (!raw) return undefined;
 	const input = String(raw).trim();
 	if (!input) return undefined;
-	// Accept only: cli:claude | cli:codex | cli:agy | cli:atomcode (case-insensitive prefix/backend).
+	// Accept only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode (case-insensitive prefix/backend).
 	if (!isExternalCliModel(input)) return undefined;
 	const parsed = parseExternalCliModel(input);
 	if (!parsed) {
 		throw new Error(
-			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, cli:agy, or cli:atomcode (no model override; each CLI uses its own default model).`,
+			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, cli:agy, cli:atomcode, or cli:zcode (no model override; each CLI uses its own default model).`,
 		);
 	}
 	return parsed.canonical;
@@ -128,6 +131,7 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 			codex: "Codex CLI",
 			agy: "Antigravity CLI",
 			atomcode: "AtomCode CLI",
+			zcode: "ZCode CLI (GLM-5.3)",
 		};
 		const label = `cli:${backend}  — ${labelByBackend[backend]}, default model (${status})`;
 		opts.push({ ref: `${EXTERNAL_CLI_PREFIX}${backend}`, label });
@@ -136,7 +140,7 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 }
 
 export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
-	const out = { claude: false, codex: false, agy: false, atomcode: false } as Record<ExternalBackend, boolean>;
+	const out = { claude: false, codex: false, agy: false, atomcode: false, zcode: false } as Record<ExternalBackend, boolean>;
 	for (const b of EXTERNAL_BACKENDS) {
 		out[b] = Boolean(resolveExternalCommand(b));
 	}
@@ -146,6 +150,13 @@ export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
 // ── command resolution (Windows-aware) ─────────────────────────────────────
 
 function resolveExternalCommand(backend: ExternalBackend): string | undefined {
+	// Special case: zcode is a Node.js script (zcode.cjs), not a standalone
+	// executable — run it through node. The script's absolute path is appended
+	// by buildZcodeArgs/runZcode.
+	if (backend === "zcode") {
+		return "node";
+	}
+
 	const candidates =
 		process.platform === "win32"
 			? backend === "claude"
@@ -609,6 +620,52 @@ export function buildAtomcodeArgs(prompt: string): string[] {
 	return ["-y", "-p", prompt];
 }
 
+// ── ZCode ──────────────────────────────────────────────────────────────────
+
+export function buildZcodeArgs(prompt: string): string[] {
+	// zcode.cjs -p <prompt>: plain stdout capture of the final answer (the
+	// GLM-5.3 model is fixed by ~/.zcode/cli/config.json, never overridden).
+	// --cwd is appended by runZcode since it is per-call state.
+	return ["-p", prompt];
+}
+
+async function runZcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
+	const { base, runId } = ctx;
+	// ZCode uses a fixed GLM-5.3; system prompt and task merge into one prompt
+	// (no separate system-prompt or model channel in the -p headless path).
+	const promptParts = [ctx.systemPrompt, ctx.task].filter(Boolean);
+	const taskPrompt = promptParts.join("\n\n");
+
+	// Command: node "D:\Software\zcode\resources\glm\zcode.cjs" -p "<prompt>" --cwd "<cwd>"
+	// ctx.command is "node" (resolveExternalCommand special case), so args must
+	// carry the zcode.cjs script path.
+	const zcodeScript = "D:\\Software\\zcode\\resources\\glm\\zcode.cjs";
+	const args = [zcodeScript, ...buildZcodeArgs(taskPrompt), "--cwd", ctx.cwd];
+
+	const outcome = await spawnStreaming({
+		backend: "zcode",
+		command: ctx.command,
+		args,
+		cwd: ctx.cwd,
+		timeoutMs: ctx.timeoutMs ?? 600000, // default 10 minutes
+		signal: ctx.signal,
+		onUpdate: ctx.onUpdate,
+		captureStdout: true, // plain stdout capture (same as agy / AtomCode)
+	});
+
+	return finishStreamResult({
+		base,
+		runId,
+		modelLabel: base.requestedModel ?? "cli:zcode",
+		usage: emptyUsage(),
+		resultText: outcome.stdout,
+		eventError: undefined,
+		sawTerminal: true,
+		outcome,
+		backendLabel: "zcode",
+	});
+}
+
 // ── shared spawn runner ────────────────────────────────────────────────────
 
 interface StreamRunOptions {
@@ -841,6 +898,9 @@ export async function runExternalCli(params: RunExternalCliParams): Promise<Exte
 	}
 	if (backend === "agy") {
 		return runAgy({ ...params, backend, command, cwd, runId, base });
+	}
+	if (backend === "zcode") {
+		return runZcode({ ...params, backend, command, cwd, runId, base });
 	}
 	return runAtomcode({ ...params, backend, command, cwd, runId, base });
 }

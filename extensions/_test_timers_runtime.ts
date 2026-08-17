@@ -205,6 +205,77 @@ function makeTimer(overrides: Record<string, unknown>) {
 	delete process.env.PI_SUBAGENT;
 }
 
+// ── 回归：投递失败不丢消息（at-least-once，2026-08-13 P1）────────
+{
+	const tdir = mkdtempSync(join(tmpdir(), "timers-runtime-atleast-"));
+	writeTimerAtomic(tdir, makeTimer({ id: "t_retry" }));
+
+	// 第一次 pump：send 抛错 → 不得置 fired，保持 pending
+	const failPi = {
+		sendUserMessage: () => { throw new Error("send broken"); },
+	};
+	const failed = pumpDueTimers(failPi as never, tdir);
+	assert.equal(failed.length, 1);
+	assert.equal(failed[0]?.fired, false, "send 失败不算 fired");
+	assert.equal(readTimerFile(tdir, "t_retry")?.status, "pending", "send 失败必须保持 pending 供重试");
+
+	// 第二次 pump：send 恢复 → 正常触发并置 fired
+	const okPi = makeFakePi();
+	const ok = pumpDueTimers(okPi, tdir);
+	assert.equal(ok[0]?.fired, true, "重试后应成功触发");
+	assert.equal(okPi.calls.length, 1);
+	assert.equal(readTimerFile(tdir, "t_retry")?.status, "fired");
+
+	rmSync(tdir, { recursive: true, force: true });
+}
+
+// ── 回归：registerTimers 注册的工具可实际执行（防 isSubagentProcess 类闭包漏定义）──
+{
+	const { registerTimers } = await import("./timers-runtime.ts");
+	const tools = new Map<string, {
+		execute: (id: string, p: unknown, _s?: unknown, _u?: unknown, _c?: unknown) => Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }>;
+	}>();
+	const commands = new Map<string, {
+		handler: (args: string, ctx: { ui: { notify: (m: string, t?: string) => void } }) => Promise<void> | void;
+	}>();
+	const notifies: string[] = [];
+	const tdir = mkdtempSync(join(tmpdir(), "timers-runtime-regress-"));
+	delete process.env.PI_SUBAGENT;
+	delete process.env.PI_TAB_RUN_ID;
+
+	const pi = {
+		on: () => {},
+		registerTool: (t: { name: string; execute: unknown }) => { tools.set(t.name, t as never); },
+		registerCommand: (n: string, c: { handler: unknown }) => { commands.set(n, c as never); },
+		sendUserMessage: () => {},
+	} as never;
+	const cleanup = registerTimers(pi, { timersDir: tdir } as never);
+	assert.ok(cleanup, "应返回 cleanup");
+
+	// set-timer 实际执行（覆盖 4 处 isSubagentProcess 闭包路径之一）
+	const setRes = await tools.get("set-timer")!.execute("", { message: "回归测试推进", delayMs: 60_000, target: "self" });
+	const setText = setRes.content[0]?.text ?? "";
+	assert.ok(setText.includes("Timer set"), setText);
+	const id = setText.match(/timer_[A-Za-z0-9_]+/)?.[0];
+	assert.ok(id, "应返回 timer id");
+
+	// list-timers 应能看到
+	const listRes = await tools.get("list-timers")!.execute("", {});
+	assert.ok((listRes.content[0]?.text ?? "").includes(id), "list 应能看到刚创建的 timer");
+
+	// cancel-timer 取消
+	const cancelRes = await tools.get("cancel-timer")!.execute("", { timerId: id });
+	assert.ok((cancelRes.content[0]?.text ?? "").includes("cancelled"), cancelRes.content[0]?.text);
+
+	// /timers 命令 handler 实际执行（覆盖命令路径的 isSubagentProcess）
+	const timersCmd = commands.get("timers")!;
+	await timersCmd.handler("", { ui: { notify: (m: string) => notifies.push(m) } });
+	assert.ok(notifies.some((n) => n.includes("cancelled") && n.includes(id)), `应列出刚取消的 timer: ${notifies.join(" | ")}`);
+
+	cleanup();
+	rmSync(tdir, { recursive: true, force: true });
+}
+
 // ── 清理 ──────────────────────────────────────────────────────────
 rmSync(dir, { recursive: true, force: true });
 

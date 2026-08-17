@@ -130,6 +130,55 @@ function writeResult(runId: string, status = "completed") {
 	assert.equal(sent.length, 1, "不得重复注入");
 }
 
+// ── 会话定位：只注入给「派发该 tab 的会话」（2026-08-13，防 identityless 会话抢注入权）──
+{
+	_resetEventBus();
+	const sent: string[] = [];
+	const linksPath = join(dir, "links.jsonl");
+	const opts = {
+		runsDir: dir,
+		linksPath,
+		toast: false,
+		sendUserMessage: (content: string, _o?: unknown) => { sent.push(content); },
+	};
+
+	// links 溯源：tab_route1 由 session-B 派发
+	writeFileSync(linksPath, JSON.stringify({
+		sessionId: "session-B", kind: "tab", targetId: "tab_route1",
+		detail: "task=1", at: new Date().toISOString(), pid: 1,
+	}) + "\n", "utf8");
+	writeFileSync(join(dir, "tab_route1.result.json"), JSON.stringify({
+		id: "tab_route1", taskId: "1", status: "completed", finishedAt: new Date().toISOString(), summary: "s",
+	}), "utf8");
+
+	// 我是 session-A：不是派发方 → 跳过（不 claim、不注入、不 toast）
+	const { setCurrentSessionId } = await import("./identity.ts");
+	setCurrentSessionId("session-A");
+	const skipped = onTabResultFile(dir, "tab_route1.result.json", opts);
+	assert.equal(skipped, false, "非派发会话必须跳过");
+	assert.equal(sent.length, 0, "不得注入");
+	assert.equal(existsSync(join(dir, "tab_route1.notified")), false, "不得 claim（唤醒权留给真正派发会话）");
+
+	// 我是 session-B（派发方）：注入
+	_resetEventBus();
+	setCurrentSessionId("session-B");
+	const injected = onTabResultFile(dir, "tab_route1.result.json", opts);
+	assert.equal(injected, true, "派发会话应注入");
+	assert.equal(sent.length, 1, "应注入完成消息");
+	assert.ok(sent[0].includes("tab_route1"), sent[0]);
+
+	// 无溯源（旧账本无 sessionId）→ 回退 claim 先到先得（不阻断既有行为）
+	_resetEventBus();
+	setCurrentSessionId("session-A");
+	writeFileSync(join(dir, "tab_legacy.result.json"), JSON.stringify({
+		id: "tab_legacy", taskId: "2", status: "completed", finishedAt: new Date().toISOString(), summary: "legacy",
+	}), "utf8");
+	const legacy = onTabResultFile(dir, "tab_legacy.result.json", { ...opts });
+	assert.equal(legacy, true, "无溯源时回退注入");
+
+	setCurrentSessionId(undefined); // 清理，不污染后续
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log("event-bus tests passed");

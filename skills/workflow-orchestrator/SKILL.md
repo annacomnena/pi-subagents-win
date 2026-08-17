@@ -59,6 +59,7 @@ description: 使用 subagent-win 工具编排多步骤工作流（搜索→计�
 9. **Goal 默认不限预算** — `create_goal` 默认省略 `token_budget`
 10. **子 agent 读 AGENTS.md** — runtime 加载 context files；角色卡仍要求显式 `read AGENTS.md`
 11. **硬交接搜索结论 + Wiki 章节透传** — 主 agent 必须把 searcher 的「已验证事实」原文（每条含**代码位置 + Wiki 章节引用 + 校准状态**）或 research 路径写入下游 task；**并显式列出 searcher 产出的「Wiki 章节引用清单」与「Wiki 维护记录」，要求下游先 `read` 这些章节**。这些地址在本 workflow 内是规范输入：planner/implementer/reviewer 不得对已交接主题重跑 keywords/semantic/grep 猜地址，除非引用失效或要发现新主题。禁止假设子 agent 能看见主会话
+12. **完成必须 tab-finish 回报（强制）** — 本会话是主会话派发的任务 tab：全部工作（含 Wiki 收尾）完成后，**必须**调用 `tab-finish` 回报（status=completed + summary + 交付物 artifacts/reportPath）。只有 tab-finish 写入 result.json 才会触发 event-bus 唤醒主会话去 reclaim 并编排下一批；**不调 tab-finish = 未完成，主会话会一直等你**。绝不在未调用 tab-finish 的情况下直接结束回合。
 
 ## Goal 模式与 token 预算（默认不限制）
 
@@ -262,6 +263,8 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
    - [ ] 全文检索不应出现新建的 `task`/`itemNN`/`#NN` Wiki 文件
    - [ ] `recentwork.md`（如有）一行：改了哪些正式 Wiki 页，或「Wiki 更新：无」
 
+5. **回报主会话（强制）**：上述全部收尾完成后，调用 `tab-finish`（status=completed + summary + 交付物 artifacts/reportPath）向主会话回报。只有 tab-finish 才是工作流终态信号——主会话靠它被 event-bus 唤醒去 reclaim 并编排下一批；**不调 tab-finish = 未完成，主会话会一直等你**。
+
 **recentwork.md**
 
 - 改了哪些文件、计划路径、**正式功能 Wiki 页列表或「无」**（一行级摘要）
@@ -295,6 +298,8 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 同完整链路阶段 5：只更新/新建**主题向**正式页（委派 searcher 或自己改），改后 `wiki-nav rebuild`；无变化则结论「Wiki 更新：无」。验收：无任务号 / Explorations 页；全文检索无 `itemNN` / `#NN` 新建文件。
 
+**回报主会话（强制）**：研究报告 + Wiki 收尾全部完成后，调用 `tab-finish`（status=completed + summary + reportPath 指向 `plans/*_research.md`）向主会话回报；不调 tab-finish = 研究任务未完成。
+
 > 若研究过程中发现必须实现 → 回主会话说明，由用户决定是否升级为完整链路（重新用 `mode: "workflow"` 启动或按完整链路续跑）。
 
 ## 工作流：快速执行模式（execute-only）
@@ -317,6 +322,8 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 ### 阶段 E3：Wiki 收尾
 
 同完整链路阶段 5：只更新/新建**主题向**正式页；改后 `wiki-nav rebuild`；无变化则结论「Wiki 更新：无」。验收：无任务号 / Explorations 页。
+
+**回报主会话（强制）**：实现 + 审查 + Wiki 收尾全部完成后，调用 `tab-finish`（status=completed + summary + 交付物 artifacts / reportPath）向主会话回报；不调 tab-finish = 执行任务未完成。
 
 ## 落盘时机速查
 
@@ -363,7 +370,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
    - fallback 链也用尽（默认+所有 fallback 都失败，如整链 USAGE_CAP）；
    - **用户明确指定**某个模型/agent；
    - 配置模型对本任务**明显不合适**（上下文太小、能力不匹配）。
-3. override 时优先用普通 `provider/id`；**勿主动切外部 CLI**（`cli:claude/codex/agy/atomcode`），除非该 agent 的配置本就用它、或用户明确要求——「存在某个 cli: 后端」本身绝不是用它的理由。
+3. override 时优先用普通 `provider/id`；**勿主动切外部 CLI**（`cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode`），除非该 agent 的配置本就用它、或用户明确要求——「存在某个 cli: 后端」本身绝不是用它的理由。
 
 ### 机制
 

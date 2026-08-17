@@ -13,7 +13,7 @@
  * 不注册调度器、不接入 pi API、不修改 launch 流程。
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -25,6 +25,10 @@ export const MAX_TIMER_MESSAGE = 2048;
 export const MAX_PENDING_TIMERS = 50;
 /** repeatMs 下限（防止自触发风暴）。必须 > 调度器 TICK_MS(5000)，否则同 tick 内可能重入（P2-4）。 */
 export const MIN_REPEAT_MS = 10_000;
+/** 终态 timer（fired/cancelled/missed）超过该时长即归档删除（防账本无限膨胀，2026-08-13）。 */
+export const TERMINAL_TIMER_TTL_MS = 24 * 60 * 60 * 1000;
+/** session 心跳失活判定宽限（须 > 调度器 TICK_MS=5000，避免同会话 tick 抖动误判失活）。 */
+export const SESSION_HEARTBEAT_GRACE_MS = 15_000;
 
 // ── 类型 ──────────────────────────────────────────────────────────
 
@@ -75,13 +79,18 @@ export function defaultTimersDir(agentDir: string = join(homedir(), ".pi", "agen
 	return join(agentDir, "timers");
 }
 
-/** 某标签页的邮箱目录：<timersDir>/mail/<tabRunId>。 */
+/** id 组件安全字符（防路径注入：tabRunId/timerId 均来自工具参数或目录条目）。 */
+export const SAFE_ID_PART = /^[A-Za-z0-9._-]{1,160}$/;
+
+/** 某标签页的邮箱目录：<timersDir>/mail/<tabRunId>。tabRunId 必须为安全字符（防路径注入）。 */
 export function mailboxDirForTab(timersDir: string, tabRunId: string): string {
+	if (!SAFE_ID_PART.test(tabRunId)) throw new Error(`unsafe tabRunId component: ${tabRunId}`);
 	return join(timersDir, "mail", tabRunId);
 }
 
 /** 单个 timer 的账本文件路径：target=self → <timersDir>/<id>.json；tab → mail/<tabRunId>/<id>.json。 */
 export function timerFilePath(timersDir: string, timerId: string, tabRunId?: string): string {
+	if (!SAFE_ID_PART.test(timerId)) throw new Error(`unsafe timerId component: ${timerId}`);
 	return tabRunId ? join(mailboxDirForTab(timersDir, tabRunId), `${timerId}.json`) : join(timersDir, `${timerId}.json`);
 }
 
@@ -264,7 +273,7 @@ export function listTimerFiles(timersDir: string, tabRunId?: string): string[] {
 	const dir = tabRunId ? mailboxDirForTab(timersDir, tabRunId) : timersDir;
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
-		.filter((f) => f.endsWith(".json") && !f.endsWith(".tmp"))
+		.filter((f) => f.endsWith(".json") && !f.endsWith(".tmp") && SAFE_ID_PART.test(f.slice(0, -".json".length)))
 		.map((f) => f.slice(0, -".json".length));
 }
 
@@ -298,12 +307,124 @@ export function normalizeCwd(cwd: string): string {
  * （修复 2026-08-11：无身份的任意 pi 会话都会抢 root timer，导致
  * 编排消息落到无关目录的会话）。需要的话重新 set-timer 即可。
  */
-export function rootTimerConsumable(record: TimerRecord, cwd: string): boolean {
+export function rootTimerConsumable(
+	record: TimerRecord,
+	cwd: string,
+	opts?: { timersDir?: string; sessionId?: string; now?: Date },
+): boolean {
 	if (!record.ownerCwd) return false;
-	return normalizeCwd(record.ownerCwd) === normalizeCwd(cwd);
+	if (normalizeCwd(record.ownerCwd) !== normalizeCwd(cwd)) return false;
+	// 2026-08-13（P1 同 cwd 多会话双发窗口）：双方已知会话 ID 时——
+	//   owner 心跳存活 → 只有 owner 自己可消费（防双发）；
+	//   owner 心跳失活/缺失 → 其他同目录会话可接手（重启后新会话接管耐久性）。
+	// 任一 ID 缺失 → 退回 cwd 匹配（兼容旧账本 / 无身份进程）。
+	const sid = opts?.sessionId;
+	if (sid && record.ownerSessionId && record.ownerSessionId !== sid) {
+		if (!opts?.timersDir) return false; // 无法探活：保守不消费（宁可等待，不双发）
+		return !sessionAlive(opts.timersDir, record.ownerSessionId, opts?.now);
+	}
+	return true;
 }
 
 /** 统计 pending 数（用于 MAX_PENDING_TIMERS 限制）。 */
 export function countPending(timersDir: string, tabRunId?: string): number {
 	return readAllTimers(timersDir, tabRunId).filter((r) => r.status === "pending").length;
+}
+
+// ── session 心跳（2026-08-13：同 cwd 多主会话所有权门槛的活性依据）────
+
+/** 会话 ID 转安全文件名组件（仅用于心跳文件名；记录内比较仍用原始 ID）。 */
+function safeSessionId(sessionId: string): string {
+	return encodeURIComponent(sessionId);
+}
+
+/** session 心跳文件路径：<timersDir>/sessions/<encodedId>.json。 */
+export function sessionHeartbeatPath(timersDir: string, sessionId: string): string {
+	return join(timersDir, "sessions", `${safeSessionId(sessionId)}.json`);
+}
+
+/** 原子写小 JSON（心跳用；tmp+rename）。 */
+function writeJsonAtomic(file: string, value: unknown): void {
+	const dir = dirname(file);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const tmp = `${file}.tmp`;
+	writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
+	renameSync(tmp, file);
+}
+
+/** 刷新本会话心跳（调度器每 tick 在 identityless 路径调用）。 */
+export function touchSessionHeartbeat(timersDir: string, sessionId: string, now: Date = new Date()): void {
+	writeJsonAtomic(sessionHeartbeatPath(timersDir, sessionId), {
+		sessionId,
+		lastActiveAt: now.toISOString(),
+	});
+}
+
+/** 会话是否存活：心跳存在且 lastActiveAt 在宽限内。 */
+export function sessionAlive(
+	timersDir: string,
+	sessionId: string,
+	now: Date = new Date(),
+	graceMs: number = SESSION_HEARTBEAT_GRACE_MS,
+): boolean {
+	const file = sessionHeartbeatPath(timersDir, sessionId);
+	if (!existsSync(file)) return false;
+	try {
+		const raw = JSON.parse(readFileSync(file, "utf8")) as { lastActiveAt?: string };
+		if (typeof raw.lastActiveAt !== "string") return false;
+		return now.getTime() - Date.parse(raw.lastActiveAt) < graceMs;
+	} catch {
+		return false;
+	}
+}
+
+/** 清理失活会话的心跳文件（返回清理数）。 */
+export function sweepStaleHeartbeats(
+	timersDir: string,
+	opts?: { now?: Date; graceMs?: number },
+): number {
+	const dir = join(timersDir, "sessions");
+	if (!existsSync(dir)) return 0;
+	const now = opts?.now ?? new Date();
+	const grace = opts?.graceMs ?? SESSION_HEARTBEAT_GRACE_MS;
+	let swept = 0;
+	for (const f of readdirSync(dir)) {
+		if (!f.endsWith(".json") || f.endsWith(".tmp")) continue;
+		let id: string;
+		try {
+			id = decodeURIComponent(f.slice(0, -".json".length));
+		} catch {
+			continue; // 非本模块命名的文件，跳过
+		}
+		if (!sessionAlive(timersDir, id, now, grace)) {
+			rmSync(join(dir, f), { force: true });
+			swept++;
+		}
+	}
+	return swept;
+}
+
+// ── 终态 GC（2026-08-13：fired/cancelled/missed 超过 TTL 即归档删除）────
+
+/** 清理超过 TTL 的终态 timer 文件（返回清理数）；pending 永不清理。 */
+export function sweepTerminalTimers(
+	timersDir: string,
+	tabRunId?: string,
+	opts?: { now?: Date; maxAgeMs?: number },
+): number {
+	const now = opts?.now ?? new Date();
+	const maxAge = opts?.maxAgeMs ?? TERMINAL_TIMER_TTL_MS;
+	const dir = tabRunId ? mailboxDirForTab(timersDir, tabRunId) : timersDir;
+	if (!existsSync(dir)) return 0;
+	let swept = 0;
+	for (const id of listTimerFiles(timersDir, tabRunId)) {
+		const r = readTimerFile(timersDir, id, tabRunId);
+		if (!r || r.status === "pending") continue;
+		const terminalAt = Date.parse(r.firedAt ?? r.createdAt);
+		if (now.getTime() - terminalAt > maxAge) {
+			rmSync(timerFilePath(timersDir, id, tabRunId), { force: true });
+			swept++;
+		}
+	}
+	return swept;
 }

@@ -35,10 +35,6 @@ import {
 	type TabStatusView,
 } from "./tab-runs.ts";
 
-const RECLAIM_DEFAULT_TIMEOUT_MS = 120_000;
-const RECLAIM_DEFAULT_INTERVAL_MS = 3_000;
-const RECLAIM_MAX_TIMEOUT_MS = 10 * 60_000;
-
 // ── 标签页遥测 + tab-finish ───────────────────────────────────────
 
 /**
@@ -156,6 +152,7 @@ export function registerTabTelemetry(
 			"（标签页内部工具）声明本标签页工作流终态：把结构化结果原子写入 tab-runs/<runId>.result.json。",
 			"参数：status（completed|failed|cancelled）、summary、可选 finalText/artifacts[]/reportPath/openIssues[]/usage。",
 			"runId 取自进程环境（PI_TAB_RUN_ID），不接受外部传入——防止伪造其他 runId。",
+			"【完成回报 · 强制】你是主会话派发的任务 tab：全部工作完成后**必须**调用本工具向主会话回报（status=completed + summary + 交付物）——只有 result.json 才会触发 event-bus 唤醒主会话去 reclaim 并编排下一批；不调本工具 = 未完成，主会话会一直等你。",
 			"只有调用了本工具（或明确失败事件）才代表工作流完成；普通回合 stop 不算完成。",
 			"重复调用拒绝（结果只写一次）。",
 		].join(" "),
@@ -424,26 +421,27 @@ export function registerTabStatusTools(
 		name: "reclaim-tabs",
 		label: "Reclaim Tabs",
 		description: [
-			"回收标签页结果并编排下一批：reclaim-tabs({ runIds, wait?, timeoutMs?, intervalMs?, includeText? })。",
-			"wait=false：立即返回当前快照。wait=true：轮询直到全部终态（terminal 且结果存在）或超时；超时不杀进程、不伪造完成。",
+			"回收标签页结果：reclaim-tabs({ runIds, includeText? })。",
+			"永不阻塞、立即返回当前快照（2026-08-13 起移除轮询硬等；wait/timeoutMs/intervalMs 为废弃参数，仅向后兼容，调用方不应依赖）。",
+			"完成感知交给 event-bus（子 tab 写 result.json 自动唤醒主会话），编排巡检用 set-timer。",
 			"返回 ready[]（终态可取结果）/ pending[]（进行中）/ awaitingInput[]（等待输入，非完成）/ failed[]（unconfirmed 或派发失败）/ orphaned[]。",
 			"result 缺失的终态标 resultMissing=true + completion=unconfirmed，绝不静默当成功。",
 		].join(" "),
 		parameters: Type.Object({
 			runIds: Type.Array(Type.String(), { description: "要回收的 runId 列表（launch-tabs 返回）" }),
-			wait: Type.Optional(Type.Boolean({ description: "是否轮询等待终态（默认 true）" })),
-			timeoutMs: Type.Optional(Type.Number({ description: `等待超时（默认 ${RECLAIM_DEFAULT_TIMEOUT_MS}，最大 ${RECLAIM_MAX_TIMEOUT_MS}）` })),
-			intervalMs: Type.Optional(Type.Number({ description: `轮询间隔（默认 ${RECLAIM_DEFAULT_INTERVAL_MS}）` })),
+			wait: Type.Optional(Type.Boolean({ description: "（废弃）忽略：本工具永不阻塞等待" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "（废弃）忽略" })),
+			intervalMs: Type.Optional(Type.Number({ description: "（废弃）忽略" })),
 			includeText: Type.Optional(Type.Boolean({ description: "返回 lastAssistantText" })),
 		}),
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("reclaim-tabs"))} ${theme.fg("accent", `${args.runIds.length} tabs`)}${args.wait === false ? theme.fg("dim", " (snapshot)") : ""}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("reclaim-tabs"))} ${theme.fg("accent", `${args.runIds.length} tabs`)}`, 0, 0);
 		},
 		renderResult(result, { expanded }, theme) {
-			const d = result.details as { ready?: unknown[]; pending?: unknown[]; awaitingInput?: unknown[]; failed?: unknown[]; orphaned?: unknown[]; timedOut?: boolean } | undefined;
+			const d = result.details as { ready?: unknown[]; pending?: unknown[]; awaitingInput?: unknown[]; failed?: unknown[]; orphaned?: unknown[] } | undefined;
 			if (!d) return new Text("", 0, 0);
-			const summary = `ready=${d.ready?.length ?? 0} pending=${d.pending?.length ?? 0} awaitingInput=${d.awaitingInput?.length ?? 0} failed=${d.failed?.length ?? 0} orphaned=${d.orphaned?.length ?? 0}${d.timedOut ? " ⏱timedOut" : ""}`;
-			if (!expanded) return new Text(theme.fg(d.timedOut ? "warning" : "success", `reclaim-tabs: ${summary}`), 0, 0);
+			const summary = `ready=${d.ready?.length ?? 0} pending=${d.pending?.length ?? 0} awaitingInput=${d.awaitingInput?.length ?? 0} failed=${d.failed?.length ?? 0} orphaned=${d.orphaned?.length ?? 0}`;
+			if (!expanded) return new Text(theme.fg("success", `reclaim-tabs: ${summary}`), 0, 0);
 			const c = new Container();
 			c.addChild(new Text(theme.fg("toolTitle", `reclaim-tabs: ${summary}`), 0, 0));
 			for (const [label, group] of [["ready", d.ready], ["pending", d.pending], ["awaitingInput", d.awaitingInput], ["failed", d.failed], ["orphaned", d.orphaned]] as const) {
@@ -458,44 +456,23 @@ export function registerTabStatusTools(
 		},
 		async execute(_toolCallId, rawParams) {
 			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可回收标签页" }], isError: true };
-			const p = rawParams as { runIds?: string[]; wait?: boolean; timeoutMs?: number; intervalMs?: number; includeText?: boolean };
+			const p = rawParams as { runIds?: string[]; includeText?: boolean };
 			const runIds = (p.runIds ?? []).filter((id) => typeof id === "string" && id);
 			if (runIds.length === 0) return { content: [{ type: "text", text: "runIds 必填" }], isError: true };
 
-			const wait = p.wait !== false;
-			const timeoutMs = Math.min(p.timeoutMs ?? RECLAIM_DEFAULT_TIMEOUT_MS, RECLAIM_MAX_TIMEOUT_MS);
-			const intervalMs = Math.max(500, p.intervalMs ?? RECLAIM_DEFAULT_INTERVAL_MS);
-
-			const snapshot = (): Map<string, TabStatusView> => {
-				const map = new Map<string, TabStatusView>();
-				for (const id of runIds) map.set(id, buildTabStatusView(runsDir, id, sessionsRoot));
-				return map;
-			};
-
-			const deadline = Date.now() + timeoutMs;
-			let views = snapshot();
-			if (wait) {
-				while (Date.now() < deadline) {
-					const allTerminal = [...views.values()].every((v) => TERMINAL_PHASES.has(v.phase) && !v.resultMissing);
-					if (allTerminal) break;
-					await sleep(intervalMs);
-					views = snapshot();
-				}
-			}
+			// 永不阻塞：单次快照立即返回；完成感知交给 event-bus / set-timer 巡检
+			const views = new Map<string, TabStatusView>();
+			for (const id of runIds) views.set(id, buildTabStatusView(runsDir, id, sessionsRoot));
 
 			const groups = { ready: [] as Record<string, unknown>[], pending: [] as Record<string, unknown>[], awaitingInput: [] as Record<string, unknown>[], failed: [] as Record<string, unknown>[], orphaned: [] as Record<string, unknown>[] };
-			let timedOut = false;
 			for (const view of views.values()) {
 				const kind = classifyForReclaim(view);
 				const brief = viewToBrief(view);
 				if (TERMINAL_PHASES.has(view.phase) && !view.resultMissing) brief.completion = "confirmed";
 				else if (TERMINAL_PHASES.has(view.phase)) brief.completion = "unconfirmed";
 				groups[kind].push(brief);
-				if (kind === "pending" || kind === "awaitingInput" || kind === "orphaned") {
-					if (Date.now() >= deadline && wait) timedOut = true;
-				}
 			}
-			const summary = `ready=${groups.ready.length} pending=${groups.pending.length} awaitingInput=${groups.awaitingInput.length} failed=${groups.failed.length} orphaned=${groups.orphaned.length}${timedOut ? " timedOut" : ""}`;
+			const summary = `ready=${groups.ready.length} pending=${groups.pending.length} awaitingInput=${groups.awaitingInput.length} failed=${groups.failed.length} orphaned=${groups.orphaned.length}`;
 			return {
 				content: [{
 					type: "text",
@@ -507,8 +484,7 @@ export function registerTabStatusTools(
 						groups.orphaned.length ? `orphaned:\n${groups.orphaned.map((r) => `  ☠ ${r.runId}`).join("\n")}` : "",
 					].filter(Boolean).join("\n"),
 				}],
-				details: { ...groups, timedOut },
-				isError: timedOut && groups.ready.length === 0,
+				details: { ...groups },
 			};
 		},
 	});
@@ -535,10 +511,6 @@ export function registerTabStatusTools(
 			ctx.ui.notify(`Tabs (${ids.length}):\n${lines.join("\n")}`, "info");
 		},
 	});
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** 派发列表助手（供 /tabs 与 smoke 使用）。 */

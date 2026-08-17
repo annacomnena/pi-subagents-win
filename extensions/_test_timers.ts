@@ -20,7 +20,12 @@ import {
 	readAllTimers,
 	readTimerFile,
 	remainingMs,
+	rootTimerConsumable,
+	sessionAlive,
+	sweepStaleHeartbeats,
+	sweepTerminalTimers,
 	timerFilePath,
+	touchSessionHeartbeat,
 	validateTimerRecord,
 	writeTimerAtomic,
 } from "./timers.ts";
@@ -181,6 +186,63 @@ function sampleTimer(overrides: Record<string, unknown> = {}): Record<string, un
 
 	assert.equal(countPending(sub), 2, "pending 计数不含 fired");
 	assert.equal(MAX_PENDING_TIMERS, 50, "上限常量不变");
+}
+
+// ── 路径安全：危险 id 必须拒绝（防路径注入，2026-08-13）───────────
+{
+	assert.throws(() => mailboxDirForTab(dir, "..\\evil"), /unsafe/);
+	assert.throws(() => timerFilePath(dir, "..\\evil"), /unsafe/);
+	assert.throws(() => timerFilePath(dir, "timer/x"), /unsafe/);
+	assert.doesNotThrow(() => timerFilePath(dir, "timer_ok_1"));
+}
+
+// ── 心跳 / 所有权门槛 / 终态 GC（2026-08-13 P1/P2）───────────────
+{
+	const hbDir = join(dir, "hb");
+	const sidA = "session-a";
+	const sidB = "session-b";
+
+	// 心跳：touch 后存活；超过宽限失活
+	assert.equal(sessionAlive(hbDir, sidA), false, "无心跳 → 失活");
+	touchSessionHeartbeat(hbDir, sidA, new Date());
+	assert.equal(sessionAlive(hbDir, sidA, new Date(Date.now() + 5_000)), true, "宽限内 → 存活");
+	assert.equal(sessionAlive(hbDir, sidA, new Date(Date.now() + 20_000)), false, "超过宽限 → 失活");
+
+	// 所有权门槛：owner 存活时其他会话不得消费
+	const owned = validateTimerRecord(sampleTimer({ id: "timer_owner1", ownerCwd: process.cwd(), ownerSessionId: sidA })).value!;
+	assert.equal(rootTimerConsumable(owned, process.cwd(), { timersDir: hbDir, sessionId: sidB }), false, "owner 存活 → 其他会话不得消费（防双发）");
+	assert.equal(rootTimerConsumable(owned, process.cwd(), { timersDir: hbDir, sessionId: sidA }), true, "owner 自己 → 可消费");
+	assert.equal(rootTimerConsumable(owned, process.cwd()), true, "无 sessionId 上下文 → 退回 cwd 匹配");
+
+	// owner 失活（心跳缺失）→ 其他会话可接管（重启接管耐久性）
+	const hbDir2 = join(dir, "hb2");
+	const staleOwned = validateTimerRecord(sampleTimer({ id: "timer_owner2", ownerCwd: process.cwd(), ownerSessionId: "session-dead" })).value!;
+	assert.equal(rootTimerConsumable(staleOwned, process.cwd(), { timersDir: hbDir2, sessionId: sidB }), true, "owner 心跳缺失 → 可接管");
+
+	// 无 timersDir 且 ID 不同 → 保守不消费
+	assert.equal(rootTimerConsumable(owned, process.cwd(), { sessionId: sidB }), false, "无法探活时保守不消费");
+
+	// sweepStaleHeartbeats 清理失活心跳
+	touchSessionHeartbeat(hbDir, sidA, new Date(Date.now() - 60_000));
+	assert.equal(sweepStaleHeartbeats(hbDir), 1, "失活心跳应被清理");
+
+	// 终态 GC：超 TTL 的 fired 被清，新的/pending 保留
+	const gcDir = join(dir, "gc");
+	writeTimerAtomic(gcDir, validateTimerRecord(sampleTimer({
+		id: "t_old_fired",
+		status: "fired",
+		firedAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+	})).value!);
+	writeTimerAtomic(gcDir, validateTimerRecord(sampleTimer({
+		id: "t_new_fired",
+		status: "fired",
+		firedAt: new Date().toISOString(),
+	})).value!);
+	writeTimerAtomic(gcDir, validateTimerRecord(sampleTimer({ id: "t_pending_gc" })).value!);
+	assert.equal(sweepTerminalTimers(gcDir), 1, "仅清理超 TTL 的终态 timer");
+	assert.equal(existsSync(join(gcDir, "t_old_fired.json")), false);
+	assert.equal(existsSync(join(gcDir, "t_new_fired.json")), true);
+	assert.equal(existsSync(join(gcDir, "t_pending_gc.json")), true, "pending 不清理");
 }
 
 console.log("timers tests passed");
