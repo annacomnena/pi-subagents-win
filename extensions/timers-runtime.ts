@@ -145,7 +145,6 @@ function fireOneTimer(
  */
 export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }): (() => void) | undefined {
 	const timersDir = opts?.timersDir ?? defaultTimersDir();
-	const isSubagentProcess = isSubagent();
 
 	// ── 进程内调度器（子 agent 不调度）──
 	let sessionGen = 0; // 每 session 周期自增；tick 携带启动时 gen，过期 no-op
@@ -202,6 +201,16 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 		interval = setInterval(tick, TICK_MS);
 		interval.unref?.();
 	});
+
+	const cleanup = () => {
+		sessionGen++; // 使当前周期 closed → 排队 tick no-op
+		if (bootTimer) clearTimeout(bootTimer);
+		if (interval) clearInterval(interval);
+	};
+
+	// 子 agent 只执行委派工作，绝不暴露或管理计时器；tab 保持既有的
+	// 自己邮箱计时能力，便于主会话投递后的独立推进。
+	if (isSubagent()) return cleanup;
 
 	// ── 写目标解析：主会话 → 根目录（self）或邮箱（tab）；标签页 → 仅自己邮箱 ──
 	const resolveWriteScope = (
@@ -271,7 +280,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 			const myRunId = getTabRunId();
 			const ownerSessionId = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
 
-			if (isSubagentProcess) {
+			if (isSubagent()) {
 				return { content: [{ type: "text", text: "子 agent 中不可设置计时器" }], isError: true };
 			}
 			if (!message) {
@@ -358,7 +367,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 		},
 		async execute(_toolCallId, rawParams) {
 			const p = rawParams as { timerId?: string; tabRunId?: string };
-			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
+			if (isSubagent()) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
 			const timerId = (p.timerId ?? "").trim();
 			if (!timerId) return { content: [{ type: "text", text: "timerId 必填" }], isError: true };
 
@@ -406,7 +415,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			const p = rawParams as { status?: string; tabRunId?: string };
-			if (isSubagentProcess) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
+			if (isSubagent()) return { content: [{ type: "text", text: "子 agent 中不可操作计时器" }], isError: true };
 			const filter = p.status as TimerRecord["status"] | undefined;
 			const scope = resolveWriteScope(p.tabRunId ? { tabRunId: p.tabRunId } : undefined);
 			if ("error" in scope) return { content: [{ type: "text", text: scope.error }], isError: true };
@@ -438,7 +447,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 	pi.registerCommand("timers", {
 		description: "列出当前进程的计时器（人类视角）",
 		handler: async (args, ctx) => {
-			if (isSubagentProcess) {
+			if (isSubagent()) {
 				ctx.ui.notify("子 agent 中不可操作计时器", "warning");
 				return;
 			}
@@ -464,11 +473,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 		},
 	});
 
-	return () => {
-		sessionGen++; // 使当前周期 closed → 排队 tick no-op
-		if (bootTimer) clearTimeout(bootTimer);
-		if (interval) clearInterval(interval);
-	};
+	return cleanup;
 }
 
 /** 供 /timers 或调试使用：当前进程拥有的 timer 目录。 */

@@ -758,11 +758,12 @@ async function runSingle(
 	const cliPath = findPiCli();
 	// 保留项目 AGENTS.md / CLAUDE.md 注入（勿加 --no-context-files）。
 	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
-	// 同时排除 launch-tabs —— 子 agent 禁止开新标签页（launch 编排只属于主会话）。
+	// 同时排除 launch-tabs 与 timer 管理工具：子 agent 只执行工作，
+	// 不得开新标签页，也不得创建/查询/取消计时器（编排只属于主会话）。
 	const argv = [
 		cliPath,
 		"--mode", "json", "--print", "--no-session",
-		"--exclude-tools", "subagent-win,launch-tabs",
+		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
 	];
 	if (resolvedModel) argv.push("--model", resolvedModel);
 	if (resolvedThinking) argv.push("--thinking", resolvedThinking);
@@ -1475,7 +1476,8 @@ export default function (pi: ExtensionAPI) {
 	const cleanups: Array<() => void> = [];
 	const collect = (fn: (() => void) | undefined): void => { if (fn) cleanups.push(fn); };
 
-	// 计时器：到期自动向目标会话发送用户消息推进工作（超长程任务基础设施）
+	// 计时器：主会话与 tab 保持既有计时能力；子 agent 既不注册也不消费
+	// （registerTimers 内按身份做纵深隔离，spawn argv 亦从工具表排除）。
 	collect(registerTimers(pi));
 
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
@@ -1629,8 +1631,9 @@ export default function (pi: ExtensionAPI) {
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
-	if (isSubagentProcess) {
-		// 子 agent：跳过 launch-tabs 工具注册（双重防护，见 runSingle 的 --exclude-tools）
+	const canOrchestrateTabs = isMainSession(); // 只允许主会话，禁止标签页与子 agent
+	if (!canOrchestrateTabs) {
+		// 标签页 / 子 agent：跳过 launch-tabs 工具注册（防止孙 tab 派发）
 	} else {
 	pi.registerTool({
 		name: "launch-tabs",
@@ -1679,6 +1682,11 @@ export default function (pi: ExtensionAPI) {
 			return new Text(`${theme.fg(ok === results.length ? "success" : "warning", `launch-tabs ${ok}/${results.length}`)}${lines.length ? `\\n${lines.join("\\n")}` : ""}`, 0, 0);
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
+			// 运行时防护：只允许主会话调用 launch-tabs
+			if (!isMainSession()) {
+				return { content: [{ type: "text", text: "launch-tabs 只允许主会话调用；标签页会话请用 subagent-win 委派各角色，或用 tab-finish 回报主会话。" }], isError: true };
+			}
+
 			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }> }> };
 			const input = params.tasks ?? [];
 			if (input.length === 0) {
@@ -2372,9 +2380,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── /launch 命令（子 agent 进程不注册）──
-	if (isSubagentProcess) {
-		// 子 agent：跳过 /launch 命令（双重防护）
+	// ── /launch 命令（只允许主会话）──
+	if (!canOrchestrateTabs) {
+		// 标签页 / 子 agent：跳过 /launch 命令（防止孙 tab 派发）
 	} else {
 	pi.registerCommand("launch", {
 		description: "编排可见 pi 标签页；/launch -t <标题> 或 --direct 才直接启动单个任务",

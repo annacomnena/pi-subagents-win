@@ -197,12 +197,35 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.ok((handlers["session_start"] ?? []).length >= 1, "应在 session_start 注册调度器");
 	cleanup?.();
 
-	// 子 agent：handler 仍注册但内部 isSubagent 检查跳过调度（工厂不返回调度器启动）
+	// 子 agent：既不调度，也绝不向模型注册 timer 管理工具或 /timers。
+	const subagentTools: string[] = [];
+	const subagentCommands: string[] = [];
 	process.env.PI_SUBAGENT = "1";
-	const cleanupSub = registerTimers(makePi() as never);
+	const cleanupSub = registerTimers({
+		...makePi(),
+		registerTool: (t: { name: string }) => subagentTools.push(t.name),
+		registerCommand: (name: string) => subagentCommands.push(name),
+	} as never);
 	assert.ok(typeof cleanupSub === "function", "子 agent 也返回 cleanup（幂等安全）");
+	assert.deepEqual(subagentTools, [], "子 agent 不得看到计时器工具");
+	assert.deepEqual(subagentCommands, [], "子 agent 不得看到 /timers 命令");
 	cleanupSub?.();
 	delete process.env.PI_SUBAGENT;
+
+	// tab 维持既有权限：可管理自己的邮箱 timer（跨 tab 写入另有 resolveWriteScope 限制）。
+	const tabTools: string[] = [];
+	const tabCommands: string[] = [];
+	process.env.PI_TAB_RUN_ID = "tab_timer_test";
+	const cleanupTab = registerTimers({
+		...makePi(),
+		registerTool: (t: { name: string }) => tabTools.push(t.name),
+		registerCommand: (name: string) => tabCommands.push(name),
+	} as never);
+	assert.ok(typeof cleanupTab === "function", "tab 应保留 timer 邮箱调度器 cleanup");
+	assert.deepEqual(tabTools, ["set-timer", "cancel-timer", "list-timers"], "tab 应保留自己的 timer 工具");
+	assert.deepEqual(tabCommands, ["timers"], "tab 应保留 /timers 命令");
+	cleanupTab?.();
+	delete process.env.PI_TAB_RUN_ID;
 }
 
 // ── 回归：投递失败不丢消息（at-least-once，2026-08-13 P1）────────
