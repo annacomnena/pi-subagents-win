@@ -3,6 +3,7 @@
 ## [Unreleased] — 2026-08-13
 
 ### Added
+- External CLI backend `cli:mimo` (MimoCode): resolves `MIMOCODE_BIN`, then `%USERPROFILE%\.mimocode\bin\mimo.exe`, then PATH; runs `mimo run <prompt> --format json --dangerously-skip-permissions --dir <cwd>` and parses its JSON event stream. The CLI's own configured provider/model and credentials remain authoritative.
 - External CLI backends: `cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode` (the latter spawns `node D:\Software\zcode\resources\glm\zcode.cjs -p <prompt> --cwd <cwd>`, plain stdout capture, fixed GLM-5.3)
 
 ### Changed

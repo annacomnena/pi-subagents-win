@@ -115,8 +115,9 @@ The async task panel (TUI widget + status bar + completion toast) shows running 
 | `cli:agy` | `agy` | plain stdout capture, native `--effort`, CLI default model |
 | `cli:atomcode` | `atomcode -y -p <prompt>` | headless, no-approval, CLI default model |
 | `cli:zcode` | `node zcode.cjs` | plain stdout capture (-p), GLM-5.3 fixed |
+| `cli:mimo` | `mimo run` | JSON event stream, `--dangerously-skip-permissions`, CLI configured/default model |
 
-**Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one. `cli:zcode` is special: it spawns `zcode.cjs` through `node` and always uses the fixed GLM-5.3 configured in `~/.zcode/cli/config.json`.
+**Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one. `cli:zcode` is special: it spawns `zcode.cjs` through `node` and always uses the fixed GLM-5.3 configured in `~/.zcode/cli/config.json`. `cli:mimo` (also accepts the alias `cli:mimocode`) runs `mimo run <prompt> --format json --dangerously-skip-permissions --dir <cwd>`; it discovers `MIMOCODE_BIN`, then `%USERPROFILE%\\.mimocode\\bin\\mimo.exe`, then PATH. The current MimoCode installation must be signed in or configured with a usable provider/model; the harness does not supply credentials.
 
 ### 3.3 Consultant — user-named model evaluation
 

@@ -7,11 +7,12 @@
  *   cli:agy
  *   cli:atomcode
  *   cli:zcode
+ *   cli:mimo
  *
  * Never pass --model to the external harness; users configure models inside
- * Claude Code / Codex / Antigravity / AtomCode themselves. ZCode is an
- * exception: it is a Node.js script (zcode.cjs) fixed on GLM-5.3, so no model
- * override applies there either.
+ * Claude Code / Codex / Antigravity / AtomCode / MimoCode themselves. ZCode is
+ * an exception: it is a Node.js script (zcode.cjs) fixed on GLM-5.3, so no
+ * model override applies there either.
  *
  * Spawns the local CLI harness instead of pi --mode json.
  * Windows-aware: resolves .exe/.cmd, process-group kill only on non-Windows.
@@ -19,11 +20,12 @@
 
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 // ── public types (kept compatible with index.ts SubagentResult) ────────────
 
-export type ExternalBackend = "claude" | "codex" | "agy" | "atomcode" | "zcode";
+export type ExternalBackend = "claude" | "codex" | "agy" | "atomcode" | "zcode" | "mimo";
 
 export interface ExternalUsageSummary {
 	input: number;
@@ -53,7 +55,7 @@ export interface ExternalSubagentResult {
 }
 
 export interface RunExternalCliParams {
-	/** Backend selector only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode */
+	/** Backend selector only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode | cli:mimo */
 	modelRef: string;
 	task: string;
 	/** Role system prompt (agent body / override). */
@@ -67,7 +69,7 @@ export interface RunExternalCliParams {
 }
 
 export const EXTERNAL_CLI_PREFIX = "cli:";
-export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy", "atomcode", "zcode"];
+export const EXTERNAL_BACKENDS: ExternalBackend[] = ["claude", "codex", "agy", "atomcode", "zcode", "mimo"];
 
 const FORCE_KILL_DELAY_MS = 3000;
 const MAX_STDERR_CHARS = 128 * 1024;
@@ -99,8 +101,11 @@ export function parseExternalCliModel(ref: string): {
 		return null;
 	}
 	const backendRaw = rest.toLowerCase();
-	if (!EXTERNAL_BACKENDS.includes(backendRaw as ExternalBackend)) return null;
-	const backend = backendRaw as ExternalBackend;
+	// Product name alias: the executable is `mimo`, while users commonly call
+	// the product MimoCode. Canonicalize both refs to cli:mimo.
+	const normalizedBackend = backendRaw === "mimocode" ? "mimo" : backendRaw;
+	if (!EXTERNAL_BACKENDS.includes(normalizedBackend as ExternalBackend)) return null;
+	const backend = normalizedBackend as ExternalBackend;
 	return { backend, canonical: `${EXTERNAL_CLI_PREFIX}${backend}` };
 }
 
@@ -109,12 +114,12 @@ export function normalizeExternalCliModel(raw?: string | null): string | undefin
 	if (!raw) return undefined;
 	const input = String(raw).trim();
 	if (!input) return undefined;
-	// Accept only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode (case-insensitive prefix/backend).
+	// Accept only: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode | cli:mimo (case-insensitive prefix/backend).
 	if (!isExternalCliModel(input)) return undefined;
 	const parsed = parseExternalCliModel(input);
 	if (!parsed) {
 		throw new Error(
-			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, cli:agy, cli:atomcode, or cli:zcode (no model override; each CLI uses its own default model).`,
+			`Unknown external CLI model "${input}". Use cli:claude, cli:codex, cli:agy, cli:atomcode, cli:zcode, or cli:mimo (no model override; each CLI uses its own default model).`,
 		);
 	}
 	return parsed.canonical;
@@ -132,6 +137,7 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 			agy: "Antigravity CLI",
 			atomcode: "AtomCode CLI",
 			zcode: "ZCode CLI (GLM-5.3)",
+			mimo: "MimoCode CLI (configured/default model)",
 		};
 		const label = `cli:${backend}  — ${labelByBackend[backend]}, default model (${status})`;
 		opts.push({ ref: `${EXTERNAL_CLI_PREFIX}${backend}`, label });
@@ -140,7 +146,7 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 }
 
 export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
-	const out = { claude: false, codex: false, agy: false, atomcode: false, zcode: false } as Record<ExternalBackend, boolean>;
+	const out = { claude: false, codex: false, agy: false, atomcode: false, zcode: false, mimo: false } as Record<ExternalBackend, boolean>;
 	for (const b of EXTERNAL_BACKENDS) {
 		out[b] = Boolean(resolveExternalCommand(b));
 	}
@@ -156,9 +162,22 @@ function resolveExternalCommand(backend: ExternalBackend): string | undefined {
 	if (backend === "zcode") {
 		return "node";
 	}
+	if (backend === "mimo") {
+		// MimoCode's Windows installer keeps its executable outside PATH by
+		// default. Allow an explicit override, then probe the local install
+		// location before falling back to normal PATH resolution.
+		const configured = process.env.MIMOCODE_BIN?.trim();
+		if (configured && existsSync(configured)) return configured;
+		const localInstall = process.env.USERPROFILE
+			? join(process.env.USERPROFILE, ".mimocode", "bin", "mimo.exe")
+			: undefined;
+		if (localInstall && existsSync(localInstall)) return localInstall;
+	}
 
 	const candidates =
-		process.platform === "win32"
+		backend === "mimo"
+			? process.platform === "win32" ? ["mimo.exe", "mimo.cmd", "mimo"] : ["mimo"]
+			: process.platform === "win32"
 			? backend === "claude"
 				? [`${backend}.exe`, backend]
 				: [`${backend}.cmd`, `${backend}.exe`, backend]
@@ -666,6 +685,75 @@ async function runZcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	});
 }
 
+// ── MimoCode ───────────────────────────────────────────────────────────────
+
+export function buildMimoArgs(prompt: string, cwd: string): string[] {
+	// `--format json` gives one raw event per line for reliable parsing. MimoCode
+	// is launched non-interactively, so explicitly approve only its own runtime
+	// permission prompts; its configured model remains untouched.
+	return ["run", prompt, "--format", "json", "--dangerously-skip-permissions", "--dir", cwd];
+}
+
+function nestedMimoText(value: unknown): string | undefined {
+	if (typeof value === "string" && value.trim()) return value;
+	const record = asRecord(value);
+	if (!record) return undefined;
+	for (const key of ["text", "content", "message", "output", "delta", "data"]) {
+		const candidate = nestedMimoText(record[key]);
+		if (candidate) return candidate;
+	}
+	return undefined;
+}
+
+function extractMimoFinalText(event: Record<string, unknown>): string | undefined {
+	// MimoCode JSON events have varied across releases. Prefer text carried by
+	// message/assistant events and tolerate the common nested data/part shapes.
+	if (event.type === "error") return undefined;
+	const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
+	if (!/(assistant|message|text|result|done|complete)/.test(type)) return undefined;
+	return nestedMimoText(event);
+}
+
+function extractMimoError(event: Record<string, unknown>): string | undefined {
+	if (event.type !== "error") return undefined;
+	const error = asRecord(event.error);
+	const message = nestedMimoText(error) ?? nestedMimoText(event);
+	return `MimoCode error: ${message ?? "unknown error"}`;
+}
+
+async function runMimo(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
+	const { base, runId } = ctx;
+	const taskPrompt = [ctx.systemPrompt, ctx.task].filter(Boolean).join("\n\n");
+	let resultText = "";
+	let eventError: string | undefined;
+	const outcome = await spawnStreaming({
+		backend: "mimo",
+		command: ctx.command,
+		args: buildMimoArgs(taskPrompt, ctx.cwd),
+		cwd: ctx.cwd,
+		timeoutMs: ctx.timeoutMs,
+		signal: ctx.signal,
+		onUpdate: ctx.onUpdate,
+		onJsonLine: (event) => {
+			const text = extractMimoFinalText(event);
+			if (text) resultText = text;
+			const error = extractMimoError(event);
+			if (error) eventError ??= error;
+		},
+	});
+	return finishStreamResult({
+		base,
+		runId,
+		modelLabel: base.requestedModel ?? "cli:mimo",
+		usage: emptyUsage(),
+		resultText,
+		eventError,
+		sawTerminal: true, // MimoCode has no stable terminal event across releases
+		outcome,
+		backendLabel: "mimo",
+	});
+}
+
 // ── shared spawn runner ────────────────────────────────────────────────────
 
 interface StreamRunOptions {
@@ -901,6 +989,9 @@ export async function runExternalCli(params: RunExternalCliParams): Promise<Exte
 	}
 	if (backend === "zcode") {
 		return runZcode({ ...params, backend, command, cwd, runId, base });
+	}
+	if (backend === "mimo") {
+		return runMimo({ ...params, backend, command, cwd, runId, base });
 	}
 	return runAtomcode({ ...params, backend, command, cwd, runId, base });
 }
