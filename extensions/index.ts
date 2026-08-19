@@ -158,6 +158,8 @@ interface AgentConfig {
 	fallbackModels: Record<string, string[]>;
 	thinking: Record<string, string>;
 	notifications?: boolean;
+	/** searcher 派发模式：auto（默认，orchestrator 自行判断）、serial（逐个串行）、parallel（并发） */
+	searcherMode?: "auto" | "serial" | "parallel";
 }
 
 function configPath(): string {
@@ -172,9 +174,10 @@ function readConfig(): AgentConfig {
 			fallbackModels: parsed.fallbackModels ?? {},
 			thinking: parsed.thinking ?? {},
 			notifications: parsed.notifications !== false,
+			searcherMode: parsed.searcherMode ?? "auto",
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto" };
 	}
 }
 
@@ -1627,6 +1630,19 @@ export default function (pi: ExtensionAPI) {
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
+		// searcher 派发模式
+		const searcherMode = cfg.searcherMode ?? "auto";
+		const searcherModeHint: Record<string, string> = {
+			auto: "auto — orchestrator 根据模型上下文（<200K 拆分并行）和任务独立性自行决定串/并行",
+			serial: "serial — 逐个串行派发 searcher（每次只跑一个，等返回后派下一个；适合 GPU 资源有限的本地模型）",
+			parallel: "parallel — 并发派发所有 searcher（速度优先，多方向同时搜索）",
+		};
+		lines.push(`Searcher dispatch mode: ${searcherModeHint[searcherMode] ?? searcherModeHint["auto"]}`);
+		if (searcherMode === "serial") {
+			lines.push(`[searcher-mode=serial] 强制要求：所有 searcher 必须串行派发。主 agent 派发多个 searcher 时，必须等上一个 searcher 返回结果后再派下一个（sync 单次调用），不得使用 parallel tasks 数组并发。唯一例外：搜索方向完全独立且用户明确要求速度时，可临时 override 为 parallel。`);
+		} else if (searcherMode === "parallel") {
+			lines.push(`[searcher-mode=parallel] 所有 searcher 优先并发派发（parallel tasks 数组），除非搜索方向之间有严格依赖。`);
+		}
 		lines.push("Note: When dispatching the searcher, ask it to query `Wiki/` by keyword first, jump straight to code via each page's `source_paths` (e.g. `file#L49` / `file::Symbol`, no grep guessing), cross-check with codegraph, and PROACTIVELY maintain theme pages — update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a durable, source-verified cross-task theme is absent. Require each returned fact to carry a code location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a 'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
 		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
@@ -2383,6 +2399,32 @@ export default function (pi: ExtensionAPI) {
 				const status = cfg.notifications !== false ? "🟢 已开启" : "🔴 已关闭";
 				ctx.ui.notify(
 					`🪟 Windows 通知：${status}\n用法：/notify on 或 /notify off`,
+					"info",
+				);
+			}
+		},
+	});
+
+	// ── /searcher-mode 命令 ──
+	pi.registerCommand("searcher-mode", {
+		description: "searcher 派发模式：auto / serial / parallel",
+		handler: async (args, ctx) => {
+			const val = (args ?? "").trim().toLowerCase();
+			const cfg = reloadConfig();
+			if (val === "auto" || val === "serial" || val === "parallel") {
+				cfg.searcherMode = val;
+				writeConfig(cfg);
+				const labels: Record<string, string> = { auto: "🤖 自动（orchestrator 判断）", serial: "🔗 串行（逐个派发）", parallel: "⚡ 并行（并发派发）" };
+				ctx.ui.notify(`🔍 searcher 模式已设为：${labels[val]}`, "info");
+			} else {
+				const current = cfg.searcherMode ?? "auto";
+				const labels: Record<string, string> = { auto: "🤖 自动", serial: "🔗 串行", parallel: "⚡ 并行" };
+				ctx.ui.notify(
+					`当前 searcher 模式：${labels[current] ?? current}\n` +
+					`用法：/searcher-mode <auto|serial|parallel>\n` +
+					`  auto     — orchestrator 根据模型上下文和任务自行决定串/并行\n` +
+					`  serial   — 逐个派发 searcher（适合 GPU 资源有限的本地模型）\n` +
+					`  parallel — 并发派发所有 searcher（速度优先）`,
 					"info",
 				);
 			}
