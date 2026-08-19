@@ -48,6 +48,7 @@
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
     "test:report": "node --experimental-strip-types ./extensions/_test_report.ts",
     "test:identity": "node --experimental-strip-types ./extensions/_test_identity.ts",
+    "test:register-graph": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_test_register_graph.ts",
     "smoke:extension-load": "node ./scripts/check-extension-load.mjs"
   },
   "dependencies": {
