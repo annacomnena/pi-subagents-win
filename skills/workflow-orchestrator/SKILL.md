@@ -48,12 +48,12 @@ description: 使用 subagent-win 工具编排多步骤工作流（搜索→计�
 
 ## 核心原则
 
-1. **委派，不要亲自执行** — 搜索、实现、审查交给子 agent
+1. **委派，不要亲自执行** — 搜索、实现、审查交给 subagent；注意：subagent 与可见 tab 是两种不同的派发对象，不能因为都有 runId 就混用管理工具
 2. **Wiki 第一站（术语发现 → 精确定位 → 直接交接）+ codegraph** — 仅新主题查询时，用 `wiki-nav keywords queries=[...]` 查精确术语，exact miss 才用 `semantic-terms` 扩展候选，选词后 grep 定位 Wiki；searcher 一旦确认 `Wiki/path.md#章节`，该地址就是本 workflow 的规范交接物，后续 agent 直接 read，绝不重新术语发现。再按页内 `source_paths` 直达代码，联合 `codegraph explore / query / node / impact` 追溯；**主动维护主题页：过期更新、缺失且已验证的跨任务主题新建、同主题碎片自主合并**
 3. **任务临时发现不进 Wiki** — 搜索结论走回复或 `plans/*_research.md`；进度走 `recentwork.md`
 4. **正式 Wiki 仅主题/功能页** — 收尾阶段必须对照改动更新**对应功能**正式页；禁止 task/Item 叙事进 Wiki
 5. **积极分派搜索** — 多方向时并行 searcher
-6. **三种执行模式（自主选）** — 单 agent、并行 subagent、**异步（async: true）**。判据：结果马上要用 → 单 agent/并行（同步等待）；任务独立、分钟级+、当前回合不需要结果 → **async 派发**（立即拿 runId，稍后用 `action:"status"` 或 set-timer 推进）。长耗时探索/实现批次、以及不想阻塞主回合时优先 async
+6. **先区分 subagent 与 tab，再选择执行模式** — `subagent-win` 是无头子 agent；`launch-tabs` 是可见独立 pi 标签页。单 agent、并行 subagent、**async subagent** 都不会打开标签页。async subagent 的 runId 只能用 `subagent-win({ action:"status", runId })` 查询；不要对它使用 `tab-status`、`reclaim-tabs`、`tab-finish` 或 `set-timer`。只有主会话需要长时间、可见、独立且可回收的工作时，才调用 `launch-tabs`。判据：结果马上要用 → 同步/并行 subagent；本回合不需要结果 → async subagent；需要可见独立标签页 → 主会话 launch-tabs
 7. **前置串行，独立并行** — 有依赖串行，无依赖并行
 8. **模型选择守配置优先** — 默认走各 agent 的 config 默认 + fallback 链，不主动 override；仅当 fallback 也用尽/用户指定/配置模型明显不合适才换；勿擅自用未配置的外部 CLI
 9. **Goal 默认不限预算** — `create_goal` 默认省略 `token_budget`
@@ -98,7 +98,7 @@ create_goal({ objective: "...", token_budget: 150000 })  # 自设
 
 ## 跨 agent 上下文交接（强制）
 
-子 agent 是**独立 pi 进程**（`--no-session`），不继承主会话，也看不到上一个 searcher 的回复，除非你写进 task。
+subagent 是**独立的无头 pi 进程**（`--no-session`），不继承主会话，也看不到上一个 searcher 的回复，除非你写进 task。它不是可见 tab；即使使用 `async: true`，也仍是 subagent，不得用 `tab-status`、`reclaim-tabs`、`tab-finish` 或 `set-timer` 管理。可见 tab 只由主会话通过 `launch-tabs` 创建；已派发 tab 内严禁再调用 `launch-tabs`，tab 内角色委派只能走 `subagent-win`。
 
 ### 共享外存
 

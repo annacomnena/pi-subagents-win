@@ -1597,6 +1597,13 @@ export default function (pi: ExtensionAPI) {
 		const lines: string[] = [
 			"### Subagent-win default config (config.json only; NOT the model of the last/current run)",
 			"",
+			"【会话与派发硬规则】subagent 是无头子 agent；tab 是可见的独立 pi 标签页。两者都可能有 runId，但 runId 不是同一种东西。",
+			"1. `subagent-win` = 无头子 agent：sync、parallel、async 三种模式都不会打开 Windows Terminal 标签页。async subagent 的 runId 只能用 `subagent-win({ action: \"status\", runId })` 查询；不要使用 `tab-status`、`reclaim-tabs`、`tab-finish` 或 `set-timer`。",
+			"2. `launch-tabs` = 可见任务 tab：只允许主会话调用，用于长时间、独立、需要可见 TUI 或跨主会话重启存活的工作。tab 的 runId 只能用 `tab-status` / `reclaim-tabs` 管理，完成用 `tab-finish`。",
+			"3. 已派发的任务 tab 严禁再调用 `launch-tabs` / `/launch`；tab 内的角色委派只能使用 `subagent-win`。",
+			"4. 选择规则：本轮需要结果 → `subagent-win`；长时间且需要可见/独立回收 → 主会话调用 `launch-tabs`。不要因为 subagent 使用 async 就把它当成 tab。",
+			"5. timer 不是 async subagent 的配套机制：主会话可按需为 tab 编排巡检，subagent 不得设置 timer。",
+			"",
 		];
 		const names = [...new Set([...agents.map((a) => a.name), ...Object.keys(cfg.models)])].sort();
 		for (const name of names) {
@@ -1616,7 +1623,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
 		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode/zcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
-		lines.push("Sync/async decision (you decide per dispatch): SYNC (no `async`) when the result is needed immediately to decide the next step; PARALLEL (`tasks: [...]`) for several independent tasks you must all wait for; ASYNC (`async: true`) for long independent work that does not block the current turn — the tool returns a runId instantly, you continue or finish, then poll `{action:\"status\", runId}` later (pair with set-timer / reclaim-tabs for batch orchestration). When in doubt, async is safe for anything minutes-long whose result you do not need in this turn; sync/parallel for anything whose result gates the next action.");
+		lines.push("Sync/async decision applies to subagent-win only: SYNC (no `async`) when the result is needed immediately; PARALLEL (`tasks: [...]`) for independent headless subagents you must all wait for; ASYNC (`async: true`) for a headless subagent whose result is not needed this turn. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
@@ -1639,13 +1646,14 @@ export default function (pi: ExtensionAPI) {
 		name: "launch-tabs",
 		label: "Launch Pi Tabs",
 		description: [
+			"这是可见任务 tab 编排工具，只允许主会话调用；不会启动无头 subagent。任务 tab 内也严禁再次调用 launch-tabs。",
 			"在 Windows Terminal 中并行打开一个或多个可见、独立的 pi 交互标签页。",
 			"先分析当前会话并只提交彼此独立、启动条件已满足的任务；不要为编排请求本身打开标签页。",
 			"每项必须提供 taskId、具体 prompt；prompt 会自动以 `根据workflow进行工作<taskId>` 开头，并附加 workflow-orchestrator 强制约束块（先 read 技能、委派 subagent-win 各角色执行、禁止单 agent 一路干完）。",
 			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）。",
 			"一次调用传入全部任务以保证并行启动。",
 			"标签自动生成规范名 `<仓库名>[-worktree]-<taskId>-<标签>`（仓库名取自 git origin/toplevel，worktree 路径自动加 -worktree- 标记，标签取显式 title 或从 prompt 首行提取）；不再使用无意义的 wlc 默认名。",
-			"每项返回 runId（回收令牌）：用 tab-status 查询状态、reclaim-tabs 回收结果后编排下一批；每项可传 timers: [{delayMs, message, label?, repeatMs?}] 写入该标签页邮箱，到期自动发送推进消息（超长程编排）。",
+			"每项返回 tab runId（只属于可见 tab）：用 tab-status 查询状态、reclaim-tabs 回收结果后编排下一批；不要把它与 subagent-win async runId 混用。每项可传 timers: [{delayMs, message, label?, repeatMs?}] 写入该标签页邮箱，到期自动发送推进消息（仅主会话的 tab 编排）。",
 			"每项可传 cwd 指定新标签页工作目录（默认当前目录）；独立 worktree 场景必须显式传 cwd。",
 		].join(" "),
 		parameters: Type.Object({
@@ -1799,12 +1807,13 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent-win",
 		label: "Subagent Win",
 		description: [
-			"Windows 兼容的子 agent 工具。",
+			"这是无头 subagent 工具，不会打开 Windows Terminal 标签页；sync/parallel/async 都仍是 subagent，不是 tab。需要可见独立标签页时，只有主会话才能调用 launch-tabs。",
 			"单 agent: { agent, task, model?, cwd? }",
 			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency? }",
-			"异步: { agent, task, model?, cwd?, async: true }",
-			"查状态: { action: \"status\", runId? }",
-			"【async 决策准则——由你自主选择】同步（不传 async）：需要本次结果才能继续下一步（结果驱动下一步动作）。并行（tasks[]）：多个独立任务、要等全部完成再统一处理。异步（async: true）：任务独立、结果不阻塞当前回合——派发后工具立即返回 runId，你继续做别的事或结束回合，稍后用 { action: \"status\", runId } 或结合 set-timer/reclaim-tabs 查询推进。适合：长耗时（分钟级+）、可后台跑的探索/搜索/实现、编排多个批次。判据：如果这个任务的结果马上要用，用同步/并行；如果可以不阻塞地等它，用异步。",
+			"异步: { agent, task, model?, cwd?, async: true }（仍是无头 subagent）",
+			"查状态: { action: \"status\", runId? }（async subagent 的 runId 只能用这里查询）",
+			"不要对 async subagent 使用 tab-status、reclaim-tabs、tab-finish 或 set-timer。",
+			"【async 决策准则】结果马上要用 → 同步/并行 subagent；结果本回合不需要 → async subagent，然后只用 subagent-win action=status 查询。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
 			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\" | \"cli:zcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
 			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",

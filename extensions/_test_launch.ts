@@ -84,6 +84,7 @@ assert.ok(bound.startsWith("根据workflow进行工作1007\n\n> 【工作方式�
 assert.ok(bound.includes(skillPath), "约束块应给出技能绝对路径");
 assert.ok(bound.includes("你是项目经理") && bound.includes("禁止自己一路干完"), bound);
 assert.ok(bound.includes("tab-finish"), "约束块必须强提醒完成后 tab-finish 回报主会话");
+assert.ok(bound.includes("严禁再调用 `launch-tabs`"), "tab 约束必须禁止嵌套 launch-tabs");
 assert.ok(bound.endsWith("按计划实施"), "原始 handoff 应保留在末尾");
 
 // 已带前缀时不重复，约束块插在中间
@@ -118,6 +119,7 @@ const boundE = buildWorkflowTabPrompt({ taskId: "1007", prompt: "按 plans/0810_
 assert.ok(boundE.startsWith("根据execute进行工作1007\n\n> 【工作方式约束 · 强制 · 快速执行】"), boundE);
 assert.ok(boundE.includes("快速执行模式（execute-only）") && boundE.includes("跳过搜索与计划"), boundE);
 assert.ok(boundE.includes("implementer") && boundE.includes("code-reviewer") && boundE.includes("Wiki 收尾"), boundE);
+assert.ok(boundE.includes("严禁再调用 `launch-tabs`"), "execute tab 约束必须禁止嵌套 launch-tabs");
 assert.ok(boundE.includes("不要凭空设计"), "execute 约束块应禁止无交接时自行设计");
 assert.ok(boundE.includes("tab-finish"), "execute 约束块也必须强提醒 tab-finish 回报");
 assert.ok(!boundE.includes("并行 searcher 最大化搜索"), "execute 模式不应出现研究流程");
