@@ -47,7 +47,8 @@
     "test:links": "node --experimental-strip-types ./extensions/_test_links.ts",
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
     "test:report": "node --experimental-strip-types ./extensions/_test_report.ts",
-    "test:identity": "node --experimental-strip-types ./extensions/_test_identity.ts"
+    "test:identity": "node --experimental-strip-types ./extensions/_test_identity.ts",
+    "smoke:extension-load": "node ./scripts/check-extension-load.mjs"
   },
   "dependencies": {
     "usearch": "2.26.0"
