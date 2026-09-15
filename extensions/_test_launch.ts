@@ -282,4 +282,23 @@ assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 p
 	assert.ok(!workflowBlock.includes("A0 自执行快链"), "workflow 全链约束块不应含 A0 档");
 }
 
+// trace-fusion C3：session/trace 身份旗标仅在显式传入时发射（workflow 路径永不传入 → argv 与历史一致）
+{
+	const base = buildWindowsTerminalArgs("t", "p", { cwd: ".", piCli: "cli.js", execPath: "node.exe" });
+	for (const flag of ["--session-profile", "--trace-run-id", "--trace-lane"]) {
+		assert.equal(base.includes(flag), false, `workflow 路径不应发射 ${flag}`);
+	}
+	const traced = buildWindowsTerminalArgs("t", "p", {
+		cwd: ".", piCli: "cli.js", execPath: "node.exe",
+		sessionProfile: "trace-worker", traceRunId: "tfl_ab12", traceLane: "A", tabRunId: "run_1",
+	});
+	const idx = (f: string) => traced.indexOf(f);
+	assert.ok(idx("--session-profile") > 0 && traced[idx("--session-profile") + 1] === "trace-worker");
+	assert.ok(idx("--trace-run-id") > 0 && traced[idx("--trace-run-id") + 1] === "tfl_ab12");
+	assert.ok(idx("--trace-lane") > 0 && traced[idx("--trace-lane") + 1] === "A");
+	// 旗标都在 --tab-run-id 与最终 prompt 之前，且 prompt 恒为最后参数
+	assert.ok(idx("--session-profile") < idx("--tab-run-id") && idx("--tab-run-id") < traced.length - 1);
+	assert.equal(traced[traced.length - 1], "p");
+}
+
 console.log("launch tests passed");

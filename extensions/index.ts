@@ -53,11 +53,10 @@ import {
 	writeTimerAtomic,
 } from "./timers.ts";
 import {
-	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
 	launchTaskTitle,
 	parseLaunchRequest,
-	wtPromptArg,
+	spawnPiTab,
 	type LaunchMode,
 } from "./launch.ts";
 
@@ -130,29 +129,9 @@ function dispatchPiTab(
 	/** P1-2：异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
 	onSpawnError?: (err: Error) => void,
 ): LaunchDispatch {
-	try {
-		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, runId), {
-			cwd,
-			piCli,
-			execPath: process.execPath,
-			model,
-			skills,
-			tabRunId: runId, // 可靠传递标签页身份（--tab-run-id），不依赖 env 继承
-		}), {
-			shell: false,
-			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程
-			env: runId ? { ...process.env, PI_TAB_RUN_ID: runId, PI_TAB_RUNS_DIR: runsDir } : undefined,
-		});
-		child.on("error", (err: Error) => {
-			// 同步 try/catch 只覆盖 spawn 本身的异常；异步 error（如 wt.exe 立即退出）也回写账本
-			console.error(`[subagent-win launch] ${title}: ${err.message}`);
-			onSpawnError?.(err);
-		});
-		child.unref();
-		return { title, prompt, model, runId };
-	} catch (err) {
-		return { title, prompt, model, error: err instanceof Error ? err.message : String(err), runId };
-	}
+	// trace-fusion C3：spawn 逻辑已抽出至 tab-launch-core.spawnPiTab（workflow 与 trace 共用原语）。
+	const result = spawnPiTab({ wtPath, piCli, cwd, title, prompt, model, skills, tabRunId: runId, runsDir, onSpawnError });
+	return { title, prompt, model, error: result.error, runId };
 }
 
 // ── Agent 定义 ─────────────────────────────────────────────────────
