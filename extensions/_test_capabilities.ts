@@ -13,6 +13,7 @@
 
 import assert from "node:assert/strict";
 import {
+	assertDelegationAllowed,
 	canDelegateAgent,
 	capabilities,
 	currentProfile,
@@ -172,6 +173,35 @@ delete process.env.PI_SESSION_PROFILE;
 		"trace-worker: workflow=false lite=false tabs=false delegate=[\"searcher\"] timers=false exec=true",
 		"subagent: workflow=false lite=false tabs=false delegate=[] timers=false exec=true",
 	]);
+}
+
+// ── 9. 委派白名单 gate（assertDelegationAllowed，设计稿 §55）─────────
+{
+	// main：无条件放行（含 omitted 空列表）
+	assert.deepEqual(assertDelegationAllowed([], "main"), { ok: true });
+	assert.deepEqual(assertDelegationAllowed(["planner", "general"], "main"), { ok: true });
+
+	// trace-worker：只放行 searcher；omitted / 空 / 其它角色全部拒绝
+	assert.deepEqual(assertDelegationAllowed(["searcher"], "trace-worker"), { ok: true });
+	const omitted = assertDelegationAllowed([], "trace-worker");
+	assert.equal(omitted.ok, false, "agent omitted 必须拒绝（unrestricted child）");
+	const omittedSingle = assertDelegationAllowed([""], "trace-worker");
+	assert.equal(omittedSingle.ok, false, "空串 agent 同 omitted");
+	const plannerReq = assertDelegationAllowed(["planner"], "trace-worker");
+	assert.equal(plannerReq.ok, false);
+	assert.ok(!plannerReq.ok && plannerReq.reason.includes("planner"), "拒绝原因应点名被拒 agent");
+	const mixed = assertDelegationAllowed(["searcher", "implementer"], "trace-worker");
+	assert.equal(mixed.ok, false, "混合委派只要含越权角色即整体拒绝");
+
+	// subagent：一切委派拒绝
+	assert.equal(assertDelegationAllowed(["searcher"], "subagent").ok, false);
+
+	// workflow-tab：六角色放行，general 拒绝
+	assert.deepEqual(assertDelegationAllowed(["planner"], "workflow-tab"), { ok: true });
+	assert.equal(assertDelegationAllowed(["general"], "workflow-tab").ok, false);
+
+	// 进程身份兜底（无显式 profile 参数）：当前环境已是 main
+	assert.deepEqual(assertDelegationAllowed(["searcher"]), { ok: true });
 }
 
 console.log("capabilities tests passed");

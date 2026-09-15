@@ -36,7 +36,8 @@ import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
-import { capabilities } from "./capabilities.ts";
+import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
+import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
 import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
 import {
 	defaultTabRunsDir,
@@ -1512,6 +1513,9 @@ export default function (pi: ExtensionAPI) {
 
 	// 标签页身份 flag（--tab-run-id <runId>）：launch-tabs 派发时注入，可靠传递
 	registerIdentityFlag(pi);
+	// 会话身份 flag（--session-profile）：trace-fusion 派发 trace worker 时注入（C4 接线）。
+	// 与 registerIdentityFlag 同时序约束：工厂内只注册不读值，消费点惰性读取。
+	registerCapabilityFlags(pi);
 
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
 	// 禁止注册 launch-tabs 工具与 /launch 命令，杜绝子 agent 开新标签页。
@@ -1639,11 +1643,26 @@ export default function (pi: ExtensionAPI) {
 
 	// 注册包内 skill 路径
 	pi.on("resources_discover", async () => {
+		// trace worker 不得看到 workflow-orchestrator skill（设计稿 §56）；
+		// 未来若有非 workflow skill 再按 allowlist 暴露。
+		if (isTraceWorker()) {
+			return { skillPaths: [] };
+		}
 		return { skillPaths: [join(PKG_DIR, "skills")] };
 	});
 
 	// 注入 subagent-win 配置到 LLM 上下文
 	pi.on("before_agent_start", async (_event, ctx) => {
+		// trace worker：early return（设计稿 §57）——不得先注入整套 workflow 编排规则再叮嘱别用。
+		if (isTraceWorker()) {
+			return {
+				message: {
+					customType: "trace-worker-profile",
+					content: buildTraceWorkerSystemPrompt(),
+					display: false,
+				},
+			};
+		}
 		const cfg = readConfig();
 		const allModels = ctx.modelRegistry?.getAvailable() ?? [];
 		const lines: string[] = [
@@ -2015,6 +2034,18 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, _ctx) {
 			const p = rawParams as Record<string, any>;
+
+			// trace-fusion C4：trace worker 委派硬 guard（设计稿 §55）——只允许 agent="searcher"，
+			// agent omitted 必须拒绝（omitted 会变成 unrestricted child）。status 查询不属委派，放行。
+			if (isTraceWorker() && (p.task || p.tasks)) {
+				const requested: string[] = Array.isArray(p.tasks)
+					? p.tasks.map((t: { agent?: string }) => t?.agent ?? "")
+					: [typeof p.agent === "string" ? p.agent : ""];
+				const verdict = assertDelegationAllowed(requested, "trace-worker");
+				if (!verdict.ok) {
+					return { content: [{ type: "text", text: `⛔ trace worker 委派被拒：${verdict.reason}` }], isError: true };
+				}
+			}
 
 			if (p.action === "status") {
 				const runs = listAsyncRuns();
@@ -2509,6 +2540,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("launch", {
 		description: "编排可见 pi 标签页；/launch -t <标题> 或 --direct 才直接启动单个任务",
 		handler: async (args, ctx) => {
+			// C4 运行时防护（设计稿 §59）：不依赖 factory 阶段注册与否，handler 内再验一次。
+			if (!capabilities().launchTabs) {
+				ctx.ui.notify("⛔ 当前会话无标签页编排权限（launch-tabs 只属于主会话）", "error");
+				return;
+			}
 			const request = parseLaunchRequest(args ?? "");
 			if (!request.task) {
 				ctx.ui.notify("用法: /launch [--model <模型>] <编排请求>；单任务用 /launch -t <标题> <任务> 或 --direct <任务>", "error");

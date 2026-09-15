@@ -132,8 +132,9 @@ assert.deepEqual(eventNames, [
 	"tool_execution_start",
 ]);
 
-// flag 快照：identity.ts 的 tab-run-id（launch-tabs 派发时注入的身份 flag）。
-assert.deepEqual(flagNames, ["tab-run-id"], "identity flag 必须注册");
+// flag 快照：identity.ts 的 tab-run-id（launch-tabs 派发时注入的身份 flag）+
+// capabilities.ts 的 session-profile（trace-fusion C4：trace worker 身份，authoritative flag）。
+assert.deepEqual(flagNames, ["session-profile", "tab-run-id"], "身份 flag 必须注册（tab-run-id + session-profile）");
 
 // 已知关键项兜底（防止快照整体被意外清空却因写死集合一致而误绿）
 for (const t of ["subagent-win", "launch-tabs"]) {

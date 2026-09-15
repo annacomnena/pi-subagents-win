@@ -144,3 +144,30 @@ export function isTraceWorker(): boolean {
 export function isWorkflowTab(): boolean {
 	return currentProfile() === "workflow-tab";
 }
+
+/**
+ * 委派白名单 gate（设计稿 §55，subagent-win.execute 消费）：
+ * 非主会话按 profile 白名单校验；trace worker 只允许 agent=searcher，
+ * 且 **agent omitted 必须拒绝**（omitted 会变成 unrestricted child）。
+ * 纯函数，单测锁定；返回 { ok:false, reason } 时调用方直接拒绝派发。
+ */
+export function assertDelegationAllowed(
+	requestedAgents: string[],
+	profile?: SessionProfile,
+): { ok: true } | { ok: false; reason: string } {
+	const p = profile ?? currentProfile();
+	if (p === "main") return { ok: true };
+	const requested = requestedAgents.map((a) => (typeof a === "string" ? a.trim() : ""));
+	if (requested.length === 0 || requested.some((a) => !a)) {
+		return { ok: false, reason: `agent omitted 会变成 unrestricted child；当前 profile "${p}" 必须显式指定白名单内 agent` };
+	}
+	const denied = requested.filter((a) => !canDelegateAgent(a, p));
+	if (denied.length > 0) {
+		const allowed = capabilities(p).delegateAgents;
+		return {
+			ok: false,
+			reason: `当前 profile "${p}" 只允许委派 ${JSON.stringify(allowed)}；被拒：${[...new Set(denied)].join(", ")}`,
+		};
+	}
+	return { ok: true };
+}
