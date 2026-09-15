@@ -157,6 +157,22 @@ try {
 	writeFileSync(badPath, "{not json", "utf8");
 	assert.equal(parseValidationFile(badPath), null);
 	assert.deepEqual(trustedCommands(null), []);
+	// 首跑真实形状：worker 把验证条目写成顶层数组（非契约对象）——必须容错
+	{
+		const arrPath = join(root, "arr.json");
+		writeFileSync(arrPath, JSON.stringify([
+			{ command: "dotnet build GreenCAD.sln", expectation: "0 errors", result: "pass", output_excerpt: "..." },
+			{ command: "dotnet test --filter W", expectation: "all pass", result: "pass" },
+		]), "utf8");
+		const arrV = parseValidationFile(arrPath);
+		assert.ok(arrV, "数组形状应被接受");
+		assert.deepEqual(trustedCommands(arrV), ["dotnet build GreenCAD.sln", "dotnet test --filter W"], "数组元素 command 全部入池");
+		writeFileSync(arrPath, JSON.stringify([
+			{ command: "keep-me", portable: true },
+			{ command: "drop-me", portable: false },
+		]), "utf8");
+		assert.deepEqual(trustedCommands(parseValidationFile(arrPath)), ["keep-me"], "portable:false 仍排除");
+	}
 
 	// ── collectRunArtifacts 汇总 + 落盘 ─────────────────────────
 	const report = collectRunArtifacts(run2.meta);

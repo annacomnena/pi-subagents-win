@@ -80,12 +80,17 @@ export interface LaneArtifactReport {
 	collectedAt: string;
 }
 
-/** 解析 validation.json（宽松：非法 JSON → null，不致命）。 */
+/** 解析 validation.json（宽松：非法 JSON → null，不致命；首跑发现 worker 常写成数组而非对象——两种形状都接受）。 */
 export function parseValidationFile(path: string): TraceValidationJson | null {
 	if (!existsSync(path)) return null;
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf8")) as TraceValidationJson;
-		return typeof raw === "object" && raw !== null ? raw : null;
+		const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		if (Array.isArray(raw)) {
+			// 数组形状：[ { command, expectation, result, output_excerpt }, ... ]——元素本身就是验证条目
+			const entries = raw.filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null && !Array.isArray(e));
+			return { reproductions: entries as unknown as TraceValidationJson["reproductions"] };
+		}
+		return typeof raw === "object" && raw !== null ? (raw as TraceValidationJson) : null;
 	} catch {
 		return null;
 	}
