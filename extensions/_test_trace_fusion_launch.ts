@@ -26,6 +26,7 @@ if (gitVer.status !== 0) {
 }
 
 import { launchTraceRun, newTraceRunId, readTraceRunMeta, type TabSpawner } from "./trace-fusion/launch-workers.ts";
+import { ensureDirTrusted } from "./trace-fusion/trust.ts";
 import { buildTraceWorkerPrompt } from "./trace-fusion/worker-prompt.ts";
 import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig } from "./trace-fusion/types.ts";
 import type { TabLaunchOptions } from "./tab-launch-core.ts";
@@ -227,6 +228,37 @@ try {
 	assert.ok(wp.includes("supervisor"));
 	for (const s of ["Root cause", "Failed approaches", "Recommended final direction"]) {
 		assert.ok(wp.includes(s), `trajectory 九节契约缺：${s}`);
+	}
+
+	// ── trust 预信任模块 ────────────────────────────────────────
+	{
+		const trustPath = join(root, "trust.json");
+		const mkDir = (n: string) => { const d = join(root, n); mkdirSync(d, { recursive: true }); return d; };
+
+		// 文件不存在 → 创建并写 true
+		const dir1 = mkDir("trust-a");
+		const r1 = ensureDirTrusted(dir1, trustPath);
+		assert.equal(r1.ok, true, `trust 写入应成功：${r1.error}`);
+		const t1 = JSON.parse(readFileSync(trustPath, "utf8")) as Record<string, boolean>;
+		assert.equal(Object.values(t1)[0], true);
+		// realpath 口径（Windows 大小写无关地命中同一条目）
+		const r1b = ensureDirTrusted(dir1.toUpperCase(), trustPath);
+		assert.equal(r1b.ok, true);
+		assert.equal(r1b.wrote, undefined, "幂等：已信任不再写");
+
+		// 既有条目必须保留
+		const dir2 = mkDir("trust-b");
+		ensureDirTrusted(dir2, trustPath);
+		const t2 = JSON.parse(readFileSync(trustPath, "utf8")) as Record<string, boolean>;
+		assert.equal(Object.keys(t2).length, 2, "既有条目不得被清掉");
+		assert.equal(Object.values(t2).every((v) => v === true), true);
+
+		// 损坏的 trust.json → 拒绝写入（不吞用户文件）
+		const badPath = join(root, "trust-bad.json");
+		writeFileSync(badPath, "{not json", "utf8");
+		const r3 = ensureDirTrusted(mkDir("trust-c"), badPath);
+		assert.equal(r3.ok, false, "损坏文件必须拒写");
+		assert.equal(readFileSync(badPath, "utf8"), "{not json", "损坏文件原样保留");
 	}
 
 	console.log("trace-fusion launch tests passed");

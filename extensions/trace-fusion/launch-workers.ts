@@ -23,6 +23,7 @@ import { createSyntheticSnapshot } from "./snapshot.ts";
 import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type ProvisionReport } from "./worktrees.ts";
 import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type TraceFusionConfig } from "./types.ts";
 import { buildTraceWorkerPrompt } from "./worker-prompt.ts";
+import { ensureDirTrusted } from "./trust.ts";
 
 /** spawn seam：默认真 spawnPiTab；测试注入 fake。签名与 spawnPiTab 一致。 */
 export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnResult;
@@ -202,6 +203,13 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		lanes,
 	};
 	writeFileSync(metaPath(runDir), JSON.stringify(meta, null, 2) + "\n", "utf8");
+
+	// 5.5 首跑修复（2026-09-15）：worktree 含 .pi 资源时 pi 会卡在 Trust 确认上——
+	// 派发前把 worktree 根写入 trust.json（pi 的 findNearestTrustEntry 向上逐级查找，
+	// 一条 ~/.pi/tfl-wt=true 覆盖所有 run 的 lane 树与 eval 树，不随 run 累积）。
+	const trust = ensureDirTrusted(wtRoot);
+	if (!trust.ok && trust.error) lines.push(`⚠ 预信任失败（tab 可能卡在 Trust 确认）：${trust.error}`);
+	else if (trust.wrote) lines.push(`已预信任 worktree 根：${trust.wrote}`);
 
 	// 6. 三 tab 派发（§17：同一个 task、只差 lane metadata；不经 workflow builder）
 	const repoName = basename(repoRoot);
