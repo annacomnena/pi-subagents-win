@@ -31,6 +31,13 @@ export interface SnapshotInfo {
 }
 
 export function createSyntheticSnapshot(repoRoot: string, runBaseDir: string): SnapshotInfo {
+	// review 修正（Luna major）：run 目录在仓库内时，add -A 会把 snapshot 自身的
+	// base.index / 产物扫进 tree——强制 artifact 目录位于仓库外部。
+	const normRepo = repoRoot.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+	const normBase = runBaseDir.replace(/\\/g, "/").toLowerCase();
+	if (normBase === normRepo || normBase.startsWith(normRepo + "/")) {
+		throw new Error(`run 目录不得位于仓库内部（snapshot 会自吸产物）：${runBaseDir}`);
+	}
 	const head = execGit(["rev-parse", "HEAD"], { cwd: repoRoot });
 	if (head.status !== 0) throw new Error(`HEAD 不可解析：${head.stderr}`);
 	const headBefore = head.stdout;

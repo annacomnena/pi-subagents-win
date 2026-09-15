@@ -15,6 +15,7 @@ import {
 	symlinkSync,
 	copyFileSync,
 	writeFileSync,
+	rmSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -110,7 +111,21 @@ export function createSingleWorktree(
 ): { ok: true; path: string } | { ok: false; error: string } {
 	mkdirSync(dirname(wtPath), { recursive: true });
 	if (existsSync(wtPath) && !opts.allowExisting) {
-		return { ok: false, error: `目标已存在（先清理再创建）：${wtPath}` };
+		// review 修正（Luna major）：上次清理失败留下的 stale 树应自动回收，
+		// 而不是永久占用目录名导致后续 run 全部被拒。
+		const staleMarker = `${wtPath}.stale.json`;
+		if (existsSync(staleMarker)) {
+			try {
+				rmSync(wtPath, { recursive: true, force: true, maxRetries: 2, retryDelay: 200 });
+				execGit(["worktree", "prune"], { cwd: repoRoot });
+				rmSync(staleMarker, { force: true });
+			} catch {
+				return { ok: false, error: `stale 目录回收失败，请手动删除：${wtPath}` };
+			}
+		}
+		if (existsSync(wtPath)) {
+			return { ok: false, error: `目标已存在（先清理再创建）：${wtPath}` };
+		}
 	}
 	const add = execGit(["worktree", "add", "--detach", wtPath, baseCommit], { cwd: repoRoot });
 	if (add.status !== 0) return { ok: false, error: add.stderr };

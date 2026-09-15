@@ -27,8 +27,10 @@ import {
 import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
-import { launchTraceRun } from "./trace-fusion/launch-workers.ts";
+import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
+import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
+import { runCrossTest } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
@@ -2040,6 +2042,22 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, signal, onUpdate, _ctx) {
 			const p = rawParams as Record<string, any>;
 
+			// 入参校验：空 task 的派发在任何 profile 下都是调用方 bug
+			// （同时封死 review 指出的绕过面：空字符串 task 不再进入派发分支）。
+			if (p.task !== undefined && !String(p.task ?? "").trim()) {
+				return { content: [{ type: "text", text: "⛔ task 不能为空字符串" }], isError: true };
+			}
+			if (Array.isArray(p.tasks)) {
+				if (p.tasks.length === 0) {
+					return { content: [{ type: "text", text: "⛔ tasks 不能为空数组" }], isError: true };
+				}
+				for (const t of p.tasks) {
+					if (!String(t?.task ?? "").trim()) {
+						return { content: [{ type: "text", text: "⛔ tasks 每项必须有非空 task" }], isError: true };
+					}
+				}
+			}
+
 			// trace-fusion C4：trace worker 委派硬 guard（设计稿 §55）——只允许 agent="searcher"，
 			// agent omitted 必须拒绝（omitted 会变成 unrestricted child）。status 查询不属委派，放行。
 			if (isTraceWorker() && (p.task || p.tasks)) {
@@ -2049,6 +2067,13 @@ export default function (pi: ExtensionAPI) {
 				const verdict = assertDelegationAllowed(requested, "trace-worker");
 				if (!verdict.ok) {
 					return { content: [{ type: "text", text: `⛔ trace worker 委派被拒：${verdict.reason}` }], isError: true };
+				}
+				// §12：trace worker 派 searcher 时强制窄工具面（read/bash），调用方不得覆盖——
+				// searcher 只收集证据，不实现。
+				if (Array.isArray(p.tasks)) {
+					for (const t of p.tasks) t.tools = ["read", "bash"];
+				} else {
+					p.tools = ["read", "bash"];
 				}
 			}
 
@@ -2645,6 +2670,12 @@ export default function (pi: ExtensionAPI) {
 		pi.registerCommand("trace-fusion-loop", {
 			description: "三路独立 trace rollout + 证据融合（/trace-fusion-loop <任务>）",
 			handler: async (args, ctx) => {
+				// review 修正（Luna critical）：不信任 factory 阶段的 canOrchestrateTabs 布尔，
+				// handler 内再验一次能力（profile 时序变化时的兑底防线）。
+				if (!capabilities().launchTabs) {
+					ctx.ui.notify("⛔ 当前会话无 trace-fusion 启动权限（仅主会话）", "error");
+					return;
+				}
 				const task = (args ?? "").trim();
 				if (!task) {
 					ctx.ui.notify("用法：/trace-fusion-loop <任务描述>\n将对当前仓库开三个独立 worktree tab 并行求解，完成后证据融合。", "error");
@@ -2735,6 +2766,57 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				ctx.ui.notify(lines.join("\n"), "info");
+			},
+		});
+
+		// ── /trace-fusion-collect（review 修正 Luna major：把 C7/C8 接入生产生命周期）──
+		// 三路终态（或人工确认）后调用：权威收集 → deterministic cross-test → meta 终态。
+		pi.registerCommand("trace-fusion-collect", {
+			description: "收集 trace-fusion artifacts 并跑 deterministic cross-test（/trace-fusion-collect [runId]）",
+			handler: async (args, ctx) => {
+				const runId = (args ?? "").trim();
+				const runsDir = defaultTraceFusionRunsDir();
+				let runDir: string | null = null;
+				if (runId) {
+					runDir = existsSync(join(runsDir, runId, "meta.json")) ? join(runsDir, runId) : null;
+				} else {
+					// 默认取最新的 running run，否则最新 run
+					const candidates = existsSync(runsDir)
+						? readdirSync(runsDir, { withFileTypes: true }).filter((e) => e.isDirectory() && existsSync(join(runsDir, e.name, "meta.json"))).map((e) => e.name).sort().reverse()
+						: [];
+					for (const name of candidates) {
+						const m = readTraceRunMeta(join(runsDir, name));
+						if (m?.status === "running") { runDir = join(runsDir, name); break; }
+					}
+					runDir = runDir ?? (candidates[0] ? join(runsDir, candidates[0]) : null);
+				}
+				if (!runDir) {
+					ctx.ui.notify("未找到 trace-fusion run。用法：/trace-fusion-collect [runId]", "error");
+					return;
+				}
+				const meta = readTraceRunMeta(runDir);
+				if (!meta) {
+					ctx.ui.notify(`run meta 不可读：${runDir}`, "error");
+					return;
+				}
+				const tfConfig = readTraceFusionConfig();
+				ctx.ui.notify(`📦 收集 ${meta.runId} 的 lane artifacts（三段式 patch/叙事/终态）…`, "info");
+				const collect = collectRunArtifacts(meta);
+				ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");
+				const matrix = runCrossTest(meta, collect, {
+					provisioning: tfConfig.provisioning,
+					mainRoot: meta.repoRoot,
+				});
+				// deterministic 层终态：报告就绪，等待人工裁决（fusion/consult 为 v0.4）
+				const finished = { ...meta, status: "completed" as const };
+				writeFileSync(join(runDir, "meta.json"), JSON.stringify(finished, null, 2) + "\n", "utf8");
+				const pass = matrix.cells.filter((c) => c.result === "pass").length;
+				const fail = matrix.cells.filter((c) => c.result === "fail").length;
+				ctx.ui.notify(
+					`✅ cross-test 完成：${pass} pass / ${fail} fail / ${matrix.cells.length - pass - fail} 其它。\n` +
+					`报告：${matrix.reportPath}\n三份 trajectory 与 patch 在 ${meta.runDir}\\lanes\\，等待人工裁决。`,
+					"info",
+				);
 			},
 		});
 	}

@@ -118,6 +118,15 @@ try {
 	assert.equal(repA.workerFinished, false);
 	assert.ok(repA.issues.some((i) => i.includes("未 tab-finish")), "终态缺失进 issues");
 
+	// ── 情形 1b：staged 未 commit（review critical 9：part2 必须 diff HEAD）──
+	const wtA2 = run1.meta.lanes.A.worktree;
+	writeFileSync(join(wtA2, "src.txt"), "v3-staged\n");
+	g(["add", "src.txt"], wtA2);
+	const repA2 = collectLaneArtifacts(run1.meta, "A");
+	const patchA2 = readFileSync(repA2.patchPath, "utf8");
+	assert.ok(patchA2.includes("v3-staged"), "staged 未 commit 的修改必须进 patch（diff HEAD）");
+	assert.ok(repA2.changedFiles.includes("src.txt"), "staged 修改进 changedFiles");
+
 	// ── 情形 2：worker 已 commit（part1 覆盖）────────────────────────────
 	const run2 = makeRun();
 	const wtB = run2.meta.lanes.B.worktree;
@@ -164,5 +173,3 @@ try {
 		console.warn(`cleanup warning: ${(err as Error).message}`);
 	}
 }
-
-

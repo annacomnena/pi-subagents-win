@@ -115,6 +115,10 @@ try {
 	// ── 归一化 ─────────────────────────────────────────────────
 	const normalized = normalizeCommand(`node ${meta.lanes.C.worktree}\\check.js`, meta);
 	assert.equal(normalized, "node check.js", "worktree 绝对路径剥除");
+	// review major 10：引号包裹形式（cd "<wt>" && ...）也要剥除
+	const normQuoted = normalizeCommand(`cd "${meta.lanes.A.worktree}" && node check.js`, meta);
+	assert.ok(!normQuoted.toLowerCase().includes(meta.lanes.A.worktree.toLowerCase()), `引号路径应被剥除：${normQuoted}`);
+	assert.ok(/node check\.js$/.test(normQuoted.trim()), `剥除后应剩下命令本体：${normQuoted}`);
 	const pooled = poolCommands(collect, meta);
 	assert.equal(pooled.length, 1, `C 归一化后与 A/B 合并为同一条（实际 ${JSON.stringify(pooled)}）`);
 	const shared = pooled[0];
@@ -184,4 +188,3 @@ try {
 		console.warn(`cleanup warning: ${(err as Error).message}`);
 	}
 }
-

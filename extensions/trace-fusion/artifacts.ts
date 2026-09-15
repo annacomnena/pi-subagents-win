@@ -29,6 +29,32 @@ export interface TraceValidationJson {
 	[key: string]: unknown;
 }
 
+/**
+ * changedFiles（review 修正 Luna major）：name-status 三段（base→HEAD、index/工作树、untracked），
+ * 覆盖修改/新增/删除/重命名；返回统一后的目标路径集合。
+ */
+function collectChangedFiles(baseCommit: string, worktree: string): string[] {
+	const out = new Set<string>();
+	const addNameStatus = (r: { status: number; stdout: string }): void => {
+		if (r.status !== 0) return;
+		for (const line of r.stdout.split("\n")) {
+			if (!line) continue;
+			const parts = line.split("\t");
+			const code = parts[0]?.slice(0, 1) ?? "";
+			if (code === "R" || code === "C") {
+				// 重命名/拷贝：取新旧两个路径（old 也要进集合，删除语义）
+				if (parts[1]) out.add(parts[1]);
+				if (parts[2]) out.add(parts[2]);
+			} else {
+				if (parts[1]) out.add(parts[1]);
+			}
+		}
+	};
+	addNameStatus(execGit(["diff", "--name-status", baseCommit, "HEAD"], { cwd: worktree }));
+	addNameStatus(execGit(["diff", "--name-status", "HEAD"], { cwd: worktree }));
+	return [...out].filter((p) => p.length > 0);
+}
+
 export interface LaneArtifactReport {
 	lane: LaneId;
 	laneDir: string;
@@ -143,24 +169,23 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 		issues.push("validation.json 缺失或非法");
 	}
 
-	// 三段式 patch（worker 有无 commit 都覆盖）
+	// 三段式 patch（§21.0 P4 修订；worker 有无 commit 都覆盖）。
+	// review 修正（Luna critical）：part2 用 `diff HEAD`——裸 `diff` 只看 unstaged，
+	// 会漏掉 worker 已 git add 未 commit 的 staged 修改。
 	const part1 = execGit(["diff", "--binary", meta.baseCommit, "HEAD"], { cwd: worktree });
-	const part2 = execGit(["diff", "--binary"], { cwd: worktree });
+	const part2 = execGit(["diff", "--binary", "HEAD"], { cwd: worktree });
 	if (part1.status !== 0) issues.push(`patch part1 失败：${part1.stderr}`);
 	if (part2.status !== 0) issues.push(`patch part2 失败：${part2.stderr}`);
-	const patch = [part1.stdout, part2.stdout].filter((s) => s.length > 0).join("\n");
+	const patch = [part1.stdout, part2.stdout].filter((s) => s.length > 0).map((s) => (s.endsWith("\n") ? s : s + "\n")).join("");
 	const patchPath = join(laneDir, "patch.diff");
-	writeFileSync(patchPath, patch.endsWith("\n") || patch.length === 0 ? patch : patch + "\n", "utf8");
+	writeFileSync(patchPath, patch, "utf8");
 
-	// changed files（对 patch 的 +++; 行提取，权威与 patch 同源）
-	const changedFiles = [...new Set(
-		patch.split("\n").filter((l) => l.startsWith("+++ b/")).map((l) => l.slice(6)),
-	)];
-
-	// part3：untracked 归档
+	// changedFiles（review 修正 Luna major：name-status 覆盖重命名/删除，不再是 +++ b/ 单一来源）
+	const changedFiles = collectChangedFiles(meta.baseCommit, worktree);
 	const untrackedDir = join(laneDir, "untracked");
 	const untracked = existsSync(worktree) ? archiveUntracked(worktree, untrackedDir) : { files: [] as string[], issues: ["worktree 不存在"] };
 	issues.push(...untracked.issues);
+	changedFiles.push(...untracked.files);
 
 	// status.txt（§21.3：登记）
 	const st = execGit(["status", "--porcelain=v1"], { cwd: worktree });
@@ -170,6 +195,13 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 		issues.push("lane 无 tabRunId（派发即失败，artifact 为空证据）");
 	} else if (workerResult === null) {
 		issues.push("lane 未 tab-finish（仍在运行或静默挂起；终态前收集为部分证据）");
+	}
+
+	// worker result.json 归档（review 修正 Luna minor：受校验的副本进 lane artifact 目录）
+	if (workerResult) {
+		try {
+			writeFileSync(join(laneDir, "result.json"), JSON.stringify(workerResult, null, 2) + "\n", "utf8");
+		} catch { /* 归档尽力而为 */ }
 	}
 
 	return {

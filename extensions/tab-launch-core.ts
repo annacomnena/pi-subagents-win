@@ -52,6 +52,9 @@ export function buildWindowsTerminalArgs(
 	const piArgs = [options.piCli];
 	if (options.model) piArgs.push("--model", options.model);
 	for (const skill of options.skills ?? []) piArgs.push("--skill", skill);
+	if (options.excludeTools && options.excludeTools.length > 0) {
+		piArgs.push("--exclude-tools", options.excludeTools.join(","));
+	}
 	if (options.sessionProfile) piArgs.push("--session-profile", options.sessionProfile);
 	if (options.traceRunId) piArgs.push("--trace-run-id", options.traceRunId);
 	if (options.traceLane) piArgs.push("--trace-lane", options.traceLane);
@@ -155,6 +158,8 @@ export interface TabLaunchOptions {
 	sessionProfile?: string;
 	traceRunId?: string;
 	traceLane?: string;
+	/** 工具排除名单（trace worker §17：隔离 launch/timer/wiki 写工具）；仅显式传入才发射。 */
+	excludeTools?: string[];
 	/** 异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
 	onSpawnError?: (err: Error) => void;
 }
@@ -186,10 +191,22 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 			sessionProfile: options.sessionProfile,
 			traceRunId: options.traceRunId,
 			traceLane: options.traceLane,
+			excludeTools: options.excludeTools,
 		}), {
 			shell: false,
-			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程
-			env: tabRunId ? { ...process.env, PI_TAB_RUN_ID: tabRunId, PI_TAB_RUNS_DIR: runsDir } : undefined,
+			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程。
+			// review 修正（Luna critical）：session profile 同步注入 env——factory 阶段
+			// CLI flag 尚未就绪，只有 env 能保证 profile 在扩展初始化时即生效。
+			env: tabRunId
+				? {
+					...process.env,
+					PI_TAB_RUN_ID: tabRunId,
+					PI_TAB_RUNS_DIR: runsDir,
+					...(options.sessionProfile ? { PI_SESSION_PROFILE: options.sessionProfile } : {}),
+					...(options.traceRunId ? { PI_TRACE_RUN_ID: options.traceRunId } : {}),
+					...(options.traceLane ? { PI_TRACE_LANE: options.traceLane } : {}),
+				}
+				: undefined,
 		});
 		child.on("error", (err: Error) => {
 			// 同步 try/catch 只覆盖 spawn 本身的异常；异步 error（如 wt.exe 立即退出）也回写账本

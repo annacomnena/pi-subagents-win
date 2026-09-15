@@ -23,11 +23,15 @@ export interface GitOptions {
 }
 
 export function execGit(args: string[], opts: GitOptions = {}): GitResult {
+	// review 修正（Luna major）：GIT_INDEX_FILE 默认从继承环境剔除，防止宿主进程
+	// 残留值污染后续 worktree/diff/status 操作；snapshot 需要时经 opts.env 显式注入。
+	const { GIT_INDEX_FILE: _stripped, ...safeEnv } = process.env as Record<string, string | undefined>;
+	void _stripped;
 	const res = spawnSync("git", args, {
 		cwd: opts.cwd,
 		input: opts.input,
 		encoding: "utf8",
-		env: opts.env ? { ...process.env, ...opts.env } : process.env,
+		env: opts.env ? { ...safeEnv, ...opts.env } : safeEnv,
 		windowsHide: true,
 	});
 	return {

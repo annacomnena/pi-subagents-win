@@ -67,23 +67,25 @@ export interface CrossTestOptions {
 export function normalizeCommand(command: string, meta: TraceRunMeta): string {
 	let out = command;
 	const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const replacements: [RegExp, string][] = [];
+	// review 修正（Luna major）：全局 + 大小写不敏感 + 容忍路径被引号包裹
+	// （`cd "C:\wt\a" && ...` / `npm --prefix "C:\wt\a" test` 等常见形式）。
+	const strip = (raw: string): void => {
+		for (const variant of [raw, raw.split("\\").join("/")]) {
+			const q = '["\']?' + esc(variant) + '["\']?[\\\\/]?';
+			out = out.replace(new RegExp(q, "gi"), "");
+		}
+	};
 	for (const lane of ["A", "B", "C"] as const) {
 		const wt = meta.lanes[lane].worktree;
-		if (wt) {
-			replacements.push([new RegExp(esc(wt) + "[\\\\/]?$", "i"), ""]);
-			replacements.push([new RegExp(esc(wt) + "[\\\\/]"), ""]);
-			replacements.push([new RegExp(esc(wt.replace(/\\/g, "/")) + "[\\\\/]?$"), ""]);
-			replacements.push([new RegExp(esc(wt.replace(/\\/g, "/")) + "[\\\\/]"), ""]);
-		}
+		if (wt) strip(wt);
 	}
-	if (meta.runDir) {
-		replacements.push([new RegExp(esc(meta.runDir) + "[\\\\/]?"), ""]);
-		replacements.push([new RegExp(esc(meta.runDir.replace(/\\/g, "/")) + "[\\\\/]?"), ""]);
-	}
-	for (const [re, to] of replacements) out = out.replace(re, to);
-	// 收敛空白与多余引号空格
-	return out.replace(/\s{2,}/g, " ").replace(/^["'\s]+|["'\s]+$/g, "").trim();
+	if (meta.runDir) strip(meta.runDir);
+	// 收敛重复分隔符、空白与孤立引号
+	return out
+		.replace(/[\\/]{2,}/g, "/")
+		.replace(/\s{2,}/g, " ")
+		.replace(/^[\s"']+|[\s"']+$/g, "")
+		.trim();
 }
 
 /** 汇总 pooled commands（跨 lane 去重、归一化后合并来源）。 */
@@ -92,6 +94,12 @@ export function poolCommands(collect: RunCollectReport, meta: TraceRunMeta): Poo
 	for (const entry of collect.commandPool) {
 		const cmd = normalizeCommand(entry.command, meta);
 		if (!cmd) continue;
+		// review 修正（Luna major）安全阀：归一化后仍引用 lane worktree 的命令无法在 eval 树执行，拒绝入池
+		const low = cmd.toLowerCase();
+		if (["A", "B", "C"].some((l) => {
+			const w = meta.lanes[l].worktree;
+			return w && low.includes(w.split("\\").join("/").toLowerCase());
+		})) continue;
 		const existing = byCommand.get(cmd.toLowerCase());
 		if (existing) {
 			if (!existing.sourceLanes.includes(entry.lane)) existing.sourceLanes.push(entry.lane);
@@ -264,7 +272,24 @@ export function runCrossTest(meta: TraceRunMeta, collect: RunCollectReport, opts
 					continue;
 				}
 				const diff = testFileDiff(meta, other, tf);
-				if (!diff) continue;
+				if (!diff) {
+					// review 修正（Luna major）：untracked 测试文件不在 git diff 里——从其它 lane 的归档复制
+					if (!collect.lanes[other].untrackedFiles.includes(tf)) continue; // 该 lane 根本没改这个文件
+					const dest = join(evalTree, tf);
+					if (existsSync(dest)) {
+						info.notes.push(`pooled test 跳过（eval 内已存在同名文件）：${tf}（来自 ${other}）`);
+						continue;
+					}
+					try {
+						mkdirSync(dirname(dest), { recursive: true });
+						copyFileSync(join(collect.lanes[other].untrackedDir, tf), dest);
+						info.pooledTestFiles.push(`${tf} (${other}, untracked)`);
+						mergedOwners.push(tf);
+					} catch (err) {
+						info.notes.push(`pooled untracked test 复制失败：${tf}：${(err as Error).message}`);
+					}
+					continue;
+				}
 				const patchFile = join(meta.runDir, "lanes", other, `testdiff-${lane}.diff`);
 				writeFileSync(patchFile, diff, "utf8");
 				const apply = execGit(["apply", "--whitespace=nowarn", patchFile], { cwd: evalTree });
@@ -313,7 +338,11 @@ export function runCrossTest(meta: TraceRunMeta, collect: RunCollectReport, opts
 	// 5. §28：eval 树即用即删（失败标 stale，不拖垮报告）
 	for (const lane of ["A", "B", "C"] as const) {
 		const path = lanes[lane].evalWorktree;
-		if (path && existsSync(path)) removeWorktreeRetry(path, meta.repoRoot, { attempts: 2, baseDelayMs: 200 });
+		if (path && existsSync(path)) {
+			const rm = removeWorktreeRetry(path, meta.repoRoot, { attempts: 2, baseDelayMs: 200 });
+			// review 修正（Luna minor）：cleanup 失败不再静默——记 warning 但不改矩阵结果
+			if (!rm.removed) lanes[lane].notes.push(`eval 树清理失败（stale 标记，下次启动回收）：${rm.error?.slice(0, 120)}`);
+		}
 	}
 	lanes.A.evalWorktree = lanes.B.evalWorktree = lanes.C.evalWorktree = null;
 

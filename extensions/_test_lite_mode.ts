@@ -19,6 +19,11 @@ function assert(label: string, cond: boolean): void {
 let registered: { name: string; def: { handler: (args: string, ctx: any) => Promise<void> } } | null = null;
 const pi = { registerCommand: (name: string, def: any) => { registered = { name, def }; } };
 
+// review 修正（Luna regression）：测试可能在子 agent 进程内运行（PI_SUBAGENT=1），
+// 此时 /lite 的 capability guard 会正确拒绝。测试关注 handler 逻辑本身，先清身份环境。
+delete (process.env as Record<string, string | undefined>).PI_SUBAGENT;
+delete (process.env as Record<string, string | undefined>).PI_SESSION_PROFILE;
+
 const BASE_CFG: LiteConfigLike & Record<string, unknown> = {
 	models: {
 		searcher: "agens/agnes-3.0-flash",

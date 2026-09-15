@@ -9,7 +9,7 @@
  * 集成测试可注入 fake（无 Windows Terminal 也能测编排逻辑）。
  */
 
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
@@ -17,6 +17,7 @@ import {
 	spawnPiTab,
 } from "../tab-launch-core.ts";
 import { defaultTabRunsDir, newTabRunId, writeTabDispatch, type TabDispatchRecord } from "../tab-runs.ts";
+import { defaultTimersDir, newTimerId, dueAtFromDelay, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "../timers.ts";
 import { runPreflight } from "./preflight.ts";
 import { createSyntheticSnapshot } from "./snapshot.ts";
 import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type ProvisionReport } from "./worktrees.ts";
@@ -25,6 +26,51 @@ import { buildTraceWorkerPrompt } from "./worker-prompt.ts";
 
 /** spawn seam：默认真 spawnPiTab；测试注入 fake。签名与 spawnPiTab 一致。 */
 export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnResult;
+
+/** §17：trace worker tab 的工具排除名单（wiki/timer/launch 写能力不可见；subagent-win 保留）。 */
+export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "wiki-nav", "wiki-semantic"];
+
+/**
+ * §24.2：向 lane tab 邮箱写两个墙钟计时器——
+ *   deadline-5min「即将超时，收敛证据」；deadline「立即 tab-finish」。
+ * 仅提醒不强制；真正的超时判定在 collect（timedOut）。
+ */
+export function writeLaneTimers(tabRunId: string, lane: LaneId, deadline: Date, now: Date): void {
+	try {
+		const timersDir = defaultTimersDir();
+		const reminderAt = new Date(deadline.getTime() - 5 * 60_000);
+		const entries: { dueAt: Date; message: string; label: string }[] = [
+			{
+				dueAt: reminderAt,
+				message: `⏳ TRACE ${lane} 将在 5 分钟后到达墙钟时限。停止开新战线，立即把已有证据写入 trajectory.md / validation.json，然后 tab-finish。`,
+				label: `trace ${lane} deadline reminder`,
+			},
+			{
+				dueAt: deadline,
+				message: `🛑 TRACE ${lane} 已到墙钟时限。立即调用 tab-finish（status 按实际完成度，failed 也必须上报）。超时后 supervisor 将按部分修改收集证据。`,
+				label: `trace ${lane} deadline`,
+			},
+		];
+		for (const e of entries) {
+			if (e.dueAt.getTime() <= now.getTime()) continue; // run 已晚于该时点则不再排
+			const record: TimerRecord = {
+				id: newTimerId(now),
+				version: 1,
+				dueAt: dueAtFromDelay(Math.max(0, e.dueAt.getTime() - now.getTime()), now),
+				message: e.message,
+				target: { tabRunId },
+				source: "trace-fusion-loop",
+				label: e.label,
+				status: "pending",
+				createdAt: now.toISOString(),
+			};
+			const check = validateTimerRecord(record);
+			if (check.ok && check.value) writeTimerAtomic(timersDir, check.value, { tabRunId });
+		}
+	} catch {
+		// 计时器属加速器而非正确性依赖（§24.1）；写失败不影响派发
+	}
+}
 
 export interface LaunchTraceRunInput {
 	task: string;
@@ -183,6 +229,8 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		};
 		// 账本写入 tab-runs 目录（tab-status/reclaim-tabs 从那里读），而非 trace runs dir
 		writeTabDispatch(defaultTabRunsDir(), dispatch);
+		// review 修正（Luna major）：异步 spawn 失败（wt.exe 启动后才报错）也回写账本 + 留痕
+		const launchErrorsLog = join(runDir, "launch-errors.log");
 		const spawn = spawnTab({
 			wtPath: input.wtExe,
 			piCli: input.piCli,
@@ -194,6 +242,14 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			sessionProfile: "trace-worker",
 			traceRunId: runId,
 			traceLane: lane,
+			// §17：trace worker 工具隔离（launch/timer/wiki 写工具不可见；subagent-win 保留由 runtime guard 窄化）
+			excludeTools: TRACE_WORKER_EXCLUDE_TOOLS,
+			onSpawnError: (err) => {
+				writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
+				try {
+					appendFileSync(launchErrorsLog, `${new Date().toISOString()} lane ${lane} [${laneRunId}] async spawn error: ${err.message}\n`, "utf8");
+				} catch { /* 留痕尽力而为 */ }
+			},
 		});
 		if (spawn.error) {
 			dispatchErrors.push(`lane ${lane}：${spawn.error}`);
@@ -201,6 +257,9 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			continue;
 		}
 		laneMeta.tabRunId = laneRunId;
+		// review 修正（Luna major）：§24.2 墙钟邮箱计时器——临近超时提醒 + 超时收口
+		// （仅提醒不强制；enforcement 在 collect 的 timedOut 判定）。
+		writeLaneTimers(laneRunId, lane, deadline, now);
 		lines.push(`TRACE ${lane}：${title} [${laneRunId}]`);
 	}
 
