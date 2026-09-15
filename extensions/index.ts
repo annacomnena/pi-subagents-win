@@ -36,6 +36,7 @@ import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { capabilities } from "./capabilities.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
@@ -1689,7 +1690,7 @@ export default function (pi: ExtensionAPI) {
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
-	const canOrchestrateTabs = isMainSession(); // 只允许主会话，禁止标签页与子 agent
+	const canOrchestrateTabs = capabilities().launchTabs; // 主会话专属；trace-worker/subagent 禁止（矩阵见 capabilities.ts，现阶段与 isMainSession() 等价）
 	if (!canOrchestrateTabs) {
 		// 标签页 / 子 agent：跳过 launch-tabs 工具注册（防止孙 tab 派发）
 	} else {
@@ -1742,7 +1743,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			// 运行时防护：只允许主会话调用 launch-tabs
-			if (!isMainSession()) {
+			if (!capabilities().launchTabs) {
 				return { content: [{ type: "text", text: "launch-tabs 只允许主会话调用；标签页会话请用 subagent-win 委派各角色，或用 tab-finish 回报主会话。" }], isError: true };
 			}
 

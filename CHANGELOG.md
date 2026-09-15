@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased] — trace-fusion-loop (feat branch)
+
+### Added
+- **会话能力矩阵（capabilities）**：新增 `extensions/capabilities.ts`，定义四类 session profile（main / workflow-tab / trace-worker / subagent）的能力面（workflow / lite / launch-tabs / 角色委派白名单 / timer 编排 / 直接执行）。身份判定沿用 identity 双轨经验：flag `--session-profile`（authoritative，本提交仅注册函数，工厂接线留待 trace-worker 提交）→ env `PI_SESSION_PROFILE` 兜底 → identity 推导。本提交行为零变化：矩阵与 isMainSession/isTabSession/isSubagent 判定完全等价，trace-worker 检测处于休眠态；`index.ts` 两处 launch-tabs 门槛改为 `capabilities().launchTabs`（语义等价替换）。配套 `_test_capabilities.ts`（8 组用例：推导等价、env/flag 优先级、非法值忽略、委派白名单、矩阵快照防漂移）与 `npm run test:capabilities`。
+
 ## [Unreleased] — 2026-09-15
 
 ### Added
