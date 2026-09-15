@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { sendReportToMain } from "./report.ts";
 import { getTabRunId, isMainSession, isSubagent, isTabSession } from "./identity.ts";
+import { isTraceWorker } from "./capabilities.ts";
 import {
 	buildTabStatusView,
 	defaultTabRunsDir,
@@ -155,6 +156,11 @@ export function registerTabTelemetry(
 			"【完成回报 · 强制】你是主会话派发的任务 tab：全部工作完成后**必须**调用本工具向主会话回报（status=completed + summary + 交付物）——只有 result.json 才会触发 event-bus 唤醒主会话去 reclaim 并编排下一批；不调本工具 = 未完成，主会话会一直等你。",
 			"只有调用了本工具（或明确失败事件）才代表工作流完成；普通回合 stop 不算完成。",
 			"重复调用拒绝（结果只写一次）。",
+			// §23：trace worker 的 Trace-specific 完成契约（按 session profile 注入）
+			...(isTraceWorker() ? [
+				"【TRACE 完成契约】你若正在运行此工具，说明你是 trace worker tab：调用前必须已写好 trajectory.md 与 validation.json 到任务指定的 lanes/<lane>/ 目录；",
+				"status=completed 表示你已尽力完成独立求解并留下全部证据；status=failed 也必须调用（带已有证据与 openIssues）——静默挂起会让整个 run 降级。",
+			] : []),
 		].join(" "),
 		parameters: Type.Object({
 			status: Type.String({ description: "completed | failed | cancelled" }),
