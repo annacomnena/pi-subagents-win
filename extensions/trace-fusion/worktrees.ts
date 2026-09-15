@@ -16,7 +16,7 @@ import {
 	copyFileSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { execGit } from "./git.ts";
 import type { LaneId, TraceFusionProvisioning } from "./types.ts";
@@ -100,6 +100,24 @@ export interface WorktreeCreationResult {
 }
 
 /**
+ * 单个 detached worktree 创建原语（lane 树 / eval 树共用）。
+ */
+export function createSingleWorktree(
+	baseCommit: string,
+	wtPath: string,
+	repoRoot: string,
+	opts: { allowExisting?: boolean } = {},
+): { ok: true; path: string } | { ok: false; error: string } {
+	mkdirSync(dirname(wtPath), { recursive: true });
+	if (existsSync(wtPath) && !opts.allowExisting) {
+		return { ok: false, error: `目标已存在（先清理再创建）：${wtPath}` };
+	}
+	const add = execGit(["worktree", "add", "--detach", wtPath, baseCommit], { cwd: repoRoot });
+	if (add.status !== 0) return { ok: false, error: add.stderr };
+	return { ok: true, path: wtPath };
+}
+
+/**
  * 从同一 baseCommit 为各 lane 创建 detached worktree 并逐个供给。
  * 先 `worktree prune` 清掉上次 stale 残留的 admin 条目（§40.3：next startup 清理）。
  */
@@ -118,13 +136,9 @@ export function createLaneWorktrees(
 	const errors: string[] = [];
 	for (const lane of lanes) {
 		const laneDir = join(wtDir, lane.toLowerCase());
-		if (existsSync(laneDir)) {
-			errors.push(`lane ${lane}：目标已存在（先清理再启动）：${laneDir}`);
-			continue;
-		}
-		const add = execGit(["worktree", "add", "--detach", laneDir, baseCommit], { cwd: repoRoot });
-		if (add.status !== 0) {
-			errors.push(`lane ${lane}：worktree add 失败：${add.stderr}`);
+		const created = createSingleWorktree(baseCommit, laneDir, repoRoot);
+		if (!created.ok) {
+			errors.push(`lane ${lane}：${created.error}`);
 			continue;
 		}
 		const provision = provisionWorktree(laneDir, mainRoot, provisioning);

@@ -45,10 +45,12 @@ import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "
 import {
 	defaultTabRunsDir,
 	newTabRunId,
+	readTabResultFile,
 	validateTabDispatchRecord,
 	writeTabDispatch,
 	type TabDispatchRecord,
 } from "./tab-runs.ts";
+import type { TraceRunMeta } from "./trace-fusion/types.ts";
 import {
 	defaultTimersDir,
 	dueAtFromDelay,
@@ -2689,6 +2691,50 @@ export default function (pi: ExtensionAPI) {
 					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。`,
 					"info",
 				);
+			},
+		});
+
+		// ── /trace-fusion-status（§24.1：磁盘是唯一真相源，主会话重启后重建视图）──
+		pi.registerCommand("trace-fusion-status", {
+			description: "查看 trace-fusion run 状态（从磁盘重建，不依赖内存态）",
+			handler: async (_args, ctx) => {
+				const runsDir = defaultTraceFusionRunsDir();
+				if (!existsSync(runsDir)) {
+					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
+					return;
+				}
+				const runs = readdirSync(runsDir, { withFileTypes: true })
+					.filter((e) => e.isDirectory())
+					.map((e) => {
+						try {
+							return JSON.parse(readFileSync(join(runsDir, e.name, "meta.json"), "utf8")) as TraceRunMeta;
+						} catch {
+							return null;
+						}
+					})
+					.filter((m): m is TraceRunMeta => m !== null)
+					.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+					.slice(0, 5);
+				if (runs.length === 0) {
+					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
+					return;
+				}
+				const lines: string[] = [];
+				for (const m of runs) {
+					lines.push(`📦 ${m.runId} [${m.status}] ${m.task.slice(0, 50)}`);
+					lines.push(`   base ${m.baseCommit.slice(0, 12)} · deadline ${m.laneDeadlineAt}`);
+					for (const lane of TRACE_LANES) {
+						const l = m.lanes[lane];
+						const finished = l.tabRunId ? readTabResultFile(defaultTabRunsDir(), l.tabRunId) : null;
+						const timedOut = Date.now() > new Date(m.laneDeadlineAt).getTime();
+						const artifacts = existsSync(join(m.runDir, "lanes", lane, "patch.diff")) ? "patch✓" : "patch✗";
+						lines.push(`   ${lane}: ${finished ? `终态 ${finished.status}` : timedOut ? "⏱ 超时未完成" : "运行中"} · ${artifacts} · ${l.worktree}`);
+					}
+					for (const f of ["collect.json", "cross-test.json", "cross-test-report.md"]) {
+						if (existsSync(join(m.runDir, f))) lines.push(`   产物：${f}`);
+					}
+				}
+				ctx.ui.notify(lines.join("\n"), "info");
 			},
 		});
 	}

@@ -114,6 +114,7 @@ assert.deepEqual(commandNames, [
 	"timers",
 	"today-usage",
 	"trace-fusion-loop",
+	"trace-fusion-status",
 ]);
 
 // 事件快照（按名排序；2026-08-19 冻结）。同一事件可被多处注册：
@@ -146,7 +147,7 @@ assert.deepEqual(
 for (const t of ["subagent-win", "launch-tabs"]) {
 	assert.ok(toolNames.includes(t), `工具 ${t} 必须注册`);
 }
-for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop"]) {
+for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop", "trace-fusion-status"]) {
 	assert.ok(commandNames.includes(c), `命令 ${c} 必须注册`);
 }
 for (const e of ["session_start", "session_shutdown", "before_agent_start"]) {

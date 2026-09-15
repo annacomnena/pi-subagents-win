@@ -44,6 +44,7 @@
     "test:trace-fusion-git": "node --experimental-strip-types ./extensions/_test_trace_fusion_git.ts",
     "test:trace-fusion-launch": "node --experimental-strip-types ./extensions/_test_trace_fusion_launch.ts",
     "test:trace-fusion-collect": "node --experimental-strip-types ./extensions/_test_trace_fusion_collect.ts",
+    "test:trace-fusion-crosstest": "node --experimental-strip-types ./extensions/_test_trace_fusion_crosstest.ts",
     "test:lite-mode": "node --experimental-strip-types ./extensions/_test_lite_mode.ts",
     "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts",
     "test:tab-runs": "node --experimental-strip-types ./extensions/_test_tab_runs.ts",
