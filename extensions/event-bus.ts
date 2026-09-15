@@ -82,9 +82,10 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	seenResults.add(fileName);
 	const runId = fileName.slice(0, -".result.json".length);
 
+	// trace-fusion 自动收集等自定义消费者：返回 true 表示已消费（跳过默认 toast/reclaim 注入）；
+	// 返回 false/undefined → 落回默认流程（向后兼容：旧调用方不返回值时行为不变）。
 	if (opts.onTabFinished) {
-		opts.onTabFinished(runId);
-		return true;
+		if (opts.onTabFinished(runId) === true) return true;
 	}
 
 	// 会话定位（2026-08-13：与 report.ts 溯源对齐，防止 identityless 会话抢注入权）：

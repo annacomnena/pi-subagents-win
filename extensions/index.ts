@@ -28,6 +28,7 @@ import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
+import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { runCrossTest } from "./trace-fusion/cross-test.ts";
@@ -1546,8 +1547,24 @@ export default function (pi: ExtensionAPI) {
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
 	collect(registerAsyncPanel(pi));
 
-	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）
-	collect(registerEventBus(pi));
+	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）；
+	// trace-fusion lane tab 则由 supervisor 自动后台收集（不注入 reclaim 提示）
+	collect(registerEventBus(pi, {
+		onTabFinished: (finishedTabRunId) => {
+			const outcome = maybeAutoCollectTraceRun(finishedTabRunId);
+			if (!outcome.isTrace) return false; // 普通 tab → 默认 toast + reclaim 注入
+			if (outcome.phase === "started") {
+				try {
+					pi.sendUserMessage?.(
+						`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
+进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
+						{ deliverAs: "followUp" },
+					);
+				} catch { /* 通知尽力而为，收集已在后台 */ }
+			}
+			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
+		},
+	}));
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
 	collect(registerReportListener(pi));
