@@ -23,7 +23,8 @@ import { modePrefix, type LaunchMode } from "./launch.ts";
 
 // ── 类型 ───────────────────────────────────────────────────────────
 
-export type TabMode = LaunchMode;
+/** tab 模式：workflow 四模式 + trace-fusion 的 trace worker（不进 launch.ts 的 prompt 前缀体系）。 */
+export type TabMode = LaunchMode | "trace";
 
 /** 派发时主会话写入的账本记录（launch-tabs 每 task 一条）。 */
 export interface TabDispatchRecord {
@@ -498,7 +499,9 @@ export function validateTabDispatchRecord(raw: unknown): { ok: boolean; errors: 
 		errors.push("dispatchStatus must be dispatched|launch_failed");
 	}
 	const mode = str(record.mode);
-	if (mode && !["workflow", "research", "execute", "adaptive"].includes(mode)) errors.push("mode must be workflow|research|execute|adaptive");
+	if (mode && !["workflow", "research", "execute", "adaptive", "trace"].includes(mode)) {
+		errors.push("mode must be workflow|research|execute|adaptive|trace");
+	}
 	if (errors.length > 0) return { ok: false, errors };
 	const value: TabDispatchRecord = {
 		id: str(record.id)!,

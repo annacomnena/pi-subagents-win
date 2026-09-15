@@ -27,6 +27,9 @@ import {
 import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
+import { launchTraceRun } from "./trace-fusion/launch-workers.ts";
+import { readTraceFusionConfig } from "./trace-fusion/config.ts";
+import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
@@ -2632,5 +2635,61 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},
 	});
+	}
+
+	// ── /trace-fusion-loop 命令（trace-fusion C6，只允许主会话）──
+	// 设计稿 §5.1：主入口。编排 preflight → snapshot → 三 worktree → 三 trace worker tab。
+	if (canOrchestrateTabs) {
+		pi.registerCommand("trace-fusion-loop", {
+			description: "三路独立 trace rollout + 证据融合（/trace-fusion-loop <任务>）",
+			handler: async (args, ctx) => {
+				const task = (args ?? "").trim();
+				if (!task) {
+					ctx.ui.notify("用法：/trace-fusion-loop <任务描述>\n将对当前仓库开三个独立 worktree tab 并行求解，完成后证据融合。", "error");
+					return;
+				}
+				let wtExe: string | null;
+				let piCli: string;
+				try {
+					wtExe = findWindowsTerminal();
+					piCli = findPiCli();
+				} catch (err) {
+					ctx.ui.notify(`❌ 启动环境不可用：${err instanceof Error ? err.message : String(err)}`, "error");
+					return;
+				}
+				if (!wtExe) {
+					ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。", "error");
+					return;
+				}
+				const tfConfig = readTraceFusionConfig();
+				const result = launchTraceRun({
+					task,
+					repoRoot: process.cwd(),
+					wtExe,
+					piCli,
+					config: tfConfig,
+					runsDir: defaultTraceFusionRunsDir(),
+				});
+				for (const line of result.lines ?? []) ctx.ui.notify(line, "info");
+				if (!result.ok) {
+					ctx.ui.notify(`❌ trace-fusion 启动失败：${result.error}`, "error");
+					return;
+				}
+				// 溯源：本会话唤起了这三个 lane tab
+				try {
+					for (const lane of TRACE_LANES) {
+						recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+					}
+				} catch {
+					/* 溯源失败不阻塞 */
+				}
+				ctx.ui.notify(
+					`🧬 run ${result.meta.runId} 已启动：TRACE A/B/C 三路独立求解中。\n` +
+					`状态：/trace-fusion-status；中止：/trace-fusion-abort；\n` +
+					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。`,
+					"info",
+				);
+			},
+		});
 	}
 }

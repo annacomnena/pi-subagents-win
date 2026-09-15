@@ -95,9 +95,10 @@ assert.deepEqual(toolNames, [
 	"wiki-nav",
 ]);
 
-// 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets）：
-// codex-headers / timers / tabs 来自兄弟模块，其余 10 个是 index.ts 直接注册
-// （含主会话专属 /launch、/lite、/sub-presets）。
+// 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets，
+// 2026-09-15 trace-fusion C6 补主会话专属 /trace-fusion-loop）：
+// codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
+// （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
 assert.deepEqual(commandNames, [
 	"agents",
 	"codex-headers",
@@ -112,6 +113,7 @@ assert.deepEqual(commandNames, [
 	"tabs",
 	"timers",
 	"today-usage",
+	"trace-fusion-loop",
 ]);
 
 // 事件快照（按名排序；2026-08-19 冻结）。同一事件可被多处注册：
@@ -132,15 +134,19 @@ assert.deepEqual(eventNames, [
 	"tool_execution_start",
 ]);
 
-// flag 快照：identity.ts 的 tab-run-id（launch-tabs 派发时注入的身份 flag）+
-// capabilities.ts 的 session-profile（trace-fusion C4：trace worker 身份，authoritative flag）。
-assert.deepEqual(flagNames, ["session-profile", "tab-run-id"], "身份 flag 必须注册（tab-run-id + session-profile）");
+// flag 快照：tab-run-id（launch-tabs 身份）+ session-profile / trace-run-id / trace-lane
+// （trace-fusion C4/C6：trace worker 三旗标，派发时注入，不注册会死于 CLI 解析）。
+assert.deepEqual(
+	flagNames,
+	["session-profile", "tab-run-id", "trace-lane", "trace-run-id"],
+	"身份 flag 必须注册（tab-run-id + trace 三件套）",
+);
 
 // 已知关键项兜底（防止快照整体被意外清空却因写死集合一致而误绿）
 for (const t of ["subagent-win", "launch-tabs"]) {
 	assert.ok(toolNames.includes(t), `工具 ${t} 必须注册`);
 }
-for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch"]) {
+for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop"]) {
 	assert.ok(commandNames.includes(c), `命令 ${c} 必须注册`);
 }
 for (const e of ["session_start", "session_shutdown", "before_agent_start"]) {

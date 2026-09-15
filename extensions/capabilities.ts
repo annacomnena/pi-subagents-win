@@ -79,6 +79,8 @@ const CAPS: Record<SessionProfile, SessionCapabilities> = {
 };
 
 const PROFILE_FLAG = "session-profile";
+const TRACE_RUN_FLAG = "trace-run-id";
+const TRACE_LANE_FLAG = "trace-lane";
 const PROFILE_ENV = "PI_SESSION_PROFILE";
 
 let cachedPi: ExtensionAPI | null = null;
@@ -100,6 +102,18 @@ export function registerCapabilityFlags(pi: ExtensionAPI): void {
 		});
 	} catch {
 		/* flag 注册失败则退回 env / identity 推导 */
+	}
+	// C6：trace run/lane 身份旗标（派发时注入 worker tab；不注册会导致 worker 在
+	// CLI 解析时死于未知选项）。supervisor 侧不经此读取——meta.json 是真相源。
+	for (const [flag, desc] of [
+		[TRACE_RUN_FLAG, "trace-fusion run 身份（trace-fusion-loop 派发时注入 worker tab）"],
+		[TRACE_LANE_FLAG, "trace lane：A | B | C（trace-fusion-loop 派发时注入 worker tab）"],
+	] as const) {
+		try {
+			pi.registerFlag(flag, { description: desc, type: "string", default: "" });
+		} catch {
+			/* 同上：env 兼容 */
+		}
 	}
 }
 
@@ -127,6 +141,40 @@ export function currentProfile(): SessionProfile {
 /** 当前（或指定）profile 的能力面。 */
 export function capabilities(profile?: SessionProfile): SessionCapabilities {
 	return CAPS[profile ?? currentProfile()];
+}
+
+/** trace run 身份读取（flag > env PI_TRACE_RUN_ID；空串视同未设）。worker tab 诊断用。 */
+export function traceRunId(): string | undefined {
+	const read = (): string | undefined => {
+		if (cachedPi) {
+			try {
+				const v = String(cachedPi.getFlag(TRACE_RUN_FLAG) ?? "").trim();
+				if (v) return v;
+			} catch {
+				/* flag 不可用则退回 env */
+			}
+		}
+		const env = (process.env.PI_TRACE_RUN_ID ?? "").trim();
+		return env || undefined;
+	};
+	return read();
+}
+
+/** trace lane 读取（flag > env PI_TRACE_LANE；仅认 A/B/C）。 */
+export function traceLane(): "A" | "B" | "C" | undefined {
+	const read = (): "A" | "B" | "C" | undefined => {
+		let v = "";
+		if (cachedPi) {
+			try {
+				v = String(cachedPi.getFlag(TRACE_LANE_FLAG) ?? "").trim();
+			} catch {
+				/* flag 不可用则退回 env */
+			}
+		}
+		if (!v) v = (process.env.PI_TRACE_LANE ?? "").trim();
+		return v === "A" || v === "B" || v === "C" ? v : undefined;
+	};
+	return read();
 }
 
 /** 是否允许向指定角色 agent 委派（subagent-win.execute 的 agent 白名单 gate）。 */
