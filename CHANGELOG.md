@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] — 2026-09-15
+
+### Added
+- **lite 轻量工作流模式（/lite on|auto|off）**：中小任务不开 launch-tabs、不用六角色 agent，主会话直接编排单一 `general` agent（新角色卡 `agents/general.md`），按阶段以 `model=` 传档位模型：small（检索/文档）= `models.searcher`、medium（实现/常规计划）= `models.implementer`、large（咨询/修订计划/独立审查）= `models.consultant`（从 config.models 实时投影，无独立配置表）。链路 L1 检索→L2 计划→L3 实现→L4 独立审查（不可省）→L5 文档收尾；上下文纪律：只派 sync/parallel（async status 仅 500 字符预览）、交接默认落盘（>30 行写文件，回复只带路径+≤10 行摘要）、升级线（中转材料 >10K token / fan-out≥3 / 需跨会话存活 → 完整链 tab）。落地：`extensions/lite-mode.ts`（独立模块，纯函数 litePromptLines 生成注入段，off 零注入；deps 注入 config 读写，同 model-presets 约束）、`index.ts` 仅 +7 行接线（import/类型/readConfig×2/configPrompt 注入点/命令注册）、config.json 新键 `liteMode: "off"`、workflow-orchestrator SKILL.md（frontmatter、lite 节、落盘速查行、快捷入口「lite 走一遍」）、`_test_lite_mode.ts`（33 用例：纯函数三态/档位投影/缺模型降级 + 命令注册/写入/状态显示/非法参数）。
+
+## [Unreleased] — 2026-09-06
+
+### Changed
+- **直接启动不再自动绑定 workflow**：`/launch -t` 与 `/launch --direct` 只有在用户显式指定 `--research`、`--execute`、`--adaptive`，或在任务文本中使用 `根据...进行工作<taskId>` 前缀时，才附加 workflow 约束；单独出现任务编号不再触发 workflow。普通直接任务保持原始 prompt。
+
+### Added
+- **第四种任务模式 adaptive（自适应工作流）**：链深由任务书信息完备度决定，不由仪式感决定（源案例 BidRadar 1030：主会话已给出根因+方案+文件域+验收标准，tab 仍走完整六阶段重复已知信息，耗时翻倍）。`launch-tabs` 传 `mode: "adaptive"`（前缀 `根据adaptive进行工作<taskId>`），tab 启动自评完备度选链深：**A 快链**（四要素齐全：根因/结论+代码位置、方案方向、文件域、可测验收标准）→ 校验性核对（≤3 轮工具调用，codegraph/read/bash 验证假设，禁止重新调研）→ implementer → code-reviewer → Wiki；**B 中链**（缺验收或缺方案）→ planner 微型计划 → plan-reviewer 快审 → implementer → code-reviewer → Wiki；**C 全链**（仅问题描述）→ 同 workflow 六阶段。升降级规则：执行中发现假设失效升档并声明；降级禁止（A 档至少保留码审）；存疑取高档。首轮回复必须声明档位与依据。落地：`launch.ts`（LaunchMode/modePrefix/adaptive 纪律块/taskTitleLabel 前缀过滤/`--adaptive` 旗标解析剥离）、`index.ts`（launch-tabs 工具与 schema 描述、mode 归一化、/launch 文案与 modeHint/modeName、系统提示 Four task modes）、`tab-runs.ts`（账本 mode 校验加 adaptive）、workflow-orchestrator SKILL.md（frontmatter、新增「自适应模式（adaptive）」节含 A0 校验/升降级/模式边界、落盘速查行、快捷入口）、README（四模式表）。`_test_launch.ts` 新增 adaptive 前缀/纪律块/旗标用例。
+
 ## [Unreleased] — 2026-08-13
 
 ### Added

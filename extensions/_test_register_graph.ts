@@ -95,17 +95,20 @@ assert.deepEqual(toolNames, [
 	"wiki-nav",
 ]);
 
-// 命令快照（按名排序；2026-08-19 冻结）：codex-headers / timers / tabs 来自
-// 兄弟模块，其余 8 个是 index.ts 直接注册（含主会话专属 /launch）。
+// 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets）：
+// codex-headers / timers / tabs 来自兄弟模块，其余 10 个是 index.ts 直接注册
+// （含主会话专属 /launch、/lite、/sub-presets）。
 assert.deepEqual(commandNames, [
 	"agents",
 	"codex-headers",
 	"launch",
 	"links",
+	"lite",
 	"notify",
 	"runs",
 	"searcher-mode",
 	"sub-models",
+	"sub-presets",
 	"tabs",
 	"timers",
 	"today-usage",

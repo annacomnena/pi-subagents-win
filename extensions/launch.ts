@@ -13,6 +13,8 @@ export interface LaunchRequest {
 	research: boolean;
 	/** 快速执行模式：结论已明确，跳过搜索与计划，只做实现 → 审查 → Wiki 收尾。 */
 	execute: boolean;
+	/** 自适应模式：任务书四要素（根因+方案+文件域+验收标准）齐全但不确定假设是否仍成立，tab 启动时自评完备度选链深 A0自执行快链/A快链/B中链/C全链。 */
+	adaptive: boolean;
 }
 
 export interface LaunchTask {
@@ -66,6 +68,13 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 		text = `${text.slice(0, executeMatch.index)} ${text.slice((executeMatch.index ?? 0) + executeMatch[0].length)}`.trim();
 	}
 
+	let adaptive = false;
+	const adaptiveMatch = text.match(/(?:^|\s)--adaptive(?=\s|$)/);
+	if (adaptiveMatch) {
+		adaptive = true;
+		text = `${text.slice(0, adaptiveMatch.index)} ${text.slice((adaptiveMatch.index ?? 0) + adaptiveMatch[0].length)}`.trim();
+	}
+
 	let title: string | undefined;
 	const titleMatch = text.match(/^-t\s+(\S+)(?:\s+(.*))?$/s);
 	if (titleMatch) {
@@ -74,7 +83,7 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 		direct = true;
 	}
 
-	return { task: text, title, model, cwd, direct, research, execute };
+	return { task: text, title, model, cwd, direct, research, execute, adaptive };
 }
 
 /**
@@ -132,7 +141,7 @@ export function taskTitleLabel(title: string | undefined, prompt: string): strin
 		if (cleaned) return cleaned;
 	}
 	const firstLine =
-		prompt.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !/^(##|>|根据workflow进行工作|根据research进行工作|根据execute进行工作)/.test(l)) ?? "";
+		prompt.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !/^(##|>|根据workflow进行工作|根据research进行工作|根据execute进行工作|根据adaptive进行工作)/.test(l)) ?? "";
 	const label = firstLine
 		.replace(/^[*#\-\s]+/, "")
 		.replace(/^(?:Item\s+\d+\s*[—\-:]*\s*)/i, "")
@@ -162,13 +171,25 @@ export function composeLaunchTitle(parts: LaunchTitleParts): string {
 	return `${parts.repo}${wt}-${id}${parts.label}`;
 }
 
+/**
+ * Strip WT-risky characters from a tab title before it hits the wt command line.
+ *
+ * wt.exe re-parses the command line with its own tokenizer (quote handling +
+ * %env% expansion). `wtPromptArg` protects the prompt argument, but `--title`
+ * carries a label derived from the prompt's first line (e.g. "修复 50% 回归")
+ * or a user-provided title verbatim — same risk class, no protection.
+ */
+export function sanitizeWtTitle(title: string): string {
+	return title.replace(/[\r\n;"%]/g, " ").replace(/\s{2,}/g, " ").trim() || "task";
+}
+
 export function launchTaskTitle(task: LaunchTask, cwd: string): string {
-	return composeLaunchTitle({
+	return sanitizeWtTitle(composeLaunchTitle({
 		repo: repoName(cwd),
 		worktree: isWorktreePath(cwd),
 		taskId: task.taskId,
 		label: taskTitleLabel(task.title, task.prompt),
-	});
+	}));
 }
 
 /** @deprecated use launchTaskTitle; kept for backward compatibility. */
@@ -176,12 +197,13 @@ export function deriveLaunchTitle(task: string): string {
 	return task.replace(/\s+/g, " ").slice(0, 30).trim() || "pi-task";
 }
 
-/** 任务会话模式：workflow（完整链路）| research（深度研究：只搜索 + 研究报告 + Wiki 维护）| execute（快速执行：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）。 */
-export type LaunchMode = "workflow" | "research" | "execute";
+/** 任务会话模式：workflow（完整链路）| research（深度研究：只搜索 + 研究报告 + Wiki 维护）| execute（快速执行：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）| adaptive（自适应：tab 启动时按任务书信息完备度自选链深 A0自执行快链/A快链/B中链/C全链）。 */
+export type LaunchMode = "workflow" | "research" | "execute" | "adaptive";
 
 export function modePrefix(taskId: string, mode: LaunchMode): string {
 	if (mode === "research") return `根据research进行工作${taskId}`;
 	if (mode === "execute") return `根据execute进行工作${taskId}`;
+	if (mode === "adaptive") return `根据adaptive进行工作${taskId}`;
 	return `根据workflow进行工作${taskId}`;
 }
 
@@ -238,6 +260,23 @@ export function workflowDisciplineBlock(taskId: string, skillPath?: string, mode
 			reportLine,
 		].join("\n");
 	}
+	if (mode === "adaptive") {
+		return [
+			`> 【工作方式约束 · 强制 · 自适应】本会话是自适应工作流任务会话（任务号 ${taskId}）：链深不在派发时固定，由你在启动时按任务书信息完备度自评决定。你必须按 workflow-orchestrator 技能的「自适应模式（adaptive）」执行：`,
+			`> 1. 第一步 ${skillRef}，重点读「自适应模式（adaptive）」一节；先 read 仓库根 AGENTS.md，再通读任务书。`,
+			"> 2. 【首轮自评 · 必须声明】在首轮回复开头声明完备度档位与选择依据：",
+			">    - **A0 自执行快链**（A 档条件 + 小任务边界：文件域 ≤3 文件、单模块、验收可直接跑通）：校验性核对 → 你（tab）自己 read 代码/改代码/跑验收命令，不派 implementer；中途仅在①跨模块架构取舍 ②方案冲突需第二模型视角 ③截图/视觉参照 三类事件时可用 subagent-win 派 consultant 咨询（每次咨询记入回报：问题+结论+影响，禁止例行化；咨询不能替代升档）；code-reviewer 独立审查必做（交 git diff，不交描述）→ Wiki 收尾。tab-finish 的 summary 必须含自执行记录 + 咨询记录（无则写「无」）+ 审查结论。",
+			">    - **A 快链**（任务书四要素齐全：根因/结论+代码位置、方案方向、文件域、可测验收标准）：校验性核对（用 codegraph explore / read 快速验证任务书假设仍成立，≤3 轮工具调用，禁止重新调研）→ implementer 实现 → code-reviewer 审查 → Wiki 收尾。",
+			">    - **B 中链**（缺验收标准或缺方案，但问题与域明确）：planner 出微型实施序 → plan-reviewer 快审（可并行）→ implementer → code-reviewer → Wiki 收尾。",
+			">    - **C 全链**（仅问题描述）：标准完整链 搜索 → 计划 → 审查 → 实现 → 审查 → Wiki 收尾。",
+			"> 3. 【升级规则】执行中发现任务书假设失效（文件/符号不存在、结论与现状冲突、验收不可测）：升级到更高档位并在回复中声明升级原因；降级禁止（A 档发现冗余也至少保留码审）。A0 档执行中超出小任务边界（文件扩散 >3 / 跨模块 / 假设失效）→ 剩余工作移交 implementer 或升 A/B/C 并声明。",
+			"> 4. 你是项目经理：各阶段仍委派给 subagent-win 的 searcher / planner / plan-reviewer / implementer / code-reviewer；禁止自己一路干完；A0 自执行快链例外：允许自己实现（松执行、死审查——独立审查与审计链不省）；A 快链的校验性核对可自己做但仅限验证类工具。",
+			`> 5. 任务临时发现只进回复或 plans/*_research.md；禁止 task${taskId}/Item/计划步骤进 Wiki；Wiki 只更新对应功能/主题正式页，改动后调 wiki-nav rebuild。`,
+			"> 6. 模型选择遵守各 agent 的 config 默认 + fallback 链，不主动 override。",
+			noNestedTabsLine,
+			reportLine,
+		].join("\n");
+	}
 	return [
 		`> 【工作方式约束 · 强制】本会话是 workflow 的任务会话（任务号 ${taskId}），不是一次性实现任务。你必须按 workflow-orchestrator 技能执行完整工作流：`,
 		`> 1. 第一步 ${skillRef}，严格遵循其流程：搜索 → 计划 → 审查 → 实现 → 审查 → Wiki 收尾（阶段 5 强制，可结论「无」）。`,
@@ -256,6 +295,7 @@ export function workflowDisciplineBlock(taskId: string, skillPath?: string, mode
  *   根据workflow进行工作<taskId>   (mode: "workflow")
  *   根据research进行工作<taskId>   (mode: "research")
  *   根据execute进行工作<taskId>   (mode: "execute")
+ *   根据adaptive进行工作<taskId>   (mode: "adaptive")
  *
  *   > 【工作方式约束 · 强制】…
  *

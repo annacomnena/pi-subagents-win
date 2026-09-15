@@ -25,6 +25,8 @@ import {
 	type ExternalSubagentResult,
 } from "./external-cli.ts";
 import { registerCodexHeaders } from "./codex-headers.ts";
+import { registerSubPresetsCommand } from "./model-presets.ts";
+import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
@@ -160,6 +162,8 @@ interface AgentConfig {
 	notifications?: boolean;
 	/** searcher 派发模式：auto（默认，orchestrator 自行判断）、serial（逐个串行）、parallel（并发） */
 	searcherMode?: "auto" | "serial" | "parallel";
+	/** lite 轻量工作流模式：off（默认，零注入）、on（一律走 lite 链）、auto（按任务判据自选）；逻辑在 lite-mode.ts */
+	liteMode?: LiteMode;
 }
 
 function configPath(): string {
@@ -175,9 +179,10 @@ function readConfig(): AgentConfig {
 			thinking: parsed.thinking ?? {},
 			notifications: parsed.notifications !== false,
 			searcherMode: parsed.searcherMode ?? "auto",
+			liteMode: parsed.liteMode ?? "off",
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto" };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off" };
 	}
 }
 
@@ -1135,10 +1140,12 @@ function recordUsage(agent: string | undefined, result: SubagentResult): void {
 
 interface UsageBucket extends UsageSummary {
 	count: number;
+	/** Per-model breakdown (key = provider/id when available). */
+	byModel: Map<string, UsageBucket>;
 }
 
 function emptyUsage(): UsageBucket {
-	return { ...emptyUsageSummary(), count: 0 };
+	return { ...emptyUsageSummary(), count: 0, byModel: new Map() };
 }
 
 function addUsage(target: UsageBucket, usage: Partial<UsageSummary>, count = 0): void {
@@ -1149,6 +1156,32 @@ function addUsage(target: UsageBucket, usage: Partial<UsageSummary>, count = 0):
 	target.cost += usage.cost ?? 0;
 	target.turns += usage.turns ?? 0;
 	target.count += count;
+}
+
+function addModelUsage(target: UsageBucket, model: string, usage: Partial<UsageSummary>, count = 0): void {
+	let bucket = target.byModel.get(model);
+	if (!bucket) {
+		bucket = emptyUsage();
+		target.byModel.set(model, bucket);
+	}
+	addUsage(bucket, usage, count);
+}
+
+function modelKey(provider: unknown, model: unknown): string {
+	if (typeof provider === "string" && provider && typeof model === "string" && model) return `${provider}/${model}`;
+	if (typeof model === "string" && model) return model;
+	return "unknown";
+}
+
+function mergeModelBuckets(target: Map<string, UsageBucket>, source: Map<string, UsageBucket>): void {
+	for (const [model, bucket] of source) {
+		let t = target.get(model);
+		if (!t) {
+			t = emptyUsage();
+			target.set(model, t);
+		}
+		addUsage(t, { input: bucket.input, output: bucket.output, cacheRead: bucket.cacheRead, cacheWrite: bucket.cacheWrite, cost: bucket.cost, turns: bucket.turns }, 0);
+	}
 }
 
 function parseTsMs(value: unknown): number | null {
@@ -1224,6 +1257,7 @@ function collectSubagentUsage(day: DayBounds): UsageBucket {
 					input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
 					cost: u.cost, turns: u.turns,
 				});
+				addModelUsage(total, typeof r.model === "string" && r.model ? r.model : "unknown", u, 0);
 			} catch { /* skip bad line */ }
 		}
 	}
@@ -1264,10 +1298,9 @@ function collectMainSessionUsage(day: DayBounds, sessionsRoot = DEFAULT_SESSIONS
 				if (!inDay(msgTs, day)) continue;
 
 				const u = msg.usage;
-				addUsage(total, {
-					input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
-					cost: u.cost?.total, turns: 1,
-				});
+				const usagePart = { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, cost: u.cost?.total };
+				addUsage(total, { ...usagePart, turns: 1 });
+				addModelUsage(total, modelKey(msg.provider, msg.model), usagePart, 1);
 				fileHasUsage = true;
 			} catch { /* skip bad line */ }
 		}
@@ -1643,13 +1676,15 @@ export default function (pi: ExtensionAPI) {
 		} else if (searcherMode === "parallel") {
 			lines.push(`[searcher-mode=parallel] 所有 searcher 优先并发派发（parallel tasks 数组），除非搜索方向之间有严格依赖。`);
 		}
+		// lite 轻量工作流模式（逻辑在 lite-mode.ts；off 时零注入）
+		lines.push(...litePromptLines(cfg));
 		lines.push("Note: When dispatching the searcher, ask it to query `Wiki/` by keyword first, jump straight to code via each page's `source_paths` (e.g. `file#L49` / `file::Symbol`, no grep guessing), cross-check with codegraph, and PROACTIVELY maintain theme pages — update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a durable, source-verified cross-task theme is absent. Require each returned fact to carry a code location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a 'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
 		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
 		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
-		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), and `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`).");
+		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
@@ -1666,7 +1701,7 @@ export default function (pi: ExtensionAPI) {
 			"在 Windows Terminal 中并行打开一个或多个可见、独立的 pi 交互标签页。",
 			"先分析当前会话并只提交彼此独立、启动条件已满足的任务；不要为编排请求本身打开标签页。",
 			"每项必须提供 taskId、具体 prompt；prompt 会自动以 `根据workflow进行工作<taskId>` 开头，并附加 workflow-orchestrator 强制约束块（先 read 技能、委派 subagent-win 各角色执行、禁止单 agent 一路干完）。",
-			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）。",
+			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）| adaptive（自适应：任务书含根因+方案+文件域+验收标准时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链；前缀 `根据adaptive进行工作<taskId>`）。",
 			"一次调用传入全部任务以保证并行启动。",
 			"标签自动生成规范名 `<仓库名>[-worktree]-<taskId>-<标签>`（仓库名取自 git origin/toplevel，worktree 路径自动加 -worktree- 标记，标签取显式 title 或从 prompt 首行提取）；不再使用无意义的 wlc 默认名。",
 			"每项返回 tab runId（只属于可见 tab）：用 tab-status 查询状态、reclaim-tabs 回收结果后编排下一批；不要把它与 subagent-win async runId 混用。每项可传 timers: [{delayMs, message, label?, repeatMs?}] 写入该标签页邮箱，到期自动发送推进消息（仅主会话的 tab 编排）。",
@@ -1679,7 +1714,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: Type.Optional(Type.String({ description: "新标签页工作目录；缺省用当前目录。独立 worktree 场景必填，如 G:/code/worktrees/GreenCAD-123" })),
 				model: Type.Optional(Type.String({ description: "仅用户明确要求或配置不适用时覆盖新 pi 会话模型" })),
 				title: Type.Optional(Type.String({ description: "标签名（可选）：仅作为标签部分，自动剥离开头的 pi-/wlc- 前缀；缺省从 prompt 首行提取" })),
-				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）" })),
+				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）| adaptive（自适应：任务书四要素齐全时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链）" })),
 				timers: Type.Optional(Type.Array(Type.Object({
 					delayMs: Type.Number({ description: "延时毫秒：到期后系统自动向该标签页发送消息推进工作" }),
 					message: Type.String({ description: "到期自动发送的推进指令" }),
@@ -1743,7 +1778,7 @@ export default function (pi: ExtensionAPI) {
 				// workflow 绑定：前缀 + 强制约束块 + 原始 handoff；--skill 保证技能在标签会话里可见
 				const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
 				const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
-				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : "workflow";
+				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : item.mode === "adaptive" ? "adaptive" : "workflow";
 				const normalizedPrompt = buildWorkflowTabPrompt({ taskId, title: item.title, prompt, model: item.model }, skillRef, mode);
 				const cwdRaw = (item.cwd ?? "").trim() || process.cwd();
 				const cwd = resolve(cwdRaw);
@@ -2118,6 +2153,10 @@ export default function (pi: ExtensionAPI) {
 			const main = collectMainSessionUsage(day, DEFAULT_SESSIONS_ROOT);
 			const mainTotal = main.total;
 
+			const grandModelBuckets = new Map<string, UsageBucket>();
+			mergeModelBuckets(grandModelBuckets, subTotal.byModel);
+			mergeModelBuckets(grandModelBuckets, mainTotal.byModel);
+
 			const grandTotal = {
 				input: subTotal.input + mainTotal.input,
 				output: subTotal.output + mainTotal.output,
@@ -2127,6 +2166,11 @@ export default function (pi: ExtensionAPI) {
 			};
 			const tokenTotal = (usage: Pick<UsageSummary, "input" | "output" | "cacheRead" | "cacheWrite">) =>
 				usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+			const modelNameWidth = Math.min(32, Math.max(8, ...[...grandModelBuckets.keys()].map((k) => k.length), 0));
+			const modelLines = [...grandModelBuckets.entries()]
+				.sort((a, b) => tokenTotal(b[1]) - tokenTotal(a[1]))
+				.map(([model, bucket]) =>
+					`\n  ${model.padEnd(modelNameWidth)}  ${tokenTotal(bucket).toLocaleString()} tokens  ${bucket.turns.toLocaleString()} turns  $${bucket.cost.toFixed(4)}`).join("");
 			const usageLines = (usage: UsageSummary) =>
 				`\n  ↑ ${usage.input.toLocaleString()} input` +
 				`\n  ↓ ${usage.output.toLocaleString()} output` +
@@ -2139,7 +2183,8 @@ export default function (pi: ExtensionAPI) {
 				`Today token usage (${day.label}, local day)\n` +
 				`\n=== Subagent runs (${subTotal.count} runs, ${subTotal.turns} turns) ===` + usageLines(subTotal) +
 				`\n=== Main sessions (${main.sessionCount} sessions, ${main.sessionsWithUsage} with usage, ${mainTotal.turns} turns) ===` + usageLines(mainTotal) +
-				`\n=== Total ===` + usageLines({ ...grandTotal, turns: 0 }),
+				`\n=== Total ===` + usageLines({ ...grandTotal, turns: 0 }) +
+				`\n  by model:` + modelLines,
 				"info",
 			);
 		},
@@ -2381,6 +2426,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── /sub-presets 命令（模型预设槽位，逻辑在 model-presets.ts）──
+	registerSubPresetsCommand(pi, { reloadConfig, writeConfig });
+
 	// ── /notify on|off 命令 ──
 	pi.registerCommand("notify", {
 		description: "Windows 通知开关（/notify on 或 /notify off）",
@@ -2431,6 +2479,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── /lite 命令（轻量工作流模式，逻辑在 lite-mode.ts）──
+	registerLiteCommand(pi, { reloadConfig, writeConfig });
+
 	// ── /launch 命令（只允许主会话）──
 	if (!canOrchestrateTabs) {
 		// 标签页 / 子 agent：跳过 /launch 命令（防止孙 tab 派发）
@@ -2451,8 +2502,8 @@ export default function (pi: ExtensionAPI) {
 				const modelHint = request.model
 					? `\n用户指定新 pi 会话模型为 \"${request.model}\"；只有在 launch-tabs 的每项需要时传入该 model。`
 					: "";
-				const modeHint = request.execute || request.research
-					? `\n用户请求为${request.execute ? "快速执行模式（--execute）：结论/方案已明确，跳过搜索与计划" : "深度研究模式（--research）：只要结论不要实现"}。把对应任务在 launch-tabs 里传 mode: ${request.execute ? "\"execute\"" : "\"research\""}；这些标签页将以 ${request.execute ? "`根据execute进行工作<taskId>`" : "`根据research进行工作<taskId>`"} 启动，只做${request.execute ? "实现 → 审查 → Wiki 收尾" : "并行搜索 + 研究报告 + Wiki 维护"}。`
+				const modeHint = request.execute || request.research || request.adaptive
+					? `\n用户请求为${request.execute ? "快速执行模式（--execute）：结论/方案已明确，跳过搜索与计划" : request.research ? "深度研究模式（--research）：只要结论不要实现" : "自适应模式（--adaptive）：tab 启动时按任务书信息完备度自评链深 A0自执行快链/A快链/B中链/C全链"}。把对应任务在 launch-tabs 里传 mode: ${request.execute ? "\"execute\"" : request.research ? "\"research\"" : "\"adaptive\""}；这些标签页将以 ${request.execute ? "`根据execute进行工作<taskId>`" : request.research ? "`根据research进行工作<taskId>`" : "`根据adaptive进行工作<taskId>`"} 启动，只做${request.execute ? "实现 → 审查 → Wiki 收尾" : request.research ? "并行搜索 + 研究报告 + Wiki 维护" : "启动自评链深后按对应档位执行（自适应）"}。`
 					: "";
 				pi.sendUserMessage([
 					"这是一个 /launch workflow 编排请求，不要把这句话直接作为新标签页任务。",
@@ -2462,7 +2513,7 @@ export default function (pi: ExtensionAPI) {
 					"请先分析当前会话上下文，找出用户明确表示启动条件已满足、且彼此独立的任务。",
 					"对每个任务调用 launch-tabs；一次调用提交全部任务以并行打开标签页。",
 					"每项必须有准确的 taskId（例如 1007）、具体且可执行的首轮 prompt，并保留 workflow 的 Wiki/plan/审查交接；不要把未满足条件的任务启动。",
-					"launch-tabs 会确保每个首轮 prompt 以 `根据workflow进行工作<taskId>` 开头并附带 workflow-orchestrator 强制约束块（先 read 技能、委派执行、禁止自己一路干完）；任务模式由每项 mode 决定——research（深度研究，前缀 `根据research进行工作<taskId>`，只做并行搜索+研究报告+Wiki 维护）或 execute（结论已明确，前缀 `根据execute进行工作<taskId>`，跳过搜索与计划，只做实现+审查+Wiki 收尾）。若没有足够明确的独立任务，先说明原因，不要开标签页。",
+					"launch-tabs 会确保每个首轮 prompt 以 `根据workflow进行工作<taskId>` 开头并附带 workflow-orchestrator 强制约束块（先 read 技能、委派执行、禁止自己一路干完）；任务模式由每项 mode 决定——research（深度研究，前缀 `根据research进行工作<taskId>`，只做并行搜索+研究报告+Wiki 维护）、execute（结论已明确，前缀 `根据execute进行工作<taskId>`，跳过搜索与计划，只做实现+审查+Wiki 收尾）或 adaptive（任务书含根因+方案+文件域+验收标准时用，前缀 `根据adaptive进行工作<taskId>`，tab 启动自评完备度选链深）。若没有足够明确的独立任务，先说明原因，不要开标签页。",
 				].filter(Boolean).join("\n"), { deliverAs: "followUp" });
 				ctx.ui.notify("🧭 已交给当前 agent 分析；它会在确认任务后通过 launch-tabs 并行打开标签页", "info");
 				return;
@@ -2482,13 +2533,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// 任务文本带任务序号（如 "Fix 1004 detector lifecycle"）时同样绑定 workflow 约束：
-			// 前缀 根据workflow进行工作<序号> / 根据research进行工作<序号> + 强制约束块 + 原始任务；无序号则保持直开（用户自定任务）。
+			// 只有用户显式选择模式时才绑定 workflow 约束。任务编号本身只是业务标识，
+			// 不应把普通的单任务启动自动升级成 workflow。
 			const taskNum = request.task.match(/\b\d{3,5}\b/)?.[0] ?? "";
-			const workflowBound = taskNum !== "";
+			const explicitMode = request.execute || request.research || request.adaptive;
+			const explicitWorkflowPrefix = /根据(?:workflow|research|execute|adaptive)进行工作\s*\d{3,5}/.test(request.task);
+			const workflowBound = explicitMode || explicitWorkflowPrefix;
 			const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
 			const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
-			const mode: LaunchMode = request.execute ? "execute" : request.research ? "research" : "workflow";
+			const mode: LaunchMode = request.execute ? "execute" : request.research ? "research" : request.adaptive ? "adaptive" : "workflow";
 			const prompt = workflowBound
 				? buildWorkflowTabPrompt({ taskId: taskNum, title: request.title, prompt: request.task, model: request.model }, skillRef, mode)
 				: request.task;
@@ -2518,7 +2571,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const modelHint = request.model ? ` (model: ${request.model})` : "";
-			const modeName = request.execute ? "快速执行" : request.research ? "深度研究" : "workflow";
+			const modeName = request.execute ? "快速执行" : request.research ? "深度研究" : request.adaptive ? "自适应" : "workflow";
 			const boundHint = workflowBound ? ` (workflow 约束已绑定 · ${modeName}模式)` : "";
 			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},

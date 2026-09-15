@@ -1,6 +1,6 @@
 ---
 name: workflow-orchestrator
-description: 使用 subagent-win 工具编排多步骤工作流（搜索→计划→审查→执行→审查→Wiki 收尾），自动在步骤间传递上下文；也支持深度研究模式（research-only：并行搜索→研究报告→Wiki 收尾，不做实现）与快速执行模式（execute-only：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）。当用户要求执行完整工作流、深度研究或快速执行时使用。与 pi-codex-goal 联用时默认不设 token_budget（不限预算），仅用户显式给出预算时才限制。Wiki 只更新对应功能/主题正式页；禁止 taskXXX 任务描述进 Wiki；任务临时发现不进 Wiki。
+description: 使用 subagent-win 工具编排多步骤工作流（搜索→计划→审查→执行→审查→Wiki 收尾），自动在步骤间传递上下文；也支持深度研究模式（research-only：并行搜索→研究报告→Wiki 收尾，不做实现）、快速执行模式（execute-only：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）与自适应模式（adaptive：tab 启动时按任务书信息完备度自选链深 A0自执行快链/A快链/B中链/C全链）与轻量链模式（lite：/lite on|auto 开启，主会话内直接编排单一 general agent + 按阶段档位模型 small/medium/large，不开 tab、交接默认落盘）。**仅当用户明确要求使用某个 workflow/工作流模式（包括 workflow、research、execute、adaptive、lite）时才使用；普通“直接执行/修复/实现”不得自动触发本技能。**与 pi-codex-goal 联用时默认不设 token_budget（不限预算），仅用户显式给出预算时才限制。Wiki 只更新对应功能/主题正式页；禁止 taskXXX 任务描述进 Wiki；任务临时发现不进 Wiki。
 ---
 
 # Workflow Orchestrator
@@ -46,13 +46,44 @@ description: 使用 subagent-win 工具编排多步骤工作流（搜索→计�
 - 可一次探索较大范围
 - 仍建议按目录/模块并行，提高效率
 
+## Searcher 派发模式（/searcher-mode）
+
+主 agent 启动时会在系统提示中看到 `Searcher dispatch mode: ...`，这是当前的 searcher 派发模式。**必须按此模式派发 searcher，不得自行决定。**
+
+| 模式 | 行为 | 何时使用
+|------|------|----------|
+| `auto`（默认） | orchestrator 根据模型上下文（<200K 拆并行）和任务独立性自行判断 | 通用场景 |
+| `serial` | 逐个派发 searcher（每次 sync 调一个，等返回后派下一个） | GPU 资源有限的本地模型（如 lms/*）、避免并发争抢 |
+| `parallel` | 用 `tasks: [...]` 并发派发所有 searcher | 速度优先、搜索方向完全独立 |
+
+**派发规则：**
+
+1. **auto 模式**：
+   - 模型上下文 <200K → 按目录/模块拆分并行 searcher
+   - 模型上下文 >=200K → 可并行（效率优先）或单次大范围探索
+   - 任务间无依赖 → 并行；有依赖 → 串行
+
+2. **serial 模式（强制串行）**：
+   - 每次只派发一个 searcher：`subagent-win({ agent: "searcher", task: "..." })`
+   - 等上一个返回后，再派下一个
+   - **不得**使用 `tasks: [...]` 并发
+   - 例外：用户明确要求速度时，可在 task 里临时写 `[dispatch: parallel]` 覆盖
+   - 适合场景：本地模型（lms/*）跑多实例会 GPU 竞争/OOM、模型不稳定需要逐个确认结果
+
+3. **parallel 模式（强制并发）**：
+   - 用 `subagent-win({ tasks: [{agent:"searcher",task:"..."}, ...], concurrency: N })` 并发
+   - `concurrency` 一般设 3（默认）；GPU 资源充足可设更高
+   - 除非搜索方向有严格依赖，否则全部并发
+
+**用户可通过 `/searcher-mode auto|serial|parallel` 切换模式。**
+
 ## 核心原则
 
 1. **委派，不要亲自执行** — 搜索、实现、审查交给 subagent；注意：subagent 与可见 tab 是两种不同的派发对象，不能因为都有 runId 就混用管理工具
 2. **Wiki 第一站（术语发现 → 精确定位 → 直接交接）+ codegraph** — 仅新主题查询时，用 `wiki-nav keywords queries=[...]` 查精确术语，exact miss 才用 `semantic-terms` 扩展候选，选词后 grep 定位 Wiki；searcher 一旦确认 `Wiki/path.md#章节`，该地址就是本 workflow 的规范交接物，后续 agent 直接 read，绝不重新术语发现。再按页内 `source_paths` 直达代码，联合 `codegraph explore / query / node / impact` 追溯；**主动维护主题页：过期更新、缺失且已验证的跨任务主题新建、同主题碎片自主合并**
 3. **任务临时发现不进 Wiki** — 搜索结论走回复或 `plans/*_research.md`；进度走 `recentwork.md`
 4. **正式 Wiki 仅主题/功能页** — 收尾阶段必须对照改动更新**对应功能**正式页；禁止 task/Item 叙事进 Wiki
-5. **积极分派搜索** — 多方向时并行 searcher
+5. **积极分派搜索** — 多方向时按 searcher-mode 派发（见下方「searcher 派发模式」）
 6. **先区分 subagent 与 tab，再选择执行模式** — `subagent-win` 是无头子 agent；`launch-tabs` 是可见独立 pi 标签页。单 agent、并行 subagent、**async subagent** 都不会打开标签页。async subagent 的 runId 只能用 `subagent-win({ action:"status", runId })` 查询；不要对它使用 `tab-status`、`reclaim-tabs`、`tab-finish` 或 `set-timer`。只有主会话需要长时间、可见、独立且可回收的工作时，才调用 `launch-tabs`。判据：结果马上要用 → 同步/并行 subagent；本回合不需要结果 → async subagent；需要可见独立标签页 → 主会话 launch-tabs
 7. **前置串行，独立并行** — 有依赖串行，无依赖并行
 8. **模型选择守配置优先** — 默认走各 agent 的 config 默认 + fallback 链，不主动 override；仅当 fallback 也用尽/用户指定/配置模型明显不合适才换；勿擅自用未配置的外部 CLI
@@ -161,7 +192,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 ### 阶段 1：搜索 (Search)
 
-**不要自己搜代码。** 并行 searcher。任务发现写在**回复**里，不进 Wiki。
+**不要自己搜代码。** 按当前 searcher-mode 派发 searcher（见「searcher 派发模式」）。任务发现写在**回复**里，不进 Wiki。
 
 ```json
 { "tasks": [
@@ -275,9 +306,9 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 **与完整链路的区别**：不做 planner / plan-reviewer / implementer / code-reviewer；不写实现计划（`plans/<主题>.md`）；产出是**研究报告**而非计划。搜索纪律不变：Wiki 第一站、`source_paths` 直达、codegraph 验证、主动维护主题页；任务临时发现仍只进回复 / `plans/*_research.md`。
 
-### 阶段 R1：最大化并行搜索
+### 阶段 R1：最大化搜索
 
-- 把主题按**模块 / 目录 / 问题维度**拆成多个**并行 searcher**（searcher 的模型上下文 <200K 时应拆得更细；这里是「广度优先」，宁可多拆几个）。
+- 把主题按**模块 / 目录 / 问题维度**拆成多个 searcher，按当前 searcher-mode 派发（serial 模式逐个，parallel 模式并发；auto 模式按模型上下文自行判断）（searcher 的模型上下文 <200K 时应拆得更细；这里是「广度优先」，宁可多拆几个）。
 - 每个 searcher 用与完整链路阶段 1 相同的任务模板（先 read AGENTS.md 与 Wiki/_index.md → Wiki 第一站定位 → `source_paths` 直达代码 → codegraph 追溯 → **主动维护主题页**）。并在 task 里写明研究深度：覆盖现状、接口、调用链、风险点、未决问题。
 - 回复必含：①「已验证事实」每条带代码位置 + Wiki 章节引用 + 校准状态；②「Wiki 章节引用清单」；③「Wiki 维护记录」（改过页的 searcher 随后调 `wiki-nav rebuild`）。
 - 结论过大 → searcher 写 `plans/YYYYMMDD_research_<topic>_partN.md`。
@@ -325,6 +356,82 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 **回报主会话（强制）**：实现 + 审查 + Wiki 收尾全部完成后，调用 `tab-finish`（status=completed + summary + 交付物 artifacts / reportPath）向主会话回报；不调 tab-finish = 执行任务未完成。
 
+## 工作流：自适应模式（adaptive）
+
+**适用**：主会话判断不准该用 execute 还是 workflow 时——把已知信息全写进任务书后派 `mode: "adaptive"`，由 tab 在启动时**自评信息完备度**选择链深。典型信号：任务书里已能写出可测验收标准，但主会话不确定假设是否仍然成立。
+
+**设计动机（源案例 1030）**：主会话已在任务书里给出根因（file:line）+方案方向+文件域+验收标准，但 tab 仍走完整六阶段——检索/计划阶段在重复主会话已知的信息，耗时翻倍。链深应由**信息完备度**决定，不由仪式感决定。
+
+### 启动自评（首轮回复开头必须声明档位与依据）
+
+| 档位 | 任务书条件 | 链条 |
+|------|-----------|------|
+| **A0 自执行快链** | A 档条件 + 小任务边界：文件域 ≤3 个文件、单模块、验收标准可直接跑通 | 校验性核对 → **tab 自执行**（必要时事件驱动咨询）→ code-reviewer → Wiki 收尾 |
+| **A 快链** | 四要素齐全：①根因/结论+代码位置 ②方案方向（含取舍）③文件域清单 ④可测验收标准 | 校验性核对 → implementer → code-reviewer → Wiki 收尾 |
+| **B 中链** | 问题与域明确，但缺验收标准或缺方案 | planner 微型实施序 → plan-reviewer 快审 → implementer → code-reviewer → Wiki 收尾 |
+| **C 全链** | 仅问题描述 | 完整六阶段（同 workflow 默认） |
+
+### 校验性核对（A0/A 快链共有前置阶段，≤3 轮工具调用）
+
+- **目的**：验证任务书假设仍成立（文件/符号存在、代码位置未漂移、验收可测），不是重新调研。
+- **手段**：`codegraph explore <符号>` / `read` 目标文件关键行 / `bash` 跑一次复现命令。禁止 searcher 全量搜索。
+- **通过**：假设成立 → 按档位继续（A0 → tab 自执行；A → implementer）。**失效**：升级档位（→B 或 C）并在回复声明升级原因。
+
+### 档位 A0：自执行快链（tab 自己干活 + 事件驱动咨询）
+
+**定位**：把 A 档的「项目经理纯委派」放宽为「松执行、死审查」——小任务下交接税（重写交接材料、subagent 重新读文件）比实现本身更贵，且主会话上下文里的细粒度信息在 handoff 中会衰减。A0 让 tab 直接实现，但**独立审查与审计链不省**。
+
+- **触发**：A 档四要素齐全，且①文件域 ≤3 个文件 ②单模块 ③验收标准可直接跑通（有可执行命令）。任一不满足 → 落 A 档。
+- **自执行**：A0 校验性核对通过后，tab 自己 `read` 代码 → 改代码 → 跑验收命令，不派 implementer。改动的长期契约（Wiki 主题页）仍按收尾节处理。
+- **咨询（事件驱动，禁止例行化）**：允许中途用 `subagent-win` 派 consultant，但只在以下事件触发：①跨模块架构取舍 ②方案冲突需要第二模型视角 ③截图/视觉设计参照。每次咨询在回报中记录（问题 + 结论 + 对实现的影响）。**咨询不能替代升档**：A0 核对已发现假设失效时，动作是升档声明，不是「问一下 consultant 再继续」。
+- **独立审查不可省**：code-reviewer 必须委派（tab 不能审自己的代码），且交 **diff**（`git diff` 或逐文件改动），不是「我大概改了什么」的描述。这是 A0 与「单 agent 一路干」纪律的底线区别。
+- **升档路径**：执行中发现超出小任务边界（文件扩散 >3 / 跨模块 / 假设失效）→ 剩余工作移交 implementer 或升 A/B/C，声明原因。降级禁止同 A 档。
+- **回报（tab-finish 强制字段）**：summary 必须含 ①自执行记录（改了哪些文件）②咨询记录（每次的问题/结论/影响，无则写「无」）③code-reviewer 审查结论。
+
+### 升降级规则
+
+- **升级允许且必须声明**：执行中发现任务书假设失效（符号不存在/结论与现状冲突/验收不可测）→ 升到更高档位重走对应前置阶段。
+- **降级禁止**：A 档发现任务书信息冗余也不得跳过 code-reviewer（审查是质量底线，不是仪式）。
+- 自评存疑时取更高档位（宁慢勿错）。
+
+### 与各模式的边界
+
+- **与 execute 的区别**：execute 强假设交接结论完全可靠（不验证）；adaptive 先花 ≤3 轮验证假设再实现，适合「结论是主会话从研究报告推导的、未经实施验证」的场景。
+- **与 workflow 的区别**：全链六阶段固定开销；adaptive 在信息完备时把前三个阶段压缩成 ≤3 轮核对。
+
+**回报主会话（强制）**：同 execute——实现/审查/Wiki 收尾完成后调用 `tab-finish`（status=completed + summary + artifacts / reportPath）。
+
+## 工作流：轻量链模式（lite）
+
+**适用**：中小任务、用户正在对话中等结果、不需要跨会话存活/可见 TUI。**不开 launch-tabs、不用角色 agent（searcher/planner/implementer/…），主会话直接编排单一 `general` agent，按阶段以 `model=` 传档位模型。**由 `/lite on`（一律 lite）或 `/lite auto`（逐任务判据自选）开启；off 时完全不注入、行为不变。
+
+**设计动机**：完整链的 tab 生命周期（launch/reclaim/event-bus/timer）+ 六角色交接仪式对中小任务过重；且角色制的本质就是按阶段配模型档位——lite 把它显式化为「按阶段选档」，用既有机制（general 角色卡 + per-call model override + 文件交接）零新代码路径实现。
+
+### 档位映射（从 config.models 实时投影，/sub-models 改了自动同步）
+
+| 档位 | 用途 | 模型来源 |
+|------|------|----------|
+| small | 检索代码 / 更新文档 / 读文档找证据 | `models.searcher` |
+| medium | 实现 / 常规计划 | `models.implementer` |
+| large | 咨询 / 修订计划 / 独立审查 | `models.consultant` |
+
+派发示例：`subagent-win({ agent: "general", model: "<small 档模型>", task: "阶段：检索。…" })`。档位传入是 lite 的既定机制，不触发「不得随意 override model」规则。
+
+### 链路 L1–L5
+
+1. **L1 检索（small）**：1–2 个 general，Wiki 第一站 → source_paths 直达 → 主动维护主题页；事实带代码位置 + Wiki 章节引用
+2. **L2 计划（medium；高风险修订用 large）**：基于 L1 事实写 `plans/<月日_主题>.md`
+3. **L3 实现（medium）**：按计划改代码、跑验证
+4. **L4 独立审查（large）**：独立 general 进程，交 `git diff` + 计划路径核对，直接修复；**不可省、不可自己审自己**
+5. **L5 文档收尾（small）**：只更新功能/主题正式页，可结论「Wiki 更新：无」；改过 wiki 调 `wiki-nav rebuild`
+
+### 上下文纪律（lite 成败关键）
+
+- **只用 sync / parallel**：async 的 status 只回 500 字符预览，拿不到全文
+- **交接默认落盘**：>30 行产物让 general 写 `plans/` 或 Wiki，回复只带路径 + ≤10 行摘要——细节住磁盘，不住主会话上下文（每阶段主会话开销 ~1K，不随任务规模增长）
+- **升级线**：预计中转材料 >10K token、fan-out ≥3、需跨会话存活 → 停用 lite，改 `launch-tabs` 完整链（mode=workflow/adaptive）；用户单次说「这次走完整链」可临时覆盖
+- 任务 tab 的模式纪律（workflow/research/execute/adaptive）不受 lite 影响
+
 ## 落盘时机速查
 
 | 步骤 | Wiki | plans / 回复 | recentwork.md |
@@ -337,6 +444,8 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 | **阶段 5 Wiki 收尾（searcher）** | **✅ searcher 更新对应功能页**；可结论「无」 | 可选 | ✅ 列出页或「无」 |
 | **深度研究模式（research-only）** | 只更新主题页（searcher） | ✅ `plans/YYYYMMDD_research_<topic>.md` 研究报告；过大 → `*_research.md` | ✅ 一行摘要 |
 | **快速执行模式（execute-only）** | 长期契约变化才更新（E1 顺手 / E3 收尾） | ✅ 按交接结论/计划实现 | ✅ 一行摘要 |
+| **自适应模式（adaptive）** | 同 execute（档位对应链条的收尾节） | ✅ A0 校验记录 + 实现产物；A0 自执行快链另含自执行记录 + 咨询记录 | ✅ 一行摘要（含自评档位） |
+| **轻量链模式（lite）** | L5 只更新主题页（general+small，可结论「无」） | ✅ >30 行产物一律落盘，回复只带路径+≤10 行摘要 | ✅ 一行摘要 |
 
 ## 快捷入口
 
@@ -351,6 +460,12 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 **"结论已明确，执行：xxx" / "按已确认的方案实现" / "执行计划 plans/xxx.md"**  
 → **execute 模式**：跳过搜索与计划 → implementer 按交接结论/计划实现 → code-reviewer 审查 → **Wiki 收尾（功能页）**。
+
+**"lite 走一遍：xxx" / "轻量走一遍：xxx"**（需 /lite on 或 /lite auto 已开启，或用户本次明确要求 lite）  
+→ **lite 模式**：不开 tab、不用角色 agent，主会话直接编排 general：L1 检索（small）→ L2 计划（medium）→ L3 实现（medium）→ L4 独立审查（large，交 diff 不可省）→ L5 Wiki 收尾（small，可结论「无」）；交接默认落盘（>30 行写文件，回复只带路径+摘要）；只派 sync/parallel；中转材料 >10K token 或 fan-out≥3 → 升级 launch-tabs 完整链。
+
+**"自适应执行：xxx"（任务书含根因+方案+文件域+验收标准，但不确定假设是否仍成立）**  
+→ **adaptive 模式**（mode: "adaptive"）：tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链；A0 档（A 档条件 + 文件域 ≤3 文件/单模块/验收可跑通）由 tab 自执行 + 事件驱动咨询（咨询不替代升档）+ code-reviewer 独立审查（交 diff）；A 档先 ≤3 轮校验性核对验证假设，再按档位链条执行；执行中假设失效则升档并声明，降级禁止。
 
 **"执行计划：plans/xxx.md"**  
 → 读计划 → 缺背景再 search → implement + review → **Wiki 收尾（功能页）**

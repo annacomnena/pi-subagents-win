@@ -9,9 +9,11 @@ import {
 	deriveLaunchTitle,
 	isWorktreePath,
 	launchTaskTitle,
+	modePrefix,
 	normalizeWorkflowPrompt,
 	parseLaunchRequest,
 	repoName,
+	sanitizeWtTitle,
 	taskTitleLabel,
 	workflowDisciplineBlock,
 	wtPromptArg,
@@ -26,6 +28,7 @@ assert.deepEqual(orchestration, {
 	direct: false,
 	research: false,
 	execute: false,
+	adaptive: false,
 });
 
 const direct = parseLaunchRequest("-t pi-wlc-1007 --model Zhipu/glm-5.2 修复 1007");
@@ -37,6 +40,7 @@ assert.deepEqual(direct, {
 	direct: true,
 	research: false,
 	execute: false,
+	adaptive: false,
 });
 
 const withCwd = parseLaunchRequest("--direct --cwd /home/user/worktrees/MyProject-123 实施 123");
@@ -128,6 +132,28 @@ assert.ok(boundE.endsWith("按 plans/0810_agent_safety.md 实现"));
 assert.equal(buildWorkflowTabPrompt({ taskId: "1008", prompt: "根据execute进行工作1008\n\n实现" }, skillPath, "execute").split("\n")[0], "根据execute进行工作1008");
 assert.equal(buildWorkflowTabPrompt({ taskId: "", prompt: "随便看看" }, skillPath, "execute"), "根据execute进行工作\n\n随便看看");
 assert.ok(workflowDisciplineBlock("1007", skillPath, "execute").split("\n").every((l) => l.startsWith("> ")));
+
+// ── adaptive 模式：前缀、纪律块、parseLaunchRequest --adaptive ──
+assert.equal(modePrefix("1040", "adaptive"), "根据adaptive进行工作1040");
+const boundA = buildWorkflowTabPrompt({ taskId: "1040", prompt: "修复 1040 检测器生命周期" }, skillPath, "adaptive");
+assert.equal(boundA.split("\n")[0], "根据adaptive进行工作1040");
+assert.ok(boundA.includes("首轮自评"), "adaptive 纪律块必须含首轮自评");
+assert.ok(boundA.includes("A 快链") && boundA.includes("B 中链") && boundA.includes("C 全链"), "adaptive 纪律块必须含三档链");
+assert.ok(boundA.includes("升级规则") && boundA.includes("降级禁止"), "adaptive 纪律块必须含升降级规则");
+assert.ok(boundA.includes("校验性核对"), "adaptive 纪律块必须含 A0 校验性核对");
+assert.ok(!boundA.includes("【工作方式约束 · 强制 · 快速执行】") && !boundA.includes("【工作方式约束 · 强制 · 深度研究】"), "adaptive 纪律块不应复用 execute/research 标题");
+assert.ok(boundA.endsWith("修复 1040 检测器生命周期"));
+// 已带 adaptive 前缀时不重复；无 taskId 时只前缀归一化
+assert.equal(buildWorkflowTabPrompt({ taskId: "1041", prompt: "根据adaptive进行工作1041\n\n实现" }, skillPath, "adaptive").split("\n")[0], "根据adaptive进行工作1041");
+assert.equal(buildWorkflowTabPrompt({ taskId: "", prompt: "随便看看" }, skillPath, "adaptive"), "根据adaptive进行工作\n\n随便看看");
+assert.ok(workflowDisciplineBlock("1040", skillPath, "adaptive").split("\n").every((l) => l.startsWith("> ")));
+// /launch 文本 --adaptive 旗标：解析并剥离
+assert.equal(parseLaunchRequest("--adaptive 修复 1040").adaptive, true);
+assert.equal(parseLaunchRequest("--adaptive 修复 1040").task, "修复 1040");
+assert.equal(parseLaunchRequest("--adaptive --direct 实现 1040").adaptive, true);
+assert.equal(parseLaunchRequest("普通任务 1040").adaptive, false);
+// workflow 前缀不受 adaptive 影响
+assert.equal(modePrefix("1040", "workflow"), "根据workflow进行工作1040");
 
 // 无 taskId（直开标签）不绑定
 assert.equal(buildWorkflowTabPrompt({ taskId: "", prompt: "随便看看" }), "根据workflow进行工作\n\n随便看看");
@@ -234,6 +260,26 @@ assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 p
 	// 安全单行 prompt 保持内联（零行为变化）
 	assert.equal(wtPromptArg("单行安全 prompt"), "单行安全 prompt");
 	assert.equal(wtPromptArg("根据workflow进行工作123"), "根据workflow进行工作123");
+}
+
+// ── --title 消毒（标签从 prompt 首行提取，可能含 ; " % —— wt tokenizer 风险字符；标题不走 @file 物化，必须就地清洗）──
+{
+	assert.equal(sanitizeWtTitle("GreenCAD-307-修复 50% 回归"), "GreenCAD-307-修复 50 回归");
+	assert.equal(sanitizeWtTitle('a"b;c d'), "a b c d");
+	assert.equal(sanitizeWtTitle("  双  空格  "), "双 空格");
+	assert.equal(sanitizeWtTitle(";;;"), "task");
+	const riskyTitle = launchTaskTitle({ taskId: "307", title: undefined, prompt: '50% 回归; 修复 "x" 的测试\n\n正文' }, process.cwd());
+	assert.ok(!/[\r\n;"%]/.test(riskyTitle), `launchTaskTitle 输出不得含 wt 风险字符: ${riskyTitle}`);
+}
+
+// ── adaptive 纪律块：A0 自执行快链档位声明（与 SKILL.md 口径一致）──
+{
+	const adaptiveBlock = workflowDisciplineBlock("1030", undefined, "adaptive");
+	assert.ok(adaptiveBlock.includes("**A0 自执行快链**"), "adaptive 约束块应含 A0 档");
+	assert.ok(adaptiveBlock.includes("code-reviewer 独立审查必做"), "A0 档独立审查不可省");
+	assert.ok(adaptiveBlock.includes("禁止例行化"), "A0 咨询事件驱动、禁止例行化");
+	const workflowBlock = workflowDisciplineBlock("1031");
+	assert.ok(!workflowBlock.includes("A0 自执行快链"), "workflow 全链约束块不应含 A0 档");
 }
 
 console.log("launch tests passed");

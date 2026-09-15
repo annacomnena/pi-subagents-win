@@ -498,7 +498,7 @@ export function validateTabDispatchRecord(raw: unknown): { ok: boolean; errors: 
 		errors.push("dispatchStatus must be dispatched|launch_failed");
 	}
 	const mode = str(record.mode);
-	if (mode && !["workflow", "research", "execute"].includes(mode)) errors.push("mode must be workflow|research|execute");
+	if (mode && !["workflow", "research", "execute", "adaptive"].includes(mode)) errors.push("mode must be workflow|research|execute|adaptive");
 	if (errors.length > 0) return { ok: false, errors };
 	const value: TabDispatchRecord = {
 		id: str(record.id)!,

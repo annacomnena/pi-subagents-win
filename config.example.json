@@ -23,5 +23,7 @@
     "code-reviewer": "high",
     "consultant": "high"
   },
-  "notifications": true
+  "notifications": true,
+  "searcherMode": "auto",
+  "liteMode": "off"
 }

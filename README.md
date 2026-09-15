@@ -151,15 +151,18 @@ Retryable failures (`USAGE_CAP`, `RATE_LIMIT`, `AUTH`, `TIMEOUT`, `PROVIDER`) wa
 /launch --direct <task>                 # single tab, derived title
 ```
 
-`launch-tabs` normalizes every prompt to `根据workflow进行工作<taskId>` (or `根据research/execute进行工作<taskId>`) and appends a **workflow discipline block** — read the `workflow-orchestrator` skill, act as project manager, delegate stages to subagent-win agents, never do it all yourself.
+`launch-tabs` is the explicit workflow launcher: it normalizes every prompt to `根据workflow进行工作<taskId>` (or `根据research/execute/adaptive进行工作<taskId>`) and appends a **workflow discipline block**. A direct `/launch -t` or `/launch --direct` tab remains a plain task by default; a task number alone never enables workflow constraints. Direct tabs receive workflow constraints only when the user explicitly supplies a mode flag or workflow prefix.
 
-Three task modes:
+Four task modes:
 
 | Mode | Prefix | Pipeline |
 |---|---|---|
 | `workflow` (default) | `根据workflow进行工作<id>` | search → plan → review → implement → review → Wiki wrap-up |
 | `research` | `根据research进行工作<id>` | parallel searchers → research report → Wiki maintenance (no implementation) |
 | `execute` | `根据execute进行工作<id>` | skip search/planning → implement → review → Wiki wrap-up |
+| `adaptive` | `根据adaptive进行工作<id>` | tab self-assesses handoff completeness at startup → A fast lane (verify ≤3 tool calls → implement → review → Wiki) / B medium (mini plan → quick review → implement → review → Wiki) / C full chain; upgrades allowed & declared, downgrades forbidden |
+
+**lite mode** is not a tab mode — it runs **inside the current session**: no `launch-tabs`, no role agents, just one `general` agent dispatched per stage with a tier model (`small` = search/docs → `models.searcher`, `medium` = implement → `models.implementer`, `large` = consult/revise/review → `models.consultant`). Chain: L1 search → L2 plan → L3 implement → L4 independent review (never skipped) → L5 Wiki wrap-up. Toggle with `/lite on|auto|off` (persisted in `config.json` `liteMode`; `off` injects nothing). Context discipline: sync/parallel only, handoffs land on disk (>30 lines → file, reply carries path + ≤10-line summary), escalate to a full-chain tab when relay material exceeds ~10K tokens, fan-out ≥3, or cross-session survival is needed.
 
 Tab titles: `<repo>[-worktree]-[<taskId>-]<label>`. Each tab returns a **`runId`** (see §5).
 
@@ -246,7 +249,7 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
-- **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/runs`, `/tabs`, `/timers`, `/links`, `/agents`.
+- **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/sub-presets` (save/load named subagent-model snapshots across 5 slots, e.g. night-time cheap models or local-only fallback), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/runs`, `/tabs`, `/timers`, `/links`, `/agents`.
 
 ---
 
@@ -259,9 +262,13 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
   "models": { "searcher": "provider/id", "planner": "…", "implementer": "…", "code-reviewer": "…", "consultant": "…" },
   "fallbackModels": { "searcher": ["provider/id2"] },
   "thinking": { "searcher": "low", "planner": "high" },
-  "notifications": true
+  "notifications": true,
+  "searcherMode": "auto",
+  "liteMode": "off"
 }
 ```
+
+`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §4); tiers are projected live from `models`, no separate tier table.
 
 Model selection priority: (1) configured default + fallback chain; (2) override only when the chain is exhausted, the user names a model, or the default is clearly unsuitable; (3) prefer normal `provider/id` — never switch to an external CLI unless configured or user-requested.
 
@@ -355,6 +362,7 @@ npm run smoke:real-tab          # real pi process (needs network/model)
 | `tab-runs.ts` | tab reclaim pure functions (ledger, probe, classify, compose) |
 | `tab-runs-runtime.ts` | tab lifecycle telemetry, `tab-finish`, `tab-report`, `tab-status`, `reclaim-tabs`, `/tabs` |
 | `timers.ts` | timer pure functions (validation, due/late, CAS claim, mailbox) |
+| `lite-mode.ts` | `/lite` on\|auto\|off + lite-chain system-prompt injection (tier projection from `models`; zero injection when off) |
 | `timers-runtime.ts` | timer scheduler + `set/cancel/list-timers`, `/timers` |
 | `async-panel.ts` | background-subagent TUI panel |
 | `event-bus.ts` | fs.watch completion detection (main session) |
