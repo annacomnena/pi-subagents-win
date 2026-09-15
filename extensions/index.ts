@@ -37,6 +37,7 @@ import { registerReportListener } from "./report.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
 import { capabilities } from "./capabilities.ts";
+import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
@@ -740,13 +741,30 @@ async function runSingle(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text: string) => void,
-	cwd?: string,
+	opts?: RunDispatchOptions,
 ): Promise<SubagentResult> {
+	const { cwd, tools, excludeTools } = opts ?? {};
 	const finalPrompt = systemPrompt ?? agent?.body ?? "";
 	const workingDirectory = resolveSubagentCwd(cwd);
 	// model arg is already normalized by resolveCallModel / runWithFallback.
 	const resolvedModel = model ?? agentDefaultModel(agent);
 	const resolvedThinking = agentDefaultThinking(agent);
+
+	// P2 修订：显式 tools + 外部 CLI 后端 → 快速失败（安全 allowlist 不许被静默忽略）。
+	// 放在外部 CLI 分支之前才能拦住 cli:* 派发。
+	if (!toolsSupportedForBackend(resolvedModel, tools)) {
+		onUpdate?.("⛔ tools unsupported", `--tools is not supported for external CLI backend ${resolvedModel}`);
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: `--tools allowlist is not supported for external CLI backend "${resolvedModel}"; use a normal provider/id model or drop tools`,
+			agent: agent?.name,
+			requestedModel: resolvedModel,
+		};
+	}
 
 	// External CLI backends (claude / codex / agy / atomcode) — spawn local harness, not pi.
 	if (resolvedModel && isExternalCliModel(resolvedModel)) {
@@ -769,15 +787,17 @@ async function runSingle(
 	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
 	// 同时排除 launch-tabs 与 timer 管理工具：子 agent 只执行工作，
 	// 不得开新标签页，也不得创建/查询/取消计时器（编排只属于主会话）。
-	const argv = [
+	// tools/excludeTools 为 per-call opt-in（runner-argv.ts P2 修订）：
+	// 未显式传入时 argv 不含 --tools，与历史行为逐字节一致。
+	const argv = buildPiArgv({
 		cliPath,
-		"--mode", "json", "--print", "--no-session",
-		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
-	];
-	if (resolvedModel) argv.push("--model", resolvedModel);
-	if (resolvedThinking) argv.push("--thinking", resolvedThinking);
-	if (finalPrompt) argv.push("--append-system-prompt", finalPrompt);
-	argv.push(`Task: ${task}`);
+		model: resolvedModel,
+		thinking: resolvedThinking,
+		systemPrompt: finalPrompt || undefined,
+		task,
+		tools,
+		excludeTools,
+	});
 
 	// 首次进度：显示真正传给 pi 的模型
 	onUpdate?.(`🤖 ${resolvedModel ?? "default"}`, "starting...");
@@ -951,7 +971,7 @@ async function runWithFallback(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text?: string) => void,
-	cwd?: string,
+	opts?: RunDispatchOptions,
 ): Promise<SubagentResult> {
 	// 未显式设置超时时使用默认值（10 分钟），避免长时间无响应
 	if (timeoutMs === undefined) timeoutMs = DEFAULT_TIMEOUT_MS;
@@ -982,7 +1002,7 @@ async function runWithFallback(
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
 	if (candidates.length === 0) {
-		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, cwd);
+		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, opts);
 		if (result.requestedModel) result.triedModels = [result.requestedModel];
 		return result;
 	}
@@ -995,7 +1015,7 @@ async function runWithFallback(
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
 		tried.push(candidate);
-		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, cwd);
+		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, opts);
 		result.requestedModel = candidate;
 		result.triedModels = [...tried];
 		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
@@ -1034,6 +1054,12 @@ async function runWithFallback(
 
 // ── 并行 ────────────────────────────────────────────────────────────
 
+/** 末位派发选项：工作目录 + per-call 工具策略（仅显式传入才生效，见 runner-argv.ts）。 */
+export interface RunDispatchOptions extends RunnerToolsOptions {
+	/** Working directory / git worktree for this dispatch. */
+	cwd?: string;
+}
+
 interface TaskInput {
 	agent?: string;
 	task: string;
@@ -1042,6 +1068,10 @@ interface TaskInput {
 	timeoutMs?: number;
 	/** Working directory / git worktree for this task. */
 	cwd?: string;
+	/** per-call 正向 allowlist（P2 修订：显式传入才加 --tools；不读 agent frontmatter）。 */
+	tools?: string[];
+	/** per-call 额外排他列表（叠加到默认防递归列表之后）。 */
+	excludeTools?: string[];
 }
 
 async function runParallel(
@@ -1071,7 +1101,7 @@ async function runParallel(
 			const taskCb = onUpdate
 				? (s: string, _t: string) => onUpdate(`[${idx + 1}/${tasks.length}] ${agentName} ${s}`, _t)
 				: undefined;
-			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, t.cwd);
+			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools });
 		}
 	};
 	await Promise.all(Array.from({ length: limit }, () => worker()));
@@ -1882,6 +1912,8 @@ export default function (pi: ExtensionAPI) {
 				})),
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
+				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行" })),
@@ -1893,6 +1925,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
+			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 		}),
 
 		// ── TUI 渲染 ──
@@ -2064,7 +2098,7 @@ export default function (pi: ExtensionAPI) {
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
-				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, p.cwd).then((result) => {
+				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools }).then((result) => {
 					record.status = result.status; record.result = result;
 					recordUsage(agentDef?.name, result);
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
@@ -2081,7 +2115,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Unknown agent "${p.agent}". Available: ${agents.map((a) => a.name).join(", ")}` }], isError: true };
 				}
 				const cb = onUpdate ? (s: string, t: string) => onUpdate({ content: [{ type: "text", text: s + " " + t }] }) : undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, p.cwd);
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
