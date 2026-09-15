@@ -2774,7 +2774,9 @@ export default function (pi: ExtensionAPI) {
 		pi.registerCommand("trace-fusion-collect", {
 			description: "收集 trace-fusion artifacts 并跑 deterministic cross-test（/trace-fusion-collect [runId]）",
 			handler: async (args, ctx) => {
-				const runId = (args ?? "").trim();
+				const raw = (args ?? "").trim();
+				const force = /(^|\s)--force(\s|$)/.test(raw);
+				const runId = raw.replace(/--force/g, "").trim();
 				const runsDir = defaultTraceFusionRunsDir();
 				let runDir: string | null = null;
 				if (runId) {
@@ -2800,6 +2802,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const tfConfig = readTraceFusionConfig();
+				// review 复核修正（Luna major）：三 lane 未全部终态时拒绝收集（除非 --force）——
+				// 运行中的 worker 仍在改 worktree，提前收集会拿到撕裂证据并错误终结 run。
+				const pending = TRACE_LANES.filter((lane) => {
+					const l = meta.lanes[lane];
+					return !(l.tabRunId && readTabResultFile(defaultTabRunsDir(), l.tabRunId));
+				});
+				if (pending.length > 0 && !force) {
+					ctx.ui.notify(
+						`⏳ 以下 lane 尚未 tab-finish：${pending.join(", ")}。\n` +
+						`等待完成后重试；确要放弃等待并对当前状态出报告，用 /trace-fusion-collect ${meta.runId} --force（后续 lane 的修改不再进入证据）。`,
+						"info",
+					);
+					return;
+				}
 				ctx.ui.notify(`📦 收集 ${meta.runId} 的 lane artifacts（三段式 patch/叙事/终态）…`, "info");
 				const collect = collectRunArtifacts(meta);
 				ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");

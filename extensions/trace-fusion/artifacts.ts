@@ -155,8 +155,8 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 	const runsDir = opts.tabRunsDir ?? defaultTabRunsDir();
 	const workerResult = laneMeta.tabRunId ? readTabResultFile(runsDir, laneMeta.tabRunId) : null;
 
-	// §24.2 墙钟超时
-	const timedOut = now > new Date(meta.laneDeadlineAt);
+	// §24.2 墙钟超时（恰达 deadline 也算超时）
+	const timedOut = now.getTime() >= new Date(meta.laneDeadlineAt).getTime();
 
 	// 叙事文件（§21.0：参考不作硬证据；缺失记 issue 不致命）
 	const trajectoryPath = join(laneDir, "trajectory.md");

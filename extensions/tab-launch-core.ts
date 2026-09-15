@@ -41,6 +41,8 @@ export interface PiLaunchArgsOptions {
 	traceRunId?: string;
 	/** trace lane：A | B | C。 */
 	traceLane?: string;
+	/** 工具排除名单（trace worker §17）；仅非空时发射 --exclude-tools。 */
+	excludeTools?: string[];
 }
 
 /** Build argv as an array so prompts are never split or reinterpreted by a shell. */

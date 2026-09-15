@@ -3,6 +3,7 @@
 ## [Unreleased] — trace-fusion-loop (feat branch)
 
 ### Fixed
+- **Luna 复核轮修复（2 major + 4 partial 补全）**：`PiLaunchArgsOptions` 补声明 `excludeTools`（静态类型同步）；cross-test `testFileDiff` 改 `diff HEAD`（上轮批量修复因脚本中断遗漏，实测复现 staged 测试 diff 丢失）；`/trace-fusion-collect` 增加终态门槛（三 lane 未全部 tab-finish 时拒绝，除非 `--force` 显式放弃等待——防撕裂证据与错误终结 run）；命令归一化改【路径→`.`】策略（`cd "."`/`npm --prefix .`/`./f.js` 全部语义正确；lookahead 路径边界防 `C:\wtx` 误伤；URL scheme 不折叠）；异步 spawn 失败时清理该 lane 邮箱的 pending deadline timers；`timedOut` 判定改 `>=`；cross-test 报告落盘移到 cleanup 之后（cleanup notes 持久化进报告）。
 - **Luna C4–C8 审查修复（13 项 major/critical + 3 minor）**：①trace worker 身份 env 化（spawnPiTab 注入 PI_SESSION_PROFILE/PI_TRACE_*，factory 阶段即可判定）+ `/trace-fusion-loop` handler 内运行时能力二次校验；②trace tab 工具隔离落地（spawnPiTab 新增 excludeTools 通道，C6 强制传 §17 名单 launch/timer/wiki 写工具）；③delegation guard 加固（空 task/空 tasks 入参校验封死绕过面；trace worker 派 searcher 强制 tools=read,bash 不可覆盖）；④synthetic snapshot 拒绝 run 目录在仓库内（防自吸产物）；⑤execGit 默认剔除继承的 GIT_INDEX_FILE（防污染后续 git 操作）；⑥stale worktree 自动回收（带标记的残留目录启动时清理）；⑦异步 spawn 失败回写 launch_failed 账本 + launch-errors.log；⑧§24.2 墙钟邮箱计时器（deadline-5min 提醒 + deadline 收口）；⑨**三段式 patch part2 改 `diff HEAD`**（原裸 diff 漏 staged，cross-test testFileDiff 同步修）；⑩命令归一化全局+大小写不敏感+引号形式，归一化后仍引用 worktree 的命令拒绝入池；⑪changedFiles 改 name-status 三段（覆盖重命名/删除）；⑫untracked 测试文件从其它 lane 归档复制进 eval 树；⑬新增 `/trace-fusion-collect` 把收集+cross-test 接入生产生命周期（meta 终态化）；minor：result.json 归档进 lane 目录、eval 清理失败记 note、EOF 空白/缩进、lite 测试清理身份 env。
 
 ### Added

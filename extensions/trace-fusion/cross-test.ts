@@ -63,16 +63,22 @@ export interface CrossTestOptions {
 	now?: Date;
 }
 
-/** §27.1 修订 1：命令归一化——剥除各 lane worktree / run 目录绝对路径（含后续分隔符），改为相对 eval cwd。 */
+/** §27.1 修订 1：命令归一化——lane worktree / run 目录绝对路径改写为相对引用（改为相对 eval cwd）。 */
 export function normalizeCommand(command: string, meta: TraceRunMeta): string {
 	let out = command;
 	const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	// review 修正（Luna major）：全局 + 大小写不敏感 + 容忍路径被引号包裹
-	// （`cd "C:\wt\a" && ...` / `npm --prefix "C:\wt\a" test` 等常见形式）。
+	// review 修正（Luna major，复核轮）：路径【替换为 .】而非删除——
+	//   `cd "<wt>" && x`      → `cd "." && x`        （合法）
+	//   `npm --prefix "<wt>"` → `npm --prefix "."`   （合法）
+	//   `node <wt>/f.js`      → `node ./f.js`        （合法）
+	// 路径后必须跟分隔符/独立边界，防 `C:\wt\ax` 前缀误伤（lookahead 不消耗字符）。
 	const strip = (raw: string): void => {
 		for (const variant of [raw, raw.split("\\").join("/")]) {
-			const q = '["\']?' + esc(variant) + '["\']?[\\\\/]?';
-			out = out.replace(new RegExp(q, "gi"), "");
+			const e = esc(variant);
+			// 后随分隔符：路径→"."，保留原分隔符（随后统一折叠）
+			out = out.replace(new RegExp('["\']?' + e + '["\']?(?=[\\\\/])', "gi"), ".");
+			// 独立出现（后随空白/引号/URL 片段/结尾）：路径→"."
+			out = out.replace(new RegExp('["\']?' + e + '["\']?(?=$|[\\s"&#])', "gi"), ".");
 		}
 	};
 	for (const lane of ["A", "B", "C"] as const) {
@@ -80,9 +86,11 @@ export function normalizeCommand(command: string, meta: TraceRunMeta): string {
 		if (wt) strip(wt);
 	}
 	if (meta.runDir) strip(meta.runDir);
-	// 收敛重复分隔符、空白与孤立引号
+	// 折叠重复分隔符（URL scheme 后不折叠）、反斜杠统一为 /、去冗余 ./
 	return out
-		.replace(/[\\/]{2,}/g, "/")
+		.replace(/(?<!:)[\\/]{2,}/g, "/")
+		.split("\\").join("/")
+		.replace(/([\s"']|^)\.\//g, "$1")
 		.replace(/\s{2,}/g, " ")
 		.replace(/^[\s"']+|[\s"']+$/g, "")
 		.trim();
@@ -164,7 +172,8 @@ function copyUntrackedInto(untrackedDir: string, evalTree: string): void {
 function testFileDiff(meta: TraceRunMeta, lane: LaneId, file: string): string {
 	const wt = meta.lanes[lane].worktree;
 	const d1 = execGit(["diff", "--binary", meta.baseCommit, "HEAD", "--", file], { cwd: wt });
-	const d2 = execGit(["diff", "--binary", "--", file], { cwd: wt });
+	// review 复核修正（Luna major）：`diff HEAD` 才覆盖 staged + unstaged（裸 diff 漏 staged）
+	const d2 = execGit(["diff", "--binary", "HEAD", "--", file], { cwd: wt });
 	// execGit 会 trim 尾部换行；git apply 要求 patch 以换行结尾，否则 corrupt patch
 	const parts = [d1.stdout, d2.stdout].filter((s) => s.length > 0).map((s) => (s.endsWith("\n") ? s : s + "\n"));
 	return parts.join("");
@@ -331,11 +340,7 @@ export function runCrossTest(meta: TraceRunMeta, collect: RunCollectReport, opts
 		reportPath: join(meta.runDir, "cross-test-report.md"),
 	};
 
-	// 4. 报告落盘（json 给 v0.4 fusion 消费；md 给人）
-	writeFileSync(join(meta.runDir, "cross-test.json"), JSON.stringify(matrix, null, 2) + "\n", "utf8");
-	writeFileSync(matrix.reportPath, renderReport(matrix), "utf8");
-
-	// 5. §28：eval 树即用即删（失败标 stale，不拖垮报告）
+	// 4. §28：eval 树即用即删（失败标 stale，不拖垮报告）——先 cleanup，报告才能包含 cleanup notes
 	for (const lane of ["A", "B", "C"] as const) {
 		const path = lanes[lane].evalWorktree;
 		if (path && existsSync(path)) {
@@ -345,6 +350,10 @@ export function runCrossTest(meta: TraceRunMeta, collect: RunCollectReport, opts
 		}
 	}
 	lanes.A.evalWorktree = lanes.B.evalWorktree = lanes.C.evalWorktree = null;
+
+	// 5. 报告落盘（json 给 v0.4 fusion 消费；md 给人）——cleanup 的 notes 已包含在内
+	writeFileSync(join(meta.runDir, "cross-test.json"), JSON.stringify(matrix, null, 2) + "\n", "utf8");
+	writeFileSync(matrix.reportPath, renderReport(matrix), "utf8");
 
 	return matrix;
 }
