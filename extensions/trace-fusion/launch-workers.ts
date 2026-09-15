@@ -9,7 +9,7 @@
  * 集成测试可注入 fake（无 Windows Terminal 也能测编排逻辑）。
  */
 
-import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
@@ -17,7 +17,7 @@ import {
 	spawnPiTab,
 } from "../tab-launch-core.ts";
 import { defaultTabRunsDir, newTabRunId, writeTabDispatch, type TabDispatchRecord } from "../tab-runs.ts";
-import { defaultTimersDir, newTimerId, dueAtFromDelay, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "../timers.ts";
+import { defaultTimersDir, mailboxDirForTab, newTimerId, dueAtFromDelay, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "../timers.ts";
 import { runPreflight } from "./preflight.ts";
 import { createSyntheticSnapshot } from "./snapshot.ts";
 import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type ProvisionReport } from "./worktrees.ts";
@@ -26,6 +26,9 @@ import { buildTraceWorkerPrompt } from "./worker-prompt.ts";
 
 /** spawn seam：默认真 spawnPiTab；测试注入 fake。签名与 spawnPiTab 一致。 */
 export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnResult;
+
+/** 异步 spawn 已失败的 lane runId（writeLaneTimers 的竞态守卫）。 */
+const spawnFailedLanes = new Set<string>();
 
 /** §17：trace worker tab 的工具排除名单（wiki/timer/launch 写能力不可见；subagent-win 保留）。 */
 export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "wiki-nav", "wiki-semantic"];
@@ -36,6 +39,8 @@ export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-t
  * 仅提醒不强制；真正的超时判定在 collect（timedOut）。
  */
 export function writeLaneTimers(tabRunId: string, lane: LaneId, deadline: Date, now: Date): void {
+	// review 复核修正（Luna minor）：异步 spawn 已失败的 lane 不写邮箱计时器
+	if (spawnFailedLanes.has(tabRunId)) return;
 	try {
 		const timersDir = defaultTimersDir();
 		const reminderAt = new Date(deadline.getTime() - 5 * 60_000);
@@ -249,6 +254,12 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 				try {
 					appendFileSync(launchErrorsLog, `${new Date().toISOString()} lane ${lane} [${laneRunId}] async spawn error: ${err.message}\n`, "utf8");
 				} catch { /* 留痕尽力而为 */ }
+				// review 复核修正（Luna minor）：tab 未起来，已排/将排的 deadline timers 一并清理。
+				// 异步事件与 writeLaneTimers 存在时序竞态，两侧都拦：这里删邮箱，writeLaneTimers 侧查 spawnFailed。
+				try {
+					rmSync(mailboxDirForTab(defaultTimersDir(), laneRunId), { recursive: true, force: true });
+					spawnFailedLanes.add(laneRunId);
+				} catch { /* 清理尽力而为 */ }
 			},
 		});
 		if (spawn.error) {

@@ -75,10 +75,13 @@ export function normalizeCommand(command: string, meta: TraceRunMeta): string {
 	const strip = (raw: string): void => {
 		for (const variant of [raw, raw.split("\\").join("/")]) {
 			const e = esc(variant);
+			// review 复核修正（Luna minor）：负向 lookbehind 拒绝前导字符为 词/冒号/斜杠 的命中，
+			// 防 URL 内部段落（https://host/tmp/wt/c/x）被当成 worktree 路径改写。
+			const lb = "(?<![\\w:/])";
 			// 后随分隔符：路径→"."，保留原分隔符（随后统一折叠）
-			out = out.replace(new RegExp('["\']?' + e + '["\']?(?=[\\\\/])', "gi"), ".");
+			out = out.replace(new RegExp(lb + '["\']?' + e + '["\']?(?=[\\\\/])', "gi"), ".");
 			// 独立出现（后随空白/引号/URL 片段/结尾）：路径→"."
-			out = out.replace(new RegExp('["\']?' + e + '["\']?(?=$|[\\s"&#])', "gi"), ".");
+			out = out.replace(new RegExp(lb + '["\']?' + e + '["\']?(?=$|[\\s"&#])', "gi"), ".");
 		}
 	};
 	for (const lane of ["A", "B", "C"] as const) {
