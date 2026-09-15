@@ -55,6 +55,9 @@ export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
 /** run 生命周期状态（meta.json / status 命令消费）。 */
 export type TraceRunStatus = "running" | "collecting" | "fusing" | "completed" | "failed" | "cancelled";
 
+/** run 的 cancelled/failed 附加说明（自动回收/人工取消时写入 meta.json）。 */
+export type TraceRunMetaExtra = { cancelledReason?: string };
+
 /** artifact 根：~/.pi/agent/trace-fusion-runs/<runId>/（§15：artifact 可放长路径）。 */
 export function defaultRunsDir(): string {
 	return join(homedir(), ".pi", "agent", "trace-fusion-runs");

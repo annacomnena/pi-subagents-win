@@ -6,7 +6,7 @@
  * dirty 工作树【不是】拒绝项——synthetic snapshot 的存在意义就是折叠它。
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execGit } from "./git.ts";
 
@@ -33,25 +33,43 @@ export interface PreflightOptions {
 	maxActiveRuns?: number;
 }
 
-/** 扫描 runsDir 下 meta.json status=running 的 run（§14.2 单 active run 互斥）。 */
-export function findActiveRuns(runsDir: string): string[] {
+/**
+ * 扫描 runsDir 下的 run：status=running 且未过期 → active；
+ * 已过期（now >= laneDeadlineAt，§24.2）→ 自动改写为 cancelled 并排除（首跑运维修复：
+ * v0.3 没有 /trace-fusion-abort，僵尸 running 会永久占锁）。
+ * 读取失败 / meta 损坏不算 active，但也不吞掉目录。
+ */
+export function findActiveRuns(runsDir: string, now: Date = new Date()): string[] {
 	if (!existsSync(runsDir)) return [];
 	const active: string[] = [];
 	for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
 		if (!entry.isDirectory()) continue;
-		const metaPath = join(runsDir, entry.name, "meta.json");
+		const dirPath = join(runsDir, entry.name);
+		const metaPath = join(dirPath, "meta.json");
 		if (!existsSync(metaPath)) continue;
 		try {
-			const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { status?: string };
-			if (meta.status === "running") active.push(entry.name);
+			const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { status?: string; laneDeadlineAt?: string };
+			if (meta.status !== "running") continue;
+			const deadline = meta.laneDeadlineAt ? new Date(meta.laneDeadlineAt).getTime() : NaN;
+			if (Number.isFinite(deadline) && now.getTime() >= deadline) {
+				// 墙钟已过仍 running = 无人收尾的僵尸（§24.2 超时语义），回收锁
+				try {
+					const reaped = { ...meta, status: "cancelled", cancelledReason: `wall-clock expired at ${meta.laneDeadlineAt}; auto-reaped at next launch` };
+					writeFileSync(metaPath, JSON.stringify(reaped, null, 2) + "\n", "utf8");
+					continue;
+				} catch {
+					// 写不进去就保守地仍算 active
+				}
+			}
+			active.push(entry.name);
 		} catch {
-			// meta 损坏不算 active，但也不吞掉目录
+			// meta 损坏不算 active
 		}
 	}
 	return active;
 }
 
-export function runPreflight(cwd: string, opts: PreflightOptions = {}): PreflightResult {
+export function runPreflight(cwd: string, opts: PreflightOptions = {}, now: Date = new Date()): PreflightResult {
 	const checks: PreflightCheck[] = [];
 	const fail = (reason: string, extra?: Partial<PreflightResult>): PreflightResult => ({
 		ok: false,
@@ -84,16 +102,22 @@ export function runPreflight(cwd: string, opts: PreflightOptions = {}): Prefligh
 		if (!ok) return fail(`仓库处于进行中的 ${ref} 状态，拒绝启动 trace-fusion`);
 	}
 
-	// 4. active run 互斥
+	// 4. active run 互斥（过期 running 已被自动回收，见 findActiveRuns）
 	const maxActiveRuns = opts.maxActiveRuns ?? 1;
-	const active = opts.runsDir ? findActiveRuns(opts.runsDir) : [];
+	const active = opts.runsDir ? findActiveRuns(opts.runsDir, now) : [];
 	const mutexOk = active.length < maxActiveRuns;
 	checks.push({
 		name: "active-run-mutex",
 		ok: mutexOk,
 		detail: mutexOk ? undefined : `已有 ${active.length} 个 running run（maxActiveRuns=${maxActiveRuns}）：${active.join(", ")}`,
 	});
-	if (!mutexOk) return fail(`已存在 running 的 trace-fusion run，v1 只允许 ${maxActiveRuns} 个并发：${active.join(", ")}`, { activeRunIds: active });
+	if (!mutexOk) {
+		return fail(
+			`已存在 running 的 trace-fusion run，v1 只允许 ${maxActiveRuns} 个并发：${active.join(", ")}。` +
+			`过期 run 会在下次启动时自动回收；也可手动把对应 meta.json 的 status 改为 "cancelled"。`,
+			{ activeRunIds: active },
+		);
+	}
 
 	// 5. 记录 dirty 状态（不 gate）
 	const st = execGit(["status", "--porcelain=v1"], { cwd: toplevel });

@@ -159,6 +159,25 @@ assert.equal(norm(pf.toplevel ?? ""), norm(repo));
 	writeFileSync(join(runsDir, "run-live", "meta.json"), JSON.stringify({ status: "completed" }));
 	assert.equal(runPreflight(repo, { runsDir }).ok, true, "run 终态后放行");
 
+	// 过期的 running run 在下次启动时自动回收（墙钟已过仍 running = 僵尸，不该永久占锁）
+	mkdirSync(join(runsDir, "run-zombie"), { recursive: true });
+	writeFileSync(join(runsDir, "run-zombie", "meta.json"), JSON.stringify({
+		status: "running",
+		laneDeadlineAt: new Date(Date.now() - 60_000).toISOString(),
+	}));
+	const pfReap = runPreflight(repo, { runsDir });
+	assert.equal(pfReap.ok, true, "过期僵尸应被自动回收并放行");
+	const reapedMeta = JSON.parse(readFileSync(join(runsDir, "run-zombie", "meta.json"), "utf8")) as { status?: string; cancelledReason?: string };
+	assert.equal(reapedMeta.status, "cancelled", "僵尸 meta 应被改写为 cancelled");
+	assert.ok(reapedMeta.cancelledReason?.includes("wall-clock"), "回收原因落盘");
+	// 未过期的 running 仍阻塞
+	mkdirSync(join(runsDir, "run-fresh"), { recursive: true });
+	writeFileSync(join(runsDir, "run-fresh", "meta.json"), JSON.stringify({
+		status: "running",
+		laneDeadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+	}));
+	assert.equal(runPreflight(repo, { runsDir }).ok, false, "未过期 running 仍然阻塞");
+
 	// unborn repo 拒绝
 	const unborn = join(root, "unborn");
 	mkdirSync(unborn);
