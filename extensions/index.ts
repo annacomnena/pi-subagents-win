@@ -792,6 +792,12 @@ async function runSingle(
 				PI_SUBAGENT: "1",
 				PI_TAB_RUN_ID: "",
 				PI_TAB_RUNS_DIR: "",
+				// review 修正（Luna major，设计稿 §12.1）：子 agent 身份恒为 subagent，
+				// 不继承父进程的 trace/session profile（否则 trace worker 派 searcher 时
+				// 子进程继承 PI_SESSION_PROFILE=trace-worker，能力矩阵误判）。
+				PI_SESSION_PROFILE: "subagent",
+				PI_TRACE_RUN_ID: "",
+				PI_TRACE_LANE: "",
 			},
 		});
 		let buf = "", lineBuf = "", stderrBuf = "";

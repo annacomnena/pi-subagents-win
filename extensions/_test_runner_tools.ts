@@ -16,11 +16,34 @@ import { buildPiArgv, DEFAULT_EXCLUDE_TOOLS, toolsSupportedForBackend } from "./
 const CLI = "node";
 const BASE_TASK = "Task: do something";
 
-// ── 1. 未传 tools → 无 --tools 旗标（P2 核心承诺：argv 不变）────────
+// ── 1. 未传 tools → 无 --tools 旗标（P2 核心承诺：argv 逐字节一致）────
 {
 	const argv = buildPiArgv({ cliPath: CLI, task: "do something" });
 	assert.equal(argv.includes("--tools"), false, "缺省时绝不能出现 --tools");
 	assert.equal(argv[argv.length - 1], BASE_TASK, "task 恒为最后一个位置参数");
+	// review 修正（Luna minor）：golden deepEqual 锁死完整 argv，防任何字段/顺序漂移
+	assert.deepEqual(argv, [
+		CLI,
+		"--mode", "json", "--print", "--no-session",
+		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
+		BASE_TASK,
+	]);
+	// 全字段变体也锁死（与抽取前 runSingle 的拼装顺序逐项一致）
+	assert.deepEqual(
+		buildPiArgv({
+			cliPath: CLI, task: "do something",
+			model: "Zhipu/glm-5.2", thinking: "high", systemPrompt: "You are a searcher.",
+		}),
+		[
+			CLI,
+			"--mode", "json", "--print", "--no-session",
+			"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
+			"--model", "Zhipu/glm-5.2",
+			"--thinking", "high",
+			"--append-system-prompt", "You are a searcher.",
+			BASE_TASK,
+		],
+	);
 	const exclIdx = argv.indexOf("--exclude-tools");
 	assert.ok(exclIdx > 0);
 	assert.equal(argv[exclIdx + 1], DEFAULT_EXCLUDE_TOOLS.join(","), "缺省排他列表与历史版本一致");
@@ -76,6 +99,9 @@ const BASE_TASK = "Task: do something";
 	assert.equal(toolsSupportedForBackend("cli:codex", ["read", "bash"]), false);
 	assert.equal(toolsSupportedForBackend("cli:agy", undefined), true, "未传 tools 时外部 CLI 照常工作");
 	assert.equal(toolsSupportedForBackend("cli:zcode", []), true, "空数组 = 未传");
+	// review 修正（Luna minor）：大小写/空白归一，与 isExternalCliModel 行为一致
+	assert.equal(toolsSupportedForBackend("CLI:CLAUDE", ["read"]), false, "大写写法也必须拦截");
+	assert.equal(toolsSupportedForBackend("  cli:codex  ", ["read"]), false, "前后空白也必须拦截");
 	assert.equal(toolsSupportedForBackend("Zhipu/glm-5.2", ["read", "bash"]), true, "正常 provider/id 支持");
 	assert.equal(toolsSupportedForBackend(undefined, ["read"]), true, "无模型（pi default）支持");
 }

@@ -82,6 +82,7 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
 export function toolsSupportedForBackend(model: string | undefined, explicitTools: string[] | undefined): boolean {
 	if (!explicitTools || explicitTools.length === 0) return true;
 	if (!model) return true;
-	// cli:* 后端（claude/codex/agy/atomcode/zcode）有自己的工具面，无法施加 pi 的 --tools。
-	return !model.startsWith("cli:");
+	// review 修正（Luna minor）：与 isExternalCliModel 同样做 trim+小写归一，
+	// 避免 "CLI:CLAUDE" / 带空白写法绕过守卫导致 allowlist 被静默忽略。
+	return !model.trim().toLowerCase().startsWith("cli:");
 }
