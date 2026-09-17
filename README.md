@@ -13,7 +13,7 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Delegate** any step to a role agent (search / plan / review / implement) without leaving your session.
 - **Parallelize** independent work with a single tool call.
 - **Run hours-long pipelines unattended**: spawn visible tabs, let them report back, auto-advance with timers, reclaim results, launch the next batch.
-- **Spend subscriptions, not tokens**: point role agents at local CLI harnesses (Claude Code / Codex / Agy / AtomCode / ZCode / MimoCode) so heavy delegation bills against flat-rate plans, not per-token API credits (§4).
+- **Spend quota you already own**: point role agents at local CLI harnesses (Claude Code / Codex / Agy / AtomCode / ZCode / MimoCode) — subscriptions, free tiers, discounted dedicated-tool billing, and plans that can't be reverse-proxied into an API all become usable as subagent workers (§4).
 - **Scale reasoning on hard problems** with trace-fusion (§7): three independent read-only diagnosis rollouts on the same task, auto-collected and fused — the agent can self-trigger it when a problem looks underdetermined.
 
 ### Architecture
@@ -128,15 +128,20 @@ Retryable failures (`USAGE_CAP`, `RATE_LIMIT`, `AUTH`, `TIMEOUT`, `PROVIDER`) wa
 
 ---
 
-## 4. External CLI agents — spend subscriptions, not tokens
+## 4. External CLI agents — spend quota you already own (CLI backends)
 
-Every role agent (`searcher` / `planner` / `implementer` / `code-reviewer` / `consultant`) can be pointed at a **local CLI harness** instead of an API model. The subagent then runs inside Claude Code / Codex CLI / Agy / AtomCode / ZCode / MimoCode and bills against **that tool's flat-rate subscription** — heavy stages stop burning per-token API credits, and each CLI brings its own quota pool, so provider outages and rate limits stop being single points of failure.
+Every role agent (`searcher` / `planner` / `implementer` / `code-reviewer` / `consultant`) can be pointed at a **local CLI harness** instead of an API model. The subagent then runs inside Claude Code / Codex CLI / Agy / AtomCode / ZCode / MimoCode and bills against **quota you may already own** — a subscription, a free tier, or a dedicated-tool plan with preferential rates — instead of per-token API credits. Each CLI also brings its own quota pool, so provider outages and rate limits stop being single points of failure.
 
-### Why this saves money
+### Why this matters for your wallet
 
-- **Flat-rate instead of per-token**: an `implementer` that rewrites 500 lines or a `code-reviewer` that reads a whole diff is exactly the workload where API token costs spike; on a CLI subscription those calls are already paid for.
+The point is not "CLIs are cheaper than APIs" — it is that a lot of usable quota is **locked inside CLI tools** and unreachable any other way:
+
+- **Subscriptions you already pay for**: Claude Code / Codex / … flat-rate plans. Agent work bills against quota that is already sunk cost; heavy stages (an `implementer` rewriting 500 lines, a `code-reviewer` reading a whole diff) stop burning per-token API credits.
+- **Free tiers**: several CLI tools include free or near-free usage bands that plain API access does not get.
+- **Preferential dedicated-tool billing**: e.g. ZCode bills GLM-5.3 inside the tool at a discounted rate/multiplier that raw API calls do not enjoy.
+- **Plans that cannot be reverse-proxied**: some subscriptions can neither contractually nor technically be exposed as an OpenAI-compatible API endpoint — the official CLI is the **only** access path. Without the `cli:` backends that quota simply sits stranded; with them, orchestration spends it at zero marginal cost.
 - **Budget isolation**: role agents on CLI + main session on API = the experiment loop can run wild without touching your API balance (and vice versa).
-- **Quota safety net**: put a CLI in `fallbackModels` — when the API primary hits `USAGE_CAP`/`RATE_LIMIT`, the chain walks into your subscription instead of stalling (see §3.3).
+- **Quota safety net**: put a CLI in `fallbackModels` — when the API primary hits `USAGE_CAP`/`RATE_LIMIT`, the chain walks into stranded subscription quota instead of stalling (see §3.3).
 
 ### Supported backends
 
@@ -172,7 +177,7 @@ A CLI ref only routes when it sits in that agent's own default/fallback chain �
 | failure classification + fallback chain | ✅ | ✅ (a CLI failure walks the chain like any other) |
 | per-call `model` override | ✅ | ❌ — the CLI runs **its own configured/default model**; configure models inside each CLI |
 | per-call `tools` allowlist | ✅ | ❌ — not supported by external harnesses (explicitly passing it errors) |
-| billing | API tokens | the CLI's own plan/subscription |
+| billing | API tokens | the CLI's own plan — subscription, free tier, or discounted dedicated-tool billing |
 
 ### Safety
 
