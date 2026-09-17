@@ -44,6 +44,12 @@ export interface RuntimeEnvelope<T = unknown> {
 	payload?: T;
 	payloadRef?: string;
 
+	/** 领域发生时间（业务事实）；与 at 的分工见下。 */
+	recordedAt?: string;
+
+	/** 幂等去重键：`<type>:<subject>`；同键重放 = 同一事件，projector 按此幂等（terra 裁决缺陷 4）。 */
+	dedupeKey?: string;
+
 	at: string;
 }
 
@@ -60,8 +66,15 @@ export interface NewEventEnvelopeInput<T = unknown> {
 	ttlMs?: number;
 	payload?: T;
 	payloadRef?: string;
-	/** ISO 时间；缺省 = 生成时刻。 */
+	/** ISO 时间；缺省 = 生成时刻。
+	 *
+	 * at 语义（terra 裁决 #10，v1 冻结）：at = 领域发生时间（业务事实，如 dispatchedAt/finishedAt），
+	 * recordedAt = 本信封构造/落盘时间（诊断用）。Timeline 排序与状态机以 at 为准，
+	 * recordedAt 仅用于观测写入延迟。
+	 */
 	at?: string;
+	recordedAt?: string;
+	dedupeKey?: string;
 }
 
 /** 构造 event 信封；id 自动生成（evt_ 前缀）。字段非法立即抛错（构造期_fail-fast_，运行期由 Safe wrapper 兜底）。 */
@@ -82,6 +95,8 @@ export function newEventEnvelope<T>(input: NewEventEnvelopeInput<T>, now: Date =
 	if (input.ttlMs !== undefined) envelope.ttlMs = input.ttlMs;
 	if (input.payload !== undefined) envelope.payload = input.payload;
 	if (input.payloadRef !== undefined) envelope.payloadRef = input.payloadRef;
+	if (input.recordedAt !== undefined) envelope.recordedAt = input.recordedAt;
+	if (input.dedupeKey !== undefined) envelope.dedupeKey = input.dedupeKey;
 
 	const errs = validateEnvelope(envelope);
 	if (errs.length > 0) throw new Error(`newEventEnvelope: invalid envelope — ${errs.join("; ")}`);
@@ -112,6 +127,8 @@ export function validateEnvelope(x: unknown): string[] {
 	if (e.priority !== undefined && typeof e.priority !== "number") errs.push("priority must be a number");
 	if (e.ttlMs !== undefined && (typeof e.ttlMs !== "number" || !Number.isFinite(e.ttlMs) || e.ttlMs <= 0)) errs.push("ttlMs must be a positive finite number");
 	if (e.payloadRef !== undefined && typeof e.payloadRef !== "string") errs.push("payloadRef must be a string");
+	if (e.recordedAt !== undefined && (typeof e.recordedAt !== "string" || e.recordedAt.length === 0 || !Number.isFinite(Date.parse(e.recordedAt)))) errs.push("recordedAt must be a parseable ISO time string");
+	if (e.dedupeKey !== undefined && (typeof e.dedupeKey !== "string" || e.dedupeKey.length === 0 || /\s/.test(e.dedupeKey))) errs.push("dedupeKey must be a non-empty whitespace-free string");
 	if (e.correlationId !== undefined && typeof e.correlationId !== "string") errs.push("correlationId must be a string");
 	if (e.causationId !== undefined && typeof e.causationId !== "string") errs.push("causationId must be a string");
 

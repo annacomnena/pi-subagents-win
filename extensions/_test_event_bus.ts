@@ -155,12 +155,26 @@ function writeResult(runId: string, status = "completed") {
 	}), "utf8");
 
 	// 我是 session-A：不是派发方 → 跳过（不 claim、不注入、不 toast）
+	// ——但 journal 终态必须照写（terra 缺陷 1 修复：emit 与 recipient 路由解耦，
+	// rollover 后新 master session 也能补写，journal 完备性不依赖唤醒路由）
 	const { setCurrentSessionId } = await import("./identity.ts");
 	setCurrentSessionId("session-A");
 	const skipped = onTabResultFile(dir, "tab_route1.result.json", opts);
 	assert.equal(skipped, false, "非派发会话必须跳过");
 	assert.equal(sent.length, 0, "不得注入");
 	assert.equal(existsSync(join(dir, "tab_route1.notified")), false, "不得 claim（唤醒权留给真正派发会话）");
+	{
+		const { listRuntimeEnvelopes } = await import("./runtime/journal.ts");
+		const mine = () => listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_route1");
+		assert.equal(mine().length, 1, "非派发会话也要写 journal 终态");
+		assert.equal(mine()[0].dedupeKey, "run.completed:run://tab/tab_route1");
+		assert.ok(mine()[0].at, "at = 领域发生时间");
+		// 幂等：另一个实例（同样非派发方）重放同一文件 → dedupeKey claim 拒绝，不双写
+		_resetEventBus();
+		setCurrentSessionId("session-C");
+		onTabResultFile(dir, "tab_route1.result.json", opts);
+		assert.equal(mine().length, 1, "重放不双写");
+	}
 
 	// 我是 session-B（派发方）：注入
 	_resetEventBus();

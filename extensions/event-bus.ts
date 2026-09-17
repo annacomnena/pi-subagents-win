@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
-import { emitRuntimeEvent } from "./runtime/journal.ts";
+import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
@@ -84,16 +84,19 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	seenResults.add(fileName);
 	const runId = fileName.slice(0, -".result.json".length);
 
+	// Phase 1 shadow emit（terra 裁决缺陷 1 修订）：**最先执行，与消费/recipient 路由/唤醒完全解耦**——
+	// 原派发 session rollover 消失后，新 master session 的 watcher 也必须能补写终态，
+	// 否则 journal 违背「logical master 账目不丢」目标；trace-fusion 消费分支提前
+	// return true 的场景同样需要终态入账。
+	// 幂等用独立 dedupeKey claim（跨实例/跨重放），不动 .notified 的唤醒语义。
+	const result = readTabResultFile(runsDir, runId);
+	if (result) emitRuntimeEventOnce(tabResultToRuntimeEvent(result));
+
 	// trace-fusion 自动收集等自定义消费者：返回 true 表示已消费（跳过默认 toast/reclaim 注入）；
 	// 返回 false/undefined → 落回默认流程（向后兼容：旧调用方不返回值时行为不变）。
+	// （journal 终态 emit 已在此之前完成，与消费/唤醒解耦——terra 裁决缺陷 1。）
 	if (opts.onTabFinished) {
-		if (opts.onTabFinished(runId) === true) {
-			// Phase 1 shadow emit（设计稿 §13）：消费分支不走 claim，此处是该 result 唯一的
-			// journal 写入点；只观察、不改消费语义，写失败不影响消费返回值。
-			const consumed = readTabResultFile(runsDir, runId);
-			if (consumed) emitRuntimeEvent(tabResultToRuntimeEvent(consumed));
-			return true;
-		}
+		if (opts.onTabFinished(runId) === true) return true;
 	}
 
 	// 会话定位（2026-08-13：与 report.ts 溯源对齐，防止 identityless 会话抢注入权）：
@@ -106,16 +109,12 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 		return false;
 	}
 
+	const status = result?.status ?? "unknown";
 	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
 	if (!claimNotified(runsDir, runId)) {
 		return false; // 已被其他实例通知过 → 静默跳过，不注入
 	}
 
-	const result = readTabResultFile(runsDir, runId);
-	// Phase 1 shadow emit（设计稿 §13）：claim 幂等已保证跨 watcher/双实例只写一次；
-	// result 读取失败（损坏）不 emit，事件缺失优于伪造终态。
-	if (result) emitRuntimeEvent(tabResultToRuntimeEvent(result));
-	const status = result?.status ?? "unknown";
 	const summary = result?.summary?.slice(0, 200) ?? "(no summary)";
 	const artifacts = result?.artifacts?.length ? result.artifacts.slice(0, 5).map((a) => `  • ${a}`).join("\n") : "";
 	const reportPath = result?.reportPath ? `

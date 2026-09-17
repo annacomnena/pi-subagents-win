@@ -11,7 +11,7 @@
  *   - legacy 文件（tab-runs/*.json 等）仍是 source of truth；本 journal 只观察。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, openSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { validateEnvelope, type RuntimeEnvelope } from "./envelope.ts";
@@ -27,6 +27,36 @@ export function defaultRuntimeDir(): string {
 
 export function defaultJournalPath(): string {
 	return join(defaultRuntimeDir(), "events.jsonl");
+}
+
+/** 语义去重 claim 目录：`<dedupeKey sanitized>` 排他创建，跨实例/跨 rollover 幂等（terra 裁决缺陷 1/4）。 */
+function defaultClaimsDir(): string {
+	return join(defaultRuntimeDir(), "claims");
+}
+
+/**
+ * 原子领取一个 dedupeKey 的「已写入 journal」权：第一个 open('wx') 成功者获得写权，
+ * 其余实例/后续重放看到标记直接跳过。与 legacy .notified 唤醒幂等完全解耦——
+ * journal 的完备性不依赖 recipient 路由，rollover 后新 master session 仍能补写终态。
+ *
+ * dedupeKey 含 scheme 字符（`run.completed:run://tab/x`），claim 文件名做受限替换；
+ * tab runId 为 base36 无 `/` `:`，受控格式下无碰撞面。
+ */
+export function claimRuntimeEmission(dedupeKey: string, claimsDir: string = defaultClaimsDir()): boolean {
+	if (!dedupeKey || /\s/.test(dedupeKey)) return false;
+	try {
+		mkdirSync(claimsDir, { recursive: true });
+	} catch {
+		return false;
+	}
+	const fileName = `${dedupeKey.replace(/[^A-Za-z0-9._-]/g, "_")}.claimed`;
+	try {
+		const fd = openSync(join(claimsDir, fileName), "wx");
+		try { closeSync(fd); } catch { /* ignore */ }
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // ── 写 ─────────────────────────────────────────────────────────────
@@ -58,6 +88,18 @@ export function appendRuntimeEnvelopeSafe(envelope: RuntimeEnvelope, path: strin
 /** 接线点语义入口（设计稿 §11 emitRuntimeEvent 形状）：发一个已构造好的 envelope，成功与否都不影响调用方。 */
 export function emitRuntimeEvent(envelope: RuntimeEnvelope, path: string = defaultJournalPath()): boolean {
 	return appendRuntimeEnvelopeSafe(envelope, path).ok;
+}
+
+/**
+ * 幂等语义入口：有 dedupeKey 时先跨进程排他领取再写入（同键重放/双触发只落盘一次）。
+ * 无 dedupeKey 的 envelope 退化为普通 emit（不拦截）。
+ * index.ts / event-bus.ts 的全部接线点一律走这里——写端不重复，读端（Phase 2 projector）
+ * 仍按 dedupeKey 再防一道（防御纵深）。
+ */
+export function emitRuntimeEventOnce(envelope: RuntimeEnvelope, path: string = defaultJournalPath()): boolean {
+	if (!envelope.dedupeKey) return emitRuntimeEvent(envelope, path);
+	if (!claimRuntimeEmission(envelope.dedupeKey)) return false;
+	return emitRuntimeEvent(envelope, path);
 }
 
 // ── 读（tolerant）─────────────────────────────────────────────────

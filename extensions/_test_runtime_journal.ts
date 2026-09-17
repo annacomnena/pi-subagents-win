@@ -14,12 +14,17 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// 隔离：本测试的默认 journal/claims 路径绝不触碰真实 ~/.pi/agent/runtime/
+process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-journal-test-env-"));
 import { newEventEnvelope, validateEnvelope, type RuntimeEnvelope } from "./runtime/envelope.ts";
 import {
 	appendRuntimeEnvelope,
 	appendRuntimeEnvelopeSafe,
+	claimRuntimeEmission,
 	defaultJournalPath,
 	emitRuntimeEvent,
+	emitRuntimeEventOnce,
 	listRuntimeEnvelopes,
 	readRuntimeEnvelope,
 } from "./runtime/journal.ts";
@@ -64,6 +69,24 @@ try {
 		assert.equal(env.ttlMs, 60000);
 		assert.equal(env.payloadRef, "runtime/objects/run_x.json");
 		assert.equal(env.payload, undefined, "payloadRef 与 payload 可并存也均可缺省");
+	}
+
+	// ── 2.5 envelope：recordedAt / dedupeKey（terra 裁决 #10/缺陷 4）────
+	{
+		const env = newEventEnvelope({
+			type: "run.completed",
+			source: masterAddress(),
+			subject: tabRunAddress("tab_z"),
+			at: "2026-09-17T00:00:00.000Z",
+			recordedAt: "2026-09-17T00:00:05.000Z",
+			dedupeKey: "run.completed:run://tab/tab_z",
+		});
+		assert.equal(env.at, "2026-09-17T00:00:00.000Z", "at = 领域发生时间");
+		assert.equal(env.recordedAt, "2026-09-17T00:00:05.000Z");
+		assert.equal(env.dedupeKey, "run.completed:run://tab/tab_z");
+		assert.deepEqual(validateEnvelope(env), []);
+		assert.ok(validateEnvelope({ ...env, dedupeKey: "has space" }).length > 0);
+		assert.ok(validateEnvelope({ ...env, recordedAt: "nope" }).length > 0);
 	}
 
 	// ── 3. envelope：必填缺失 / 非法逐项拒绝（§16.3）───────────────
@@ -196,10 +219,37 @@ try {
 		assert.equal(readRuntimeEnvelope("evt_not_there", { path }), null);
 	}
 
-	// ── 10. 默认路径形状（不触碰真实文件，只断言拼接）──────────────
+	// ── 9.5 dedupeKey 跨进程幂等（terra 缺陷 1/4 基建）────────────
+	{
+		const claimsDir = join(tmp, "claims");
+		const key = "run.completed:run://tab/tab_dedupe_x";
+		assert.equal(claimRuntimeEmission(key, claimsDir), true, "首次领取成功");
+		assert.equal(claimRuntimeEmission(key, claimsDir), false, "同键二次领取被拒");
+		assert.equal(claimRuntimeEmission("other" + key, claimsDir), true, "不同键互不影响");
+		assert.equal(claimRuntimeEmission("has space", claimsDir), false, "非法键拒绝");
+
+		// emitRuntimeEventOnce：同 dedupeKey 双调用只落盘一次
+		const path = jp("once");
+		const mk = () => newEventEnvelope({
+			type: "run.completed",
+			source: masterAddress(),
+			subject: tabRunAddress("tab_once"),
+			dedupeKey: "run.completed:run://tab/tab_once",
+		});
+		assert.equal(emitRuntimeEventOnce(mk(), path), true);
+		assert.equal(emitRuntimeEventOnce(mk(), path), false, "同键第二次不发");
+		const { envelopes } = listRuntimeEnvelopes({ path });
+		assert.equal(envelopes.length, 1, "journal 只有一条");
+	}
+
+	// ── 10. 默认路径：env override 生效（PI_RUNTIME_DIR 隔离契约）────
 	{
 		assert.ok(defaultJournalPath().endsWith("events.jsonl"));
-		assert.ok(defaultJournalPath().includes(join(".pi", "agent", "runtime")));
+		assert.equal(
+			defaultJournalPath().startsWith(process.env.PI_RUNTIME_DIR!),
+			true,
+			"PI_RUNTIME_DIR 已设 → 默认路径必须落在隔离目录",
+		);
 	}
 } finally {
 	rmSync(tmp, { recursive: true, force: true });

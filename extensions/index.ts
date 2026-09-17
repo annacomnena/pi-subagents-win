@@ -39,7 +39,7 @@ import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { emitRuntimeEvent } from "./runtime/journal.ts";
+import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus } from "./event-bus.ts";
@@ -1882,7 +1882,7 @@ export default function (pi: ExtensionAPI) {
 				};
 				writeTabDispatch(runsDir, dispatch);
 				// Phase 1 shadow emit（设计稿 §11）：journal 写失败不影响 launch
-				emitRuntimeEvent(tabDispatchToRuntimeEvent(dispatch));
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
 				// 溯源：记录「本会话唤起了这个 tab」
 				recordLink({
 					sessionId: sessionIdentity(_ctx as never),
@@ -1917,13 +1917,13 @@ export default function (pi: ExtensionAPI) {
 					console.error(`[subagent-win launch] async spawn failed ${runId}: ${err.message}`);
 					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
 					writeTabDispatch(runsDir, failed);
-					emitRuntimeEvent(tabDispatchToRuntimeEvent(failed));
+					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
 				});
 				if (result.error) {
 					// 派发失败保留 launch_failed 记录（不静默消失）
 					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
 					writeTabDispatch(runsDir, failed);
-					emitRuntimeEvent(tabDispatchToRuntimeEvent(failed));
+					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
 				}
 				return { ...result, runId, taskId, cwd };
 			});
@@ -2699,13 +2699,19 @@ export default function (pi: ExtensionAPI) {
 			};
 			writeTabDispatch(defaultTabRunsDir(), directDispatch);
 			// Phase 1 shadow emit（设计稿 §11）
-			emitRuntimeEvent(tabDispatchToRuntimeEvent(directDispatch));
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(directDispatch));
 
-			const result = dispatchPiTab(wtPath, piCli, directCwd, boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined, directRunId, defaultTabRunsDir());
+			const result = dispatchPiTab(wtPath, piCli, directCwd, boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined, directRunId, defaultTabRunsDir(), (err) => {
+				// terra 裁决缺陷 2：直开路径也要在异步 spawn 失败时回写 launch_failed
+				//（否则 journal 永远只有 dispatched，Phase 2 投影为非终态）
+				const failed = { ...directDispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+				writeTabDispatch(defaultTabRunsDir(), failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			});
 			if (result.error) {
 				const failed = { ...directDispatch, dispatchStatus: "launch_failed" as const, error: result.error };
 				writeTabDispatch(defaultTabRunsDir(), failed);
-				emitRuntimeEvent(tabDispatchToRuntimeEvent(failed));
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
 				ctx.ui.notify(`❌ 启动失败: ${result.error}`, "error");
 				return;
 			}
