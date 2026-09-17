@@ -39,6 +39,7 @@
     "smoke:real-tab": "node ./scripts/real-tab-smoke.mjs",
     "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts",
     "test:runtime-core": "node --experimental-strip-types ./extensions/_test_runtime_core.ts",
+    "test:runtime-journal": "node --experimental-strip-types ./extensions/_test_runtime_journal.ts",
     "test:capabilities": "node --experimental-strip-types ./extensions/_test_capabilities.ts",
     "test:runner-tools": "node --experimental-strip-types ./extensions/_test_runner_tools.ts",
     "test:trace-worker": "node --experimental-strip-types ./extensions/_test_trace_worker.ts",
