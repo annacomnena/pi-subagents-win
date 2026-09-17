@@ -19,10 +19,14 @@
 import type { TabDispatchRecord, TabResult } from "../../tab-runs.ts";
 import { newEventEnvelope, type RuntimeEnvelope } from "../envelope.ts";
 import { masterAddress, tabRunAddress, type ObjectAddress } from "../address.ts";
+import { newEnvelopeId } from "../ids.ts";
+import { newMessageFrame, type MessageFrame } from "../protocol.ts";
 
 // ── payload 预算（terra 裁决 #6）───────────────────────────────────
 
 const SUMMARY_MAX_BYTES = 2048;
+/** protocol 层 body.summary 预算（512B，validateMessageFrame 强制）——adapter 预截断避免校验拒绝。 */
+const MAILBOX_SUMMARY_MAX_BYTES = 512;
 const LIST_MAX_ITEMS = 20;
 const LIST_ITEM_MAX_BYTES = 512;
 
@@ -71,6 +75,45 @@ export function tabDispatchToRuntimeEvent(
 			error: dispatch.error,
 		},
 	});
+}
+
+// ── result → mailbox REPORT（Phase 3c 影子投递，§27-28）────────────
+
+/**
+ * tab 终态结果 → mailbox REPORT MessageFrame（投给 agent://master_default）。
+ *
+ * §28 迁移意义：收件人是 logical recipient，不依赖 links.jsonl 的 sessionId 映射
+ * ——物理 session 消失/更换后，信仍投给「那个逻辑 master」，后续由 resolver/generation
+ * （Phase 4）决定谁有权领取。
+ *
+ * dedupeId 确定性：`run-<tabRunId>-<status>` —— 双 watcher/跨进程重复观察同一终态
+ * 只落一封信（deliverLetter 文件名屏障）。
+ */
+export function tabResultToReportLetter(
+	result: TabResult,
+	from: ObjectAddress = masterAddress(),
+): { frame: MessageFrame; dedupeId: string } {
+	const subject = tabRunAddress(result.id);
+	const frame = newMessageFrame({
+		id: newEnvelopeId("msg"),
+		kind: "REPORT",
+		from,
+		to: from, // v1 单 master：观察者与收件人同一逻辑身份；多 master 时收件人由派发关系决定
+		subject,
+		sentAt: result.finishedAt,
+		summary:
+			result.summary !== undefined
+				? truncateUtf8(result.summary, MAILBOX_SUMMARY_MAX_BYTES)
+				: `(tab ${result.id} ${result.status})`,
+		details: {
+			tabRunId: result.id,
+			status: result.status,
+			taskId: result.taskId,
+			artifacts: truncateList(result.artifacts),
+			reportPath: result.reportPath,
+		},
+	});
+	return { frame, dedupeId: `run-${result.id}-${result.status}` };
 }
 
 // ── result → run.completed | run.failed | run.cancelled ───────────

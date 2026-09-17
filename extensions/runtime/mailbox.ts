@@ -53,11 +53,13 @@ export function newMessageId(now: Date = new Date()): EnvelopeId {
 
 /**
  * 投递一帧到目标 logical recipient 的 spool（status=pending）。
- * 同 messageId 已存在 → 幂等 no-op（返回既存 letter）。
+ * 幂等屏障 = spool 文件名：默认用 messageId（生产端防重），跨进程确定性场景
+ * （如双 watcher 观察同一 run）传 opts.dedupeId（如 `run-<runId>-completed`）——
+ * 同 dedupeId 已存在即 no-op（返回既存 letter），不同进程不约而同投递也只落一封。
  */
 export function deliverLetter(
 	frame: Deliverable,
-	opts: { mailboxDir?: string; expiresAt?: string } = {},
+	opts: { mailboxDir?: string; expiresAt?: string; dedupeId?: string } = {},
 ): { letter: Letter; created: boolean } {
 	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
 	if (frame.frame === "message" && !validateMessageFrame(frame)) {
@@ -73,7 +75,8 @@ export function deliverLetter(
 	mkdirSync(dir, { recursive: true });
 
 	const messageId = frame.frame === "message" ? frame.id : newMessageId();
-	const path = join(dir, `${messageId}.json`);
+	const fileName = (opts.dedupeId ?? messageId).replace(/[^A-Za-z0-9._-]/g, "_");
+	const path = join(dir, `${fileName}.json`);
 	if (existsSync(path)) {
 		return { letter: JSON.parse(readFileSync(path, "utf8")) as Letter, created: false };
 	}
@@ -81,6 +84,19 @@ export function deliverLetter(
 	const letter: Letter = { frame, status: "pending", expiresAt: opts.expiresAt };
 	writeJsonAtomic(path, letter);
 	return { letter, created: true };
+}
+
+/**
+ * 安全投递（event-bus 接线专用，同 emitRuntimeEventOnce 的 safe 纪律）：
+ * 任何失败不影响 caller——mailbox 是影子通道，投递失败只返回 false。
+ */
+export function deliverLetterSafe(frame: Deliverable, opts: { mailboxDir?: string; expiresAt?: string; dedupeId?: string } = {}): boolean {
+	try {
+		deliverLetter(frame, opts);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /** Command 投递便捷入口（messageId 由 spool 分配）。 */

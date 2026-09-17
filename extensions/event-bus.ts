@@ -22,6 +22,8 @@ import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
+import { deliverLetterSafe } from "./runtime/mailbox.ts";
+import { tabResultToReportLetter } from "./runtime/adapters/tab-run.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
@@ -90,7 +92,13 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// return true 的场景同样需要终态入账。
 	// 幂等用独立 dedupeKey claim（跨实例/跨重放），不动 .notified 的唤醒语义。
 	const result = readTabResultFile(runsDir, runId);
-	if (result) emitRuntimeEventOnce(tabResultToRuntimeEvent(result));
+	if (result) {
+		emitRuntimeEventOnce(tabResultToRuntimeEvent(result));
+		// Phase 3c 影子投递（§27-28）：mailbox REPORT 给 logical recipient（agent://master），
+		// 与 links.jsonl 的 sessionId 路由完全解耦；safe-wrapped，失败不影响唤醒链路。
+		const { frame, dedupeId } = tabResultToReportLetter(result);
+		deliverLetterSafe(frame, { dedupeId });
+	}
 
 	// trace-fusion 自动收集等自定义消费者：返回 true 表示已消费（跳过默认 toast/reclaim 注入）；
 	// 返回 false/undefined → 落回默认流程（向后兼容：旧调用方不返回值时行为不变）。

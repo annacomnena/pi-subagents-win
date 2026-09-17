@@ -196,6 +196,38 @@ function writeResult(runId: string, status = "completed") {
 	setCurrentSessionId(undefined); // 清理，不污染后续
 }
 
+// ── Phase 3c：mailbox 影子投递（§27-28）─────────────────────
+{
+	_resetEventBus();
+	const { setCurrentSessionId } = await import("./identity.ts");
+	const opts = { runsDir: dir, toast: false, autoReclaim: false, onTabFinished: () => {} };
+	writeFileSync(join(dir, "tab_mbx.result.json"), JSON.stringify({
+		id: "tab_mbx", taskId: "3", status: "completed", finishedAt: new Date().toISOString(), summary: "mailbox smoke",
+	}), "utf8");
+	setCurrentSessionId("session-B");
+	onTabResultFile(dir, "tab_mbx.result.json", opts);
+
+	// 信落入 logical recipient（agent://master_default）的 spool，不依赖 links.jsonl sessionId
+	const { listLetters, defaultMailboxDir } = await import("./runtime/mailbox.ts");
+	const { masterAddress } = await import("./runtime/address.ts");
+	const mine = () => listLetters(masterAddress(), undefined, defaultMailboxDir())
+		.filter((l) => l.frame.subject === "run://tab/tab_mbx");
+	assert.equal(mine().length, 1, "tab 终态 → mailbox 恰好一封信");
+	const letter = mine()[0]!;
+	assert.equal(letter.status, "pending");
+	assert.equal(letter.frame.frame === "message" ? letter.frame.kind : "", "REPORT");
+	assert.equal(letter.frame.subject, "run://tab/tab_mbx");
+	assert.equal(letter.frame.to, "agent://master_default");
+	assert.equal(String((letter.frame.body.details as Record<string, unknown> | undefined)?.tabRunId), "tab_mbx");
+
+	// 重复触发同一 result（模拟第二个 watcher 进程）：_resetEventBus 清 seenResults，
+	// dedupeId 文件名屏障防重投（跨进程幂等）
+	_resetEventBus();
+	onTabResultFile(dir, "tab_mbx.result.json", opts);
+	assert.equal(mine().length, 1, "双 watcher 不重投");
+	setCurrentSessionId(undefined);
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log("event-bus tests passed");
