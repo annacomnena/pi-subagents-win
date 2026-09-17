@@ -28,7 +28,7 @@ import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
-import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { runCrossTest } from "./trace-fusion/cross-test.ts";
@@ -1565,6 +1565,22 @@ export default function (pi: ExtensionAPI) {
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
 		},
 	}));
+
+	// trace-fusion 追赶收集：主会话启动时，扫「三路已终态但未出报告」的 running run
+	// 补后台收集（覆盖「三路全部在无主会话时完成」——重启后 watcher 把既有 result 标 seen，
+	// onTabFinished 不再触发，只能靠这里）。§24.1：磁盘是真相源，watch 只是加速器。
+	pi.on("session_start", (_event, ctx) => {
+		if (!isMainSession()) return;
+		const catches = catchUpAutoCollect();
+		if (!catches.length) return;
+		try {
+			pi.sendUserMessage?.(
+				`🧬 trace-fusion 追赶：${catches.map((c) => c.runId).join(", ")} 三路已终态但报告缺失，已后台补跑 cross-test。进度：/trace-fusion-status`,
+				{ deliverAs: "followUp" },
+			);
+		} catch { /* 通知尽力而为，收集已在后台 */ }
+		void ctx;
+	});
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
 	collect(registerReportListener(pi));

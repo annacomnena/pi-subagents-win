@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tfl-sv-test-"));
 const runsDir = join(root, "runs");
@@ -94,6 +94,39 @@ try {
 	laneResult("tabX");
 	const done = maybeAutoCollectTraceRun("tabX", { runsDir, tabRunsDir, spawnWorker: () => { spawned++; } });
 	assert.deepEqual(done, { isTrace: false }, "终态 run 不再触发自动收集");
+
+	// ---- claim 幂等：已有新鲜 claim → busy，不 spawn（防双 worker）
+	makeRun("tfl-busy", { A: "tabP", B: "tabQ", C: "tabR" });
+	laneResult("tabP");
+	laneResult("tabQ");
+	laneResult("tabR");
+	writeFileSync(join(runsDir, "tfl-busy", "collect-worker.claim"),
+		JSON.stringify({ pid: 999, at: new Date().toISOString() }));
+	const busy = maybeAutoCollectTraceRun("tabP", { runsDir, tabRunsDir, spawnWorker: () => { spawned++; } });
+	assert.ok(busy.isTrace && busy.phase === "busy");
+	assert.equal(spawned, 1, "claim 持有期间不 spawn");
+
+	// ---- catch-up：无 claim 的全终态 running run → started
+	// （tfl-sv / tfl-busy 均已被前面步骤留下新鲜 claim → 幂等跳过）
+	makeRun("tfl-catch", { A: "tabU", B: "tabV", C: "tabW" });
+	laneResult("tabU");
+	laneResult("tabV");
+	laneResult("tabW");
+	let caught: string[] = [];
+	const ups = catchUpAutoCollect({
+		runsDir, tabRunsDir,
+		spawnWorker: (_s, runId) => { caught.push(runId); },
+	});
+	assert.deepEqual(ups.map((u) => u.runId), ["tfl-catch"], "只补无 claim 的 tfl-catch");
+	assert.deepEqual(caught, ["tfl-catch"]);
+
+	// 第二次 catch-up：tfl-catch 也已持 claim → 幂等零 spawn
+	const ups2 = catchUpAutoCollect({
+		runsDir, tabRunsDir,
+		spawnWorker: (_s, runId) => { caught.push(runId); },
+	});
+	assert.deepEqual(ups2, [], "claim 已持有 → 幂等不重 spawn");
+	assert.deepEqual(caught, ["tfl-catch"]);
 
 	// runsDir 不存在 → isTrace false（容错）
 	const missing = maybeAutoCollectTraceRun("tabA", { runsDir: join(root, "nope"), tabRunsDir });

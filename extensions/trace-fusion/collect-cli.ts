@@ -8,7 +8,7 @@
  * 设计稿 §24.1：磁盘是唯一真相源——本 worker 只与磁盘交互，不依赖主会话存活。
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -21,7 +21,15 @@ import { defaultRunsDir } from "./types.ts";
 function main(): void {
 	const runId = process.argv[2] ?? "";
 	const here = dirname(fileURLToPath(import.meta.url));
-	const logPath = join(defaultRunsDir(), runId, "collect-worker.log");
+	const runDir = join(defaultRunsDir(), runId);
+	const logPath = join(runDir, "collect-worker.log");
+	// supervisor 在 spawn 前已用 'wx' 认领；worker 退出时释放（成功后 cross-test.json
+	// 先于 claim 检查所以无所谓，失败后释放允许 catch-up 重试）
+	const releaseClaim = (): void => {
+		try {
+			rmSync(join(runDir, "collect-worker.claim"));
+		} catch { /* 尽力而为 */ }
+	};
 	const log = (msg: string): void => {
 		try {
 			appendFileSync(logPath, `${new Date().toISOString()} ${msg}\n`, "utf8");
@@ -52,7 +60,9 @@ function main(): void {
 			"utf8",
 		);
 		log("meta -> completed");
+		releaseClaim();
 	} catch (err) {
+		releaseClaim();
 		try {
 			appendFileSync(logPath, `${new Date().toISOString()} FATAL: ${(err as Error).stack ?? (err as Error).message}\n`, "utf8");
 		} catch { /* 尽力而为 */ }
