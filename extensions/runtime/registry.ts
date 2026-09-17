@@ -18,7 +18,7 @@
  * 纯库、无接线、无 Pi API 依赖。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 import { isObjectAddress, masterAddress, type ObjectAddress } from "./address.ts";
@@ -96,7 +96,7 @@ export interface AttachInput {
 
 export type AttachResult =
 	| { ok: true; attachment: MasterAttachment; genesis: boolean }
-	| { ok: false; reason: "bad-session" | "owner-active" | "bad-token" | "token-expired" | "generation-mismatch" | "not-stale" };
+	| { ok: false; reason: "bad-session" | "owner-active" | "bad-token" | "token-expired" | "generation-mismatch" | "not-stale" | "lease-contended" };
 
 /**
  * 显式 attach。genesis（无 owner）→ wx 原子创建 gen 1；已有 owner → 需 token
@@ -134,6 +134,26 @@ export function attachMaster(input: AttachInput): AttachResult {
 }
 
 function attachWithOwner(
+	agent: ObjectAddress,
+	current: MasterAttachment,
+	input: AttachInput,
+	now: string,
+): AttachResult {
+	// F13：排他 lease 包住 read-modify-write；lease 内重读比对 generation（CAS compare）
+	const lease = acquireRegistryLease(`attach:${input.sessionId}`);
+	if (!lease.won) return { ok: false, reason: "lease-contended" };
+	try {
+		const fresh = readAttachment(agent);
+		if (!fresh || fresh.generation !== current.generation || fresh.sessionId !== current.sessionId) {
+			return { ok: false, reason: "generation-mismatch" }; // lease 等待期间有人先动了
+		}
+		return attachWithOwnerLocked(agent, fresh, input, now);
+	} finally {
+		lease.release();
+	}
+}
+
+function attachWithOwnerLocked(
 	agent: ObjectAddress,
 	current: MasterAttachment,
 	input: AttachInput,
@@ -233,8 +253,58 @@ function readHandoff(agent: ObjectAddress): HandoffToken | null {
 	}
 }
 
-// ── heartbeat（条件刷新）────────────────────────────────────────────
+// ── 排他 lease（F13 CAS 互斥，附记 A5）─────────────────────────────
 
+export interface RegistryLease {
+	won: boolean;
+	release: () => void;
+}
+
+/**
+ * 排他 lease：registry/.lease（wx 排他创建，first-wins）。
+ * staleAfterMs 缺省 30s：持有者崩溃未释放，他人过期接管（lease 文件内 timestamp 判定）。
+ * 用途：包住 attach 的 read-modify-write；lease 内重读比对 generation 即 CAS。
+ * genesis（wx-create）与 detach（只写 token 文件，无 RMW）不需要 lease。
+ */
+export function acquireRegistryLease(purpose: string, staleAfterMs = 30_000): RegistryLease {
+	const path = join(registryDir(), ".lease");
+	mkdirSync(registryDir(), { recursive: true });
+	const noop = (): void => undefined;
+	const content = JSON.stringify({
+		holder: `${purpose}@${process.pid}`,
+		purpose,
+		acquiredAt: new Date().toISOString(),
+	});
+	try {
+		writeFileSync(path, content, { flag: "wx", encoding: "utf8" });
+		return { won: true, release: () => releaseLease(path, content) };
+	} catch {
+		// 已被占：stale 则接管（覆盖写），否则认输
+		try {
+			const existing = JSON.parse(readFileSync(path, "utf8")) as { acquiredAt?: string };
+			const age = Date.now() - Date.parse(existing.acquiredAt ?? "");
+			if (Number.isFinite(age) && age > staleAfterMs) {
+				writeRawAtomic(path, content);
+				return { won: true, release: () => releaseLease(path, content) };
+			}
+		} catch {
+			/* 读坏按被占处理（认输，safe 方向） */
+		}
+		return { won: false, release: noop };
+	}
+}
+
+/** 释放：仅当文件内容仍是自己写入的才删（防误删他人接管后的 lease）。 */
+function releaseLease(path: string, ownContent: string): void {
+	try {
+		const current = readFileSync(path, "utf8");
+		if (current === ownContent) unlinkSync(path);
+	} catch {
+		/* best-effort */
+	}
+}
+
+// ── heartbeat（条件刷新）────────────────────────────────────────────
 /**
  * 条件心跳：sessionId+generation 必须同时匹配，否则 false。
  * 被 bump 掉的旧 owner 无法复活心跳（防 resuscitation）。
@@ -253,7 +323,12 @@ function newAttemptId(): string {
 }
 
 function writeJsonAtomic(path: string, value: unknown): void {
+	writeRawAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/** 原子写原始字符串（lease takeover 需字节精确，否则 release 比对失败）。 */
+function writeRawAtomic(path: string, content: string): void {
 	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	writeFileSync(tmp, content, "utf8");
 	renameSync(tmp, path);
 }

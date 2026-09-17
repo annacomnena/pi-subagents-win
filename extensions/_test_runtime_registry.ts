@@ -22,6 +22,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-registry-env-")
 
 import { masterAddress } from "./runtime/address.ts";
 import {
+	acquireRegistryLease,
 	attachMaster,
 	attachmentPathFor,
 	detachMaster,
@@ -188,6 +189,57 @@ try {
 		assert.equal(good.ok, true);
 		const after = listRuntimeEnvelopes({ path: journalPath }).envelopes;
 		assert.equal(after.filter((e) => e.type === "agent.session.detached").length, 1);
+	}
+
+	// ── 15. F13：lease 互斥（双接管仅一胜）──────────────────────────
+	{
+		const first = acquireRegistryLease("test-a");
+		assert.equal(first.won, true);
+		const second = acquireRegistryLease("test-b");
+		assert.equal(second.won, false, "lease 被占时认输");
+		// attach 在 lease 被占时拒绝（CAS 保护）
+		const contended = attachMaster({ sessionId: "sess-G", forceStale: true, staleAfterMs: -1 });
+		assert.equal(contended.ok, false);
+		assert.equal(!contended.ok && contended.reason, "lease-contended");
+		first.release();
+		const third = acquireRegistryLease("test-c");
+		assert.equal(third.won, true, "释放后可重新获得");
+		third.release();
+		// stale lease 可接管
+		const { writeFileSync } = await import("node:fs");
+		const leasePath = join(process.env.PI_RUNTIME_DIR!, "registry", ".lease");
+		writeFileSync(leasePath, JSON.stringify({ holder: "dead", purpose: "x", acquiredAt: new Date(Date.now() - 60_000).toISOString() }), "utf8");
+		const takeover = acquireRegistryLease("test-d", 30_000);
+		assert.equal(takeover.won, true, "过期 lease 可接管");
+		takeover.release();
+		assert.equal((await import("node:fs")).existsSync(leasePath), false, "release 删自己的 lease");
+	}
+
+	// ── 16. F14：注入互斥（claim → confirm）─────────────────────────
+	{
+		const { claimInjection, confirmInjection } = await import("./runtime/receipts.ts");
+		const key = runReceiptKey("tab_mutex", "completed");
+		const c1 = claimInjection(key, "chain-A");
+		assert.equal(c1.status, "claimed");
+		const c2 = claimInjection(key, "chain-B");
+		assert.equal(c2.status, "claimed-by-other", "双链同时只能一链拿注入权");
+		assert.equal(c2.by, "chain-A");
+		assert.equal(confirmInjection(key, "chain-B"), false, "他人冒确认拒绝");
+		assert.equal(confirmInjection(key, "chain-A"), true);
+		assert.equal(hasNotificationReceipt(key), true, "确认后收据存在");
+		const c3 = claimInjection(key, "chain-C");
+		assert.equal(c3.status, "injected-already", "已注入后直接短路");
+		// stale claiming 接管
+		const key2 = runReceiptKey("tab_stale", "failed");
+		claimInjection(key2, "crashed-chain");
+		const { writeFileSync, readFileSync } = await import("node:fs");
+		const claimingPath = join(process.env.PI_RUNTIME_DIR!, "receipts", `${key2}.claiming.json`);
+		const old = JSON.parse(readFileSync(claimingPath, "utf8"));
+		old.claimedAt = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+		writeFileSync(claimingPath, JSON.stringify(old), "utf8");
+		const take = claimInjection(key2, "chain-D");
+		assert.equal(take.status, "claimed");
+		assert.equal(take.tookOver, true, "过期占位可接管（at-least-once 重试）");
 	}
 
 	// ── 14. registry 优先：journal 写失败不影响 attach 结果 ────────

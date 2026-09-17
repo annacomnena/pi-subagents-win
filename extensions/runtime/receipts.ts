@@ -13,7 +13,7 @@
  * 纯库、无接线。
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 
@@ -57,4 +57,71 @@ export function hasNotificationReceipt(key: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+// ── 注入互斥（F14，附记 A5：跨路径注入 mutex）──────────────────────
+
+export type InjectionClaimStatus = "claimed" | "injected-already" | "claimed-by-other";
+
+export interface InjectionClaimResult {
+	status: InjectionClaimStatus;
+	/** 当前 claiming 持有者（claimed-by-other 时由谁占着；claimed 时是自己） */
+	by?: string;
+	/** stale 接管（at-least-once 重试语义） */
+	tookOver?: boolean;
+}
+
+function claimingPath(key: string): string {
+	return join(receiptsDir(), `${key.replace(/[^A-Za-z0-9._-]/g, "_")}.claiming.json`);
+}
+
+/**
+ * 声明注入权：wx first-wins；已 injected → injected-already；被占 → claimed-by-other；
+ * 占位超 staleAfterMs（缺省 10min，同 mailbox 纪律）→ 接管（tookOver，at-least-once 重试）。
+ * 三路注入（event-bus / reports / mailbox）在此互斥：同时查空不可能同时注入。
+ */
+export function claimInjection(key: string, by: string, staleAfterMs = 10 * 60 * 1000): InjectionClaimResult {
+	if (!key || /\s/.test(key) || !by) return { status: "claimed-by-other" };
+	mkdirSync(receiptsDir(), { recursive: true });
+	if (hasNotificationReceipt(key)) return { status: "injected-already" };
+	const path = claimingPath(key);
+	const content = JSON.stringify({ key, by, claimedAt: new Date().toISOString() });
+	try {
+		writeFileSync(path, content, { flag: "wx", encoding: "utf8" });
+		return { status: "claimed", by };
+	} catch {
+		try {
+			const existing = JSON.parse(readFileSync(path, "utf8")) as { by?: string; claimedAt?: string };
+			const age = Date.now() - Date.parse(existing.claimedAt ?? "");
+			if (Number.isFinite(age) && age > staleAfterMs) {
+				writeFileSync(path, content, "utf8"); // stale 接管（有意覆盖）
+				return { status: "claimed", by, tookOver: true };
+			}
+			return { status: "claimed-by-other", by: existing.by };
+		} catch {
+			return { status: "claimed-by-other" };
+		}
+	}
+}
+
+/**
+ * 确认注入完成：仅 claiming 持有者可确认（by 必须一致，防他人冒确认）；
+ * 成功写 injected 收据并删 claiming。返回 false 时调用方不得 ack（4d 顺序保证 F16）。
+ */
+export function confirmInjection(key: string, by: string): boolean {
+	if (!key || !by) return false;
+	const path = claimingPath(key);
+	try {
+		const existing = JSON.parse(readFileSync(path, "utf8")) as { by?: string };
+		if (existing.by !== by) return false;
+	} catch {
+		return false;
+	}
+	if (!recordNotificationReceipt(key, by)) return false;
+	try {
+		unlinkSync(path);
+	} catch {
+		/* claiming 残留无害（stale 后可接管；injected 已存在则 claim 直接短路） */
+	}
+	return true;
 }
