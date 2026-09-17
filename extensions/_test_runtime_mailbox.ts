@@ -145,6 +145,42 @@ try {
 		const masterRow = backlog.find((r) => r.recipient.includes("master"))!;
 		assert.equal(masterRow.pending, 1, "master 仅剩 command 一封 pending（其余已终态）");
 	}
+
+	// ── 9. F7：dedupeId 原子 slot（terra 缺陷 #1/#2，附记 A4）────────
+	{
+		const a = msg("REPORT", "2026-09-17T15:00:00.000Z");
+		const b = msg("REPORT", "2026-09-17T15:00:00.000Z"); // 不同帧实例（模拟第二个 watcher）
+		const first = deliverLetter(a, { mailboxDir: MAILBOX, dedupeId: "run-tab_f7-completed" });
+		const second = deliverLetter(b, { mailboxDir: MAILBOX, dedupeId: "run-tab_f7-completed" });
+		assert.equal(first.created, true);
+		assert.equal(second.created, false, "同 dedupeId 第二次不重投");
+		assert.equal(second.letter.frame.frame === "message" ? second.letter.frame.id : "", first.letter.frame.frame === "message" ? first.letter.frame.id : "", "输家返回赢家的信（同 messageId）");
+
+		// 缺陷 #1 回归：dedupe 信可按 frame.id ack（文件名恒等于 messageId）
+		const mid = first.letter.frame.frame === "message" ? first.letter.frame.id : "";
+		claimLetters(master, { claimedBy: "w", mailboxDir: MAILBOX });
+		const acked = ackLetter(master, mid, { mailboxDir: MAILBOX });
+		assert.ok(acked && acked.status === "acked", "dedupe 信 ack 可达");
+	}
+
+	// ── 10. 旧 dedupe 命名信件兼容（F7 前落盘，scan 兜底）────────────
+	{
+		const { writeFileSync } = await import("node:fs");
+		const { mailboxDirFor } = await import("./runtime/mailbox.ts");
+		const legacy = newMessageFrame({
+			id: newEnvelopeId("msg"),
+			kind: "REPORT",
+			from: "agent://agent_worker_1",
+			to: master,
+			sentAt: "2026-09-17T16:00:00.000Z",
+			summary: "legacy file",
+		});
+		const dir = mailboxDirFor(master, MAILBOX);
+		writeFileSync(join(dir, "run-tab_legacy-completed.json"), JSON.stringify({ frame: legacy, status: "claimed" }), "utf8");
+		const mid = legacy.id;
+		const acked = ackLetter(master, mid, { mailboxDir: MAILBOX });
+		assert.ok(acked && acked.status === "acked", "旧命名信件 ack 可达（scan 兜底）");
+	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });
 }

@@ -53,9 +53,12 @@ export function newMessageId(now: Date = new Date()): EnvelopeId {
 
 /**
  * 投递一帧到目标 logical recipient 的 spool（status=pending）。
- * 幂等屏障 = spool 文件名：默认用 messageId（生产端防重），跨进程确定性场景
- * （如双 watcher 观察同一 run）传 opts.dedupeId（如 `run-<runId>-completed`）——
- * 同 dedupeId 已存在即 no-op（返回既存 letter），不同进程不约而同投递也只落一封。
+ *
+ * 命名不变量（F7，附记 A4）：spool 文件名恒等于 messageId（frame.id）——ack 按
+ * messageId 可达（terra 缺陷 #1）。dedupeId 只走原子 claim slot
+ * （claims/mailbox-<dedupeId>.json → {messageId}，open wx 排他创建），不进文件名：
+ * 跨进程确定性场景（如双 watcher 观察同一 run）传 opts.dedupeId，输家读赢家映射
+ * 直接返回既存信；赢家若在 claim→落盘窗口崩溃，输家替补写（at-least-once）。
  */
 export function deliverLetter(
 	frame: Deliverable,
@@ -75,8 +78,14 @@ export function deliverLetter(
 	mkdirSync(dir, { recursive: true });
 
 	const messageId = frame.frame === "message" ? frame.id : newMessageId();
-	const fileName = (opts.dedupeId ?? messageId).replace(/[^A-Za-z0-9._-]/g, "_");
-	const path = join(dir, `${fileName}.json`);
+
+	// F7：dedupeId 经原子 claim slot 映射到唯一的 messageId（跨进程原子，缺陷 #2）
+	if (opts.dedupeId) {
+		const slot = claimDedupeSlot(opts.dedupeId, messageId);
+		if (!slot.won) return readOrAdoptWinnerLetter(dir, slot.messageId, frame, opts.expiresAt);
+	}
+
+	const path = join(dir, `${messageId}.json`);
 	if (existsSync(path)) {
 		return { letter: JSON.parse(readFileSync(path, "utf8")) as Letter, created: false };
 	}
@@ -102,6 +111,65 @@ export function deliverLetterSafe(frame: Deliverable, opts: { mailboxDir?: strin
 /** Command 投递便捷入口（messageId 由 spool 分配）。 */
 export function deliverCommand(frame: CommandFrame, opts: { mailboxDir?: string; expiresAt?: string } = {}): { letter: Letter; created: boolean } {
 	return deliverLetter(frame, opts);
+}
+
+// ── F7 原子 dedupe slot（附记 A4，terra 缺陷 #1/#2）────────────────
+
+/**
+ * 原子领取 dedupeId → messageId 映射槽（claims/mailbox-<id>.json，wx 排他创建）。
+ * 赢家拿走写权；输家拿到赢家的 messageId 去读既存信。slot 与 journal claims 同目录族。
+ */
+function claimDedupeSlot(dedupeId: string, messageId: string): { won: boolean; messageId: string } {
+	const dir = join(defaultRuntimeDir(), "claims");
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, `mailbox-${dedupeId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+	try {
+		writeFileSync(path, JSON.stringify({ messageId }), { flag: "wx", encoding: "utf8" });
+		return { won: true, messageId };
+	} catch {
+		// slot 已被占：读赢家映射（读坏属极罕见 IO 损坏，抛给 safe wrapper 吞掉）
+		const winner = (JSON.parse(readFileSync(path, "utf8")) as { messageId: string }).messageId;
+		if (typeof winner !== "string" || winner.length === 0) throw new Error("claimDedupeSlot: slot unreadable");
+		return { won: false, messageId: winner };
+	}
+}
+
+/**
+ * 输家路径：读赢家的信；赢家若在 claim→落盘窗口崩溃（信文件尚不存在），
+ * 用赢家的 messageId 替补写（frame.id 领养赢家 id，命名不变量保持）。
+ */
+function readOrAdoptWinnerLetter(
+	dir: string,
+	winnerMessageId: string,
+	frame: Deliverable,
+	expiresAt: string | undefined,
+): { letter: Letter; created: boolean } {
+	const path = join(dir, `${winnerMessageId}.json`);
+	try {
+		return { letter: JSON.parse(readFileSync(path, "utf8")) as Letter, created: false };
+	} catch {
+		const adopted: Deliverable = frame.frame === "message"
+			? { ...frame, id: winnerMessageId as EnvelopeId }
+			: frame;
+		const letter: Letter = { frame: adopted, status: "pending", expiresAt };
+		writeJsonAtomic(path, letter);
+		return { letter, created: false };
+	}
+}
+
+/** 按 frame.id 扫描定位信件文件（F7 前旧信件兼容，缺陷 #1 可达性）。 */
+function findLetterFileByFrameId(dir: string, frameId: string): string | null {
+	if (!existsSync(dir)) return null;
+	for (const f of readdirSync(dir)) {
+		if (!f.endsWith(".json")) continue;
+		try {
+			const letter = JSON.parse(readFileSync(join(dir, f), "utf8")) as Letter;
+			if (letter.frame?.frame === "message" && letter.frame.id === frameId) return join(dir, f);
+		} catch {
+		continue;
+		}
+	}
+	return null;
 }
 
 // ── claim / deliver / ack（消费端）────────────────────────────────
@@ -264,8 +332,13 @@ function mutateLetter(
 	mutate: (l: Letter) => Letter | null,
 ): Letter | null {
 	const dir = mailboxDirFor(recipient, opts.mailboxDir);
-	const path = join(dir, `${messageId}.json`);
-	if (!existsSync(path)) return null;
+	let path = join(dir, `${messageId}.json`);
+	if (!existsSync(path)) {
+		// 兼容 F7 前的 dedupe 命名旧信件：按 frame.id 扫描定位（缺陷 #1 可达性）
+		const found = findLetterFileByFrameId(dir, messageId);
+		if (!found) return null;
+		path = found;
+	}
 	let letter: Letter;
 	try {
 		letter = JSON.parse(readFileSync(path, "utf8")) as Letter;
@@ -278,9 +351,9 @@ function mutateLetter(
 	return updated;
 }
 
-/** 原子写：tmp + rename（同 state-store 纪律）。 */
+/** 原子写：唯一 tmp + rename（固定 .tmp 名跨进程互覆盖，缺陷 #2 下半）。 */
 function writeJsonAtomic(path: string, value: unknown): void {
-	const tmp = `${path}.tmp`;
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
 	writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 	renameSync(tmp, path);
 }
