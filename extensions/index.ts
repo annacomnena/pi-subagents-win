@@ -31,7 +31,8 @@ import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.
 import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
-import { runCrossTest } from "./trace-fusion/cross-test.ts";
+import { cleanTraceRun } from "./trace-fusion/clean.ts";
+import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
@@ -2851,11 +2852,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(`📦 收集 ${meta.runId} 的 lane artifacts（三段式 patch/叙事/终态）…`, "info");
 				const collect = collectRunArtifacts(meta);
-				ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");
-				const matrix = runCrossTest(meta, collect, {
-					provisioning: tfConfig.provisioning,
-					mainRoot: meta.repoRoot,
-				});
+				// diagnose 模式（2026-09-17）：不在用户主仓库执行 pooled commands，
+				// 落盘跳过型报告 + 违规写入确定性检查
+				const matrix = meta.mode === "diagnose"
+					? finishDiagnoseRun(meta, collect)
+					: (() => {
+						ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");
+						return runCrossTest(meta, collect, {
+							provisioning: tfConfig.provisioning,
+							mainRoot: meta.repoRoot,
+						});
+					})();
 				// deterministic 层终态：报告就绪，等待人工裁决（fusion/consult 为 v0.4）
 				const finished = { ...meta, status: "completed" as const };
 				writeFileSync(join(runDir, "meta.json"), JSON.stringify(finished, null, 2) + "\n", "utf8");
@@ -2866,6 +2873,28 @@ export default function (pi: ExtensionAPI) {
 					`报告：${matrix.reportPath}\n三份 trajectory 与 patch 在 ${meta.runDir}\\lanes\\，等待人工裁决。`,
 					"info",
 				);
+			},
+		});
+
+		// ── /trace-fusion-clean（v0.5 提前落地：§15「用完即删」的执行机制）──
+		// implement 模式一轮真实 run 占 12GB+；清理 worktree、保留 runDir artifact（patch/trajectory）。
+		pi.registerCommand("trace-fusion-clean", {
+			description: "清理 trace-fusion run 的 worktree 占用（保留 artifact）：/trace-fusion-clean <runId> [--force]",
+			handler: async (args, ctx) => {
+				const raw = (args ?? "").trim();
+				const force = /(^|\s)--force(\s|$)/.test(raw);
+				const runId = raw.replace(/--force/g, "").trim();
+				if (!runId) {
+					ctx.ui.notify("用法：/trace-fusion-clean <runId> [--force]；runId 见 /trace-fusion-status", "error");
+					return;
+				}
+				const result = cleanTraceRun(runId, { force, runsDir: defaultTraceFusionRunsDir() });
+				for (const line of result.lines) ctx.ui.notify(line, "info");
+				if (!result.ok) {
+					ctx.ui.notify(`清理失败：${result.error}`, "error");
+					return;
+				}
+				ctx.ui.notify(`✅ 清理完成：${result.removedWorktrees.length} 个 worktree 已移除`, "info");
 			},
 		});
 	}

@@ -141,6 +141,18 @@ function archiveUntracked(worktree: string, destDir: string): { files: string[];
 	return { files, issues };
 }
 
+/**
+ * diagnose 模式确定性违规检查：主仓库当前 porcelain 对比启动基线，
+ * 返回新增条目（lane 违规写入的证据）。只增不改——基线内既有脏项不算违规。
+ */
+export function diagnoseDirtyViolations(meta: TraceRunMeta): string[] {
+	if (!meta.dirtyBaselineFile || !existsSync(meta.dirtyBaselineFile)) return [];
+	const nowSt = execGit(["status", "--porcelain=v1"], { cwd: meta.repoRoot });
+	if (nowSt.status !== 0) return [];
+	const base = new Set(readFileSync(meta.dirtyBaselineFile, "utf8").split("\n").map((l) => l.trim()).filter((l) => l.length > 0));
+	return nowSt.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !base.has(l));
+}
+
 export interface CollectOptions {
 	now?: Date;
 	/** tab-runs 目录（测试注入；缺省 defaultTabRunsDir）。 */
@@ -177,20 +189,38 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 	// 三段式 patch（§21.0 P4 修订；worker 有无 commit 都覆盖）。
 	// review 修正（Luna critical）：part2 用 `diff HEAD`——裸 `diff` 只看 unstaged，
 	// 会漏掉 worker 已 git add 未 commit 的 staged 修改。
+	// diagnose 模式（2026-09-17）：不收集 patch（lane 只读，应无任何修改）；
+	// 改为确定性违规检查——对比启动时 porcelain 基线，新增条目即 lane 违规写主仓库。
+	const patchPath = join(laneDir, "patch.diff");
+	let changedFiles: string[] = [];
+	let untrackedFiles: string[] = [];
+	const untrackedDir = join(laneDir, "untracked");
+	if (meta.mode === "diagnose") {
+		writeFileSync(patchPath, "", "utf8");
+		issues.push("diagnose 模式：不收集 patch（lane 只读）；证据以 trajectory/validation 为准");
+		const violations = diagnoseDirtyViolations(meta);
+		if (violations.length > 0) {
+			issues.push(`⚠ 主仓库出现基线外改动（疑似 lane 违规写入）：${violations.slice(0, 5).join("; ")}`);
+		}
+	} else {
 	const part1 = execGit(["diff", "--binary", meta.baseCommit, "HEAD"], { cwd: worktree });
 	const part2 = execGit(["diff", "--binary", "HEAD"], { cwd: worktree });
 	if (part1.status !== 0) issues.push(`patch part1 失败：${part1.stderr}`);
 	if (part2.status !== 0) issues.push(`patch part2 失败：${part2.stderr}`);
 	const patch = [part1.stdout, part2.stdout].filter((s) => s.length > 0).map((s) => (s.endsWith("\n") ? s : s + "\n")).join("");
-	const patchPath = join(laneDir, "patch.diff");
 	writeFileSync(patchPath, patch, "utf8");
 
 	// changedFiles（review 修正 Luna major：name-status 覆盖重命名/删除，不再是 +++ b/ 单一来源）
-	const changedFiles = collectChangedFiles(meta.baseCommit, worktree);
-	const untrackedDir = join(laneDir, "untracked");
+	changedFiles = collectChangedFiles(meta.baseCommit, worktree);
 	const untracked = existsSync(worktree) ? archiveUntracked(worktree, untrackedDir) : { files: [] as string[], issues: ["worktree 不存在"] };
 	issues.push(...untracked.issues);
 	changedFiles.push(...untracked.files);
+	untrackedFiles = untracked.files;
+
+	// status.txt（§21.3：登记）
+	const st = execGit(["status", "--porcelain=v1"], { cwd: worktree });
+	writeFileSync(join(laneDir, "status.txt"), st.stdout, "utf8");
+	}
 
 	// status.txt（§21.3：登记）
 	const st = execGit(["status", "--porcelain=v1"], { cwd: worktree });
@@ -222,7 +252,7 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 		patchPath,
 		patchBytes: statSync(patchPath).size,
 		changedFiles,
-		untrackedFiles: untracked.files,
+		untrackedFiles,
 		untrackedDir,
 		trustedCommands: trustedCommands(validation),
 		testFiles: validation && Array.isArray(validation.testFiles)

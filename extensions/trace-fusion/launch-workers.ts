@@ -19,10 +19,11 @@ import {
 import { defaultTabRunsDir, newTabRunId, writeTabDispatch, type TabDispatchRecord } from "../tab-runs.ts";
 import { defaultTimersDir, mailboxDirForTab, newTimerId, dueAtFromDelay, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "../timers.ts";
 import { runPreflight } from "./preflight.ts";
+import { execGit } from "./git.ts";
 import { createSyntheticSnapshot } from "./snapshot.ts";
 import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type ProvisionReport } from "./worktrees.ts";
 import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type TraceFusionConfig } from "./types.ts";
-import { buildTraceWorkerPrompt } from "./worker-prompt.ts";
+import { buildTraceWorkerPrompt, buildDiagnoseWorkerPrompt } from "./worker-prompt.ts";
 import { ensureDirTrusted } from "./trust.ts";
 
 /** spawn seam：默认真 spawnPiTab；测试注入 fake。签名与 spawnPiTab 一致。 */
@@ -102,16 +103,21 @@ export interface TraceRunMeta {
 	runId: string;
 	shortId: string;
 	status: "running";
+	/** run 模式（2026-09-17）：diagnose 只读诊断（默认）| implement worktree 读写实现。 */
+	mode: "diagnose" | "implement";
 	task: string;
 	repoRoot: string;
 	createdAt: string;
 	baseCommit: string;
 	headBefore: string;
 	runDir: string;
+	/** worktree 根目录；diagnose 模式为空串（不开 worktree）。 */
 	wtDir: string;
 	laneWallClockMin: number;
 	laneDeadlineAt: string;
 	lanes: Record<LaneId, TraceLaneMeta>;
+	/** diagnose 模式：启动时主仓库 porcelain 基线文件路径（collect 时对比检违规写入）。 */
+	dirtyBaselineFile?: string;
 }
 
 export type LaunchTraceRunResult =
@@ -139,12 +145,15 @@ export function readTraceRunMeta(runDir: string): TraceRunMeta | null {
 	}
 }
 
+const noopProvision = (): ProvisionReport => ({ junction: [], copied: [], commandOk: true, degraded: false, issues: [] });
+
 export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult {
 	const lines: string[] = [];
 	const runsDir = input.runsDir ?? defaultRunsDir();
 	const wtRoot = input.wtRoot ?? defaultWorktreeRoot();
 	const now = input.now ?? new Date();
 	const spawnTab = input.spawnTab ?? ((opts) => spawnPiTab(opts));
+	const mode = input.config.mode ?? "diagnose";
 
 	// 1. preflight（§14.2：含单 active run 互斥）
 	const pf = runPreflight(input.repoRoot, { runsDir, maxActiveRuns: input.config.maxActiveRuns });
@@ -155,8 +164,122 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 	// 2. runId + 目录（artifact 长路径 / worktree 短路径，§15）
 	const { runId, shortId } = newTraceRunId(now);
 	const runDir = join(runsDir, runId);
-	const wtDir = join(wtRoot, shortId);
+	const wtDir = mode === "implement" ? join(wtRoot, shortId) : "";
 	mkdirSync(runDir, { recursive: true });
+
+	// ── diagnose 分支（2026-09-17）：零写入主仓库——不 snapshot、不开 worktree、不预信任；
+	// lane 直接在主仓库只读诊断，产出诊断+方案，交主会话融合后单次实现。
+	if (mode === "diagnose") {
+		const base = execGit(["rev-parse", "HEAD"], { cwd: repoRoot });
+		if (base.status !== 0) return { ok: false, error: `rev-parse HEAD 失败：${base.stderr}`, lines };
+		const baseCommit = base.stdout.trim();
+		const porcelain = execGit(["status", "--porcelain=v1"], { cwd: repoRoot });
+		const baselineFile = join(runDir, "dirty-baseline.txt");
+		writeFileSync(baselineFile, porcelain.stdout, "utf8");
+		lines.push(`diagnose 模式：只读诊断主仓库 @ ${baseCommit.slice(0, 12)}（基线 ${porcelain.stdout.split("\n").filter((l) => l.trim()).length} 条脏项，不折叠不触碰）`);
+
+		const wallMin = input.config.maxWallClockPerLaneMin;
+		const deadline = new Date(now.getTime() + wallMin * 60_000);
+		const lanes = {} as Record<LaneId, TraceLaneMeta>;
+		for (const lane of TRACE_LANES) {
+			lanes[lane] = { lane, worktree: repoRoot, tabRunId: "", provision: noopProvision() };
+		}
+		const meta: TraceRunMeta = {
+			runId,
+			shortId,
+			status: "running",
+			mode,
+			task: input.task.trim(),
+			repoRoot,
+			createdAt: now.toISOString(),
+			baseCommit,
+			headBefore: baseCommit,
+			runDir,
+			wtDir: "",
+			laneWallClockMin: wallMin,
+			laneDeadlineAt: deadline.toISOString(),
+			lanes,
+			dirtyBaselineFile: baselineFile,
+		};
+		writeFileSync(metaPath(runDir), JSON.stringify(meta, null, 2) + "\n", "utf8");
+
+		const repoName = basename(repoRoot);
+		const diagnoseErrors: string[] = [];
+		for (const lane of TRACE_LANES) {
+			const laneMeta = lanes[lane];
+			const prompt = buildDiagnoseWorkerPrompt({
+				task: input.task,
+				runId,
+				lane,
+				baseCommit,
+				repoRoot,
+				runDir,
+				wallClockMin: wallMin,
+			});
+			const laneRunId = newTabRunId(now);
+			const taskId = `${shortId}-L${lane}`;
+			const title = `[TRACE ${lane}] ${repoName}-${taskId}`;
+			const dispatch: TabDispatchRecord = {
+				id: laneRunId,
+				version: 1,
+				taskId,
+				mode: "trace",
+				title,
+				cwd: repoRoot,
+				requestedModel: input.config.workerModel,
+				dispatchedAt: new Date().toISOString(),
+				dispatchStatus: "dispatched",
+			};
+			writeTabDispatch(defaultTabRunsDir(), dispatch);
+			const launchErrorsLog = join(runDir, "launch-errors.log");
+			const spawn = spawnTab({
+				wtPath: input.wtExe,
+				piCli: input.piCli,
+				cwd: repoRoot,
+				title,
+				prompt,
+				model: input.config.workerModel,
+				tabRunId: laneRunId,
+				sessionProfile: "trace-worker",
+				traceRunId: runId,
+				traceLane: lane,
+				// diagnose：额外禁 edit/write（只读诊断）；bash 保留（git log/grep 等只读探查），
+				// 违规写入由 collect 的 dirty-baseline 对比确定性检出
+				excludeTools: [...TRACE_WORKER_EXCLUDE_TOOLS, "edit", "write"],
+				onSpawnError: (err) => {
+					writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
+					try {
+						appendFileSync(launchErrorsLog, `${new Date().toISOString()} lane ${lane} [${laneRunId}] async spawn error: ${err.message}\n`, "utf8");
+					} catch { /* 留痕尽力而为 */ }
+					try {
+						rmSync(mailboxDirForTab(defaultTimersDir(), laneRunId), { recursive: true, force: true });
+						spawnFailedLanes.add(laneRunId);
+					} catch { /* 清理尽力而为 */ }
+				},
+			});
+			if (spawn.error) {
+				diagnoseErrors.push(`lane ${lane}：${spawn.error}`);
+				writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: spawn.error });
+				continue;
+			}
+			laneMeta.tabRunId = laneRunId;
+			writeLaneTimers(laneRunId, lane, deadline, now);
+			lines.push(`TRACE ${lane}：${title} [${laneRunId}]`);
+		}
+
+		const dispatched = TRACE_LANES.filter((l) => lanes[l].tabRunId);
+		if (dispatched.length === 0) {
+			const failed = { ...meta, status: "failed" as const };
+			writeFileSync(metaPath(runDir), JSON.stringify(failed, null, 2) + "\n", "utf8");
+			return { ok: false, error: `三个 tab 全部派发失败：${diagnoseErrors.join("; ")}`, lines };
+		}
+		writeFileSync(metaPath(runDir), JSON.stringify({ ...meta, lanes }, null, 2) + "\n", "utf8");
+		if (diagnoseErrors.length > 0) lines.push(`⚠ ${diagnoseErrors.length} 个 lane 派发失败（run 降级 ${dispatched.length}/3）：${diagnoseErrors.join("; ")}`);
+		lines.push(`deadline：${meta.laneDeadlineAt}（${wallMin}min/lane）；产物为三份诊断+方案（无 patch），交主会话融合`);
+		return { ok: true, meta: { ...meta, lanes }, lines };
+	}
+
+	// ── implement 分支（原有 C5–C8 管线，opt-in 昂贵档）──
 
 	// 3. synthetic snapshot（§13–§14）
 	let snap;
@@ -191,6 +314,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		runId,
 		shortId,
 		status: "running",
+		mode: "implement",
 		task: input.task.trim(),
 		repoRoot,
 		createdAt: now.toISOString(),

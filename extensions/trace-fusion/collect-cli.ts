@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { readTraceRunMeta } from "./launch-workers.ts";
 import { collectRunArtifacts } from "./artifacts.ts";
-import { runCrossTest } from "./cross-test.ts";
+import { runCrossTest, finishDiagnoseRun } from "./cross-test.ts";
 import { readTraceFusionConfig } from "./config.ts";
 import { defaultRunsDir } from "./types.ts";
 
@@ -46,10 +46,13 @@ function main(): void {
 		const config = readTraceFusionConfig(join(here, "..", "..", "config.json"));
 		const collect = collectRunArtifacts(meta);
 		log(`collected: commands=${collect.commandPool.length}`);
-		const matrix = runCrossTest(meta, collect, {
-			provisioning: config.provisioning,
-			mainRoot: meta.repoRoot,
-		});
+		// diagnose 模式（2026-09-17）：不在用户主仓库执行命令，落盘跳过型报告 + 违规写入检查
+		const matrix = meta.mode === "diagnose"
+			? finishDiagnoseRun(meta, collect)
+			: runCrossTest(meta, collect, {
+					provisioning: config.provisioning,
+					mainRoot: meta.repoRoot,
+				});
 		const pass = matrix.cells.filter((c) => c.result === "pass").length;
 		const fail = matrix.cells.filter((c) => c.result === "fail").length;
 		log(`cross-test done: ${pass} pass / ${fail} fail / ${matrix.cells.length - pass - fail} other -> ${matrix.reportPath}`);
@@ -69,6 +72,8 @@ function main(): void {
 	}
 }
 
-// 仅作为主模块运行时执行（被 import 时不执行）
-const asMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1].replace(/\\/g, "/");
+// 仅作为主模块运行时执行（被 import 时不执行）。两侧都归一化到正斜杠：
+// Windows 上 fileURLToPath 返回反斜杠，只归一化 argv[1] 会永不相等（真实首跑踩坑）
+const norm = (p: string): string => p.replace(/\\/g, "/");
+const asMain = Boolean(process.argv[1]) && norm(fileURLToPath(import.meta.url)) === norm(process.argv[1]);
 if (asMain) main();

@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] — 2026-09-17 (trace-fusion diagnose mode)
+
+- **trace-fusion-loop 新增 diagnose 模式并设为默认**（`traceFusionLoop.mode`，`implement` 为 opt-in）：lane 只读诊断主仓库，产出诊断+推进方案，零 worktree、零磁盘代价（implement 实测 12GB/轮）。edit/write 派发期禁用 + dirty-baseline 违规确定性检查；cross-test 以 skip 型报告 + 融合交接说明替代（不在用户仓库执行命令）。管线其余（三 tab 派发/墙钟/权威收集/自动收集）不变。
+- **`/trace-fusion-clean <runId> [--force]`**：清理 run 的 worktree 占用（v0.5 提前落地）；runDir artifact（patch/trajectory）永不删，patch 可重放复验。running run 需 `--force`。
+- supervisor 自动收集 + session_start 追赶 + claim 幂等（2026-09-16/17 系列）：三路终态自动后台 cross-test，主会话重启可追赶，claim 文件防双 spawn。
+- 修复：collect-cli 主模块守卫在 Windows 永假（路径分隔符未归一化）导致后台 worker 空转。
+- 真实首跑修复（2026-09-15/16）：validation.json 数组形状容错、墙钟过期 run 自动回收、worktree 根 trust 预授权。
+
+## [Unreleased] — 2026-09-17
+
+### Added
+- **热点路由缓存首版（extensions/hotspot/，v2 设计落地）**：新会话首轮用户消息末尾附加一次 `<system-reminder>` 热点块（幂等：entries 检查 + `hotspot-injected` custom entry 双保险；恢复/旧会话不注入；压缩经 customInstructions 保留指针提示；字段 `<` 转义防提前闭合）；`hotspot` 工具（read/upsert/remove：严格解析文件格式、结构+引用+CodeGraph 符号三重验证、存储与注入双预算、revision+指纹乐观锁、`.lock` 跨进程锁（陈旧 30s 抢占）、临时文件原子替换、相同路由内容不写入不增版、remove 保留 `_hotspot.trash.jsonl` 恢复副本）；`/hotspot` 只读诊断（磁盘/注入版本、热度排序含评分依据、预算估算、降级原因、效果日志路径）；热度信号现算不落盘（git churn 14d + recentwork 活跃行，降级安全）；效果日志 `~/.pi/agent/hotspot-logs/<repo-key>.jsonl`（仅必要指标）。子 agent 进程不注册任何能力（首版主会话统一提交）；主 `index.ts` 仅 +5 行（import + registerHotspot）。配套：`_test_hotspot.ts`（28 断言：解析对称/严格拒绝/乐观锁冲突/工具外编辑指纹发现/坏文件停写/恢复副本/离线引用验证/结构校验/存储预算/注入预算整条省略/防闭合转义）、`_seed_greencad.ts`（greencad 试点条目 mesh-push，真实 CodeGraph 验证后写入，幂等）；searcher.md 增「热点候选」回返纪律，workflow-orchestrator 阶段 5 验收清单增热点路由检查项。设计：`plans/20260915_plan_hotspot_memory_layer.md`（v2 §11 代码结构约束：主 index.ts 只加 import+一行注册）。
+
 ## [Unreleased] — trace-fusion-loop (feat branch)
 
 ### Fixed

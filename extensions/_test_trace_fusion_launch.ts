@@ -33,6 +33,8 @@ import type { TabLaunchOptions } from "./tab-launch-core.ts";
 
 const cfg = (over: Partial<TraceFusionConfig> = {}): TraceFusionConfig => ({
 	...structuredClone(DEFAULT_TRACE_FUSION_CONFIG),
+	// 本文件锁的是 implement 模式（worktree 管线）——diagnose 分支另有专项用例
+	mode: "implement",
 	maxWallClockPerLaneMin: 45,
 	...over,
 });
@@ -259,6 +261,52 @@ try {
 		const r3 = ensureDirTrusted(mkDir("trust-c"), badPath);
 		assert.equal(r3.ok, false, "损坏文件必须拒写");
 		assert.equal(readFileSync(badPath, "utf8"), "{not json", "损坏文件原样保留");
+	}
+
+	// ── diagnose 模式（2026-09-17）：零 worktree、零主仓库写入、cwd=主仓库、禁 edit/write ──
+	{
+		const repo2 = join(root, "repo-diag");
+		mkdirSync(repo2, { recursive: true });
+		assert.equal(g(["init", "-b", "main"], repo2), 0);
+		writeFileSync(join(repo2, "src.txt"), "code\n");
+		g(["add", "."], repo2);
+		g(["commit", "-m", "init"], repo2);
+		// 预置用户自己的脏项（不在清理范围，不算违规）
+		writeFileSync(join(repo2, "user-dirty.txt"), "user\n");
+
+		const { spawner, calls } = makeFakeSpawner();
+		const res = launchTraceRun({
+			task: "诊断一个 bug",
+			repoRoot: repo2,
+			wtExe: "wt.exe",
+			piCli: "pi.cmd",
+			config: { ...cfg(), mode: "diagnose" },
+			runsDir: join(root, "runs-diag"),
+			wtRoot,
+			now: new Date("2026-09-17T09:00:00"),
+			spawnTab: spawner,
+		});
+		assert.equal(res.ok, true, `diagnose 派发应成功：${!res.ok ? res.error : ""}`);
+		if (res.ok) {
+			assert.equal(res.meta.mode, "diagnose");
+			assert.equal(res.meta.wtDir, "", "diagnose 不开 worktree");
+			assert.equal(res.meta.baseCommit, res.meta.headBefore, "不折叠不建合成快照（base=HEAD）");
+			assert.ok(!existsSync(res.meta.dirtyBaselineFile ?? "") === false, "基线文件已落盘");
+			const baseline = readFileSync(res.meta.dirtyBaselineFile ?? "", "utf8");
+			assert.ok(baseline.includes("user-dirty.txt"), "基线记录用户既有脏项");
+			assert.ok(!existsSync(join(wtRoot, res.meta.shortId)), "不创建任何 worktree");
+			assert.equal(Object.keys(res.meta.lanes).length, 3);
+			for (const lane of ["A", "B", "C"] as const) {
+				assert.equal(res.meta.lanes[lane].worktree.replace(/\\/g, "/"), repo2.replace(/\\/g, "/"), "lane 工作区=主仓库");
+			}
+			assert.equal(calls.length, 3, "三 tab 已派发");
+			for (const c of calls) {
+				assert.equal(c.cwd?.replace(/\\/g, "/"), repo2.replace(/\\/g, "/"), "tab cwd=主仓库");
+				assert.ok(c.excludeTools?.includes("edit") && c.excludeTools.includes("write"), "diagnose 禁 edit/write");
+				assert.ok(c.__prompt.includes("只读纪律"), "diagnose prompt 声明只读纪律");
+				assert.ok(c.__prompt.includes("八节"), "diagnose 契约为八节叙事");
+			}
+		}
 	}
 
 	console.log("trace-fusion launch tests passed");

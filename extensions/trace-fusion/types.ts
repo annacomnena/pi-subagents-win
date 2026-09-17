@@ -20,7 +20,14 @@ export interface TraceFusionProvisioning {
 }
 
 /** traceFusionLoop 配置块（设计稿 §47；存于 subagent-win config.json）。 */
+/** traceFusionLoop 配置块（设计稿 §47；存于 subagent-win config.json）。 */
 export interface TraceFusionConfig {
+	/**
+	 * run 模式（真实运行驱动，2026-09-17）：
+	 *   diagnose（默认）— lane 只读诊断主仓库，产出诊断+方案；零 worktree、零磁盘代价；
+	 *   implement — lane 在独立 worktree 内实现+构建+测试（12GB/轮级，真实验证证据，opt-in）。
+	 */
+	mode?: "diagnose" | "implement";
 	workerModel?: string;
 	fusionModel?: string;
 	consultMode: "auto" | "always" | "never";
@@ -38,6 +45,7 @@ export interface TraceFusionConfig {
 }
 
 export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
+	mode: "diagnose",
 	consultMode: "auto",
 	maxRounds: 2,
 	maxConsultations: 1,
@@ -55,8 +63,11 @@ export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
 /** run 生命周期状态（meta.json / status 命令消费）。 */
 export type TraceRunStatus = "running" | "collecting" | "fusing" | "completed" | "failed" | "cancelled";
 
-/** run 的 cancelled/failed 附加说明（自动回收/人工取消时写入 meta.json）。 */
-export type TraceRunMetaExtra = { cancelledReason?: string };
+/** run 的 cancelled/failed 附加说明（自动回收/人工取消/清理时写入 meta.json）。 */
+export type TraceRunMetaExtra = { cancelledReason?: string; cleanedAt?: string };
+
+/** diagnose 模式的启动时工作树基线（collect 时对比，确定性检 lane 是否违规写主仓库）。 */
+export type DiagnoseMetaExtra = { dirtyBaselineFile?: string };
 
 /** artifact 根：~/.pi/agent/trace-fusion-runs/<runId>/（§15：artifact 可放长路径）。 */
 export function defaultRunsDir(): string {
