@@ -75,6 +75,9 @@ function holderOf(sessionId: string): string {
 	return `mailbox-consumer:${sessionId}`;
 }
 
+/** 已审计过的 pre-cutover 键（进程内去重：tick 每轮重扫不再重复记审计；审计是诊断性的） */
+const auditedPreCutover = new Set<string>();
+
 /**
  * 消费一轮（owner 会话调用）。返回报告；任何单封失败不影响其余。
  */
@@ -104,13 +107,17 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	for (const letter of pending) {
 		const messageId = describeLetter(letter);
 		try {
-			// F17：cutover 前的旧信留给 legacy
+			// F17：cutover 前的旧信留给 legacy（每键只审计一次，防 tick 刷屏）
 			if (letterTime(letter) < cutover.enabledAt) {
-				auditSuppression(
-					{ key: receiptKeyFor(letter), sessionId: opts.sessionId, path: "mailbox-consumer" },
-					"pre-cutover-legacy",
-					{ sessionId: attachment.sessionId, generation: attachment.generation },
-				);
+				const auditKey = receiptKeyFor(letter);
+				if (!auditedPreCutover.has(auditKey)) {
+					auditedPreCutover.add(auditKey);
+					auditSuppression(
+						{ key: auditKey, sessionId: opts.sessionId, path: "mailbox-consumer" },
+						"pre-cutover-legacy",
+						{ sessionId: attachment.sessionId, generation: attachment.generation },
+					);
+				}
 				reportPush(report, messageId, "skipped", "pre-cutover-legacy");
 				continue;
 			}
