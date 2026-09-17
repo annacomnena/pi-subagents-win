@@ -177,6 +177,38 @@ function makeLinks(...entries: Array<{ from: string; sessionId: string }>): stri
 }
 
 setCurrentSessionId(undefined);
+
+// ── Phase 4d：cutover 启用 + 非 owner → 抑制（A5 F2）──────────────
+{
+	const isoDir = mkdtempSync(join(tmpdir(), "report-cutover-"));
+	const prev = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = isoDir;
+	try {
+		const { setCutover, attachMaster } = await import("./runtime/registry.ts");
+		setCutover(true, "test");
+		attachMaster({ sessionId: "session-owner" });
+		_resetReportListener();
+		setCurrentSessionId("session-other"); // 非 owner，但 links 溯源通过
+		const injected3: string[] = [];
+		const reportsDir3 = join(dir, "reports3");
+		const linksPath3 = makeLinks({ from: "tab_9", sessionId: "session-other" });
+		sendReportToMain({ from: "tab_9", message: "求抑制", taskId: "1009" }, reportsDir3);
+		const fired3 = pollNewReports(reportsDir3, {
+			reportsDir: reportsDir3, linksPath: linksPath3, toast: false,
+			sendUserMessage: (content: string) => { injected3.push(content); },
+		});
+		assert.equal(fired3.length, 0, "非 owner 不消费");
+		assert.equal(injected3.length, 0, "非 owner 不注入");
+		const { existsSync: ex } = await import("node:fs");
+		assert.equal(ex(join(isoDir, "suppressions.jsonl")), true, "抑制记审计");
+		setCurrentSessionId(undefined);
+	} finally {
+		if (prev === undefined) delete process.env.PI_RUNTIME_DIR;
+		else process.env.PI_RUNTIME_DIR = prev;
+		rmSync(isoDir, { recursive: true, force: true });
+	}
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log("report tests passed");
