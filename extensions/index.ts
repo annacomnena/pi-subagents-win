@@ -46,6 +46,7 @@ import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer } from "./mailbox-consumer.ts";
 import { attachMaster, detachMaster, readAttachment, readCutover, setCutover } from "./runtime/registry.ts";
+import { attachMasterWithAudit, detachMasterWithAudit } from "./runtime/adapters/session-lifecycle.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
 import { mailboxBacklog } from "./runtime/mailbox.ts";
 import { masterAddress } from "./runtime/address.ts";
@@ -1632,7 +1633,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("master-attach: --force-stale 须与 --confirm 同用（二次人工确认），拒绝", "warning");
 				return;
 			}
-			const r = attachMaster({ sessionId: sid, token, forceStale: force || undefined });
+			const r = attachMasterWithAudit({ sessionId: sid, token, forceStale: force || undefined });
 			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
 			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
 		},
@@ -1658,7 +1659,7 @@ export default function (pi: ExtensionAPI) {
 			if (!sid) { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
 			const att = readAttachment(masterAddress());
 			if (!att || att.sessionId !== sid) { ctx.ui.notify("master-detach: 你不是当前 owner，拒绝", "warning"); return; }
-			const d = detachMaster({ sessionId: sid, generation: att.generation, reason: (args ?? "").trim() || undefined });
+			const d = detachMasterWithAudit({ sessionId: sid, generation: att.generation, reason: (args ?? "").trim() || undefined });
 			if (!d.ok) { ctx.ui.notify("master-detach 失败：not-owner", "warning"); return; }
 			ctx.ui.notify(`master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`, "info");
 		},
