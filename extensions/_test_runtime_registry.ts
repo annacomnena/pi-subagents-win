@@ -138,6 +138,71 @@ try {
 		assert.equal(hasNotificationReceipt(key), true);
 		assert.equal(recordNotificationReceipt(""), false, "空键拒绝");
 	}
+
+	// ── 11. attach 审计：attaching → attached（同一 attemptId）─────
+	{
+		const { attachMasterWithAudit } = await import("./runtime/adapters/session-lifecycle.ts");
+		const { listRuntimeEnvelopes } = await import("./runtime/journal.ts");
+		const journalPath = join(process.env.PI_RUNTIME_DIR!, "events.jsonl");
+		const d = detachMaster({ sessionId: "sess-C", generation: 3 });
+		assert.equal(d.ok, true);
+		const r = attachMasterWithAudit({ sessionId: "sess-D", token: d.token! }, { journalPath });
+		assert.equal(r.ok, true);
+		assert.equal(r.ok && r.attachment.generation, 4);
+		assert.equal(r.audit.attemptEmitted, true);
+		assert.equal(r.audit.terminalEmitted, true);
+		const { envelopes } = listRuntimeEnvelopes({ path: journalPath });
+		const mine = envelopes.filter((e) => e.subject === master);
+		assert.equal(mine.filter((e) => e.type === "agent.session.attaching").length, 1);
+		const attached = mine.find((e) => e.type === "agent.session.attached")!;
+		assert.equal((attached.payload as { generation?: number }).generation, 4);
+		assert.equal((attached.payload as { attemptId?: string }).attemptId, r.audit.attemptId, "attempt 关联");
+		assert.equal(attached.dedupeKey, `agent.session.attached:${master}:4`);
+	}
+
+	// ── 12. 失败 attach 审计：attaching_failed（ok:false）──────────
+	{
+		const { attachMasterWithAudit } = await import("./runtime/adapters/session-lifecycle.ts");
+		const { listRuntimeEnvelopes } = await import("./runtime/journal.ts");
+		const journalPath = join(process.env.PI_RUNTIME_DIR!, "events.jsonl");
+		const r = attachMasterWithAudit({ sessionId: "sess-E", token: "ho_bogus" }, { journalPath });
+		assert.equal(r.ok, false);
+		const { envelopes } = listRuntimeEnvelopes({ path: journalPath });
+		const failed = envelopes.filter((e) => e.type === "agent.session.attaching_failed");
+		assert.equal(failed.length, 1);
+		assert.equal((failed[0]!.payload as { ok?: boolean }).ok, false);
+		assert.equal((failed[0]!.payload as { attemptId?: string }).attemptId, r.audit.attemptId);
+		assert.equal(readAttachment(master)!.sessionId, "sess-D", "失败不碰 registry");
+	}
+
+	// ── 13. detach 审计：detached + 错误 detach → detaching_failed ─
+	{
+		const { detachMasterWithAudit } = await import("./runtime/adapters/session-lifecycle.ts");
+		const { listRuntimeEnvelopes } = await import("./runtime/journal.ts");
+		const journalPath = join(process.env.PI_RUNTIME_DIR!, "events.jsonl");
+		const bad = detachMasterWithAudit({ sessionId: "sess-X", generation: 99 }, { journalPath });
+		assert.equal(bad.ok, false);
+		const { envelopes } = listRuntimeEnvelopes({ path: journalPath });
+		assert.equal(envelopes.filter((e) => e.type === "agent.session.detaching_failed").length, 1);
+		const good = detachMasterWithAudit({ sessionId: "sess-D", generation: 4, reason: "test handoff" }, { journalPath });
+		assert.equal(good.ok, true);
+		const after = listRuntimeEnvelopes({ path: journalPath }).envelopes;
+		assert.equal(after.filter((e) => e.type === "agent.session.detached").length, 1);
+	}
+
+	// ── 14. registry 优先：journal 写失败不影响 attach 结果 ────────
+	{
+		const { writeFileSync } = await import("node:fs");
+		const { attachMasterWithAudit } = await import("./runtime/adapters/session-lifecycle.ts");
+		const blocker = join(process.env.PI_RUNTIME_DIR!, "blocker");
+		writeFileSync(blocker, "i am a file, not a dir", "utf8");
+		const badJournal = join(blocker, "events.jsonl"); // 父级是文件 → mkdir/append 必败
+		const before = readAttachment(master)!;
+		const r = attachMasterWithAudit({ sessionId: "sess-F", forceStale: true, staleAfterMs: -1 }, { journalPath: badJournal });
+		assert.equal(r.ok, true, "registry 提交不受审计失败影响");
+		assert.equal(r.audit.terminalEmitted, false, "审计失败如实报告");
+		assert.equal(readAttachment(master)!.generation, before.generation + 1);
+	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });
 }
