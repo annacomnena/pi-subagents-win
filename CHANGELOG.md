@@ -2,6 +2,8 @@
 
 ## [Unreleased] — 2026-09-17 (trace-fusion diagnose mode)
 
+- **新增主会话工具 `trace-fusion`**：agent 判断任务困难/根因不明时可自主触发只读诊断 rollout（强制 diagnose 模式，零磁盘零主仓库写入），发起后立即可继续其它工作，三路终态自动收集并通知；lane tab 不可见该工具（排除名单 + 运行时能力二次校验）。implement（worktree 读写）仍仅限人工命令。
+
 - **trace-fusion-loop 新增 diagnose 模式并设为默认**（`traceFusionLoop.mode`，`implement` 为 opt-in）：lane 只读诊断主仓库，产出诊断+推进方案，零 worktree、零磁盘代价（implement 实测 12GB/轮）。edit/write 派发期禁用 + dirty-baseline 违规确定性检查；cross-test 以 skip 型报告 + 融合交接说明替代（不在用户仓库执行命令）。管线其余（三 tab 派发/墙钟/权威收集/自动收集）不变。
 - **`/trace-fusion-clean <runId> [--force]`**：清理 run 的 worktree 占用（v0.5 提前落地）；runDir artifact（patch/trajectory）永不删，patch 可重放复验。running run 需 `--force`。
 - supervisor 自动收集 + session_start 追赶 + claim 幂等（2026-09-16/17 系列）：三路终态自动后台 cross-test，主会话重启可追赶，claim 文件防双 spawn。

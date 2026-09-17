@@ -3971,3 +3971,11 @@ implement 管线（C5–C8）原样保留：需要真实执行证据的任务（
   cross-test.json，幂等检查直接命中）
 - 与 §15 的关系：worktree 短路径布局仅 implement 模式使用；§68 分期不变，
   v0.4 fusion 的输入从「三份 patch」变为「三份方案」（diagnose）或保持 patch（implement）
+
+## 74.4 主动触发（同日补）
+
+主会话 agent 侧新增 `trace-fusion` 工具：判断任务困难/根因不明/单轨迹置信度低时，
+agent 可自主发起 diagnose run（强制只读模式，忽略 config 的 implement 档）。
+发起即返回（lane runId + 指引），收集/通知走 §24.1 自动化；隔离三重：lane tab
+排除名单不可见 + execute 内 capabilities 运行时校验 + trace-worker prompt 硬边界。
+implement（worktree 读写）保持人工命令专属——昂贵档不允许模型自主花钱。

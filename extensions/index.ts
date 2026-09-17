@@ -2698,6 +2698,73 @@ export default function (pi: ExtensionAPI) {
 	});
 	}
 
+	// ── trace-fusion 工具（2026-09-17）：主会话 agent 自主触发只读诊断 rollout ──
+	// 与 /trace-fusion-loop 命令同一套 launchTraceRun，但强制 diagnose 模式（零磁盘代价、
+	// 零主仓库写入）；implement（worktree 读写）仅保留给人丁命令。lane tab 看不到本工具
+	// （TRACE_WORKER_EXCLUDE_TOOLS）+ execute 内 capabilities 运行时二次校验。
+	pi.registerTool({
+		name: "trace-fusion",
+		label: "Trace Fusion (diagnose)",
+		description: [
+			"主会话专属：对当前仓库启动三路完全独立的只读诊断 rollout（diagnose 模式 trace-fusion）——三个可见 pi 标签页各自独立诊断同一个任务，产出三份诊断+推进方案（trajectory），完成后自动收集，交本会话融合。",
+			"适用：任务明显困难/根因不明/单一轨迹置信度低/值得 test-time scaling 时主动使用；简单任务勿用。",
+			"成本：三路并行墙钟约 laneWallClockMin（默认 45min），零磁盘零主仓库写入（只读，edit/write 对 lane 禁用）。",
+			"发起后立即可继续其它工作；三路全部完成后系统自动后台收集并通知你，届时读 runDir/lanes/{A,B,C}/trajectory.md 做融合（一致根因→高置信；分歧→仲裁）后单次实现。",
+			"只允许主会话调用；同一时刻仅允许一个 active run（并发启动会被 preflight 拒绝）。",
+		].join(" "),
+		parameters: Type.Object({
+			task: Type.String({ description: "任务描述（三路逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
+		}),
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (!capabilities().launchTabs) {
+				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
+			}
+			const params = rawParams as { task?: string };
+			const task = (params.task ?? "").trim();
+			if (!task) {
+				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
+			}
+			let wtExe: string | null;
+			let piCli: string;
+			try {
+				wtExe = findWindowsTerminal();
+				piCli = findPiCli();
+			} catch (err) {
+				return { content: [{ type: "text", text: `启动环境不可用：${err instanceof Error ? err.message : String(err)}` }], isError: true };
+			}
+			if (!wtExe) {
+				return { content: [{ type: "text", text: "未找到 Windows Terminal (wt.exe)，无法启动标签页。" }], isError: true };
+			}
+			const tfConfig = readTraceFusionConfig();
+			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档
+			const result = launchTraceRun({
+				task,
+				repoRoot: process.cwd(),
+				wtExe,
+				piCli,
+				config: { ...tfConfig, mode: "diagnose" },
+				runsDir: defaultTraceFusionRunsDir(),
+			});
+			const lines = result.lines ?? [];
+			if (!result.ok) {
+				return { content: [{ type: "text", text: ["trace-fusion 启动失败：", result.error, ...lines].join("\n") }], isError: true };
+			}
+			try {
+				for (const lane of TRACE_LANES) {
+					recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+				}
+			} catch { /* 溯源尽力而为 */ }
+			const laneIds = TRACE_LANES.map((l) => `${l}=${result.meta.lanes[l].tabRunId}`).join(", ");
+			return { content: [{ type: "text", text: [
+				`✅ trace-fusion diagnose run 已启动：${result.meta.runId}`,
+				...lines,
+				`lane tabs: ${laneIds}`,
+				"三路完成后自动后台收集（无需干预）；进度 /trace-fusion-status。",
+				"完成后：读 ~/.pi/agent/trace-fusion-runs/<runId>/lanes/{A,B,C}/trajectory.md，融合三份诊断（一致根因→高置信；分歧→仲裁）后单次实现。",
+			].join("\n") }] };
+		},
+	});
+
 	// ── /trace-fusion-loop 命令（trace-fusion C6，只允许主会话）──
 	// 设计稿 §5.1：主入口。编排 preflight → snapshot → 三 worktree → 三 trace worker tab。
 	if (canOrchestrateTabs) {

@@ -27,6 +27,7 @@ export function buildTraceWorkerSystemPrompt(lane?: string): string {
 		"HARD ORCHESTRATION BOUNDARY (also enforced at runtime, not just by this text)",
 		"- Do not use Full workflow. Do not use Lite workflow.",
 		"- Do not invoke launch-tabs or /launch.",
+		"- Do not invoke the trace-fusion tool (diagnosis fan-out is a main-session capability).",
 		"- Do not invoke planner, implementer, reviewer, consultant, general, or any other role agent.",
 		"- The only delegated agent you may use is searcher (subagent-win with agent: \"searcher\").",
 		"- Searcher is optional and must only gather targeted evidence; never implement through it.",

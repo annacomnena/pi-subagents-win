@@ -32,8 +32,9 @@ export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnRes
 /** 异步 spawn 已失败的 lane runId（writeLaneTimers 的竞态守卫）。 */
 const spawnFailedLanes = new Set<string>();
 
-/** §17：trace worker tab 的工具排除名单（wiki/timer/launch 写能力不可见；subagent-win 保留）。 */
-export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "wiki-nav", "wiki-semantic"];
+/** §17：trace worker tab 的工具排除名单（wiki/timer/launch 写能力不可见；subagent-win 保留）。
+ *  trace-fusion（主会话主动触发诊断）对 lane 同样不可见。 */
+export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "wiki-nav", "wiki-semantic", "trace-fusion"];
 
 /**
  * §24.2：向 lane tab 邮箱写两个墙钟计时器——
