@@ -13,7 +13,8 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Delegate** any step to a role agent (search / plan / review / implement) without leaving your session.
 - **Parallelize** independent work with a single tool call.
 - **Run hours-long pipelines unattended**: spawn visible tabs, let them report back, auto-advance with timers, reclaim results, launch the next batch.
-- **Scale reasoning on hard problems** with trace-fusion (§6): three independent read-only diagnosis rollouts on the same task, auto-collected and fused — the agent can self-trigger it when a problem looks underdetermined.
+- **Spend subscriptions, not tokens**: point role agents at local CLI harnesses (Claude Code / Codex / Agy / AtomCode / ZCode / MimoCode) so heavy delegation bills against flat-rate plans, not per-token API credits (§4).
+- **Scale reasoning on hard problems** with trace-fusion (§7): three independent read-only diagnosis rollouts on the same task, auto-collected and fused — the agent can self-trigger it when a problem looks underdetermined.
 
 ### Architecture
 
@@ -107,7 +108,37 @@ subagent-win({ action: "status", runId: "run_xxx" })
 
 The async task panel (TUI widget + status bar + completion toast) shows running background jobs; `/runs` lists recent ones.
 
-### 3.2 External CLI backends
+### 3.2 Consultant — user-named model evaluation
+
+When the user names a model ("请glm来评估一下", "请gpt5.6看看截图"), dispatch `agent: "consultant"` with that model as a per-call `model` override. Short aliases expand from `~/.pi/agent/models.json`. The consultant answers from that model's perspective; screenshot paths go in the `task` (it reads images with `read`).
+
+### 3.3 Timeout semantics — stall, not wall-clock
+
+`timeoutMs` is an **inactivity (stall) timeout**, not a total-run cap:
+
+- **Error** → stop (exit≠0 / `stopReason=error`).
+- **Stall** → "an operation is stuck with no output" → stop after `timeoutMs` of silence.
+- **Progress** → any stdout/stderr output resets the timer; a healthy long task never gets killed.
+
+A stall is classified as `STALL` (non-retryable) — it does not burn a fallback attempt, because a stuck task won't fix itself on another model.
+
+### 3.4 Failure classification & fallback
+
+Retryable failures (`USAGE_CAP`, `RATE_LIMIT`, `AUTH`, `TIMEOUT`, `PROVIDER`) walk the agent's `fallbackModels` chain. `USAGE_CAP` (e.g. Zhipu/GLM package quota, often a bare 429) surfaces as `[subagent-failure kind=USAGE_CAP]` telling the main agent to switch model via `/model` instead of retrying.
+
+---
+
+## 4. External CLI agents — spend subscriptions, not tokens
+
+Every role agent (`searcher` / `planner` / `implementer` / `code-reviewer` / `consultant`) can be pointed at a **local CLI harness** instead of an API model. The subagent then runs inside Claude Code / Codex CLI / Agy / AtomCode / ZCode / MimoCode and bills against **that tool's flat-rate subscription** — heavy stages stop burning per-token API credits, and each CLI brings its own quota pool, so provider outages and rate limits stop being single points of failure.
+
+### Why this saves money
+
+- **Flat-rate instead of per-token**: an `implementer` that rewrites 500 lines or a `code-reviewer` that reads a whole diff is exactly the workload where API token costs spike; on a CLI subscription those calls are already paid for.
+- **Budget isolation**: role agents on CLI + main session on API = the experiment loop can run wild without touching your API balance (and vice versa).
+- **Quota safety net**: put a CLI in `fallbackModels` — when the API primary hits `USAGE_CAP`/`RATE_LIMIT`, the chain walks into your subscription instead of stalling (see §3.3).
+
+### Supported backends
 
 | Model ref | Spawns | Notes |
 |-----------|--------|--------|
@@ -120,27 +151,36 @@ The async task panel (TUI widget + status bar + completion toast) shows running 
 
 **Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one. `cli:zcode` is special: it spawns `zcode.cjs` through `node` and always uses the fixed GLM-5.3 configured in `~/.zcode/cli/config.json`. `cli:mimo` (also accepts the alias `cli:mimocode`) runs `mimo run <prompt> --format json --dangerously-skip-permissions --dir <cwd>`; it discovers `MIMOCODE_BIN`, then `%USERPROFILE%\\.mimocode\\bin\\mimo.exe`, then PATH. The current MimoCode installation must be signed in or configured with a usable provider/model; the harness does not supply credentials.
 
-### 3.3 Consultant — user-named model evaluation
+### Wiring it up
 
-When the user names a model ("请glm来评估一下", "请gpt5.6看看截图"), dispatch `agent: "consultant"` with that model as a per-call `model` override. Short aliases expand from `~/.pi/agent/models.json`. The consultant answers from that model's perspective; screenshot paths go in the `task` (it reads images with `read`).
+Set the CLI ref as an agent's **default or fallback** in `config.json` (or interactively via `/sub-models`):
 
-### 3.4 Timeout semantics — stall, not wall-clock
+```json
+{
+  "models": { "implementer": "cli:agy", "code-reviewer": "openai-codex/gpt-5.6-luna" },
+  "fallbackModels": { "consultant": ["cli:codex"], "implementer": ["openai-codex/gpt-5.6-terra", "cli:zcode"] }
+}
+```
 
-`timeoutMs` is an **inactivity (stall) timeout**, not a total-run cap:
+A CLI ref only routes when it sits in that agent's own default/fallback chain — the dispatcher never sends an unrelated agent to a CLI on a whim, and per-call `model:` overrides **cannot select a CLI backend** (passing `cli:x/...` model refs is rejected outright).
 
-- **Error** → stop (exit≠0 / `stopReason=error`).
-- **Stall** → "an operation is stuck with no output" → stop after `timeoutMs` of silence.
-- **Progress** → any stdout/stderr output resets the timer; a healthy long task never gets killed.
+### What transfers — and what doesn't
 
-A stall is classified as `STALL` (non-retryable) — it does not burn a fallback attempt, because a stuck task won't fix itself on another model.
+| | API subagent | CLI subagent |
+|---|---|---|
+| task text, cwd, stall timeout (`timeoutMs`) | ✅ | ✅ |
+| failure classification + fallback chain | ✅ | ✅ (a CLI failure walks the chain like any other) |
+| per-call `model` override | ✅ | ❌ — the CLI runs **its own configured/default model**; configure models inside each CLI |
+| per-call `tools` allowlist | ✅ | ❌ — not supported by external harnesses (explicitly passing it errors) |
+| billing | API tokens | the CLI's own plan/subscription |
 
-### 3.5 Failure classification & fallback
+### Safety
 
-Retryable failures (`USAGE_CAP`, `RATE_LIMIT`, `AUTH`, `TIMEOUT`, `PROVIDER`) walk the agent's `fallbackModels` chain. `USAGE_CAP` (e.g. Zhipu/GLM package quota, often a bare 429) surfaces as `[subagent-failure kind=USAGE_CAP]` telling the main agent to switch model via `/model` instead of retrying.
+External CLIs are spawned in their no-approval / auto-approve modes (`--dangerously-skip-permissions`, bypassed approvals — see table above), and they execute with full tool access in your repo. **Use them only in trusted repositories**, same policy as the CLIs themselves. For Codex behind a reverse proxy, `/codex-headers` configures per-provider request-header compatibility.
 
 ---
 
-## 4. Tabs — visible parallel sessions
+## 5. Tabs — visible parallel sessions
 
 ### `/launch` and `launch-tabs`
 
@@ -204,7 +244,7 @@ Lite discipline (all six enforced):
 
 ### Choosing an execution style
 
-| | **Full chain (tab)** | **Lite (in-session)** | **trace-fusion (§6)** |
+| | **Full chain (tab)** | **Lite (in-session)** | **trace-fusion (§7)** |
 |---|---|---|---|
 | Runs in | visible tab (survives restart) | current session | 3 visible tabs |
 | Workers | role agents via `subagent-win` | one `general` agent per stage, tier models | 3 independent full rollouts |
@@ -212,13 +252,13 @@ Lite discipline (all six enforced):
 | Cost | tab + role models | lowest (small models on easy stages) | 3× wall clock, ~zero disk (diagnose) |
 | Use when | heavy tasks, batches, must survive | quick single tasks in-session | hard/uncertain tasks, need independent diagnoses |
 
-Tab titles: `<repo>[-worktree]-[<taskId>-]<label>`. Each tab returns a **`runId`** (see §5).
+Tab titles: `<repo>[-worktree]-[<taskId>-]<label>`. Each tab returns a **`runId`** (see §6).
 
 ---
 
-## 5. Ultra-long Task Infrastructure
+## 6. Ultra-long Task Infrastructure
 
-### 5.1 Tab reclaim
+### 6.1 Tab reclaim
 
 `launch-tabs` writes a dispatch ledger (`~/.pi/agent/tab-runs/<runId>.json`) and returns the `runId`. Tabs report lifecycle via `PI_TAB_RUN_ID` and finish with a structured result.
 
@@ -250,7 +290,7 @@ The orchestration loop is therefore: `launch-tabs(batch)` → [event-bus wakes y
 
 `/tabs` lists all dispatched tabs for humans.
 
-### 5.2 Auto-push timers
+### 6.2 Auto-push timers
 
 ```ts
 set-timer({ message: "检查批次结果并汇报", delayMs: 600000, label: "advance" })
@@ -267,19 +307,19 @@ When a timer expires the system **auto-sends a user message** to the target sess
 - **GC** — terminal timers (`fired/cancelled/missed`) older than 24h and stale heartbeats are swept every ~60s, so the ledger does not grow unbounded.
 - **Capacity** — up to 50 pending timers per target (self or a single tab mailbox).
 
-### 5.3 Event bus — completion is felt, not polled
+### 6.3 Event bus — completion is felt, not polled
 
 The main session `fs.watch`es `tab-runs/`; when a tab writes `result.json`, it is noticed sub-second: a Windows toast fires and a user message is injected telling the model to reclaim and continue. Startup snapshots dedupe (no re-fire after restart); a 10s tick covers Windows `fs.watch` misses.
 
-### 5.4 Active reporting — tab → main session
+### 6.4 Active reporting — tab → main session
 
 `tab-report` (inside a tab) actively contacts the main session: `reports/<id>.json` is written atomically, the main session notices it and injects a user message with the full content. The tab's model calls it when work completes or attention is needed — it does not wait to be polled.
 
-### 5.5 Provenance — who spawned what
+### 6.5 Provenance — who spawned what
 
 `~/.pi/agent/links.jsonl` logs every dispatch: `{ sessionId, kind: tab|async|timer, targetId, detail, at }`. `/links` lists them (filter by session/kind/runId). `sessionIdentity` resolves `PI_TAB_RUN_ID` → `sessionManager.sessionId` automatically.
 
-### 5.6 Closed orchestration loop
+### 6.6 Closed orchestration loop
 
 ```text
 launch-tabs(batch N)                 # returns runIds
@@ -293,7 +333,7 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
 
 ---
 
-## 6. Trace Fusion Loop — three-lane parallel diagnosis (`/trace-fusion-loop`)
+## 7. Trace Fusion Loop — three-lane parallel diagnosis (`/trace-fusion-loop`)
 
 A standalone SWE test-time scaling command: launch **three fully independent rollouts on the same task**, let them diagnose separately, then fuse. It is its own island — it never enters the Lite/Full workflow chains, and lane tabs cannot see orchestration tools (launch/timers/wiki/trace-fusion are excluded at dispatch).
 
@@ -341,7 +381,7 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 
 ---
 
-## 7. UI Integration
+## 8. UI Integration
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
@@ -349,7 +389,7 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 
 ---
 
-## 8. Configuration & Runtime State
+## 9. Configuration & Runtime State
 
 ### config.json (copy from `config.example.json`)
 
@@ -365,7 +405,7 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 }
 ```
 
-`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §4); tiers are projected live from `models`, no separate tier table. `traceFusionLoop`: see §6 — `mode` `diagnose|implement`, `workerModel`, `maxWallClockPerLaneMin` (nudge + timedOut semantics), `maxActiveRuns` (v1: 1), `provisioning` (junction/copy/command for implement-mode worktrees).
+`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §5); tiers are projected live from `models`, no separate tier table. `traceFusionLoop`: see §7 — `mode` `diagnose|implement`, `workerModel`, `maxWallClockPerLaneMin` (nudge + timedOut semantics), `maxActiveRuns` (v1: 1), `provisioning` (junction/copy/command for implement-mode worktrees).
 
 Model selection priority: (1) configured default + fallback chain; (2) override only when the chain is exhausted, the user names a model, or the default is clearly unsuitable; (3) prefer normal `provider/id` — never switch to an external CLI unless configured or user-requested.
 
@@ -391,7 +431,7 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 
 ---
 
-## 9. Knowledge Management (project document system)
+## 10. Knowledge Management (project document system)
 
 The workflow ships a full documentation system for long-lived repos. **Five separate document families — don't confuse them:**
 
@@ -403,24 +443,24 @@ The workflow ships a full documentation system for long-lived repos. **Five sepa
 | **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log (`Item NN` entries) | implementer / reviewer |
 | **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (wiki-and-task templates) |
 
-### 9.1 Wiki — durable knowledge
+### 10.1 Wiki — durable knowledge
 
 - Theme pages only (a topic = one page with sections), `status: current`, `source_paths` + Evidence.
 - **Hard rule: task findings NEVER go to Wiki** — they live in replies or `plans/*_research.md`.
 - `wiki-nav` tool: `tree` / `around` / `find` / `keywords` / `path` / `rebuild` (progressive navigation, no need to read whole indexes). Optional semantic term expansion via `~/.pi/agent/embeddings.json` (see `examples/embeddings.json`).
 - After any Wiki page change: `wiki-nav rebuild` regenerates `_navigation.json` / `_search.json` / `_keywords.json`.
 
-### 9.2 Timeline / recentwork
+### 10.2 Timeline / recentwork
 
 - `Item NN` = the repo timeline/task identifier when that file exists — **not** a GitHub issue.
 - `recentwork.md` rows: what changed, paths, status. The launcher/runner may be wired to the task board server (wiki-and-task).
 
-### 9.3 Changelog
+### 10.3 Changelog
 
 - Month-based release history (`changelog.md` quick nav + `changelog/YYYY/YYYY-MM.md`), per wiki-and-task templates.
-- Distinct from this package's own `CHANGELOG.md` (package release log — see §10).
+- Distinct from this package's own `CHANGELOG.md` (package release log — see §11).
 
-### 9.4 How documents flow in a workflow run
+### 10.4 How documents flow in a workflow run
 
 ```text
 search ──► Wiki verify/update (searcher)
@@ -453,7 +493,7 @@ Design principles: *compute what you can, store only the rest*; *routing pointer
 
 ---
 
-## 10. Development
+## 11. Development
 
 ### Tests
 
@@ -504,12 +544,12 @@ File system is the bus: ledgers under `~/.pi/agent/` are the shared state; `fs.w
 
 ---
 
-## 11. FAQ / Known limits
+## 12. FAQ / Known limits
 
 - **Async subagents die with the session.** `async: true` runs in a child process of your pi session; closing/restarting it kills them. For work that must survive, use tabs.
 - **Stall timeout** is per-process inactivity; it cannot detect a "busy but wrong" loop.
 - **Windows `fs.watch`** can miss events on large/network directories — the 5–10s tick fallback covers this.
-- **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as pi-flow-external).
+- **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as pi-flow-external). See §4 for wiring them as role-agent backends.
 - **Two changelogs:** the project's `changelog.md` (wiki-and-task monthly history) vs this package's `CHANGELOG.md` (release log).
 - **trace-fusion diagnose vs implement:** diagnose never runs commands in your repo (evidence claims are reviewed, not rerun); implement gives real build/test evidence but costs 10GB+ disk per run on large repos — clean with `/trace-fusion-clean` when done. Lane reads/writes inside gitignored paths are not visible to the dirty-baseline check (documented residual risk).
 
