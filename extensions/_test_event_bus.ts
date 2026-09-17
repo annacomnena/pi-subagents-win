@@ -8,6 +8,9 @@ import { readTabResultFile } from "./tab-runs.ts";
 delete process.env.PI_SUBAGENT;
 delete process.env.PI_TAB_RUN_ID;
 
+// 隔离 shadow journal：emit 路径不得写真实 ~/.pi/agent/runtime/（Phase 1H 修复）
+process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "event-bus-journal-"));
+
 const dir = mkdtempSync(join(tmpdir(), "event-bus-test-"));
 
 function writeResult(runId: string, status = "completed") {

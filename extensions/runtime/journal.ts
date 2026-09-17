@@ -19,6 +19,9 @@ import { validateEnvelope, type RuntimeEnvelope } from "./envelope.ts";
 // ── 路径 ───────────────────────────────────────────────────────────
 
 export function defaultRuntimeDir(): string {
+	// env override：测试隔离用（同 PI_TAB_RUNS_DIR 模式）；不发则用真实用户目录
+	const override = process.env.PI_RUNTIME_DIR;
+	if (override && override.trim()) return override.trim();
 	return join(homedir(), ".pi", "agent", "runtime");
 }
 
