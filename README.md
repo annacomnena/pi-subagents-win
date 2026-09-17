@@ -13,6 +13,7 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Delegate** any step to a role agent (search / plan / review / implement) without leaving your session.
 - **Parallelize** independent work with a single tool call.
 - **Run hours-long pipelines unattended**: spawn visible tabs, let them report back, auto-advance with timers, reclaim results, launch the next batch.
+- **Scale reasoning on hard problems** with trace-fusion (§6): three independent read-only diagnosis rollouts on the same task, auto-collected and fused — the agent can self-trigger it when a problem looks underdetermined.
 
 ### Architecture
 
@@ -245,7 +246,55 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
 
 ---
 
-## 6. UI Integration
+## 6. Trace Fusion Loop — three-lane parallel diagnosis (`/trace-fusion-loop`)
+
+A standalone SWE test-time scaling command: launch **three fully independent rollouts on the same task**, let them diagnose separately, then fuse. It is its own island — it never enters the Lite/Full workflow chains, and lane tabs cannot see orchestration tools (launch/timers/wiki/trace-fusion are excluded at dispatch).
+
+### Two run modes
+
+| | **`diagnose` (default)** | **`implement` (opt-in, expensive)** |
+|---|---|---|
+| Lane workspace | main repo, **read-only** | isolated git worktree (read-write) |
+| Disk cost | ~0 | 10GB+/run on large repos (source ×3 + build outputs ×3) |
+| Output | 3 × diagnosis +推进方案 (8-section trajectory + read-only evidence claims) | patch + trajectory + executable validation per lane |
+| Cross-validation | skip-type report + deterministic dirty-baseline violation check (no commands run in the user's repo) | cross-test matrix: patches replayed on fresh eval trees, pooled commands rerun, flaky debounce |
+| Handoff | main session fuses the three plans → single implementation | promote best patch / fresh synthesis (v0.4) |
+
+### Trigger paths
+
+- **`/trace-fusion-loop <task>`** (human, main session only) — honors `traceFusionLoop.mode`.
+- **`trace-fusion` tool** (main session **agent**, self-triggered) — always forced to `diagnose`: when the model judges a task hard / root cause unclear / single-trajectory confidence low, it can fan out on its own. The expensive worktree tier stays human-only.
+- Dispatch returns immediately with lane `runId`s; you keep working. Wall-clock timers are preloaded into each lane's mailbox (deadline −5min nudge, deadline finish) — reminder-only; enforcement happens at collection (`timedOut` degradation).
+
+### Zero-touch lifecycle
+
+```text
+launch 3 lanes → lanes run (45min default wall clock each)
+  → each lane tab-finish → event bus notices (code-level, zero tokens)
+  → 3/3 terminal → background worker: authoritative collect → cross-test/skip report
+     → meta status=completed, notification injected
+  → main session closed/restarted mid-run? session_start catch-up re-scans and resumes
+claim file prevents double-spawn across watcher / catch-up / duplicate sessions
+```
+
+### Commands & state
+
+```text
+/trace-fusion-loop <task>       # start (mode from config; agent tool is always diagnose)
+/trace-fusion-status            # rebuild view from disk (survives restarts)
+/trace-fusion-collect [id] [--force]   # manual fallback; refuses until all 3 lanes tab-finish
+/trace-fusion-clean <runId> [--force]  # remove worktrees, keep runDir artifacts (patches stay replayable)
+```
+
+Artifacts (kept forever, never auto-deleted): `~/.pi/agent/trace-fusion-runs/<runId>/` — `meta.json`, `lanes/{A,B,C}/trajectory.md + validation.json + patch.diff + result.json`, `collect.json`, `cross-test.json`, `cross-test-report.md`, `collect-worker.log`. Worktrees (implement mode only) live short at `~/.pi/tfl-wt/<shortId>/{a,b,c}` and are removable via `/trace-fusion-clean`.
+
+Read-only guarantees (diagnose): `edit`/`write` excluded from lane tools at dispatch; porcelain baseline captured at launch and diffed at collection — out-of-baseline entries are flagged as suspected lane writes (writes inside gitignored paths are a documented residual risk).
+
+Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment layer); today the deterministic report + three trajectories are the deliverable, fused by the main session or by you.
+
+---
+
+## 7. UI Integration
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
@@ -253,7 +302,7 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
 
 ---
 
-## 7. Configuration & Runtime State
+## 8. Configuration & Runtime State
 
 ### config.json (copy from `config.example.json`)
 
@@ -264,11 +313,12 @@ Hours-long, unattended pipelines become a sequence of small orchestration steps.
   "thinking": { "searcher": "low", "planner": "high" },
   "notifications": true,
   "searcherMode": "auto",
-  "liteMode": "off"
+  "liteMode": "off",
+  "traceFusionLoop": { "mode": "diagnose", "maxWallClockPerLaneMin": 45, "maxActiveRuns": 1 }
 }
 ```
 
-`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §4); tiers are projected live from `models`, no separate tier table.
+`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §4); tiers are projected live from `models`, no separate tier table. `traceFusionLoop`: see §6 — `mode` `diagnose|implement`, `workerModel`, `maxWallClockPerLaneMin` (nudge + timedOut semantics), `maxActiveRuns` (v1: 1), `provisioning` (junction/copy/command for implement-mode worktrees).
 
 Model selection priority: (1) configured default + fallback chain; (2) override only when the chain is exhausted, the user names a model, or the default is clearly unsuitable; (3) prefer normal `provider/id` — never switch to an external CLI unless configured or user-requested.
 
@@ -281,6 +331,8 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `timers/<id>.json` | self timers; `timers/mail/<runId>/` tab mailboxes |
 | `reports/<id>.json` | tab → main active reports |
 | `links.jsonl` | provenance log (who spawned what) |
+| `trace-fusion-runs/<runId>/` | trace-fusion run artifacts (meta, lanes/{A,B,C}, collect, cross-test, logs) |
+| `trust.json` | pre-granted trusted paths (e.g. worktree root for implement mode) |
 
 ### Environment variables
 
@@ -292,7 +344,7 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 
 ---
 
-## 8. Knowledge Management (project document system)
+## 9. Knowledge Management (project document system)
 
 The workflow ships a full documentation system for long-lived repos. **Four separate document families — don't confuse them:**
 
@@ -303,24 +355,24 @@ The workflow ships a full documentation system for long-lived repos. **Four sepa
 | **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log (`Item NN` entries) | implementer / reviewer |
 | **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (wiki-and-task templates) |
 
-### 8.1 Wiki — durable knowledge
+### 9.1 Wiki — durable knowledge
 
 - Theme pages only (a topic = one page with sections), `status: current`, `source_paths` + Evidence.
 - **Hard rule: task findings NEVER go to Wiki** — they live in replies or `plans/*_research.md`.
 - `wiki-nav` tool: `tree` / `around` / `find` / `keywords` / `path` / `rebuild` (progressive navigation, no need to read whole indexes). Optional semantic term expansion via `~/.pi/agent/embeddings.json` (see `examples/embeddings.json`).
 - After any Wiki page change: `wiki-nav rebuild` regenerates `_navigation.json` / `_search.json` / `_keywords.json`.
 
-### 8.2 Timeline / recentwork
+### 9.2 Timeline / recentwork
 
 - `Item NN` = the repo timeline/task identifier when that file exists — **not** a GitHub issue.
 - `recentwork.md` rows: what changed, paths, status. The launcher/runner may be wired to the task board server (wiki-and-task).
 
-### 8.3 Changelog
+### 9.3 Changelog
 
 - Month-based release history (`changelog.md` quick nav + `changelog/YYYY/YYYY-MM.md`), per wiki-and-task templates.
-- Distinct from this package's own `CHANGELOG.md` (package release log — see §9).
+- Distinct from this package's own `CHANGELOG.md` (package release log — see §10).
 
-### 8.4 How documents flow in a workflow run
+### 9.4 How documents flow in a workflow run
 
 ```text
 search ──► Wiki verify/update (searcher)
@@ -335,7 +387,7 @@ Wiki wrap-up (stage 5) ──► update the corresponding theme page; may be "no
 
 ---
 
-## 9. Development
+## 10. Development
 
 ### Tests
 
@@ -352,6 +404,13 @@ npm run test:launch
 npm run test:external-cli
 npm run smoke:reclaim-loop      # full loop (dispatch → timer → finish → reclaim)
 npm run smoke:real-tab          # real pi process (needs network/model)
+npm run test:trace-fusion-git   # trace-fusion: git primitives (worktree, snapshot, normalization)
+npm run test:trace-fusion-launch    # dispatch orchestration (implement + diagnose branches)
+npm run test:trace-fusion-collect   # authoritative artifact collection
+npm run test:trace-fusion-crosstest # cross-test matrix + diagnose skip report
+npm run test:trace-fusion-supervisor # auto-collect decision matrix + claim idempotency
+npm run test:trace-worker       # worker identity/profile/guard
+npm run test:register-graph     # tool/command registration snapshot
 ```
 
 ### extensions/ file map
@@ -370,6 +429,8 @@ npm run smoke:real-tab          # real pi process (needs network/model)
 | `links.ts` | provenance log |
 | `external-cli.ts` | Claude/Codex/Agy/AtomCode/ZCode spawn runners |
 | `codex-headers.ts`, `notify-windows.ts`, `launch.ts`, `wiki-nav.ts`, `wiki-semantic.ts` | supporting modules |
+| `trace-fusion/` | trace-fusion-loop: `types`/`config` (mode, defaults), `git` (worktree/patch primitives), `snapshot` (synthetic base), `worktrees` (lane provisioning), `trust` (pre-grant), `worker-prompt` (implement/diagnose contracts), `launch-workers` (run orchestration + lane timers), `artifacts` (authoritative collect, dirty-baseline check), `cross-test` (eval-tree matrix / diagnose skip report), `supervisor` (auto-collect decisions, claim), `collect-cli` (background collection worker), `clean` (worktree disposal) |
+| `trace-worker.ts`, `capabilities.ts`, `identity.ts`, `runner-argv.ts`, `tab-launch-core.ts` | trace lane identity/tool isolation, capability matrix, pi argv builder, single-tab spawn primitive |
 
 ### How the event layer works
 
@@ -377,13 +438,14 @@ File system is the bus: ledgers under `~/.pi/agent/` are the shared state; `fs.w
 
 ---
 
-## 10. FAQ / Known limits
+## 11. FAQ / Known limits
 
 - **Async subagents die with the session.** `async: true` runs in a child process of your pi session; closing/restarting it kills them. For work that must survive, use tabs.
 - **Stall timeout** is per-process inactivity; it cannot detect a "busy but wrong" loop.
 - **Windows `fs.watch`** can miss events on large/network directories — the 5–10s tick fallback covers this.
 - **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as pi-flow-external).
 - **Two changelogs:** the project's `changelog.md` (wiki-and-task monthly history) vs this package's `CHANGELOG.md` (release log).
+- **trace-fusion diagnose vs implement:** diagnose never runs commands in your repo (evidence claims are reviewed, not rerun); implement gives real build/test evidence but costs 10GB+ disk per run on large repos — clean with `/trace-fusion-clean` when done. Lane reads/writes inside gitignored paths are not visible to the dirty-baseline check (documented residual risk).
 
 ---
 
