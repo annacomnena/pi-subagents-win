@@ -163,7 +163,54 @@ Four task modes:
 | `execute` | `根据execute进行工作<id>` | skip search/planning → implement → review → Wiki wrap-up |
 | `adaptive` | `根据adaptive进行工作<id>` | tab self-assesses handoff completeness at startup → A fast lane (verify ≤3 tool calls → implement → review → Wiki) / B medium (mini plan → quick review → implement → review → Wiki) / C full chain; upgrades allowed & declared, downgrades forbidden |
 
-**lite mode** is not a tab mode — it runs **inside the current session**: no `launch-tabs`, no role agents, just one `general` agent dispatched per stage with a tier model (`small` = search/docs → `models.searcher`, `medium` = implement → `models.implementer`, `large` = consult/revise/review → `models.consultant`). Chain: L1 search → L2 plan → L3 implement → L4 independent review (never skipped) → L5 Wiki wrap-up. Toggle with `/lite on|auto|off` (persisted in `config.json` `liteMode`; `off` injects nothing). Context discipline: sync/parallel only, handoffs land on disk (>30 lines → file, reply carries path + ≤10-line summary), escalate to a full-chain tab when relay material exceeds ~10K tokens, fan-out ≥3, or cross-session survival is needed.
+**lite mode** is not a tab mode — it runs **inside the current session**; the full discipline is in the Lite workflow subsection below.
+
+### Full workflow — the tab chain
+
+A `workflow`/`research`/`execute`/`adaptive` tab is not a lone worker: on startup it reads the bundled `workflow-orchestrator` skill and acts as a **project manager** — it breaks the task into stages and delegates each stage to a **role agent** via `subagent-win` (headless subagents inside the tab):
+
+```text
+searcher → planner → plan-reviewer → implementer → code-reviewer → (consultant when stuck)
+    └────────── every handoff lands on disk (plans/, Wiki) ──────────┘
+```
+
+- **Stage discipline is enforced, not suggested**: the tab may not complete the task in one shot; the searcher maintains Wiki theme pages; findings stay out of Wiki; the reviewer is always an independent process reviewing a `git diff`.
+- **Model per role**: each role agent has its own configured default + fallback chain (see §3); per-call overrides only on exhaustion/user request/mismatch.
+- **Why a tab**: the chain is long and produces large relay material; a visible tab survives main-session restarts, lets the human steer mid-run, and reclaims results via the event bus.
+
+Use the full chain when the task is heavy, needs role separation, parallel batches, or must survive the session.
+
+### Lite workflow — the in-session chain
+
+`/lite on|auto|off` (persisted as `config.json` `liteMode`; `off` injects nothing). When on, **workflow requests run inside the current session** — no `launch-tabs`, no role agents. Instead a single `general` agent is dispatched per stage, with a **tier model** projected live from your `models` config:
+
+| Stage | Tier | Model from |
+|---|---|---|
+| L1 search / docs | `small` | `models.searcher` |
+| L2 plan / L3 implement | `medium` | `models.implementer` |
+| L4 independent review / L5 consult / plan revision | `large` | `models.consultant` |
+
+Chain: **L1 search → L2 plan → L3 implement → L4 review → L5 Wiki wrap-up**. This is the lite mechanism, not a per-call exception — the caller just passes `model=` per dispatch.
+
+Lite discipline (all six enforced):
+1. **Sync/parallel only** — async `status` returns a 500-char preview, not enough for handoffs.
+2. **Handoffs land on disk** — >30-line artifacts go to `plans/` or Wiki; the reply carries the path + ≤10-line summary.
+3. **Retrieved facts** still carry code location + Wiki section reference + calibration status.
+4. **Searcher dispatch mode** (serial/parallel) applies to L1 unchanged.
+5. **L4 is never skipped** — independent `general` process, reviews the `git diff`; never self-review.
+6. **Escalation lines** — relay material >~10K tokens, fan-out ≥3, or cross-session survival needed → stop lite, escalate to a full-chain tab (`mode=workflow/adaptive`).
+
+**Boundary**: lite only changes how the current session orchestrates; task tabs (their prompt's first line) keep their own mode discipline and are unaffected. A one-shot `这次走完整链` from the user overrides back to a full-chain tab.
+
+### Choosing an execution style
+
+| | **Full chain (tab)** | **Lite (in-session)** | **trace-fusion (§6)** |
+|---|---|---|---|
+| Runs in | visible tab (survives restart) | current session | 3 visible tabs |
+| Workers | role agents via `subagent-win` | one `general` agent per stage, tier models | 3 independent full rollouts |
+| Divergence | none (one plan) | none (one plan) | 3 diagnoses fused |
+| Cost | tab + role models | lowest (small models on easy stages) | 3× wall clock, ~zero disk (diagnose) |
+| Use when | heavy tasks, batches, must survive | quick single tasks in-session | hard/uncertain tasks, need independent diagnoses |
 
 Tab titles: `<repo>[-worktree]-[<taskId>-]<label>`. Each tab returns a **`runId`** (see §5).
 
@@ -346,11 +393,12 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 
 ## 9. Knowledge Management (project document system)
 
-The workflow ships a full documentation system for long-lived repos. **Four separate document families — don't confuse them:**
+The workflow ships a full documentation system for long-lived repos. **Five separate document families — don't confuse them:**
 
 | Family | Where | Purpose | Written by |
 |--------|-------|---------|------------|
 | **Wiki** | `Wiki/{Concepts,Modules,Architecture,Decisions,Workflows}/` | durable cross-task facts, `status: current`, `source_paths` + Evidence | searcher (proactively maintained) |
+| **Hotspot cache** | `Wiki/_hotspot.md` | routing snapshot of recently-active topics (Wiki section slices, symbol entry points, evidence pointers) | main session via `hotspot` tool |
 | **Plans** | `plans/` | per-task implementation plans & research notes | planner; research mode |
 | **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log (`Item NN` entries) | implementer / reviewer |
 | **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (wiki-and-task templates) |
@@ -377,13 +425,31 @@ The workflow ships a full documentation system for long-lived repos. **Four sepa
 ```text
 search ──► Wiki verify/update (searcher)
    │          plans/ research notes (if oversized)
+   │          hotspot candidates in the reply (searcher returns, never writes)
    ▼
 plan ──► plans/<date_topic>.md (planner)
    ▼
 implement/review ──► recentwork.md row (progress)
    ▼
 Wiki wrap-up (stage 5) ──► update the corresponding theme page; may be "none"
+                        ──► hotspot upsert if a routing pointer changed (idle if not)
 ```
+
+### 9.5 Hotspot routing cache (`Wiki/_hotspot.md`)
+
+A routing-only working set for **new-session cold starts**. When a session's first user message is submitted, the extension appends one `<system-reminder>` block (once, idempotent — resume/retry never re-injects) containing:
+
+- **Recent tasks** — latest 3 active `recentwork.md` rows (one pointer line each; status stays owned by recentwork)
+- **Recently modified functions** — top 5 method-level hunk contexts aggregated from the **uncommitted working tree** + last 30 commits (purely derived, recomputed each injection; needs `*.cs diff=csharp` funcname for C# quality, falls back to file level)
+- **Topic entries** — per topic: Wiki section slice, symbol entry points (`path::Symbol`, resolvable via CodeGraph), evidence pointers — sorted by heat and capped at ~1k tokens total
+
+Heat signals are **computed, never stored**: uncommitted `git diff HEAD` (×5 — git log can't see in-progress work), 14-day churn (×3), active recentwork rows. The file stores only what can't be computed: routing pointers, pitfalls, semantic links.
+
+- **`hotspot` tool** (`read` / `upsert` / `remove`) — the only write path. Strict parse, shape + path-boundary + CodeGraph-symbol validation, revision + fingerprint optimistic lock, cross-process `.lock`, atomic tmp-rename, identical-content no-op, removal keeps a `_hotspot.trash.jsonl` recovery copy. Subagent processes get none of it (candidates travel in replies; the main session commits).
+- **`/hotspot`** — read-only diagnostics: disk vs injected revision, per-topic heat score **with its reasoning**, budget estimate, degradation causes.
+- **Effect log** — `~/.pi/agent/hotspot-logs/<repo-key>.jsonl` (topic/version/action/time only); two weeks of this data decides the v3 candidates (dynamic CodeGraph relation projection, usage feedback into heat, curator).
+
+Design principles: *compute what you can, store only the rest*; *routing pointers, never explanatory knowledge* (that's Wiki's job); *no daemon, no timers* — everything lives inside pi session lifecycles. Underscore prefix keeps `_hotspot.md` out of `wiki-nav` indexes. Design doc: `plans/20260915_plan_hotspot_memory_layer.md`.
 
 ---
 
