@@ -21,6 +21,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
+import { emitRuntimeEvent } from "./runtime/journal.ts";
+import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath } from "./links.ts";
@@ -85,7 +87,13 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// trace-fusion 自动收集等自定义消费者：返回 true 表示已消费（跳过默认 toast/reclaim 注入）；
 	// 返回 false/undefined → 落回默认流程（向后兼容：旧调用方不返回值时行为不变）。
 	if (opts.onTabFinished) {
-		if (opts.onTabFinished(runId) === true) return true;
+		if (opts.onTabFinished(runId) === true) {
+			// Phase 1 shadow emit（设计稿 §13）：消费分支不走 claim，此处是该 result 唯一的
+			// journal 写入点；只观察、不改消费语义，写失败不影响消费返回值。
+			const consumed = readTabResultFile(runsDir, runId);
+			if (consumed) emitRuntimeEvent(tabResultToRuntimeEvent(consumed));
+			return true;
+		}
 	}
 
 	// 会话定位（2026-08-13：与 report.ts 溯源对齐，防止 identityless 会话抢注入权）：
@@ -104,6 +112,9 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	}
 
 	const result = readTabResultFile(runsDir, runId);
+	// Phase 1 shadow emit（设计稿 §13）：claim 幂等已保证跨 watcher/双实例只写一次；
+	// result 读取失败（损坏）不 emit，事件缺失优于伪造终态。
+	if (result) emitRuntimeEvent(tabResultToRuntimeEvent(result));
 	const status = result?.status ?? "unknown";
 	const summary = result?.summary?.slice(0, 200) ?? "(no summary)";
 	const artifacts = result?.artifacts?.length ? result.artifacts.slice(0, 5).map((a) => `  • ${a}`).join("\n") : "";
