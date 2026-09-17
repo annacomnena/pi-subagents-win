@@ -64,7 +64,8 @@
     "test:register-graph": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_test_register_graph.ts",
     "smoke:extension-load": "node ./scripts/check-extension-load.mjs",
     "test:runtime-protocol": "node --experimental-strip-types ./extensions/_test_runtime_protocol.ts",
-    "test:runtime-mailbox": "node --experimental-strip-types ./extensions/_test_runtime_mailbox.ts"
+    "test:runtime-mailbox": "node --experimental-strip-types ./extensions/_test_runtime_mailbox.ts",
+    "test:runtime-registry": "node --experimental-strip-types ./extensions/_test_runtime_registry.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
