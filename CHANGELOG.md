@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2026-09-17 (trace-fusion diagnose mode)
+## [0.3.0] — 2026-09-17 (trace-fusion diagnose mode)
 
 - **新增主会话工具 `trace-fusion`**：agent 判断任务困难/根因不明时可自主触发只读诊断 rollout（强制 diagnose 模式，零磁盘零主仓库写入），发起后立即可继续其它工作，三路终态自动收集并通知；lane tab 不可见该工具（排除名单 + 运行时能力二次校验）。implement（worktree 读写）仍仅限人工命令。
 
@@ -13,9 +13,10 @@
 ## [Unreleased] — 2026-09-17
 
 ### Added
-- **热点路由缓存首版（extensions/hotspot/，v2 设计落地）**：新会话首轮用户消息末尾附加一次 `<system-reminder>` 热点块（幂等：entries 检查 + `hotspot-injected` custom entry 双保险；恢复/旧会话不注入；压缩经 customInstructions 保留指针提示；字段 `<` 转义防提前闭合）；`hotspot` 工具（read/upsert/remove：严格解析文件格式、结构+引用+CodeGraph 符号三重验证、存储与注入双预算、revision+指纹乐观锁、`.lock` 跨进程锁（陈旧 30s 抢占）、临时文件原子替换、相同路由内容不写入不增版、remove 保留 `_hotspot.trash.jsonl` 恢复副本）；`/hotspot` 只读诊断（磁盘/注入版本、热度排序含评分依据、预算估算、降级原因、效果日志路径）；热度信号现算不落盘（git churn 14d + recentwork 活跃行，降级安全）；效果日志 `~/.pi/agent/hotspot-logs/<repo-key>.jsonl`（仅必要指标）。子 agent 进程不注册任何能力（首版主会话统一提交）；主 `index.ts` 仅 +5 行（import + registerHotspot）。配套：`_test_hotspot.ts`（28 断言：解析对称/严格拒绝/乐观锁冲突/工具外编辑指纹发现/坏文件停写/恢复副本/离线引用验证/结构校验/存储预算/注入预算整条省略/防闭合转义）、`_seed_greencad.ts`（greencad 试点条目 mesh-push，真实 CodeGraph 验证后写入，幂等）；searcher.md 增「热点候选」回返纪律，workflow-orchestrator 阶段 5 验收清单增热点路由检查项。设计：`plans/20260915_plan_hotspot_memory_layer.md`（v2 §11 代码结构约束：主 index.ts 只加 import+一行注册）。
+- **热点路由缓存首版（extensions/hotspot/，v2 设计落地）**：新会话首轮用户消息末尾附加一次 `<system-reminder>` 热点块（幂等：entries 检查 + `hotspot-injected` custom entry 双保险；恢复/旧会话不注入；压缩经 customInstructions 保留指针提示；字段 `<` 转义防提前闭合）；`hotspot` 工具（read/upsert/remove：严格解析文件格式、结构+引用+CodeGraph 符号三重验证、存储与注入双预算、revision+指纹乐观锁、`.lock` 跨进程锁（陈旧 30s 抢占）、临时文件原子替换、相同路由内容不写入不增版、remove 保留 `_hotspot.trash.jsonl` 恢复副本）；`/hotspot` 只读诊断（磁盘/注入版本、热度排序含评分依据、预算估算、降级原因、效果日志路径）；热度信号现算不落盘；效果日志 `~/.pi/agent/hotspot-logs/<repo-key>.jsonl`（仅必要指标）。子 agent 进程不注册任何能力；主 `index.ts` 仅 +5 行。配套：`_test_hotspot.ts`、`_seed_greencad.ts`（真实 CodeGraph 验证试点条目 mesh-push）；searcher.md 增「热点候选」回返纪律，workflow-orchestrator 阶段 5 验收清单增热点路由检查项。设计：`plans/20260915_plan_hotspot_memory_layer.md`（v2 §11 代码结构约束）。
+- **热点首版验收补账（§8.2 修订，同日）**：①热度信号补**未提交工作树 diff**（`git diff HEAD --name-only`，命中 ×5/目录 ×2 高于已提交 churn——实测 greencad 有 246 文件/7804 行进行中改动对 git log 完全不可见，原排序失真）；②注入头新增「最近任务 / 最近改动」两行现算小节：任务按 Item 编号降序 top3（指针式一行，不复制状态），函数级从未提交 diff + 近 30 条 commit hunk 上下文聚合 top5（`extractFuncContexts` 过滤 namespace/using 噪声，空时降级文件级）；③greencad 配置 `*.cs diff=csharp` + xfuncname（C# 默认 xfunc 抓 namespace，配置后方法签名级可用，实测 `ClearMaterialSelection(`、`TrySample(` 命中）。固定说明预算 600→900 字符；实测注入总量 323 token 零降级。
 
-## [Unreleased] — trace-fusion-loop (feat branch)
+## [0.3.0] — trace-fusion-loop (feat branch)
 
 ### Fixed
 - **Luna 复核轮修复（2 major + 4 partial 补全）**：`PiLaunchArgsOptions` 补声明 `excludeTools`（静态类型同步）；cross-test `testFileDiff` 改 `diff HEAD`（上轮批量修复因脚本中断遗漏，实测复现 staged 测试 diff 丢失）；`/trace-fusion-collect` 增加终态门槛（三 lane 未全部 tab-finish 时拒绝，除非 `--force` 显式放弃等待——防撕裂证据与错误终结 run）；命令归一化改【路径→`.`】策略（`cd "."`/`npm --prefix .`/`./f.js` 全部语义正确；lookahead 路径边界防 `C:\wtx` 误伤；URL scheme 不折叠）；异步 spawn 失败时清理该 lane 邮箱的 pending deadline timers；`timedOut` 判定改 `>=`；cross-test 报告落盘移到 cleanup 之后（cleanup notes 持久化进报告）。

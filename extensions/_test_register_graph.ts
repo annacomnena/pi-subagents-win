@@ -84,6 +84,7 @@ for (const n of flagNames) console.log(`  ${n}`);
 // wiki-nav 1 个、index.ts 2 个（launch-tabs 主会话、subagent-win）。
 assert.deepEqual(toolNames, [
 	"cancel-timer",
+	"hotspot",
 	"launch-tabs",
 	"list-timers",
 	"reclaim-tabs",
@@ -103,6 +104,7 @@ assert.deepEqual(toolNames, [
 assert.deepEqual(commandNames, [
 	"agents",
 	"codex-headers",
+	"hotspot",
 	"launch",
 	"links",
 	"lite",
@@ -130,8 +132,10 @@ assert.deepEqual(eventNames, [
 	"agent_start",
 	"before_agent_start",
 	"before_provider_headers",
+	"input",
 	"message_end",
 	"resources_discover",
+	"session_before_compact",
 	"session_shutdown",
 	"session_start",
 	"tool_execution_end",
@@ -150,7 +154,7 @@ assert.deepEqual(
 for (const t of ["subagent-win", "launch-tabs"]) {
 	assert.ok(toolNames.includes(t), `工具 ${t} 必须注册`);
 }
-for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop", "trace-fusion-status", "trace-fusion-collect", "trace-fusion-clean"]) {
+for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop", "trace-fusion-status", "trace-fusion-collect", "trace-fusion-clean", "hotspot"]) {
 	assert.ok(commandNames.includes(c), `命令 ${c} 必须注册`);
 }
 for (const e of ["session_start", "session_shutdown", "before_agent_start"]) {

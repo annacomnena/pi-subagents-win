@@ -32,6 +32,7 @@ import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/sup
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { cleanTraceRun } from "./trace-fusion/clean.ts";
+import { registerHotspot } from "./hotspot/index.ts";
 import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
@@ -1582,6 +1583,10 @@ export default function (pi: ExtensionAPI) {
 		} catch { /* 通知尽力而为，收集已在后台 */ }
 		void ctx;
 	});
+
+	// 热点路由缓存（v2 首版）：首轮 system-reminder 注入 + hotspot 工具 + /hotspot 诊断；
+	// 结构约束（v2 §11）：主 index.ts 只加这一处注册
+	collect(registerHotspot(pi));
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
 	collect(registerReportListener(pi));

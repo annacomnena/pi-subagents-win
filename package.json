@@ -46,6 +46,7 @@
     "test:trace-fusion-collect": "node --experimental-strip-types ./extensions/_test_trace_fusion_collect.ts",
     "test:trace-fusion-crosstest": "node --experimental-strip-types ./extensions/_test_trace_fusion_crosstest.ts",
     "test:trace-fusion-supervisor": "node --experimental-strip-types ./extensions/_test_trace_fusion_supervisor.ts",
+    "test:hotspot": "node --experimental-strip-types ./extensions/hotspot/_test_hotspot.ts",
     "test:lite-mode": "node --experimental-strip-types ./extensions/_test_lite_mode.ts",
     "test:external-cli": "node --experimental-strip-types ./extensions/_test_external_cli.ts",
     "test:tab-runs": "node --experimental-strip-types ./extensions/_test_tab_runs.ts",
