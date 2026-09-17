@@ -24,6 +24,8 @@ import { readTabResultFile } from "./tab-runs.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { deliverLetterSafe } from "./runtime/mailbox.ts";
 import { tabResultToReportLetter } from "./runtime/adapters/tab-run.ts";
+import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
+import { runReceiptKey } from "./runtime/receipts.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
@@ -118,8 +120,17 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	}
 
 	const status = result?.status ?? "unknown";
+	// Phase 4d 统一注入门（A5 F2/F15/F16）：cutover 未启用时恒 inject:true，零行为变化；
+	// 启用后非 owner 被抑制（记审计），owner 走 claimInjection 互斥。
+	let gateCtx: InjectionContext | null = null;
+	{
+		const gate = preInject({ key: runReceiptKey(runId, status), sessionId: mySession, path: "legacy-eventbus" });
+		if (!gate.inject) return false;
+		gateCtx = { key: runReceiptKey(runId, status), sessionId: mySession, path: "legacy-eventbus" };
+	}
 	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
 	if (!claimNotified(runsDir, runId)) {
+		if (gateCtx) postInject(gateCtx, true); // legacy 已注证明，回填收据（4d 三路去重）
 		return false; // 已被其他实例通知过 → 静默跳过，不注入
 	}
 
@@ -151,6 +162,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 				`下一步: 用 reclaim-tabs({ runIds: ["${runId}"] }) 确认并编排后续。`,
 			].filter((l): l is string => Boolean(l)).join("\n");
 			opts.sendUserMessage?.(body, { deliverAs: "followUp" });
+			if (gateCtx) postInject(gateCtx, true); // 注入成功 → 确认收据（4d 三路去重）
 		} catch {
 			selfDisabled = true; // 旧实例 stale → 停止注入
 		}

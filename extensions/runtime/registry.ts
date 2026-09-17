@@ -253,6 +253,37 @@ function readHandoff(agent: ObjectAddress): HandoffToken | null {
 	}
 }
 
+// ── cutover flag（F11，附记 A5：attach 与接管可分离）─────────────────
+
+export interface CutoverState {
+	enabled: boolean;
+	enabledBy: string;
+	enabledAt: string;
+}
+
+function cutoverPath(): string {
+	return join(registryDir(), "cutover.json");
+}
+
+/** 读 cutover（缺失/损坏 → null = 未切换，legacy 行为）。 */
+export function readCutover(): CutoverState | null {
+	try {
+		const raw = JSON.parse(readFileSync(cutoverPath(), "utf8")) as CutoverState;
+		if (typeof raw.enabled !== "boolean") return null;
+		return raw;
+	} catch {
+		return null;
+	}
+}
+
+/** 写 cutover（单人操作，last-writer-wins；开关由 /master-cutover 执行）。 */
+export function setCutover(enabled: boolean, by: string): CutoverState {
+	mkdirSync(registryDir(), { recursive: true });
+	const state: CutoverState = { enabled, enabledBy: by, enabledAt: new Date().toISOString() };
+	writeJsonAtomic(cutoverPath(), state);
+	return state;
+}
+
 // ── 排他 lease（F13 CAS 互斥，附记 A5）─────────────────────────────
 
 export interface RegistryLease {

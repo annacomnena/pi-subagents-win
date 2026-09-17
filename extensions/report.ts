@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
@@ -159,8 +160,16 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 		return false; // 不是本会话的回报 → 不 claim、不注入（留给真正的编排会话）
 	}
 
+	// Phase 4d 统一注入门（A5 F2/F15/F16）：cutover 未启用时恒 inject:true，零行为变化。
+	let gateCtx: InjectionContext | null = null;
+	{
+		const gate = preInject({ key: `report-${id}`, sessionId: mySession, path: "legacy-reports" });
+		if (!gate.inject) return false;
+		gateCtx = { key: `report-${id}`, sessionId: mySession, path: "legacy-reports" };
+	}
 	// 跨实例幂等：原子领取消费权（双 watcher/双实例只有第一个注入）
 	if (!claimReportNotified(reportsDir, id)) {
+		if (gateCtx) postInject(gateCtx, true); // legacy 已注证明，回填收据
 		return false; // 已被其他实例消费 → 静默跳过
 	}
 
@@ -177,6 +186,7 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 			`📨 ${record.from} 主动回报：${record.message}${record.taskId ? `\ntask=${record.taskId}` : ""}${record.summary ? `\n摘要: ${record.summary}` : ""}\n请处理这份回报并决定下一步。`,
 			{ deliverAs: "followUp" },
 		);
+		if (gateCtx) postInject(gateCtx, true);
 	} catch {
 		selfDisabled = true; // 旧实例 stale → 停止注入
 	}

@@ -182,6 +182,8 @@ export interface ClaimOptions {
 	reclaimAfterMs?: number;
 	/** 单次最多领取数（缺省全部 pending+stale） */
 	limit?: number;
+	/** 只领取这些 messageId（4d 消费端定向领取；与 limit 叠加） */
+	ids?: string[];
 }
 
 /** 领取一个 logical recipient 的可处理信件（pending + stale claimed），置为 claimed。 */
@@ -191,9 +193,25 @@ export function claimLetters(recipient: ObjectAddress, opts: ClaimOptions): Lett
 	const reclaimAfterMs = opts.reclaimAfterMs ?? 10 * 60 * 1000;
 	const now = Date.now();
 
+	const names = opts.ids
+		? opts.ids.map((id) => `${id}.json`)
+		: readdirSync(dir).filter((f) => f.endsWith(".json"));
+
+	// ids 定向领取兼容旧命名信件（F7 前 dedupe 命名）：直接文件缺失则按 frame.id 扫描
+	const resolvedNames: string[] = [];
+	for (const f of names) {
+		if (existsSync(join(dir, f))) {
+			resolvedNames.push(f);
+			continue;
+		}
+		if (opts.ids) {
+			const found = findLetterFileByFrameId(dir, f.slice(0, -".json".length));
+			if (found) resolvedNames.push(found.split(/[\\/]/).pop()!);
+		}
+	}
+
 	const claimable: { path: string; letter: Letter }[] = [];
-	for (const f of readdirSync(dir)) {
-		if (!f.endsWith(".json")) continue;
+	for (const f of resolvedNames) {
 		const path = join(dir, f);
 		let letter: Letter;
 		try {
