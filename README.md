@@ -2,7 +2,7 @@
 
 Windows-native subagent orchestration for [pi](https://github.com/earendil-works/pi-coding-agent): role agents for delegation, visible parallel tabs for long-running work, and a full ultra-long task infrastructure (tab reclaim, auto-push timers, an event bus, and active reporting) on top of it.
 
-**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.2.1
+**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.3.0
 
 ---
 
