@@ -16,7 +16,7 @@ import { newEventEnvelope } from "./envelope.ts";
 import { defaultJournalPath, defaultRuntimeDir, emitRuntimeEventOnce } from "./journal.ts";
 import { buildHandoff } from "./hydrate.ts";
 import { issueMasterHandoffToken } from "./master-control.ts";
-import { adoptTransfer, completeProposalForGeneration } from "./master-succession.ts";
+import { adoptTransfer, completeProposalForTransfer } from "./master-succession.ts";
 import { readAttachment } from "./registry.ts";
 
 export type TransferStatus = "initiated" | "spawned" | "attached" | "completed" | "failed";
@@ -216,6 +216,6 @@ export function confirmTransferAttach(
 	record.updatedAt = new Date().toISOString();
 	writeRecordAtomic(recordPath(record.transferId, opts.stateDir), record);
 	emitTransferEvent("master.handoff.completed", record, opts.journalPath);
-	completeProposalForGeneration(att.generation, opts);
+	completeProposalForTransfer(record.transferId, opts);
 	return { ok: true, transferId: record.transferId, generation: att.generation };
 }

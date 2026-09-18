@@ -20,7 +20,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-successi
 import { attachCurrentSession, issueMasterHandoffToken } from "./runtime/master-control.ts";
 import {
 	adoptTransfer,
-	completeProposalForGeneration,
+	completeProposalForTransfer,
 	decideProposal,
 	getPendingReminder,
 	maybePropose,
@@ -85,7 +85,7 @@ let proposalId = "";
 {
 	const no = adoptTransfer({ transferId: "tr_x", fromGeneration: 1 });
 	assert.equal(no.adopted, false); // 已 accepted，非 pending
-	const none = completeProposalForGeneration(1);
+	const none = completeProposalForTransfer("tr_nope");
 	assert.equal(none.completed, false);
 	assert.equal(getPendingReminder(), null);
 	ok("adopt/complete 非 pending 即 no-op");
@@ -104,7 +104,7 @@ let proposalId = "";
 	const ad = adoptTransfer({ transferId: "tr_demo", fromGeneration: 2 });
 	assert.equal(ad.adopted, true);
 	assert.equal(readProposal()?.status, "transferring");
-	const done = completeProposalForGeneration(2);
+	const done = completeProposalForTransfer("tr_demo");
 	assert.equal(done.completed, true);
 	assert.equal(readProposal()?.status, "completed");
 	ok("新代覆盖 + adopt→transferring + complete 闭环");

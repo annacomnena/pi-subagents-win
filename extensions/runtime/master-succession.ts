@@ -171,13 +171,13 @@ export function adoptTransfer(
 	return { adopted: true };
 }
 
-/** confirm 完成后：同代 transferring → completed。 */
-export function completeProposalForGeneration(
-	generation: number,
+/** confirm 完成后：凭 transferId 将 transferring proposal → completed。 */
+export function completeProposalForTransfer(
+	transferId: string,
 	opts: SuccessionOptions = {},
 ): { completed: boolean } {
 	const existing = readProposal(opts.stateDir);
-	if (!existing || existing.status !== "transferring" || existing.generation !== generation) {
+	if (!existing || existing.status !== "transferring" || existing.transferId !== transferId) {
 		return { completed: false };
 	}
 	existing.status = "completed";
