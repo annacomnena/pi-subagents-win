@@ -21,6 +21,11 @@ import {
 	prepareMasterHandoff,
 	setMasterCutover,
 } from "./runtime/master-control.ts";
+import {
+	confirmTransferAttach,
+	transferMaster,
+	type SpawnSuccessor,
+} from "./runtime/master-transfer.ts";
 
 export interface ToolOutcome {
 	text: string;
@@ -114,7 +119,35 @@ function textResult(outcome: ToolOutcome): { content: { type: string; text: stri
 	};
 }
 
-export function registerMasterTools(pi: ExtensionAPI): void {
+export function masterTransferLogic(
+	sessionId: string,
+	input: { reason?: string; spawn: SpawnSuccessor },
+): ToolOutcome {
+	const r = transferMaster({ sessionId, reason: input.reason, spawn: input.spawn });
+	if (!r.ok) {
+		return {
+			text: r.reason === "not-owner"
+				? "master-transfer: 你不是当前 owner，拒绝"
+				: `master-transfer 失败：spawn 未能启动（${r.error ?? "unknown"}），你仍是 owner（transfer=${r.transferId}）`,
+			isError: true,
+		};
+	}
+	return {
+		text: `master-transfer 已发起：transfer=${r.transferId} 后继=${r.successorRunId}（gen ${r.generation}→${r.generation + 1}，交接包=${r.handoffPath}）`,
+		details: { transferId: r.transferId, successorRunId: r.successorRunId, token: r.token, handoffPath: r.handoffPath },
+	};
+}
+
+export function masterTransferConfirmLogic(
+	sessionId: string,
+	input: { transferId: string },
+): ToolOutcome {
+	const r = confirmTransferAttach({ transferId: input.transferId, sessionId });
+	if (!r.ok) return { text: `master-transfer-confirm 失败：${r.reason}`, isError: true };
+	return { text: `master-transfer 完成：transfer=${r.transferId} gen=${r.generation}`, details: { transferId: r.transferId, generation: r.generation } };
+}
+
+export function registerMasterTools(pi: ExtensionAPI, opts: { spawnSuccessor?: SpawnSuccessor } = {}): void {
 	const subBlocked = () => isSubagent();
 
 	pi.registerTool({
@@ -227,6 +260,56 @@ export function registerMasterTools(pi: ExtensionAPI): void {
 			const params = rawParams as { enabled?: boolean };
 			if (typeof params.enabled !== "boolean") return textResult({ text: "用法：master-cutover {enabled: true|false}", isError: true });
 			const outcome = masterCutoverLogic(sid, { enabled: params.enabled });
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-transfer",
+		label: "Master Transfer",
+		description: `一键交接事务：备 fresh 交接包→发 token→spawn 后继→后继凭 token 接管（gen+1）。仅 owner 可调；子 agent 不可调。仅在用户明确要求时调用；spawn 失败旧主仍是 owner，不重试。`,
+		parameters: Type.Object({
+			reason: Type.Optional(Type.String({ description: "交接原因" })),
+		}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-transfer"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: "子 agent 不可发起交接", isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: "master-transfer: 无法确定当前会话身份，拒绝", isError: true });
+			if (!opts.spawnSuccessor) return textResult({ text: "master-transfer: spawn 通道不可用，拒绝", isError: true });
+			const params = rawParams as { reason?: string };
+			const outcome = masterTransferLogic(sid, { reason: params.reason, spawn: opts.spawnSuccessor });
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-transfer-confirm",
+		label: "Master Transfer Confirm",
+		description: `后继凭 token 接管成功后调用：校验 gen+1 与 owner，落 attached→completed。由后继会话在首轮调用；子 agent 不可调。`,
+		parameters: Type.Object({
+			transferId: Type.String({ description: "交接事务 id（后继 prompt 内给出）" }),
+		}),
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-transfer-confirm"))} ${theme.fg("accent", String((args as { transferId?: string }).transferId ?? "?"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: "子 agent 不可确认交接", isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: "master-transfer-confirm: 无法确定当前会话身份，拒绝", isError: true });
+			const params = rawParams as { transferId?: string };
+			if (!params.transferId) return textResult({ text: "用法：master-transfer-confirm {transferId}", isError: true });
+			const outcome = masterTransferConfirmLogic(sid, { transferId: params.transferId });
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
 		},
 	});

@@ -1862,8 +1862,40 @@ export default function (pi: ExtensionAPI) {
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
 
-	// master tools：agent 可调用的 Master 控制（M2，与 /master-* 同服务层）
-	registerMasterTools(pi);
+	// master tools：agent 可调用的 Master 控制（M2/M3，与 /master-* 同服务层）
+	registerMasterTools(pi, {
+		spawnSuccessor: ({ transferId, title, prompt, sessionId }) => {
+			const wtPath = findWindowsTerminal();
+			if (!wtPath) throw new Error("master-transfer: no wt.exe");
+			const piCli = findPiCli();
+			const runId = newTabRunId();
+			const taskId = `transfer-${transferId.slice(3, 9)}`;
+			const cwd = process.cwd();
+			const runsDir = defaultTabRunsDir();
+			const dispatch: TabDispatchRecord = {
+				id: runId, version: 1, taskId, mode: "execute", title, cwd,
+				dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+			};
+			writeTabDispatch(runsDir, dispatch);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+			recordLink({ sessionId, kind: "tab", targetId: runId, detail: `transfer=${transferId}` });
+			const result = spawnPiTab({
+				wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
+				onSpawnError: (err) => {
+					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+					writeTabDispatch(runsDir, failed);
+					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+				},
+			});
+			if (result.error) {
+				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
+				writeTabDispatch(runsDir, failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+				throw new Error(result.error);
+			}
+			return { successorRunId: runId };
+		},
+	});
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
