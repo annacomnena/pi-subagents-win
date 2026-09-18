@@ -167,7 +167,7 @@ function attachWithOwnerLocked(
 	}
 
 	if (input.token) {
-		const handoff = readHandoff(agent);
+		const handoff = readHandoffToken(agent);
 		if (!handoff || handoff.token !== input.token) return { ok: false, reason: "bad-token" };
 		if (Date.parse(handoff.expiresAt) <= Date.parse(now)) return { ok: false, reason: "token-expired" };
 		if (handoff.fromSession !== current.sessionId || handoff.fromGeneration !== current.generation) {
@@ -245,7 +245,7 @@ export function detachMaster(input: {
 	return { ok: true, token: token.token };
 }
 
-function readHandoff(agent: ObjectAddress): HandoffToken | null {
+export function readHandoffToken(agent: ObjectAddress = masterAddress()): HandoffToken | null {
 	try {
 		return JSON.parse(readFileSync(handoffPathFor(agent), "utf8")) as HandoffToken;
 	} catch {

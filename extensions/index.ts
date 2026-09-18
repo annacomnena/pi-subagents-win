@@ -59,6 +59,7 @@ import {
 	updateWorkstream,
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
+import { buildHandoff } from "./runtime/hydrate.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
 import { mailboxBacklog } from "./runtime/mailbox.ts";
 import { masterAddress } from "./runtime/address.ts";
@@ -1674,6 +1675,19 @@ export default function (pi: ExtensionAPI) {
 			const d = detachMasterWithAudit({ sessionId: sid, generation: att.generation, reason: (args ?? "").trim() || undefined });
 			if (!d.ok) { ctx.ui.notify("master-detach 失败：not-owner", "warning"); return; }
 			ctx.ui.notify(`master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`, "info");
+		},
+	});
+	pi.registerCommand("master-handoff", {
+		description: "生成交接包：/master-handoff [repoRoot]（只读装配，只落盘不注入）",
+		handler: async (args, ctx) => {
+			const repoRoot = (args ?? "").trim() || undefined;
+			try {
+				const doc = buildHandoff({ repoRoot });
+				const present = doc.manifest.filter((m) => m.present).length;
+				ctx.ui.notify(`handoff 已生成：${doc.path}\nmanifest ${present}/${doc.manifest.length} 项 present`, "info");
+			} catch (e) {
+				ctx.ui.notify(`master-handoff 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
 		},
 	});
 

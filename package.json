@@ -68,7 +68,8 @@
     "test:runtime-registry": "node --experimental-strip-types ./extensions/_test_runtime_registry.ts",
     "test:runtime-consumer": "node --experimental-strip-types ./extensions/_test_runtime_consumer.ts",
     "test:runtime-cutover": "node --experimental-strip-types ./extensions/_test_runtime_cutover.ts",
-    "test:runtime-workstream": "node --experimental-strip-types ./extensions/_test_runtime_workstream.ts"
+    "test:runtime-workstream": "node --experimental-strip-types ./extensions/_test_runtime_workstream.ts",
+    "test:runtime-hydrate": "node --experimental-strip-types ./extensions/_test_runtime_hydrate.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
