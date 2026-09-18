@@ -252,6 +252,31 @@ export function ackLetter(recipient: ObjectAddress, messageId: string, opts: { m
 		l.status === "claimed" || l.status === "delivered" ? { ...l, status: "acked", ackedAt: new Date().toISOString() } : null);
 }
 
+/**
+ * 按 holder 批量 ack（wake 确认专用：claim 时 holder=`wake:<sid>:<ws>`，
+ * 确认时同 holder 全收，无需逐文件名——command 信无 frame.id 也可收尾）。
+ * 返回 ack 数量。
+ */
+export function ackClaimedBy(recipient: ObjectAddress, claimedBy: string, mailboxDir: string = defaultMailboxDir()): number {
+	const dir = mailboxDirFor(recipient, mailboxDir);
+	if (!existsSync(dir)) return 0;
+	let n = 0;
+	for (const f of readdirSync(dir)) {
+		if (!f.endsWith(".json")) continue;
+		const path = join(dir, f);
+		try {
+			const letter = JSON.parse(readFileSync(path, "utf8")) as Letter;
+			if (letter.status === "claimed" && letter.claimedBy === claimedBy) {
+				writeJsonAtomic(path, { ...letter, status: "acked", ackedAt: new Date().toISOString() });
+				n += 1;
+			}
+		} catch {
+			continue;
+		}
+	}
+	return n;
+}
+
 // ── 过期（惰性扫描）───────────────────────────────────────────────
 
 /** 把超过 expiresAt 的非终态信件置为 expired。返回过期数量。 */

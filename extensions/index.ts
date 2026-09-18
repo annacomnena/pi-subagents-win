@@ -44,7 +44,8 @@ import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
-import { registerMailboxConsumer } from "./mailbox-consumer.ts";
+import { registerMailboxConsumer, registerWakeLoop } from "./mailbox-consumer.ts";
+import type { WakeDecision } from "./runtime/wake.ts";
 import { readAttachment, readCutover, setCutover } from "./runtime/registry.ts";
 import { attachMasterWithAudit, detachMasterWithAudit } from "./runtime/adapters/session-lifecycle.ts";
 import {
@@ -1615,6 +1616,51 @@ export default function (pi: ExtensionAPI) {
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
 
+	// Sub-Master 唤醒循环（Phase 5c）：评估与消费同门；无 ws/无信/未切换时空转。
+	// spawn 走与 launch-tabs 相同的账本序列（dispatch→journal→link→spawn→failed 回写）。
+	collect(registerWakeLoop(pi, {
+		intervalMs: 30_000,
+		spawn: (decision: WakeDecision, sessionId: string | undefined) => {
+			if (!sessionId) throw new Error("wake spawn: session unknown");
+			const wtPath = findWindowsTerminal();
+			if (!wtPath) throw new Error("wake spawn: no wt.exe");
+			const piCli = findPiCli();
+			const runId = newTabRunId();
+			const taskId = `wake-${decision.workstreamId.slice(0, 14)}`;
+			const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
+			const title = `wake ${decision.workstreamId.slice(0, 14)} (${decision.letters.length} inputs)`;
+			const prompt = buildWorkflowTabPrompt(
+				{ taskId, title, prompt: decision.prompt ?? "", model: undefined },
+				skillRef,
+				"execute",
+			);
+			const cwd = process.cwd();
+			const runsDir = defaultTabRunsDir();
+			const dispatch: TabDispatchRecord = {
+				id: runId, version: 1, taskId, mode: "execute", title, cwd,
+				dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+			};
+			writeTabDispatch(runsDir, dispatch);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+			recordLink({ sessionId, kind: "tab", targetId: runId, detail: `wake=${decision.workstreamId}` });
+			const result = spawnPiTab({
+				wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
+				onSpawnError: (err) => {
+					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+					writeTabDispatch(runsDir, failed);
+					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+				},
+			});
+			if (result.error) {
+				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
+				writeTabDispatch(runsDir, failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+				throw new Error(result.error);
+			}
+			return runId;
+		},
+	}));
+
 	// ── /master-* 命令（Phase 4d，A5 F9/F11）──
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
@@ -1784,6 +1830,22 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`task ${id.slice(0, 14)} → ${t.status}`, "info");
 			} catch (e) {
 				ctx.ui.notify(`task-close 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("workstream-pause", {
+		description: "灭火开关：/workstream-pause <ws-id> [off]（缺省暂停，加 off 恢复 active；只封未来 wake，不杀在飞 tab）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const [wsId, flag] = parts;
+			if (!wsId) { ctx.ui.notify("用法：/workstream-pause <ws-id> [off]", "warning"); return; }
+			const target = flag === "off" ? "active" : "paused";
+			try {
+				const ws = updateWorkstream(wsId, { status: target as never, session: sessionIdentity(ctx as never) });
+				if (!ws) { ctx.ui.notify(`workstream 不存在：${wsId}`, "warning"); return; }
+				ctx.ui.notify(`workstream ${wsId.slice(0, 14)} → ${ws.status}${target === "paused" ? "（未来 wake 已封，在飞 tab 需手动 reclaim）" : ""}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`workstream-pause 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
 			}
 		},
 	});

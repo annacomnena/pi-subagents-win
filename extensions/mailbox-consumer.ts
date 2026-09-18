@@ -28,6 +28,7 @@ import { auditSuppression, postInject, preInject } from "./injection-gate.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession } from "./identity.ts";
+import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
 
 export interface ConsumeOptions {
 	sessionId: string | undefined;
@@ -206,8 +207,7 @@ export function registerMailboxConsumer(
 		sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
 	},
 	opts: { mailboxDir?: string; intervalMs?: number } = {},
-): () => void {
-	let interval: ReturnType<typeof setInterval> | null = null;
+): () => void {	let interval: ReturnType<typeof setInterval> | null = null;
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
@@ -228,6 +228,74 @@ export function registerMailboxConsumer(
 				/* 消费端永不破坏会话 */
 			}
 		}, opts.intervalMs ?? 10_000);
+		interval.unref?.();
+	});
+	return () => {
+		sessionGen++;
+		if (interval) clearInterval(interval);
+		interval = null;
+	};
+}
+
+/**
+ * 注册 Sub-Master 唤醒循环（Phase 5c）：与消费循环同形态但独立 interval。
+ * tick 内：evaluateWakes（纯评估+claim）→ spawn（调用方注入）→ confirm/audit。
+ * cutover 关/非 owner/无 ws/无信时全程空转（零行为变化）。
+ * spawn 抛错 → auditWakeSpawnFailed，信留 claimed（stale 恢复），tick 继续。
+ */
+export function registerWakeLoop(
+	pi: {
+		on: (event: string, cb: (event: unknown, ctx?: { sessionManager?: { sessionId?: string } }) => void) => void;
+	},
+	opts: {
+		spawn: (decision: WakeDecision, sessionId: string | undefined) => string;
+		mailboxDir?: string;
+		stateDir?: string;
+		runsDir?: string;
+		intervalMs?: number;
+	},
+): () => void {
+	let interval: ReturnType<typeof setInterval> | null = null;
+	let sessionGen = 0;
+	pi.on("session_start", (_event, ctx) => {
+		try {
+			if (!isMainSession()) return;
+		} catch {
+			return;
+		}
+		const myGen = ++sessionGen;
+		const closed = (): boolean => myGen !== sessionGen;
+		if (interval) clearInterval(interval);
+		const sid = ctx?.sessionManager?.sessionId;
+		interval = setInterval(() => {
+			if (closed()) return;
+			try {
+				const decisions = evaluateWakes({
+					sessionId: sid,
+					mailboxDir: opts.mailboxDir,
+					stateDir: opts.stateDir,
+					runsDir: opts.runsDir,
+				});
+				for (const d of decisions) {
+					if (!d.fire) continue;
+					try {
+						const tabRunId = opts.spawn(d, sid);
+						confirmWakeSpawn(d.workstreamId, tabRunId, {
+							stateDir: opts.stateDir,
+							mailboxDir: opts.mailboxDir,
+							sessionId: sid!,
+						});
+					} catch (e) {
+						auditWakeSpawnFailed(d.workstreamId, e instanceof Error ? e.message : String(e), {
+							stateDir: opts.stateDir,
+							sessionId: sid,
+						});
+					}
+				}
+			} catch {
+				/* 唤醒循环永不破坏会话 */
+			}
+		}, opts.intervalMs ?? 30_000);
 		interval.unref?.();
 	});
 	return () => {

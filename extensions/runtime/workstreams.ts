@@ -279,6 +279,11 @@ export function listAudit(stateDir?: string, limit = 100): WorkstreamAuditEntry[
 	return readAuditLines(stateDir, limit);
 }
 
+/** 审计写入口（wake 等模块复用 F21 尾迹；调用方传 session 显式归属）。 */
+export function auditWorkstreamOp(stateDir: string | undefined, session: string | undefined, op: string, id: string, summary?: string): void {
+	audit(stateDir, session, op, id, summary);
+}
+
 function readAuditLines(stateDir: string | undefined, limit: number): WorkstreamAuditEntry[] {
 	let lines: string[];
 	try {
