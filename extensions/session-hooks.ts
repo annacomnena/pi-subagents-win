@@ -9,7 +9,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { clearAsyncPanelUi } from "./async-panel.ts";
-import { isMainSession, isSubagent, isTraceWorker } from "./identity.ts";
+import { isMainSession, isSubagent } from "./identity.ts";
+import { isTraceWorker } from "./capabilities.ts";
 import { sessionIdentity } from "./links.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";

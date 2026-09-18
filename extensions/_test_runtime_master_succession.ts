@@ -27,6 +27,9 @@ import {
 	readProposal,
 } from "./runtime/master-succession.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
+// R1 回归网：session-hooks 仅定义无顶层执行，导入即验证全部 import 绑定可解析
+// （strip-types --check 只查语法，此导入补命名解析层）。
+import "./session-hooks.ts";
 
 let n = 0;
 const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
