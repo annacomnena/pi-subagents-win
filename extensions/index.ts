@@ -45,8 +45,20 @@ import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyn
 import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer } from "./mailbox-consumer.ts";
-import { attachMaster, detachMaster, readAttachment, readCutover, setCutover } from "./runtime/registry.ts";
+import { readAttachment, readCutover, setCutover } from "./runtime/registry.ts";
 import { attachMasterWithAudit, detachMasterWithAudit } from "./runtime/adapters/session-lifecycle.ts";
+import {
+	createTask,
+	createWorkstream,
+	enrichRunRefs,
+	listAudit,
+	listTasks,
+	listWorkstreams,
+	readWorkstream,
+	setTaskStatus,
+	updateWorkstream,
+} from "./runtime/workstreams.ts";
+import { listProjectedRuns } from "./runtime/state-store.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
 import { mailboxBacklog } from "./runtime/mailbox.ts";
 import { masterAddress } from "./runtime/address.ts";
@@ -1662,6 +1674,103 @@ export default function (pi: ExtensionAPI) {
 			const d = detachMasterWithAudit({ sessionId: sid, generation: att.generation, reason: (args ?? "").trim() || undefined });
 			if (!d.ok) { ctx.ui.notify("master-detach 失败：not-owner", "warning"); return; }
 			ctx.ui.notify(`master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`, "info");
+		},
+	});
+
+	// ── /workstream* /task-* 命令（Phase 5a，A7 F18：显式优先）──
+	const wsSid = (ctx: unknown): string | undefined => sessionIdentity(ctx as never);
+	pi.registerCommand("workstream-create", {
+		description: "创建 Workstream：/workstream-create <mission> [--criteria <成功标准>]",
+		handler: async (args, ctx) => {
+			const raw = (args ?? "").trim();
+			if (!raw) { ctx.ui.notify("用法：/workstream-create <mission> [--criteria <成功标准>]", "warning"); return; }
+			const ci = raw.indexOf("--criteria");
+			const mission = (ci < 0 ? raw : raw.slice(0, ci)).trim();
+			const criteria = ci < 0 ? undefined : raw.slice(ci + "--criteria".length).trim() || undefined;
+			try {
+				const ws = createWorkstream({ mission, successCriteria: criteria, session: wsSid(ctx) });
+				ctx.ui.notify(`workstream 已创建：${ws.id}\nmission=${mission.slice(0, 80)}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`workstream-create 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("workstream", {
+		description: "查看 Workstream：/workstream [id]（无 id 列全部，含关联 runs 派生）",
+		handler: async (args, ctx) => {
+			const id = (args ?? "").trim();
+			if (!id) {
+				const all = listWorkstreams();
+				if (!all.length) { ctx.ui.notify("暂无 workstream（/workstream-create 创建）", "info"); return; }
+				ctx.ui.notify(all.map((w) => `${w.id} [${w.status}] ${w.mission.slice(0, 60)}`).join("\n"), "info");
+				return;
+			}
+			const ws = readWorkstream(id);
+			if (!ws) { ctx.ui.notify(`workstream 不存在：${id}`, "warning"); return; }
+			const tasks = listTasks(ws.id);
+			// 关联 runs（enrichment 派生，读时计算，F18）
+			const runs = listProjectedRuns();
+			const linked = runs.filter((r) => enrichRunRefs(r, tasks, [ws]).workstreamRef === ws.id);
+			const lines = [
+				`${ws.id} [${ws.status}]`,
+				`mission=${ws.mission}`,
+				ws.successCriteria ? `criteria=${ws.successCriteria}` : null,
+				`tasks=${tasks.map((t) => `${t.id.slice(0, 14)}:${t.status}`).join(" ") || "(none)"}`,
+				`runs=${linked.map((r) => `${r.subject.split("/").pop()}${r.status === "completed" ? "✓" : "…"}`).join(" ") || "(none)"}`,
+			].filter((l): l is string => Boolean(l));
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+	pi.registerCommand("workstream-link", {
+		description: "关联任务到 Workstream：/workstream-link <ws-id> <extId|run://…>…（run:// 精确，裸 id 为 label）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const [wsId, ...refs] = parts;
+			if (!wsId || !refs.length) { ctx.ui.notify("用法：/workstream-link <ws-id> <extId|run://…>…", "warning"); return; }
+			const ws = readWorkstream(wsId);
+			if (!ws) { ctx.ui.notify(`workstream 不存在：${wsId}`, "warning"); return; }
+			const runSubjects = [...(ws.taskSelector?.runSubjects ?? [])];
+			const externalTaskIds = [...(ws.taskSelector?.externalTaskIds ?? [])];
+			for (const ref of refs) {
+				if (ref.startsWith("run://")) { if (!runSubjects.includes(ref)) runSubjects.push(ref); }
+				else if (!externalTaskIds.includes(ref)) externalTaskIds.push(ref);
+			}
+			updateWorkstream(wsId, { taskSelector: { runSubjects, externalTaskIds }, session: wsSid(ctx) });
+			ctx.ui.notify(`已关联 ${refs.length} 个引用到 ${wsId}`, "info");
+		},
+	});
+	pi.registerCommand("task-create", {
+		description: "创建 Task：/task-create <objective> [--for <ws-id>] [--ext <外部任务号>]",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const flag = (name: string): string | undefined => {
+				const i = parts.indexOf(name);
+				return i >= 0 ? parts[i + 1] : undefined;
+			};
+			const objective = parts.filter((p, i) => !p.startsWith("--") && parts[i - 1] !== "--for" && parts[i - 1] !== "--ext").join(" ");
+			if (!objective) { ctx.ui.notify("用法：/task-create <objective> [--for <ws-id>] [--ext <外部任务号>]", "warning"); return; }
+			try {
+				const t = createTask({ objective, workstreamId: flag("--for") as never, externalTaskId: flag("--ext"), session: wsSid(ctx) });
+				ctx.ui.notify(`task 已创建：${t.id}（pending）`, "info");
+			} catch (e) {
+				ctx.ui.notify(`task-create 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("task-close", {
+		description: "关闭 Task：/task-close <task-id> <completed|failed|cancelled>",
+		handler: async (args, ctx) => {
+			const [id, status] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			if (!id || !["completed", "failed", "cancelled"].includes(status ?? "")) {
+				ctx.ui.notify("用法：/task-close <task-id> <completed|failed|cancelled>", "warning"); return;
+			}
+			try {
+				const t = setTaskStatus(id, status as never, { session: wsSid(ctx) });
+				if (!t) { ctx.ui.notify(`task 不存在：${id}`, "warning"); return; }
+				ctx.ui.notify(`task ${id.slice(0, 14)} → ${t.status}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`task-close 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
 		},
 	});
 

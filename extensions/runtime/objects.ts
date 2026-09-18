@@ -43,6 +43,30 @@ export interface WorkstreamRecord {
 	/** 指向 workspace 的引用（Logical Address 或文件路径），Phase 1 不解释。 */
 	workspaceRef?: string;
 
+	/** 成功标准（用户意图，Phase 5 前置 hydrate/GUI 消费）。v1.1 additive。 */
+	successCriteria?: string;
+
+	/**
+	 * 任务选择器（v1.1 additive，A7 F18）：显式 run/subject 精确匹配优先，
+	 * externalTaskId label 匹配为 best-effort（同 label 重试 run 会被一并吸入，
+	 * enrichment 必须标注匹配方式）。用户维护，telemetry 永不回写。
+	 */
+	taskSelector?: {
+		runSubjects?: string[];
+		externalTaskIds?: string[];
+	};
+
+	/**
+	 * 唤醒策略（v1.1 additive，A7 F20；5d 前只存储不评估）。
+	 * cooldownMs 必填（防无限重生）；workstream.pause 为 day-one 灭火开关。
+	 */
+	wakePolicy?: {
+		enabled: boolean;
+		cooldownMs: number;
+		debounceMs?: number;
+		maxSpawns?: number;
+	};
+
 	createdAt: string;
 	updatedAt: string;
 }
@@ -66,6 +90,11 @@ export interface TaskRecord {
 
 	status: RuntimeTaskStatus;
 
+	/**
+	 * 状态语义（A7 F18）：本字段只承载用户意图。库仅允许 pending / cancelled /
+	 * completed / failed 手设；running / waiting / blocked 为 telemetry 保留位，
+	 * 运行进度读时经 taskRef 查询派生、永不落盘。双真相源在此终结。
+	 */
 	createdAt: string;
 	updatedAt: string;
 }
