@@ -37,6 +37,7 @@ import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
+import { getPendingReminder } from "./runtime/master-succession.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { registerMasterTools } from "./master-tools.ts";
@@ -1957,6 +1958,9 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
+		// S2 提议制交接提醒缝（M5）：存在 pending proposal 即追加短提醒（§12），否则零注入。
+		const successionReminder = getPendingReminder();
+		if (successionReminder) lines.push(successionReminder);
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 

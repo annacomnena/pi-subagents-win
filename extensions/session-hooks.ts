@@ -9,9 +9,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { clearAsyncPanelUi } from "./async-panel.ts";
-import { isMainSession, isTraceWorker } from "./identity.ts";
+import { isMainSession, isSubagent, isTraceWorker } from "./identity.ts";
+import { sessionIdentity } from "./links.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
+import { masterAddress } from "./runtime/address.ts";
+import { readPressure } from "./runtime/master-pressure.ts";
+import { maybePropose } from "./runtime/master-succession.ts";
+import { readAttachment } from "./runtime/registry.ts";
 
 export interface SessionHooksDeps {
 	cleanups: Array<() => void>;
@@ -126,5 +131,30 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			return { skillPaths: [] };
 		}
 		return { skillPaths: [join(deps.pkgDir, "skills")] };
+	});
+
+	// S2 提议制交接的 turn 检查（M5）：agent turn 结束 → 读本会话压力 →
+	// owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）。
+	// gauge 永不打断主流程：任何异常静默吞掉；subagent 进程跳过。
+	pi.on("agent_end", (_event, ctx) => {
+		try {
+			if (isSubagent()) return;
+			const sid = sessionIdentity(ctx as never);
+			if (!sid || sid === "unknown") return;
+			const att = readAttachment(masterAddress());
+			if (!att || att.sessionId !== sid) return;
+			const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
+			if (typeof getUsage !== "function") return;
+			const reading = readPressure(getUsage.call(ctx) as never);
+			const r = maybePropose({ sessionId: sid, generation: att.generation, reading });
+			if (!r.proposed) return;
+			try {
+				const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
+				ui?.notify?.(
+					`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
+					"warning",
+				);
+			} catch { /* 通知尽力而为，proposal 已落盘 */ }
+		} catch { /* gauge 永不打断主流程 */ }
 	});
 }
