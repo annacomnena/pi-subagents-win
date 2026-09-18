@@ -1,0 +1,233 @@
+/**
+ * master-tools.ts — Agent-callable Master Tools（Phase 5.5 M2）。
+ *
+ * 与 /master-* 命令共用 runtime/master-control.ts（M1），零逻辑复制。
+ * 纯逻辑函数（显式 sessionId，可单测）+ registerMasterTools(pi) 薄注册层。
+ *
+ * 调用纪律（见各 tool description）：仅在用户明确要求时调用；
+ * 不要手工组合 attach/detach/cutover 做交接——succession 走 master-transfer（M3）。
+ * F9：sessionId 取自 tool ctx，禁参数传入；"unknown" 身份拒绝（比命令层更严，
+ * 命令层的 !sid guard 历史上不可达，冻结不动）。
+ */
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { sessionIdentity } from "./links.ts";
+import { isSubagent } from "./identity.ts";
+import {
+	attachCurrentSession,
+	getMasterStatus,
+	issueMasterHandoffToken,
+	prepareMasterHandoff,
+	setMasterCutover,
+} from "./runtime/master-control.ts";
+
+export interface ToolOutcome {
+	text: string;
+	isError?: boolean;
+	details?: Record<string, unknown>;
+}
+
+/** 与 /master-status 同文案。 */
+export function masterStatusLogic(): ToolOutcome {
+	const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
+	const lines = [
+		`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
+		`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
+		`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
+		`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
+	];
+	return { text: `Master status:\n${lines.join("\n")}` };
+}
+
+export function masterAttachLogic(
+	sessionId: string,
+	input: { token?: string; forceStale?: boolean; confirm?: boolean } = {},
+): ToolOutcome {
+	if (input.forceStale && !input.confirm) {
+		return { text: "master-attach: --force-stale 须与 confirm 同用（二次人工确认），拒绝", isError: true };
+	}
+	const r = attachCurrentSession({ sessionId, token: input.token, forceStale: input.forceStale || undefined });
+	if (!r.ok) return { text: `master-attach 失败：${r.reason}`, isError: true };
+	return {
+		text: `master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sessionId.slice(0, 12)}`,
+		details: { generation: r.attachment.generation, genesis: r.genesis },
+	};
+}
+
+export function masterCutoverLogic(
+	sessionId: string,
+	input: { enabled: boolean },
+): ToolOutcome {
+	const st = setMasterCutover({ enabled: input.enabled, by: sessionId });
+	if (!st.ok) {
+		return { text: "master-cutover: 尚未 attach（先 /master-attach），拒绝开启", isError: true };
+	}
+	return {
+		text: `master-cutover 已${st.enabled ? "开启" : "关闭"}（by=${sessionId.slice(0, 12)}）`,
+		details: { enabled: st.enabled },
+	};
+}
+
+export function masterDetachLogic(
+	sessionId: string,
+	input: { reason?: string } = {},
+): ToolOutcome {
+	const d = issueMasterHandoffToken({ sessionId, reason: input.reason });
+	if (!d.ok) {
+		return {
+			text: "precheck" in d ? "master-detach: 你不是当前 owner，拒绝" : "master-detach 失败：not-owner",
+			isError: true,
+		};
+	}
+	return {
+		text: `master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`,
+		details: { token: d.token },
+	};
+}
+
+export function masterHandoffLogic(input: { repoRoot?: string } = {}): ToolOutcome {
+	try {
+		const doc = prepareMasterHandoff({ repoRoot: input.repoRoot });
+		const present = doc.manifest.filter((m) => m.present).length;
+		return {
+			text: `handoff 已生成：${doc.path}\nmanifest ${present}/${doc.manifest.length} 项 present`,
+			details: { path: doc.path, present, total: doc.manifest.length },
+		};
+	} catch (e) {
+		return { text: `master-handoff 失败：${e instanceof Error ? e.message : String(e)}`, isError: true };
+	}
+}
+
+const USER_DIRECTIVE = "仅在用户明确要求时调用；禁止自行决定接管/交接/切换。";
+const NO_COMPOSE = "不要手工组合 attach/detach/cutover 执行 succession；交接走 master-transfer（未发布前走 /master-detach 发 token + 新会话 attach 流程）。";
+
+function toolSession(ctx: unknown): string {
+	return sessionIdentity(ctx as never);
+}
+
+function textResult(outcome: ToolOutcome): { content: { type: string; text: string }[]; details?: Record<string, unknown>; isError?: boolean } {
+	return {
+		content: [{ type: "text", text: outcome.text }],
+		...(outcome.details ? { details: outcome.details } : {}),
+		...(outcome.isError ? { isError: true } : {}),
+	};
+}
+
+export function registerMasterTools(pi: ExtensionAPI): void {
+	const subBlocked = () => isSubagent();
+
+	pi.registerTool({
+		name: "master-status",
+		label: "Master Status",
+		description: `查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压。只读，随时可调。${USER_DIRECTIVE}`,
+		parameters: Type.Object({}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-status"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, _rawParams) {
+			const outcome = masterStatusLogic();
+			return textResult({ ...outcome, details: { text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-handoff",
+		label: "Master Handoff",
+		description: `生成交接包 markdown（只读装配，只落盘不注入）。${USER_DIRECTIVE}`,
+		parameters: Type.Object({
+			repoRoot: Type.Optional(Type.String({ description: "仓库根目录（缺省当前目录）" })),
+		}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-handoff"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as { repoRoot?: string };
+			const outcome = masterHandoffLogic({ repoRoot: params.repoRoot });
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-attach",
+		label: "Master Attach",
+		description: `显式接管逻辑 Master（genesis / token 交接 / forceStale 强接需 confirm 双确认）。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		parameters: Type.Object({
+			token: Type.Optional(Type.String({ description: "handoff token（接班时用）" })),
+			forceStale: Type.Optional(Type.Boolean({ description: "owner 失联时强接（必须与 confirm 同用）" })),
+			confirm: Type.Optional(Type.Boolean({ description: "与 forceStale 同用的二次确认" })),
+		}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-attach"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: "子 agent 不可接管 Master", isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: "master-attach: 无法确定当前会话身份，拒绝", isError: true });
+			const params = rawParams as { token?: string; forceStale?: boolean; confirm?: boolean };
+			const outcome = masterAttachLogic(sid, params);
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-detach",
+		label: "Master Detach",
+		description: `交出逻辑 Master 并颁发 handoff token（仅 owner 可调）。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		parameters: Type.Object({
+			reason: Type.Optional(Type.String({ description: "交接原因" })),
+		}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-detach"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: "子 agent 不可交出 Master", isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: "master-detach: 无法确定当前会话身份，拒绝", isError: true });
+			const params = rawParams as { reason?: string };
+			const outcome = masterDetachLogic(sid, params);
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-cutover",
+		label: "Master Cutover",
+		description: `切换消费端接管总开关（开启需已 attach）。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		parameters: Type.Object({
+			enabled: Type.Boolean({ description: "true 开启 / false 关闭" }),
+		}),
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-cutover"))} ${theme.fg("accent", String((args as { enabled?: boolean }).enabled ?? "?"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: "子 agent 不可切换 cutover", isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: "master-cutover: 无法确定当前会话身份，拒绝", isError: true });
+			const params = rawParams as { enabled?: boolean };
+			if (typeof params.enabled !== "boolean") return textResult({ text: "用法：master-cutover {enabled: true|false}", isError: true });
+			const outcome = masterCutoverLogic(sid, { enabled: params.enabled });
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+}

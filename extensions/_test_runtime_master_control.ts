@@ -27,6 +27,13 @@ import {
 	prepareMasterHandoff,
 	setMasterCutover,
 } from "./runtime/master-control.ts";
+import {
+	masterAttachLogic,
+	masterCutoverLogic,
+	masterDetachLogic,
+	masterHandoffLogic,
+	masterStatusLogic,
+} from "./master-tools.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 
@@ -85,6 +92,27 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 	assert.equal(typeof doc.path, "string");
 	assert.ok(Array.isArray(doc.manifest));
 	ok("prepareMasterHandoff 返回 doc");
+}
+
+// ⑥ tool 纯逻辑（显式 sessionId，与命令同文案）
+{
+	const s = masterStatusLogic();
+	assert.match(s.text, /attachment: /);
+	const cf = masterAttachLogic("sess_x", { forceStale: true });
+	assert.equal(cf.isError, true);
+	const co = masterCutoverLogic("sess_owner_1", { enabled: false });
+	assert.equal(co.isError, undefined);
+	assert.match(co.text, /关闭/);
+	const bad = masterDetachLogic("sess_other");
+	assert.equal(bad.isError, true);
+	assert.match(bad.text, /不是当前 owner/);
+	const good = masterDetachLogic("sess_owner_1", { reason: "tool-test" });
+	assert.equal(good.isError, undefined);
+	assert.match(good.text, /handoff token=ho_/);
+	const h = masterHandoffLogic({});
+	assert.equal(h.isError, undefined);
+	assert.match(h.text, /manifest \d+\/\d+ 项 present/);
+	ok("master-tools 纯逻辑：文案 parity + 门控");
 }
 
 console.log(`\n# pass ${n}`);
