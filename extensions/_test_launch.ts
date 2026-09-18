@@ -90,6 +90,7 @@ assert.ok(bound.includes("你是项目经理") && bound.includes("禁止自己�
 assert.ok(bound.includes("tab-finish"), "约束块必须强提醒完成后 tab-finish 回报主会话");
 assert.ok(bound.includes("严禁再调用 `launch-tabs`"), "tab 约束必须禁止嵌套 launch-tabs");
 assert.ok(bound.endsWith("按计划实施"), "原始 handoff 应保留在末尾");
+assert.ok(!bound.includes("busy-poll"), "worker prompt 不得含禁轮询文本（worker 面零加噪；STOP 合法终态与 tab-finish 纪律冲突）");
 
 // 已带前缀时不重复，约束块插在中间
 const bound2 = buildWorkflowTabPrompt({ taskId: "1008", prompt: "根据workflow进行工作1008\n\n执行" }, skillPath);

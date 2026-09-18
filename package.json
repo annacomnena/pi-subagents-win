@@ -38,6 +38,7 @@
     "smoke:reclaim-loop": "node --experimental-strip-types ./extensions/_smoke_reclaim_loop.ts",
     "smoke:real-tab": "node ./scripts/real-tab-smoke.mjs",
     "test:launch": "node --experimental-strip-types ./extensions/_test_launch.ts",
+    "test:no-poll": "node --experimental-strip-types ./extensions/_test_no_poll.ts",
     "test:runtime-core": "node --experimental-strip-types ./extensions/_test_runtime_core.ts",
     "test:runtime-journal": "node --experimental-strip-types ./extensions/_test_runtime_journal.ts",
     "test:runtime-projector": "node --experimental-strip-types ./extensions/_test_runtime_projector.ts",
@@ -72,8 +73,10 @@
     "test:runtime-master-transfer": "node --experimental-strip-types ./extensions/_test_runtime_master_transfer.ts",
     "test:runtime-master-pressure": "node --experimental-strip-types ./extensions/_test_runtime_master_pressure.ts",
     "test:runtime-master-succession": "node --experimental-strip-types ./extensions/_test_runtime_master_succession.ts",
+    "test:runtime-master-auto": "node --experimental-strip-types ./extensions/_test_runtime_master_auto.ts",
     "test:runtime-workstream": "node --experimental-strip-types ./extensions/_test_runtime_workstream.ts",
     "test:runtime-hydrate": "node --experimental-strip-types ./extensions/_test_runtime_hydrate.ts",
+    "test:runtime-snapshot": "node --experimental-strip-types ./extensions/_test_runtime_snapshot.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts"
   },
   "dependencies": {

@@ -32,6 +32,7 @@ import {
 	meetsProposalThreshold,
 	readPressure,
 } from "./runtime/master-pressure.ts";
+import type { MasterSuccessionConfig } from "./runtime/master-auto.ts";
 
 export interface ToolOutcome {
 	text: string;
@@ -39,16 +40,21 @@ export interface ToolOutcome {
 	details?: Record<string, unknown>;
 }
 
-/** 与 /master-status 同文案。 */
-export function masterStatusLogic(): ToolOutcome {
+/** 与 /master-status 同文案；带 cfg 时多一行 auto-handoff 观测（S3，缺省不显示）。 */
+export function masterStatusLogic(cfg?: MasterSuccessionConfig): ToolOutcome {
 	const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
 	const lines = [
 		`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
 		`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
 		`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
 		`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
+		...(cfg ? [autoHandoffLine(cfg)] : []),
 	];
 	return { text: `Master status:\n${lines.join("\n")}` };
+}
+
+function autoHandoffLine(cfg: MasterSuccessionConfig): string {
+	return `auto-handoff: ${cfg.auto ? "ON" : "OFF"} (autoPercent=${cfg.autoPercent})`;
 }
 
 export function masterAttachLogic(
@@ -163,7 +169,10 @@ export function masterPressureLogic(usage: unknown): ToolOutcome {
 	};
 }
 
-export function registerMasterTools(pi: ExtensionAPI, opts: { spawnSuccessor?: SpawnSuccessor } = {}): void {
+export function registerMasterTools(
+	pi: ExtensionAPI,
+	opts: { spawnSuccessor?: SpawnSuccessor; masterSuccession?: () => MasterSuccessionConfig } = {},
+): void {
 	const subBlocked = () => isSubagent();
 
 	pi.registerTool({
@@ -179,7 +188,7 @@ export function registerMasterTools(pi: ExtensionAPI, opts: { spawnSuccessor?: S
 			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
 		},
 		async execute(_toolCallId, _rawParams) {
-			const outcome = masterStatusLogic();
+			const outcome = masterStatusLogic(opts.masterSuccession?.());
 			return textResult({ ...outcome, details: { text: outcome.text } });
 		},
 	});

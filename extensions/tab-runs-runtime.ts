@@ -49,7 +49,9 @@ export function registerTabTelemetry(
 	// 不在此同步早退：CLI flag（--tab-run-id）在扩展加载完成后才就绪，
 	// 工厂里 getTabRunId() 可能返回 undefined。改为事件回调/工具执行时惰性解析。
 	// 非标签页进程里回调会因 resolveRunId() 返回 undefined 而直接跳过。
-	const runsDir = opts?.runsDir ?? process.env.PI_TAB_RUNS_DIR ?? defaultTabRunsDir();
+	// 空串 env（子 agent 进程注入 PI_TAB_RUNS_DIR=""）视为未设置 → 落默认（|| 链，2026-09-18 与
+	// timers-runtime.targetRunTerminal 同型空串坑一并修；?? 链会把空串当有效目录）
+	const runsDir = opts?.runsDir || process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir();
 	const resolveRunId = (): string | undefined => {
 		if (opts?.tabRunId) return opts.tabRunId;
 		const id = getTabRunId();
@@ -430,6 +432,7 @@ export function registerTabStatusTools(
 			"回收标签页结果：reclaim-tabs({ runIds, includeText? })。",
 			"永不阻塞、立即返回当前快照（2026-08-13 起移除轮询硬等；wait/timeoutMs/intervalMs 为废弃参数，仅向后兼容，调用方不应依赖）。",
 			"完成感知交给 event-bus（子 tab 写 result.json 自动唤醒主会话），编排巡检用 set-timer。",
+			"禁轮询: 不要用 turn 反复重调本工具/tab-status 等待状态变化；等待靠完成事件 + 一次性 set-timer 兜底。",
 			"返回 ready[]（终态可取结果）/ pending[]（进行中）/ awaitingInput[]（等待输入，非完成）/ failed[]（unconfirmed 或派发失败）/ orphaned[]。",
 			"result 缺失的终态标 resultMissing=true + completion=unconfirmed，绝不静默当成功。",
 		].join(" "),

@@ -30,6 +30,7 @@ import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath } from "./links.ts";
+import { NO_POLL_HINT } from "./no-poll.ts";
 import { recipientSessionIdFor } from "./report.ts";
 
 export const EVENT_BUS_WATCH_KEY = "subagent-event-bus";
@@ -160,6 +161,8 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 				reportPath || null,
 				openIssues || null,
 				`下一步: 用 reclaim-tabs({ runIds: ["${runId}"] }) 确认并编排后续。`,
+				// 完成/回报类事件唤醒 → 附禁轮询 compact hint（条件追加判据见 no-poll.ts 头注释）
+				NO_POLL_HINT,
 			].filter((l): l is string => Boolean(l)).join("\n");
 			opts.sendUserMessage?.(body, { deliverAs: "followUp" });
 			if (gateCtx) postInject(gateCtx, true); // 注入成功 → 确认收据（4d 三路去重）

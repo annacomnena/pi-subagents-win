@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
 import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
+import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
@@ -183,7 +184,7 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 
 	try {
 		opts.sendUserMessage?.(
-			`📨 ${record.from} 主动回报：${record.message}${record.taskId ? `\ntask=${record.taskId}` : ""}${record.summary ? `\n摘要: ${record.summary}` : ""}\n请处理这份回报并决定下一步。`,
+			`📨 ${record.from} 主动回报：${record.message}${record.taskId ? `\ntask=${record.taskId}` : ""}${record.summary ? `\n摘要: ${record.summary}` : ""}\n请处理这份回报并决定下一步。\n${NO_POLL_HINT}`,
 			{ deliverAs: "followUp" },
 		);
 		if (gateCtx) postInject(gateCtx, true);

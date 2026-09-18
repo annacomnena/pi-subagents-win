@@ -111,6 +111,7 @@ try {
 		assert.equal(r.consumed[0]!.action, "injected");
 		assert.equal(sent.length, 1, "恰好注入一次");
 		assert.ok(sent[0]!.includes("tab_c1"));
+		assert.ok(sent[0]!.includes("busy-poll"), "mailbox 完成信正文应含禁轮询纪律");
 		assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "收据确认");
 		assert.ok(existsSync(join(RUNSDIR, "tab_c1.notified")), ".notified 补认领");
 		// 重扫：已 ack，不重注

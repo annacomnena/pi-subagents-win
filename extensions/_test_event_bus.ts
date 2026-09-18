@@ -82,6 +82,7 @@ function writeResult(runId: string, status = "completed") {
 	assert.ok(sent[0].includes("plans/20260806.md"), "回报应带 artifacts");
 	assert.ok(sent[0].includes("plans/20260806_research.md"), "回报应带 reportPath");
 	assert.ok(sent[0].includes("$0.0123"), "回报应带 cost");
+	assert.ok(sent[0].includes("busy-poll"), "完成通知应含禁轮询纪律");
 
 	const result = readTabResultFile(dir, "tab_reclaim");
 	assert.equal(result?.status, "completed");

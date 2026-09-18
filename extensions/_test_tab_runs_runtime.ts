@@ -206,6 +206,24 @@ writeTabDispatch(runsDir, dispatch);
 	rmSync(runsDir2, { recursive: true, force: true });
 }
 
+// ── runsDir 空串回退（|| 链，2026-09-18 与 timers-runtime 同类空串坑一并修）────────
+{
+	const envDir = mkdtempSync(join(tmpdir(), "tab-runtime-emptystr-"));
+	const TAB4 = "tab_runtime_empty";
+	process.env.PI_TAB_RUNS_DIR = envDir; // 顶部已 delete，块尾恢复
+	try {
+		const pi = makeFakePi();
+		registerTabTelemetry(pi, { tabRunId: TAB4, runsDir: "" }); // 空串不得短路链路（?? 链会写到 cwd 相对路径）
+		await pi.emit("session_start", { reason: "startup" }, { sessionManager: { getSessionFile: () => "C:/pi/sess/y.jsonl" } });
+		const s = readTabState(envDir, TAB4);
+		assert.ok(s, "runsDir 空串应回退 env 目录写 state（而非 cwd/空串路径）");
+		assert.equal(s?.phase, "attached");
+	} finally {
+		delete process.env.PI_TAB_RUNS_DIR;
+		rmSync(envDir, { recursive: true, force: true });
+	}
+}
+
 rmSync(runsDir, { recursive: true, force: true });
 
 console.log("tab-runs-runtime tests passed");

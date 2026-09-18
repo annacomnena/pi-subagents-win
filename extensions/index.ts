@@ -41,6 +41,8 @@ import { getPendingReminder } from "./runtime/master-succession.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { registerMasterTools } from "./master-tools.ts";
+import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
+import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
@@ -68,7 +70,8 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { getTabRunId, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
 import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
@@ -181,6 +184,8 @@ interface AgentConfig {
 	searcherMode?: "auto" | "serial" | "parallel";
 	/** lite 轻量工作流模式：off（默认，零注入）、on（一律走 lite 链）、auto（按任务判据自选）；逻辑在 lite-mode.ts */
 	liteMode?: LiteMode;
+	/** S3 自动交接（A1）：默认 auto:false；归一化见 master-auto.ts */
+	masterSuccession?: MasterSuccessionConfig;
 }
 
 function configPath(): string {
@@ -197,9 +202,10 @@ function readConfig(): AgentConfig {
 			notifications: parsed.notifications !== false,
 			searcherMode: parsed.searcherMode ?? "auto",
 			liteMode: parsed.liteMode ?? "off",
+			masterSuccession: normalizeMasterSuccession(parsed.masterSuccession),
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off" };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off", masterSuccession: normalizeMasterSuccession(undefined) };
 	}
 }
 
@@ -1694,6 +1700,19 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`master-cutover 已${st.enabled ? "开启" : "关闭"}（by=${sid.slice(0, 12)}）`, "info");
 		},
 	});
+	// S3 自动交接开关（A1）：持久化 config.json 切片，缺省 auto=false（OFF 零行为变化）
+	pi.registerCommand("master-auto-handoff", {
+		description: "S3 自动交接开关：/master-auto-handoff on|off（持久化 config，默认 off）",
+		handler: async (args, ctx) => {
+			const want = (args ?? "").trim().toLowerCase();
+			if (want !== "on" && want !== "off") { ctx.ui.notify("用法：/master-auto-handoff on|off", "warning"); return; }
+			const cfg = reloadConfig();
+			cfg.masterSuccession.auto = want === "on";
+			writeConfig(cfg);
+			reloadConfig();
+			ctx.ui.notify(`master 自动交接${want === "on" ? "已开启" : "已关闭"}（autoPercent=${cfg.masterSuccession.autoPercent}%，proposalPercent=${cfg.masterSuccession.proposalPercent}%）`, "info");
+		},
+	});
 	pi.registerCommand("master-detach", {
 		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]）",
 		handler: async (args, ctx) => {
@@ -1835,47 +1854,50 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
-	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）
-	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR });
+	// 后继 spawn 通道（wt.exe + spawnPiTab + 失败写 launch_failed）：master-transfer 工具与
+	// S3 自动交接共用同一闭包（M3 内联实现原样提取，零逻辑变化）
+	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId }) => {
+		const wtPath = findWindowsTerminal();
+		if (!wtPath) throw new Error("master-transfer: no wt.exe");
+		const piCli = findPiCli();
+		const runId = newTabRunId();
+		const taskId = `transfer-${transferId.slice(3, 9)}`;
+		const cwd = process.cwd();
+		const runsDir = defaultTabRunsDir();
+		const dispatch: TabDispatchRecord = {
+			id: runId, version: 1, taskId, mode: "execute", title, cwd,
+			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+		};
+		writeTabDispatch(runsDir, dispatch);
+		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+		recordLink({ sessionId, kind: "tab", targetId: runId, detail: `transfer=${transferId}` });
+		const result = spawnPiTab({
+			wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
+			onSpawnError: (err) => {
+				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+				writeTabDispatch(runsDir, failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			},
+		});
+		if (result.error) {
+			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
+			writeTabDispatch(runsDir, failed);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			throw new Error(result.error);
+		}
+		return { successorRunId: runId };
+	};
+
+	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）；
+	// S3：spawn 通道 + 配置读取闭包一并传入（不传 = 不启用自动交接块）
+	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR, spawnSuccessor, masterSuccession: () => readConfig().masterSuccession });
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
 
 	// master tools：agent 可调用的 Master 控制（M2/M3，与 /master-* 同服务层）
-	registerMasterTools(pi, {
-		spawnSuccessor: ({ transferId, title, prompt, sessionId }) => {
-			const wtPath = findWindowsTerminal();
-			if (!wtPath) throw new Error("master-transfer: no wt.exe");
-			const piCli = findPiCli();
-			const runId = newTabRunId();
-			const taskId = `transfer-${transferId.slice(3, 9)}`;
-			const cwd = process.cwd();
-			const runsDir = defaultTabRunsDir();
-			const dispatch: TabDispatchRecord = {
-				id: runId, version: 1, taskId, mode: "execute", title, cwd,
-				dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
-			};
-			writeTabDispatch(runsDir, dispatch);
-			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
-			recordLink({ sessionId, kind: "tab", targetId: runId, detail: `transfer=${transferId}` });
-			const result = spawnPiTab({
-				wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
-				onSpawnError: (err) => {
-					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
-					writeTabDispatch(runsDir, failed);
-					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				},
-			});
-			if (result.error) {
-				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
-				writeTabDispatch(runsDir, failed);
-				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				throw new Error(result.error);
-			}
-			return { successorRunId: runId };
-		},
-	});
+	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession });
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
@@ -1958,6 +1980,8 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
+		// 主会话专属禁轮询纪律（isMainSession 门：tab/子 agent 不注入——"STOP 是合法终态"与 worker 的 tab-finish 纪律冲突，见 no-poll.ts 头注释）
+		if (isMainSession()) lines.push(NO_POLL_DISCIPLINE);
 		// S2 提议制交接提醒缝（M5）：存在 pending proposal 即追加短提醒（§12），否则零注入。
 		const successionReminder = getPendingReminder();
 		if (successionReminder) lines.push(successionReminder);

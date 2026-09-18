@@ -30,6 +30,7 @@ import {
 	readAllTimers,
 	readTimerFile,
 	rootTimerConsumable,
+	SAFE_ID_PART,
 	sweepStaleHeartbeats,
 	sweepTerminalTimers,
 	touchSessionHeartbeat,
@@ -38,6 +39,11 @@ import {
 	writeTimerAtomic,
 	type TimerRecord,
 } from "./timers.ts";
+import {
+	defaultTabRunsDir,
+	readTabResultFile,
+	readTabState,
+} from "./tab-runs.ts";
 
 const TICK_MS = 5000; // 调度器 tick；MIN_REPEAT_MS(10000) 必须 > 本值（P2-4）
 const STARTUP_FIRE_DELAY_MS = 1500;
@@ -56,6 +62,8 @@ export interface PumpScope {
 	cwd?: string;
 	/** identityless 进程：消费后重新盖章的会话 UUID（repeat 续期归属）。 */
 	sessionId?: string;
+	/** 目标终态守卫（2026-09-18）的 tab-runs 账本目录；缺省 env→默认（同 tab-runs-runtime 解析链）。 */
+	runsDir?: string;
 }
 
 /**
@@ -98,6 +106,20 @@ function fireOneTimer(
 	const current = readTimerFile(timersDir, record.id, scope.tabRunId);
 	if (!current || current.status !== "pending") return { fired: false, reason: "already terminal" };
 
+	// 0.5) 目标终态守卫（2026-09-18 盲开火修复）：指向已完成的 tab run 的 due timer →
+	//     置 skipped 不注入，避免对已完成 run 的过时催办。探测失败→照常开火（at-least-once：宁噪音不丢失）。
+	if (typeof current.target === "object" && current.target.tabRunId &&
+		targetRunTerminal(scope.runsDir, current.target.tabRunId)) {
+		const skipped: TimerRecord = {
+			...current,
+			status: "skipped",
+			skippedAt: new Date().toISOString(),
+			skippedReason: "target-terminal",
+		};
+		writeTimerAtomic(timersDir, skipped, { tabRunId: scope.tabRunId });
+		return { fired: false, reason: "target-terminal", record: skipped };
+	}
+
 	// 1) 先投递（2026-08-13 P1：at-least-once——原实现先置 fired 再 send，send 失败消息即丢且不重试；
 	//    现在投递失败保持 pending，下个 tick 自动重试。代价：send 成功但落账前崩溃可能重复投递一次，
 	//    对推进型 nudge 可接受）。
@@ -136,6 +158,24 @@ function fireOneTimer(
 }
 
 /**
+ * 目标 run 是否已终态（2026-09-18 盲开火守卫判据，复用 tab-runs 既有纯函数，零新判态逻辑）：
+ *   result.json 存在且合法，或 state.terminal === true。
+ * 失败语义：缺失/损坏/目录不存在/路径异常 → 一律 false（照常开火，回退旧行为；
+ * 盲开火的代价是噪音，误跳过的代价是丢失推进）。
+ */
+function targetRunTerminal(runsDir: string | undefined, tabRunId: string): boolean {
+	try {
+		if (!SAFE_ID_PART.test(tabRunId)) return false; // 不安全组件 → 不跳过（回退旧行为）
+		// 空串 env（子 agent 进程注入 PI_TAB_RUNS_DIR=""）视为未设置 → 落默认（与 identity.ts 空串兜底同义）
+		const dir = runsDir || process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir();
+		if (readTabResultFile(dir, tabRunId)) return true;
+		return readTabState(dir, tabRunId)?.terminal === true;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * 注册计时器调度器与工具。
  * 调用点：主扩展入口（index.ts default 内）。
  *
@@ -143,7 +183,7 @@ function fireOneTimer(
  * 后台资源），并用 generation token 根除 reload/replacement 的排队 tick /
  * 双实例瞬时窗口——过期周期的 tick 直接 no-op，绝不用旧 pi 发起 turn。
  */
-export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }): (() => void) | undefined {
+export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; runsDir?: string }): (() => void) | undefined {
 	const timersDir = opts?.timersDir ?? defaultTimersDir();
 
 	// ── 进程内调度器（子 agent 不调度）──
@@ -169,11 +209,11 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
 				const tabRunId = getTabRunId();
 				if (tabRunId) {
-					pumpDueTimers(pi, timersDir, { tabRunId });
+					pumpDueTimers(pi, timersDir, { tabRunId, runsDir: opts?.runsDir });
 				} else {
 					const sid = getCurrentSessionId();
 					if (sid) touchSessionHeartbeat(timersDir, sid); // 会话活性信号（所有权门槛依据）
-					pumpDueTimers(pi, timersDir, { cwd: process.cwd(), sessionId: sid });
+					pumpDueTimers(pi, timersDir, { cwd: process.cwd(), sessionId: sid, runsDir: opts?.runsDir });
 				}
 				// 定期维护（每 12 tick ≈ 60s）：终态 timer GC + 失活心跳清理
 				if (++tickCount % 12 === 0) {
@@ -238,6 +278,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 			"设置一个计时器：到期后系统自动向目标会话发送一条用户消息，推进工作（超长程任务基础设施）。",
 			"参数：message（到期自动发送的推进指令，≤2048 字符）；delayMs 或 dueAt（ISO，二选一）；target 缺省 self（当前会话）；也可传 { tabRunId, taskId? } 指向某标签页邮箱（仅主会话可写其他 tab）；label 可读说明；repeatMs ≥10000 可周期重发。",
 			"到期后消息以用户消息形态注入，TUI 可见、可人工接管；会话忙碌时自动排队不打断工具循环。",
+			"message 是一次性推进指令；不要写诱导模型逐 turn 轮询状态的 message。",
 			"每个目标（self 或单个 tab 邮箱）最多 50 个 pending timer。",
 		].join(" "),
 		parameters: Type.Object({
@@ -389,7 +430,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 		label: "List Timers",
 		description: "列出计时器：list-timers({ status?, tabRunId? })。返回每条的 id / dueAt / 剩余毫秒 / status / label / message 截断。缺省列出当前进程拥有的全部（self + 本 tab 邮箱）。",
 		parameters: Type.Object({
-			status: Type.Optional(Type.String({ description: "过滤：pending|fired|cancelled" })),
+			status: Type.Optional(Type.String({ description: "过滤：pending|fired|cancelled|skipped" })),
 			tabRunId: Type.Optional(Type.String({ description: "查看某标签页邮箱（仅主会话）" })),
 		}),
 		renderCall(args, theme) {
@@ -453,9 +494,9 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string }):
 			}
 			const filterRaw = (args ?? "").trim();
 			// P2-6：校验 filter 集合，非法时提示用法
-			const validFilters: TimerRecord["status"][] = ["pending", "fired", "cancelled", "missed"];
+			const validFilters: TimerRecord["status"][] = ["pending", "fired", "cancelled", "missed", "skipped"];
 			if (filterRaw && !validFilters.includes(filterRaw as TimerRecord["status"])) {
-				ctx.ui.notify(`用法: /timers [pending|fired|cancelled|missed]`,"warning");
+				ctx.ui.notify(`用法: /timers [pending|fired|cancelled|missed|skipped]`,"warning");
 				return;
 			}
 			const filter = filterRaw as TimerRecord["status"] | "";

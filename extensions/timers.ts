@@ -25,7 +25,7 @@ export const MAX_TIMER_MESSAGE = 2048;
 export const MAX_PENDING_TIMERS = 50;
 /** repeatMs 下限（防止自触发风暴）。必须 > 调度器 TICK_MS(5000)，否则同 tick 内可能重入（P2-4）。 */
 export const MIN_REPEAT_MS = 10_000;
-/** 终态 timer（fired/cancelled/missed）超过该时长即归档删除（防账本无限膨胀，2026-08-13）。 */
+/** 终态 timer（fired/cancelled/missed/skipped）超过该时长即归档删除（防账本无限膨胀，2026-08-13）。 */
 export const TERMINAL_TIMER_TTL_MS = 24 * 60 * 60 * 1000;
 /** session 心跳失活判定宽限（须 > 调度器 TICK_MS=5000，避免同会话 tick 抖动误判失活）。 */
 export const SESSION_HEARTBEAT_GRACE_MS = 15_000;
@@ -33,7 +33,7 @@ export const SESSION_HEARTBEAT_GRACE_MS = 15_000;
 // ── 类型 ──────────────────────────────────────────────────────────
 
 export type TimerTarget = "self" | { tabRunId: string; taskId?: string };
-export type TimerStatus = "pending" | "fired" | "cancelled" | "missed";
+export type TimerStatus = "pending" | "fired" | "cancelled" | "missed" | "skipped";
 
 export interface TimerRecord {
 	/** timer_<base36 时间戳>_<rand>，唯一键。 */
@@ -58,6 +58,10 @@ export interface TimerRecord {
 	fireCount?: number;
 	/** P2-3：最近一次触发时刻。 */
 	lastFiredAt?: string;
+	/** 2026-09-18 盲开火拦截：目标 run 已终态，调度器自动弃置（未 fire 过，不写 firedAt）。 */
+	skippedAt?: string;
+	/** 弃置原因（本修复恒为 "target-terminal"，预留枚举扩展）。 */
+	skippedReason?: string;
 	/** 拥有方目录（root/self timer 的创建进程 cwd；标签页邮箱 timer 不需要）。 */
 	ownerCwd?: string;
 	/** 拥有方会话 UUID（root/self timer 的创建会话；消费时重新盖章）。 */
@@ -139,8 +143,8 @@ export function validateTimerRecord(raw: unknown): { ok: boolean; errors: string
 	if (!source) errors.push("source required");
 
 	const status = record.status as TimerStatus;
-	if (!["pending", "fired", "cancelled", "missed"].includes(status)) {
-		errors.push(`status must be pending|fired|cancelled|missed, got ${String(record.status)}`);
+	if (!["pending", "fired", "cancelled", "missed", "skipped"].includes(status)) {
+		errors.push(`status must be pending|fired|cancelled|missed|skipped, got ${String(record.status)}`);
 	}
 
 	let repeatMs: number | undefined;
@@ -170,6 +174,8 @@ export function validateTimerRecord(raw: unknown): { ok: boolean; errors: string
 		firedLate: record.firedLate === true ? true : undefined,
 		fireCount: typeof record.fireCount === "number" && record.fireCount > 0 ? Math.floor(record.fireCount) : undefined,
 		lastFiredAt: typeof record.lastFiredAt === "string" ? record.lastFiredAt : undefined,
+		skippedAt: typeof record.skippedAt === "string" ? record.skippedAt : undefined,
+		skippedReason: typeof record.skippedReason === "string" ? record.skippedReason : undefined,
 		ownerCwd: typeof record.ownerCwd === "string" && record.ownerCwd ? record.ownerCwd : undefined,
 		ownerSessionId: typeof record.ownerSessionId === "string" && record.ownerSessionId ? record.ownerSessionId : undefined,
 		createdAt,
@@ -242,7 +248,7 @@ export function readTimerFile(timersDir: string, timerId: string, tabRunId?: str
 
 /**
  * CAS 到期 claim：读当前记录 → 若 status 仍为 pending 则写 fired 版本并返回；
- * 已 fired/cancelled/missed 返回 null（防双发）。
+ * 已 fired/cancelled/missed/skipped 返回 null（防双发）。
  *
  * 注：单进程调度器场景下无并发写冲突；跨进程同写同一 timer 属误用（每 timer 只有
  * 一个消费方），此处仍做「读-校验-写」的最小防护。
@@ -404,7 +410,7 @@ export function sweepStaleHeartbeats(
 	return swept;
 }
 
-// ── 终态 GC（2026-08-13：fired/cancelled/missed 超过 TTL 即归档删除）────
+// ── 终态 GC（2026-08-13：fired/cancelled/missed/skipped 超过 TTL 即归档删除）────
 
 /** 清理超过 TTL 的终态 timer 文件（返回清理数）；pending 永不清理。 */
 export function sweepTerminalTimers(
@@ -420,7 +426,7 @@ export function sweepTerminalTimers(
 	for (const id of listTimerFiles(timersDir, tabRunId)) {
 		const r = readTimerFile(timersDir, id, tabRunId);
 		if (!r || r.status === "pending") continue;
-		const terminalAt = Date.parse(r.firedAt ?? r.createdAt);
+		const terminalAt = Date.parse(r.skippedAt ?? r.firedAt ?? r.createdAt);
 		if (now.getTime() - terminalAt > maxAge) {
 			rmSync(timerFilePath(timersDir, id, tabRunId), { force: true });
 			swept++;

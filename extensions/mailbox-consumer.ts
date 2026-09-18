@@ -28,6 +28,7 @@ import { auditSuppression, postInject, preInject } from "./injection-gate.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession } from "./identity.ts";
+import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
 
 export interface ConsumeOptions {
@@ -194,6 +195,8 @@ function buildInjectBody(letter: Letter): string {
 		`📬 Tab ${details?.tabRunId ?? letter.frame.subject} 已完成（mailbox REPORT${task}）`,
 		`摘要: ${letter.frame.body.summary.slice(0, 500)}`,
 		`下一步: 用 reclaim-tabs 确认并编排后续；本消息已在 mailbox ack，不会重复。`,
+		// 完成类消息（command 分支不附；与 event-bus 完成体同一常量，cutover 切流前后纪律一致）
+		NO_POLL_HINT,
 	].join("\n");
 }
 

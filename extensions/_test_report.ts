@@ -15,6 +15,8 @@ import { setCurrentSessionId } from "./identity.ts";
 
 delete process.env.PI_SUBAGENT;
 delete process.env.PI_TAB_RUN_ID;
+// 隔离 shadow runtime：真实 ~/.pi/agent/runtime/registry 的 cutover 状态会让 preInject 判定 suppressed-not-owner（测试惯例同 _test_runtime_cutover）
+process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "report-runtime-"));
 
 const dir = mkdtempSync(join(tmpdir(), "report-test-"));
 const reportsDir = join(dir, "reports");
@@ -67,6 +69,7 @@ function makeLinks(...entries: Array<{ from: string; sessionId: string }>): stri
 	assert.ok(injected[0].includes("tab_2"), injected[0]);
 	assert.ok(injected[0].includes("完成 X"), "应含回报消息");
 	assert.ok(injected[0].includes("1008"), "应含 taskId");
+	assert.ok(injected[0].includes("busy-poll"), "回报注入应含禁轮询纪律");
 
 	// 重复 poll → 幂等（已 seen 不再注入）
 	const again = pollNewReports(reportsDir2, opts);

@@ -18,11 +18,20 @@ import { masterAddress } from "./runtime/address.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
 import { readAttachment } from "./runtime/registry.ts";
+import {
+	DEFAULT_MASTER_SUCCESSION,
+	maybeAutoSucceed,
+	type MasterSuccessionConfig,
+} from "./runtime/master-auto.ts";
+import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 
 export interface SessionHooksDeps {
 	cleanups: Array<() => void>;
 	isNotifyEnabled: () => boolean;
 	pkgDir: string;
+	/** S3 自动交接：spawn 通道 + 配置读取闭包（缺省 = 不启用 S3 块） */
+	spawnSuccessor?: SpawnSuccessor;
+	masterSuccession?: () => MasterSuccessionConfig;
 }
 
 export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): void {
@@ -147,15 +156,41 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
 			if (typeof getUsage !== "function") return;
 			const reading = readPressure(getUsage.call(ctx) as never);
-			const r = maybePropose({ sessionId: sid, generation: att.generation, reading });
-			if (!r.proposed) return;
-			try {
-				const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
-				ui?.notify?.(
-					`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
-					"warning",
-				);
-			} catch { /* 通知尽力而为，proposal 已落盘 */ }
+			const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
+			const cfg = deps.masterSuccession?.() ?? DEFAULT_MASTER_SUCCESSION;
+			// S2：owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）；
+			// proposalPercent 缺省 0.75，与现状零差。
+			const r = maybePropose({ sessionId: sid, generation: att.generation, reading, proposalPercent: cfg.proposalPercent / 100 });
+			if (r.proposed) {
+				try {
+					ui?.notify?.(
+						`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
+						"warning",
+					);
+				} catch { /* 通知尽力而为，proposal 已落盘 */ }
+			}
+			// S3 自动交接（A1）：gate 短路 + 失败回退全在 master-auto.ts；这里只做调用与尽力 notify。
+			// OFF 时 gate 第一关 auto-off 即返回，零写零事件零 spawn。
+			if (deps.masterSuccession) {
+				const auto = maybeAutoSucceed({
+					sessionId: sid,
+					generation: att.generation,
+					reading,
+					cfg,
+					spawn: deps.spawnSuccessor ?? null,
+				});
+				if (auto.action === "transferred") {
+					ui?.notify?.(
+						`Master 已自动交接：transfer=${auto.transferId} 后继=${auto.successorRunId}（gen ${auto.generation}→${auto.generation + 1}）`,
+						"info",
+					);
+				} else if (auto.action === "failed") {
+					ui?.notify?.(
+						`Master 自动交接失败（transfer=${auto.transferId}，${auto.error ?? "unknown"}）：你仍是 owner，已回退提议/人工：/master-transfer`,
+						"warning",
+					);
+				}
+			}
 		} catch { /* gauge 永不打断主流程 */ }
 	});
 }
