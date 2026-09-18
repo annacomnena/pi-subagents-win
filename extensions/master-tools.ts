@@ -26,6 +26,12 @@ import {
 	transferMaster,
 	type SpawnSuccessor,
 } from "./runtime/master-transfer.ts";
+import {
+	DEFAULT_PROPOSAL_PERCENT,
+	formatPressure,
+	meetsProposalThreshold,
+	readPressure,
+} from "./runtime/master-pressure.ts";
 
 export interface ToolOutcome {
 	text: string;
@@ -145,6 +151,16 @@ export function masterTransferConfirmLogic(
 	const r = confirmTransferAttach({ transferId: input.transferId, sessionId });
 	if (!r.ok) return { text: `master-transfer-confirm 失败：${r.reason}`, isError: true };
 	return { text: `master-transfer 完成：transfer=${r.transferId} gen=${r.generation}`, details: { transferId: r.transferId, generation: r.generation } };
+}
+
+export function masterPressureLogic(usage: unknown): ToolOutcome {
+	const reading = readPressure(usage as { tokens?: number | null; contextWindow?: number | null; percent?: number | null } | null | undefined);
+	const text = formatPressure(reading);
+	const over = meetsProposalThreshold(reading);
+	return {
+		text: over ? `${text}\n已达提议线 ${DEFAULT_PROPOSAL_PERCENT * 100}%（是否交接由 proposal 流程决定，见 master-transfer）` : text,
+		details: { tokens: reading.tokens, contextWindow: reading.contextWindow, percent: reading.percent, overThreshold: over },
+	};
 }
 
 export function registerMasterTools(pi: ExtensionAPI, opts: { spawnSuccessor?: SpawnSuccessor } = {}): void {
@@ -310,6 +326,25 @@ export function registerMasterTools(pi: ExtensionAPI, opts: { spawnSuccessor?: S
 			const params = rawParams as { transferId?: string };
 			if (!params.transferId) return textResult({ text: "用法：master-transfer-confirm {transferId}", isError: true });
 			const outcome = masterTransferConfirmLogic(sid, { transferId: params.transferId });
+			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	pi.registerTool({
+		name: "master-pressure",
+		label: "Master Pressure",
+		description: `读取当前 Master 会话的上下文窗口压力（只读）。${USER_DIRECTIVE}`,
+		parameters: Type.Object({}),
+		renderCall(_args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-pressure"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, _rawParams, _signal, _onUpdate, ctx) {
+			const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
+			const outcome = masterPressureLogic(typeof getUsage === "function" ? getUsage.call(ctx) : null);
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
 		},
 	});
