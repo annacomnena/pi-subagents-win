@@ -1,0 +1,130 @@
+/**
+ * session-hooks.ts — 会话生命周期小 hook 集中地（Phase 5.5 R1）。
+ *
+ * 从 index.ts 逐字搬移（零行为变化）：session_start 追赶收集、
+ * session_shutdown 清理、tool_execution toast 通知、resources_discover skill 暴露。
+ * before_agent_start 的巨型 prompt builder 留在 index（每轮关键路径，另案处理）；
+ * M5 的 turn 检查与 proposal 提醒将落在此文件。
+ */
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { clearAsyncPanelUi } from "./async-panel.ts";
+import { isMainSession, isTraceWorker } from "./identity.ts";
+import { sendWindowsToast } from "./notify-windows.ts";
+import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
+
+export interface SessionHooksDeps {
+	cleanups: Array<() => void>;
+	isNotifyEnabled: () => boolean;
+	pkgDir: string;
+}
+
+export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): void {
+	// trace-fusion 追赶收集：主会话启动时，扫「三路已终态但未出报告」的 running run
+	// 补后台收集（覆盖「三路全部在无主会话时完成」——重启后 watcher 把既有 result 标 seen，
+	// onTabFinished 不再触发，只能靠这里）。§24.1：磁盘是真相源，watch 只是加速器。
+	pi.on("session_start", (_event, ctx) => {
+		if (!isMainSession()) return;
+		const catches = catchUpAutoCollect();
+		if (!catches.length) return;
+		try {
+			pi.sendUserMessage?.(
+				`🧬 trace-fusion 追赶：${catches.map((c) => c.runId).join(", ")} 三路已终态但报告缺失，已后台补跑 cross-test。进度：/trace-fusion-status`,
+				{ deliverAs: "followUp" },
+			);
+		} catch { /* 通知尽力而为，收集已在后台 */ }
+		void ctx;
+	});
+
+	pi.on("session_shutdown", () => {
+		for (const cleanup of deps.cleanups) {
+			try { cleanup(); } catch { /* ignore */ }
+		}
+		deps.cleanups.length = 0;
+		clearAsyncPanelUi(); // 丢弃缓存的 UI 引用（旧 ctx 已 stale）
+	});
+
+	// subagent-win 工具开始执行时通知
+	pi.on("tool_execution_start", (event) => {
+		if (event.toolName !== "subagent-win") return;
+		if (!deps.isNotifyEnabled()) return;
+		const args = event.args as Record<string, unknown> | undefined;
+		const agent = args?.agent ?? args?.tasks?.[0]?.agent ?? "subagent";
+		const task = (args?.task ?? args?.tasks?.[0]?.task ?? "") as string;
+		const preview = String(task).slice(0, 60);
+		sendWindowsToast({
+			title: `🤖 ${agent} 开始工作`,
+			body: preview || "(无任务描述)",
+			duration: "short",
+		});
+	});
+
+	// subagent-win 工具执行结束时通知
+	pi.on("tool_execution_end", (event) => {
+		if (event.toolName !== "subagent-win") return;
+		if (!deps.isNotifyEnabled()) return;
+		const result = event.result as Record<string, unknown> | undefined;
+		const details = result?.details as Record<string, unknown> | undefined;
+		const results = details?.results as Array<Record<string, unknown>> | undefined;
+
+		if (results) {
+			// 并行模式
+			const ok = results.filter((r) => r.status === "completed").length;
+			const total = results.length;
+			const icon = ok === total ? "✅" : "⚠️";
+			sendWindowsToast({
+				title: `${icon} Parallel: ${ok}/${total}`,
+				body: ok === total ? "全部 task 完成" : `${total - ok} 个 task 失败`,
+				duration: ok === total ? "short" : "long",
+			});
+		} else {
+			// 单 agent 模式
+			const r = details?.result as Record<string, unknown> | undefined;
+			const agent = (r?.agent ?? "subagent") as string;
+			const status = (r?.status ?? "completed") as string;
+			const isOk = status === "completed";
+			const error = r?.error as string | undefined;
+			const usage = r?.usage as Record<string, unknown> | undefined;
+			const cost = usage?.cost as number | undefined;
+
+			sendWindowsToast({
+				title: isOk ? `✅ ${agent} 完成` : `❌ ${agent} 失败`,
+				body: isOk
+					? cost !== undefined
+						? `✓ 成功  ($${cost.toFixed(4)})`
+						: "✓ 成功"
+					: `✗ ${(error ?? "未知错误").slice(0, 100)}`,
+				duration: isOk ? "short" : "long",
+			});
+		}
+	});
+
+	// update_goal(complete) 时通知 goal 完成
+	pi.on("tool_execution_end", (event) => {
+		if (event.toolName !== "update_goal") return;
+		if (event.isError) return;
+		if (!deps.isNotifyEnabled()) return;
+		const result = event.result as Record<string, unknown> | undefined;
+		const content = result?.content as Array<Record<string, unknown>> | undefined;
+		if (!content) return;
+		const text = content.map((c) => String(c.text ?? "")).join("");
+		// 检查输出是否包含 complete 状态的确认
+		if (/complete|完成|✅|✓/i.test(text)) {
+			sendWindowsToast({
+				title: "🎯 Goal 已完成",
+				body: text.slice(0, 120) || "所有目标达成",
+				duration: "long",
+			});
+		}
+	});
+
+	// 注册包内 skill 路径
+	pi.on("resources_discover", async () => {
+		// trace worker 不得看到 workflow-orchestrator skill（设计稿 §56）；
+		// 未来若有非 workflow skill 再按 allowlist 暴露。
+		if (isTraceWorker()) {
+			return { skillPaths: [] };
+		}
+		return { skillPaths: [join(deps.pkgDir, "skills")] };
+	});
+}

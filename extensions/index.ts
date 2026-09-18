@@ -28,7 +28,7 @@ import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
-import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { cleanTraceRun } from "./trace-fusion/clean.ts";
@@ -36,13 +36,13 @@ import { registerHotspot } from "./hotspot/index.ts";
 import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
-import { sendWindowsToast } from "./notify-windows.ts";
+import { registerSessionHooks } from "./session-hooks.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { registerMasterTools } from "./master-tools.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
-import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
+import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop } from "./mailbox-consumer.ts";
@@ -67,7 +67,7 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { getTabRunId, isSubagent, registerIdentityFlag } from "./identity.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
 import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
@@ -1592,22 +1592,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	}));
 
-	// trace-fusion 追赶收集：主会话启动时，扫「三路已终态但未出报告」的 running run
-	// 补后台收集（覆盖「三路全部在无主会话时完成」——重启后 watcher 把既有 result 标 seen，
-	// onTabFinished 不再触发，只能靠这里）。§24.1：磁盘是真相源，watch 只是加速器。
-	pi.on("session_start", (_event, ctx) => {
-		if (!isMainSession()) return;
-		const catches = catchUpAutoCollect();
-		if (!catches.length) return;
-		try {
-			pi.sendUserMessage?.(
-				`🧬 trace-fusion 追赶：${catches.map((c) => c.runId).join(", ")} 三路已终态但报告缺失，已后台补跑 cross-test。进度：/trace-fusion-status`,
-				{ deliverAs: "followUp" },
-			);
-		} catch { /* 通知尽力而为，收集已在后台 */ }
-		void ctx;
-	});
-
 	// 热点路由缓存（v2 首版）：首轮 system-reminder 注入 + hotspot 工具 + /hotspot 诊断；
 	// 结构约束（v2 §11）：主 index.ts 只加这一处注册
 	collect(registerHotspot(pi));
@@ -1850,13 +1834,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
-	pi.on("session_shutdown", () => {
-		for (const cleanup of cleanups) {
-			try { cleanup(); } catch { /* ignore */ }
-		}
-		cleanups.length = 0;
-		clearAsyncPanelUi(); // 丢弃缓存的 UI 引用（旧 ctx 已 stale）
-	});
+	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）
+	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR });
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
@@ -1906,89 +1885,7 @@ export default function (pi: ExtensionAPI) {
 		return readConfig().notifications !== false;
 	}
 
-	// subagent-win 工具开始执行时通知
-	pi.on("tool_execution_start", (event) => {
-		if (event.toolName !== "subagent-win") return;
-		if (!notifyEnabled()) return;
-		const args = event.args as Record<string, unknown> | undefined;
-		const agent = args?.agent ?? args?.tasks?.[0]?.agent ?? "subagent";
-		const task = (args?.task ?? args?.tasks?.[0]?.task ?? "") as string;
-		const preview = String(task).slice(0, 60);
-		sendWindowsToast({
-			title: `🤖 ${agent} 开始工作`,
-			body: preview || "(无任务描述)",
-			duration: "short",
-		});
-	});
-
-	// subagent-win 工具执行结束时通知
-	pi.on("tool_execution_end", (event) => {
-		if (event.toolName !== "subagent-win") return;
-		if (!notifyEnabled()) return;
-		const result = event.result as Record<string, unknown> | undefined;
-		const details = result?.details as Record<string, unknown> | undefined;
-		const results = details?.results as Array<Record<string, unknown>> | undefined;
-
-		if (results) {
-			// 并行模式
-			const ok = results.filter((r) => r.status === "completed").length;
-			const total = results.length;
-			const icon = ok === total ? "✅" : "⚠️";
-			sendWindowsToast({
-				title: `${icon} Parallel: ${ok}/${total}`,
-				body: ok === total ? "全部 task 完成" : `${total - ok} 个 task 失败`,
-				duration: ok === total ? "short" : "long",
-			});
-		} else {
-			// 单 agent 模式
-			const r = details?.result as Record<string, unknown> | undefined;
-			const agent = (r?.agent ?? "subagent") as string;
-			const status = (r?.status ?? "completed") as string;
-			const isOk = status === "completed";
-			const error = r?.error as string | undefined;
-			const usage = r?.usage as Record<string, unknown> | undefined;
-			const cost = usage?.cost as number | undefined;
-
-			sendWindowsToast({
-				title: isOk ? `✅ ${agent} 完成` : `❌ ${agent} 失败`,
-				body: isOk
-					? cost !== undefined
-						? `✓ 成功  ($${cost.toFixed(4)})`
-						: "✓ 成功"
-					: `✗ ${(error ?? "未知错误").slice(0, 100)}`,
-				duration: isOk ? "short" : "long",
-			});
-		}
-	});
-
-	// update_goal(complete) 时通知 goal 完成
-	pi.on("tool_execution_end", (event) => {
-		if (event.toolName !== "update_goal") return;
-		if (event.isError) return;
-		if (!notifyEnabled()) return;
-		const result = event.result as Record<string, unknown> | undefined;
-		const content = result?.content as Array<Record<string, unknown>> | undefined;
-		if (!content) return;
-		const text = content.map((c) => String(c.text ?? "")).join("");
-		// 检查输出是否包含 complete 状态的确认
-		if (/complete|完成|✅|✓/i.test(text)) {
-			sendWindowsToast({
-				title: "🎯 Goal 已完成",
-				body: text.slice(0, 120) || "所有目标达成",
-				duration: "long",
-			});
-		}
-	});
-
-	// 注册包内 skill 路径
-	pi.on("resources_discover", async () => {
-		// trace worker 不得看到 workflow-orchestrator skill（设计稿 §56）；
-		// 未来若有非 workflow skill 再按 allowlist 暴露。
-		if (isTraceWorker()) {
-			return { skillPaths: [] };
-		}
-		return { skillPaths: [join(PKG_DIR, "skills")] };
-	});
+	// 注册包内 skill 路径（注：小 hook 已迁 session-hooks.ts，此处仅保留 notify 开关与 prompt 注入）
 
 	// 注入 subagent-win 配置到 LLM 上下文
 	pi.on("before_agent_start", async (_event, ctx) => {
