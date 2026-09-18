@@ -46,8 +46,13 @@ import { registerEventBus } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop } from "./mailbox-consumer.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
-import { readAttachment, readCutover, setCutover } from "./runtime/registry.ts";
-import { attachMasterWithAudit, detachMasterWithAudit } from "./runtime/adapters/session-lifecycle.ts";
+import {
+	attachCurrentSession,
+	getMasterStatus,
+	issueMasterHandoffToken,
+	prepareMasterHandoff,
+	setMasterCutover,
+} from "./runtime/master-control.ts";
 import {
 	createTask,
 	createWorkstream,
@@ -60,10 +65,6 @@ import {
 	updateWorkstream,
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
-import { buildHandoff } from "./runtime/hydrate.ts";
-import { resolveRecipient } from "./runtime/resolver.ts";
-import { mailboxBacklog } from "./runtime/mailbox.ts";
-import { masterAddress } from "./runtime/address.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
@@ -1665,11 +1666,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
 		handler: async (_args, ctx) => {
-			const master = masterAddress();
-			const att = readAttachment(master);
-			const cut = readCutover();
-			const snap = resolveRecipient(master);
-			const backlog = mailboxBacklog();
+			const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
 			const lines = [
 				`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
 				`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
@@ -1692,7 +1689,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("master-attach: --force-stale 须与 --confirm 同用（二次人工确认），拒绝", "warning");
 				return;
 			}
-			const r = attachMasterWithAudit({ sessionId: sid, token, forceStale: force || undefined });
+			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined });
 			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
 			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
 		},
@@ -1702,12 +1699,12 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const want = (args ?? "").trim().toLowerCase();
 			if (want !== "on" && want !== "off") { ctx.ui.notify("用法：/master-cutover on|off", "warning"); return; }
-			if (want === "on" && !readAttachment(masterAddress())) {
+			const sid = sessionIdentity(ctx as never) ?? "unknown";
+			const st = setMasterCutover({ enabled: want === "on", by: sid });
+			if (!st.ok) {
 				ctx.ui.notify("master-cutover: 尚未 attach（先 /master-attach），拒绝开启", "warning");
 				return;
 			}
-			const sid = sessionIdentity(ctx as never) ?? "unknown";
-			const st = setCutover(want === "on", sid);
 			ctx.ui.notify(`master-cutover 已${st.enabled ? "开启" : "关闭"}（by=${sid.slice(0, 12)}）`, "info");
 		},
 	});
@@ -1716,10 +1713,11 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sid = sessionIdentity(ctx as never);
 			if (!sid) { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
-			const att = readAttachment(masterAddress());
-			if (!att || att.sessionId !== sid) { ctx.ui.notify("master-detach: 你不是当前 owner，拒绝", "warning"); return; }
-			const d = detachMasterWithAudit({ sessionId: sid, generation: att.generation, reason: (args ?? "").trim() || undefined });
-			if (!d.ok) { ctx.ui.notify("master-detach 失败：not-owner", "warning"); return; }
+			const d = issueMasterHandoffToken({ sessionId: sid, reason: (args ?? "").trim() || undefined });
+			if (!d.ok) {
+				ctx.ui.notify("precheck" in d ? "master-detach: 你不是当前 owner，拒绝" : "master-detach 失败：not-owner", "warning");
+				return;
+			}
 			ctx.ui.notify(`master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`, "info");
 		},
 	});
@@ -1728,7 +1726,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const repoRoot = (args ?? "").trim() || undefined;
 			try {
-				const doc = buildHandoff({ repoRoot });
+				const doc = prepareMasterHandoff({ repoRoot });
 				const present = doc.manifest.filter((m) => m.present).length;
 				ctx.ui.notify(`handoff 已生成：${doc.path}\nmanifest ${present}/${doc.manifest.length} 项 present`, "info");
 			} catch (e) {
