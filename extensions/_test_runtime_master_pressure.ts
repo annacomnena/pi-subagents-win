@@ -18,6 +18,7 @@ import {
 	formatPressure,
 	meetsProposalThreshold,
 	proposalThresholdTokens,
+	proposalTierCap,
 	readPressure,
 } from "./runtime/master-pressure.ts";
 
@@ -66,19 +67,19 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 }
 
 {
-	// A2 1M 解冻：line(1M)=round(0.75×min(1M,200K))=150,000；161K 实测最重会话可达。
+	// A2 1M 解冻（档位表 0919 拍板后：line(1M)=min(75%×1M,400K)=400,000；本会话即真实可达）。
 	// 反证②：旧规则（15/14.9/16.1 均 <75）⇒ 全 false ⇒ 红。
-	assert.equal(meetsProposalThreshold({ tokens: 150000, contextWindow: 1000000, percent: 15 }), true);
-	assert.equal(meetsProposalThreshold({ tokens: 149999, contextWindow: 1000000, percent: 14.9 }), false);
-	assert.equal(meetsProposalThreshold({ tokens: 161000, contextWindow: 1000000, percent: 16.1 }), true);
-	ok("A2 1M 解冻：150000 true / 149999 false / 161000 最重会话可达 true");
+	assert.equal(meetsProposalThreshold({ tokens: 400000, contextWindow: 1000000, percent: 40 }), true);
+	assert.equal(meetsProposalThreshold({ tokens: 399999, contextWindow: 1000000, percent: 39.9 }), false);
+	assert.equal(meetsProposalThreshold({ tokens: 420000, contextWindow: 1000000, percent: 42 }), true);
+	ok("A2 1M 解冻（档位 400K）：400000 true / 399999 false / 420000 true");
 }
 
 {
-	// A3 旋钮保活（非裸 CAP）：threshold=0.5 @1M → line=100,000；{100000,1M,10} → true。
-	// 裸 CAP 方案此条必红（任何 p≥15% 都得 150K）⇒ 钉死设计选择。
-	assert.equal(meetsProposalThreshold({ tokens: 100000, contextWindow: 1000000, percent: 10 }, 0.5), true);
-	ok("A3 旋钮保活：0.5@1M 线=100K");
+	// A3 旋钮保活（非裸 CAP）：threshold=0.5 @1M → line=min(500K,400K)=400,000；{400000,1M,40} → true。
+	// 裸 CAP 方案此条必红（任何 p≥40% 都得 400K）⇒ 钉死设计选择。
+	assert.equal(meetsProposalThreshold({ tokens: 400000, contextWindow: 1000000, percent: 40 }, 0.5), true);
+	ok("A3 旋钮保活：0.5@1M 线=400K");
 }
 
 {
@@ -90,14 +91,20 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 }
 
 {
-	// proposalThresholdTokens 三档线位（128K/200K/1M）钉死
+	// proposalThresholdTokens 档位表（0919 拍板：128K-96K / 200K-150K / 400K·500K-250K / 1M-400K）钉死
 	assert.equal(proposalThresholdTokens(128000), 96000);
 	assert.equal(proposalThresholdTokens(199999), 149999);
 	assert.equal(proposalThresholdTokens(200000), 150000);
-	assert.equal(proposalThresholdTokens(200001), 150000);
-	assert.equal(proposalThresholdTokens(1000000), 150000);
-	assert.equal(proposalThresholdTokens(1000000, 0.5), 100000);
-	ok("proposalThresholdTokens 三档线位");
+	assert.equal(proposalThresholdTokens(400000), 250000); // 400K 档：min(300K,250K)=250K
+	assert.equal(proposalThresholdTokens(500000), 250000); // 500K 档封顶
+	assert.equal(proposalThresholdTokens(500001), 375001); // >500K 进 1M 档：75%×W=375K 仍低于 cap（min 语义，百分比先到）
+	assert.equal(proposalThresholdTokens(534000), 400000); // crossover ≈533.3K：cap 400K 开始生效
+	assert.equal(proposalThresholdTokens(1000000), 400000);
+	assert.equal(proposalThresholdTokens(1000000, 0.5), 400000); // 旋钮也受档位封顶
+	assert.equal(proposalTierCap(128000), 150000);
+	assert.equal(proposalTierCap(400000), 250000);
+	assert.equal(proposalTierCap(1000000), 400000);
+	ok("proposalThresholdTokens 档位表（三档封顶）");
 }
 
 console.log(`\n# pass ${n}`);

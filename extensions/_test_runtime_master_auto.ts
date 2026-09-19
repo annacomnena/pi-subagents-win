@@ -262,12 +262,16 @@ let transferId5 = "";
 }
 
 // T8 边界：proposalPercent > autoPercent → auto 失败后 S2 回退 below-threshold，proposal 缺席但不抛错
+// 档位表 0919：200K 档 proposal 被 cap=150K 硬顶，p=0.95 无法再抬线（176K 恒达）——
+// 原构造失效。改用 128K 档（百分比主导区）：auto 线=min(90%×128K, 128K−28192)=99808，
+// proposal(0.95) 线=min(121.6K,150K)=121600；取 110000 ∈ [99808,121600)：auto 达、proposal 未达。
 {
+	const HI128 = { tokens: 110000, contextWindow: 128000, percent: 85.9 };
 	const cfg: MasterSuccessionConfig = { auto: true, proposalPercent: 95, autoPercent: 90 };
 	const r = maybeAutoSucceed({
 		sessionId: "sess_auto_gen4",
 		generation: 4,
-		reading: HI, // 88% < 95% 提议线，但 176000 ≥ auto 线 171808
+		reading: HI128, // 85.9% < 95% 提议线（121.6K），但 110000 ≥ auto 线 99808
 		cfg,
 		spawn: () => { throw new Error("boom8"); },
 	});
