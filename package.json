@@ -74,6 +74,7 @@
     "test:runtime-master-pressure": "node --experimental-strip-types ./extensions/_test_runtime_master_pressure.ts",
     "test:runtime-master-succession": "node --experimental-strip-types ./extensions/_test_runtime_master_succession.ts",
     "test:runtime-master-auto": "node --experimental-strip-types ./extensions/_test_runtime_master_auto.ts",
+    "test:master-dispatch": "node --experimental-strip-types ./extensions/_test_runtime_master_dispatch.ts",
     "test:runtime-workstream": "node --experimental-strip-types ./extensions/_test_runtime_workstream.ts",
     "test:runtime-hydrate": "node --experimental-strip-types ./extensions/_test_runtime_hydrate.ts",
     "test:runtime-snapshot": "node --experimental-strip-types ./extensions/_test_runtime_snapshot.ts",

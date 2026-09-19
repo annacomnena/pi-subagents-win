@@ -13,7 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { sessionIdentity } from "./links.ts";
-import { isSubagent } from "./identity.ts";
+import { isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import {
 	attachCurrentSession,
 	getMasterStatus,
@@ -21,6 +21,8 @@ import {
 	prepareMasterHandoff,
 	setMasterCutover,
 } from "./runtime/master-control.ts";
+import { readAttachment, type MasterAttachment } from "./runtime/registry.ts";
+import { masterAddress } from "./runtime/address.ts";
 import {
 	confirmTransferAttach,
 	transferMaster,
@@ -119,6 +121,81 @@ export function masterHandoffLogic(input: { repoRoot?: string } = {}): ToolOutco
 const USER_DIRECTIVE = "仅在用户明确要求时调用；禁止自行决定接管/交接/切换。";
 const NO_COMPOSE = "不要手工组合 attach/detach/cutover 执行 succession；交接走 master-transfer（未发布前走 /master-detach 发 token + 新会话 attach 流程）。";
 
+// ── master-dispatch：ownership 门控 + 派发（0918 计划 §3）──────────
+//
+// 派单资格看 ownership，不看 provenance（计划 §0，不复议）：
+//   ① isSubagent 硬挡 → ② 身份（unknown 拒绝）→ ③ ownership 比对（owner 放行——
+//   无论是否 tab；被上代 transfer 派生的 Master 其 attachment.sessionId 即自身，
+//   天然过比对，dogfood 修复 0918：原「任务 tab 永不是 owner」静态断言与此矛盾，
+//   曾把 tab 形态的 owner 误挡）→ ④ 主会话恒可派（编排者）→ ⑤ 非 owner 的任务
+//   tab（tab-session）/其余（not-owner）拒绝 → ⑥ owner 路径 generation fencing（双读）。
+// gate 之后 generation 被 bump 才挡——gate 双读 + 派发通道最终 fencing
+// （masterDispatchLaunch 在 runId/账本/spawn 前重读比对）把 gate→落账窗口压到最小（0918 审查 §1）。
+
+/** master-dispatch 门控结果。ok 时携带 via（main/owner）与 owner 附件（owner 路径用）。 */
+export type MasterDispatchGate =
+	| { ok: true; via: "main" | "owner"; attachment: MasterAttachment | null }
+	| { ok: false; reason: "subagent" | "unknown-session" | "tab-session" | "not-owner" | "generation-mismatch" };
+
+/**
+ * 门控三件套（纯函数，可单测）。readAttachment 注入：gate 读一次判 owner，spawn 前再读一次
+ * 比对 {sessionId, generation}——两读之间窗口最小化，与 attachMaster「lease 内重读 CAS」同构。
+ */
+export function masterDispatchGate(input: {
+	sessionId: string;
+	isSub: boolean;
+	isTab: boolean;
+	isMain: boolean;
+	readAttachment: () => MasterAttachment | null;
+}): MasterDispatchGate {
+	if (input.isSub) return { ok: false, reason: "subagent" };                    // ① 身份硬挡（最高优先）
+	const sid = input.sessionId;
+	if (!sid || sid === "unknown") return { ok: false, reason: "unknown-session" };  // ② 身份不可定
+	const att = input.readAttachment();
+	if (att && att.sessionId === sid) {                                              // ③ ownership 优先（tab 形态的 owner 也放行）
+		const fresh = input.readAttachment();                                         //    generation fencing（双读）
+		if (fresh === null || fresh.sessionId !== sid || fresh.generation !== att.generation) {
+			return { ok: false, reason: "generation-mismatch" };
+		}
+		return { ok: true, via: "owner", attachment: fresh };
+	}
+	if (input.isMain) return { ok: true, via: "main", attachment: null };             // ④ 主会话恒可派
+	if (input.isTab) return { ok: false, reason: "tab-session" };                    // ⑤ 非 owner 的任务 tab
+	return { ok: false, reason: "not-owner" };                                      // ⑥ 其余（not-owner）
+}
+
+/** 拒绝文案（isError:true）。not-owner 需 owner 附件以渲染「owner=…/无 owner」。 */
+export function masterDispatchRejectText(
+	gate: Extract<MasterDispatchGate, { ok: false }>,
+	att: MasterAttachment | null,
+): string {
+	switch (gate.reason) {
+		case "subagent": return "master-dispatch: 子 agent 不可派发任务 tab";
+		case "unknown-session": return "master-dispatch: 无法确定当前会话身份，拒绝";
+		case "tab-session": return "master-dispatch: 任务 tab 不是 owner，不可派发；用 tab-finish 回报主会话由主会话编排";
+		case "not-owner": return `master-dispatch: 你不是当前 Master owner 也不是主会话，拒绝（owner=${att ? att.sessionId.slice(0, 12) : "无 owner"}）`;
+		case "generation-mismatch": return "master-dispatch: Master 归属已变化（stale generation），拒绝；请重新确认 owner";
+	}
+}
+
+/** 派发入参（dispatchTab 闭包契约；index.ts 提供实现：wt 前置检查 + launchWorkflowTab 账本/spawn）。 */
+export interface MasterDispatchTabArgs {
+	taskId: string;
+	title?: string;
+	cwd?: string;
+	mode: "workflow" | "research" | "execute" | "adaptive";
+	prompt: string;
+	model?: string;
+	timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }>;
+	sessionId: string;
+	/** gate 第二读的 owner 快照（owner 路径）；main 路径 null（派发通道最终 fencing 用，不依赖 attachment）。 */
+	owner: MasterAttachment | null;
+}
+
+/** 派发通道（注入式）：wt 缺席在生成 runId 之前返回 error，不写任何账本；stale=true 表示
+ *  最终 fencing 失败（gate 后 attachment 已变），同样零账本零 spawn。 */
+export type DispatchTab = (args: MasterDispatchTabArgs) => { runId?: string; title: string; error?: string; stale?: true };
+
 function toolSession(ctx: unknown): string {
 	return sessionIdentity(ctx as never);
 }
@@ -171,7 +248,7 @@ export function masterPressureLogic(usage: unknown): ToolOutcome {
 
 export function registerMasterTools(
 	pi: ExtensionAPI,
-	opts: { spawnSuccessor?: SpawnSuccessor; masterSuccession?: () => MasterSuccessionConfig } = {},
+	opts: { spawnSuccessor?: SpawnSuccessor; masterSuccession?: () => MasterSuccessionConfig; dispatchTab?: DispatchTab } = {},
 ): void {
 	const subBlocked = () => isSubagent();
 
@@ -355,6 +432,90 @@ export function registerMasterTools(
 			const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
 			const outcome = masterPressureLogic(typeof getUsage === "function" ? getUsage.call(ctx) : null);
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
+		},
+	});
+
+	// master-dispatch：Master owner（含主会话）派一个可见任务 tab。账本/回收链与 launch-tabs
+	// 同构（共享 index.ts 的 launchWorkflowTab），journal source 记 agent://master_default。
+	// 门控内聚在本工具 execute（与 master-attach/detach/transfer 同款写法），与 capability 矩阵正交。
+	pi.registerTool({
+		name: "master-dispatch",
+		label: "Master Dispatch",
+		description: [
+			"Master 派单工具：仅主会话或 Master owner（agent://master_default 当前 attachment 的会话）可调用。",
+			"派一个可见 pi 任务 tab，账本与回收链（tab-status / reclaim-tabs / tab-finish）与 launch-tabs 完全同构；journal source 记为 agent://master_default。",
+			"任务 tab 与 subagent 永不可调（门控硬挡）。不碰 succession（交接走 master-transfer）。",
+		].join(" "),
+		parameters: Type.Object({
+			taskId: Type.String({ description: "任务号（如 S2）" }),
+			prompt: Type.String({ description: "首轮 prompt（含交接材料；自动加模式前缀+纪律块）" }),
+			title: Type.Optional(Type.String({ description: "标签名（同 launch-tabs 语义，剥 pi-/wlc- 前缀）" })),
+			cwd: Type.Optional(Type.String({ description: "工作目录（缺省 process.cwd()）" })),
+			mode: Type.Optional(Type.Union([
+				Type.Literal("workflow"),
+				Type.Literal("research"),
+				Type.Literal("execute"),
+				Type.Literal("adaptive"),
+			], { description: "缺省 workflow" })),
+			model: Type.Optional(Type.String({ description: "覆盖模型（provider/id 或短名）" })),
+			timers: Type.Optional(Type.Array(Type.Object({
+				delayMs: Type.Number({}),
+				message: Type.String({}),
+				label: Type.Optional(Type.String({}),),
+				repeatMs: Type.Optional(Type.Number({}),),
+			}))),
+		}),
+		renderCall(args, theme) {
+			const a = args as { taskId?: string; title?: string; mode?: string };
+			return new Text(`${theme.fg("toolTitle", theme.bold("master-dispatch"))} ${theme.fg("accent", String(a.taskId ?? "?"))}${a.mode ? ` ${theme.fg("dim", a.mode)}` : ""}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (subBlocked()) return textResult({ text: masterDispatchRejectText({ ok: false, reason: "subagent" }, null), isError: true });
+			const sid = toolSession(ctx);
+			if (!sid || sid === "unknown") return textResult({ text: masterDispatchRejectText({ ok: false, reason: "unknown-session" }, null), isError: true });
+			if (!opts.dispatchTab) return textResult({ text: "master-dispatch: 派发通道不可用，拒绝", isError: true });
+			const params = rawParams as {
+				taskId?: string; prompt?: string; title?: string; cwd?: string; mode?: string;
+				model?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }>;
+			};
+			const gate = masterDispatchGate({
+				sessionId: sid,
+				isSub: isSubagent(),
+				isTab: isTabSession(),
+				isMain: isMainSession(),
+				readAttachment: () => readAttachment(masterAddress()),
+			});
+			if (!gate.ok) {
+				const att = gate.reason === "not-owner" ? readAttachment(masterAddress()) : null;
+				const text = masterDispatchRejectText(gate, att);
+				return textResult({ text, isError: true, details: { text, reason: gate.reason } });
+			}
+			const mode: "workflow" | "research" | "execute" | "adaptive" =
+				params.mode === "research" ? "research" : params.mode === "execute" ? "execute" : params.mode === "adaptive" ? "adaptive" : "workflow";
+			const res = opts.dispatchTab({
+				taskId: (params.taskId ?? "").trim(),
+				prompt: (params.prompt ?? "").trim(),
+				title: params.title,
+				cwd: params.cwd,
+				mode,
+				model: params.model,
+				timers: params.timers,
+				sessionId: sid,
+				owner: gate.attachment,
+			});
+			if (res.stale) {
+				const text = masterDispatchRejectText({ ok: false, reason: "generation-mismatch" }, null);
+				return textResult({ text, isError: true, details: { text, reason: "generation-mismatch" } });
+			}
+			if (res.error) {
+				return textResult({ text: `✗ ${res.title}: ${res.error}`, isError: true, details: { text: `✗ ${res.title}: ${res.error}`, runId: res.runId, title: res.title } });
+			}
+			const text = `master-dispatch 已启动：${res.title} runId=${res.runId}（用 tab-status / reclaim-tabs 回收）`;
+			return { content: [{ type: "text", text }], details: { runId: res.runId, title: res.title, taskId: (params.taskId ?? "").trim(), mode, text } };
 		},
 	});
 }

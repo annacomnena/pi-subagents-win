@@ -40,7 +40,9 @@ import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { registerMasterTools } from "./master-tools.ts";
+import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { readAttachment } from "./runtime/registry.ts";
+import { masterAddress } from "./runtime/address.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
 import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
@@ -86,10 +88,6 @@ import {
 import type { TraceRunMeta } from "./trace-fusion/types.ts";
 import {
 	defaultTimersDir,
-	dueAtFromDelay,
-	newTimerId,
-	validateTimerRecord,
-	writeTimerAtomic,
 } from "./timers.ts";
 import {
 	buildWorkflowTabPrompt,
@@ -98,6 +96,7 @@ import {
 	spawnPiTab,
 	type LaunchMode,
 } from "./launch.ts";
+import { launchWorkflowTab, masterDispatchLaunch } from "./launch-workflow.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
@@ -1896,8 +1895,23 @@ export default function (pi: ExtensionAPI) {
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
 
-	// master tools：agent 可调用的 Master 控制（M2/M3，与 /master-* 同服务层）
-	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession });
+	// master tools：agent 可调用的 Master 控制（M2/M3，与 /master-* 同服务层）。
+	// master-dispatch（0918 计划）：dispatchTab 闭包只做 findWindowsTerminal/findPiCli 解析 +
+	// 注入 readAttachment（owner 路径最终 fencing 用），其余（wt 缺席在生成 runId 之前返回 error
+	// 不落账本 + 账本/spawn）委托 masterDispatchLaunch。
+	const dispatchTab: DispatchTab = (args) => {
+		const wtPath = findWindowsTerminal();
+		let piCli: string | undefined;
+		let piErr: string | undefined;
+		try {
+			piCli = findPiCli();
+		} catch (err) {
+			piErr = `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		return masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
+	};
+
+	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, dispatchTab });
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
@@ -2069,79 +2083,21 @@ export default function (pi: ExtensionAPI) {
 			const timersDir = defaultTimersDir();
 
 			const results = input.map((item) => {
-				const taskId = (item.taskId ?? "").trim();
-				const prompt = (item.prompt ?? "").trim();
-				if (!taskId || !prompt) {
-					return { title: item.title ?? (taskId || "?"), prompt, model: item.model, error: "taskId and prompt are required" };
-				}
-				// workflow 绑定：前缀 + 强制约束块 + 原始 handoff；--skill 保证技能在标签会话里可见
-				const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
-				const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
 				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : item.mode === "adaptive" ? "adaptive" : "workflow";
-				const normalizedPrompt = buildWorkflowTabPrompt({ taskId, title: item.title, prompt, model: item.model }, skillRef, mode);
-				const cwdRaw = (item.cwd ?? "").trim() || process.cwd();
-				const cwd = resolve(cwdRaw);
-				const title = launchTaskTitle({ taskId, title: item.title, prompt: normalizedPrompt, model: item.model }, cwd);
-
-				// 1) 派发前写账本：回收闭环的 runId 唯一令牌
-				const runId = newTabRunId();
-				const dispatch: TabDispatchRecord = {
-					id: runId,
-					version: 1,
-					taskId,
-					mode,
-					title: item.title ?? title,
-					cwd,
-					requestedModel: item.model,
-					dispatchedAt: new Date().toISOString(),
-					dispatchStatus: "dispatched",
-				};
-				writeTabDispatch(runsDir, dispatch);
-				// Phase 1 shadow emit（设计稿 §11）：journal 写失败不影响 launch
-				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
-				// 溯源：记录「本会话唤起了这个 tab」
-				recordLink({
-					sessionId: sessionIdentity(_ctx as never),
-					kind: "tab",
-					targetId: runId,
-					detail: `task=${taskId} mode=${mode} ${title}`,
-				});
-
-				// 2) 写入该标签页邮箱的计时器（到期自动发送推进消息）
-				for (const t of item.timers ?? []) {
-					if (typeof t.delayMs !== "number" || !Number.isFinite(t.delayMs) || t.delayMs <= 0) continue;
-					if (typeof t.message !== "string" || !t.message.trim()) continue;
-					const timerRaw: Record<string, unknown> = {
-						id: newTimerId(),
-						version: 1,
-						dueAt: dueAtFromDelay(t.delayMs),
-						message: t.message.trim(),
-						target: { tabRunId: runId, taskId },
-						source: "launch-tabs",
-						label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : undefined,
-						repeatMs: t.repeatMs,
-						status: "pending",
-						createdAt: new Date().toISOString(),
-					};
-					const check = validateTimerRecord(timerRaw);
-					if (check.ok && check.value) writeTimerAtomic(timersDir, check.value, { tabRunId: runId });
-				}
-
-				// 3) spawn（env 携带 PI_TAB_RUN_ID / PI_TAB_RUNS_DIR）
-				const result = dispatchPiTab(wtPath, piCli, cwd, title, normalizedPrompt, item.model, skillArgs, runId, runsDir, (err) => {
-					// P1-2：异步 spawn 失败也回写 launch_failed（不静默卡 dispatched）
-					console.error(`[subagent-win launch] async spawn failed ${runId}: ${err.message}`);
-					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
-					writeTabDispatch(runsDir, failed);
-					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				});
-				if (result.error) {
-					// 派发失败保留 launch_failed 记录（不静默消失）
-					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
-					writeTabDispatch(runsDir, failed);
-					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				}
-				return { ...result, runId, taskId, cwd };
+				return launchWorkflowTab(
+					{
+						taskId: item.taskId ?? "",
+						title: item.title,
+						prompt: item.prompt ?? "",
+						model: item.model,
+						cwd: item.cwd,
+						mode,
+						timers: item.timers,
+						sessionId: sessionIdentity(_ctx as never),
+						timerSource: "launch-tabs",
+					},
+					{ wtPath, piCli, runsDir, timersDir },
+				);
 			});
 			const ok = results.filter((item) => !item.error).length;
 			const lines = results.map((item) => item.error
