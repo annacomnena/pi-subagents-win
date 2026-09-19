@@ -15,8 +15,11 @@
  *   T8 边界（proposalPercent > autoPercent 时 auto 失败 → attention+事件在，proposal 缺席）
  *   T9 回归（masterStatusLogic 带/不带 cfg；maybePropose 缺省 0.75 行为零差）
  *   T10 OFF 真实接线集成（agent_end hook + 默认 auto:false → 无 spawn/无 notify/零写零事件）
- *   T11 阈值精确边界（175423 → below-threshold 零尝试；175424 → transfer）
+ *   T11 阈值精确边界（171807 → below-threshold 零尝试；171808 → transfer）
  *   T12 transferMaster 非 spawn I/O 异常归一化（→ 失败回退全序列 + 同代禁重试）
+ *   T13 1M 钉死：effectiveAutoThresholdTokens({900000,1M},90)=900000（percent 绑定，buffer 不生效）
+ *   T14 三档保序：proposalLine(W) < autoLine(W)（128K/200K/1M）
+ *   T15 双写 tripwire：proposalPercent/100 === DEFAULT_PROPOSAL_PERCENT
  *
  * 运行：npm run test:runtime-master-auto
  */
@@ -47,6 +50,7 @@ import {
 	type MasterSuccessionConfig,
 } from "./runtime/master-auto.ts";
 import { masterStatusLogic } from "./master-tools.ts";
+import { DEFAULT_PROPOSAL_PERCENT, proposalThresholdTokens } from "./runtime/master-pressure.ts";
 // R1 回归网：session-hooks（含 master-auto 新导入链）仅定义无顶层执行，
 // 导入即验证全部 import 绑定可解析（strip-types --check 只查语法，此导入补命名解析层）；
 // T10 另直接调用 registerSessionHooks 走真实 agent_end 接线。
@@ -63,7 +67,7 @@ const masterEventCount = () =>
 	listRuntimeEnvelopes().envelopes.filter((e) => e.type.startsWith("master.")).length;
 
 const ON: MasterSuccessionConfig = { auto: true, proposalPercent: 75, autoPercent: 90 };
-const HI = { tokens: 176000, contextWindow: 200000, percent: 88 }; // 88% < 90% 线，但 176000 ≥ 175424（min 线）
+const HI = { tokens: 176000, contextWindow: 200000, percent: 88 }; // 88% < 90% 线，但 176000 ≥ 171808（min 线 = 200000−28192）
 const OK_SPAWN = () => ({ successorRunId: "run_stub" });
 
 // T1 配置归一化
@@ -84,7 +88,7 @@ const OK_SPAWN = () => ({ successorRunId: "run_stub" });
 
 // T2 阈值
 {
-	assert.equal(effectiveAutoThresholdTokens({ tokens: 176000, contextWindow: 200000 }, 90), 175424);
+	assert.equal(effectiveAutoThresholdTokens({ tokens: 176000, contextWindow: 200000 }, 90), 171808);
 	assert.equal(effectiveAutoThresholdTokens({ tokens: 176000, contextWindow: 200000 }, 50), 100000);
 	assert.equal(effectiveAutoThresholdTokens({ tokens: 50000, contextWindow: 100000 }, 50), 50000);
 	assert.equal(effectiveAutoThresholdTokens({ tokens: null, contextWindow: 200000 }, 90), null);
@@ -263,7 +267,7 @@ let transferId5 = "";
 	const r = maybeAutoSucceed({
 		sessionId: "sess_auto_gen4",
 		generation: 4,
-		reading: HI, // 88% < 95% 提议线，但 176000 ≥ auto 线 175424
+		reading: HI, // 88% < 95% 提议线，但 176000 ≥ auto 线 171808
 		cfg,
 		spawn: () => { throw new Error("boom8"); },
 	});
@@ -347,8 +351,9 @@ let transferId5 = "";
 	}
 }
 
-// T11 阈值精确边界（review 必须项 2）：200000/90% 已知线 175424 = min(180000, 200000-16384-8192)。
-// 175423 → below-threshold 且零尝试；175424 → transfer。T2 的函数级数值样例保持不动。
+// T11 阈值精确边界（review 必须项 2）：200000/90% 已知线 171808 = min(180000, 200000-20000-8192)。
+// 171807 → below-threshold 且零尝试；171808 → transfer。T2 的函数级数值样例保持不动。
+// 反证③：reserve 改回 16384 ⇒ 线回 175424 ⇒ 171808 例变 below-threshold ⇒ 红。
 {
 	const tok = issueMasterHandoffToken({ sessionId: "sess_auto_gen4", reason: "t11" });
 	assert.equal(tok.ok, true);
@@ -364,11 +369,11 @@ let transferId5 = "";
 	const low = maybeAutoSucceed({
 		sessionId: "sess_auto_gen5",
 		generation: 5,
-		reading: { tokens: 175423, contextWindow: 200000, percent: 87.7 },
+		reading: { tokens: 171807, contextWindow: 200000, percent: 85.9 },
 		cfg: ON,
 		spawn: () => { spawnCalls++; return { successorRunId: "x" }; },
 	});
-	assert.deepEqual(low, { action: "none", reason: "below-threshold" }); // 175423 差 1 不触发
+	assert.deepEqual(low, { action: "none", reason: "below-threshold" }); // 171807 差 1 不触发
 	assert.equal(spawnCalls, 0);
 	const markerRawAfter = existsSync(masterAutoPath) ? readFileSync(masterAutoPath, "utf8") : null;
 	assert.equal(markerRawAfter, markerRaw, "below-threshold 零尝试：marker 未写");
@@ -378,11 +383,11 @@ let transferId5 = "";
 	const high = maybeAutoSucceed({
 		sessionId: "sess_auto_gen5",
 		generation: 5,
-		reading: { tokens: 175424, contextWindow: 200000, percent: 87.7 },
+		reading: { tokens: 171808, contextWindow: 200000, percent: 85.9 },
 		cfg: ON,
 		spawn: () => { spawnCalls++; return { successorRunId: "run_auto_3" }; },
 	});
-	assert.equal(high.action, "transferred", "175424 恰达线 → transfer");
+	assert.equal(high.action, "transferred", "171808 恰达线 → transfer");
 	if (high.action !== "transferred") throw new Error("unreachable");
 	assert.equal(high.successorRunId, "run_auto_3");
 	assert.equal(spawnCalls, 1);
@@ -394,7 +399,7 @@ let transferId5 = "";
 	assert.equal(a6.ok, true);
 	if (a6.ok) assert.equal(a6.attachment.generation, 6);
 	assert.equal(confirmTransferAttach({ transferId: high.transferId, sessionId: "sess_auto_gen6" }).ok, true);
-	n++; console.log(`ok ${n} - T11 阈值精确边界：175423 below-threshold 零尝试 / 175424 transfer`);
+	n++; console.log(`ok ${n} - T11 阈值精确边界：171807 below-threshold 零尝试 / 171808 transfer`);
 }
 
 // T12 transferMaster 非 spawn I/O 异常归一化（review 必须项 3）：记录目录 mkdirSync 招 ENOTDIR
@@ -451,6 +456,29 @@ let transferId5 = "";
 	assert.deepEqual(again, { action: "none", reason: "already-attempted" });
 	assert.equal(spawnCalls, 0);
 	n++; console.log(`ok ${n} - T12 非 spawn I/O 异常归一化：failed 回退全序列 + 同代禁重试`);
+}
+
+// T13 1M 钉死：1M 档 auto 线 = min(round(1M×90%)=900000, 1M−28192=971808) = 900000（percent 绑定，
+// buffer 不生效）——文档化现状（S3@1M 仍 90% 不可达；S3 OFF 下无实害，生产化需同款参考窗改造）。
+{
+	assert.equal(effectiveAutoThresholdTokens({ tokens: 900000, contextWindow: 1000000 }, 90), 900000);
+	ok("T13 1M 钉死：auto 线=900000（percent 绑定，buffer 不生效）");
+}
+
+// T14 三档保序：同窗 S2 proposal 线 < S3 auto 线（96000<99808；150000<171808；150000<900000）。
+{
+	for (const W of [128000, 200000, 1000000]) {
+		const p = proposalThresholdTokens(W, 0.75);
+		const a = effectiveAutoThresholdTokens({ tokens: 0, contextWindow: W }, 90)!;
+		assert.ok(p < a, `保序 W=${W}: proposal ${p} < auto ${a}`);
+	}
+	ok("T14 三档保序：128K/200K/1M 同窗 proposal 线 < auto 线");
+}
+
+// T15 双写 tripwire：config 旋钮 proposalPercent 与 master-pressure 的 DEFAULT_PROPOSAL_PERCENT 永久同步（R3）。
+{
+	assert.equal(DEFAULT_MASTER_SUCCESSION.proposalPercent / 100, DEFAULT_PROPOSAL_PERCENT);
+	ok("T15 双写 tripwire：proposalPercent/100 === DEFAULT_PROPOSAL_PERCENT");
 }
 
 console.log(`\n# pass ${n}`);

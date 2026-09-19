@@ -40,6 +40,8 @@ export interface MasterSuccessionConfig {
 }
 
 export const DEFAULT_MASTER_SUCCESSION: MasterSuccessionConfig = { auto: false, proposalPercent: 75, autoPercent: 90 };
+// 上项 proposalPercent 必须与 runtime/master-pressure.ts 的 DEFAULT_PROPOSAL_PERCENT×100 同步（双写；
+// _test_runtime_master_auto.ts 的 tripwire 永久防 0.75/75 漂移）。
 
 const clampPercent = (v: unknown, dflt: number): number =>
 	typeof v === "number" && Number.isFinite(v) ? Math.min(100, Math.max(1, v)) : dflt;
@@ -57,9 +59,14 @@ export function normalizeMasterSuccession(raw: unknown): MasterSuccessionConfig 
 // ── 阈值（token 绝对值判定，不 race Pi 自 compaction）────────────────
 
 export const HANDOFF_SAFETY_TOKENS = 8192;
+// 交接事务在旧主侧的 token 开销（handoff 包只读机械装配、不注入旧主，token 写 + 工具调用 ~1–2K）；
+// 后继是全新窗口不吃旧主预算，量级 8K 足够。硬约束：不可取 20K+13K=33K，否则 128K 档
+// autoLine=95,000 < proposalLine=96,000，破坏“同窗 S2<S3”保序（20K+8K=28,192 三档全保序）。
 /** Pi 自 compaction 余量估算初始值（docs/compaction.md 未公布具体数值；标定后只改这一个常量）。
+ *  标定来源（0918 S2 阈值重校准）：对标 CC MAX_OUTPUT_TOKENS_FOR_SUMMARY=20_000 /
+ *  WLC ReservedForOutput=20_000（CC 注释：p99.99 压缩摘要输出 17,387）。16,384 → 20,000。
  *  min() 保证方向安全：估大 → 阈值更低 → 提前交接；绝不会晚于 Pi compaction 触发。 */
-export const PI_COMPACTION_RESERVE_TOKENS = 16384;
+export const PI_COMPACTION_RESERVE_TOKENS = 20000;
 
 export function effectiveAutoThresholdTokens(
 	reading: { tokens: number | null; contextWindow: number | null },
