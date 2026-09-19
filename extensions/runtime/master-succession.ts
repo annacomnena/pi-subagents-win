@@ -102,11 +102,17 @@ export type ProposeResult =
 	| { proposed: true; proposal: SuccessionProposal }
 	| { proposed: false; reason: "not-owner" | "no-decision" | "below-threshold" | "already-proposed" };
 
-/** turn 检查入口：owner + 达线 + 同代未提过 → 落 pending（§10）。 */
+/**
+ * turn 检查入口：owner + 达线 + 同代未提过 → 落 pending（§10）。
+ * `enabled === false`（总开关 /master-succession off）→ 静默返回 null：
+ * 不落 state、不发事件、不通知；已落盘的旧 pending 不清除（既有生命周期处理）；
+ * 压力满由 pi 原生 compaction 自然接管。缺省（undefined）= true，现状零差。
+ */
 export function maybePropose(
-	input: { sessionId: string; generation: number; reading: PressureReading; proposalPercent?: number },
+	input: { sessionId: string; generation: number; reading: PressureReading; proposalPercent?: number; enabled?: boolean },
 	opts: SuccessionOptions = {},
-): ProposeResult {
+): ProposeResult | null {
+	if (input.enabled === false) return null;
 	const att = readAttachment(masterAddress());
 	if (!att || att.sessionId !== input.sessionId || att.generation !== input.generation) {
 		return { proposed: false, reason: "not-owner" };

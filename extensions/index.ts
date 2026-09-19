@@ -1701,6 +1701,29 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`master-cutover 已${st.enabled ? "开启" : "关闭"}（by=${sid.slice(0, 12)}）`, "info");
 		},
 	});
+	// succession 总开关（L3）：off = 不弹 proposal、不 auto transfer，压力满回落 pi 原生 compaction；
+	// 缺省 on（现状零行为变化）。模式照 /master-auto-handoff：写 config 切片 + 回显；无参回显当前状态。
+	pi.registerCommand("master-succession", {
+		description: "succession 总开关：/master-succession on|off（默认 on；off 时静默提议/自动交接，回落 pi 原生 compaction）",
+		handler: async (args, ctx) => {
+			const want = (args ?? "").trim().toLowerCase();
+			if (want !== "on" && want !== "off") {
+				const cur = reloadConfig().masterSuccession.enabled ? "on" : "off";
+				ctx.ui.notify(`succession 当前：${cur}（用法：/master-succession on|off）`, "info");
+				return;
+			}
+			const cfg = reloadConfig();
+			cfg.masterSuccession.enabled = want === "on";
+			writeConfig(cfg);
+			reloadConfig();
+			ctx.ui.notify(
+				want === "on"
+					? `succession 已开启（auto=${cfg.masterSuccession.auto ? "ON" : "OFF"}）`
+					: "succession 已关闭（不弹 proposal、不自动交接；压力满回落 pi 原生 compaction）",
+				"info",
+			);
+		},
+	});
 	// S3 自动交接开关（A1）：持久化 config.json 切片，缺省 auto=false（OFF 零行为变化）
 	pi.registerCommand("master-auto-handoff", {
 		description: "S3 自动交接开关：/master-auto-handoff on|off（持久化 config，默认 off）",
@@ -1999,7 +2022,9 @@ export default function (pi: ExtensionAPI) {
 		// 主会话专属禁轮询纪律（isMainSession 门：tab/子 agent 不注入——"STOP 是合法终态"与 worker 的 tab-finish 纪律冲突，见 no-poll.ts 头注释）
 		if (isMainSession()) lines.push(NO_POLL_DISCIPLINE);
 		// S2 提议制交接提醒缝（M5）：存在 pending proposal 即追加短提醒（§12），否则零注入。
-		const successionReminder = getPendingReminder();
+		// 总开关 enabled=false → 全静默（L3 返修）：不注入 reminder；pending state 保留不清除，
+		// 开关回 on 后现有提醒生命周期原样恢复。
+		const successionReminder = cfg.masterSuccession.enabled ? getPendingReminder() : null;
 		if (successionReminder) lines.push(successionReminder);
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});

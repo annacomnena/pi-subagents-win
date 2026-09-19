@@ -58,7 +58,8 @@ export function masterStatusLogic(cfg?: MasterSuccessionConfig): ToolOutcome {
 }
 
 function autoHandoffLine(cfg: MasterSuccessionConfig): string {
-	return `auto-handoff: ${cfg.auto ? "ON" : "OFF"} (autoPercent=${cfg.autoPercent})`;
+	// 总开关（/master-succession）在前，S3 独立 auto 开关在后（enabled=false 时 auto 失效）。
+	return `succession: ${cfg.enabled ? "on" : "off"} · auto-handoff: ${cfg.auto ? "ON" : "OFF"} (autoPercent=${cfg.autoPercent})`;
 }
 
 export function masterAttachLogic(

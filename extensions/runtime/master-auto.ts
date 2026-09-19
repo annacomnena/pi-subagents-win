@@ -31,7 +31,11 @@ import { readAttachment, readCutover } from "./registry.ts";
 // ── 配置（config.json 切片；缺失/非法 = 全默认 = 现状零差）────────────
 
 export interface MasterSuccessionConfig {
-	/** 必须严格 === true 才开启（truthy 字符串/1 一律 false） */
+	/** 总开关（默认 true = 现状零行为变化）。false = 整条 succession 静默：
+	 *  不弹 proposal、不 auto transfer；压力满由 pi 原生 compaction 自然接管（无需主动动作）。
+	 *  归一化语义与 auto 相反：严格 === false 才关，缺失/垃圾一律 true。 */
+	enabled: boolean;
+	/** 必须严格 === true 才开启（truthy 字符串/1 一律 false）；enabled=false 时本开关失效 */
 	auto: boolean;
 	/** S2 提议线，百分比（hook 传给 maybePropose 时 /100） */
 	proposalPercent: number;
@@ -39,7 +43,7 @@ export interface MasterSuccessionConfig {
 	autoPercent: number;
 }
 
-export const DEFAULT_MASTER_SUCCESSION: MasterSuccessionConfig = { auto: false, proposalPercent: 75, autoPercent: 90 };
+export const DEFAULT_MASTER_SUCCESSION: MasterSuccessionConfig = { enabled: true, auto: false, proposalPercent: 75, autoPercent: 90 };
 // 上项 proposalPercent 必须与 runtime/master-pressure.ts 的 DEFAULT_PROPOSAL_PERCENT×100 同步（双写；
 // _test_runtime_master_auto.ts 的 tripwire 永久防 0.75/75 漂移）。
 
@@ -50,6 +54,7 @@ export function normalizeMasterSuccession(raw: unknown): MasterSuccessionConfig 
 	if (typeof raw !== "object" || raw === null) return { ...DEFAULT_MASTER_SUCCESSION };
 	const o = raw as Record<string, unknown>;
 	return {
+		enabled: o.enabled !== false,
 		auto: o.auto === true,
 		proposalPercent: clampPercent(o.proposalPercent, DEFAULT_MASTER_SUCCESSION.proposalPercent),
 		autoPercent: clampPercent(o.autoPercent, DEFAULT_MASTER_SUCCESSION.autoPercent),
@@ -137,7 +142,7 @@ export function hasInFlightTransfer(stateDir?: string): boolean {
 // ⑦（turn ended）结构性保证，见头注；达 auto 线由 maybeAutoSucceed 单独判（below-threshold）。
 
 export type AutoGateReason =
-	| "auto-off" | "not-owner" | "cutover-off" | "no-usage"
+	| "disabled" | "auto-off" | "not-owner" | "cutover-off" | "no-usage"
 	| "in-flight-transfer" | "already-attempted" | "no-spawn";
 
 export type AutoGateResult = { pass: true } | { pass: false; reason: AutoGateReason };
@@ -241,6 +246,9 @@ export function maybeAutoSucceed(
 	},
 	opts: AutoSucceedOptions = {},
 ): AutoSucceedResult {
+	// 总开关入口门（先于 auto 门，S3 独立开关保留但 enabled=false 时失效）：
+	// 静默返回，零写零事件零 spawn；压力满由 pi 原生 compaction 自然接管。
+	if (input.cfg.enabled !== true) return { action: "none", reason: "disabled" };
 	const gate = checkAutoGate({
 		sessionId: input.sessionId,
 		generation: input.generation,

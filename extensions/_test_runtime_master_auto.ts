@@ -20,6 +20,11 @@
  *   T13 1M 钉死：effectiveAutoThresholdTokens({900000,1M},90)=900000（percent 绑定，buffer 不生效）
  *   T14 三档保序：proposalLine(W) < autoLine(W)（128K/200K/1M）
  *   T15 双写 tripwire：proposalPercent/100 === DEFAULT_PROPOSAL_PERCENT
+ *   T16 enabled=false 时 maybePropose 零动作（高压读数不落 proposal、无通知）
+ *   T17 enabled=false 时 maybeAutoSucceed 静默（零 spawn 零 marker 零事件，reason=disabled）
+ *   T18 enabled=true 现状等价（既有 T4–T15 全绿即证；本测钉 default enabled=true）
+ *   T19 真实命令层：/master-succession on/off config 持久化往返 + 无参回显 +
+ *      auto-handoff 不串扰 + enabled=off 时 pending reminder 全静默（回归）
  *
  * 运行：npm run test:runtime-master-auto
  */
@@ -27,7 +32,8 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-auto-env-"));
@@ -37,7 +43,7 @@ import { readAttachment, setCutover } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 import { confirmTransferAttach, readTransferRecord } from "./runtime/master-transfer.ts";
-import { maybePropose, readProposal } from "./runtime/master-succession.ts";
+import { getPendingReminder, maybePropose, readProposal } from "./runtime/master-succession.ts";
 import {
 	DEFAULT_MASTER_SUCCESSION,
 	checkAutoGate,
@@ -66,7 +72,7 @@ const transfersDir = join(STATE_DIR, "master-transfers");
 const masterEventCount = () =>
 	listRuntimeEnvelopes().envelopes.filter((e) => e.type.startsWith("master.")).length;
 
-const ON: MasterSuccessionConfig = { auto: true, proposalPercent: 75, autoPercent: 90 };
+const ON: MasterSuccessionConfig = { enabled: true, auto: true, proposalPercent: 75, autoPercent: 90 };
 const HI = { tokens: 176000, contextWindow: 200000, percent: 88 }; // 88% < 90% 线，但 176000 ≥ 171808（min 线 = 200000−28192）
 const OK_SPAWN = () => ({ successorRunId: "run_stub" });
 
@@ -83,7 +89,11 @@ const OK_SPAWN = () => ({ successorRunId: "run_stub" });
 	assert.equal(normalizeMasterSuccession({ auto: true, proposalPercent: 0 }).proposalPercent, 1); // clamp
 	assert.equal(normalizeMasterSuccession({ auto: true, autoPercent: 150 }).autoPercent, 100); // clamp
 	assert.equal(normalizeMasterSuccession({ auto: true, proposalPercent: "x" }).proposalPercent, 75);
-	ok("T1 normalizeMasterSuccession：默认/严格 true/clamp [1,100]");
+	assert.equal(d.enabled, true, "总开关默认 true（现状零行为变化）");
+	assert.equal(normalizeMasterSuccession({ enabled: false }).enabled, false);
+	assert.equal(normalizeMasterSuccession({ enabled: "false" }).enabled, true, "严格 === false 才关");
+	assert.equal(normalizeMasterSuccession({ auto: 1 }).enabled, true); // 缺省补全
+	ok("T1 normalizeMasterSuccession：默认/严格 true/clamp [1,100]/enabled 严格 false");
 }
 
 // T2 阈值
@@ -267,7 +277,7 @@ let transferId5 = "";
 // proposal(0.95) 线=min(121.6K,150K)=121600；取 110000 ∈ [99808,121600)：auto 达、proposal 未达。
 {
 	const HI128 = { tokens: 110000, contextWindow: 128000, percent: 85.9 };
-	const cfg: MasterSuccessionConfig = { auto: true, proposalPercent: 95, autoPercent: 90 };
+	const cfg: MasterSuccessionConfig = { enabled: true, auto: true, proposalPercent: 95, autoPercent: 90 };
 	const r = maybeAutoSucceed({
 		sessionId: "sess_auto_gen4",
 		generation: 4,
@@ -293,9 +303,11 @@ let transferId5 = "";
 	assert.match(noCfg.text, /attachment: /);
 	assert.ok(!noCfg.text.includes("auto-handoff"));
 	const off = masterStatusLogic(DEFAULT_MASTER_SUCCESSION);
-	assert.ok(off.text.includes("auto-handoff: OFF (autoPercent=90)"));
-	const on = masterStatusLogic({ auto: true, proposalPercent: 75, autoPercent: 90 });
-	assert.ok(on.text.includes("auto-handoff: ON (autoPercent=90)"));
+	assert.match(off.text, /succession: on \u00b7 auto-handoff: OFF \(autoPercent=90\)/);
+	const on = masterStatusLogic({ enabled: true, auto: true, proposalPercent: 75, autoPercent: 90 });
+	assert.match(on.text, /succession: on \u00b7 auto-handoff: ON \(autoPercent=90\)/);
+	const off2 = masterStatusLogic({ enabled: false, auto: false, proposalPercent: 75, autoPercent: 90 });
+	assert.match(off2.text, /succession: off \u00b7 auto-handoff: OFF \(autoPercent=90\)/);
 	// S2 缺省 75% 线：74% 不提议、76% 提议（现状行为不变）
 	const low = maybePropose({ sessionId: "sess_auto_gen4", generation: 4, reading: { tokens: 148000, contextWindow: 200000, percent: 74 } });
 	assert.equal(low.proposed, false);
@@ -483,6 +495,185 @@ let transferId5 = "";
 {
 	assert.equal(DEFAULT_MASTER_SUCCESSION.proposalPercent / 100, DEFAULT_PROPOSAL_PERCENT);
 	ok("T15 双写 tripwire：proposalPercent/100 === DEFAULT_PROPOSAL_PERCENT");
+}
+
+// T16 总开关 enabled=false：maybePropose 入口静默返回 null——高压读数（88 ≥ 75 线）
+// 不落 proposal、无通知、不落任何 state（owner 是 gen6，无同代 pending，排除 already-proposed 干扰）。
+{
+	const disabled: MasterSuccessionConfig = { enabled: false, auto: true, proposalPercent: 75, autoPercent: 90 };
+	const proposalBefore = readProposal();
+	const r = maybePropose({ sessionId: "sess_auto_gen6", generation: 6, reading: HI, proposalPercent: 0.75, enabled: false });
+	assert.equal(r, null, "enabled=false → 返回 null（不落盘不通知）");
+	assert.deepEqual(readProposal(), proposalBefore, "proposal 文件未动");
+	ok("T16 enabled=false：maybePropose 零动作（高压不落 proposal、无通知）");
+}
+
+// T17 总开关 enabled=false：maybeAutoSucceed 入口静默（reason=disabled），
+// 零 spawn 零 marker 零事件零 transfer 记录；enabled 门在 auto 门之前（S3 独立开关保留但失效）。
+{
+	const eventsBefore = masterEventCount();
+	const recsBefore = existsSync(transfersDir) ? readdirSync(transfersDir).length : 0;
+	const markerRaw = existsSync(masterAutoPath) ? readFileSync(masterAutoPath, "utf8") : null;
+	let spawnCalls = 0;
+	const r = maybeAutoSucceed({
+		sessionId: "sess_auto_gen6",
+		generation: 6,
+		reading: HI,
+		cfg: { enabled: false, auto: true, proposalPercent: 75, autoPercent: 90 },
+		spawn: () => { spawnCalls++; return { successorRunId: "x" }; },
+	});
+	assert.deepEqual(r, { action: "none", reason: "disabled" }, "入口静默，先于 auto 门");
+	assert.equal(spawnCalls, 0);
+	const markerRawAfter = existsSync(masterAutoPath) ? readFileSync(masterAutoPath, "utf8") : null;
+	assert.equal(markerRawAfter, markerRaw, "零 marker 写入");
+	assert.equal(masterEventCount(), eventsBefore, "零 journal 增量");
+	assert.equal(existsSync(transfersDir) ? readdirSync(transfersDir).length : 0, recsBefore, "零 transfer 记录");
+	ok("T17 enabled=false：maybeAutoSucceed 静默（零 spawn 零 marker 零事件）");
+}
+
+// T18 enabled=true 现状等价：默认配置 enabled=true 时既有行为零差（T4–T15 全绿即证；
+// 本测只钉默认值，防有人把 default 翻 false 静默关闭 succession）。
+{
+	assert.equal(DEFAULT_MASTER_SUCCESSION.enabled, true);
+	assert.equal(normalizeMasterSuccession(undefined).enabled, true);
+	ok("T18 enabled=true 现状等价：default enabled=true（既有 T4–T15 零差）");
+}
+
+// T19 真实命令层（review 返修）：fake ExtensionAPI 捕获 index.ts 真实 default factory 注册的
+// /master-succession 命令 handler 并真实调用（惯例同 _test_register_graph.ts 的 factory 直调 +
+// _test_lite_mode.ts 的 handler 捕获断言模式）。index.ts 无循环 import 阻塞（register-graph
+// 长期直接 import 验证）；命令 handler 的 config 读写走模块级 readConfig/writeConfig（无注入
+// 缝），故先备份真实 config.json，finally 恢复原字节。before_agent_start 的 pending reminder
+// 门禁回归（review 必须项 1）复用同一 factory 注册的真实 hook。
+{
+	const testDir = dirname(fileURLToPath(import.meta.url));
+	const cfgPath = join(testDir, "..", "config.json");
+	const backup = existsSync(cfgPath) ? readFileSync(cfgPath, "utf8") : null;
+	// 身份环境隔离（同 T10 / _test_lite_mode）：清 tab/subagent/profile 身份，factory 以主会话执行
+	const savedTab = process.env.PI_TAB_RUN_ID;
+	const savedSub = process.env.PI_SUBAGENT;
+	const savedProf = process.env.PI_SESSION_PROFILE;
+	delete process.env.PI_TAB_RUN_ID;
+	delete process.env.PI_SUBAGENT;
+	delete process.env.PI_SESSION_PROFILE;
+	try {
+		const indexMod = await import("./index.ts");
+		const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+		const hooks = new Map<string, Array<(ev: unknown, ctx: unknown) => unknown>>();
+		const fakePi = {
+			registerTool: () => {},
+			registerCommand: (name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+				commands.set(name, def.handler);
+			},
+			registerFlag: () => {},
+			on: (ev: string, h: (ev: unknown, ctx: unknown) => unknown) => {
+				hooks.set(ev, [...(hooks.get(ev) ?? []), h]);
+			},
+			getFlag: () => "",
+			sendUserMessage: () => {},
+			sendMessage: () => {},
+			exec: () => {},
+		} as unknown as ExtensionAPI;
+		await indexMod.default(fakePi);
+		assert.ok(commands.has("master-succession"), "/master-succession 已注册");
+		assert.ok(commands.has("master-auto-handoff"), "/master-auto-handoff 已注册");
+		const beforeStart = hooks.get("before_agent_start") ?? [];
+		assert.equal(beforeStart.length, 1, "before_agent_start 已注册");
+
+		const notices: string[] = [];
+		const cmdCtx = { hasUI: true, ui: { notify: (m: string) => notices.push(m) } };
+		const run = (name: string, args: string): Promise<void> => {
+			const h = commands.get(name);
+			if (!h) throw new Error(`command ${name} 未注册`);
+			return h(args, cmdCtx as never);
+		};
+		const readRaw = (): Record<string, unknown> => JSON.parse(readFileSync(cfgPath, "utf8"));
+		const backupObj: Record<string, unknown> = backup ? JSON.parse(backup) : {};
+		const ms = (r: Record<string, unknown>) => r.masterSuccession as { enabled: boolean; auto: boolean; proposalPercent: number; autoPercent: number };
+
+		// ① 无参调用：回显当前状态（真实 config 无 masterSuccession 切片 → 归一化 enabled=true）
+		await run("master-succession", "");
+		assert.ok(notices[notices.length - 1].includes("succession 当前：on"), "无参回显 on");
+		assert.ok(notices[notices.length - 1].includes("/master-succession on|off"), "无参带用法");
+
+		// ② off：持久化 enabled:false，其它切片不变，默认值补全
+		notices.length = 0;
+		await run("master-succession", "off");
+		let raw = readRaw();
+		assert.equal(ms(raw).enabled, false, "off 持久化");
+		assert.equal(ms(raw).auto, false, "auto 缺省补全不被篡改");
+		for (const k of Object.keys(backupObj)) {
+			if (k === "masterSuccession") continue;
+			assert.deepEqual(raw[k], backupObj[k], `键 ${k} 保留`);
+		}
+		assert.ok(notices[0].includes("succession 已关闭"), "off 通知");
+
+		// ③ on：往返恢复 enabled:true，auto 保持缺省 false
+		notices.length = 0;
+		await run("master-succession", "on");
+		raw = readRaw();
+		assert.equal(ms(raw).enabled, true, "on 往返恢复");
+		assert.ok(notices[0].includes("succession 已开启（auto=OFF）"), "on 通知 + auto 子开关回显");
+
+		// ④ 非法参数：零落盘，落到用法回显
+		const beforeBogus = readFileSync(cfgPath, "utf8");
+		notices.length = 0;
+		await run("master-succession", "bogus");
+		assert.equal(readFileSync(cfgPath, "utf8"), beforeBogus, "非法参数不写盘");
+		assert.ok(notices[0].includes("succession 当前：on"), "非法参数落到状态回显");
+
+		// ⑤ 不串扰：/master-auto-handoff 只改 auto 不动 enabled；总开关只改 enabled 不重写 auto
+		await run("master-auto-handoff", "on");
+		raw = readRaw();
+		assert.equal(ms(raw).auto, true, "auto 命令开启 auto");
+		assert.equal(ms(raw).enabled, true, "auto 命令不动 enabled");
+		await run("master-succession", "off");
+		raw = readRaw();
+		assert.equal(ms(raw).enabled, false, "总开关关闭");
+		assert.equal(ms(raw).auto, true, "总开关不重写 auto 子开关（失效但未被改写）");
+		notices.length = 0;
+		await run("master-succession", "");
+		assert.ok(notices[notices.length - 1].includes("succession 当前：off"), "无参回显跟随最新 off");
+
+		// ⑥ pending reminder 门禁（review 必须项 1）：先有 pending（T9 已落 gen4 pending 于隔离
+		//    临时 state 目录，PI_RUNTIME_DIR）→ enabled=off 时下一轮零注入且 pending 不清除；回 on 恢复。
+		assert.ok(getPendingReminder() !== null, "前置：pending proposal 存在");
+		const startCtx = { modelRegistry: { getAvailable: () => [] } };
+		const contentOf = async (): Promise<string> => {
+			const r = (await beforeStart[0]({}, startCtx)) as { message?: { content?: string } } | undefined;
+			return r?.message?.content ?? "";
+		};
+		// 当前 enabled=false（⑤ 遗留 off）：下一轮不注入 reminder，pending 文件保留
+		let content = await contentOf();
+		assert.ok(!content.includes("A pending Master handoff proposal exists"), "enabled=off → 无 reminder（全静默）");
+		assert.ok(!content.includes("call master-transfer"), "enabled=off → 无交接指引行");
+		assert.ok(getPendingReminder() !== null, "pending state 未被清除");
+		// 回 on：reminder 恢复（现有生命周期原样恢复）
+		await run("master-succession", "on");
+		content = await contentOf();
+		assert.ok(content.includes("A pending Master handoff proposal exists"), "enabled=on → reminder 恢复");
+		assert.ok(content.includes("call master-transfer"), "enabled=on → 交接指引行恢复");
+
+		// ⑦ 恢复默认：auto off（回缺省 OFF）；enabled 保持 on
+		notices.length = 0;
+		await run("master-auto-handoff", "off");
+		raw = readRaw();
+		assert.equal(ms(raw).auto, false, "auto 恢复缺省 OFF");
+		assert.equal(ms(raw).enabled, true, "enabled 保持 on");
+	} finally {
+		if (backup !== null) writeFileSync(cfgPath, backup);
+		else if (existsSync(cfgPath)) rmSync(cfgPath);
+		if (savedTab !== undefined) process.env.PI_TAB_RUN_ID = savedTab; else delete process.env.PI_TAB_RUN_ID;
+		if (savedSub !== undefined) process.env.PI_SUBAGENT = savedSub; else delete process.env.PI_SUBAGENT;
+		if (savedProf !== undefined) process.env.PI_SESSION_PROFILE = savedProf; else delete process.env.PI_SESSION_PROFILE;
+	}
+// status 行显示（纯函数半，不依赖命令）：succession: on/off 两态
+{
+	const off = { ...DEFAULT_MASTER_SUCCESSION, enabled: false };
+	assert.match(masterStatusLogic(off).text, /succession: off \u00b7 auto-handoff: OFF \(autoPercent=90\)/);
+	assert.match(masterStatusLogic(DEFAULT_MASTER_SUCCESSION).text, /succession: on \u00b7 auto-handoff: OFF \(autoPercent=90\)/);
+}
+	n++; console.log(`ok ${n} - T19 真实命令层：on→off→on config 持久化往返 + 无参回显 + auto-handoff 不串扰 + enabled=off 时 pending reminder 全静默`);
 }
 
 console.log(`\n# pass ${n}`);

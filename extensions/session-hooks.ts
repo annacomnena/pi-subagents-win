@@ -159,9 +159,9 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
 			const cfg = deps.masterSuccession?.() ?? DEFAULT_MASTER_SUCCESSION;
 			// S2：owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）；
-			// proposalPercent 缺省 0.75，与现状零差。
-			const r = maybePropose({ sessionId: sid, generation: att.generation, reading, proposalPercent: cfg.proposalPercent / 100 });
-			if (r.proposed) {
+			// proposalPercent 缺省 0.75，与现状零差；enabled=false（总开关 off）→ 静默 null。
+			const r = maybePropose({ sessionId: sid, generation: att.generation, reading, proposalPercent: cfg.proposalPercent / 100, enabled: cfg.enabled });
+			if (r && r.proposed) {
 				try {
 					ui?.notify?.(
 						`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
