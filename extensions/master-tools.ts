@@ -14,6 +14,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { sessionIdentity } from "./links.ts";
 import { isMainSession, isSubagent, isTabSession } from "./identity.ts";
+import { triggerOwnershipRecheck } from "./event-bus.ts";
 import {
 	attachCurrentSession,
 	getMasterStatus,
@@ -32,6 +33,7 @@ import {
 	DEFAULT_PROPOSAL_PERCENT,
 	formatPressure,
 	meetsProposalThreshold,
+	proposalThresholdTokens,
 	readPressure,
 } from "./runtime/master-pressure.ts";
 import type { MasterSuccessionConfig } from "./runtime/master-auto.ts";
@@ -240,8 +242,13 @@ export function masterPressureLogic(usage: unknown): ToolOutcome {
 	const reading = readPressure(usage as { tokens?: number | null; contextWindow?: number | null; percent?: number | null } | null | undefined);
 	const text = formatPressure(reading);
 	const over = meetsProposalThreshold(reading);
+	// 达线提示：tokens/W 已知时显示绝对线（如 150,000 tokens），未知时保留百分比文案。
+	const line =
+		reading.tokens !== null && reading.contextWindow !== null && reading.contextWindow > 0
+			? `已达提议线（${proposalThresholdTokens(reading.contextWindow, DEFAULT_PROPOSAL_PERCENT).toLocaleString("en-US")} tokens）`
+			: `已达提议线 ${DEFAULT_PROPOSAL_PERCENT * 100}%`;
 	return {
-		text: over ? `${text}\n已达提议线 ${DEFAULT_PROPOSAL_PERCENT * 100}%（是否交接由 proposal 流程决定，见 master-transfer）` : text,
+		text: over ? `${text}\n${line}（是否交接由 proposal 流程决定，见 master-transfer）` : text,
 		details: { tokens: reading.tokens, contextWindow: reading.contextWindow, percent: reading.percent, overThreshold: over },
 	};
 }
@@ -313,6 +320,11 @@ export function registerMasterTools(
 			if (!sid || sid === "unknown") return textResult({ text: "master-attach: 无法确定当前会话身份，拒绝", isError: true });
 			const params = rawParams as { token?: string; forceStale?: boolean; confirm?: boolean };
 			const outcome = masterAttachLogic(sid, params);
+			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（succession 后继 tab 在
+			// session_start 之后才成 owner，一次性 session_start 判定漏注册；best-effort，失败不影响接管）。
+			if (!outcome.isError) {
+				try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
+			}
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
 		},
 	});

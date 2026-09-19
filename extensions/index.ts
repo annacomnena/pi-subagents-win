@@ -48,7 +48,7 @@ import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
-import { registerEventBus } from "./event-bus.ts";
+import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop } from "./mailbox-consumer.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
@@ -1682,6 +1682,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined });
 			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
+			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
+			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
 			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
 		},
 	});

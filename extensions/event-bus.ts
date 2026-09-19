@@ -8,8 +8,18 @@
  *   - 刷新 async 面板/状态栏（如适用）
  *
  * 设计约束：
- *   - 只有主会话（无 PI_TAB_RUN_ID、非 PI_SUBAGENT）注册 watch；
- *     子 agent/标签页不注册，避免重复唤醒。
+ *   - 注册条件 ownership-gated（Phase 5.6，修「tab 承载 owner 唤醒链断裂」）：
+ *     cutover 启用 + 有 attachment 时「owner 是谁谁 watch」——仅当前 logical master 的
+ *     承载会话注册（主会话若恰为 owner 同样走此路）；本会话 attach 成 owner 时由
+ *     master-attach 触发 triggerOwnershipRecheck 补注册（succession 后继 tab 在
+ *     session_start 之后才成 owner，一次性判定会漏注册）。cutover 未启用/无 registry 时
+ *     legacy 回退 isMainSession()（零变化）；子 agent 恒不注册。
+ *   - 注入前 fencing（Phase 5.6）：onTabResultFile 处理前重读 attachment，watch 期间易主
+ *     （本会话不再是 owner）→ 静默放弃（不 journal、不 mailbox、不注入）。
+ *   - transfer 窗口补偿（Phase 5.6b，修「fencing 放弃 + 新 owner snapshot 标 seen → 完成通知永久丢失」）：
+ *     旧 owner 的 watcher fencing 放弃时**不创建 .notified**；新 owner 经 master-attach 补注册 watcher
+ *     （triggerOwnershipRecheck）时先对「已存在且无 .notified」的 result 补投一次（journal+mailbox+注入，
+ *     均幂等），再 snapshot 标 seen——「journal 跟随 owner」，易主窗口不丢终态。
  *   - 去重：启动时把已存在的 result 视为"已处理"；只对启动后新出现的触发。
  *   - Windows fs.watch 偶发丢事件 → 保留 10s tick 兜底（见 async-panel / registerTabStatusTools）。
  */
@@ -23,12 +33,14 @@ import { sendWindowsToast } from "./notify-windows.ts";
 import { readTabResultFile } from "./tab-runs.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { deliverLetterSafe } from "./runtime/mailbox.ts";
+import { readAttachment, readCutover } from "./runtime/registry.ts";
+import { masterAddress } from "./runtime/address.ts";
 import { tabResultToReportLetter } from "./runtime/adapters/tab-run.ts";
-import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
+import { auditSuppression, postInject, preInject, type InjectionContext } from "./injection-gate.ts";
 import { runReceiptKey } from "./runtime/receipts.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
-import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { getCurrentSessionId, isMainSession, isSubagent, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath } from "./links.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { recipientSessionIdFor } from "./report.ts";
@@ -54,6 +66,59 @@ export interface EventBusOptions {
 let watcher: FSWatcher | null = null;
 let seenResults = new Set<string>();
 let selfDisabled = false; // 旧实例 stale 后停止注入，避免反复报错
+let watcherGen = 0; // 每次 (重)建 / close watcher 自增；回调据此判 stale（防双 watcher / reload 死 watcher）
+let startWatch: (() => void) | null = null; // 当前周期的"按需(重)启动 watch"闭包；owner 易主（master-attach）后由 triggerOwnershipRecheck 触发
+
+/** 关掉在途 watcher 并使其回调 stale（watcherGen 自增）。 */
+function closeWatcher(): void {
+	watcherGen++;
+	try {
+		watcher?.close();
+	} catch {
+		/* ignore */
+	}
+	watcher = null;
+}
+
+/**
+ * 是否应由本会话注册 result watcher（Phase 5.6：ownership-gated）。
+ *  - cutover 未启用 / 无 attachment（registry 未激活）→ legacy 回退 isMainSession()（零变化）。
+ *  - cutover 启用 + 有 attachment → "owner 是谁谁 watch"：仅当本会话就是当前 owner 才 watch。
+ * 主会话若恰为 owner 同样走此路（不再靠 isMainSession 特判）；子 agent 恒不 watch。
+ *
+ * 子 agent 硬门（review §1 Must fix）：docstring 承诺「子 agent 恒不 watch」，此前却从未
+ * 调用 isSubagent()——一个恰好捕获了等于某 registry attachment 的 sessionId 的子 agent
+ * 在 cutover 下会被放行注册。故在 legacy / owner 两分支之前硬挡 isSubagent()（两种 ownership
+ * 状态都不 watch），与 isMainSession() 内部的 !isSubagent 语义一致但显式前置。
+ */
+export function shouldRegisterWatcher(): boolean {
+	if (isSubagent()) return false; // 子 agent 恒不 watch（legacy 回退 + cutover ownership 两路都不走）
+	const cutover = readCutover();
+	const attachment = readAttachment(masterAddress());
+	if (!cutover?.enabled || !attachment) return isMainSession();
+	const me = getCurrentSessionId();
+	return me !== undefined && attachment.sessionId === me;
+}
+
+/**
+ * 会话刚成为 owner（master-attach / /master-attach 成功）后由 master 侧调用：
+ * 重查 ownership，若现在轮到本会话 watch 且尚未 watch → 补注册 watcher。
+ * 覆盖「succession 后继 tab 在 session_start 之后才 attach 成 owner」——一次性 session_start
+ * 判定（那时它还不是 owner）会漏注册，导致 result 落盘无人发现。幂等：已在 watch / 非 owner → no-op。
+ */
+export function triggerOwnershipRecheck(): void {
+	startWatch?.();
+}
+
+/** 测试/调试：当前是否有活跃 result watcher。 */
+/** 测试 teardown 钩子：关最后一个 watcher，保障测试进程退出（仅测试用，生产由 cleanup 返回值负责）。 */
+export function closeWatcherForTests(): void {
+	closeWatcher();
+}
+
+export function isEventBusWatching(): boolean {
+	return watcher !== null;
+}
 
 /** 启动时快照：已存在的 result 视为已处理，避免重启后重复触发。 */
 function snapshotExisting(runsDir: string): void {
@@ -61,6 +126,36 @@ function snapshotExisting(runsDir: string): void {
 	if (!existsSync(runsDir)) return;
 	for (const f of readdirSync(runsDir)) {
 		if (f.endsWith(".result.json")) seenResults.add(f);
+	}
+}
+
+/**
+ * Phase 5.6b transfer 窗口 / crash 补偿投递（review §3 Must fix）：
+ *
+ * 漏洞序列：旧 owner 持有 watcher → 易主期间某 `*.result.json` 落盘 → 旧 watcher 观察到
+ * 后 fencing 发现已非 owner → 静默放弃（不 journal/不 mailbox/不 claimNotified，故**无 .notified**）
+ * → 新 owner 经 triggerOwnershipRecheck 补注册 watcher，其 begin() 的 snapshotExisting 把该
+ * 文件当作「启动历史」标记 seen → 无人再处理 → 完成通知永久丢失（原「留给新 owner 的 watcher」
+ * 注释在此窗口下不成立）。
+ *
+ * 修复：新 owner 补注册 watcher 时（triggerOwnershipRecheck 路径），先对「已存在且从未投递
+ * （无 .notified 持久标记）」的 result 补投一次（journal + mailbox + 注入），再 snapshot 标记 seen。
+ *
+ * 幂等（跨进程/跨实例，review §3 要求保留 restart dedupe）：
+ *   - `.notified` 文件是跨进程「已投递」持久屏障——正常完成/已投递/重启去重的文件都有它 → 跳过；
+ *     只有 fencing 放弃（未达 claimNotified）的丢失结果缺它 → 才补投。
+ *   - journal 走 emitRuntimeEventOnce 的 dedupeKey、mailbox 走 dedupeId，重放不双写。
+ *   - onTabResultFile 内部 fencing/recipient/claimNotified 均幂等，重放不会重复注入。
+ * 仅 current owner（begin 已过 shouldRegisterWatcher 门）可产出 journal/mailbox/注入。
+ */
+function recoverUnnotifiedResults(runsDir: string, opts: EventBusOptions): void {
+	if (!existsSync(runsDir)) return;
+	for (const f of readdirSync(runsDir)) {
+		if (!f.endsWith(".result.json")) continue;
+		const runId = f.slice(0, -".result.json".length);
+		if (existsSync(join(runsDir, `${runId}.notified`))) continue; // 已投递 → 重启/重放去重，不动
+		seenResults.delete(f); // 撤销 begin() 的「启动历史」标记（无 .notified 说明从未投递，非历史）
+		onTabResultFile(runsDir, f, opts); // 补投（内部 fencing/claim/journal 均幂等）
 	}
 }
 
@@ -88,13 +183,32 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (seenResults.has(fileName)) return false;
 	seenResults.add(fileName);
 	const runId = fileName.slice(0, -".result.json".length);
-
-	// Phase 1 shadow emit（terra 裁决缺陷 1 修订）：**最先执行，与消费/recipient 路由/唤醒完全解耦**——
-	// 原派发 session rollover 消失后，新 master session 的 watcher 也必须能补写终态，
-	// 否则 journal 违背「logical master 账目不丢」目标；trace-fusion 消费分支提前
-	// return true 的场景同样需要终态入账。
-	// 幂等用独立 dedupeKey claim（跨实例/跨重放），不动 .notified 的唤醒语义。
 	const result = readTabResultFile(runsDir, runId);
+
+	// Phase 5.6 注入前 fencing（ownership 重读，"journal 跟随 owner"）：watch 期间易主
+	//（本会话不再是当前 owner）→ 静默放弃：不 journal、不 mailbox、不注入，也不创建 .notified——终态
+	// 由新 owner 经 triggerOwnershipRecheck 的 transfer 窗口补偿（recoverUnnotifiedResults）补投
+	//（无 .notified 才补投，幂等）。「journal 跟随 owner」。仅 cutover 启用 + 有 attachment 时判定；
+	// legacy（未启用/无 registry）恒放行，行为零变化。记抑制审计（与 preInject gate 同语义，保持可审计）；
+	// 已 seen 去重保持（上方已 add，本进程不重放；跨进程由新 owner 独立 seen + .notified 屏障处理）。
+	{
+		const cut = readCutover();
+		const att = readAttachment(masterAddress());
+		const me = getCurrentSessionId();
+		if (cut?.enabled && att && me !== att.sessionId) {
+			auditSuppression(
+				{ key: runReceiptKey(runId, result?.status ?? "unknown"), sessionId: me, path: "legacy-eventbus" },
+				"suppressed-not-owner",
+				att,
+			);
+			return false;
+		}
+	}
+
+	// Phase 1 shadow emit（terra 裁决缺陷 1 修订）：**owner 进程最先执行，与消费/唤醒解耦**——
+	// 新 master session（含 tab 承载）的 watcher 必须能补写终态，否则 journal 违背「logical
+	// master 账目不丢」目标；trace-fusion 消费分支提前 return true 同样需入账。
+	// 幂等用独立 dedupeKey claim（跨实例/跨重放），不动 .notified 的唤醒语义。
 	if (result) {
 		emitRuntimeEventOnce(tabResultToRuntimeEvent(result));
 		// Phase 3c 影子投递（§27-28）：mailbox REPORT 给 logical recipient（agent://master），
@@ -174,41 +288,40 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 }
 
 /**
- * 注册事件总线（主会话）。返回清理函数（测试用）。
+ * 注册事件总线（主会话 / 当前 owner 会话）。返回清理函数（测试用）。
  */
 export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): () => void {
 	// 工厂入口重置模块状态（P1：reload 重跑工厂时不继承旧实例的 selfDisabled/seen*，避免新会话静默失效）
 	_resetEventBus();
 	const runsDir = opts.runsDir ?? DEFAULT_TAB_RUNS_DIR;
 
-	// 延迟到 session_start 再判定身份并启动 watcher：
-	// CLI flag（--tab-run-id）在扩展加载完成后才就绪，工厂里 isMainSession() 不可靠；
-	// 非主会话（标签页/子 agent）进程不 watch，避免重复唤醒。
-	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
-	pi.on("session_start", (_event, ctx) => {
-		if (!isMainSession()) return;
-		// 捕获当前会话 UUID（完成消息会话定位的依据；与 report/timers 同模式）
-		try {
-			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
-		} catch { /* ctx 不可用则保持 undefined（不注入任何完成消息，宁可静默） */ }
+	// sendUserMessage 从 pi 注入（EventBusOptions 里没有，闭包拿 pi）
+	const fullOpts: EventBusOptions = {
+		...opts,
+		runsDir,
+		linksPath: opts.linksPath ?? defaultLinksPath(),
+		sendUserMessage: pi.sendUserMessage?.bind(pi),
+	};
 
-		const myGen = ++sessionGen;
-		const closed = (): boolean => myGen !== sessionGen;
-
+	// 延迟到 session_start 再判定身份并启动 watcher：CLI flag（--tab-run-id）在扩展加载完成后
+	// 才就绪，工厂里 isMainSession() 不可靠。
+	// Phase 5.6：注册条件 ownership-gated——cutover 启用 + 有 attachment 时「owner 是谁谁
+	// watch」（仅当前 owner 注册）；未启用/无 registry 时 legacy 回退 isMainSession()（零变化）。
+	// 本会话后续 attach 成 owner 时，由 master-attach 触发 triggerOwnershipRecheck() 补注册。
+	// begin() 幂等 + stale-safe：reload 重跑时先 closeWatcher 关上一个再建新，回调凭 watcherGen 判
+	// stale，根治「双 watcher / reload 后旧 watcher 死活不分」。
+	const begin = (recover: boolean = false): void => {
+		if (!shouldRegisterWatcher()) return; // 非 owner（cutover）/ 非主会话（legacy）→ 不 watch
+		closeWatcher(); // 关上一个（防双 watcher / stale 死 watcher）
+		const gen = ++watcherGen;
+		// transfer 窗口 / crash 补偿：仅 attach 补注册路径（recover=true）先对「未投递」result 补投，
+		// 再 snapshot；普通 session_start 首次注册保持 legacy snapshot 行为（零变化）。
+		if (recover) recoverUnnotifiedResults(runsDir, fullOpts);
 		snapshotExisting(runsDir);
-
-		// sendUserMessage 从 pi 注入（EventBusOptions 里没有，闭包拿 pi）
-		const fullOpts: EventBusOptions = {
-			...opts,
-			runsDir,
-			linksPath: opts.linksPath ?? defaultLinksPath(),
-			sendUserMessage: pi.sendUserMessage?.bind(pi),
-		};
-
 		if (existsSync(runsDir)) {
 			try {
 				watcher = watch(runsDir, (_event, fileName) => {
-					if (closed()) return;
+					if (gen !== watcherGen) return; // 被新的替代 / cleanup → stale no-op
 					if (typeof fileName === "string") {
 						onTabResultFile(runsDir, fileName, fullOpts);
 					}
@@ -217,16 +330,21 @@ export function registerEventBus(pi: ExtensionAPI, opts: EventBusOptions = {}): 
 				watcher = null;
 			}
 		}
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		// 捕获当前会话 UUID（owner 判定 / 完成消息会话定位的依据；与 report/timers 同模式）
+		try {
+			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
+		} catch { /* ctx 不可用则保持 undefined（非 owner 时不注入任何完成消息，宁可静默） */ }
+
+		startWatch = () => begin(true); // master-attach 成功后经 triggerOwnershipRecheck 触发补注册 + transfer 窗口补偿
+		begin();
 	});
 
 	const cleanup = () => {
-		sessionGen++; // 使当前周期 closed → 排队回调 no-op
-		try {
-			watcher?.close();
-		} catch {
-			/* ignore */
-		}
-		watcher = null;
+		startWatch = null;
+		closeWatcher(); // 使在途回调 stale + 关 watcher
 	};
 	return cleanup;
 }
@@ -247,10 +365,6 @@ export function pollNewResults(runsDir: string, opts: EventBusOptions): string[]
 export function _resetEventBus(): void {
 	seenResults = new Set<string>();
 	selfDisabled = false;
-	try {
-		watcher?.close();
-	} catch {
-		/* ignore */
-	}
-	watcher = null;
+	startWatch = null;
+	closeWatcher(); // 关在途 watcher + 使其回调 stale
 }
