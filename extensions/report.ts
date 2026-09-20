@@ -18,7 +18,11 @@ import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
-import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { getCurrentSessionId, isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
+import { masterAddress } from "./runtime/address.ts";
+import { readAttachment, readCutover } from "./runtime/registry.ts";
+import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
+import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
@@ -143,9 +147,9 @@ export function claimReportNotified(reportsDir: string, id: string): boolean {
 export function onNewReport(reportsDir: string, id: string, opts: ReportListenerOptions): boolean {
 	if (selfDisabled) return false; // 旧实例已失效
 	if (seenReports.has(id)) return false;
-	seenReports.add(id);
 	const record = readReportFile(reportsDir, id);
-	if (!record) return false;
+	if (!record) return false; // 被删/未写完/损坏：不标 seen（下个事件/tick 可重试），与 event-bus 空结果守卫同理
+	seenReports.add(id);
 
 	if (opts.onReport) {
 		opts.onReport(record, id);
@@ -153,14 +157,24 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	}
 
 	// 会话定位：只消费派发给「当前会话」的回报（不同目录的 identityless 进程不得抢）
+	// links 记录的是派发时身份（sessionIdentity：tab runId 优先）；重启后本进程 scope 可能
+	// 变回 UUID（TUI 重开丢 flag）——双域任一匹配即视为本会话的回报（DOG2 根因，与 event-bus 同族）。
 	const recipient = recipientSessionIdFor(record, opts.linksPath);
-	const mySession = getCurrentSessionId();
-	if (!recipient || !mySession || recipient !== mySession) {
+	const mySession = sessionScopeKey();
+	if (!recipient || !mySession || (recipient !== mySession && recipient !== getCurrentSessionId())) {
 		return false; // 不是本会话的回报 → 不 claim、不注入（留给真正的编排会话）
 	}
 
+	// Phase 4d 统一注入门（A5 F2/F15/F16）：cutover 未启用时恒 inject:true，零行为变化。
+	let gateCtx: InjectionContext | null = null;
+	{
+		const gate = preInject({ key: `report-${id}`, sessionId: getCurrentSessionId() ?? mySession, path: "legacy-reports" }); // 持久 UUID 域（ownership 同侧）
+		if (!gate.inject) return false;
+		gateCtx = { key: `report-${id}`, sessionId: getCurrentSessionId() ?? mySession, path: "legacy-reports" };
+	}
 	// 跨实例幂等：原子领取消费权（双 watcher/双实例只有第一个注入）
 	if (!claimReportNotified(reportsDir, id)) {
+		if (gateCtx) postInject(gateCtx, true); // legacy 已注证明，回填收据
 		return false; // 已被其他实例消费 → 静默跳过
 	}
 
@@ -174,9 +188,10 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 
 	try {
 		opts.sendUserMessage?.(
-			`📨 ${record.from} 主动回报：${record.message}${record.taskId ? `\ntask=${record.taskId}` : ""}${record.summary ? `\n摘要: ${record.summary}` : ""}\n请处理这份回报并决定下一步。`,
+			`📨 ${record.from} 主动回报：${record.message}${record.taskId ? `\ntask=${record.taskId}` : ""}${record.summary ? `\n摘要: ${record.summary}` : ""}\n请处理这份回报并决定下一步。\n${NO_POLL_HINT}`,
 			{ deliverAs: "followUp" },
 		);
+		if (gateCtx) postInject(gateCtx, true);
 	} catch {
 		selfDisabled = true; // 旧实例 stale → 停止注入
 	}
@@ -199,11 +214,21 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 	const reportsDir = opts.reportsDir ?? defaultReportsDir();
 
 	// 延迟到 session_start 再判定身份并启动监听：
-	// CLI flag 在扩展加载完成后才就绪；只主会话消费（标签页/子 agent 只发送）。
+	// CLI flag 在扩展加载完成后才就绪；消费注册 ownership-gated（M1，与 event-bus watcher 同
+	// 不变量）：cutover 启用时「owner 是谁谁消费」（UUID 域），否则 legacy 回退主会话；子 agent 恒不消费。
 	let interval: ReturnType<typeof setInterval> | null = null;
 	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
 	pi.on("session_start", (_event, ctx) => {
-		if (!isMainSession()) return;
+		try {
+			if (isSubagent()) return;
+			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
+			const cut = readCutover();
+			const att = readAttachment(masterAddress());
+			const eligible = cut?.enabled && att
+				? Boolean(sid && sid === att.sessionId)
+				: isMainSession();
+			if (!eligible) return;
+		} catch { /* ctx 不可用 → 不消费（宁可静默） */ }
 		// 捕获当前会话 UUID（回报会话定位的依据）
 		try {
 			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);

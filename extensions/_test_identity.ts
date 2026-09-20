@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag } from "./identity.ts";
+import { durableSessionIdentity, getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag } from "./identity.ts";
 
 // 环境隔离：先清空全部身份相关环境
 delete process.env.PI_SUBAGENT;
@@ -19,7 +19,11 @@ delete process.env.PI_TAB_RUN_ID;
 	assert.equal(getTabRunId(), "tab_env_1");
 	assert.equal(isMainSession(), false);
 	assert.equal(isTabSession(), true);
+	// owner 身份不随启动 flag 漂移：UUID 必须压过 tab runId；session_start 前无 UUID 则拒（M2，不回退 runId）。
+	assert.equal(durableSessionIdentity({ sessionManager: { sessionId: "uuid_owner_1" } }), "uuid_owner_1");
+	assert.equal(durableSessionIdentity(null), "unknown", "无 sessionManager id → unknown（不回退易失 runId）");
 	delete process.env.PI_TAB_RUN_ID;
+	assert.equal(durableSessionIdentity(null), "unknown");
 }
 
 // ── PI_SUBAGENT → 子 agent（即使有 tab 身份也不是标签页）─────────

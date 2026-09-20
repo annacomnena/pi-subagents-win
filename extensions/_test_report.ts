@@ -15,6 +15,8 @@ import { setCurrentSessionId } from "./identity.ts";
 
 delete process.env.PI_SUBAGENT;
 delete process.env.PI_TAB_RUN_ID;
+// 隔离 shadow runtime：真实 ~/.pi/agent/runtime/registry 的 cutover 状态会让 preInject 判定 suppressed-not-owner（测试惯例同 _test_runtime_cutover）
+process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "report-runtime-"));
 
 const dir = mkdtempSync(join(tmpdir(), "report-test-"));
 const reportsDir = join(dir, "reports");
@@ -67,6 +69,7 @@ function makeLinks(...entries: Array<{ from: string; sessionId: string }>): stri
 	assert.ok(injected[0].includes("tab_2"), injected[0]);
 	assert.ok(injected[0].includes("完成 X"), "应含回报消息");
 	assert.ok(injected[0].includes("1008"), "应含 taskId");
+	assert.ok(injected[0].includes("busy-poll"), "回报注入应含禁轮询纪律");
 
 	// 重复 poll → 幂等（已 seen 不再注入）
 	const again = pollNewReports(reportsDir2, opts);
@@ -177,6 +180,38 @@ function makeLinks(...entries: Array<{ from: string; sessionId: string }>): stri
 }
 
 setCurrentSessionId(undefined);
+
+// ── Phase 4d：cutover 启用 + 非 owner → 抑制（A5 F2）──────────────
+{
+	const isoDir = mkdtempSync(join(tmpdir(), "report-cutover-"));
+	const prev = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = isoDir;
+	try {
+		const { setCutover, attachMaster } = await import("./runtime/registry.ts");
+		setCutover(true, "test");
+		attachMaster({ sessionId: "session-owner" });
+		_resetReportListener();
+		setCurrentSessionId("session-other"); // 非 owner，但 links 溯源通过
+		const injected3: string[] = [];
+		const reportsDir3 = join(dir, "reports3");
+		const linksPath3 = makeLinks({ from: "tab_9", sessionId: "session-other" });
+		sendReportToMain({ from: "tab_9", message: "求抑制", taskId: "1009" }, reportsDir3);
+		const fired3 = pollNewReports(reportsDir3, {
+			reportsDir: reportsDir3, linksPath: linksPath3, toast: false,
+			sendUserMessage: (content: string) => { injected3.push(content); },
+		});
+		assert.equal(fired3.length, 0, "非 owner 不消费");
+		assert.equal(injected3.length, 0, "非 owner 不注入");
+		const { existsSync: ex } = await import("node:fs");
+		assert.equal(ex(join(isoDir, "suppressions.jsonl")), true, "抑制记审计");
+		setCurrentSessionId(undefined);
+	} finally {
+		if (prev === undefined) delete process.env.PI_RUNTIME_DIR;
+		else process.env.PI_RUNTIME_DIR = prev;
+		rmSync(isoDir, { recursive: true, force: true });
+	}
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log("report tests passed");

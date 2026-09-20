@@ -93,6 +93,13 @@ plans/YYYYMMDD_item<NN>_<topic>_research.md
 
 这是**任务研究备注**，供 planner 引用；**不是** Wiki 页。`recentwork.md` 只记一行摘要 + 路径。
 
+### 热点候选（仅当仓库有 Wiki/_hotspot.md）
+
+若本任务验证了活跃主题的路由变化（新入口符号、Wiki 章节切片迁移、旧指针失效），
+在回复末尾列「热点候选」：topic_id + Wiki 切片 + `path::Symbol` + 验证依据。
+**不直接写热点文件**（子代理无 hotspot 工具）——由主会话/工作流收尾统一提交；
+无路由变化则不列。只存路由指针，不存解释性知识。
+
 ## 输出格式
 
 ### 搜索的文件

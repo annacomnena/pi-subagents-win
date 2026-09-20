@@ -22,6 +22,7 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { capabilities, currentProfile } from "./capabilities.ts";
 
 // ── 数据模型 ────────────────────────────────────────────────────────
 
@@ -99,6 +100,12 @@ export function registerLiteCommand(pi: ExtensionAPI, deps: CommandDeps): void {
 	pi.registerCommand("lite", {
 		description: "轻量工作流模式：/lite on|off|auto（主会话直接编排 general agent + 档位模型，不开 tab）",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			// C4 运行时防护（设计稿 §58）：trace worker / 子 agent 无 lite 能力；
+			// 即使命令在 UI 中可见，也不得生效。
+			if (!capabilities().lite) {
+				ctx.ui.notify(`⛔ 当前会话（profile: ${currentProfile()}）不支持 Lite workflow`, "error");
+				return;
+			}
 			const val = (args ?? "").trim().toLowerCase();
 			if (val === "on" || val === "off" || val === "auto") {
 				// 写前重读，只改 liteMode 一个键，保留其余字段（同 /searcher-mode 约定）

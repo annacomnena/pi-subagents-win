@@ -3930,3 +3930,52 @@ Trace Fusion decides HOW to search uncertainty
 # 73. 一句话产品定义
 
 > **`/trace-fusion-loop` 是一个独立的 SWE test-time scaling 命令：它从同一仓库快照启动三个隔离 worktree 中的完整 coding rollout，让它们分别真实试错；随后以跨轨迹测试和执行证据融合最优解，只在证据不足时咨询更强模型并做少量定向实验，最后生成经过统一验证的最终 patch。**
+
+---
+
+# 74. 附记 A1（2026-09-17，真实运行驱动）：diagnose 成为默认模式
+
+## 74.1 触发
+
+首次 implement 真实 run（tfl-20260915-222111-484b，GreenCAD）实测：
+
+- worktree 占用 **12GB**（源树 ×3 + bin/obj ×3，`~/.pi/tfl-wt/<shortId>/{a,b,c}`）；
+  外加更早僵尸 run 残留 1.1GB
+- 三路 45 分钟各自完成实现，但分化主要在「改动幅度」（保守/广谱/折中），
+  **根因诊断三路完全一致**——这一信息在方案层即可合成，无需 3×实现+构建
+
+## 74.2 决策
+
+引入 run 模式 `mode: diagnose | implement`（config `traceFusionLoop.mode`，默认 **diagnose**）：
+
+| | diagnose（默认） | implement（opt-in 昂贵档） |
+|---|---|---|
+| lane 工作区 | 主仓库只读 | 独立 worktree 读写 |
+| 磁盘代价 | ~0 | 12GB/轮级（随仓库） |
+| 产物 | 诊断+推进方案（trajectory 八节 + 只读证据主张） | patch + trajectory + 可执行验证 |
+| 交叉验证 | 不在用户仓库执行命令（无隔离）；dirty-baseline 违规检查 | cross-test 矩阵（eval 树复跑） |
+| 后续 | 主会话融合三份方案 → 单次实现 | promote / fresh synthesis（v0.4） |
+
+diagnose 的工具隔离：dispatch 时 excludeTools 追加 `edit`/`write`；bash 保留（只读探查
+用），纪律入 prompt，违规由 **dirty-baseline 确定性检查**兜底（启动 porcelain 基线 vs
+collect 时对比；gitignore 内写入为已记录的残余风险）。不建 synthetic snapshot、不触碰
+用户 HEAD、不做 trust 预授权。
+
+implement 管线（C5–C8）原样保留：需要真实执行证据的任务（高风险重构等）显式开启。
+
+## 74.3 配套
+
+- `/trace-fusion-clean <runId> [--force]`（v0.5 §13 提前落地）：移除 lane worktrees +
+  prune，**runDir artifact 永不删**（patch 可随时重放复验）；running run 需 --force
+- supervisor 自动收集对 diagnose 天然生效（finishDiagnoseRun 落盘 skip 型
+  cross-test.json，幂等检查直接命中）
+- 与 §15 的关系：worktree 短路径布局仅 implement 模式使用；§68 分期不变，
+  v0.4 fusion 的输入从「三份 patch」变为「三份方案」（diagnose）或保持 patch（implement）
+
+## 74.4 主动触发（同日补）
+
+主会话 agent 侧新增 `trace-fusion` 工具：判断任务困难/根因不明/单轨迹置信度低时，
+agent 可自主发起 diagnose run（强制只读模式，忽略 config 的 implement 档）。
+发起即返回（lane runId + 指引），收集/通知走 §24.1 自动化；隔离三重：lane tab
+排除名单不可见 + execute 内 capabilities 运行时校验 + trace-worker prompt 硬边界。
+implement（worktree 读写）保持人工命令专属——昂贵档不允许模型自主花钱。

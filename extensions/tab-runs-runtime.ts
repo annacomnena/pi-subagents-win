@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { sendReportToMain } from "./report.ts";
 import { getTabRunId, isMainSession, isSubagent, isTabSession } from "./identity.ts";
+import { isTraceWorker } from "./capabilities.ts";
 import {
 	buildTabStatusView,
 	defaultTabRunsDir,
@@ -48,7 +49,9 @@ export function registerTabTelemetry(
 	// 不在此同步早退：CLI flag（--tab-run-id）在扩展加载完成后才就绪，
 	// 工厂里 getTabRunId() 可能返回 undefined。改为事件回调/工具执行时惰性解析。
 	// 非标签页进程里回调会因 resolveRunId() 返回 undefined 而直接跳过。
-	const runsDir = opts?.runsDir ?? process.env.PI_TAB_RUNS_DIR ?? defaultTabRunsDir();
+	// 空串 env（子 agent 进程注入 PI_TAB_RUNS_DIR=""）视为未设置 → 落默认（|| 链，2026-09-18 与
+	// timers-runtime.targetRunTerminal 同型空串坑一并修；?? 链会把空串当有效目录）
+	const runsDir = opts?.runsDir || process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir();
 	const resolveRunId = (): string | undefined => {
 		if (opts?.tabRunId) return opts.tabRunId;
 		const id = getTabRunId();
@@ -155,6 +158,11 @@ export function registerTabTelemetry(
 			"【完成回报 · 强制】你是主会话派发的任务 tab：全部工作完成后**必须**调用本工具向主会话回报（status=completed + summary + 交付物）——只有 result.json 才会触发 event-bus 唤醒主会话去 reclaim 并编排下一批；不调本工具 = 未完成，主会话会一直等你。",
 			"只有调用了本工具（或明确失败事件）才代表工作流完成；普通回合 stop 不算完成。",
 			"重复调用拒绝（结果只写一次）。",
+			// §23：trace worker 的 Trace-specific 完成契约（按 session profile 注入）
+			...(isTraceWorker() ? [
+				"【TRACE 完成契约】你若正在运行此工具，说明你是 trace worker tab：调用前必须已写好 trajectory.md 与 validation.json 到任务指定的 lanes/<lane>/ 目录；",
+				"status=completed 表示你已尽力完成独立求解并留下全部证据；status=failed 也必须调用（带已有证据与 openIssues）——静默挂起会让整个 run 降级。",
+			] : []),
 		].join(" "),
 		parameters: Type.Object({
 			status: Type.String({ description: "completed | failed | cancelled" }),
@@ -424,6 +432,7 @@ export function registerTabStatusTools(
 			"回收标签页结果：reclaim-tabs({ runIds, includeText? })。",
 			"永不阻塞、立即返回当前快照（2026-08-13 起移除轮询硬等；wait/timeoutMs/intervalMs 为废弃参数，仅向后兼容，调用方不应依赖）。",
 			"完成感知交给 event-bus（子 tab 写 result.json 自动唤醒主会话），编排巡检用 set-timer。",
+			"禁轮询: 不要用 turn 反复重调本工具/tab-status 等待状态变化；等待靠完成事件 + 一次性 set-timer 兜底。",
 			"返回 ready[]（终态可取结果）/ pending[]（进行中）/ awaitingInput[]（等待输入，非完成）/ failed[]（unconfirmed 或派发失败）/ orphaned[]。",
 			"result 缺失的终态标 resultMissing=true + completion=unconfirmed，绝不静默当成功。",
 		].join(" "),

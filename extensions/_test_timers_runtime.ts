@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pumpDueTimers } from "./timers-runtime.ts";
-import { readTimerFile, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "./timers.ts";
+import { readTimerFile, sweepTerminalTimers, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "./timers.ts";
+import { readTabResultFile, writeJsonAtomic, writeTabState } from "./tab-runs.ts";
 
 // P0-1：隔离进程环境（PI_SUBAGENT=1 时 pumpDueTimers 的调用方身份语义会被测试污染）
 delete process.env.PI_SUBAGENT;
@@ -296,6 +297,177 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.ok(notifies.some((n) => n.includes("cancelled") && n.includes(id)), `应列出刚取消的 timer: ${notifies.join(" | ")}`);
 
 	cleanup();
+	rmSync(tdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T1：目标 run 已有 result.json（终态）→ 零 send + skipped 落账 ──
+{
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-result-"));
+	const TAB = "tab_guard_T1";
+	// 目标 run 已完成——**只写 result.json（不写 state）**：隔离验证 result 分支本身有效，
+	// 即使删掉 readTabResultFile，本测试也必须红（review 0918 必须修复项 1）
+	writeJsonAtomic(join(rdir, `${TAB}.result.json`), {
+		id: TAB, taskId: "2201", status: "completed", finishedAt: new Date().toISOString(),
+	});
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard1", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+	const pi = makeFakePi();
+	const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB, runsDir: rdir } as never);
+	assert.equal(outcomes[0]?.fired, false, "目标已终态不得开火");
+	assert.equal(outcomes[0]?.reason, "target-terminal");
+	assert.equal(pi.calls.length, 0, "盲开火必须零 send");
+	const rec = readTimerFile(dir, "t_guard1", TAB);
+	assert.equal(rec?.status, "skipped");
+	assert.ok(rec?.skippedAt, "应记录 skippedAt");
+	assert.equal(rec?.skippedReason, "target-terminal");
+	assert.equal(rec?.firedAt, undefined, "skipped 不得写 firedAt");
+	// 再次 pump 不重复（skipped 是终态，不可再被 claim）
+	const again = pumpDueTimers(pi, dir, { tabRunId: TAB, runsDir: rdir } as never);
+	assert.equal(again.length, 0, "skipped 后不得再产生 outcome");
+	assert.equal(pi.calls.length, 0);
+	rmSync(rdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T2：仅 state.json 终态（无 result.json）→ 零 send + skipped ──
+{
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-state-"));
+	const TAB = "tab_guard_T2";
+	writeTabState(rdir, TAB, { id: TAB, phase: "cancelled", turn: "idle", terminal: true });
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard2", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+	const pi = makeFakePi();
+	const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB, runsDir: rdir } as never);
+	assert.equal(outcomes[0]?.fired, false, "state 终态同样不得开火");
+	assert.equal(outcomes[0]?.reason, "target-terminal");
+	assert.equal(pi.calls.length, 0, "零 send");
+	const rec = readTimerFile(dir, "t_guard2", TAB);
+	assert.equal(rec?.status, "skipped");
+	assert.ok(rec?.skippedAt);
+	assert.equal(rec?.skippedReason, "target-terminal");
+	rmSync(rdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T3：目标未终态 → 照常开火（红绿对照）────────────
+{
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-active-"));
+	const TAB = "tab_guard_T3";
+	writeTabState(rdir, TAB, { id: TAB, phase: "working", turn: "working", terminal: false });
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard3", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+	const pi = makeFakePi();
+	const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB, runsDir: rdir } as never);
+	assert.equal(outcomes[0]?.fired, true, "目标未终态必须照常开火");
+	assert.equal(pi.calls.length, 1, "应注入一条用户消息");
+	assert.equal(readTimerFile(dir, "t_guard3", TAB)?.status, "fired");
+	rmSync(rdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T4：dispatcher/root self timer 不受守卫影响 ─────────
+{
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-disp-"));
+	// 即使 runsDir 里存在同名 result.json，root self timer 也不该被守卫拦截
+	writeTabState(rdir, "someRun", { id: "someRun", phase: "completed", turn: "idle", terminal: true });
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard4" })); // target: "self" + ownerCwd
+
+	const pi = makeFakePi();
+	const outcomes = pumpDueTimers(pi, dir, { cwd: process.cwd(), runsDir: rdir } as never);
+	assert.equal(outcomes[0]?.fired, true, "root self timer 不受目标终态守卫影响");
+	assert.equal(pi.calls.length, 1);
+	rmSync(rdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T5：env 兜底（PI_TAB_RUNS_DIR，不显式传 runsDir）────
+{
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-env-"));
+	const TAB = "tab_guard_T5";
+	writeTabState(rdir, TAB, { id: TAB, phase: "completed", turn: "idle", terminal: true });
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard5", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+	process.env.PI_TAB_RUNS_DIR = rdir; // 文件开头已 delete，块尾恢复
+	try {
+		const pi = makeFakePi();
+		const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB });
+		assert.equal(outcomes[0]?.fired, false, "env 兜底路径守卫必须生效");
+		assert.equal(pi.calls.length, 0);
+		assert.equal(readTimerFile(dir, "t_guard5", TAB)?.status, "skipped");
+	} finally {
+		delete process.env.PI_TAB_RUNS_DIR;
+	}
+	rmSync(rdir, { recursive: true, force: true });
+}
+
+// ── 盲开火守卫 T6：探测失败（runsDir 不存在/不可读）→ 照常开火（宁噪音不丢失，安全边界）──
+{
+	const TAB = "tab_guard_T6";
+	const rdir = mkdtempSync(join(tmpdir(), "timers-guard-probefail-"));
+	rmSync(rdir, { recursive: true, force: true }); // 探测走「目录缺失/不可读」路径 → false
+	writeTimerAtomic(dir, makeTimer({ id: "t_guard6", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+	const pi = makeFakePi();
+	const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB, runsDir: rdir } as never);
+	assert.equal(outcomes[0]?.fired, true, "探测失败不得阻止开火");
+	assert.equal(pi.calls.length, 1);
+	assert.equal(readTimerFile(dir, "t_guard6", TAB)?.status, "fired", "探测失败时按旧行为置 fired");
+}
+
+// ── 盲开火守卫 T7：PI_TAB_RUNS_DIR 空串 → 回退默认目录（|| 链，非 ?? 链）────
+// 反证设计（review 0918 Re-verification 修复）：在**默认目录**预置该 run 的合法终态 result。
+//  || 链：空串视为未设置 → 落默认目录 → 读到终态 → skipped；
+//  ?? 链：空串是有效目录 → 读 `<空串>/tab_x.result.json` 失败 → 照常开火 fired → 本断言必红。
+// 故「实现改回 ?? 时必红」是本测试杀伤力的直接证明。
+{
+	const TAB = `tab_guard_T7_${Date.now().toString(36)}`; // 唯一 id，避免与真实 tab-runs 冲突
+	const { defaultTabRunsDir } = await import("./tab-runs.ts");
+	const defDir = defaultTabRunsDir();
+	const resultPath = join(defDir, `${TAB}.result.json`);
+	const preExisting = existsSync(resultPath) ? readFileSync(resultPath, "utf8") : null;
+	try {
+		// fixture：默认目录预置合法终态 result（result-only，不依赖 state）
+		writeJsonAtomic(resultPath, {
+			id: TAB, taskId: "T7", status: "completed", finishedAt: new Date().toISOString(),
+		});
+		assert.ok(readTabResultFile(defDir, TAB), "fixture 必须是合法可解析的 result（与实现无关，确定性前提）");
+		writeTimerAtomic(dir, makeTimer({ id: "t_guard7", target: { tabRunId: TAB } }), { tabRunId: TAB });
+
+		process.env.PI_TAB_RUNS_DIR = ""; // 子 agent 进程可能注入空串；空串必须视为未设置
+		try {
+			const pi = makeFakePi();
+			const outcomes = pumpDueTimers(pi, dir, { tabRunId: TAB });
+			assert.equal(outcomes[0]?.fired, false, "空串 env 必须回退默认目录读到终态 → skipped；若走 ?? 链（空串当目录）则探测失败开火，此断言必红");
+			assert.equal(outcomes[0]?.reason, "target-terminal");
+			assert.equal(pi.calls.length, 0, "盲开火必须零 send");
+			assert.equal(readTimerFile(dir, "t_guard7", TAB)?.status, "skipped");
+		} finally {
+			delete process.env.PI_TAB_RUNS_DIR;
+		}
+	} finally {
+		// 恢复默认目录现场：原本存在则还原内容，否则删除我们写入的文件
+		if (preExisting !== null) writeJsonAtomic(resultPath, JSON.parse(preExisting));
+		else if (existsSync(resultPath)) rmSync(resultPath, { force: true });
+	}
+}
+
+// ── 盲开火守卫 T8：skipped GC 时钟（skippedAt 优先，缺失回退 createdAt）────
+{
+	const tdir = mkdtempSync(join(tmpdir(), "timers-gc-skip-"));
+	const base = (over: Record<string, unknown>) =>
+		makeTimer({ id: `t_gc_${Math.random().toString(36).slice(2, 6)}`, ...over });
+
+	// A：createdAt 很旧 + skippedAt 很新 → 以 skippedAt 计龄，不得提前清理
+	const freshSkip = new Date().toISOString();
+	const a = base({ status: "skipped", createdAt: "2026-01-01T00:00:00.000Z", skippedAt: freshSkip, skippedReason: "target-terminal" });
+	writeTimerAtomic(tdir, a);
+
+	// B：无 skippedAt 的终态（旧 fired 记录）→ 回退 createdAt 计龄，超龄应清理
+	const b = base({ id: a.id + "_old", status: "fired", createdAt: "2026-01-01T00:00:00.000Z" });
+	writeTimerAtomic(tdir, b);
+
+	const now = new Date("2026-09-18T12:00:00.000Z");
+	const swept = sweepTerminalTimers(tdir, undefined, { now, maxAgeMs: 60 * 60 * 1000 }); // 1h TTL
+	assert.equal(swept, 1, "只应清理超龄的 B（无 skippedAt 回退 createdAt）");
+	assert.equal(readTimerFile(tdir, a.id)?.status, "skipped", "新鲜 skippedAt 的记录不得被提前清理");
+	assert.equal(readTimerFile(tdir, b.id), null, "超龄终态记录应被清理");
+
 	rmSync(tdir, { recursive: true, force: true });
 }
 

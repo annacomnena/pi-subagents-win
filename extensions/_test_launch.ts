@@ -90,6 +90,7 @@ assert.ok(bound.includes("你是项目经理") && bound.includes("禁止自己�
 assert.ok(bound.includes("tab-finish"), "约束块必须强提醒完成后 tab-finish 回报主会话");
 assert.ok(bound.includes("严禁再调用 `launch-tabs`"), "tab 约束必须禁止嵌套 launch-tabs");
 assert.ok(bound.endsWith("按计划实施"), "原始 handoff 应保留在末尾");
+assert.ok(!bound.includes("busy-poll"), "worker prompt 不得含禁轮询文本（worker 面零加噪；STOP 合法终态与 tab-finish 纪律冲突）");
 
 // 已带前缀时不重复，约束块插在中间
 const bound2 = buildWorkflowTabPrompt({ taskId: "1008", prompt: "根据workflow进行工作1008\n\n执行" }, skillPath);
@@ -280,6 +281,25 @@ assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 p
 	assert.ok(adaptiveBlock.includes("禁止例行化"), "A0 咨询事件驱动、禁止例行化");
 	const workflowBlock = workflowDisciplineBlock("1031");
 	assert.ok(!workflowBlock.includes("A0 自执行快链"), "workflow 全链约束块不应含 A0 档");
+}
+
+// trace-fusion C3：session/trace 身份旗标仅在显式传入时发射（workflow 路径永不传入 → argv 与历史一致）
+{
+	const base = buildWindowsTerminalArgs("t", "p", { cwd: ".", piCli: "cli.js", execPath: "node.exe" });
+	for (const flag of ["--session-profile", "--trace-run-id", "--trace-lane"]) {
+		assert.equal(base.includes(flag), false, `workflow 路径不应发射 ${flag}`);
+	}
+	const traced = buildWindowsTerminalArgs("t", "p", {
+		cwd: ".", piCli: "cli.js", execPath: "node.exe",
+		sessionProfile: "trace-worker", traceRunId: "tfl_ab12", traceLane: "A", tabRunId: "run_1",
+	});
+	const idx = (f: string) => traced.indexOf(f);
+	assert.ok(idx("--session-profile") > 0 && traced[idx("--session-profile") + 1] === "trace-worker");
+	assert.ok(idx("--trace-run-id") > 0 && traced[idx("--trace-run-id") + 1] === "tfl_ab12");
+	assert.ok(idx("--trace-lane") > 0 && traced[idx("--trace-lane") + 1] === "A");
+	// 旗标都在 --tab-run-id 与最终 prompt 之前，且 prompt 恒为最后参数
+	assert.ok(idx("--session-profile") < idx("--tab-run-id") && idx("--tab-run-id") < traced.length - 1);
+	assert.equal(traced[traced.length - 1], "p");
 }
 
 console.log("launch tests passed");

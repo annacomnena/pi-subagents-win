@@ -1,7 +1,24 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { sanitizeWtTitle } from "./tab-launch-core.ts";
+
+// tab 启动原语已抽出至 tab-launch-core（trace-fusion C3）：本模块保留
+// workflow 语义层（parse / mode / prompt builder / 标题规范），spawn 与
+// wt 命令行安全原语经 re-export 供既有导入方（index.ts / _test_launch）
+// 继续使用，行为不变。依赖方向（设计稿 §53）：
+//   launch-tabs → workflow prompt builder（本模块）→ tab-launch-core
+//   trace-fusion-loop → trace worker prompt builder → tab-launch-core
+export {
+	buildWindowsTerminalArgs,
+	type PiLaunchArgsOptions,
+	cleanupWtPromptArg,
+	sanitizeWtTitle,
+	spawnPiTab,
+	sweepStaleWtPrompts,
+	type TabLaunchOptions,
+	type TabSpawnResult,
+	wtPromptArg,
+	wtPromptDir,
+} from "./tab-launch-core.ts";
 
 export interface LaunchRequest {
 	task: string;
@@ -87,15 +104,25 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 }
 
 /**
+ * 驱动器相对冒号归一（纯函数）：`C:a` → `C:/a`（Windows 上 `C:a` 是 drive-relative，
+ * 与 `C:\a` 的 git 解析可能不同）；`C:\a` / `C:/a` / 非盘符路径原样返回。
+ * 所有 git 调用前必须先归一（L4 M3：旧实现无 capture group 却用 `$1`，实测产出 `$1:/a`）。
+ */
+export function normalizeDriveColon(p: string): string {
+	return p.replace(/^([A-Za-z]):(?![\\/])/g, "$1:/");
+}
+
+/**
  * Short repo name for tab titles.
  *
  * Priority: git origin remote basename (stable across main tree and worktrees)
  * → git toplevel basename → cwd path basename. Never throws.
  */
 export function repoName(cwd: string): string {
+	const norm = normalizeDriveColon(cwd);
 	const tryGit = (args: string[]): string => {
 		try {
-			const out = execFileSync("git", ["-C", cwd, ...args], {
+			const out = execFileSync("git", ["-C", norm, ...args], {
 				encoding: "utf8",
 				shell: false,
 				stdio: ["ignore", "pipe", "ignore"],
@@ -113,13 +140,28 @@ export function repoName(cwd: string): string {
 		if (base) return base;
 	}
 
-	const top = tryGit(["rev-parse", "--show-toplevel"]);
+	const top = gitToplevel(norm);
 	if (top) {
-		const base = top.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+		const base = normalizeDriveColon(top).split(/[\\/]/).pop();
 		if (base) return base;
 	}
 
-	return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+	return norm.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+}
+
+/** Git toplevel 的绝对路径（已去尾部分隔符）。永不抛错：非 git 仓 / 无 git / cwd 异常 → null。 */
+export function gitToplevel(cwd: string): string | null {
+	const norm = normalizeDriveColon(cwd);
+	try {
+		const out = execFileSync("git", ["-C", norm, "rev-parse", "--show-toplevel"], {
+			encoding: "utf8",
+			shell: false,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return out ? out.replace(/[\\/]+$/, "") : null;
+	} catch {
+		return null;
+	}
 }
 
 /** True when cwd sits inside a `worktrees/` directory (git worktree checkout). */
@@ -169,18 +211,6 @@ export function composeLaunchTitle(parts: LaunchTitleParts): string {
 	const wt = parts.worktree ? "-worktree" : "";
 	const id = parts.taskId.trim() ? `${parts.taskId.trim()}-` : "";
 	return `${parts.repo}${wt}-${id}${parts.label}`;
-}
-
-/**
- * Strip WT-risky characters from a tab title before it hits the wt command line.
- *
- * wt.exe re-parses the command line with its own tokenizer (quote handling +
- * %env% expansion). `wtPromptArg` protects the prompt argument, but `--title`
- * carries a label derived from the prompt's first line (e.g. "修复 50% 回归")
- * or a user-provided title verbatim — same risk class, no protection.
- */
-export function sanitizeWtTitle(title: string): string {
-	return title.replace(/[\r\n;"%]/g, " ").replace(/\s{2,}/g, " ").trim() || "task";
 }
 
 export function launchTaskTitle(task: LaunchTask, cwd: string): string {
@@ -320,97 +350,5 @@ export function buildWorkflowTabPrompt(task: LaunchTask, skillPath?: string, mod
 
 	const block = workflowDisciplineBlock(taskId, skillPath, mode);
 	return rest ? `${prefix}\n\n${block}\n\n${rest}` : `${prefix}\n\n${block}`;
-}
-
-export interface PiLaunchArgsOptions {
-	cwd: string;
-	piCli: string;
-	execPath: string;
-	model?: string;
-	/**
-	 * Skill roots/files guaranteed via --skill (canonical-path deduped against
-	 * package-registered skills, so passing the same skills/ root is a no-op
-	 * guarantee rather than a duplicate).
-	 */
-	skills?: string[];
-	/** 标签页回收身份（--tab-run-id <runId>，可靠传递，不依赖 env 继承）。 */
-	tabRunId?: string;
-}
-
-/** Build argv as an array so prompts are never split or reinterpreted by a shell. */
-export function buildWindowsTerminalArgs(
-	terminalTitle: string,
-	prompt: string,
-	options: PiLaunchArgsOptions,
-): string[] {
-	const piArgs = [options.piCli];
-	if (options.model) piArgs.push("--model", options.model);
-	for (const skill of options.skills ?? []) piArgs.push("--skill", skill);
-	if (options.tabRunId) piArgs.push("--tab-run-id", options.tabRunId);
-	piArgs.push(prompt);
-	return [
-		"-w", "0",
-		"new-tab",
-		"--title", terminalTitle,
-		"--suppressApplicationTitle",
-		"-d", options.cwd,
-		options.execPath,
-		...piArgs,
-	];
-}
-
-// ── wt 命令行 prompt 物化（2026-08-13：修复多开无用 tab）───────────────
-
-/** 派发 prompt 的临时目录（~/.pi/agent/launch-prompts）。 */
-export function wtPromptDir(): string {
-	return join(homedir(), ".pi", "agent", "launch-prompts");
-}
-
-/**
- * wt.exe 会用自己的 tokenizer 重解析命令行：含换行的参数会被拆成多条命令，
- * 剩余行变成标题/内容都是 prompt 残留的无用 tab（实证：派发 workflow tab 几乎必现）。
- * 引号/分号/百分号同理有风险（wt 会做引号与 %env% 展开）。
- */
-const WT_RISKY_CHARS = /[\r\n;"%]/;
-
-/**
- * 生成传给 wt 命令行的 prompt 参数：凡含风险字符的 prompt 一律物化为临时 @file
- * （pi 原生支持 `pi @file.md` 把文件内容作为首轮消息），命令行上只留一个不含换行的
- * `@路径`；安全单行 prompt 保持内联（零行为变化）。
- */
-export function wtPromptArg(prompt: string, key?: string): string {
-	if (!WT_RISKY_CHARS.test(prompt)) return prompt;
-	const dir = wtPromptDir();
-	mkdirSync(dir, { recursive: true });
-	const file = join(dir, `pi-launch-${key ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`}.md`);
-	writeFileSync(file, prompt, "utf8");
-	// 尽力清理：5 分钟后删除（pi 启动早期即读完文件，删除不阻塞）；顺带清理 24h 前陈旧文件
-	setTimeout(() => { try { rmSync(file, { force: true }); } catch { /* 清理尽力而为 */ } }, 5 * 60_000).unref?.();
-	sweepStaleWtPrompts();
-	return `@${file}`;
-}
-
-/** 清理超 24h 的陈旧派发 prompt 文件（防 launch-prompts 目录膨胀）。 */
-export function sweepStaleWtPrompts(maxAgeMs: number = 24 * 60 * 60 * 1000): number {
-	const dir = wtPromptDir();
-	let swept = 0;
-	try {
-		for (const f of readdirSync(dir)) {
-			if (!f.startsWith("pi-launch-") || !f.endsWith(".md")) continue;
-			try {
-				if (Date.now() - statSync(join(dir, f)).mtimeMs > maxAgeMs) {
-					rmSync(join(dir, f), { force: true });
-					swept++;
-				}
-			} catch { /* 单个失败无碍 */ }
-		}
-	} catch { /* 目录不存在等 */ }
-	return swept;
-}
-
-/** 删除指定 `@file` 参数对应的临时文件（测试/手动清理用）。 */
-export function cleanupWtPromptArg(arg: string): void {
-	if (!arg.startsWith("@")) return;
-	try { rmSync(arg.slice(1), { force: true }); } catch { /* 尽力而为 */ }
 }
 

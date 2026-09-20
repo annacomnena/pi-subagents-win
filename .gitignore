@@ -7,6 +7,14 @@ dist/
 *.tsbuildinfo
 package-lock.json
 
+# ── G5 GUI（gui/ 独立前端子树）──
+# 注：上方 node_modules/ 与 dist/ 无前导斜杠 = 任意层级生效，已覆盖 gui/node_modules、
+# gui/dist；gui/package-lock.json 同理被 package-lock.json 全局规则忽略（与仓库「无锁」
+# 现状一致，接受，不特判）。此处显式列出仅为可读性。
+gui/node_modules/
+gui/dist/
+gui/package-lock.json
+
 # ── 任务计划 / 研究笔记（本地任务临时文件，不应进版本库）──
 plans/
 

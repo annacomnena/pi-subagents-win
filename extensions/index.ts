@@ -9,7 +9,7 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,37 +27,78 @@ import {
 import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
+import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
+import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { readTraceFusionConfig } from "./trace-fusion/config.ts";
+import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
+import { cleanTraceRun } from "./trace-fusion/clean.ts";
+import { registerHotspot } from "./hotspot/index.ts";
+import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
+import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
-import { sendWindowsToast } from "./notify-windows.ts";
+import { registerSessionHooks } from "./session-hooks.ts";
+import { getPendingReminder } from "./runtime/master-succession.ts";
+import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
-import { registerEventBus } from "./event-bus.ts";
+import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { readAttachment } from "./runtime/registry.ts";
+import { masterAddress } from "./runtime/address.ts";
+import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
+import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
+import { emitRuntimeEventOnce } from "./runtime/journal.ts";
+import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
+import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
+import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
+import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
+import type { WakeDecision } from "./runtime/wake.ts";
+import type { ScopeWakeDecision } from "./runtime/scope.ts";
+import {
+	attachCurrentSession,
+	getMasterStatus,
+	issueMasterHandoffToken,
+	prepareMasterHandoff,
+	setMasterCutover,
+} from "./runtime/master-control.ts";
+import {
+	createTask,
+	createWorkstream,
+	enrichRunRefs,
+	listAudit,
+	listTasks,
+	listWorkstreams,
+	readWorkstream,
+	setTaskStatus,
+	updateWorkstream,
+} from "./runtime/workstreams.ts";
+import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { durableSessionIdentity, getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
+import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
+import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
+import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
 import {
 	defaultTabRunsDir,
 	newTabRunId,
+	readTabResultFile,
 	validateTabDispatchRecord,
 	writeTabDispatch,
 	type TabDispatchRecord,
 } from "./tab-runs.ts";
+import type { TraceRunMeta } from "./trace-fusion/types.ts";
 import {
 	defaultTimersDir,
-	dueAtFromDelay,
-	newTimerId,
-	validateTimerRecord,
-	writeTimerAtomic,
 } from "./timers.ts";
 import {
-	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
 	launchTaskTitle,
 	parseLaunchRequest,
-	wtPromptArg,
+	spawnPiTab,
 	type LaunchMode,
 } from "./launch.ts";
+import { launchWorkflowTab, masterDispatchLaunch } from "./launch-workflow.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
@@ -128,29 +169,9 @@ function dispatchPiTab(
 	/** P1-2：异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
 	onSpawnError?: (err: Error) => void,
 ): LaunchDispatch {
-	try {
-		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, runId), {
-			cwd,
-			piCli,
-			execPath: process.execPath,
-			model,
-			skills,
-			tabRunId: runId, // 可靠传递标签页身份（--tab-run-id），不依赖 env 继承
-		}), {
-			shell: false,
-			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程
-			env: runId ? { ...process.env, PI_TAB_RUN_ID: runId, PI_TAB_RUNS_DIR: runsDir } : undefined,
-		});
-		child.on("error", (err: Error) => {
-			// 同步 try/catch 只覆盖 spawn 本身的异常；异步 error（如 wt.exe 立即退出）也回写账本
-			console.error(`[subagent-win launch] ${title}: ${err.message}`);
-			onSpawnError?.(err);
-		});
-		child.unref();
-		return { title, prompt, model, runId };
-	} catch (err) {
-		return { title, prompt, model, error: err instanceof Error ? err.message : String(err), runId };
-	}
+	// trace-fusion C3：spawn 逻辑已抽出至 tab-launch-core.spawnPiTab（workflow 与 trace 共用原语）。
+	const result = spawnPiTab({ wtPath, piCli, cwd, title, prompt, model, skills, tabRunId: runId, runsDir, onSpawnError });
+	return { title, prompt, model, error: result.error, runId };
 }
 
 // ── Agent 定义 ─────────────────────────────────────────────────────
@@ -164,6 +185,8 @@ interface AgentConfig {
 	searcherMode?: "auto" | "serial" | "parallel";
 	/** lite 轻量工作流模式：off（默认，零注入）、on（一律走 lite 链）、auto（按任务判据自选）；逻辑在 lite-mode.ts */
 	liteMode?: LiteMode;
+	/** S3 自动交接（A1）：默认 auto:false；归一化见 master-auto.ts */
+	masterSuccession?: MasterSuccessionConfig;
 }
 
 function configPath(): string {
@@ -180,14 +203,36 @@ function readConfig(): AgentConfig {
 			notifications: parsed.notifications !== false,
 			searcherMode: parsed.searcherMode ?? "auto",
 			liteMode: parsed.liteMode ?? "off",
+			masterSuccession: normalizeMasterSuccession(parsed.masterSuccession),
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off" };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off", masterSuccession: normalizeMasterSuccession(undefined) };
 	}
 }
 
 function writeConfig(cfg: AgentConfig): void {
-	writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n");
+	// G4（§2.4③）：裸写 → tmp+rename 原子写（与 runtime/command-executor.ts 同款模式），
+	// 消除与 Host 侧 auto-handoff.set 并发时的 torn-write / JSON 损坏面。
+	// EPERM×3 重试（10ms backoff）：Windows 下并发 reader 持句柄时 rename 短暂 EPERM。
+	// 残余风险（显式记录）：read-modify-write 窗口非零，极小概率 lost update
+	//（另一进程在调用方 fresh read（reloadConfig）与本 rename 之间写入）——后果 = 对方
+	// 切片回退一次，重写自愈；跨进程文件锁不采（pi 侧写者不持锁，见 plans/0920_G4_cmdexec_plan.md §2.4）。
+	const path = configPath();
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+	writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n");
+	for (let attempt = 0; ; attempt++) {
+		try {
+			renameSync(tmp, path);
+			return;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EPERM" && attempt < 3) {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+				continue;
+			}
+			try { unlinkSync(tmp); } catch { /* ignore */ }
+			throw e;
+		}
+	}
 }
 
 function reloadConfig(): AgentConfig {
@@ -739,13 +784,30 @@ async function runSingle(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text: string) => void,
-	cwd?: string,
+	opts?: RunDispatchOptions,
 ): Promise<SubagentResult> {
+	const { cwd, tools, excludeTools } = opts ?? {};
 	const finalPrompt = systemPrompt ?? agent?.body ?? "";
 	const workingDirectory = resolveSubagentCwd(cwd);
 	// model arg is already normalized by resolveCallModel / runWithFallback.
 	const resolvedModel = model ?? agentDefaultModel(agent);
 	const resolvedThinking = agentDefaultThinking(agent);
+
+	// P2 修订：显式 tools + 外部 CLI 后端 → 快速失败（安全 allowlist 不许被静默忽略）。
+	// 放在外部 CLI 分支之前才能拦住 cli:* 派发。
+	if (!toolsSupportedForBackend(resolvedModel, tools)) {
+		onUpdate?.("⛔ tools unsupported", `--tools is not supported for external CLI backend ${resolvedModel}`);
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: `--tools allowlist is not supported for external CLI backend "${resolvedModel}"; use a normal provider/id model or drop tools`,
+			agent: agent?.name,
+			requestedModel: resolvedModel,
+		};
+	}
 
 	// External CLI backends (claude / codex / agy / atomcode) — spawn local harness, not pi.
 	if (resolvedModel && isExternalCliModel(resolvedModel)) {
@@ -768,15 +830,17 @@ async function runSingle(
 	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
 	// 同时排除 launch-tabs 与 timer 管理工具：子 agent 只执行工作，
 	// 不得开新标签页，也不得创建/查询/取消计时器（编排只属于主会话）。
-	const argv = [
+	// tools/excludeTools 为 per-call opt-in（runner-argv.ts P2 修订）：
+	// 未显式传入时 argv 不含 --tools，与历史行为逐字节一致。
+	const argv = buildPiArgv({
 		cliPath,
-		"--mode", "json", "--print", "--no-session",
-		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
-	];
-	if (resolvedModel) argv.push("--model", resolvedModel);
-	if (resolvedThinking) argv.push("--thinking", resolvedThinking);
-	if (finalPrompt) argv.push("--append-system-prompt", finalPrompt);
-	argv.push(`Task: ${task}`);
+		model: resolvedModel,
+		thinking: resolvedThinking,
+		systemPrompt: finalPrompt || undefined,
+		task,
+		tools,
+		excludeTools,
+	});
 
 	// 首次进度：显示真正传给 pi 的模型
 	onUpdate?.(`🤖 ${resolvedModel ?? "default"}`, "starting...");
@@ -792,6 +856,12 @@ async function runSingle(
 				PI_SUBAGENT: "1",
 				PI_TAB_RUN_ID: "",
 				PI_TAB_RUNS_DIR: "",
+				// review 修正（Luna major，设计稿 §12.1）：子 agent 身份恒为 subagent，
+				// 不继承父进程的 trace/session profile（否则 trace worker 派 searcher 时
+				// 子进程继承 PI_SESSION_PROFILE=trace-worker，能力矩阵误判）。
+				PI_SESSION_PROFILE: "subagent",
+				PI_TRACE_RUN_ID: "",
+				PI_TRACE_LANE: "",
 			},
 		});
 		let buf = "", lineBuf = "", stderrBuf = "";
@@ -950,7 +1020,7 @@ async function runWithFallback(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text?: string) => void,
-	cwd?: string,
+	opts?: RunDispatchOptions,
 ): Promise<SubagentResult> {
 	// 未显式设置超时时使用默认值（10 分钟），避免长时间无响应
 	if (timeoutMs === undefined) timeoutMs = DEFAULT_TIMEOUT_MS;
@@ -981,7 +1051,7 @@ async function runWithFallback(
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
 	if (candidates.length === 0) {
-		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, cwd);
+		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, opts);
 		if (result.requestedModel) result.triedModels = [result.requestedModel];
 		return result;
 	}
@@ -994,7 +1064,7 @@ async function runWithFallback(
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
 		tried.push(candidate);
-		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, cwd);
+		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, opts);
 		result.requestedModel = candidate;
 		result.triedModels = [...tried];
 		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
@@ -1033,6 +1103,12 @@ async function runWithFallback(
 
 // ── 并行 ────────────────────────────────────────────────────────────
 
+/** 末位派发选项：工作目录 + per-call 工具策略（仅显式传入才生效，见 runner-argv.ts）。 */
+export interface RunDispatchOptions extends RunnerToolsOptions {
+	/** Working directory / git worktree for this dispatch. */
+	cwd?: string;
+}
+
 interface TaskInput {
 	agent?: string;
 	task: string;
@@ -1041,6 +1117,10 @@ interface TaskInput {
 	timeoutMs?: number;
 	/** Working directory / git worktree for this task. */
 	cwd?: string;
+	/** per-call 正向 allowlist（P2 修订：显式传入才加 --tools；不读 agent frontmatter）。 */
+	tools?: string[];
+	/** per-call 额外排他列表（叠加到默认防递归列表之后）。 */
+	excludeTools?: string[];
 }
 
 async function runParallel(
@@ -1070,7 +1150,7 @@ async function runParallel(
 			const taskCb = onUpdate
 				? (s: string, _t: string) => onUpdate(`[${idx + 1}/${tasks.length}] ${agentName} ${s}`, _t)
 				: undefined;
-			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, t.cwd);
+			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools });
 		}
 	};
 	await Promise.all(Array.from({ length: limit }, () => worker()));
@@ -1496,6 +1576,9 @@ export default function (pi: ExtensionAPI) {
 
 	// 标签页身份 flag（--tab-run-id <runId>）：launch-tabs 派发时注入，可靠传递
 	registerIdentityFlag(pi);
+	// 会话身份 flag（--session-profile）：trace-fusion 派发 trace worker 时注入（C4 接线）。
+	// 与 registerIdentityFlag 同时序约束：工厂内只注册不读值，消费点惰性读取。
+	registerCapabilityFlags(pi);
 
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
 	// 禁止注册 launch-tabs 工具与 /launch 命令，杜绝子 agent 开新标签页。
@@ -1519,24 +1602,450 @@ export default function (pi: ExtensionAPI) {
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
 	collect(registerAsyncPanel(pi));
 
-	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）
-	collect(registerEventBus(pi));
+	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）；
+	// trace-fusion lane tab 则由 supervisor 自动后台收集（不注入 reclaim 提示）
+	collect(registerEventBus(pi, {
+		onTabFinished: (finishedTabRunId) => {
+			const outcome = maybeAutoCollectTraceRun(finishedTabRunId);
+			if (!outcome.isTrace) return false; // 普通 tab → 默认 toast + reclaim 注入
+			if (outcome.phase === "started") {
+				try {
+					pi.sendUserMessage?.(
+						`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
+进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
+						{ deliverAs: "followUp" },
+					);
+				} catch { /* 通知尽力而为，收集已在后台 */ }
+			}
+			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
+		},
+	}));
+
+	// 热点路由缓存（v2 首版）：首轮 system-reminder 注入 + hotspot 工具 + /hotspot 诊断；
+	// 结构约束（v2 §11）：主 index.ts 只加这一处注册
+	collect(registerHotspot(pi));
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
 	collect(registerReportListener(pi));
 
-	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
-	pi.on("session_shutdown", () => {
-		for (const cleanup of cleanups) {
-			try { cleanup(); } catch { /* ignore */ }
+	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
+	collect(registerMailboxConsumer(pi, {}));
+
+	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
+	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
+	const spawnOneShotTab = (args: {
+		sessionId: string;
+		taskId: string;
+		title: string;
+		prompt: string;
+		cwd: string;
+		linkDetail: string;
+	}): { runId: string; error?: string } => {
+		const wtPath = findWindowsTerminal();
+		if (!wtPath) return { runId: "", error: "no wt.exe" };
+		const piCli = findPiCli();
+		const runId = newTabRunId();
+		const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
+		const prompt = buildWorkflowTabPrompt(
+			{ taskId: args.taskId, title: args.title, prompt: args.prompt, model: undefined },
+			skillRef,
+			"execute",
+		);
+		const runsDir = defaultTabRunsDir();
+		const dispatch: TabDispatchRecord = {
+			id: runId, version: 1, taskId: args.taskId, mode: "execute", title: args.title, cwd: args.cwd,
+			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+		};
+		const markFailed = (err: Error): void => {
+			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+			writeTabDispatch(runsDir, failed);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+		};
+		writeTabDispatch(runsDir, dispatch);
+		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: args.linkDetail });
+		const result = spawnPiTab({
+			wtPath, piCli, cwd: args.cwd, title: args.title, prompt, tabRunId: runId, runsDir,
+			onSpawnError: (err) => markFailed(err),
+		});
+		if (result.error) {
+			markFailed(new Error(result.error));
+			return { runId, error: result.error };
 		}
-		cleanups.length = 0;
-		clearAsyncPanelUi(); // 丢弃缓存的 UI 引用（旧 ctx 已 stale）
+		return { runId };
+	};
+
+	// Sub-Master 唤醒循环（Phase 5c）：评估与消费同门；无 ws/无信/未切换时空转。
+	// spawn 走与 launch-tabs 相同的账本序列（dispatch→journal→link→spawn→failed 回写）。
+	collect(registerWakeLoop(pi, {
+		intervalMs: 30_000,
+		spawn: (decision: WakeDecision, sessionId: string | undefined) => {
+			if (!sessionId) throw new Error("wake spawn: session unknown");
+			const r = spawnOneShotTab({
+				sessionId,
+				taskId: `wake-${decision.workstreamId.slice(0, 14)}`,
+				title: `wake ${decision.workstreamId.slice(0, 14)} (${decision.letters.length} inputs)`,
+				prompt: decision.prompt ?? "",
+				cwd: process.cwd(),
+				linkDetail: `wake=${decision.workstreamId}`,
+			});
+			if (r.error) throw new Error(r.error);
+			return r.runId;
+		},
+	}));
+
+	// Local Master v1 唤醒循环（per-repo，0920）：本 scope 无 owner 时 session_start 静默认领；
+	// 本会话为 scope owner 才 tick。spawn cwd = scope 仓 toplevel（读回 attachment.detail，缺省回退 cwd）。
+	collect(registerScopeWakeLoop(pi, {
+		intervalMs: 30_000,
+		spawn: (decision: ScopeWakeDecision, sessionId: string | undefined) => {
+			if (!sessionId) throw new Error("scope wake spawn: session unknown");
+			const r = spawnOneShotTab({
+				sessionId,
+				taskId: `l2-${decision.scope.slice(0, 14)}`,
+				title: `l2 ${decision.scope.slice(0, 20)} (${decision.letters.length} inputs)`,
+				prompt: decision.prompt ?? "",
+				cwd: decision.repoCwd ?? process.cwd(),
+				linkDetail: `l2=${decision.scope}`,
+			});
+			if (r.error) throw new Error(r.error);
+			return r.runId;
+		},
+	}));
+
+	// ── /master-* 命令（Phase 4d，A5 F9/F11）──
+	pi.registerCommand("master-status", {
+		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
+		handler: async (_args, ctx) => {
+			const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
+			const lines = [
+				`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
+				`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
+				`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
+				`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
+			];
+			ctx.ui.notify(`Master status:\n${lines.join("\n")}`, "info");
+		},
 	});
+	pi.registerCommand("master-attach", {
+		description: "显式接管逻辑 Master：/master-attach [handoff-token] [--force-stale --confirm]",
+		handler: async (args, ctx) => {
+			// F9：sessionId 取自 Pi 上下文，禁参数伪造
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域（DOG2 根因终修）
+			if (!sid || sid === "unknown") { ctx.ui.notify("master-attach: 无法确定当前会话身份，拒绝", "warning"); return; }
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const token = parts.find((p) => !p.startsWith("--"));
+			const force = parts.includes("--force-stale") && parts.includes("--confirm");
+			if (parts.includes("--force-stale") && !parts.includes("--confirm")) {
+				ctx.ui.notify("master-attach: --force-stale 须与 --confirm 同用（二次人工确认），拒绝", "warning");
+				return;
+			}
+			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined });
+			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
+			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
+			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
+			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
+		},
+	});
+	pi.registerCommand("master-cutover", {
+		description: "切换消费端接管：/master-cutover on|off（需已 attach）",
+		handler: async (args, ctx) => {
+			const want = (args ?? "").trim().toLowerCase();
+			if (want !== "on" && want !== "off") { ctx.ui.notify("用法：/master-cutover on|off", "warning"); return; }
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
+			const st = setMasterCutover({ enabled: want === "on", by: sid });
+			if (!st.ok) {
+				ctx.ui.notify("master-cutover: 尚未 attach（先 /master-attach），拒绝开启", "warning");
+				return;
+			}
+			ctx.ui.notify(`master-cutover 已${st.enabled ? "开启" : "关闭"}（by=${sid.slice(0, 12)}）`, "info");
+		},
+	});
+	// succession 总开关（L3）：off = 不弹 proposal、不 auto transfer，压力满回落 pi 原生 compaction；
+	// 缺省 on（现状零行为变化）。模式照 /master-auto-handoff：写 config 切片 + 回显；无参回显当前状态。
+	pi.registerCommand("master-succession", {
+		description: "succession 总开关：/master-succession on|off（默认 on；off 时静默提议/自动交接，回落 pi 原生 compaction）",
+		handler: async (args, ctx) => {
+			const want = (args ?? "").trim().toLowerCase();
+			if (want !== "on" && want !== "off") {
+				const cur = reloadConfig().masterSuccession.enabled ? "on" : "off";
+				ctx.ui.notify(`succession 当前：${cur}（用法：/master-succession on|off）`, "info");
+				return;
+			}
+			const cfg = reloadConfig();
+			cfg.masterSuccession.enabled = want === "on";
+			writeConfig(cfg);
+			reloadConfig();
+			ctx.ui.notify(
+				want === "on"
+					? `succession 已开启（auto=${cfg.masterSuccession.auto ? "ON" : "OFF"}）`
+					: "succession 已关闭（不弹 proposal、不自动交接；压力满回落 pi 原生 compaction）",
+				"info",
+			);
+		},
+	});
+	// S3 自动交接开关（A1）：持久化 config.json 切片，缺省 auto=false（OFF 零行为变化）
+	pi.registerCommand("master-auto-handoff", {
+		description: "S3 自动交接开关：/master-auto-handoff on|off（持久化 config，默认 off）",
+		handler: async (args, ctx) => {
+			const want = (args ?? "").trim().toLowerCase();
+			if (want !== "on" && want !== "off") { ctx.ui.notify("用法：/master-auto-handoff on|off", "warning"); return; }
+			const cfg = reloadConfig();
+			cfg.masterSuccession.auto = want === "on";
+			writeConfig(cfg);
+			reloadConfig();
+			ctx.ui.notify(`master 自动交接${want === "on" ? "已开启" : "已关闭"}（autoPercent=${cfg.masterSuccession.autoPercent}%，proposalPercent=${cfg.masterSuccession.proposalPercent}%）`, "info");
+		},
+	});
+	pi.registerCommand("master-detach", {
+		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]）",
+		handler: async (args, ctx) => {
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
+			if (!sid || sid === "unknown") { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
+			const d = issueMasterHandoffToken({ sessionId: sid, reason: (args ?? "").trim() || undefined });
+			if (!d.ok) {
+				ctx.ui.notify("precheck" in d ? "master-detach: 你不是当前 owner，拒绝" : "master-detach 失败：not-owner", "warning");
+				return;
+			}
+			ctx.ui.notify(`master-detach 成功：handoff token=${d.token}（接班者在新会话执行 /master-attach ${d.token}）`, "info");
+		},
+	});
+	pi.registerCommand("master-handoff", {
+		description: "生成交接包：/master-handoff [repoRoot]（只读装配，只落盘不注入）",
+		handler: async (args, ctx) => {
+			const repoRoot = (args ?? "").trim() || undefined;
+			try {
+				const doc = prepareMasterHandoff({ repoRoot });
+				const present = doc.manifest.filter((m) => m.present).length;
+				ctx.ui.notify(`handoff 已生成：${doc.path}\nmanifest ${present}/${doc.manifest.length} 项 present`, "info");
+			} catch (e) {
+				ctx.ui.notify(`master-handoff 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+
+	// ── /runtime-host 命令（Phase 6 G2：只读观察服务；拍板② 仅 slash 命令，默认不启动，零行为变化）──
+	// start 派生独立 node 进程（bind 127.0.0.1:0，实际端口写 host.json 做发现）；stop 杀进程 +
+	// 清 host.json（含僵尸文件）；status 回显 host.json + 探活（alive/stale/dead/missing）。
+	pi.registerCommand("runtime-host", {
+		description: "Runtime Host（G2 只读观察服务）：/runtime-host start|stop|status",
+		handler: async (args, ctx) => {
+			const cmd = (args ?? "").trim().toLowerCase();
+			if (cmd === "start") {
+				const r = await startRuntimeHost();
+				if (r.error || !r.info) {
+					ctx.ui.notify(`runtime-host 启动失败：${r.error ?? "未知错误"}`, "warning");
+					return;
+				}
+				if (r.already) {
+					ctx.ui.notify(`runtime-host 已在跑：pid=${r.info.pid} port=${r.info.port} startedAt=${r.info.startedAt}（回显现有，未重新 spawn）`, "info");
+					return;
+				}
+				ctx.ui.notify(`runtime-host 已启动：127.0.0.1:${r.info.port} pid=${r.info.pid}（端口动态，实际值已写 host.json）`, "info");
+				return;
+			}
+			if (cmd === "stop") {
+				const r = await stopRuntimeHost();
+				if (!r.stopped) {
+					ctx.ui.notify(`runtime-host stop：${r.reason ?? "失败"}`, "warning");
+					return;
+				}
+				ctx.ui.notify(`runtime-host 已停止：pid=${r.info?.pid ?? "?"}（host.json 已清理）`, "info");
+				return;
+			}
+			if (cmd === "status") {
+				const s = await runtimeHostStatus();
+				if (s.state === "missing" || !s.info) {
+					ctx.ui.notify("runtime-host：未启动（无 host.json）——/runtime-host start 启动", "info");
+					return;
+				}
+				const i = s.info;
+				const probe = s.state === "alive" ? "health=OK" : s.state === "stale" ? "probe=timeout（进程在、服务面不可用）" : "pid=dead（僵尸文件，可 stop 清理）";
+				const master = (s.health as { master?: { attachment?: { sessionId?: string; generation?: number } | null } } | null)?.master;
+				const owner = master?.attachment ? `master=${master.attachment.sessionId.slice(0, 12)} gen=${master.attachment.generation}` : "master=未 attach";
+				ctx.ui.notify(
+					`runtime-host：${s.state} pid=${i.pid} port=${i.port} startedAt=${i.startedAt}\nprobe: ${probe}\n${owner}`,
+					s.state === "dead" || s.state === "stale" ? "warning" : "info",
+				);
+				return;
+			}
+			ctx.ui.notify("用法：/runtime-host start|stop|status", "warning");
+		},
+	});
+
+	// ── /workstream* /task-* 命令（Phase 5a，A7 F18：显式优先）──
+	const wsSid = (ctx: unknown): string | undefined => sessionIdentity(ctx as never);
+	pi.registerCommand("workstream-create", {
+		description: "创建 Workstream：/workstream-create <mission> [--criteria <成功标准>]",
+		handler: async (args, ctx) => {
+			const raw = (args ?? "").trim();
+			if (!raw) { ctx.ui.notify("用法：/workstream-create <mission> [--criteria <成功标准>]", "warning"); return; }
+			const ci = raw.indexOf("--criteria");
+			const mission = (ci < 0 ? raw : raw.slice(0, ci)).trim();
+			const criteria = ci < 0 ? undefined : raw.slice(ci + "--criteria".length).trim() || undefined;
+			try {
+				const ws = createWorkstream({ mission, successCriteria: criteria, session: wsSid(ctx) });
+				ctx.ui.notify(`workstream 已创建：${ws.id}\nmission=${mission.slice(0, 80)}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`workstream-create 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("workstream", {
+		description: "查看 Workstream：/workstream [id]（无 id 列全部，含关联 runs 派生）",
+		handler: async (args, ctx) => {
+			const id = (args ?? "").trim();
+			if (!id) {
+				const all = listWorkstreams();
+				if (!all.length) { ctx.ui.notify("暂无 workstream（/workstream-create 创建）", "info"); return; }
+				ctx.ui.notify(all.map((w) => `${w.id} [${w.status}] ${w.mission.slice(0, 60)}`).join("\n"), "info");
+				return;
+			}
+			const ws = readWorkstream(id);
+			if (!ws) { ctx.ui.notify(`workstream 不存在：${id}`, "warning"); return; }
+			const tasks = listTasks(ws.id);
+			// 关联 runs（enrichment 派生，读时计算，F18）
+			const runs = listProjectedRuns();
+			const linked = runs.filter((r) => enrichRunRefs(r, tasks, [ws]).workstreamRef === ws.id);
+			const lines = [
+				`${ws.id} [${ws.status}]`,
+				`mission=${ws.mission}`,
+				ws.successCriteria ? `criteria=${ws.successCriteria}` : null,
+				`tasks=${tasks.map((t) => `${t.id.slice(0, 14)}:${t.status}`).join(" ") || "(none)"}`,
+				`runs=${linked.map((r) => `${r.subject.split("/").pop()}${r.status === "completed" ? "✓" : "…"}`).join(" ") || "(none)"}`,
+			].filter((l): l is string => Boolean(l));
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+	pi.registerCommand("workstream-link", {
+		description: "关联任务到 Workstream：/workstream-link <ws-id> <extId|run://…>…（run:// 精确，裸 id 为 label）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const [wsId, ...refs] = parts;
+			if (!wsId || !refs.length) { ctx.ui.notify("用法：/workstream-link <ws-id> <extId|run://…>…", "warning"); return; }
+			const ws = readWorkstream(wsId);
+			if (!ws) { ctx.ui.notify(`workstream 不存在：${wsId}`, "warning"); return; }
+			const runSubjects = [...(ws.taskSelector?.runSubjects ?? [])];
+			const externalTaskIds = [...(ws.taskSelector?.externalTaskIds ?? [])];
+			for (const ref of refs) {
+				if (ref.startsWith("run://")) { if (!runSubjects.includes(ref)) runSubjects.push(ref); }
+				else if (!externalTaskIds.includes(ref)) externalTaskIds.push(ref);
+			}
+			updateWorkstream(wsId, { taskSelector: { runSubjects, externalTaskIds }, session: wsSid(ctx) });
+			ctx.ui.notify(`已关联 ${refs.length} 个引用到 ${wsId}`, "info");
+		},
+	});
+	pi.registerCommand("task-create", {
+		description: "创建 Task：/task-create <objective> [--for <ws-id>] [--ext <外部任务号>]",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const flag = (name: string): string | undefined => {
+				const i = parts.indexOf(name);
+				return i >= 0 ? parts[i + 1] : undefined;
+			};
+			const objective = parts.filter((p, i) => !p.startsWith("--") && parts[i - 1] !== "--for" && parts[i - 1] !== "--ext").join(" ");
+			if (!objective) { ctx.ui.notify("用法：/task-create <objective> [--for <ws-id>] [--ext <外部任务号>]", "warning"); return; }
+			try {
+				const t = createTask({ objective, workstreamId: flag("--for") as never, externalTaskId: flag("--ext"), session: wsSid(ctx) });
+				ctx.ui.notify(`task 已创建：${t.id}（pending）`, "info");
+			} catch (e) {
+				ctx.ui.notify(`task-create 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("task-close", {
+		description: "关闭 Task：/task-close <task-id> <completed|failed|cancelled>",
+		handler: async (args, ctx) => {
+			const [id, status] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			if (!id || !["completed", "failed", "cancelled"].includes(status ?? "")) {
+				ctx.ui.notify("用法：/task-close <task-id> <completed|failed|cancelled>", "warning"); return;
+			}
+			try {
+				const t = setTaskStatus(id, status as never, { session: wsSid(ctx) });
+				if (!t) { ctx.ui.notify(`task 不存在：${id}`, "warning"); return; }
+				ctx.ui.notify(`task ${id.slice(0, 14)} → ${t.status}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`task-close 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+	pi.registerCommand("workstream-pause", {
+		description: "灭火开关：/workstream-pause <ws-id> [off]（缺省暂停，加 off 恢复 active；只封未来 wake，不杀在飞 tab）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const [wsId, flag] = parts;
+			if (!wsId) { ctx.ui.notify("用法：/workstream-pause <ws-id> [off]", "warning"); return; }
+			const target = flag === "off" ? "active" : "paused";
+			try {
+				const ws = updateWorkstream(wsId, { status: target as never, session: sessionIdentity(ctx as never) });
+				if (!ws) { ctx.ui.notify(`workstream 不存在：${wsId}`, "warning"); return; }
+				ctx.ui.notify(`workstream ${wsId.slice(0, 14)} → ${ws.status}${target === "paused" ? "（未来 wake 已封，在飞 tab 需手动 reclaim）" : ""}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`workstream-pause 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
+		},
+	});
+
+	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
+	// 后继 spawn 通道（wt.exe + spawnPiTab + 失败写 launch_failed）：master-transfer 工具与
+	// S3 自动交接共用同一闭包（M3 内联实现原样提取，零逻辑变化）
+	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId }) => {
+		const wtPath = findWindowsTerminal();
+		if (!wtPath) throw new Error("master-transfer: no wt.exe");
+		const piCli = findPiCli();
+		const runId = newTabRunId();
+		const taskId = `transfer-${transferId.slice(3, 9)}`;
+		const cwd = process.cwd();
+		const runsDir = defaultTabRunsDir();
+		const dispatch: TabDispatchRecord = {
+			id: runId, version: 1, taskId, mode: "execute", title, cwd,
+			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+		};
+		writeTabDispatch(runsDir, dispatch);
+		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+		recordLink({ sessionId, kind: "tab", targetId: runId, detail: `transfer=${transferId}` });
+		const result = spawnPiTab({
+			wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
+			onSpawnError: (err) => {
+				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+				writeTabDispatch(runsDir, failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			},
+		});
+		if (result.error) {
+			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
+			writeTabDispatch(runsDir, failed);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			throw new Error(result.error);
+		}
+		return { successorRunId: runId };
+	};
+
+	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）；
+	// S3：spawn 通道 + 配置读取闭包一并传入（不传 = 不启用自动交接块）
+	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR, spawnSuccessor, masterSuccession: () => readConfig().masterSuccession });
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
 	registerTabStatusTools(pi);
+
+	// master tools：agent 可调用的 Master 控制（M2/M3，与 /master-* 同服务层）。
+	// master-dispatch（0918 计划）：dispatchTab 闭包只做 findWindowsTerminal/findPiCli 解析 +
+	// 注入 readAttachment（owner 路径最终 fencing 用），其余（wt 缺席在生成 runId 之前返回 error
+	// 不落账本 + 账本/spawn）委托 masterDispatchLaunch。
+	const dispatchTab: DispatchTab = (args) => {
+		const wtPath = findWindowsTerminal();
+		let piCli: string | undefined;
+		let piErr: string | undefined;
+		try {
+			piCli = findPiCli();
+		} catch (err) {
+			piErr = `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		return masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
+	};
+
+	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, dispatchTab });
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
@@ -1547,87 +2056,20 @@ export default function (pi: ExtensionAPI) {
 		return readConfig().notifications !== false;
 	}
 
-	// subagent-win 工具开始执行时通知
-	pi.on("tool_execution_start", (event) => {
-		if (event.toolName !== "subagent-win") return;
-		if (!notifyEnabled()) return;
-		const args = event.args as Record<string, unknown> | undefined;
-		const agent = args?.agent ?? args?.tasks?.[0]?.agent ?? "subagent";
-		const task = (args?.task ?? args?.tasks?.[0]?.task ?? "") as string;
-		const preview = String(task).slice(0, 60);
-		sendWindowsToast({
-			title: `🤖 ${agent} 开始工作`,
-			body: preview || "(无任务描述)",
-			duration: "short",
-		});
-	});
-
-	// subagent-win 工具执行结束时通知
-	pi.on("tool_execution_end", (event) => {
-		if (event.toolName !== "subagent-win") return;
-		if (!notifyEnabled()) return;
-		const result = event.result as Record<string, unknown> | undefined;
-		const details = result?.details as Record<string, unknown> | undefined;
-		const results = details?.results as Array<Record<string, unknown>> | undefined;
-
-		if (results) {
-			// 并行模式
-			const ok = results.filter((r) => r.status === "completed").length;
-			const total = results.length;
-			const icon = ok === total ? "✅" : "⚠️";
-			sendWindowsToast({
-				title: `${icon} Parallel: ${ok}/${total}`,
-				body: ok === total ? "全部 task 完成" : `${total - ok} 个 task 失败`,
-				duration: ok === total ? "short" : "long",
-			});
-		} else {
-			// 单 agent 模式
-			const r = details?.result as Record<string, unknown> | undefined;
-			const agent = (r?.agent ?? "subagent") as string;
-			const status = (r?.status ?? "completed") as string;
-			const isOk = status === "completed";
-			const error = r?.error as string | undefined;
-			const usage = r?.usage as Record<string, unknown> | undefined;
-			const cost = usage?.cost as number | undefined;
-
-			sendWindowsToast({
-				title: isOk ? `✅ ${agent} 完成` : `❌ ${agent} 失败`,
-				body: isOk
-					? cost !== undefined
-						? `✓ 成功  ($${cost.toFixed(4)})`
-						: "✓ 成功"
-					: `✗ ${(error ?? "未知错误").slice(0, 100)}`,
-				duration: isOk ? "short" : "long",
-			});
-		}
-	});
-
-	// update_goal(complete) 时通知 goal 完成
-	pi.on("tool_execution_end", (event) => {
-		if (event.toolName !== "update_goal") return;
-		if (event.isError) return;
-		if (!notifyEnabled()) return;
-		const result = event.result as Record<string, unknown> | undefined;
-		const content = result?.content as Array<Record<string, unknown>> | undefined;
-		if (!content) return;
-		const text = content.map((c) => String(c.text ?? "")).join("");
-		// 检查输出是否包含 complete 状态的确认
-		if (/complete|完成|✅|✓/i.test(text)) {
-			sendWindowsToast({
-				title: "🎯 Goal 已完成",
-				body: text.slice(0, 120) || "所有目标达成",
-				duration: "long",
-			});
-		}
-	});
-
-	// 注册包内 skill 路径
-	pi.on("resources_discover", async () => {
-		return { skillPaths: [join(PKG_DIR, "skills")] };
-	});
+	// 注册包内 skill 路径（注：小 hook 已迁 session-hooks.ts，此处仅保留 notify 开关与 prompt 注入）
 
 	// 注入 subagent-win 配置到 LLM 上下文
 	pi.on("before_agent_start", async (_event, ctx) => {
+		// trace worker：early return（设计稿 §57）——不得先注入整套 workflow 编排规则再叮嘱别用。
+		if (isTraceWorker()) {
+			return {
+				message: {
+					customType: "trace-worker-profile",
+					content: buildTraceWorkerSystemPrompt(),
+					display: false,
+				},
+			};
+		}
 		const cfg = readConfig();
 		const allModels = ctx.modelRegistry?.getAvailable() ?? [];
 		const lines: string[] = [
@@ -1686,10 +2128,17 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
+		// 主会话专属禁轮询纪律（isMainSession 门：tab/子 agent 不注入——"STOP 是合法终态"与 worker 的 tab-finish 纪律冲突，见 no-poll.ts 头注释）
+		if (isMainSession()) lines.push(NO_POLL_DISCIPLINE);
+		// S2 提议制交接提醒缝（M5）：存在 pending proposal 即追加短提醒（§12），否则零注入。
+		// 总开关 enabled=false → 全静默（L3 返修）：不注入 reminder；pending state 保留不清除，
+		// 开关回 on 后现有提醒生命周期原样恢复。
+		const successionReminder = cfg.masterSuccession.enabled ? getPendingReminder() : null;
+		if (successionReminder) lines.push(successionReminder);
 		return { message: { customType: "subagent-win-config", content: lines.join("\n"), display: false } };
 	});
 
-	const canOrchestrateTabs = isMainSession(); // 只允许主会话，禁止标签页与子 agent
+	const canOrchestrateTabs = capabilities().launchTabs; // 主会话专属；trace-worker/subagent 禁止（矩阵见 capabilities.ts，现阶段与 isMainSession() 等价）
 	if (!canOrchestrateTabs) {
 		// 标签页 / 子 agent：跳过 launch-tabs 工具注册（防止孙 tab 派发）
 	} else {
@@ -1742,7 +2191,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
 			// 运行时防护：只允许主会话调用 launch-tabs
-			if (!isMainSession()) {
+			if (!capabilities().launchTabs) {
 				return { content: [{ type: "text", text: "launch-tabs 只允许主会话调用；标签页会话请用 subagent-win 委派各角色，或用 tab-finish 回报主会话。" }], isError: true };
 			}
 
@@ -1770,73 +2219,21 @@ export default function (pi: ExtensionAPI) {
 			const timersDir = defaultTimersDir();
 
 			const results = input.map((item) => {
-				const taskId = (item.taskId ?? "").trim();
-				const prompt = (item.prompt ?? "").trim();
-				if (!taskId || !prompt) {
-					return { title: item.title ?? (taskId || "?"), prompt, model: item.model, error: "taskId and prompt are required" };
-				}
-				// workflow 绑定：前缀 + 强制约束块 + 原始 handoff；--skill 保证技能在标签会话里可见
-				const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
-				const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
 				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : item.mode === "adaptive" ? "adaptive" : "workflow";
-				const normalizedPrompt = buildWorkflowTabPrompt({ taskId, title: item.title, prompt, model: item.model }, skillRef, mode);
-				const cwdRaw = (item.cwd ?? "").trim() || process.cwd();
-				const cwd = resolve(cwdRaw);
-				const title = launchTaskTitle({ taskId, title: item.title, prompt: normalizedPrompt, model: item.model }, cwd);
-
-				// 1) 派发前写账本：回收闭环的 runId 唯一令牌
-				const runId = newTabRunId();
-				const dispatch: TabDispatchRecord = {
-					id: runId,
-					version: 1,
-					taskId,
-					mode,
-					title: item.title ?? title,
-					cwd,
-					requestedModel: item.model,
-					dispatchedAt: new Date().toISOString(),
-					dispatchStatus: "dispatched",
-				};
-				writeTabDispatch(runsDir, dispatch);
-				// 溯源：记录「本会话唤起了这个 tab」
-				recordLink({
-					sessionId: sessionIdentity(_ctx as never),
-					kind: "tab",
-					targetId: runId,
-					detail: `task=${taskId} mode=${mode} ${title}`,
-				});
-
-				// 2) 写入该标签页邮箱的计时器（到期自动发送推进消息）
-				for (const t of item.timers ?? []) {
-					if (typeof t.delayMs !== "number" || !Number.isFinite(t.delayMs) || t.delayMs <= 0) continue;
-					if (typeof t.message !== "string" || !t.message.trim()) continue;
-					const timerRaw: Record<string, unknown> = {
-						id: newTimerId(),
-						version: 1,
-						dueAt: dueAtFromDelay(t.delayMs),
-						message: t.message.trim(),
-						target: { tabRunId: runId, taskId },
-						source: "launch-tabs",
-						label: typeof t.label === "string" && t.label.trim() ? t.label.trim() : undefined,
-						repeatMs: t.repeatMs,
-						status: "pending",
-						createdAt: new Date().toISOString(),
-					};
-					const check = validateTimerRecord(timerRaw);
-					if (check.ok && check.value) writeTimerAtomic(timersDir, check.value, { tabRunId: runId });
-				}
-
-				// 3) spawn（env 携带 PI_TAB_RUN_ID / PI_TAB_RUNS_DIR）
-				const result = dispatchPiTab(wtPath, piCli, cwd, title, normalizedPrompt, item.model, skillArgs, runId, runsDir, (err) => {
-					// P1-2：异步 spawn 失败也回写 launch_failed（不静默卡 dispatched）
-					console.error(`[subagent-win launch] async spawn failed ${runId}: ${err.message}`);
-					writeTabDispatch(runsDir, { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
-				});
-				if (result.error) {
-					// 派发失败保留 launch_failed 记录（不静默消失）
-					writeTabDispatch(runsDir, { ...dispatch, dispatchStatus: "launch_failed", error: result.error });
-				}
-				return { ...result, runId, taskId, cwd };
+				return launchWorkflowTab(
+					{
+						taskId: item.taskId ?? "",
+						title: item.title,
+						prompt: item.prompt ?? "",
+						model: item.model,
+						cwd: item.cwd,
+						mode,
+						timers: item.timers,
+						sessionId: sessionIdentity(_ctx as never),
+						timerSource: "launch-tabs",
+					},
+					{ wtPath, piCli, runsDir, timersDir },
+				);
 			});
 			const ok = results.filter((item) => !item.error).length;
 			const lines = results.map((item) => item.error
@@ -1881,6 +2278,8 @@ export default function (pi: ExtensionAPI) {
 				})),
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
+				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行" })),
@@ -1892,6 +2291,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
+			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 		}),
 
 		// ── TUI 渲染 ──
@@ -1996,6 +2397,41 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, signal, onUpdate, _ctx) {
 			const p = rawParams as Record<string, any>;
 
+			// 入参校验：空 task 的派发在任何 profile 下都是调用方 bug
+			// （同时封死 review 指出的绕过面：空字符串 task 不再进入派发分支）。
+			if (p.task !== undefined && !String(p.task ?? "").trim()) {
+				return { content: [{ type: "text", text: "⛔ task 不能为空字符串" }], isError: true };
+			}
+			if (Array.isArray(p.tasks)) {
+				if (p.tasks.length === 0) {
+					return { content: [{ type: "text", text: "⛔ tasks 不能为空数组" }], isError: true };
+				}
+				for (const t of p.tasks) {
+					if (!String(t?.task ?? "").trim()) {
+						return { content: [{ type: "text", text: "⛔ tasks 每项必须有非空 task" }], isError: true };
+					}
+				}
+			}
+
+			// trace-fusion C4：trace worker 委派硬 guard（设计稿 §55）——只允许 agent="searcher"，
+			// agent omitted 必须拒绝（omitted 会变成 unrestricted child）。status 查询不属委派，放行。
+			if (isTraceWorker() && (p.task || p.tasks)) {
+				const requested: string[] = Array.isArray(p.tasks)
+					? p.tasks.map((t: { agent?: string }) => t?.agent ?? "")
+					: [typeof p.agent === "string" ? p.agent : ""];
+				const verdict = assertDelegationAllowed(requested, "trace-worker");
+				if (!verdict.ok) {
+					return { content: [{ type: "text", text: `⛔ trace worker 委派被拒：${verdict.reason}` }], isError: true };
+				}
+				// §12：trace worker 派 searcher 时强制窄工具面（read/bash），调用方不得覆盖——
+				// searcher 只收集证据，不实现。
+				if (Array.isArray(p.tasks)) {
+					for (const t of p.tasks) t.tools = ["read", "bash"];
+				} else {
+					p.tools = ["read", "bash"];
+				}
+			}
+
 			if (p.action === "status") {
 				const runs = listAsyncRuns();
 				const target = p.runId ? runs.find((r) => r.id === p.runId) : runs[0];
@@ -2063,7 +2499,7 @@ export default function (pi: ExtensionAPI) {
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
-				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, p.cwd).then((result) => {
+				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools }).then((result) => {
 					record.status = result.status; record.result = result;
 					recordUsage(agentDef?.name, result);
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
@@ -2080,7 +2516,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Unknown agent "${p.agent}". Available: ${agents.map((a) => a.name).join(", ")}` }], isError: true };
 				}
 				const cb = onUpdate ? (s: string, t: string) => onUpdate({ content: [{ type: "text", text: s + " " + t }] }) : undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, p.cwd);
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
@@ -2489,6 +2925,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("launch", {
 		description: "编排可见 pi 标签页；/launch -t <标题> 或 --direct 才直接启动单个任务",
 		handler: async (args, ctx) => {
+			// C4 运行时防护（设计稿 §59）：不依赖 factory 阶段注册与否，handler 内再验一次。
+			if (!capabilities().launchTabs) {
+				ctx.ui.notify("⛔ 当前会话无标签页编排权限（launch-tabs 只属于主会话）", "error");
+				return;
+			}
 			const request = parseLaunchRequest(args ?? "");
 			if (!request.task) {
 				ctx.ui.notify("用法: /launch [--model <模型>] <编排请求>；单任务用 /launch -t <标题> <任务> 或 --direct <任务>", "error");
@@ -2552,7 +2993,7 @@ export default function (pi: ExtensionAPI) {
 			// 且不能用 tab-report（回报通道要求 runId）。
 			const directRunId = newTabRunId();
 			const directCwd = request.cwd ?? process.cwd();
-			writeTabDispatch(defaultTabRunsDir(), {
+			const directDispatch: TabDispatchRecord = {
 				id: directRunId,
 				version: 1,
 				taskId: workflowBound ? taskNum : "",
@@ -2563,10 +3004,22 @@ export default function (pi: ExtensionAPI) {
 				dispatchedAt: new Date().toISOString(),
 				dispatchStatus: "dispatched",
 				direct: true,
-			});
+			};
+			writeTabDispatch(defaultTabRunsDir(), directDispatch);
+			// Phase 1 shadow emit（设计稿 §11）
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(directDispatch));
 
-			const result = dispatchPiTab(wtPath, piCli, directCwd, boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined, directRunId, defaultTabRunsDir());
+			const result = dispatchPiTab(wtPath, piCli, directCwd, boundTitle, prompt, request.model, workflowBound ? skillArgs : undefined, directRunId, defaultTabRunsDir(), (err) => {
+				// terra 裁决缺陷 2：直开路径也要在异步 spawn 失败时回写 launch_failed
+				//（否则 journal 永远只有 dispatched，Phase 2 投影为非终态）
+				const failed = { ...directDispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+				writeTabDispatch(defaultTabRunsDir(), failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+			});
 			if (result.error) {
+				const failed = { ...directDispatch, dispatchStatus: "launch_failed" as const, error: result.error };
+				writeTabDispatch(defaultTabRunsDir(), failed);
+				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
 				ctx.ui.notify(`❌ 启动失败: ${result.error}`, "error");
 				return;
 			}
@@ -2576,5 +3029,273 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},
 	});
+	}
+
+	// ── trace-fusion 工具（2026-09-17）：主会话 agent 自主触发只读诊断 rollout ──
+	// 与 /trace-fusion-loop 命令同一套 launchTraceRun，但强制 diagnose 模式（零磁盘代价、
+	// 零主仓库写入）；implement（worktree 读写）仅保留给人丁命令。lane tab 看不到本工具
+	// （TRACE_WORKER_EXCLUDE_TOOLS）+ execute 内 capabilities 运行时二次校验。
+	pi.registerTool({
+		name: "trace-fusion",
+		label: "Trace Fusion (diagnose)",
+		description: [
+			"主会话专属：对当前仓库启动三路完全独立的只读诊断 rollout（diagnose 模式 trace-fusion）——三个可见 pi 标签页各自独立诊断同一个任务，产出三份诊断+推进方案（trajectory），完成后自动收集，交本会话融合。",
+			"适用：任务明显困难/根因不明/单一轨迹置信度低/值得 test-time scaling 时主动使用；简单任务勿用。",
+			"成本：三路并行墙钟约 laneWallClockMin（默认 45min），零磁盘零主仓库写入（只读，edit/write 对 lane 禁用）。",
+			"发起后立即可继续其它工作；三路全部完成后系统自动后台收集并通知你，届时读 runDir/lanes/{A,B,C}/trajectory.md 做融合（一致根因→高置信；分歧→仲裁）后单次实现。",
+			"只允许主会话调用；同一时刻仅允许一个 active run（并发启动会被 preflight 拒绝）。",
+		].join(" "),
+		parameters: Type.Object({
+			task: Type.String({ description: "任务描述（三路逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
+		}),
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			if (!capabilities().launchTabs) {
+				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
+			}
+			const params = rawParams as { task?: string };
+			const task = (params.task ?? "").trim();
+			if (!task) {
+				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
+			}
+			let wtExe: string | null;
+			let piCli: string;
+			try {
+				wtExe = findWindowsTerminal();
+				piCli = findPiCli();
+			} catch (err) {
+				return { content: [{ type: "text", text: `启动环境不可用：${err instanceof Error ? err.message : String(err)}` }], isError: true };
+			}
+			if (!wtExe) {
+				return { content: [{ type: "text", text: "未找到 Windows Terminal (wt.exe)，无法启动标签页。" }], isError: true };
+			}
+			const tfConfig = readTraceFusionConfig();
+			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档
+			const result = launchTraceRun({
+				task,
+				repoRoot: process.cwd(),
+				wtExe,
+				piCli,
+				config: { ...tfConfig, mode: "diagnose" },
+				runsDir: defaultTraceFusionRunsDir(),
+			});
+			const lines = result.lines ?? [];
+			if (!result.ok) {
+				return { content: [{ type: "text", text: ["trace-fusion 启动失败：", result.error, ...lines].join("\n") }], isError: true };
+			}
+			try {
+				for (const lane of TRACE_LANES) {
+					recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+				}
+			} catch { /* 溯源尽力而为 */ }
+			const laneIds = TRACE_LANES.map((l) => `${l}=${result.meta.lanes[l].tabRunId}`).join(", ");
+			return { content: [{ type: "text", text: [
+				`✅ trace-fusion diagnose run 已启动：${result.meta.runId}`,
+				...lines,
+				`lane tabs: ${laneIds}`,
+				"三路完成后自动后台收集（无需干预）；进度 /trace-fusion-status。",
+				"完成后：读 ~/.pi/agent/trace-fusion-runs/<runId>/lanes/{A,B,C}/trajectory.md，融合三份诊断（一致根因→高置信；分歧→仲裁）后单次实现。",
+			].join("\n") }] };
+		},
+	});
+
+	// ── /trace-fusion-loop 命令（trace-fusion C6，只允许主会话）──
+	// 设计稿 §5.1：主入口。编排 preflight → snapshot → 三 worktree → 三 trace worker tab。
+	if (canOrchestrateTabs) {
+		pi.registerCommand("trace-fusion-loop", {
+			description: "三路独立 trace rollout + 证据融合（/trace-fusion-loop <任务>）",
+			handler: async (args, ctx) => {
+				// review 修正（Luna critical）：不信任 factory 阶段的 canOrchestrateTabs 布尔，
+				// handler 内再验一次能力（profile 时序变化时的兑底防线）。
+				if (!capabilities().launchTabs) {
+					ctx.ui.notify("⛔ 当前会话无 trace-fusion 启动权限（仅主会话）", "error");
+					return;
+				}
+				const task = (args ?? "").trim();
+				if (!task) {
+					ctx.ui.notify("用法：/trace-fusion-loop <任务描述>\n将对当前仓库开三个独立 worktree tab 并行求解，完成后证据融合。", "error");
+					return;
+				}
+				let wtExe: string | null;
+				let piCli: string;
+				try {
+					wtExe = findWindowsTerminal();
+					piCli = findPiCli();
+				} catch (err) {
+					ctx.ui.notify(`❌ 启动环境不可用：${err instanceof Error ? err.message : String(err)}`, "error");
+					return;
+				}
+				if (!wtExe) {
+					ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。", "error");
+					return;
+				}
+				const tfConfig = readTraceFusionConfig();
+				const result = launchTraceRun({
+					task,
+					repoRoot: process.cwd(),
+					wtExe,
+					piCli,
+					config: tfConfig,
+					runsDir: defaultTraceFusionRunsDir(),
+				});
+				for (const line of result.lines ?? []) ctx.ui.notify(line, "info");
+				if (!result.ok) {
+					ctx.ui.notify(`❌ trace-fusion 启动失败：${result.error}`, "error");
+					return;
+				}
+				// 溯源：本会话唤起了这三个 lane tab
+				try {
+					for (const lane of TRACE_LANES) {
+						recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+					}
+				} catch {
+					/* 溯源失败不阻塞 */
+				}
+				ctx.ui.notify(
+					`🧬 run ${result.meta.runId} 已启动：TRACE A/B/C 三路独立求解中。\n` +
+					`状态：/trace-fusion-status；中止：/trace-fusion-abort；\n` +
+					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。`,
+					"info",
+				);
+			},
+		});
+
+		// ── /trace-fusion-status（§24.1：磁盘是唯一真相源，主会话重启后重建视图）──
+		pi.registerCommand("trace-fusion-status", {
+			description: "查看 trace-fusion run 状态（从磁盘重建，不依赖内存态）",
+			handler: async (_args, ctx) => {
+				const runsDir = defaultTraceFusionRunsDir();
+				if (!existsSync(runsDir)) {
+					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
+					return;
+				}
+				const runs = readdirSync(runsDir, { withFileTypes: true })
+					.filter((e) => e.isDirectory())
+					.map((e) => {
+						try {
+							return JSON.parse(readFileSync(join(runsDir, e.name, "meta.json"), "utf8")) as TraceRunMeta;
+						} catch {
+							return null;
+						}
+					})
+					.filter((m): m is TraceRunMeta => m !== null)
+					.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+					.slice(0, 5);
+				if (runs.length === 0) {
+					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
+					return;
+				}
+				const lines: string[] = [];
+				for (const m of runs) {
+					lines.push(`📦 ${m.runId} [${m.status}] ${m.task.slice(0, 50)}`);
+					lines.push(`   base ${m.baseCommit.slice(0, 12)} · deadline ${m.laneDeadlineAt}`);
+					for (const lane of TRACE_LANES) {
+						const l = m.lanes[lane];
+						const finished = l.tabRunId ? readTabResultFile(defaultTabRunsDir(), l.tabRunId) : null;
+						const timedOut = Date.now() > new Date(m.laneDeadlineAt).getTime();
+						const artifacts = existsSync(join(m.runDir, "lanes", lane, "patch.diff")) ? "patch✓" : "patch✗";
+						lines.push(`   ${lane}: ${finished ? `终态 ${finished.status}` : timedOut ? "⏱ 超时未完成" : "运行中"} · ${artifacts} · ${l.worktree}`);
+					}
+					for (const f of ["collect.json", "cross-test.json", "cross-test-report.md"]) {
+						if (existsSync(join(m.runDir, f))) lines.push(`   产物：${f}`);
+					}
+				}
+				ctx.ui.notify(lines.join("\n"), "info");
+			},
+		});
+
+		// ── /trace-fusion-collect（review 修正 Luna major：把 C7/C8 接入生产生命周期）──
+		// 三路终态（或人工确认）后调用：权威收集 → deterministic cross-test → meta 终态。
+		pi.registerCommand("trace-fusion-collect", {
+			description: "收集 trace-fusion artifacts 并跑 deterministic cross-test（/trace-fusion-collect [runId]）",
+			handler: async (args, ctx) => {
+				const raw = (args ?? "").trim();
+				const force = /(^|\s)--force(\s|$)/.test(raw);
+				const runId = raw.replace(/--force/g, "").trim();
+				const runsDir = defaultTraceFusionRunsDir();
+				let runDir: string | null = null;
+				if (runId) {
+					runDir = existsSync(join(runsDir, runId, "meta.json")) ? join(runsDir, runId) : null;
+				} else {
+					// 默认取最新的 running run，否则最新 run
+					const candidates = existsSync(runsDir)
+						? readdirSync(runsDir, { withFileTypes: true }).filter((e) => e.isDirectory() && existsSync(join(runsDir, e.name, "meta.json"))).map((e) => e.name).sort().reverse()
+						: [];
+					for (const name of candidates) {
+						const m = readTraceRunMeta(join(runsDir, name));
+						if (m?.status === "running") { runDir = join(runsDir, name); break; }
+					}
+					runDir = runDir ?? (candidates[0] ? join(runsDir, candidates[0]) : null);
+				}
+				if (!runDir) {
+					ctx.ui.notify("未找到 trace-fusion run。用法：/trace-fusion-collect [runId]", "error");
+					return;
+				}
+				const meta = readTraceRunMeta(runDir);
+				if (!meta) {
+					ctx.ui.notify(`run meta 不可读：${runDir}`, "error");
+					return;
+				}
+				const tfConfig = readTraceFusionConfig();
+				// review 复核修正（Luna major）：三 lane 未全部终态时拒绝收集（除非 --force）——
+				// 运行中的 worker 仍在改 worktree，提前收集会拿到撕裂证据并错误终结 run。
+				const pending = TRACE_LANES.filter((lane) => {
+					const l = meta.lanes[lane];
+					return !(l.tabRunId && readTabResultFile(defaultTabRunsDir(), l.tabRunId));
+				});
+				if (pending.length > 0 && !force) {
+					ctx.ui.notify(
+						`⏳ 以下 lane 尚未 tab-finish：${pending.join(", ")}。\n` +
+						`等待完成后重试；确要放弃等待并对当前状态出报告，用 /trace-fusion-collect ${meta.runId} --force（后续 lane 的修改不再进入证据）。`,
+						"info",
+					);
+					return;
+				}
+				ctx.ui.notify(`📦 收集 ${meta.runId} 的 lane artifacts（三段式 patch/叙事/终态）…`, "info");
+				const collect = collectRunArtifacts(meta);
+				// diagnose 模式（2026-09-17）：不在用户主仓库执行 pooled commands，
+				// 落盘跳过型报告 + 违规写入确定性检查
+				const matrix = meta.mode === "diagnose"
+					? finishDiagnoseRun(meta, collect)
+					: (() => {
+						ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");
+						return runCrossTest(meta, collect, {
+							provisioning: tfConfig.provisioning,
+							mainRoot: meta.repoRoot,
+						});
+					})();
+				// deterministic 层终态：报告就绪，等待人工裁决（fusion/consult 为 v0.4）
+				const finished = { ...meta, status: "completed" as const };
+				writeFileSync(join(runDir, "meta.json"), JSON.stringify(finished, null, 2) + "\n", "utf8");
+				const pass = matrix.cells.filter((c) => c.result === "pass").length;
+				const fail = matrix.cells.filter((c) => c.result === "fail").length;
+				ctx.ui.notify(
+					`✅ cross-test 完成：${pass} pass / ${fail} fail / ${matrix.cells.length - pass - fail} 其它。\n` +
+					`报告：${matrix.reportPath}\n三份 trajectory 与 patch 在 ${meta.runDir}\\lanes\\，等待人工裁决。`,
+					"info",
+				);
+			},
+		});
+
+		// ── /trace-fusion-clean（v0.5 提前落地：§15「用完即删」的执行机制）──
+		// implement 模式一轮真实 run 占 12GB+；清理 worktree、保留 runDir artifact（patch/trajectory）。
+		pi.registerCommand("trace-fusion-clean", {
+			description: "清理 trace-fusion run 的 worktree 占用（保留 artifact）：/trace-fusion-clean <runId> [--force]",
+			handler: async (args, ctx) => {
+				const raw = (args ?? "").trim();
+				const force = /(^|\s)--force(\s|$)/.test(raw);
+				const runId = raw.replace(/--force/g, "").trim();
+				if (!runId) {
+					ctx.ui.notify("用法：/trace-fusion-clean <runId> [--force]；runId 见 /trace-fusion-status", "error");
+					return;
+				}
+				const result = cleanTraceRun(runId, { force, runsDir: defaultTraceFusionRunsDir() });
+				for (const line of result.lines) ctx.ui.notify(line, "info");
+				if (!result.ok) {
+					ctx.ui.notify(`清理失败：${result.error}`, "error");
+					return;
+				}
+				ctx.ui.notify(`✅ 清理完成：${result.removedWorktrees.length} 个 worktree 已移除`, "info");
+			},
+		});
 	}
 }
