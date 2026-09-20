@@ -1,15 +1,15 @@
 /**
- * Workstream 页（G5.1 人话化）：使命/状态/完成标准/唤醒策略 + 关联任务/运行 + 暂停/继续。
- * ⚠️ per-ws 唤醒状态 / 信箱积压 host 未暴露 → 灰色「暂无数据」徽章诚实呈现；全局信箱在主控/运行时页。
+ * Workstream 页（G5.1 人话化 + G5.2 接真数据）：使命/状态/完成标准/唤醒策略 + 唤醒状态/信箱积压
+ * （snapshot.workstreams[].wakeState / mailboxBacklog 直出）+ 关联任务/运行 + 暂停/继续。
  */
 
 import { useState } from "react";
 import { pauseResumeWorkstream, useGui } from "../store";
 import { RUN_STATUS_ZH, TASK_STATUS_ZH, WS_STATUS_ZH, zhStatus } from "../format";
-import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, naBadge } from "../ui";
-import type { WorkstreamRecord } from "../api/types";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
+import type { WorkstreamView } from "../api/types";
 
-function statusTone(s: WorkstreamRecord["status"]): "green" | "yellow" | "red" | "gray" | "blue" {
+function statusTone(s: WorkstreamView["status"]): "green" | "yellow" | "red" | "gray" | "blue" {
 	switch (s) {
 		case "active":
 			return "green";
@@ -76,6 +76,11 @@ export function WorkstreamPage() {
 										<div className="flex items-center gap-2">
 											<Badge tone={statusTone(w.status)}>{zhStatus(WS_STATUS_ZH, w.status)}</Badge>
 											<ShortId value={w.id} className="text-[11px] text-zinc-400" />
+											{/* G5.2：卡片直出唤醒/积压微摘要 */}
+											{w.mailboxBacklog.pending > 0 && (
+												<Badge tone="yellow" title="未领信件数（mailbox pending）">信 {w.mailboxBacklog.pending}</Badge>
+											)}
+											{w.wakeState.lastSpawnAt && <Badge tone="blue" title="最近一次被唤醒过">已唤醒</Badge>}
 										</div>
 										<p className="mt-0.5 line-clamp-2 text-[11px] text-zinc-500">{w.mission}</p>
 									</button>
@@ -132,11 +137,31 @@ export function WorkstreamPage() {
 										<Unset />
 									)}
 								</DetailRow>
-								<DetailRow label="唤醒状态">
-									{naBadge("后端未提供该数据（这里只显示唤醒策略的配置）")}
+								<DetailRow label="唤醒状态（最近一次自动开工）">
+									{selected.wakeState.lastSpawnAt ? (
+										<span className="text-[11px]">
+											<RelTime at={selected.wakeState.lastSpawnAt} /> 唤醒
+											{selected.wakeState.lastTabRunId && (
+												<>
+													{" · "}
+													运行 <ShortId value={selected.wakeState.lastTabRunId} />
+												</>
+											)}
+											<span className="ml-2 text-[10px] text-zinc-600">累计唤醒 {selected.wakeState.spawnAt.length} 次</span>
+										</span>
+									) : (
+										<span className="text-[11px] text-zinc-600">从未被唤醒过</span>
+									)}
 								</DetailRow>
-								<DetailRow label="信箱积压">
-									{naBadge("后端未提供按工作流的计数（全局信箱见主控/运行时页）")}
+								<DetailRow label="信箱积压（未领信件）">
+									{selected.mailboxBacklog.pending > 0 || selected.mailboxBacklog.claimed > 0 ? (
+										<span className="text-[11px]">
+											<span className="text-zinc-200">{selected.mailboxBacklog.pending}</span> 封未领
+											{selected.mailboxBacklog.claimed > 0 && ` · ${selected.mailboxBacklog.claimed} 封处理中`}
+										</span>
+									) : (
+										<span className="text-[11px] text-zinc-600">0 封（无积压）</span>
+									)}
 								</DetailRow>
 								<DetailRow label="工作区">
 									{selected.workspaceRef ? <span className="font-mono text-[11px] break-all">{selected.workspaceRef}</span> : <Unset />}

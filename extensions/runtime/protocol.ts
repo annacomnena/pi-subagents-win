@@ -49,7 +49,8 @@ export function isMessageKind(v: unknown): v is MessageKind {
 }
 
 // ── Command 词表（§26 示例 + v1 可扩展白名单；G4 additive 批次一：
-// workstream.resume / master.handoff.accept / master.auto-handoff.set，只加不改）──
+// workstream.resume / master.handoff.accept / master.auto-handoff.set，只加不改；
+// G5.2 additive：master.handoff.prepare——GUI Prepare 按钮 + 确定性提案路径）──
 
 export const COMMAND_TYPES = [
 	"agent.wake",
@@ -58,6 +59,7 @@ export const COMMAND_TYPES = [
 	"workstream.resume",
 	"master.handoff.accept",
 	"master.auto-handoff.set",
+	"master.handoff.prepare",
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];

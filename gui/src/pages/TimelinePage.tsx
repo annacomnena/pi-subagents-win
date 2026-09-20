@@ -1,11 +1,12 @@
 /**
- * Timeline 页（G5.1 人话化）：journal 人话时间线——limit 200 尾窗首屏 + /v1/events 增量合并
- * （store.pollEvents），只渲染 server/client 模板生成的 summary，**不显 raw JSON**。
+ * Timeline 页（G5.1 人话化 + G5.2 翻页）：journal 人话时间线——limit 200 尾窗首屏 + /v1/events 增量合并
+ * （store.pollEvents）+ 「加载更早」before= 历史翻页（store.loadEarlierTimeline），
+ * 只渲染 server/client 模板生成的 summary，**不显 raw JSON**。
  */
 
 import { useState } from "react";
 import { useGui } from "../store";
-import { Badge, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
 import type { TimelineItem } from "../api/types";
 
 const FILTERS: { id: string; label: string; match: (t: TimelineItem) => boolean }[] = [
@@ -26,10 +27,19 @@ function kindBadge(t: TimelineItem) {
 
 export function TimelinePage() {
 	const timeline = useGui((s) => s.timeline);
+	const timelineEnd = useGui((s) => s.timelineEnd);
+	const loadEarlier = useGui((s) => s.loadEarlierTimeline);
+	const [loadingEarlier, setLoadingEarlier] = useState(false);
 	const [filterId, setFilterId] = useState("all");
 	const filter = FILTERS.find((f) => f.id === filterId) ?? FILTERS[0];
 
-	const items = timeline.filter(filter.match).slice(-200).reverse(); // 最新在上
+	const items = timeline.filter(filter.match).reverse(); // 最新在上（G5.2：显示全部已载入条目，含 before= 翻页历史）
+
+	const onLoadEarlier = (): void => {
+		if (loadingEarlier || timelineEnd) return;
+		setLoadingEarlier(true);
+		void loadEarlier().finally(() => setLoadingEarlier(false));
+	};
 
 	return (
 		<div className="space-y-3">
@@ -50,7 +60,14 @@ export function TimelinePage() {
 						{f.label}
 					</button>
 				))}
-				<span className="ml-auto text-[10px] text-zinc-600">最近 200 条 · 2 秒增量刷新 · 6 秒全量刷新</span>
+				<span className="ml-auto text-[10px] text-zinc-600">共载入 {timeline.length} 条 · 2 秒增量刷新 · 6 秒全量刷新</span>
+				{!timelineEnd ? (
+					<Button variant="ghost" disabled={loadingEarlier} onClick={onLoadEarlier} title="按 before= 排他上界向历史翻页（每页 200 条）">
+						{loadingEarlier ? "加载中…" : "加载更早"}
+					</Button>
+				) : (
+					<span className="text-[10px] text-zinc-600">已到最早</span>
+				)}
 			</div>
 
 			<Card title={<Term zh={`时间线（${items.length}）`} en="Timeline" />}>

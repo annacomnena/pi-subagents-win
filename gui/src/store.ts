@@ -97,8 +97,8 @@ function describeEvent(e: RuntimeEnvelope): string {
 	return `${e.type}${e.subject ? ` ${e.subject}` : ""} @ ${e.at}`;
 }
 
-/** timeline 合并上限（events 增量可超 200 尾窗；硬顶防长会话内存漂移）。 */
-const TIMELINE_CAP = 1000;
+/** timeline 合并上限（events 增量 + before= 历史页共用；硬顶防长会话内存漂移）。 */
+const TIMELINE_CAP = 2000;
 
 export interface CommandReceipt {
 	at: string;
@@ -122,13 +122,15 @@ interface GuiState {
 	health: HealthView | null;
 	snapshot: RuntimeSnapshot | null;
 	timeline: TimelineItem[];
+	/** G5.2：before= 翻页已到最早（服务端返回空集/不足一页时置位，「加载更早」停用）。 */
+	timelineEnd: boolean;
 	attention: AttentionItem[];
 	attentionIncludeResolved: boolean;
 	setAttentionIncludeResolved: (v: boolean) => void;
 	nextCursor: string;
 
 	// 命令面
-	autoHandoff: boolean | null; // null = 未知（无读取端点，诚实初态）
+	autoHandoff: boolean | null; // null = 未知（snapshot 未就绪；就绪后同步真实态）
 	setAutoHandoff: (v: boolean) => void;
 	lastCommand: CommandReceipt | null;
 	setLastCommand: (r: CommandReceipt) => void;
@@ -139,6 +141,8 @@ interface GuiState {
 	pollEvents: () => Promise<void>;
 	pollAttention: () => Promise<void>;
 	pollTimeline: () => Promise<void>;
+	/** G5.2：before= 历史翻页（加载更早；幂等可重按，end 后 no-op）。 */
+	loadEarlierTimeline: () => Promise<void>;
 }
 
 function isResync(e: FetchErr): boolean {
@@ -157,6 +161,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	health: null,
 	snapshot: null,
 	timeline: [],
+	timelineEnd: false,
 	attention: [],
 	attentionIncludeResolved: false,
 	setAttentionIncludeResolved: (v) => set({ attentionIncludeResolved: v }),
@@ -180,7 +185,11 @@ export const useGui = create<GuiState>((set, get) => ({
 	pollSnapshot: async () => {
 		const r = await api.snapshot();
 		if (r.ok) {
-			set({ snapshot: r.data });
+			const patch: Partial<GuiState> = { snapshot: r.data };
+			// G5.2：auto 开关同步真实态（config.masterSuccession.auto；toggle 本地乐观更新会被下次 poll 校准）
+			const auto = r.data.master?.autoHandoff;
+			if (auto && typeof auto.auto === "boolean") patch.autoHandoff = auto.auto;
+			set(patch);
 			get().markUp(r.at);
 		} else {
 			get().markDown(r.at);
@@ -249,6 +258,34 @@ export const useGui = create<GuiState>((set, get) => ({
 			get().markDown(r.at);
 		}
 	},
+
+	/** G5.2：加载更早（before= 最旧条目，排他上界）。返回空/不足一页 → timelineEnd 停用按钮。 */
+	loadEarlierTimeline: async () => {
+		const { timeline, timelineEnd } = get();
+		if (timelineEnd || timeline.length === 0) return;
+		const oldest = timeline[0]?.id;
+		if (!oldest) return;
+		const r = await api.timeline(200, oldest);
+		if (!r.ok) {
+			get().markDown(r.at);
+			return;
+		}
+		if (r.data.timeline.length === 0) {
+			set({ timelineEnd: true });
+			get().markUp(r.at);
+			return;
+		}
+		const byId = new Map(get().timeline.map((t) => [t.id, t]));
+		for (const it of r.data.timeline) byId.set(it.id, it);
+		set({
+			timeline: [...byId.values()]
+				.sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id))
+				.slice(-TIMELINE_CAP),
+			// 满一页 → 可能还有更早；不足一页 → 已到最早
+			timelineEnd: r.data.timeline.length < 200,
+		});
+		get().markUp(r.at);
+	},
 }));
 
 // ── 命令动作（POST commands；accepted 才落本地态，回执全文进 lastCommand）──
@@ -262,6 +299,24 @@ export async function acceptHandoff(reason?: string): Promise<void> {
 		s.setLastCommand({
 			at: r.at,
 			summary: `handoff.accept 失败（HTTP ${r.status}）`,
+		});
+	}
+}
+
+/** G5.2：立即生成交接提案（确定性路径，pressure 用 host 侧 liveness 最新心跳）。 */
+export async function prepareHandoff(reason?: string): Promise<void> {
+	const r = await api.handoffPrepare(reason);
+	const s = useGui.getState();
+	if (r.ok) {
+		s.setLastCommand({ at: r.at, summary: receiptSummary(r.data) });
+	} else {
+		const detail =
+			typeof r.body === "object" && r.body !== null && typeof (r.body as { detail?: unknown }).detail === "string"
+				? ((r.body as { detail: string }).detail)
+				: undefined;
+		s.setLastCommand({
+			at: r.at,
+			summary: detail ?? `prepare 被拒绝（HTTP ${r.status}${r.body && typeof r.body === "object" && "reason" in r.body ? `：${(r.body as { reason: unknown }).reason}` : ""}）`,
 		});
 	}
 }

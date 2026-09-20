@@ -41,6 +41,7 @@ import {
 } from "./runtime/command-executor.ts";
 import { readAttachment, setCutover, attachMaster } from "./runtime/registry.ts";
 import { maybePropose, readProposal } from "./runtime/master-succession.ts";
+import { writeLiveness } from "./runtime/liveness.ts";
 import { deliverCommand, deliverLetter, listLetters } from "./runtime/mailbox.ts";
 import { consumeMailboxOnce } from "./mailbox-consumer.ts";
 import {
@@ -99,10 +100,10 @@ try {
 	{
 		assert.deepEqual(
 			[...COMMAND_TYPES],
-			["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set"],
-			"词表 additive +3（只加不改）",
+			["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare"],
+			"词表 additive（G4 +3 / G5.2 +prepare，只加不改）",
 		);
-		for (const type of ["workstream.resume", "master.handoff.accept", "master.auto-handoff.set"] as const) {
+		for (const type of ["workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare"] as const) {
 			const f = newCommandFrame({ type, to: master, issuedBy: "agent://x", commandKey: `k-${type}`, issuedAt: iso() });
 			assert.equal(validateCommandFrame(f), true, `${type} 过 validateCommandFrame`);
 		}
@@ -452,6 +453,21 @@ try {
 			assert.equal(smokeAcc.status, 404);
 			assert.equal(smokeAcc.body.reason, "no-proposal");
 
+			// G5.2 prepare HTTP：非 master → 400；无心跳 → 400 + detail 提示；有心跳 → 200 生成提案
+			const prepMt = await postJson(base, "/v1/commands", { frame: "command", type: "master.handoff.prepare", to: "agent://other", commandKey: "http-prep-mt", issuedAt: iso() });
+			assert.equal(prepMt.status, 400);
+			assert.equal(prepMt.body.reason, "invalid-payload", "非 master prepare → 400");
+			const prep0 = await postJson(base, "/v1/commands", { frame: "command", type: "master.handoff.prepare", to: master, commandKey: "http-prep-0", issuedAt: iso() });
+			assert.equal(prep0.status, 400);
+			assert.equal(prep0.body.reason, "invalid-payload");
+			assert.ok(typeof prep0.body.detail === "string" && prep0.body.detail.includes("心跳"), "无心跳 → detail 提示透传 HTTP");
+			const hAtt = readAttachment(master)!;
+			assert.equal(writeLiveness({ sessionId: hAtt.sessionId, generation: hAtt.generation, pressure: 83 }, { stateDir }), true, "HTTP 场景写心跳");
+			const prep1 = await postJson(base, "/v1/commands", { frame: "command", type: "master.handoff.prepare", to: master, commandKey: "http-prep-1", issuedAt: iso() });
+			assert.equal(prep1.status, 200);
+			assert.equal(prep1.body.status, "accepted");
+			assert.ok(typeof prep1.body.summary === "string" && prep1.body.summary.includes("已生成"), "HTTP prepare 生成提案");
+
 			// handler 内部失败 → 500 JSON 不崩进程（configPath 换成目录 → EISDIR → io-error）
 			rmSync(cfgPath);
 			mkdirSync(cfgPath);
@@ -464,6 +480,73 @@ try {
 			await h.close();
 			rmSync(D, { recursive: true, force: true });
 		}
+	}
+
+	// ── G10 master.handoff.prepare（G5.2）：确定性提案路径 ─────────────
+	{
+		const att = readAttachment(master)!;
+		const P = join(ROOT, "state-prepare");
+		mkdirSync(P, { recursive: true });
+		const cfgPath10 = join(ROOT, "config.json"); // G4c 已写（masterSuccession.enabled=true）
+		const prep = (commandKey: string, payload?: Record<string, unknown>, to: string = master) =>
+			frame({ type: "master.handoff.prepare", to, commandKey, payload });
+
+		// master-only 钉死 + payload 结构校验（先于 claim，零盘面）
+		assert.equal(exec(prep("prep-mt", undefined, "agent://other_worker")).reason, "invalid-payload", "非 master target → invalid-payload");
+		const cmdsBefore = commandsFiles(join(P, "commands")).length;
+		assert.equal(exec(prep("prep-extra", { reason: "x", extra: 1 }), { stateDir: P }).reason, "invalid-payload", "多余字段拒绝");
+		assert.equal(commandsFiles(join(P, "commands")).length, cmdsBefore, "结构性拒绝不占幂等键");
+
+		// 无心跳 → invalid-payload + detail 提示（handler 内拒绝：claim 后，可重放）
+		const rNoHb = exec(prep("prep-nohb"), { stateDir: P });
+		assert.ok(rNoHb.status === "rejected" && rNoHb.reason === "invalid-payload", "无心跳拒绝");
+		assert.ok(rNoHb.status === "rejected" && typeof rNoHb.detail === "string" && rNoHb.detail.includes("心跳"), "拒绝带提示");
+		const rNoHbReplay = exec(prep("prep-nohb"), { stateDir: P });
+		assert.ok(rNoHbReplay.status === "rejected" && rNoHbReplay.replayed, "拒绝 outcome 幂等重放");
+
+		// pressure=null 的心跳 → 同拒绝（不伪造压力）
+		assert.equal(writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: null }, { stateDir: P, now: new Date() }), true);
+		assert.equal(exec(prep("prep-nullp"), { stateDir: P }).status, "rejected", "null 压力心跳 → 拒绝");
+
+		// 有心跳 → accepted：maybePropose pending，pressure 来自 liveness
+		assert.equal(
+			writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: 82, windowTokens: 200000 }, { stateDir: P, now: new Date(Date.now() + 31_000) }),
+			true,
+			"同身份节流窗外覆写",
+		);
+		const rOk = exec(prep("prep-1"), { stateDir: P, journalPath: JOURNAL, configPath: cfgPath10 });
+		assert.ok(rOk.status === "accepted" && rOk.summary.includes("已生成"), `prepare 生成提案：${JSON.stringify(rOk)}`);
+		const prop = readProposal(P)!;
+		assert.equal(prop.status, "pending");
+		assert.equal(prop.pressure, 82, "pressure 来自 liveness（Host 不伪造）");
+		assert.equal(prop.sessionId, "sess-H");
+		assert.equal(prop.generation, att.generation);
+		const prepEnvs = listRuntimeEnvelopes({ path: JOURNAL }).envelopes;
+		assert.equal(prepEnvs.filter((e) => e.type === "master.handoff.proposed" && (e.payload as any)?.proposalId === prop.proposalId).length, 1, "S2 proposed 事件一条");
+		assert.ok(prepEnvs.some((e) => e.type === "command.accepted" && (e.payload as any)?.commandKey === "prep-1"), "G4 command.accepted 一条");
+
+		// pending 幂等：不同键再 prepare → accepted 幂等回执，不重复建
+		const rIdem = exec(prep("prep-2"), { stateDir: P, journalPath: JOURNAL, configPath: cfgPath10 });
+		assert.ok(rIdem.status === "accepted" && rIdem.summary.includes("幂等"), `同代已有提案幂等返回：${JSON.stringify(rIdem)}`);
+		assert.equal(readProposal(P)!.proposalId, prop.proposalId, "proposalId 不变");
+		assert.equal(
+			listRuntimeEnvelopes({ path: JOURNAL }).envelopes.filter((e) => e.type === "master.handoff.proposed" && (e.payload as any)?.proposalId === prop.proposalId).length,
+			1,
+			"不重复发 proposed 事件（G4b 先前的同型事件不属本提案）",
+		);
+
+		// 同键重放 → 首次 outcome 原样（replayed:true）
+		const rReplay = exec(prep("prep-1"), { stateDir: P, journalPath: JOURNAL, configPath: cfgPath10 });
+		assert.ok(rReplay.status === "accepted" && rReplay.replayed);
+
+		// 总开关关闭 → bad-state + detail（config 切片尊重 enabled=false）
+		const cfgOff = join(ROOT, "config-prep-off.json");
+		writeFileSync(cfgOff, JSON.stringify({ masterSuccession: { enabled: false } }));
+		const P2 = join(ROOT, "state-prepare-off");
+		mkdirSync(P2, { recursive: true });
+		assert.equal(writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: 50 }, { stateDir: P2 }), true);
+		const rOff = exec(prep("prep-off"), { stateDir: P2, configPath: cfgOff });
+		assert.ok(rOff.status === "rejected" && rOff.reason === "bad-state", `总开关关闭 → bad-state：${JSON.stringify(rOff)}`);
 	}
 
 	// ── G9 冒烟（续）：consumer 命令信 command-deferred（零行为变化）──

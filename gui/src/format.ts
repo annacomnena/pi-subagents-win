@@ -33,6 +33,23 @@ export function fmtPct(pressure: number | undefined | null): string {
 	return typeof pressure === "number" && Number.isFinite(pressure) ? `${(pressure * 100).toFixed(1)}%` : "暂无数据";
 }
 
+/**
+ * 压力刻度归一（G5.2）：历史 payload 曾以 0-1 小数（G3 attention/timeline 测试契约）
+ * 与 0-100 百分数（readPressure 现状，proposal.pressure 与 liveness.pressure 皆然）两种
+ * 刻度出现——≤1 视为小数、>1 视为百分数，返回 0-100 刻度；非法 → null。展示用
+ * fmtPressurePct，勿再手工 ×100。
+ */
+export function pressurePct(v: unknown): number | null {
+	if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return null;
+	return v <= 1 ? v * 100 : v;
+}
+
+/** 0-100 刻度压力展示：一位小数 + %；null → 「暂无数据」。 */
+export function fmtPressurePct(v: unknown): string {
+	const p = pressurePct(v);
+	return p === null ? "暂无数据" : `${p.toFixed(1)}%`;
+}
+
 // ── 状态中文映射（仅展示层；store/类型零改动） ──────────────────
 
 export const WS_STATUS_ZH: Record<string, string> = {

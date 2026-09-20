@@ -1,7 +1,7 @@
-/** 顶栏（G5.1 人话化）：服务●绿点=在线/灰点=离线（=值守会话心跳）；上下文压力=最近提案时点值 + 非实时标注。 */
+/** 顶栏（G5.1 人话化 + G5.2 接真数据）：服务●绿点=在线/灰点=离线；上下文压力=优先 liveness 实时心跳值（as-of），无心跳回退最近提案时点值。 */
 
 import { useGui } from "../store";
-import { fmtPct, fmtRel, fmtTime } from "../format";
+import { fmtPressurePct, fmtRel, fmtTime, pressurePct } from "../format";
 import { Term } from "../ui";
 import type { AttentionItem } from "../api/types";
 
@@ -39,8 +39,15 @@ export function TopBar() {
 				: "值守会话心跳超时——当前值守可能已断开";
 
 	const proposal = latestHandoffAttention(attention);
-	const pressure = proposal?.payload?.pressure;
-	const asOf = proposal?.payload?.proposedAt;
+	// G5.2：压力显示优先 liveness 活值 + as-of；无心跳/无有效读数回退提案时点值并标注
+	const live = useGui((s) => s.snapshot?.master?.liveness ?? null);
+	const livePct = pressurePct(live?.pressure);
+	const proposalPct = pressurePct(proposal?.payload?.pressure);
+	const pressureShown = livePct !== null && live
+		? { pct: livePct, label: `${fmtRel(live.updatedAt)}更新的实时心跳值`, title: fmtTime(live.updatedAt) }
+		: proposalPct !== null
+			? { pct: proposalPct, label: `${fmtRel(asString(proposal?.payload?.proposedAt))}的提案时点值，非实时`, title: asString(proposal?.payload?.proposedAt) ? fmtTime(asString(proposal?.payload?.proposedAt)) : undefined }
+			: null;
 
 	return (
 		<header className="flex items-center gap-4 border-b border-zinc-800 bg-zinc-900 px-4 py-2">
@@ -51,11 +58,11 @@ export function TopBar() {
 			<span className="flex items-center gap-1 text-xs text-zinc-400">
 				<Term zh="上下文压力" en="context pressure" hint="会话记忆快满时会自动提议交接" />
 				<span className="font-mono text-zinc-200">
-					{typeof pressure === "number" ? fmtPct(pressure as number) : <span className="text-zinc-600">暂无数据</span>}
+					{pressureShown ? fmtPressurePct(pressureShown.pct) : <span className="text-zinc-600">暂无数据</span>}
 				</span>
-				{typeof pressure === "number" && (
-					<span className="text-[10px] text-zinc-500" title={asString(asOf) ? fmtTime(asString(asOf)) : undefined}>
-						（{fmtRel(asString(asOf))}的提案值，非实时）
+				{pressureShown && (
+					<span className="text-[10px] text-zinc-500" title={pressureShown.title}>
+						（{pressureShown.label}）
 					</span>
 				)}
 			</span>

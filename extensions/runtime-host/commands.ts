@@ -89,7 +89,12 @@ export function commandOutcomeHttpResponse(outcome: CommandOutcome): CommandHttp
 	if (outcome.status === "rejected") {
 		return {
 			status: REJECT_HTTP_STATUS[outcome.reason] ?? 400,
-			body: { status: "rejected", reason: outcome.reason, replayed: outcome.replayed },
+			body: {
+				status: "rejected",
+				reason: outcome.reason,
+				...(outcome.detail ? { detail: outcome.detail } : {}), // G5.2 additive：面向用户的补充说明
+				replayed: outcome.replayed,
+			},
 		};
 	}
 	return {

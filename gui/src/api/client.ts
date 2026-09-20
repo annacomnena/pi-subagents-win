@@ -32,6 +32,8 @@ export interface FetchErr {
 	/** 409 cursor-invalid 时为 true（server {reason:"cursor-invalid",resync:true}）。 */
 	resync: boolean;
 	at: string;
+	/** G5.2 additive：非 2xx 响应体原样（rejected detail 等面向用户的提示）。 */
+	body?: unknown;
 }
 
 export type FetchResult<T> = FetchOk<T> | FetchErr;
@@ -55,7 +57,7 @@ async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = DEFAUL
 			const reason = (data as { reason?: unknown } | null)?.reason;
 			return { ok: false, status: 409, resync: reason === "cursor-invalid", at };
 		}
-		if (!res.ok) return { ok: false, status: res.status, resync: false, at };
+		if (!res.ok) return { ok: false, status: res.status, resync: false, at, body: data ?? undefined };
 		return { ok: true, status: res.status, data: data as T, at };
 	} catch {
 		return { ok: false, status: 0, resync: false, at };
@@ -96,8 +98,9 @@ export const api = {
 	attention: (includeResolved: boolean): Promise<FetchResult<AttentionResponse>> =>
 		fetchJson<AttentionResponse>(`/v1/attention${includeResolved ? "?includeResolved=1" : ""}`),
 
-	timeline: (limit = 200): Promise<FetchResult<TimelineResponse>> =>
-		fetchJson<TimelineResponse>(`/v1/timeline?limit=${limit}`),
+	/** limit 尾窗 + G5.2 before=（排他上界历史翻页；undefined/空串 = 不启用）。 */
+	timeline: (limit = 200, before?: string): Promise<FetchResult<TimelineResponse>> =>
+		fetchJson<TimelineResponse>(`/v1/timeline?limit=${limit}${before ? `&before=${encodeURIComponent(before)}` : ""}`),
 
 	/** workstream.pause / workstream.resume（to = workstream://<id>；payload 白名单 {reason?}）。 */
 	workstreamPauseResume: (
@@ -121,6 +124,17 @@ export const api = {
 			type: "master.handoff.accept",
 			to: "agent://master_default",
 			commandKey: newCommandKey("accept"),
+			issuedAt: new Date().toISOString(),
+			...(reason ? { payload: { reason } } : {}),
+		} satisfies CommandFrameInput),
+
+	/** master.handoff.prepare（G5.2：确定性提案路径；pressure 用 host 侧 liveness 最新心跳）。 */
+	handoffPrepare: (reason?: string): Promise<FetchResult<CommandOutcomeBody>> =>
+		postJson<CommandOutcomeBody>("/v1/commands", {
+			frame: "command",
+			type: "master.handoff.prepare",
+			to: "agent://master_default",
+			commandKey: newCommandKey("prepare"),
 			issuedAt: new Date().toISOString(),
 			...(reason ? { payload: { reason } } : {}),
 		} satisfies CommandFrameInput),

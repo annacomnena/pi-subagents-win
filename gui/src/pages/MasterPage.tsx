@@ -1,16 +1,18 @@
 /**
- * Master 页（G5.1 人话化）：主控身份/当前值守会话/接班代数/交接提案/接管总开关/信箱 +
- * 上下文压力（提案时点值，非实时）+ 最近交接时间线 + 接受提案/自动交接开关。
- * Prepare/Transfer 保留 disabled 展示（tooltip=功能未开放）；数据逻辑（store hooks）零改动。
+ * Master 页（G5.1 人话化 + G5.2 接真数据）：主控身份/当前值守会话/接班代数/交接提案/接管总开关/信箱 +
+ * 上下文压力（优先 liveness 实时心跳值 + as-of，无心跳回退提案时点值）+ 最近交接时间线 +
+ * 接受提案/自动交接开关（读 snapshot 真实态）。Prepare 启用（两步确认，确定性提案路径）。
  */
 
+import { useRef, useState } from "react";
 import { latestHandoffAttention } from "./TopBar";
-import { acceptHandoff, setAutoHandoff, useGui } from "../store";
-import { PROPOSAL_STATUS_ZH, fmtPct, zhStatus } from "../format";
+import { acceptHandoff, prepareHandoff, setAutoHandoff, useGui } from "../store";
+import { PROPOSAL_STATUS_ZH, fmtPressurePct, pressurePct, zhStatus } from "../format";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, Toggle, Tooltip, naBadge } from "../ui";
 
-const NOT_OPEN = "功能未开放：需要 host 提供对应命令（正式交接由值守会话内的 master-transfer 工具链执行）";
-const AUTO_UNKNOWN_HINT = "压力到线时自动生成提案；当前状态未知（暂无读取接口）";
+const TRANSFER_DISABLED = "交接执行只能由值守会话发起（值守会话内的 master-transfer 工具链）";
+const PREPARE_HINT = "点一次确认后由 host 按最新心跳压力立即生成交接提案（不伪造压力：无心跳时会被拒绝）";
+const AUTO_HINT = "压力到线时自动执行交接；状态来自后端 config.masterSuccession.auto";
 
 function statusTone(status: string | undefined): "yellow" | "blue" | "red" | "gray" {
 	switch (status) {
@@ -32,12 +34,31 @@ export function MasterPage() {
 	const timeline = useGui((s) => s.timeline);
 	const autoHandoff = useGui((s) => s.autoHandoff);
 
+	// G5.2：Prepare 两步确认——点一次变「确认生成提案？」，3 秒内再点才 POST
+	const [confirmPrepare, setConfirmPrepare] = useState(false);
+	const confirmTimer = useRef<number | null>(null);
+	const clickPrepare = (): void => {
+		if (!confirmPrepare) {
+			setConfirmPrepare(true);
+			if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
+			confirmTimer.current = window.setTimeout(() => setConfirmPrepare(false), 3000);
+			return;
+		}
+		if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
+		setConfirmPrepare(false);
+		void prepareHandoff();
+	};
+
 	const master = snapshot?.master ?? null;
 	const att = health?.master.attachment ?? master?.attachment ?? null;
 	const proposal = latestHandoffAttention(attention);
 	const pStatus = typeof proposal?.payload?.status === "string" ? (proposal.payload.status as string) : undefined;
 	const pending = pStatus === "pending";
 	const backlogPending = master?.backlog.reduce((n, b) => n + b.pending, 0) ?? 0;
+	// G5.2：压力显示——优先 liveness 活值（含 as-of），无心跳/无有效读数回退提案时点值
+	const live = master?.liveness ?? null;
+	const livePct = pressurePct(live?.pressure);
+	const proposalPct = pressurePct(proposal?.payload?.pressure);
 
 	const masterTimeline = timeline
 		.filter((t) => t.type.startsWith("master.handoff"))
@@ -94,19 +115,27 @@ export function MasterPage() {
 				</Card>
 
 				<div className="flex flex-col gap-3">
-					{/* 上下文压力：无实时压力端点 → 只显最近提案时点值 */}
+					{/* 上下文压力：G5.2 优先 liveness 实时心跳值 + as-of；无心跳回退提案时点值 */}
 					<Card title={<Term zh="上下文压力" en="context pressure" hint="会话记忆快满时会自动提议交接" />}>
-						{typeof proposal?.payload?.pressure === "number" ? (
+						{livePct !== null && live ? (
 							<div className="flex items-baseline gap-3">
-								<span className="font-mono text-3xl text-zinc-100">{fmtPct(proposal.payload.pressure as number)}</span>
+								<span className="font-mono text-3xl text-zinc-100">{fmtPressurePct(live.pressure)}</span>
 								<span className="text-[11px] text-zinc-500">
-									<RelTime at={proposal.payload.proposedAt as string} />生成提案时的数值（非实时）
+									<Badge tone="green" title="值守会话 agent turn 结束时写盘的心跳活值">实时</Badge>
+									<RelTime at={live.updatedAt} /> 更新
+								</span>
+							</div>
+						) : proposalPct !== null ? (
+							<div className="flex items-baseline gap-3">
+								<span className="font-mono text-3xl text-zinc-100">{fmtPressurePct(proposal?.payload?.pressure)}</span>
+								<span className="text-[11px] text-zinc-500">
+									<RelTime at={proposal?.payload?.proposedAt as string | undefined} /> 提案时点值（非实时；暂无实时心跳）
 								</span>
 							</div>
 						) : (
 							<div className="flex items-center gap-2">
 								<span className="text-3xl text-zinc-600">暂无数据</span>
-								<span className="text-[11px] text-zinc-500">还没有交接提案；后端也暂未提供实时压力查询</span>
+								<span className="text-[11px] text-zinc-500">无实时心跳，也没有交接提案</span>
 							</div>
 						)}
 					</Card>
@@ -137,10 +166,17 @@ export function MasterPage() {
 							</div>
 						)}
 						<div className="mt-3 flex flex-wrap items-center gap-2">
-							<Tooltip text={NOT_OPEN}>
-								<Button disabled>准备交接</Button>
+							<Tooltip text={PREPARE_HINT}>
+								<Button
+									variant={confirmPrepare ? "danger" : "secondary"}
+									disabled={pending}
+									title={pending ? "已有待处理的提案" : undefined}
+									onClick={clickPrepare}
+								>
+									{confirmPrepare ? "确认生成提案？" : "准备交接"}
+								</Button>
 							</Tooltip>
-							<Tooltip text={NOT_OPEN}>
+							<Tooltip text={TRANSFER_DISABLED}>
 								<Button disabled>移交主控</Button>
 							</Tooltip>
 							<Tooltip text={pending ? "把这份交接提案标记为已接受" : "当前没有待处理的提案，暂时不能接受"}>
@@ -151,16 +187,16 @@ export function MasterPage() {
 						</div>
 					</Card>
 
-					{/* 自动交接开关：无读取端点 → 「状态未知」+ tooltip 诚实呈现 */}
-					<Card title={<Term zh="自动交接开关" en="Auto-Handoff" hint={AUTO_UNKNOWN_HINT} />}>
+					{/* 自动交接开关：G5.2 读 snapshot 真实态（config.masterSuccession.auto）*/}
+					<Card title={<Term zh="自动交接开关" en="Auto-Handoff" hint={AUTO_HINT} />}>
 						<div className="flex items-center gap-3">
 							{autoHandoff === null ? (
-								<Tooltip text={AUTO_UNKNOWN_HINT}>
-									<span className="cursor-help border-b border-dashed border-zinc-600 text-sm text-zinc-500">当前状态未知</span>
+								<Tooltip text="后端数据未就绪，无法读取真实状态">
+									<span className="cursor-help border-b border-dashed border-zinc-600 text-sm text-zinc-500">状态未知</span>
 								</Tooltip>
 							) : (
-								<Badge tone={autoHandoff ? "green" : "gray"} title="点击开关后的本地记录，以后端配置为准">
-									{autoHandoff ? "已开启（本地记录）" : "已关闭（本地记录）"}
+								<Badge tone={autoHandoff ? "green" : "gray"} title="来自 snapshot.master.autoHandoff（config.masterSuccession 归一化切片）">
+									{autoHandoff ? "已开启" : "已关闭"}
 								</Badge>
 							)}
 							<Toggle

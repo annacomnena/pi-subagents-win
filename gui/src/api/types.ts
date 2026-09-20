@@ -54,13 +54,35 @@ export interface CutoverStateView {
 	enabledAt: string;
 }
 
-/** snapshot.ts MasterView = MasterStatusView + stale。 */
+/** snapshot.ts MasterView = MasterStatusView + stale + G5.2 additive（liveness/autoHandoff）。 */
 export interface MasterView {
 	attachment: MasterAttachmentView | null;
 	cutover: CutoverStateView | null;
 	snapshot: { sessionId: string; generation: number } | null;
 	backlog: { recipient: string; pending: number; claimed: number }[];
 	stale: boolean;
+	/** G5.2：owner 心跳活压力（owner 会话 agent_end 写手落盘；无心跳 = null）。 */
+	liveness: MasterLivenessView | null;
+	/** G5.2：config.masterSuccession 归一化切片（auto 开关真实态 + 阈值）。 */
+	autoHandoff: MasterAutoHandoffView;
+}
+
+/** runtime/liveness.ts MasterLiveness（pressure 0-100 刻度，null = 无有效读数）。 */
+export interface MasterLivenessView {
+	version: 1;
+	sessionId: string;
+	generation: number;
+	pressure: number | null;
+	windowTokens?: number;
+	updatedAt: string;
+}
+
+/** runtime/master-auto.ts MasterSuccessionConfig 切片。 */
+export interface MasterAutoHandoffView {
+	enabled: boolean;
+	auto: boolean;
+	proposalPercent: number;
+	autoPercent: number;
 }
 
 export type WorkstreamStatus = "active" | "waiting" | "blocked" | "paused" | "completed" | "failed";
@@ -103,6 +125,21 @@ export interface TaskRecord {
 }
 
 export type RunStatus = "created" | "dispatched" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "orphaned";
+
+/** runtime/wake.ts WakeState（snapshot workstreams[].wakeState 直出）。 */
+export interface WakeStateView {
+	workstreamId: string;
+	lastSpawnAt?: string;
+	lastTabRunId?: string;
+	spawnAt: string[];
+	updatedAt: string;
+}
+
+/** G5.2：WorkstreamRecord + wakeState + mailboxBacklog（per-ws 未领积压）。 */
+export interface WorkstreamView extends WorkstreamRecord {
+	wakeState: WakeStateView;
+	mailboxBacklog: { pending: number; claimed: number };
+}
 
 /** projector.ts ProjectedRun（journal 投影；无 tab-runs phase/waiting 字段——G1 open issue 1）。 */
 export interface ProjectedRun {
@@ -150,7 +187,7 @@ export interface RuntimeSnapshot {
 	version: 1;
 	generatedAt: string;
 	master: MasterView;
-	workstreams: WorkstreamRecord[];
+	workstreams: WorkstreamView[];
 	tasks: TaskRecord[];
 	runs: ProjectedRun[];
 	attention: AttentionItem[];
@@ -243,7 +280,7 @@ export const MASTER_ADDRESS = "agent://master_default";
 /** 客户端可不传 issuedBy——服务端注入 agent://runtime-host（commands.ts 拍板 2）。 */
 export interface CommandFrameInput {
 	frame: "command";
-	type: "workstream.pause" | "workstream.resume" | "master.handoff.accept" | "master.auto-handoff.set";
+	type: "workstream.pause" | "workstream.resume" | "master.handoff.accept" | "master.auto-handoff.set" | "master.handoff.prepare";
 	to: string;
 	issuedBy?: string;
 	commandKey: string;
@@ -253,5 +290,5 @@ export interface CommandFrameInput {
 
 export type CommandOutcomeBody =
 	| { status: "accepted"; summary: string; replayed: boolean }
-	| { status: "rejected"; reason: string; replayed: boolean }
+	| { status: "rejected"; reason: string; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: string; error?: string; replayed: boolean };

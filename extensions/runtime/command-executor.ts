@@ -48,8 +48,9 @@ import { fileURLToPath } from "node:url";
 import { masterAddress, parseObjectAddress, type ObjectAddress } from "./address.ts";
 import { newEventEnvelope } from "./envelope.ts";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
-import { normalizeMasterSuccession } from "./master-auto.ts";
-import { decideProposal } from "./master-succession.ts";
+import { readLiveness } from "./liveness.ts";
+import { DEFAULT_MASTER_SUCCESSION, normalizeMasterSuccession } from "./master-auto.ts";
+import { decideProposal, maybePropose, readProposal } from "./master-succession.ts";
 import { readAttachment } from "./registry.ts";
 import { validateCommandFrame, type CommandFrame } from "./protocol.ts";
 import { readWorkstream, updateWorkstream } from "./workstreams.ts";
@@ -62,12 +63,17 @@ export const IMPLEMENTED_COMMAND_TYPES = [
 	"workstream.resume",
 	"master.handoff.accept",
 	"master.auto-handoff.set",
+	"master.handoff.prepare",
 ] as const;
 
 export type ImplementedCommandType = (typeof IMPLEMENTED_COMMAND_TYPES)[number];
 
 /** master-only 命令：to 必须精确 === masterAddress()（agent://master_default），否则 invalid-payload。 */
-const MASTER_ONLY_TYPES: readonly string[] = ["master.handoff.accept", "master.auto-handoff.set"];
+const MASTER_ONLY_TYPES: readonly string[] = [
+	"master.handoff.accept",
+	"master.auto-handoff.set",
+	"master.handoff.prepare",
+];
 
 /** 拒绝 reason 词表（HTTP 映射：400 invalid-payload·unknown-command·not-implemented /
  *  404 no-workstream·no-proposal / 409 bad-state·not-owner·not-attached·replay-unknown-outcome）。 */
@@ -84,7 +90,8 @@ export type CommandRejectReason =
 
 export type CommandOutcome =
 	| { status: "accepted"; summary: string; replayed: boolean }
-	| { status: "rejected"; reason: CommandRejectReason; replayed: boolean }
+	/** detail（G5.2 additive，可选）：拒绝的面向用户的补充说明（如 prepare 无心跳提示），HTTP 面原样透传。 */
+	| { status: "rejected"; reason: CommandRejectReason; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: "io-error" | "failed"; error?: string; replayed: boolean };
 
 // ── 选项与路径 ─────────────────────────────────────────────────────
@@ -173,6 +180,7 @@ function commandPayloadOk(frame: CommandFrame): boolean {
 		case "workstream.pause":
 		case "workstream.resume":
 		case "master.handoff.accept":
+		case "master.handoff.prepare":
 			return payloadShapeOk(frame.payload, {}, { reason: "string" });
 		case "master.auto-handoff.set":
 			return payloadShapeOk(frame.payload, { auto: "boolean" }, { reason: "string" });
@@ -210,6 +218,8 @@ function dispatchHandler(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 			return runHandoffAccept(frame, opts);
 		case "master.auto-handoff.set":
 			return runAutoHandoffSet(frame, opts);
+		case "master.handoff.prepare":
+			return runHandoffPrepare(opts);
 		default:
 			return reject("not-implemented");
 	}
@@ -306,6 +316,83 @@ function runAutoHandoffSet(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 		summary: `masterSuccession.auto = ${want}（S3 自动交接${want ? "开启" : "关闭"}${payload.reason ? `；reason: ${payload.reason}` : ""}）`,
 		replayed: false,
 	};
+}
+
+// ── 2.5 master.handoff.prepare（G5.2：GUI Prepare 按钮的确定性提案路径）──
+
+/**
+ * 立即生成交接提案（S2 maybePropose 确定性路径）。
+ *
+ * 压力语义（G5.2 拍板：Host 侧不伪造压力）：读当前真实压力不可得 → pressure 只能用
+ * `readLiveness` 最新心跳值（owner 会话 agent_end 写手落盘）；无心跳/无有效读数 →
+ * 拒绝 invalid-payload + detail 提示先由值守会话产生心跳。
+ *
+ * 确定性：proposalPercent=0（无视达线判定——prepare 语义就是「立即生成」，与 S2 自动
+ * 提议线正交）；enabled 尊重 config.masterSuccession 总开关；同代已有 proposal → 幂等
+ * 返回 accepted 不重复建（maybePropose already-proposed + readProposal 回读）。
+ */
+function runHandoffPrepare(opts: ExecuteCommandOptions): CommandOutcome {
+	const stateDir = stateRoot(opts);
+	const live = readLiveness(stateDir);
+	if (!live || live.pressure === null) {
+		return {
+			status: "rejected",
+			reason: "invalid-payload",
+			detail: "无可用的 liveness 心跳压力值：请先由值守 Master 会话跑完一轮（agent_end 心跳写手落盘 master-liveness.json 后重试）",
+			replayed: false,
+		};
+	}
+	const att = readAttachment(masterAddress());
+	if (!att) return { status: "rejected", reason: "not-attached", replayed: false };
+
+	// config 切片只读（缺失/坏 → 归一化默认；prepare 不写 config，坏盘面不升 io-error）
+	let enabled = DEFAULT_MASTER_SUCCESSION.enabled;
+	try {
+		enabled = normalizeMasterSuccession(readConfigRaw(opts.configPath ?? defaultPkgConfigPath()).masterSuccession).enabled;
+	} catch {
+		/* 缺失/坏 JSON → 默认切片 */
+	}
+	if (!enabled) {
+		return { status: "rejected", reason: "bad-state", detail: "master-succession 总开关已关闭，提案通道停用", replayed: false };
+	}
+
+	// tokens 不可得（liveness 不存 tokens）→ 阈值判定走 percent 兆底分支；proposalPercent=0 恒达线
+	const r = maybePropose(
+		{
+			sessionId: att.sessionId,
+			generation: att.generation,
+			reading: { tokens: null, contextWindow: live.windowTokens ?? null, percent: live.pressure },
+			proposalPercent: 0,
+			enabled,
+		},
+		{ stateDir, journalPath: opts.journalPath },
+	);
+	if (r === null) {
+		return { status: "rejected", reason: "bad-state", detail: "master-succession 已停用", replayed: false };
+	}
+	if (r.proposed) {
+		return {
+			status: "accepted",
+			summary: `handoff proposal ${r.proposal.proposalId} 已生成（gen ${r.proposal.generation}，pressure ${r.proposal.pressure}%，来自 liveness 心跳 ${live.updatedAt}）；实际交接由 owner 会话 master-transfer 执行`,
+			replayed: false,
+		};
+	}
+	switch (r.reason) {
+		case "already-proposed": {
+			// 幂等：同代已有 proposal（任意状态）→ 原样返回不重复建
+			const p = readProposal(stateDir);
+			return {
+				status: "accepted",
+				summary: `已有同代提案 ${p?.proposalId ?? "?"}（status=${p?.status ?? "?"}），幂等返回不重复创建`,
+				replayed: false,
+			};
+		}
+		case "not-owner":
+			return { status: "rejected", reason: "not-owner", replayed: false };
+		default:
+			// no-decision / below-threshold：pressure 已非空 + 阈值 0 下不可达；防御性拒绝
+			return { status: "rejected", reason: "bad-state", detail: `maybePropose: ${r.reason}`, replayed: false };
+	}
 }
 
 function readConfigRaw(configPath: string): Record<string, unknown> {
