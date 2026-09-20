@@ -227,6 +227,8 @@ export function buildSnapshotView(
 		mailboxDir?: string;
 		journalPath?: string;
 		linksPath?: string;
+		/** G5.2：master.autoHandoff 切片读用的 config 路径（缺省包根 config.json）。 */
+		configPath?: string;
 		now?: Date;
 	},
 ): RuntimeSnapshot {
@@ -235,6 +237,7 @@ export function buildSnapshotView(
 		mailboxDir: opts.mailboxDir ?? defaultMailboxDir(),
 		journalPath: opts.journalPath ?? defaultJournalPath(),
 		linksPath: opts.linksPath,
+		configPath: opts.configPath,
 		now: opts.now,
 	});
 	// buildRuntimeSnapshot never-throw（G1 契约）；host 注入 = 纯字段替换，无新抛点。
@@ -430,6 +433,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						mailboxDir: opts.mailboxDir,
 						journalPath: opts.journalPath,
 						linksPath: opts.linksPath,
+						configPath: opts.configPath,
 					});
 					break;
 				case "/v1/events": {
@@ -462,13 +466,15 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					break;
 				}
 				case "/v1/timeline": {
-					// G3（拍板②）：仅 limit（默认 200，at 升序尾部 N 条，无 cursor）
-					const tlRaw = u.searchParams.get("limit");
+					// G3（拍板②）+ G5.2：limit（默认 200，at 升序尾部 N 条）+ before=（历史翻页排他上界）
+					const q = u.searchParams;
+					const tlRaw = q.get("limit");
 					const tl = buildTimelineItems({
 						stateDir: opts.stateDir,
 						journalPath: opts.journalPath,
 						linksPath: opts.linksPath,
 						limit: tlRaw !== undefined ? Number(tlRaw) : undefined,
+						before: q.get("before") ?? undefined,
 					});
 					body = { version: 1, count: tl.length, timeline: tl };
 					break;

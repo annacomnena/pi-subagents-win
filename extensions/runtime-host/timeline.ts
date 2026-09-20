@@ -15,9 +15,10 @@
  *   handoff 8 + run 5 精修；其余类型（session-lifecycle 等）通用兜底（type + subject + at）。
  *   master 生命周期精修归 §34（G5）。payload 只取展示字段。
  *
- * 分页（主会话拍板②）：v1 仅 `limit`（默认 200，**at 升序尾部 N 条**，不建 cursor；
- *   G2 `after=` 服务增量 diff 消费，timeline 是 GUI 首屏全量 + 轮询，尾部窗口已够。
- *   `before=` 历史翻页归 G5）。
+ * 分页（G3 拍板② + G5.2 additive）：`limit`（默认 200，**at 升序尾部 N 条**）+
+ *   `before=<id>`（G5.2 历史翻页：排他上界——只返回全序中严格早于该条目的更旧条目；
+ *   id 找不到 → 返回 [] 作为翻页终止信号）。G2 `after=` 服务增量 diff 消费，timeline
+ *   是 GUI 首屏全量 + 轮询 + 「加载更早」按需翻页。
  *
  * 纪律（G1/G2 同款）：全路径注入（stateDir/journalPath/linksPath），可单测；每源独立
  *   try/catch 段级降级，**never-throw**；纯读、零写盘、无 Pi API。`listLinks`（../links.ts）
@@ -60,6 +61,11 @@ export interface TimelineOptions {
 	linksPath?: string;
 	/** 尾部 N 条（at 升序）；默认 200；非法值回退默认；上限 10000（防大 journal 一次回爆）。 */
 	limit?: number;
+	/**
+	 * G5.2 历史翻页：排他上界（排序全序中该 id 位置的严格前缀）。空串/undefined = 不启用；
+	 * id 不在集内（缺失/越界）→ 返回 []（客户端据此停用「加载更早」）。
+	 */
+	before?: string;
 }
 
 export const TIMELINE_DEFAULT_LIMIT = 200;
@@ -259,7 +265,13 @@ export function buildTimelineItems(opts: TimelineOptions = {}): TimelineItem[] {
 	// 3) 溯源 enrichment（best-effort；内部全部 try/catch，缺席静默降级）
 	enrichRunDispatched(items, stateDir, linksPath);
 
-	// at 升序（同刻：journal 原序 seq，再 id 确定性）+ 尾部 N 条（拍板②：仅 limit）
+	// at 升序（同刻：journal 原序 seq，再 id 确定性）+ before 排他上界前缀 + 尾部 N 条
 	items.sort((a, b) => a.at.localeCompare(b.at) || a.seq - b.seq || a.id.localeCompare(b.id));
-	return items.slice(-limit).map(({ seq: _drop, ...it }) => it);
+	let windowed = items;
+	if (opts.before !== undefined && opts.before !== "") {
+		const idx = windowed.findIndex((it) => it.id === opts.before);
+		if (idx < 0) return []; // 翻页终止信号：id 不在集内
+		windowed = windowed.slice(0, idx);
+	}
+	return windowed.slice(-limit).map(({ seq: _drop, ...it }) => it);
 }

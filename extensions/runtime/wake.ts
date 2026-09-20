@@ -219,14 +219,15 @@ function wakeStateDir(stateDir: string): string {
 	return join(stateDir, "wake-state");
 }
 
-export function readWakeState(workstreamId: string, stateDir?: string): WakeState {
+export function readWakeState(workstreamId: string, stateDir?: string, now: Date = new Date()): WakeState {
 	const dir = stateDir ?? join(defaultRuntimeDir(), "state");
 	try {
 		return JSON.parse(
 			readFileSync(join(wakeStateDir(dir), `${workstreamId}.json`), "utf8"),
 		) as WakeState;
 	} catch {
-		return { workstreamId, spawnAt: [], updatedAt: new Date().toISOString() };
+		// G5.2：now 可注入（snapshot 确定性投影用）；缺省 = 实时（原有调用方零行为变化）。
+		return { workstreamId, spawnAt: [], updatedAt: now.toISOString() };
 	}
 }
 

@@ -14,6 +14,7 @@ import { isTraceWorker } from "./capabilities.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
+import { writeLiveness } from "./runtime/liveness.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
 import { readAttachment } from "./runtime/registry.ts";
@@ -159,6 +160,9 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 				const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
 				if (typeof getUsage === "function") {
 					const reading = readPressure(getUsage.call(ctx) as never);
+					// G5.2 心跳写手：host 是独立 detached 进程读不到会话内存，活压力必须由 owner 在此落盘
+					//（≥30s 节流 + never-throw，写失败静默）。除本调用外零改动。
+					writeLiveness({ sessionId: sid, generation: att.generation, pressure: reading.percent, windowTokens: reading.contextWindow });
 					const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
 					const cfg = deps.masterSuccession?.() ?? DEFAULT_MASTER_SUCCESSION;
 					// S2：owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）；

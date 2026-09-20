@@ -17,7 +17,8 @@
  * master 段注入限制：`getMasterStatus()` 无参数，registry/cutover 目录只能经
  *   `PI_RUNTIME_DIR` 环境变量解析（registry.ts → journal.ts::defaultRuntimeDir#L20）。
  *   测试隔离沿用 `_test_runtime_*` 惯例（import 前设 PI_RUNTIME_DIR）；不为 master
- *   单造注入通道，与全库一致。
+ *   单造注入通道，与全库一致。G5.2 additive：liveness（readLiveness 原生带 stateDir
+ *   注入）与 autoHandoff（configPath 注入）跟随已注入通道，不新造面。
  *
  * 红线（总计划 R1/R2/R7）：纯函数、零写盘、零网络、无全局状态；每段独立 try/catch，
  *   单段失败 → 兜底值 + 错误进 sectionErrors[]，**永不 throw**（最外层再兜一层，
@@ -35,15 +36,21 @@
  *   复制，不是第二真相源（R1）。
  */
 
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildAttentionItems } from "./attention.ts";
 import { buildTimelineItems } from "./timeline.ts";
+import { workstreamAddress } from "../runtime/address.ts";
 import type { RuntimeEnvelope } from "../runtime/envelope.ts";
 import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
-import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
+import { readLiveness, type MasterLiveness } from "../runtime/liveness.ts";
+import { defaultMailboxDir, mailboxBacklog, mailboxDirFor } from "../runtime/mailbox.ts";
+import { normalizeMasterSuccession, type MasterSuccessionConfig } from "../runtime/master-auto.ts";
 import { getMasterStatus, type MasterStatusView } from "../runtime/master-control.ts";
 import type { TaskRecord, WorkstreamRecord } from "../runtime/objects.ts";
 import { rebuildFromEnvelopes, type ProjectedRun } from "../runtime/projector.ts";
+import { readWakeState, type WakeState } from "../runtime/wake.ts";
 import { listTasks, listWorkstreams } from "../runtime/workstreams.ts";
 
 // ── 契约类型（G1 冻结，避免 G3/G5 改 version）──────────────────────
@@ -54,9 +61,25 @@ export type AttentionItem = Record<string, unknown>;
 /** 同上；真实形状见 runtime-host/timeline.ts。 */
 export type TimelineItem = Record<string, unknown>;
 
-/** master 段：getMasterStatus 视图 + stale 派生位。 */
-export type MasterView = MasterStatusView & { stale: boolean };
-export type WorkstreamView = WorkstreamRecord;
+/**
+ * master 段：getMasterStatus 视图 + stale 派生位。
+ * G5.2 additive：liveness（owner 心跳活压力，readLiveness 直出）+ autoHandoff
+ * （config.masterSuccession 归一化切片，GUI auto 开关真实态）。
+ */
+export type MasterView = MasterStatusView & {
+  stale: boolean;
+  /** owner 心跳活压力（owner 会话 agent_end 写手落盘；无心跳 = null）。 */
+  liveness: MasterLiveness | null;
+  /** config.masterSuccession 归一化切片（缺失/坏文件 → 默认切片）。 */
+  autoHandoff: MasterSuccessionConfig;
+};
+/** G5.2 additive：每项加运行时唤醒态与 per-ws 信箱积压。 */
+export type WorkstreamView = WorkstreamRecord & {
+  /** readWakeState 直出（缺失 = 默认空态）。 */
+  wakeState: WakeState;
+  /** 本工作流信箱未领积压（mailboxBacklog 按 spool 目录名匹配；读失败 → 0）。 */
+  mailboxBacklog: { pending: number; claimed: number };
+};
 export type TaskView = TaskRecord;
 /** runs 段：journal 投影原样（无 tab-runs phase——open issue 1，G3 决策）。 */
 export type RunView = ProjectedRun;
@@ -117,6 +140,8 @@ export interface SnapshotOptions {
 	linksPath?: string;
 	/** Date 注入，测试确定性（generatedAt 与 stale 判定同源）。 */
 	now?: Date;
+	/** config.json 路径（G5.2 master.autoHandoff 切片读；缺省包根 config.json，测试注入隔离）。 */
+	configPath?: string;
 }
 
 // ── 常量与兜底值 ───────────────────────────────────────────────────
@@ -137,7 +162,31 @@ const FALLBACK_MASTER: MasterView = {
 	snapshot: null,
 	backlog: [],
 	stale: false,
+	liveness: null,
+	autoHandoff: normalizeMasterSuccession(undefined),
 };
+
+/** 缺省 config：包根 config.json（本文件位于 <pkg>/extensions/runtime-host/，上跳两级；同 command-executor 惯例）。 */
+function defaultPkgConfigPath(): string {
+	return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "config.json");
+}
+
+/**
+ * config.masterSuccession 归一化切片（只读）。缺失文件 → 默认切片（非 error，同
+ * command-executor.readConfigRaw「无 config = 空对象起步」）；坏 JSON/意外 IO → 抛给
+ * 段级记 sectionErrors（防静默重建的语义同源）。
+ */
+function readAutoHandoffSlice(configPath: string): MasterSuccessionConfig {
+	let text: string;
+	try {
+		text = readFileSync(configPath, "utf8");
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") return normalizeMasterSuccession(undefined);
+		throw e;
+	}
+	const parsed = JSON.parse(text) as { masterSuccession?: unknown };
+	return normalizeMasterSuccession(parsed?.masterSuccession);
+}
 
 const FALLBACK_RUNTIME: RuntimeView = {
 	host: null,
@@ -151,20 +200,51 @@ function err(section: string, e: unknown): string {
 	return `${section}: ${e instanceof Error ? e.message : String(e)}`;
 }
 
-function buildMasterSection(now: Date, sectionErrors: string[]): MasterView {
+function buildMasterSection(now: Date, stateDir: string, configPath: string, sectionErrors: string[]): MasterView {
 	try {
 		const s = getMasterStatus();
 		const age = s.attachment ? now.getTime() - Date.parse(s.attachment.lastHeartbeatAt) : NaN;
-		return { ...s, stale: s.attachment !== null && Number.isFinite(age) && age > STALE_AFTER_MS };
+		// G5.2 additive（各自 tolerant，失败只记子段、不拖垮 master 段）：
+		let liveness: MasterLiveness | null = null;
+		try {
+			liveness = readLiveness(stateDir); // never-throw（缺失 → null），此处仅兑意外 IO
+		} catch (e) {
+			sectionErrors.push(err("master.liveness", e));
+		}
+		let autoHandoff = normalizeMasterSuccession(undefined);
+		try {
+			autoHandoff = readAutoHandoffSlice(configPath);
+		} catch (e) {
+			sectionErrors.push(err("master.autoHandoff", e));
+		}
+		return {
+			...s,
+			stale: s.attachment !== null && Number.isFinite(age) && age > STALE_AFTER_MS,
+			liveness,
+			autoHandoff,
+		};
 	} catch (e) {
 		sectionErrors.push(err("master", e));
 		return FALLBACK_MASTER;
 	}
 }
 
-function buildWorkstreamsSection(stateDir: string, sectionErrors: string[]): WorkstreamView[] {
+function buildWorkstreamsSection(stateDir: string, mailboxDir: string, now: Date, sectionErrors: string[]): WorkstreamView[] {
 	try {
-		return listWorkstreams(stateDir);
+		// G5.2 additive：per-ws 信箱积压一次全量扫描按 spool 目录名匹配（mailboxDirFor 同源
+		// sanitize；mailbox 读失败只记子段，工作流清单照常出）。
+		let backlogByDir = new Map<string, { pending: number; claimed: number }>();
+		try {
+			backlogByDir = new Map(mailboxBacklog(mailboxDir).map((r) => [r.recipient, { pending: r.pending, claimed: r.claimed }]));
+		} catch (e) {
+			sectionErrors.push(err("workstreams.mailboxBacklog", e));
+		}
+		return listWorkstreams(stateDir).map((ws) => ({
+			...ws,
+			// tolerant：缺失 → 默认空态；now 注入保证「同种子 + 同 now → 同输出」确定性（G1 契约）
+			wakeState: readWakeState(ws.id, stateDir, now),
+			mailboxBacklog: backlogByDir.get(basename(mailboxDirFor(workstreamAddress(ws.id), mailboxDir))) ?? { pending: 0, claimed: 0 },
+		}));
 	} catch (e) {
 		sectionErrors.push(err("workstreams", e));
 		return [];
@@ -240,12 +320,13 @@ export function buildRuntimeSnapshot(opts: SnapshotOptions = {}): RuntimeSnapsho
 	const stateDir = opts.stateDir ?? join(defaultRuntimeDir(), "state");
 	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
 	const journalPath = opts.journalPath ?? defaultJournalPath();
+	const configPath = opts.configPath ?? defaultPkgConfigPath();
 
 	const sectionErrors: string[] = [];
 	let body: Omit<RuntimeSnapshot, "generatedAt" | "sectionErrors">;
 	try {
-		const master = buildMasterSection(now, sectionErrors);
-		const workstreams = buildWorkstreamsSection(stateDir, sectionErrors);
+		const master = buildMasterSection(now, stateDir, configPath, sectionErrors);
+		const workstreams = buildWorkstreamsSection(stateDir, mailboxDir, now, sectionErrors);
 		const tasks = buildTasksSection(stateDir, sectionErrors);
 		const runs = buildRunsSection(journalPath, sectionErrors);
 		const runtime = buildRuntimeSection(
