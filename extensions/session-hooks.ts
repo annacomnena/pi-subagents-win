@@ -9,9 +9,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { clearAsyncPanelUi } from "./async-panel.ts";
-import { isMainSession, isSubagent } from "./identity.ts";
+import { durableSessionIdentity, isMainSession, isSubagent } from "./identity.ts";
 import { isTraceWorker } from "./capabilities.ts";
-import { sessionIdentity } from "./links.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
@@ -149,7 +148,8 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 	pi.on("agent_end", (_event, ctx) => {
 		try {
 			if (isSubagent()) return;
-			const sid = sessionIdentity(ctx as never);
+			// 所有权必须与 attach 写入侧同在持久 UUID 域：tab runId 只用于 links 路由。
+			const sid = durableSessionIdentity(ctx as never);
 			if (!sid || sid === "unknown") return;
 			const att = readAttachment(masterAddress());
 			if (!att || att.sessionId !== sid) return;

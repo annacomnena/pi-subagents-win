@@ -40,7 +40,7 @@ import { auditSuppression, postInject, preInject, type InjectionContext } from "
 import { runReceiptKey } from "./runtime/receipts.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
-import { isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
+import { getCurrentSessionId, isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath } from "./links.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { recipientSessionIdFor } from "./report.ts";
@@ -96,10 +96,11 @@ export function shouldRegisterWatcher(): boolean {
 	const cutover = readCutover();
 	const attachment = readAttachment(masterAddress());
 	if (!cutover?.enabled || !attachment) return isMainSession();
-	// 身份体系对齐（dogfood DOG1 复发根因）：attachment.sessionId 由 master-attach 经 sessionIdentity()
-	// 写入——tab 会话时是 tab runId（tab_xxx），主会话时是 sessionManager UUID。此前拿会话 UUID 对比
-	// tab runId 恒不匹配 → tab 形态 owner 永不注册 watcher。sessionScopeKey() 与写入侧同一方案。
-	const me = sessionScopeKey();
+	// 身份绑定持久侧（DOG2 根因终修）：attachment.sessionId 由 toolSession 写入——会话 UUID
+	//（随会话文件跨重启稳定）；此处用 getCurrentSessionId() 同侧对比。注意不要用 sessionScopeKey
+	//（runId 优先）：TUI 重启后 pane 裸 pi 重开丢 flag，scope 变回 UUID——若 attach 记过 runId
+	// 会错位；两侧统一在持久 UUID 域，重启后 owner 仍可被识别。
+	const me = getCurrentSessionId();
 	return me !== undefined && attachment.sessionId === me;
 }
 
@@ -197,7 +198,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	{
 		const cut = readCutover();
 		const att = readAttachment(masterAddress());
-		const me = sessionScopeKey(); // 与 attach 写入侧同一身份方案（见 shouldRegisterWatcher 注）
+		const me = getCurrentSessionId(); // 持久 UUID 域（与 attach 写入侧一致，见 shouldRegisterWatcher 注）
 		if (cut?.enabled && att && me !== att.sessionId) {
 			auditSuppression(
 				{ key: runReceiptKey(runId, result?.status ?? "unknown"), sessionId: me, path: "legacy-eventbus" },
@@ -232,8 +233,11 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// 其他会话静默跳过（不 claim、不 toast、不注入），把唤醒权留给真正的编排会话。
 	// 溯源解析不到（旧账本无 sessionId / 非本插件派发）→ 回退 claim 先到先得。
 	const recipient = recipientSessionIdFor({ from: runId }, opts.linksPath ?? defaultLinksPath());
-	const mySession = sessionScopeKey(); // links 由 sessionIdentity 写入（tab runId 优先），同方案对比
-	if (recipient && mySession && recipient !== mySession) {
+	// 双匹配（DOG2 根因）：links 记录的是派发时身份（sessionIdentity：tab runId 优先），但
+	// 重启后本进程 scope 可能变回 UUID——两个域任一匹配即视为本会话的回报，防启动形态漂移丢注入。
+	const myScope = sessionScopeKey();
+	const myUuid = getCurrentSessionId();
+	if (recipient && myScope && recipient !== myScope && recipient !== myUuid) {
 		return false;
 	}
 
@@ -242,9 +246,9 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// 启用后非 owner 被抑制（记审计），owner 走 claimInjection 互斥。
 	let gateCtx: InjectionContext | null = null;
 	{
-		const gate = preInject({ key: runReceiptKey(runId, status), sessionId: mySession, path: "legacy-eventbus" });
+		const gate = preInject({ key: runReceiptKey(runId, status), sessionId: myUuid ?? myScope, path: "legacy-eventbus" });
 		if (!gate.inject) return false;
-		gateCtx = { key: runReceiptKey(runId, status), sessionId: mySession, path: "legacy-eventbus" };
+		gateCtx = { key: runReceiptKey(runId, status), sessionId: myUuid ?? myScope, path: "legacy-eventbus" };
 	}
 	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
 	if (!claimNotified(runsDir, runId)) {

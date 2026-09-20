@@ -13,7 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { sessionIdentity } from "./links.ts";
-import { isMainSession, isSubagent, isTabSession } from "./identity.ts";
+import { durableSessionIdentity, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import { triggerOwnershipRecheck } from "./event-bus.ts";
 import {
 	attachCurrentSession,
@@ -200,7 +200,8 @@ export interface MasterDispatchTabArgs {
 export type DispatchTab = (args: MasterDispatchTabArgs) => { runId?: string; title: string; error?: string; stale?: true };
 
 function toolSession(ctx: unknown): string {
-	return sessionIdentity(ctx as never);
+	// Master 身份绑定持久侧（DOG2 复发根因，2026-09-20）：见 identity.ts durableSessionIdentity。
+	return durableSessionIdentity(ctx as never);
 }
 
 function textResult(outcome: ToolOutcome): { content: { type: string; text: string }[]; details?: Record<string, unknown>; isError?: boolean } {

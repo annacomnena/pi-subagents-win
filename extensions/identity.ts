@@ -34,6 +34,16 @@ export function getCurrentSessionId(): string | undefined {
 	return currentSessionId;
 }
 
+/** Master 所有权身份（持久侧，DOG2 根因终修 2026-09-20）：仅会话 UUID——随会话文件跨重启
+ *  稳定（resume 同一会话即同 UUID）；取不到 sessionManager id → "unknown"（M2：不回退 tab
+ *  runId——那是易失启动身份，持久化会重演 DOG2；session_start 前调用的所有权入口直接拒）。
+ *  与 sessionIdentity()（links.ts，runId 优先）分工：那是派发溯源/路由身份，ownership 一律绑本函数。 */
+export function durableSessionIdentity(ctx?: { sessionManager?: { sessionId?: string } } | null): string {
+	const sid = ctx?.sessionManager?.sessionId;
+	if (sid && sid.length > 0) return sid;
+	return "unknown";
+}
+
 /** 会话目录键（跨进程唯一身份）：tab_<runId> 或 sessionId；无身份 → undefined。 */
 export function sessionScopeKey(): string | undefined {
 	const tab = getTabRunId();

@@ -27,7 +27,7 @@ import { resolveRecipient } from "./runtime/resolver.ts";
 import { auditSuppression, postInject, preInject } from "./injection-gate.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
-import { isMainSession } from "./identity.ts";
+import { isMainSession, isSubagent } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
 
@@ -214,7 +214,17 @@ export function registerMailboxConsumer(
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
-			if (!isMainSession()) return;
+			if (isSubagent()) return;
+			// 消费注册 ownership-gated（M1，与 event-bus watcher 同不变量）：cutover 启用时
+			// 「owner 是谁谁消费」（UUID 域，与 attach 写入侧同域——tab 形态 owner 重启前也可消费）；
+			// 未启用/无 registry → legacy 回退 isMainSession（零变化）；子 agent 恒不消费。
+			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
+			const cut = readCutover();
+			const att = readAttachment(masterAddress());
+			const eligible = cut?.enabled && att
+				? Boolean(sid && sid === att.sessionId)
+				: isMainSession();
+			if (!eligible) return;
 		} catch {
 			return;
 		}
@@ -262,7 +272,17 @@ export function registerWakeLoop(
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
-			if (!isMainSession()) return;
+			if (isSubagent()) return;
+			// 消费注册 ownership-gated（M1，与 event-bus watcher 同不变量）：cutover 启用时
+			// 「owner 是谁谁消费」（UUID 域，与 attach 写入侧同域——tab 形态 owner 重启前也可消费）；
+			// 未启用/无 registry → legacy 回退 isMainSession（零变化）；子 agent 恒不消费。
+			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
+			const cut = readCutover();
+			const att = readAttachment(masterAddress());
+			const eligible = cut?.enabled && att
+				? Boolean(sid && sid === att.sessionId)
+				: isMainSession();
+			if (!eligible) return;
 		} catch {
 			return;
 		}

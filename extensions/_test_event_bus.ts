@@ -316,14 +316,15 @@ function writeResult(runId: string, status = "completed") {
 	{
 		_resetEventBus();
 		resetOwnership(true); // cutover ON
-		attachMaster({ sessionId: "tab_mu6k" }); // owner 是某个 tab 会话（attach 写入 runId——sessionIdentity）
-		process.env.PI_TAB_RUN_ID = "tab_mu6k"; // 是标签页（isMainSession false）
-		setCurrentSessionId("uuid-777-side"); // 会话 UUID（另一套身份，不应影响 owner 判定）
+		// 持久侧不变量（DOG2 终修）：attach 写会话 UUID（durableSessionIdentity），即便本进程是标签页
+		attachMaster({ sessionId: "uuid-mu6k-owner" }); // owner 身份 = 会话 UUID
+		process.env.PI_TAB_RUN_ID = "tab_mu6k"; // 是标签页（isMainSession false，易失启动身份）
+		setCurrentSessionId("uuid-mu6k-owner"); // 会话 UUID（持久身份，与 attachment 同域）
 		assert.equal(shouldRegisterWatcher(), true, "① owner=tab → watch（ownership-gated，靠 owner 判定而非 isMainSession）");
 		const sent: string[] = [];
 		const { pi, fire } = capturePi(sent);
 		registerEventBus(pi as never, { runsDir: ownerDir });
-		fire("tab-own");
+		fire("uuid-mu6k-owner"); // session_start 的 sessionManager.sessionId 即 attach 所用 UUID（生产同源）
 		assert.equal(isEventBusWatching(), true, "① session_start 后 owner=tab 已注册 watcher");
 		writeOwnerResult("tab_own1");
 		const ok = onTabResultFile(ownerDir, "tab_own1.result.json", {
@@ -352,8 +353,8 @@ function writeResult(runId: string, status = "completed") {
 		// 后继凭 handoff token 接班成 owner → triggerOwnershipRecheck 补注册
 		const d = detachMaster({ sessionId: "pre-own", generation: readAttachment(masterAddress())!.generation });
 		assert.equal(d.ok, true, "①b 旧主 detach 发 token");
-		attachMaster({ sessionId: "tab_succ", token: d.token }); // 后继 attach 写入其 tab runId（生产形状）
-		assert.equal(readAttachment(masterAddress())!.sessionId, "tab_succ", "①b 后继已接班（gen+1）");
+		attachMaster({ sessionId: "succ-sess", token: d.token }); // 后继 attach 写入其会话 UUID（"succ-sess" 即该测试宇宙中的 UUID）
+		assert.equal(readAttachment(masterAddress())!.sessionId, "succ-sess", "①b 后继已接班（gen+1）");
 		triggerOwnershipRecheck();
 		assert.equal(isEventBusWatching(), true, "①b 接班后 triggerOwnershipRecheck 补注册 watcher");
 		delete process.env.PI_TAB_RUN_ID;
@@ -429,18 +430,18 @@ function writeResult(runId: string, status = "completed") {
 			}), "utf8");
 		};
 		resetOwnership(true);
-		attachMaster({ sessionId: "tab_tr" }); // 旧 owner（tab 会话，attach 写 runId——生产形状）
-		process.env.PI_TAB_RUN_ID = "tab_tr"; // 旧 owner 进程是标签页
+		attachMaster({ sessionId: "uuid-old-888" }); // 旧 owner（tab 进程，attach 写会话 UUID——持久域）
+		process.env.PI_TAB_RUN_ID = "tab_tr"; // 旧 owner 进程是标签页（易失启动身份）
 		setCurrentSessionId("uuid-old-888");
 		// 旧 owner 注册 watcher（session_start 首次 begin，非 recovery 路径）
 		const sentOld: string[] = [];
 		const { pi: piOld, fire: fireOld } = capturePi(sentOld);
 		registerEventBus(piOld as never, { runsDir: tDir });
-		fireOld("old-own");
+		fireOld("uuid-old-888"); // session_start id 即 attach 所用 UUID（生产同源）
 		assert.equal(isEventBusWatching(), true, "⑧ 旧 owner 已注册 watcher（tDir 此刻空，snapshot 无历史）");
 		writeTrResult("tab_tr"); // 易主窗口内 result 落盘（新出现，不在 seen）
 		// 易主：旧主 detach 发 token → 新主凭 token 接手（gen+1）
-		const d = detachMaster({ sessionId: "tab_tr", generation: readAttachment(masterAddress())!.generation });
+		const d = detachMaster({ sessionId: "uuid-old-888", generation: readAttachment(masterAddress())!.generation });
 		assert.equal(d.ok, true, "⑧ 旧主 detach 发 token");
 		attachMaster({ sessionId: "new-own", token: d.token }); // 新 owner：主会话（换进程，无 tab 身份）
 		assert.equal(readAttachment(masterAddress())!.sessionId, "new-own", "⑧ 新主已接手");
@@ -480,29 +481,41 @@ function writeResult(runId: string, status = "completed") {
 		setCurrentSessionId(undefined);
 	}
 
-	// ── ⑨ 生产身份形状回归（DOG1 复发根因，2026-09-20）──────────────────────
-	// attachment.sessionId 由 master-attach 经 sessionIdentity() 写入——tab 会话时是 tab runId；
-	// 会话 UUID（sessionManager.sessionId）是另一套。旧测试①两边灌同一字符串掩盖了错位：
-	// 拿 UUID 对比 tab runId 恒不匹配 → tab 形态 owner 永不注册 watcher（生产 DOG1 复发）。
-	// 本例复刻生产形状：attachment=runId、session=UUID，两套身份并存。
+	// ── ⑨ DOG2 重启场景回归（身份易失→持久，2026-09-20）──────────────────────
+	// 生产形状：attach 时本进程是标签页（flag 在）；TUI 重启后 pane 裸 pi 重开丢 flag——
+	// 身份只剩会话 UUID。owner 绑定持久 UUID 域：重启前后都能被识别（watch + fencing + 注入）。
 	{
 		_resetEventBus();
 		resetOwnership(true); // cutover ON
-		attachMaster({ sessionId: "tab_mu6k3drx_fn9d" }); // attach 写入侧：tab runId（sessionIdentity）
-		process.env.PI_TAB_RUN_ID = "tab_mu6k3drx_fn9d"; // 本进程是那个标签页
-		setCurrentSessionId("3f9c2e71-aaaa-bbbb-cccc-dddddddddddd"); // sessionManager 会话 UUID（另一套身份）
-		assert.equal(shouldRegisterWatcher(), true, "⑨ tab 形态 owner（attachment=runId, session=UUID）→ watch");
+		// 第一代：tab 进程 attach（toolSession→durableSessionIdentity→UUID），flag 在
+		attachMaster({ sessionId: "01a0b320-3724-701b-8d88-1ead0ea50aa7" }); // 会话 UUID
+		process.env.PI_TAB_RUN_ID = "tab_mu6k3drx_fn9d"; // 启动身份（易失）
+		setCurrentSessionId("01a0b320-3724-701b-8d88-1ead0ea50aa7"); // 持久身份
+		assert.equal(shouldRegisterWatcher(), true, "⑨ 重启前（flag 在）：owner=UUID → watch");
+		// 重启：flag 丢失（裸 pi 重开），resume 同一会话 → UUID 不变
+		delete process.env.PI_TAB_RUN_ID;
+		assert.equal(shouldRegisterWatcher(), true, "⑨ 重启后（flag 丢，UUID 存留）：仍是 owner → watch");
 		writeOwnerResult("tab_own9");
 		const sent9: string[] = [];
 		const ok9 = onTabResultFile(ownerDir, "tab_own9.result.json", {
 			runsDir: ownerDir, toast: false, autoReclaim: true, sendUserMessage: (c: string) => { sent9.push(c); },
 		});
-		assert.equal(ok9, true, "⑨ 注入前 fencing 同方案——不被 UUID/runId 错位误伤");
+		assert.equal(ok9, true, "⑨ 重启后 fencing（UUID 域）不误伤");
 		assert.equal(sent9.length, 1, "⑨ 注入一次");
 		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_own9").length, 1, "⑨ journal 由 owner 记录");
+		// ⑨b（M3）：真实重启形状——新进程实例重新走注册（session_start）+ tick 兑底投递新 result
+		const sent9b: string[] = [];
+		const { pi: pi9b, fire: fire9b } = capturePi(sent9b);
+		registerEventBus(pi9b as never, { runsDir: ownerDir });
+		fire9b("01a0b320-3724-701b-8d88-1ead0ea50aa7"); // resume 同一会话 → 同 UUID
+		assert.equal(isEventBusWatching(), true, "⑨b 重启后新实例注册 watcher");
+		writeOwnerResult("tab_own9b");
+		const fired9b = pollNewResults(ownerDir, { runsDir: ownerDir, toast: false, autoReclaim: true, sendUserMessage: (c: string) => { sent9b.push(c); } });
+		assert.equal(fired9b.length, 1, "⑨b tick 兑底发现新 result");
+		assert.equal(sent9b.length, 1, "⑨b 新实例投递一次");
 		setCurrentSessionId(undefined);
 		delete process.env.PI_TAB_RUN_ID;
-		console.log("ok - ⑨ 生产身份形状：runId/UUID 两套身份并存 → 仍 watch+注入+journal");
+		console.log("ok - ⑨ DOG2 重启场景：flag 丢、UUID 存留 → 新实例注册+tick 投递");
 	}
 
 	// ── ⑩ M1 回归：无身份哨兵 "unknown" 拒写 attachment（注册表层硬不变量）──────────

@@ -72,7 +72,7 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { durableSessionIdentity, getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
@@ -1671,7 +1671,7 @@ export default function (pi: ExtensionAPI) {
 		description: "显式接管逻辑 Master：/master-attach [handoff-token] [--force-stale --confirm]",
 		handler: async (args, ctx) => {
 			// F9：sessionId 取自 Pi 上下文，禁参数伪造
-			const sid = sessionIdentity(ctx as never);
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域（DOG2 根因终修）
 			if (!sid || sid === "unknown") { ctx.ui.notify("master-attach: 无法确定当前会话身份，拒绝", "warning"); return; }
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const token = parts.find((p) => !p.startsWith("--"));
@@ -1692,7 +1692,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const want = (args ?? "").trim().toLowerCase();
 			if (want !== "on" && want !== "off") { ctx.ui.notify("用法：/master-cutover on|off", "warning"); return; }
-			const sid = sessionIdentity(ctx as never) ?? "unknown";
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
 			const st = setMasterCutover({ enabled: want === "on", by: sid });
 			if (!st.ok) {
 				ctx.ui.notify("master-cutover: 尚未 attach（先 /master-attach），拒绝开启", "warning");
@@ -1740,8 +1740,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("master-detach", {
 		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]）",
 		handler: async (args, ctx) => {
-			const sid = sessionIdentity(ctx as never);
-			if (!sid) { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
+			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
+			if (!sid || sid === "unknown") { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
 			const d = issueMasterHandoffToken({ sessionId: sid, reason: (args ?? "").trim() || undefined });
 			if (!d.ok) {
 				ctx.ui.notify("precheck" in d ? "master-detach: 你不是当前 owner，拒绝" : "master-detach 失败：not-owner", "warning");
