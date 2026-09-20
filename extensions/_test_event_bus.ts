@@ -316,9 +316,9 @@ function writeResult(runId: string, status = "completed") {
 	{
 		_resetEventBus();
 		resetOwnership(true); // cutover ON
-		attachMaster({ sessionId: "tab-own" }); // owner 是某个 tab 会话
+		attachMaster({ sessionId: "tab_mu6k" }); // owner 是某个 tab 会话（attach 写入 runId——sessionIdentity）
 		process.env.PI_TAB_RUN_ID = "tab_mu6k"; // 是标签页（isMainSession false）
-		setCurrentSessionId("tab-own");
+		setCurrentSessionId("uuid-777-side"); // 会话 UUID（另一套身份，不应影响 owner 判定）
 		assert.equal(shouldRegisterWatcher(), true, "① owner=tab → watch（ownership-gated，靠 owner 判定而非 isMainSession）");
 		const sent: string[] = [];
 		const { pi, fire } = capturePi(sent);
@@ -352,8 +352,8 @@ function writeResult(runId: string, status = "completed") {
 		// 后继凭 handoff token 接班成 owner → triggerOwnershipRecheck 补注册
 		const d = detachMaster({ sessionId: "pre-own", generation: readAttachment(masterAddress())!.generation });
 		assert.equal(d.ok, true, "①b 旧主 detach 发 token");
-		attachMaster({ sessionId: "succ-sess", token: d.token });
-		assert.equal(readAttachment(masterAddress())!.sessionId, "succ-sess", "①b 后继已接班（gen+1）");
+		attachMaster({ sessionId: "tab_succ", token: d.token }); // 后继 attach 写入其 tab runId（生产形状）
+		assert.equal(readAttachment(masterAddress())!.sessionId, "tab_succ", "①b 后继已接班（gen+1）");
 		triggerOwnershipRecheck();
 		assert.equal(isEventBusWatching(), true, "①b 接班后 triggerOwnershipRecheck 补注册 watcher");
 		delete process.env.PI_TAB_RUN_ID;
@@ -429,9 +429,9 @@ function writeResult(runId: string, status = "completed") {
 			}), "utf8");
 		};
 		resetOwnership(true);
-		attachMaster({ sessionId: "old-own" }); // 旧 owner
-		process.env.PI_TAB_RUN_ID = "tab_tr"; // 标签页
-		setCurrentSessionId("old-own");
+		attachMaster({ sessionId: "tab_tr" }); // 旧 owner（tab 会话，attach 写 runId——生产形状）
+		process.env.PI_TAB_RUN_ID = "tab_tr"; // 旧 owner 进程是标签页
+		setCurrentSessionId("uuid-old-888");
 		// 旧 owner 注册 watcher（session_start 首次 begin，非 recovery 路径）
 		const sentOld: string[] = [];
 		const { pi: piOld, fire: fireOld } = capturePi(sentOld);
@@ -440,10 +440,11 @@ function writeResult(runId: string, status = "completed") {
 		assert.equal(isEventBusWatching(), true, "⑧ 旧 owner 已注册 watcher（tDir 此刻空，snapshot 无历史）");
 		writeTrResult("tab_tr"); // 易主窗口内 result 落盘（新出现，不在 seen）
 		// 易主：旧主 detach 发 token → 新主凭 token 接手（gen+1）
-		const d = detachMaster({ sessionId: "old-own", generation: readAttachment(masterAddress())!.generation });
+		const d = detachMaster({ sessionId: "tab_tr", generation: readAttachment(masterAddress())!.generation });
 		assert.equal(d.ok, true, "⑧ 旧主 detach 发 token");
-		attachMaster({ sessionId: "new-own", token: d.token });
+		attachMaster({ sessionId: "new-own", token: d.token }); // 新 owner：主会话（换进程，无 tab 身份）
 		assert.equal(readAttachment(masterAddress())!.sessionId, "new-own", "⑧ 新主已接手");
+		delete process.env.PI_TAB_RUN_ID; // 新 owner 是另一进程（主会话，无标签页身份）
 		// 旧 owner 的 watcher 此时观察到 tab_tr → fencing 发现已非 owner → 静默放弃（无 .notified、无 journal）
 		const fenced = onTabResultFile(tDir, "tab_tr.result.json", {
 			runsDir: tDir, toast: false, autoReclaim: true, sendUserMessage: (c: string) => { sentOld.push(c); },
@@ -477,6 +478,41 @@ function writeResult(runId: string, status = "completed") {
 		void replay;
 		delete process.env.PI_TAB_RUN_ID;
 		setCurrentSessionId(undefined);
+	}
+
+	// ── ⑨ 生产身份形状回归（DOG1 复发根因，2026-09-20）──────────────────────
+	// attachment.sessionId 由 master-attach 经 sessionIdentity() 写入——tab 会话时是 tab runId；
+	// 会话 UUID（sessionManager.sessionId）是另一套。旧测试①两边灌同一字符串掩盖了错位：
+	// 拿 UUID 对比 tab runId 恒不匹配 → tab 形态 owner 永不注册 watcher（生产 DOG1 复发）。
+	// 本例复刻生产形状：attachment=runId、session=UUID，两套身份并存。
+	{
+		_resetEventBus();
+		resetOwnership(true); // cutover ON
+		attachMaster({ sessionId: "tab_mu6k3drx_fn9d" }); // attach 写入侧：tab runId（sessionIdentity）
+		process.env.PI_TAB_RUN_ID = "tab_mu6k3drx_fn9d"; // 本进程是那个标签页
+		setCurrentSessionId("3f9c2e71-aaaa-bbbb-cccc-dddddddddddd"); // sessionManager 会话 UUID（另一套身份）
+		assert.equal(shouldRegisterWatcher(), true, "⑨ tab 形态 owner（attachment=runId, session=UUID）→ watch");
+		writeOwnerResult("tab_own9");
+		const sent9: string[] = [];
+		const ok9 = onTabResultFile(ownerDir, "tab_own9.result.json", {
+			runsDir: ownerDir, toast: false, autoReclaim: true, sendUserMessage: (c: string) => { sent9.push(c); },
+		});
+		assert.equal(ok9, true, "⑨ 注入前 fencing 同方案——不被 UUID/runId 错位误伤");
+		assert.equal(sent9.length, 1, "⑨ 注入一次");
+		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_own9").length, 1, "⑨ journal 由 owner 记录");
+		setCurrentSessionId(undefined);
+		delete process.env.PI_TAB_RUN_ID;
+		console.log("ok - ⑨ 生产身份形状：runId/UUID 两套身份并存 → 仍 watch+注入+journal");
+	}
+
+	// ── ⑩ M1 回归：无身份哨兵 "unknown" 拒写 attachment（注册表层硬不变量）──────────
+	{
+		resetOwnership(true);
+		const r = attachMaster({ sessionId: "unknown" }); // sessionIdentity 无身份时的哨兵
+		assert.equal(r.ok, false, "⑩ unknown 哨兵拒写（bad-session）");
+		if (!r.ok) assert.equal(r.reason, "bad-session", "⑩ 拒因是 bad-session");
+		assert.equal(readAttachment(masterAddress()), null, "⑩ attachment 未被写入（无永不可读 owner）");
+		console.log("ok - ⑩ unknown 哨兵拒写 attachment（M1）");
 	}
 }
 

@@ -18,7 +18,7 @@ import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
-import { getCurrentSessionId, isMainSession, setCurrentSessionId } from "./identity.ts";
+import { isMainSession, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
 import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
@@ -155,8 +155,10 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	}
 
 	// 会话定位：只消费派发给「当前会话」的回报（不同目录的 identityless 进程不得抢）
+	// links 由 sessionIdentity 写入（tab runId 优先）→ 消费侧用同方案 sessionScopeKey 对比
+	//（tab 形态 owner 此前拿 UUID 对比 tab runId 恒不匹配，回报永不注入——event-bus 同族修复）。
 	const recipient = recipientSessionIdFor(record, opts.linksPath);
-	const mySession = getCurrentSessionId();
+	const mySession = sessionScopeKey();
 	if (!recipient || !mySession || recipient !== mySession) {
 		return false; // 不是本会话的回报 → 不 claim、不注入（留给真正的编排会话）
 	}

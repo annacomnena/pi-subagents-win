@@ -105,7 +105,10 @@ export type AttachResult =
 export function attachMaster(input: AttachInput): AttachResult {
 	const agent = input.agent ?? masterAddress();
 	const now = (input.now ?? new Date()).toISOString();
-	if (!input.sessionId) return { ok: false, reason: "bad-session" };
+	// 无身份哨兵拒写（M1，eventbus identity review）：sessionIdentity() 无身份时返回 "unknown"——
+	// 若写入 attachment，读侧（sessionScopeKey→undefined/真实身份）永远无法匹配，形成不可恢复的
+	// 永不匹配 owner。注册表层硬不变量，双门（slash/tool）只需各自给出友好报错。
+	if (!input.sessionId || input.sessionId === "unknown") return { ok: false, reason: "bad-session" };
 
 	mkdirSync(attachmentsDir(), { recursive: true });
 	mkdirSync(handoffDir(), { recursive: true });

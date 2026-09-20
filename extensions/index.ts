@@ -1672,7 +1672,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			// F9：sessionId 取自 Pi 上下文，禁参数伪造
 			const sid = sessionIdentity(ctx as never);
-			if (!sid) { ctx.ui.notify("master-attach: 无法确定当前会话身份，拒绝", "warning"); return; }
+			if (!sid || sid === "unknown") { ctx.ui.notify("master-attach: 无法确定当前会话身份，拒绝", "warning"); return; }
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const token = parts.find((p) => !p.startsWith("--"));
 			const force = parts.includes("--force-stale") && parts.includes("--confirm");

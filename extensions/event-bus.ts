@@ -40,7 +40,7 @@ import { auditSuppression, postInject, preInject, type InjectionContext } from "
 import { runReceiptKey } from "./runtime/receipts.ts";
 import { tabResultToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
-import { getCurrentSessionId, isMainSession, isSubagent, setCurrentSessionId } from "./identity.ts";
+import { isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath } from "./links.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { recipientSessionIdFor } from "./report.ts";
@@ -96,7 +96,10 @@ export function shouldRegisterWatcher(): boolean {
 	const cutover = readCutover();
 	const attachment = readAttachment(masterAddress());
 	if (!cutover?.enabled || !attachment) return isMainSession();
-	const me = getCurrentSessionId();
+	// 身份体系对齐（dogfood DOG1 复发根因）：attachment.sessionId 由 master-attach 经 sessionIdentity()
+	// 写入——tab 会话时是 tab runId（tab_xxx），主会话时是 sessionManager UUID。此前拿会话 UUID 对比
+	// tab runId 恒不匹配 → tab 形态 owner 永不注册 watcher。sessionScopeKey() 与写入侧同一方案。
+	const me = sessionScopeKey();
 	return me !== undefined && attachment.sessionId === me;
 }
 
@@ -194,7 +197,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	{
 		const cut = readCutover();
 		const att = readAttachment(masterAddress());
-		const me = getCurrentSessionId();
+		const me = sessionScopeKey(); // 与 attach 写入侧同一身份方案（见 shouldRegisterWatcher 注）
 		if (cut?.enabled && att && me !== att.sessionId) {
 			auditSuppression(
 				{ key: runReceiptKey(runId, result?.status ?? "unknown"), sessionId: me, path: "legacy-eventbus" },
@@ -229,7 +232,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// 其他会话静默跳过（不 claim、不 toast、不注入），把唤醒权留给真正的编排会话。
 	// 溯源解析不到（旧账本无 sessionId / 非本插件派发）→ 回退 claim 先到先得。
 	const recipient = recipientSessionIdFor({ from: runId }, opts.linksPath ?? defaultLinksPath());
-	const mySession = getCurrentSessionId();
+	const mySession = sessionScopeKey(); // links 由 sessionIdentity 写入（tab runId 优先），同方案对比
 	if (recipient && mySession && recipient !== mySession) {
 		return false;
 	}
