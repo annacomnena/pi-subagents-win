@@ -31,6 +31,9 @@ export const SESSION_LIFECYCLE_TYPES = [
 	"agent.session.detaching",
 	"agent.session.detached",
 	"agent.session.detaching_failed",
+	"agent.session.taking_over",
+	"agent.session.takeover",
+	"agent.session.takeover_failed",
 ] as const;
 
 export type SessionLifecycleType = (typeof SESSION_LIFECYCLE_TYPES)[number];
@@ -52,29 +55,22 @@ export interface AuditDetail {
 
 function lifecycleEvent(
 	type: SessionLifecycleType,
-	input: { agent: ObjectAddress; sessionId: string; generation?: number; attemptId: string; ok: boolean; reason?: string },
+	payload: SessionLifecyclePayload,
 	at: string,
 ): RuntimeEnvelope {
-	const subject = input.agent;
+	const subject = payload.agentAddress;
 	const dedupeKey =
-		type === "agent.session.attached" || type === "agent.session.detached"
-			? `${type}:${subject}:${input.generation}`
-			: `${type}:${subject}:${input.attemptId}`;
+		type === "agent.session.attached" || type === "agent.session.detached" || type === "agent.session.takeover"
+			? `${type}:${subject}:${payload.generation}`
+			: `${type}:${subject}:${payload.attemptId}`;
 	return newEventEnvelope({
 		type,
-		source: input.agent,
+		source: payload.agentAddress,
 		subject,
 		at,
 		recordedAt: at,
 		dedupeKey,
-		payload: {
-			agentAddress: input.agent,
-			sessionId: input.sessionId,
-			generation: input.generation,
-			attemptId: input.attemptId,
-			ok: input.ok,
-			reason: input.reason,
-		} satisfies SessionLifecyclePayload,
+		payload,
 	});
 }
 
@@ -96,7 +92,11 @@ export function attachMasterWithAudit(
 
 	const attemptAt = new Date().toISOString();
 	audit.attemptEmitted = emitRuntimeEventOnce(
-		lifecycleEvent("agent.session.attaching", { agent, sessionId: input.sessionId, attemptId, ok: true }, attemptAt),
+		lifecycleEvent(
+			"agent.session.attaching",
+			{ agentAddress: agent, sessionId: input.sessionId, attemptId, ok: true } satisfies SessionLifecyclePayload,
+			attemptAt,
+		),
 		opts.journalPath,
 	);
 
@@ -107,7 +107,7 @@ export function attachMasterWithAudit(
 		audit.terminalEmitted = emitRuntimeEventOnce(
 			lifecycleEvent(
 				"agent.session.attached",
-				{ agent, sessionId: input.sessionId, generation: result.attachment.generation, attemptId, ok: true },
+				{ agentAddress: agent, sessionId: input.sessionId, generation: result.attachment.generation, attemptId, ok: true } satisfies SessionLifecyclePayload,
 				terminalAt,
 			),
 			opts.journalPath,
@@ -116,7 +116,7 @@ export function attachMasterWithAudit(
 		audit.terminalEmitted = emitRuntimeEventOnce(
 			lifecycleEvent(
 				"agent.session.attaching_failed",
-				{ agent, sessionId: input.sessionId, attemptId, ok: false, reason: result.reason },
+				{ agentAddress: agent, sessionId: input.sessionId, attemptId, ok: false, reason: result.reason } satisfies SessionLifecyclePayload,
 				terminalAt,
 			),
 			opts.journalPath,
@@ -138,7 +138,11 @@ export function detachMasterWithAudit(
 
 	const attemptAt = new Date().toISOString();
 	audit.attemptEmitted = emitRuntimeEventOnce(
-		lifecycleEvent("agent.session.detaching", { agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: true }, attemptAt),
+		lifecycleEvent(
+			"agent.session.detaching",
+			{ agentAddress: agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: true } satisfies SessionLifecyclePayload,
+			attemptAt,
+		),
 		opts.journalPath,
 	);
 
@@ -149,7 +153,7 @@ export function detachMasterWithAudit(
 		audit.terminalEmitted = emitRuntimeEventOnce(
 			lifecycleEvent(
 				"agent.session.detached",
-				{ agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: true, reason: input.reason },
+				{ agentAddress: agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: true, reason: input.reason } satisfies SessionLifecyclePayload,
 				terminalAt,
 			),
 			opts.journalPath,
@@ -158,7 +162,7 @@ export function detachMasterWithAudit(
 		audit.terminalEmitted = emitRuntimeEventOnce(
 			lifecycleEvent(
 				"agent.session.detaching_failed",
-				{ agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: false, reason: result.reason },
+				{ agentAddress: agent, sessionId: input.sessionId, generation: input.generation, attemptId, ok: false, reason: result.reason } satisfies SessionLifecyclePayload,
 				terminalAt,
 			),
 			opts.journalPath,
@@ -185,7 +189,8 @@ interface TakeoverPayload {
  * takeover + 审计。复用 attachMasterWithAudit 的 attempt/terminal 模式：
  * taking_over（attempt）→ registry.commit → takeover（终态成功，payload 含
  * prevSessionId/prevGeneration/evidence）/ takeover_failed。registry 结果原样返回；
- * journal 写失败绝不影响 registry 结果。
+ * journal 写失败绝不影响 registry 结果。事件词表/type/去重走 lifecycleEvent 同一
+ * 受检路径（L4 M3：三事件已入 SESSION_LIFECYCLE_TYPES 导出表）。
  */
 export function takeoverMasterWithAudit(
 	input: TakeoverMasterInput,
@@ -197,15 +202,11 @@ export function takeoverMasterWithAudit(
 
 	const attemptAt = new Date().toISOString();
 	audit.attemptEmitted = emitRuntimeEventOnce(
-		newEventEnvelope({
-			type: "agent.session.taking_over",
-			source: agent,
-			subject: agent,
-			at: attemptAt,
-			recordedAt: attemptAt,
-			dedupeKey: `agent.session.taking_over:${agent}:${attemptId}`,
-			payload: { agentAddress: agent, sessionId: input.sessionId, attemptId, ok: true } satisfies TakeoverPayload,
-		}),
+		lifecycleEvent(
+			"agent.session.taking_over",
+			{ agentAddress: agent, sessionId: input.sessionId, attemptId, ok: true } satisfies SessionLifecyclePayload,
+			attemptAt,
+		),
 		opts.journalPath,
 	);
 
@@ -213,39 +214,28 @@ export function takeoverMasterWithAudit(
 
 	const terminalAt = new Date().toISOString();
 	if (result.ok) {
+		const payload: TakeoverPayload = {
+			agentAddress: agent,
+			sessionId: input.sessionId,
+			generation: result.attachment.generation,
+			attemptId,
+			ok: true,
+			reason: input.reason,
+			prevSessionId: result.prevSessionId,
+			prevGeneration: result.prevGeneration,
+			...(input.evidence ? { evidence: input.evidence } : {}),
+		};
 		audit.terminalEmitted = emitRuntimeEventOnce(
-			newEventEnvelope({
-				type: "agent.session.takeover",
-				source: agent,
-				subject: agent,
-				at: terminalAt,
-				recordedAt: terminalAt,
-				dedupeKey: `agent.session.takeover:${agent}:${result.attachment.generation}`,
-				payload: {
-					agentAddress: agent,
-					sessionId: input.sessionId,
-					generation: result.attachment.generation,
-					attemptId,
-					ok: true,
-					reason: input.reason,
-					prevSessionId: result.prevSessionId,
-					prevGeneration: result.prevGeneration,
-					...(input.evidence ? { evidence: input.evidence } : {}),
-				} satisfies TakeoverPayload,
-			}),
+			lifecycleEvent("agent.session.takeover", payload, terminalAt),
 			opts.journalPath,
 		);
 	} else {
 		audit.terminalEmitted = emitRuntimeEventOnce(
-			newEventEnvelope({
-				type: "agent.session.takeover_failed",
-				source: agent,
-				subject: agent,
-				at: terminalAt,
-				recordedAt: terminalAt,
-				dedupeKey: `agent.session.takeover_failed:${agent}:${attemptId}`,
-				payload: { agentAddress: agent, sessionId: input.sessionId, attemptId, ok: false, reason: result.reason } satisfies TakeoverPayload,
-			}),
+			lifecycleEvent(
+				"agent.session.takeover_failed",
+				{ agentAddress: agent, sessionId: input.sessionId, attemptId, ok: false, reason: result.reason } satisfies SessionLifecyclePayload,
+				terminalAt,
+			),
 			opts.journalPath,
 		);
 	}

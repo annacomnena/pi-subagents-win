@@ -10,12 +10,17 @@
  * （pre-cutover-legacy），留给 legacy——9903 信即此类，永不重注。
  * 未切换（flag 关/无 registry）时本消费端零动作（legacy 原行为）。
  *
- * 命令信接线（0920 backlog A，仅 agent://master_default 域）：command 分支不再一律
- * deferred——recipient 全等 masterAddress() 时走确定性执行链：fileId claim → F16
- * fencing 复检 → executeCommand(frame) 进程内直调 → 纯报告回执 → ack（三态全终态，
- * 不重投）。红线：命令信绝不进 LLM 注入——executor 在 claim 链内执行，LLM 只收结果
- * 报告。ws/scope 域命令信维持 command-deferred 现状（行为零变化；已知边界：这两域
- * 命令信会被 LLM 唤醒链 claim 当触发器消费）。
+ * 命令信接线（0920 backlog A + L4 返修 M1/M2，仅 agent://master_default 域）：command
+ * 分支不再一律 deferred——recipient 全等 masterAddress() 时走确定性执行链：
+ * {fileId, letter} 枚举（唯一遍历源，M2：认领的 fileId 与执行的 frame 一一绑定，
+ * commandKey 不参与任何映射）→ fileId 定向 claim → F16 fencing 复检 →
+ * executeCommand(frame) 进程内直调 → 固定模板纯报告回执（M1 红线 + L4 二次返修：
+ * 只含受控枚举、零关联字段——内容派生的 correlation id 无密钥无随机映射，猜中
+ * commandKey 即可枚举确认（oracle），已整体移除；关联对账留在 ConsumeReport/journal，
+ * commandKey / payload 派生 summary / detail / error 等任何命令可控内容绝不进 LLM）
+ * → ack 同一 fileId（三态全终态，不重投）。ws/scope 域命令信维持
+ * command-deferred 现状（行为零变化；已知边界：这两域命令信会被 LLM 唤醒链 claim
+ * 当触发器消费）。
  *
  * 注册形态同 report 监听器：session_start（仅主会话）+ interval tick。
  * 所有异常内部吞掉，绝不破坏宿主会话。
@@ -32,7 +37,7 @@ import {
 	type Letter,
 } from "./runtime/mailbox.ts";
 import { executeCommand, type CommandOutcome, type ExecuteCommandOptions } from "./runtime/command-executor.ts";
-import type { CommandFrame } from "./runtime/protocol.ts";
+import { COMMAND_TYPES, type CommandFrame } from "./runtime/protocol.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
@@ -152,23 +157,22 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	const owner = attachment.sessionId;
 	report.owner = owner;
 
-	// 命令信 fileId 索引（仅 master_default 域；commandKey → pending fileId 队列，同键多封
-	// 各领一个 fileId——重放信由 executor 幂等回放 outcome，逐封 ack 终态）
-	const commandFileIds = new Map<string, string[]>();
+	// 命令信枚举（仅 master_default 域；M2：{fileId, letter} 是唯一遍历源——同键多封
+	// 各自独立处理，重放信由 executor 幂等回放 outcome，逐封 ack 终态；枚举失败 →
+	// 命令信本轮零处理，safe 不破坏 message 链）
+	let pendingCommands: Array<{ fileId: string; letter: Letter }> = [];
 	if (recipient === masterAddress()) {
 		try {
-			for (const { fileId, letter } of listPendingCommandLetters(recipient, mailboxDir)) {
-				if (letter.frame.frame !== "command") continue;
-				const list = commandFileIds.get(letter.frame.commandKey);
-				if (list) list.push(fileId);
-				else commandFileIds.set(letter.frame.commandKey, [fileId]);
-			}
+			pendingCommands = listPendingCommandLetters(recipient, mailboxDir);
 		} catch {
-			commandFileIds.clear(); // 索引失败 → 命令信落 claim-missed（safe，不破坏 message 链）
+			pendingCommands = [];
 		}
 	}
 
-	const pending = listLetters(recipient, "pending", mailboxDir);
+	// message 链：master 域命令信归下方专属 fileId 链，从 message 循环剔除（M2）
+	const pending = listLetters(recipient, "pending", mailboxDir).filter(
+		(l) => !(l.frame.frame === "command" && recipient === masterAddress()),
+	);
 	for (const letter of pending) {
 		const messageId = describeLetter(letter);
 		try {
@@ -186,51 +190,12 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				reportPush(report, messageId, "skipped", "pre-cutover-legacy");
 				continue;
 			}
-			// command 帧（0920 backlog A）：域路由拍板 v1 只接线 agent://master_default——
-			// recipient 全等门外的 ws/scope 域维持 command-deferred 现状（信保持 pending，
-			// 行为零变化；已知边界：投到这两域的命令信会被 LLM 唤醒链 claim 消费）。
+			// command 帧（0920 backlog A + M2）：master_default 域命令信已归下方专属
+			// {fileId, letter} 链（不在本循环枚举内）；其余域维持 command-deferred 现状
+			//（信保持 pending，行为零变化；已知边界：投到这两域的命令信会被 LLM 唤醒链
+			// claim 消费）。
 			if (letter.frame.frame === "command") {
-				if (recipient !== masterAddress()) {
-					reportPush(report, messageId, "skipped", "command-deferred");
-					continue;
-				}
-				// 定向 claim：command 帧无 frame.id，用 spool 文件名（fileId，F7）
-				const fileId = commandFileIds.get(letter.frame.commandKey)?.shift();
-				if (!fileId) {
-					reportPush(report, messageId, "skipped", "claim-missed");
-					continue;
-				}
-				const taken = claimLetters(recipient, { claimedBy: holderOf(opts.sessionId), mailboxDir, ids: [fileId], limit: 1 });
-				if (taken.length === 0) {
-					reportPush(report, messageId, "skipped", "claim-missed");
-					continue;
-				}
-				// F16 fencing 复检必须先于 execute：失去 owner 身份的会话不得执行命令
-				const fresh = resolveRecipient(recipient);
-				if (!fresh || fresh.sessionId !== opts.sessionId) {
-					reportPush(report, messageId, "skipped", "generation-moved");
-					continue; // 已 claim 的信留给 stale 回收
-				}
-				// 红线：命令信绝不进 LLM 注入——executor 进程内确定性执行（never-throw 三态），
-				// 跳过 preInject 统一门与 buildInjectBody 注入路径（命令侧去重 = executor wx claim）。
-				let outcome: CommandOutcome;
-				try {
-					outcome = executeCommand(letter.frame, opts.executeCommandOptions);
-				} catch (e) {
-					outcome = { status: "failed", reason: "failed", error: e instanceof Error ? e.message : String(e), replayed: false };
-				}
-				reportPush(report, messageId, "executed", `command-${outcome.status}${outcome.status === "rejected" ? `:${outcome.reason}` : ""}`);
-				// 回执：向 owner 会话发一条纯报告 followUp（无任何待执行指令语义；不走 preInject
-				// 门——回执重复无害）。best-effort，失败不影响 ack。
-				try {
-					opts.sendUserMessage?.(buildCommandReceiptBody(letter.frame, outcome), { deliverAs: "followUp" });
-				} catch {
-					/* best-effort */
-				}
-				// 三态全终态 ack、不重投：rejected 在 executor 幂等 claim 之前拒、不占键，重投必再拒；
-				// failed 留 pending/claimed 会经 10min stale reclaim 无限空转——重试语义由 issuer
-				// 换新 commandKey 重发承担。
-				ackLetter(recipient, fileId, { mailboxDir });
+				reportPush(report, messageId, "skipped", "command-deferred");
 				continue;
 			}
 			// 定向 claim（单封）
@@ -287,6 +252,64 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			reportPush(report, messageId, "skipped", "error");
 		}
 	}
+	// 命令信专属链（仅 master_default 域，0920 backlog A + L4 M1/M2）：{fileId, letter}
+	// 唯一遍历源——每封信用自己的 fileId 定向 claim、执行自己的 frame、ack 同一 fileId，
+	// mailbox 原子领取与实际执行的 frame 严格一一绑定（同 commandKey 不同 type/payload/
+	// issuedAt 的多封信互不串）。红线（M1 + L4 二次返修）：回执只含固定模板 + 受控枚举、
+	// 零关联字段（内容派生 id 是可枚举 oracle），任何命令可控内容不进 LLM。三态全终态 ack、不重投。
+	for (const { fileId, letter } of pendingCommands) {
+		const messageId = describeLetter(letter);
+		try {
+			// F17：cutover 前的旧命令信留给 legacy（与 message 链同一审计去重）
+			if (letterTime(letter) < cutover.enabledAt) {
+				const auditKey = receiptKeyFor(letter);
+				if (!auditedPreCutover.has(auditKey)) {
+					auditedPreCutover.add(auditKey);
+					auditSuppression(
+						{ key: auditKey, sessionId: opts.sessionId, path: "mailbox-consumer" },
+						"pre-cutover-legacy",
+						{ sessionId: attachment.sessionId, generation: attachment.generation },
+					);
+				}
+				reportPush(report, messageId, "skipped", "pre-cutover-legacy");
+				continue;
+			}
+			// 定向 claim：认领的 fileId 与下方执行的 letter.frame 同源同文件（M2 绑定）
+			const taken = claimLetters(recipient, { claimedBy: holderOf(opts.sessionId), mailboxDir, ids: [fileId], limit: 1 });
+			if (taken.length === 0) {
+				reportPush(report, messageId, "skipped", "claim-missed");
+				continue;
+			}
+			// F16 fencing 复检必须先于 execute：失去 owner 身份的会话不得执行命令
+			const fresh = resolveRecipient(recipient);
+			if (!fresh || fresh.sessionId !== opts.sessionId) {
+				reportPush(report, messageId, "skipped", "generation-moved");
+				continue; // 已 claim 的信留给 stale 回收
+			}
+			// 红线：命令信绝不进 LLM 注入——executor 进程内确定性执行（never-throw 三态），
+			// 跳过 preInject 统一门与 buildInjectBody 注入路径（命令侧去重 = executor wx claim）。
+			let outcome: CommandOutcome;
+			try {
+				outcome = executeCommand(letter.frame, opts.executeCommandOptions);
+			} catch (e) {
+				outcome = { status: "failed", reason: "failed", error: e instanceof Error ? e.message : String(e), replayed: false };
+			}
+			reportPush(report, messageId, "executed", `command-${outcome.status}${outcome.status === "rejected" ? `:${outcome.reason}` : ""}`);
+			// 回执：向 owner 会话发一条纯报告 followUp（固定模板+受控枚举，M1；无任何待执行
+			// 指令语义；不走 preInject 门——回执重复无害）。best-effort，失败不影响 ack。
+			try {
+				opts.sendUserMessage?.(buildCommandReceiptBody(letter.frame, outcome), { deliverAs: "followUp" });
+			} catch {
+				/* best-effort */
+			}
+			// 三态全终态 ack、不重投（同 fileId 收尾）：rejected 在 executor 幂等 claim 之前拒、
+			// 不占键，重投必再拒；failed 留 pending/claimed 会经 10min stale reclaim 无限空转——
+			// 重试语义由 issuer 换新 commandKey 重发承担。
+			ackLetter(recipient, fileId, { mailboxDir });
+		} catch {
+			reportPush(report, messageId, "skipped", "error");
+		}
+	}
 	return { owner, consumed: report.consumed };
 }
 
@@ -295,18 +318,28 @@ function reportPush(report: ConsumeReport, messageId: string, action: "injected"
 }
 
 /**
- * 命令回执正文（0920 backlog A5）：type/key + status + summary/reason/error + replayed
- * 标注。固化纯报告模板——回执是报告不是指令，防 LLM 把回执当待执行命令。
+ * 命令回执正文（0920 backlog A5 + L4 M1 + L4 二次返修）：纯固定模板 + 受控枚举，零内容
+ * 派生字段——SHA-256 截断 correlation 已移除：它不含密钥或随机映射，对可猜 commandKey
+ * 可枚举比对确认（oracle），不满足「不可逆」；关联对账留在 ConsumeReport（cmd:<commandKey>）
+ * 与执行器 journal（commandKey）。commandKey（自由文本）、outcome.summary / detail /
+ * error（payload 与异常派生）一律不进本回执；type 只回显协议封闭词表内的值；status /
+ * reason / replayed 均为受控枚举。回执是报告不是指令，防 LLM 把回执当待执行命令或被注入。
  */
 function buildCommandReceiptBody(frame: CommandFrame, outcome: CommandOutcome): string {
-	const head = `📬 命令回执：${frame.type}（key=${frame.commandKey}）→ ${outcome.status}${outcome.replayed ? "（重放：同 commandKey 已执行过，回放首次结果，零二次副作用）" : ""}`;
+	const typeLabel = (COMMAND_TYPES as readonly string[]).includes(frame.type) ? frame.type : "（协议外类型）";
+	const replayedNote = outcome.replayed ? "（重放：同 commandKey 已执行过，回放首次结果，零二次副作用）" : "";
+	const head = `📬 命令回执：${typeLabel} → ${outcome.status}${replayedNote}`;
 	const line =
 		outcome.status === "accepted"
-			? `结果: ${outcome.summary}`
+			? "结果: 执行成功（详情见执行器 journal 与盘面产物，不在回执展开）。"
 			: outcome.status === "rejected"
-				? `拒绝原因: ${outcome.reason}${outcome.detail ? `（${outcome.detail}）` : ""}`
-				: `失败: ${outcome.reason}${outcome.error ? `（${outcome.error}）` : ""}`;
-	return [head, line, "（本条是确定性执行器的纯结果报告；命令信已执行并 ack，无需任何后续动作。）"].join("\n");
+				? `拒绝原因: ${outcome.reason}（受控枚举）。`
+				: `结果: 执行失败（reason=${outcome.reason}，受控枚举；错误详情不进 LLM，见执行器 journal）。`;
+	return [
+		head,
+		line,
+		"（本条是确定性执行器的纯结果报告；命令信已执行并 ack，无需任何后续动作。）",
+	].join("\n");
 }
 
 /** 注入正文（与 followUp 同风格，标注 mailbox 路径来源）。command 分支已删：命令信走
