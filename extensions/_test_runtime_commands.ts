@@ -508,6 +508,39 @@ try {
 		assert.equal(writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: null }, { stateDir: P, now: new Date() }), true);
 		assert.equal(exec(prep("prep-nullp"), { stateDir: P }).status, "rejected", "null 压力心跳 → 拒绝");
 
+		// R1 回归（plans/0921_G52_patch_review.md 必修 1）：旧 owner 心跳 + 新 attachment →
+		// invalid-payload（心跳未绑定当前 owner 身份），不写 proposal、不发 proposed 事件
+		{
+			const P4 = join(ROOT, "state-prepare-stale");
+			mkdirSync(P4, { recursive: true });
+			const j4 = join(ROOT, "events-prepare-stale.jsonl");
+			// 旧 owner 同 state 残留心跳：sessionId 不匹配（新 owner 尚未写心跳）
+			assert.equal(writeLiveness({ sessionId: "sess-OLD", generation: att.generation, pressure: 95 }, { stateDir: P4, now: new Date() }), true);
+			const rStale1 = exec(prep("prep-stale-sid"), { stateDir: P4, journalPath: j4 });
+			assert.ok(rStale1.status === "rejected" && rStale1.reason === "invalid-payload", "旧 sessionId 心跳 → invalid-payload");
+			assert.ok(rStale1.status === "rejected" && typeof rStale1.detail === "string" && rStale1.detail.includes("尚未产生心跳"), "detail 说明当前 owner 尚未产生心跳");
+			// 旧 generation 心跳：同 sessionId 但 gen 过期
+			assert.equal(
+				writeLiveness({ sessionId: "sess-H", generation: att.generation - 1, pressure: 95 }, { stateDir: P4, now: new Date(Date.now() + 31_000) }),
+				true,
+			);
+			const rStale2 = exec(prep("prep-stale-gen"), { stateDir: P4, journalPath: j4 });
+			assert.ok(rStale2.status === "rejected" && rStale2.reason === "invalid-payload", "旧 generation 心跳 → invalid-payload");
+			assert.equal(readProposal(P4), null, "身份不匹配零 proposal 落盘");
+			assert.equal(
+				listRuntimeEnvelopes({ path: j4 }).envelopes.filter((e) => e.type === "master.handoff.proposed").length,
+				0,
+				"身份不匹配零 proposed 事件",
+			);
+			// 正向对照：心跳身份与当前 attachment 完全一致 → prepare 恢复可用
+			assert.equal(
+				writeLiveness({ sessionId: att.sessionId, generation: att.generation, pressure: 88 }, { stateDir: P4, now: new Date(Date.now() + 62_000) }),
+				true,
+			);
+			const rOk4 = exec(prep("prep-stale-ok"), { stateDir: P4, journalPath: j4, configPath: cfgPath10 });
+			assert.ok(rOk4.status === "accepted" && rOk4.summary.includes("已生成"), "身份一致后 prepare 恢复可用");
+		}
+
 		// 有心跳 → accepted：maybePropose pending，pressure 来自 liveness
 		assert.equal(
 			writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: 82, windowTokens: 200000 }, { stateDir: P, now: new Date(Date.now() + 31_000) }),
@@ -547,6 +580,60 @@ try {
 		assert.equal(writeLiveness({ sessionId: "sess-H", generation: att.generation, pressure: 50 }, { stateDir: P2 }), true);
 		const rOff = exec(prep("prep-off"), { stateDir: P2, configPath: cfgOff });
 		assert.ok(rOff.status === "rejected" && rOff.reason === "bad-state", `总开关关闭 → bad-state：${JSON.stringify(rOff)}`);
+
+		// R2 回归（plans/0921_G52_patch_review.md 必修 2）：跨进程不同 commandKey 并发
+		// prepare → 恰一个 proposalId + 一条 proposed journal（代级 wx claim / 原子 create；
+		// 输家回读同代提案 already-proposed，绝不覆盖）
+		{
+			const P5 = join(ROOT, "state-prepare-race");
+			mkdirSync(P5, { recursive: true });
+			const j5 = join(ROOT, "events-prepare-race.jsonl");
+			assert.equal(
+				writeLiveness({ sessionId: att.sessionId, generation: att.generation, pressure: 91 }, { stateDir: P5, now: new Date() }),
+				true,
+				"race 前置：当前 owner 心跳",
+			);
+			const workerTs = join(ROOT, "prepare-race-worker.ts");
+			const optsPath = join(ROOT, "prepare-race-opts.json");
+			writeFileSync(optsPath, JSON.stringify({ stateDir: P5, journalPath: j5, configPath: cfgPath10 }));
+			writeFileSync(workerTs, [
+				`import { readFileSync } from "node:fs";`,
+				`const { executeCommand } = await import(${JSON.stringify(new URL("./runtime/command-executor.ts", import.meta.url).href)});`,
+				`const f = JSON.parse(readFileSync(process.argv[2], "utf8"));`,
+				`const o = JSON.parse(readFileSync(process.argv[3], "utf8"));`,
+				`process.stdout.write(JSON.stringify(executeCommand(f, o)));`,
+			].join("\n"));
+			const race = (commandKey: string): Promise<CommandOutcome> => {
+				const framePath = join(ROOT, `prepare-race-frame-${commandKey}.json`);
+				writeFileSync(framePath, JSON.stringify(frame({ type: "master.handoff.prepare", to: master, commandKey })));
+				return new Promise((resolve, rj) => {
+					const child = spawn(process.execPath, ["--experimental-strip-types", workerTs, framePath, optsPath], { stdio: ["ignore", "pipe", "pipe"] });
+					let out = "";
+					let err = "";
+					child.stdout.on("data", (c: Buffer) => { out += c; });
+					child.stderr.on("data", (c: Buffer) => { err += c; });
+					child.on("error", rj);
+					child.on("close", (code) => {
+						if (code !== 0) { rj(new Error(`prepare race worker exit ${code}: ${err.slice(0, 400)}`)); return; }
+						resolve(JSON.parse(out) as CommandOutcome);
+					});
+				});
+			};
+			const results = await Promise.all([race("race-a"), race("race-b"), race("race-c"), race("race-d")]);
+			const fresh = results.filter((r) => r.status === "accepted" && r.summary!.includes("已生成"));
+			const idem = results.filter((r) => r.status === "accepted" && r.summary!.includes("幂等"));
+			assert.equal(fresh.length, 1, `恰一个赢家真实创建：${JSON.stringify(results)}`);
+			assert.equal(idem.length, 3, "输家全部回读同代提案幂等返回（already-proposed）");
+			const prop5 = readProposal(P5)!;
+			assert.ok(prop5, "proposal 已落盘");
+			const hpIds = new Set(
+				results.flatMap((r) => (r.status === "accepted" ? (r.summary!.match(/hp_[0-9a-z]+_[0-9a-z]+/) ?? []) : [])),
+			);
+			assert.deepEqual([...hpIds], [prop5.proposalId], "所有回执指向同一 proposalId（不覆盖不双建）");
+			const proposed5 = listRuntimeEnvelopes({ path: j5 }).envelopes.filter((e) => e.type === "master.handoff.proposed");
+			assert.equal(proposed5.length, 1, "恰一条 proposed journal");
+			assert.equal((proposed5[0]!.payload as { proposalId?: string }).proposalId, prop5.proposalId);
+		}
 	}
 
 	// ── G9 冒烟（续）：consumer 命令信 command-deferred（零行为变化）──

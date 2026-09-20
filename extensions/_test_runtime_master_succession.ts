@@ -11,9 +11,9 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-succession-env-"));
 
@@ -108,6 +108,46 @@ let proposalId = "";
 	assert.equal(done.completed, true);
 	assert.equal(readProposal()?.status, "completed");
 	ok("新代覆盖 + adopt→transferring + complete 闭环");
+}
+
+// ── R2（plans/0921_G52_patch_review.md 必修 2）：代级 claim / 原子 create 协议 ──
+{
+	const claimsDir = join(process.env.PI_RUNTIME_DIR!, "state", "master-succession.claims");
+	mkdirSync(claimsDir, { recursive: true });
+
+	// ① 超龄 crash claim（赢家 claim 后写盘前崩溃，无 proposal）→ 接管创建成功（可恢复）
+	const tok3 = issueMasterHandoffToken({ sessionId: "sess_m5_gen2" });
+	assert.equal(tok3.ok, true);
+	if (!tok3.ok || !("token" in tok3) || !tok3.token) throw new Error("unreachable");
+	const a3 = attachCurrentSession({ sessionId: "sess_m5_gen3", token: tok3.token });
+	assert.equal(a3.ok, true);
+	const staleClaim = join(claimsDir, "gen-3.claim");
+	writeFileSync(staleClaim, JSON.stringify({ pid: -1, acquiredAt: "2026-09-20T00:00:00.000Z" }));
+	const old = new Date(Date.now() - 11_000);
+	utimesSync(staleClaim, old, old);
+	const adopt = maybePropose({ sessionId: "sess_m5_gen3", generation: 3, reading: { tokens: 150000, contextWindow: 200000, percent: 85 } });
+	assert.equal(adopt.proposed, true, `超龄 claim 被接管：${JSON.stringify(adopt)}`);
+	if (!adopt.proposed) throw new Error("unreachable");
+	assert.equal(readProposal()?.generation, 3);
+	assert.equal(readProposal()?.proposalId, adopt.proposal.proposalId);
+	const dup3 = maybePropose({ sessionId: "sess_m5_gen3", generation: 3, reading: { tokens: 150000, contextWindow: 200000, percent: 90 } });
+	assert.equal(dup3.proposed, false);
+	if (dup3.proposed === false) assert.equal(dup3.reason, "already-proposed");
+	ok("R2 超龄 claim 接管创建 + 同代去重语义保持");
+
+	// ② 新鲜 crash claim（接管窗口内）→ 保守 already-proposed，绝不覆盖/二次创建
+	const tok4 = issueMasterHandoffToken({ sessionId: "sess_m5_gen3" });
+	assert.equal(tok4.ok, true);
+	if (!tok4.ok || !("token" in tok4) || !tok4.token) throw new Error("unreachable");
+	const a4 = attachCurrentSession({ sessionId: "sess_m5_gen4", token: tok4.token });
+	assert.equal(a4.ok, true);
+	const freshClaim = join(claimsDir, "gen-4.claim");
+	writeFileSync(freshClaim, JSON.stringify({ pid: -1, acquiredAt: new Date().toISOString() }));
+	const blocked = maybePropose({ sessionId: "sess_m5_gen4", generation: 4, reading: { tokens: 150000, contextWindow: 200000, percent: 85 } });
+	assert.equal(blocked.proposed, false, "新鲜 claim 窗口内不让权强建");
+	if (blocked.proposed === false) assert.equal(blocked.reason, "already-proposed");
+	assert.equal(readProposal()?.generation, 3, "同代无 proposal 时不越权创建（等接管窗口）");
+	ok("R2 新鲜 claim 窗口内保守让权（proposal 永不覆盖）");
 }
 
 console.log(`\n# pass ${n}`);

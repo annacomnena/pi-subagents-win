@@ -97,7 +97,9 @@ function describeEvent(e: RuntimeEnvelope): string {
 	return `${e.type}${e.subject ? ` ${e.subject}` : ""} @ ${e.at}`;
 }
 
-/** timeline 合并上限（events 增量 + before= 历史页共用；硬顶防长会话内存漂移）。 */
+/** timeline live 段合并上限（events 增量 + 全量轮询尾窗共用；硬顶防长会话内存漂移）。
+ *  R3（plans/0921_G52_patch_review.md 必修 3）起 cap 只约束 live 段：用户显式「加载更早」
+ *  翻到的历史页（historyAnchorId 及更早）全量保留，不被尾切逐出。 */
 const TIMELINE_CAP = 2000;
 
 export interface CommandReceipt {
@@ -122,8 +124,15 @@ interface GuiState {
 	health: HealthView | null;
 	snapshot: RuntimeSnapshot | null;
 	timeline: TimelineItem[];
-	/** G5.2：before= 翻页已到最早（服务端返回空集/不足一页时置位，「加载更早」停用）。 */
+	/** G5.2：before= 翻页已到最早（服务端返回空集/不足一页时置位，「加载更早」停用）。
+	 *  R3 起该置位仅由真实旧端空页/不足一页触发，与容量上限无关（上限不误报已到最早）。 */
 	timelineEnd: boolean;
+	/** R3：历史翻页独立游标（排他上界 id；null = 未翻页）。翻页后不再从 timeline[0] 推导
+	 *  ——timeline 被 cap 裁剪后 timeline[0] 会回弹，从它推导会原地重复请求（必修 3 根因）。 */
+	beforeCursor: string | null;
+	/** R3：历史段边界 = 首次翻页时的当前最旧 id；live 段容量裁剪永不动它及更早的历史页
+	 *  （翻过的旧页保留）。resync 重建时复位。 */
+	historyAnchorId: string | null;
 	attention: AttentionItem[];
 	attentionIncludeResolved: boolean;
 	setAttentionIncludeResolved: (v: boolean) => void;
@@ -149,6 +158,27 @@ function isResync(e: FetchErr): boolean {
 	return e.resync === true;
 }
 
+/** 按 server 全序（at, id）合并去重；incoming 同 id 覆盖（server 精修版压过客户端映射版）。 */
+export function mergeTimelineItems(current: TimelineItem[], incoming: readonly TimelineItem[]): TimelineItem[] {
+	const byId = new Map(current.map((t) => [t.id, t] as const));
+	for (const it of incoming) byId.set(it.id, it);
+	return [...byId.values()].sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id));
+}
+
+/**
+ * R3 容量策略：cap 只裁剪 live 段（historyAnchorId 之后的尾窗）；history 段（anchor 本体
+ * 及更早 = 用户显式翻到的旧页）全量保留。anchor 缺席（resync 重建后不应发生）→ 保守
+ * 不裁剪（宁多留不错删）。返回值可能复用传入数组（未裁剪时）。 */
+export function capTimelineItems(merged: TimelineItem[], historyAnchorId: string | null): TimelineItem[] {
+	if (merged.length <= TIMELINE_CAP) return merged;
+	if (!historyAnchorId) return merged.slice(-TIMELINE_CAP);
+	const idx = merged.findIndex((t) => t.id === historyAnchorId);
+	if (idx < 0) return merged;
+	const tail = merged.slice(idx + 1);
+	if (tail.length <= TIMELINE_CAP) return merged;
+	return [...merged.slice(0, idx + 1), ...tail.slice(-TIMELINE_CAP)];
+}
+
 export const useGui = create<GuiState>((set, get) => ({
 	activeTab: "master",
 	setActiveTab: (t) => set({ activeTab: t }),
@@ -162,6 +192,8 @@ export const useGui = create<GuiState>((set, get) => ({
 	snapshot: null,
 	timeline: [],
 	timelineEnd: false,
+	beforeCursor: null,
+	historyAnchorId: null,
 	attention: [],
 	attentionIncludeResolved: false,
 	setAttentionIncludeResolved: (v) => set({ attentionIncludeResolved: v }),
@@ -205,12 +237,10 @@ export const useGui = create<GuiState>((set, get) => ({
 		if (r.ok) {
 			const incoming = r.data.envelopes.map(envelopeToTimelineItem);
 			if (incoming.length > 0) {
-				const byId = new Map(timeline.map((t) => [t.id, t]));
-				for (const it of incoming) byId.set(it.id, it);
-				const merged = [...byId.values()]
-					.sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id))
-					.slice(-TIMELINE_CAP);
-				set({ timeline: merged, nextCursor: r.data.nextCursor });
+				set({
+					timeline: capTimelineItems(mergeTimelineItems(timeline, incoming), get().historyAnchorId),
+					nextCursor: r.data.nextCursor,
+				});
 			} else {
 				set({ nextCursor: r.data.nextCursor });
 			}
@@ -226,6 +256,11 @@ export const useGui = create<GuiState>((set, get) => ({
 					snapshot: snap.data,
 					timeline: snap.data.timeline,
 					nextCursor: eventIds.length > 0 ? eventIds[eventIds.length - 1] : "0",
+					// R3：resync = 从 snapshot 重建 live 段；历史游标/边界/终态一并复位
+					//（下次翻页从新最旧重新推导；重叠旧页由 id 去重兑底）
+					beforeCursor: null,
+					historyAnchorId: null,
+					timelineEnd: false,
 				});
 				get().markUp(snap.at);
 			}
@@ -242,16 +277,13 @@ export const useGui = create<GuiState>((set, get) => ({
 		}
 	},
 
-	/** timeline 尾窗全量（无 cursor）按 id 合并：server 精修版覆盖 events 客户端映射版。 */
+	/** timeline 尾窗全量（无 cursor）按 id 合并：server 精修版覆盖 events 客户端映射版。
+		 *  R3：容量裁剪走 capTimelineItems（live 段尾窗，历史页保护）。 */
 	pollTimeline: async () => {
 		const r = await api.timeline(200);
 		if (r.ok) {
-			const byId = new Map(get().timeline.map((t) => [t.id, t]));
-			for (const it of r.data.timeline) byId.set(it.id, it);
 			set({
-				timeline: [...byId.values()]
-					.sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id))
-					.slice(-TIMELINE_CAP),
+				timeline: capTimelineItems(mergeTimelineItems(get().timeline, r.data.timeline), get().historyAnchorId),
 			});
 			get().markUp(r.at);
 		} else {
@@ -259,13 +291,18 @@ export const useGui = create<GuiState>((set, get) => ({
 		}
 	},
 
-	/** G5.2：加载更早（before= 最旧条目，排他上界）。返回空/不足一页 → timelineEnd 停用按钮。 */
+	/** G5.2/R3：加载更早（before= 排他上界）。游标独立于 cap：首按从当前最旧推导并锚定
+		 *  history 段边界（先于 await 设置，防在飞期间被裁剪），此后一律用 beforeCursor
+		 *  （= 上一页最旧）严格向旧端推进——timeline 被 cap 也不再原地打转/重复请求。
+		 *  历史页并入不过 cap（capTimelineItems 的 anchor 保护在后续自动轮询时同样生效）；
+		 *  空页/不足一页 → timelineEnd（真·已到最早；上限永不误报最早）。 */
 	loadEarlierTimeline: async () => {
-		const { timeline, timelineEnd } = get();
+		const { timeline, timelineEnd, beforeCursor } = get();
 		if (timelineEnd || timeline.length === 0) return;
-		const oldest = timeline[0]?.id;
-		if (!oldest) return;
-		const r = await api.timeline(200, oldest);
+		const before = beforeCursor ?? timeline[0]?.id;
+		if (!before) return;
+		if (get().historyAnchorId === null) set({ historyAnchorId: before });
+		const r = await api.timeline(200, before);
 		if (!r.ok) {
 			get().markDown(r.at);
 			return;
@@ -275,12 +312,10 @@ export const useGui = create<GuiState>((set, get) => ({
 			get().markUp(r.at);
 			return;
 		}
-		const byId = new Map(get().timeline.map((t) => [t.id, t]));
-		for (const it of r.data.timeline) byId.set(it.id, it);
+		const merged = mergeTimelineItems(get().timeline, r.data.timeline);
 		set({
-			timeline: [...byId.values()]
-				.sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id))
-				.slice(-TIMELINE_CAP),
+			timeline: merged,
+			beforeCursor: merged[0]?.id ?? before,
 			// 满一页 → 可能还有更早；不足一页 → 已到最早
 			timelineEnd: r.data.timeline.length < 200,
 		});

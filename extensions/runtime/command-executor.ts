@@ -329,21 +329,30 @@ function runAutoHandoffSet(frame: CommandFrame, opts: ExecuteCommandOptions): Co
  *
  * 确定性：proposalPercent=0（无视达线判定——prepare 语义就是「立即生成」，与 S2 自动
  * 提议线正交）；enabled 尊重 config.masterSuccession 总开关；同代已有 proposal → 幂等
- * 返回 accepted 不重复建（maybePropose already-proposed + readProposal 回读）。
+ * 返回 accepted 不重复建（maybePropose already-proposed + readProposal 回读；R2 起同代
+ * 创建权由 master-succession 的代级 wx claim 唯一化，跨进程不同 commandKey 也不会双建）。
+ *
+ * R1（plans/0921_G52_patch_review.md 必修 1）：先读 attachment，liveness 心跳必须绑定
+ * **当前 owner 身份**——live.sessionId === att.sessionId && live.generation === att.generation。
+ * 缺失 / pressure=null / 身份不匹配统一 invalid-payload：owner 切换后、新 owner 首次
+ * agent_end 心跳落盘前的窗口内，旧 owner 残留在 state 里的压力不得被代入新代。
  */
 function runHandoffPrepare(opts: ExecuteCommandOptions): CommandOutcome {
 	const stateDir = stateRoot(opts);
+	const att = readAttachment(masterAddress());
+	if (!att) return { status: "rejected", reason: "not-attached", replayed: false };
 	const live = readLiveness(stateDir);
-	if (!live || live.pressure === null) {
+	const staleHeartbeat = live !== null && (live.sessionId !== att.sessionId || live.generation !== att.generation);
+	if (!live || live.pressure === null || staleHeartbeat) {
 		return {
 			status: "rejected",
 			reason: "invalid-payload",
-			detail: "无可用的 liveness 心跳压力值：请先由值守 Master 会话跑完一轮（agent_end 心跳写手落盘 master-liveness.json 后重试）",
+			detail: staleHeartbeat
+				? `liveness 心跳身份过期（心跳属旧 owner/gen，与当前 attachment gen ${att.generation} 不一致）：当前 owner 尚未产生心跳，请先由值守 Master 会话在新代跑完一轮（agent_end 心跳写手落盘 master-liveness.json 后重试）`
+				: "无可用的 liveness 心跳压力值：当前 owner 尚未产生心跳，请先由值守 Master 会话跑完一轮（agent_end 心跳写手落盘 master-liveness.json 后重试）",
 			replayed: false,
 		};
 	}
-	const att = readAttachment(masterAddress());
-	if (!att) return { status: "rejected", reason: "not-attached", replayed: false };
 
 	// config 切片只读（缺失/坏 → 归一化默认；prepare 不写 config，坏盘面不升 io-error）
 	let enabled = DEFAULT_MASTER_SUCCESSION.enabled;
