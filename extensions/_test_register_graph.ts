@@ -30,6 +30,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 delete process.env.PI_SUBAGENT;
 delete process.env.PI_TAB_RUN_ID;
 delete process.env.PI_TAB_RUNS_DIR;
+delete process.env.PI_SESSION_PROFILE;
 
 // ── fake pi：记录注册图，执行类方法 no-op ──────────────────────────
 const tools = new Map<string, unknown>();
@@ -111,7 +112,7 @@ assert.deepEqual(toolNames, [
 // 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets，
 // 2026-09-15 trace-fusion C6 补主会话专属 /trace-fusion-loop，
 // 2026-09-20 补 master slash（attach/cutover/detach/handoff/status/succession/auto-handoff——
-// Phase 5.5 S1/A1/总开关）+ /runtime-host（G2））：
+// Phase 5.5 S1/A1/总开关）+ /runtime-host（G2）+ /workstream* /task-*（Phase 5a A7 F18，旧漏项——此前被 tools 断言失败遮挡）：
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
 // （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
 assert.deepEqual(commandNames, [
@@ -135,20 +136,28 @@ assert.deepEqual(commandNames, [
 	"sub-models",
 	"sub-presets",
 	"tabs",
+	"task-close",
+	"task-create",
 	"timers",
 	"today-usage",
 	"trace-fusion-clean",
 	"trace-fusion-collect",
 	"trace-fusion-loop",
 	"trace-fusion-status",
+	"workstream",
+	"workstream-create",
+	"workstream-link",
+	"workstream-pause",
 ]);
 
 // 事件快照（按名排序；2026-08-19 冻结）。同一事件可被多处注册：
+// agent_end x1（session-hooks 自动 master 交接）、
 // session_start x5（timers/async-panel/event-bus/report/tab 遥测）、
 // session_shutdown x2（tab 遥测 + index.ts 清理钩子）、
 // tool_execution_end x2 与 tool_execution_start x2（index.ts 通知钩子 +
 // tab 遥测 tracking）。
 assert.deepEqual(eventNames, [
+	"agent_end",
 	"agent_settled",
 	"agent_start",
 	"before_agent_start",

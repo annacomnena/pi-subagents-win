@@ -27,6 +27,9 @@ export interface InjectionContext {
 	key: string;
 	sessionId: string | undefined;
 	path: InjectionPath;
+	/** 派发者唤醒（run 完成归派发者，不归 master owner）：跳过 owner 压制，但保留
+	 *  claimInjection 互斥（exactly-once 不变）。仅 links recipient 即本会话的 run 完成路径置位。 */
+	dispatcherWake?: boolean;
 }
 
 export type InjectionVerdict =
@@ -47,6 +50,15 @@ export function preInject(ctx: InjectionContext): InjectionVerdict {
 	if (!cutover?.enabled || !attachment) return { inject: true, holder: holderOf(ctx) };
 
 	if (!ctx.sessionId) return { inject: false, reason: "no-session" };
+
+	// 派发者唤醒不归 owner 管（run 完成属于派发者）：跳过 owner 压制，直接走互斥领取。
+	// claimInjection 的 exactly-once 语义不变；审计仍可追踪 holder。
+	if (ctx.dispatcherWake) {
+		const claim = claimInjection(ctx.key, holderOf(ctx));
+		if (claim.status === "claimed") return { inject: true, holder: holderOf(ctx) };
+		if (claim.status === "injected-already") return { inject: false, reason: "already-injected" };
+		return { inject: false, reason: "claimed-by-other" };
+	}
 
 	// owner 判定（新鲜快照；generation 前进视为易主）
 	const fresh = resolveRecipient(masterAddress());

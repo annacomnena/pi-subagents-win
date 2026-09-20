@@ -155,9 +155,8 @@ function writeResult(runId: string, status = "completed") {
 		id: "tab_route1", taskId: "1", status: "completed", finishedAt: new Date().toISOString(), summary: "s",
 	}), "utf8");
 
-	// 我是 session-A：不是派发方 → 跳过（不 claim、不注入、不 toast）
-	// ——但 journal 终态必须照写（terra 缺陷 1 修复：emit 与 recipient 路由解耦，
-	// rollover 后新 master session 也能补写，journal 完备性不依赖唤醒路由）
+	// 我是 session-A：不是派发方 → 在任何副作用前跳过（不 journal/mailbox/claim/注入/toast）。
+	// run 完成属于 links recipient；其他会话不能以 journal 完备性之名抢占其归属。
 	const { setCurrentSessionId } = await import("./identity.ts");
 	setCurrentSessionId("session-A");
 	const skipped = onTabResultFile(dir, "tab_route1.result.json", opts);
@@ -167,17 +166,15 @@ function writeResult(runId: string, status = "completed") {
 	{
 		const { listRuntimeEnvelopes } = await import("./runtime/journal.ts");
 		const mine = () => listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_route1");
-		assert.equal(mine().length, 1, "非派发会话也要写 journal 终态");
-		assert.equal(mine()[0].dedupeKey, "run.completed:run://tab/tab_route1");
-		assert.ok(mine()[0].at, "at = 领域发生时间");
-		// 幂等：另一个实例（同样非派发方）重放同一文件 → dedupeKey claim 拒绝，不双写
+		assert.equal(mine().length, 0, "非派发会话不得写 journal");
+		// 幂等：另一个实例（同样非派发方）重放同一文件仍无副作用。
 		_resetEventBus();
 		setCurrentSessionId("session-C");
 		onTabResultFile(dir, "tab_route1.result.json", opts);
-		assert.equal(mine().length, 1, "重放不双写");
+		assert.equal(mine().length, 0, "重放仍不 journal");
 	}
 
-	// 我是 session-B（派发方）：注入
+	// 我是 session-B（派发方）：journal + 注入
 	_resetEventBus();
 	setCurrentSessionId("session-B");
 	const injected = onTabResultFile(dir, "tab_route1.result.json", opts);
@@ -361,7 +358,8 @@ function writeResult(runId: string, status = "completed") {
 		setCurrentSessionId(undefined);
 	}
 
-	// ② 非 owner（cutover ON）→ 不 watch（标签页 / 主会话均不，isMainSession 不再是判定依据）
+	// ② 非 owner（cutover ON）：标签页不 watch；主会话恒 watch（2026-09-20 修正：run 完成属于
+	// 派发者——普通主会话必须 watch 自己的 tab，exactly-once 由三重屏障保证；外人 run 靠 fencing/路由挡）
 	{
 		_resetEventBus();
 		resetOwnership(true); // cutover ON
@@ -373,10 +371,10 @@ function writeResult(runId: string, status = "completed") {
 		const { pi, fire } = capturePi(sent);
 		registerEventBus(pi as never, { runsDir: ownerDir });
 		fire("other-sess");
-		assert.equal(isEventBusWatching(), false, "② session_start（非 owner）未注册 watcher");
+		assert.equal(isEventBusWatching(), false, "② session_start（标签页非 owner）未注册 watcher");
 		delete process.env.PI_TAB_RUN_ID;
 		setCurrentSessionId("other-main"); // 主会话但非 owner
-		assert.equal(shouldRegisterWatcher(), false, "② 主会话 + 非 owner → 不 watch（ownership-gated 覆盖 isMainSession）");
+		assert.equal(shouldRegisterWatcher(), true, "② 主会话 + 非 owner → 仍 watch（派发者唤醒不归 owner 管）");
 		setCurrentSessionId(undefined);
 	}
 
@@ -526,6 +524,70 @@ function writeResult(runId: string, status = "completed") {
 		if (!r.ok) assert.equal(r.reason, "bad-session", "⑩ 拒因是 bad-session");
 		assert.equal(readAttachment(masterAddress()), null, "⑩ attachment 未被写入（无永不可读 owner）");
 		console.log("ok - ⑩ unknown 哨兵拒写 attachment（M1）");
+	}
+
+	// ── ⑪⑫ 普通派发者唤醒（2026-09-20：cutover 下非 owner 派发者不断醒）────────────────
+	// 背景：ownership-gated 修法把非 owner 主会话三重锁死（不注册+fencing+门压制），导致
+	// 普通仓库主会话派的 tab 完成无人唤醒。不变量修正：run 完成属于派发者（links recipient）。
+	{
+		const { recordLink } = await import("./links.ts");
+		const linksPath = join(dir, "ord-links.jsonl");
+		resetOwnership(true); // cutover ON
+		attachMaster({ sessionId: "uuid-global-owner" }); // 全局 master 是别人（本 gen-4 会话之外）
+		delete process.env.PI_TAB_RUN_ID; // 主会话（普通仓库裸 pi）
+		// ⑪ 本会话派发的 run：links recipient=main-A
+		recordLink({ sessionId: "main-A", kind: "tab", targetId: "tab_ord11", detail: "ordinary dispatch" }, { linksPath });
+		setCurrentSessionId("main-A");
+		assert.equal(shouldRegisterWatcher(), true, "⑪ 普通主会话恒 watch（legacy 延续）");
+		writeOwnerResult("tab_ord11");
+		const sent11: string[] = [];
+		const ok11 = onTabResultFile(ownerDir, "tab_ord11.result.json", {
+			runsDir: ownerDir, toast: false, autoReclaim: true, linksPath,
+			sendUserMessage: (c: string) => { sent11.push(c); },
+		});
+		assert.equal(ok11, true, "⑪ 派发者豁免 fencing + dispatcherWake 过门");
+		assert.equal(sent11.length, 1, "⑪ 注入一次");
+		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_ord11").length, 1, "⑪ journal 由派发者记录");
+		// ⑫ owner 也不能抢普通派发者的 run：明确 links 归属必须在 journal/mailbox 前路由早退。
+		recordLink({ sessionId: "main-A", kind: "tab", targetId: "tab_ord12", detail: "other dispatch" }, { linksPath });
+		setCurrentSessionId("uuid-global-owner");
+		writeOwnerResult("tab_ord12");
+		const sent12: string[] = [];
+		const ok12 = onTabResultFile(ownerDir, "tab_ord12.result.json", {
+			runsDir: ownerDir, toast: false, autoReclaim: true, linksPath,
+			sendUserMessage: (c: string) => { sent12.push(c); },
+		});
+		assert.equal(ok12, false, "⑫ owner 非派发者不注入（links 路由在 fencing 前挡住）");
+		assert.equal(sent12.length, 0, "⑫ owner 零注入");
+		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_ord12").length, 0, "⑫ owner 不 journal");
+		// ⑫b 矩阵 Row D：第三方 watcher（非 owner 非派发者）看普通 run → 零动作
+		setCurrentSessionId("main-B");
+		writeOwnerResult("tab_ord12b");
+		recordLink({ sessionId: "main-A", kind: "tab", targetId: "tab_ord12b", detail: "other dispatch b" }, { linksPath });
+		const sent12b: string[] = [];
+		const ok12b = onTabResultFile(ownerDir, "tab_ord12b.result.json", {
+			runsDir: ownerDir, toast: false, autoReclaim: true, linksPath,
+			sendUserMessage: (c: string) => { sent12b.push(c); },
+		});
+		assert.equal(ok12b, false, "⑫b 第三方不注入");
+		assert.equal(sent12b.length, 0, "⑫b 零注入");
+		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_ord12b").length, 0, "⑫b 第三方不 journal");
+		// ⑬ mailbox 跨通道竞争回归：派发者处理后 owner 再消费 → owner 无信可吃、无注入
+		// （已知归属非 owner 的 run 不再发 master 影子信，owner 的 mailbox 消费者抢不到 claim）
+		const { consumeMailboxOnce } = await import("./mailbox-consumer.ts");
+		const { listLetters, defaultMailboxDir } = await import("./runtime/mailbox.ts");
+		const pending11 = listLetters(masterAddress(), "pending", defaultMailboxDir());
+		assert.equal(pending11.filter((l) => JSON.stringify(l).includes("tab_ord11")).length, 0, "⑬ 普通 run 无 master 影子信");
+		const ownerSent13: string[] = [];
+		const rep13 = consumeMailboxOnce({
+			sessionId: "uuid-global-owner", mailboxDir: defaultMailboxDir(), runsDir: ownerDir,
+			sendUserMessage: (c: string) => { ownerSent13.push(c); },
+		});
+		assert.equal(ownerSent13.length, 0, "⑬ owner 的 mailbox 消费者不注入派发者的完成");
+		assert.ok(!rep13.consumed.some((c) => JSON.stringify(c).includes("tab_ord11")), "⑬ 消费清单无 tab_ord11");
+		assert.equal(sent11.length, 1, "⑬ 派发者仍是唯一注入方（恰好一次）");
+		setCurrentSessionId(undefined);
+		console.log("ok - ⑪⑫⑬ 分区矩阵：派发者唯一注入+journal；owner/第三方零动作；mailbox 抢不到");
 	}
 }
 

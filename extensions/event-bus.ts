@@ -93,15 +93,14 @@ function closeWatcher(): void {
  */
 export function shouldRegisterWatcher(): boolean {
 	if (isSubagent()) return false; // 子 agent 恒不 watch（legacy 回退 + cutover ownership 两路都不走）
+	// 主会话恒 watch（legacy 行为延续）：run 完成唤醒属于派发者——普通主会话派的 tab 必须
+	// 由自己 watch（exactly-once 由 claimNotified/emitOnce/claimInjection 三重屏障保证，多 watcher 共存安全）。
+	if (isMainSession()) return true;
 	const cutover = readCutover();
 	const attachment = readAttachment(masterAddress());
-	if (!cutover?.enabled || !attachment) return isMainSession();
-	// 身份绑定持久侧（DOG2 根因终修）：attachment.sessionId 由 toolSession 写入——会话 UUID
-	//（随会话文件跨重启稳定）；此处用 getCurrentSessionId() 同侧对比。注意不要用 sessionScopeKey
-	//（runId 优先）：TUI 重启后 pane 裸 pi 重开丢 flag，scope 变回 UUID——若 attach 记过 runId
-	// 会错位；两侧统一在持久 UUID 域，重启后 owner 仍可被识别。
+	if (!cutover?.enabled || !attachment) return false; // tab 非 owner 且无 registry → 不 watch
 	const me = getCurrentSessionId();
-	return me !== undefined && attachment.sessionId === me;
+	return me !== undefined && attachment.sessionId === me; // tab 形态 owner 才 watch
 }
 
 /**
@@ -189,16 +188,30 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	const runId = fileName.slice(0, -".result.json".length);
 	const result = readTabResultFile(runsDir, runId);
 
-	// Phase 5.6 注入前 fencing（ownership 重读，"journal 跟随 owner"）：watch 期间易主
-	//（本会话不再是当前 owner）→ 静默放弃：不 journal、不 mailbox、不注入，也不创建 .notified——终态
-	// 由新 owner 经 triggerOwnershipRecheck 的 transfer 窗口补偿（recoverUnnotifiedResults）补投
-	//（无 .notified 才补投，幂等）。「journal 跟随 owner」。仅 cutover 启用 + 有 attachment 时判定；
-	// legacy（未启用/无 registry）恒放行，行为零变化。记抑制审计（与 preInject gate 同语义，保持可审计）；
-	// 已 seen 去重保持（上方已 add，本进程不重放；跨进程由新 owner 独立 seen + .notified 屏障处理）。
-	{
+	// 会话定位（前置：fencing 豁免判定需要它）：由 links.jsonl 找到派发该 tab 的会话。
+	// 双匹配：links 记录派发时身份（sessionIdentity：tab runId 优先），重启后本进程 scope 可能
+	// 变回 UUID——两域任一匹配即视为本会话派发的 run（防启动形态漂移丢注入）。
+	const recipient = recipientSessionIdFor({ from: runId }, opts.linksPath ?? defaultLinksPath());
+	const myScope = sessionScopeKey();
+	const myUuid = getCurrentSessionId();
+	// 唯一的 links 路由谓词：派发时 scope（tab runId 优先）与当前持久 UUID 任一相等。
+	// 下方的 foreign-recipient 早退、fencing 豁免和 dispatcherWake 必须共用它，不能各自漂移。
+	const isDispatcher = Boolean(recipient && (recipient === myScope || recipient === myUuid));
+	const isForeignRecipient = Boolean(recipient && !isDispatcher);
+
+	// 有明确 links 归属时，完成只属于派发者。必须在 fencing/journal/mailbox 前早退：
+	// 否则当前 master owner 虽不注入，仍会为普通派发者的 run 记账/投递，破坏归属分区。
+	if (isForeignRecipient) return false;
+
+	// Phase 5.6 注入前 fencing（ownership 重读）+ 派发者豁免（2026-09-20，普通派发者不断醒修复）：
+	// run 完成唤醒属于派发者，不属于 master owner——本会话即派发者时跳过 owner-fencing
+	//（journal+注入照常，emitOnce/claim 屏障保恰好一次）；非派发者才走 owner-fencing：
+	// cutover 下非 owner 静默放弃（不 journal、不 mailbox、不注入、不建 .notified）——终态由
+	// owner 经 transfer 窗口补偿补投。legacy（未启用/无 registry）恒放行，零变化。
+	if (!isDispatcher) {
 		const cut = readCutover();
 		const att = readAttachment(masterAddress());
-		const me = getCurrentSessionId(); // 持久 UUID 域（与 attach 写入侧一致，见 shouldRegisterWatcher 注）
+		const me = getCurrentSessionId(); // 持久 UUID 域（与 attach 写入侧一致）
 		if (cut?.enabled && att && me !== att.sessionId) {
 			auditSuppression(
 				{ key: runReceiptKey(runId, result?.status ?? "unknown"), sessionId: me, path: "legacy-eventbus" },
@@ -217,8 +230,19 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 		emitRuntimeEventOnce(tabResultToRuntimeEvent(result));
 		// Phase 3c 影子投递（§27-28）：mailbox REPORT 给 logical recipient（agent://master），
 		// 与 links.jsonl 的 sessionId 路由完全解耦；safe-wrapped，失败不影响唤醒链路。
-		const { frame, dedupeId } = tabResultToReportLetter(result);
-		deliverLetterSafe(frame, { dedupeId });
+		// 归属锁死（2026-09-20 mailbox 跨通道竞争修复）：已知归属且 recipient 不是当前 master
+		// owner 时不发 master 信——否则 owner 的 mailbox 消费者可能用同一 receipt key 抢先
+		// claimInjection，把完成注入 master 而派发者只拿到 already-injected（exactly-once
+		// 但收件人错）。legacy（无 cutover/attachment）/ 未溯源 / recipient 即 owner 时保留原行为。
+		const cut3c = readCutover();
+		const att3c = readAttachment(masterAddress());
+		const recipientIsForeignOwner = Boolean(
+			recipient && cut3c?.enabled && att3c && recipient !== att3c.sessionId,
+		);
+		if (!recipientIsForeignOwner) {
+			const { frame, dedupeId } = tabResultToReportLetter(result);
+			deliverLetterSafe(frame, { dedupeId });
+		}
 	}
 
 	// trace-fusion 自动收集等自定义消费者：返回 true 表示已消费（跳过默认 toast/reclaim 注入）；
@@ -228,27 +252,18 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 		if (opts.onTabFinished(runId) === true) return true;
 	}
 
-	// 会话定位（2026-08-13：与 report.ts 溯源对齐，防止 identityless 会话抢注入权）：
-	// 由 links.jsonl 找到派发该 tab 的会话，只有它才注入完成消息；
-	// 其他会话静默跳过（不 claim、不 toast、不注入），把唤醒权留给真正的编排会话。
-	// 溯源解析不到（旧账本无 sessionId / 非本插件派发）→ 回退 claim 先到先得。
-	const recipient = recipientSessionIdFor({ from: runId }, opts.linksPath ?? defaultLinksPath());
-	// 双匹配（DOG2 根因）：links 记录的是派发时身份（sessionIdentity：tab runId 优先），但
-	// 重启后本进程 scope 可能变回 UUID——两个域任一匹配即视为本会话的回报，防启动形态漂移丢注入。
-	const myScope = sessionScopeKey();
-	const myUuid = getCurrentSessionId();
-	if (recipient && myScope && recipient !== myScope && recipient !== myUuid) {
-		return false;
-	}
-
+	// 有明确归属的非派发者已在 journal 前早退；无溯源（旧账本/非本插件派发）才回退 claim 先到先得。
 	const status = result?.status ?? "unknown";
-	// Phase 4d 统一注入门（A5 F2/F15/F16）：cutover 未启用时恒 inject:true，零行为变化；
-	// 启用后非 owner 被抑制（记审计），owner 走 claimInjection 互斥。
+	// Phase 4d 统一注入门：派发者唤醒（isDispatcher）走 dispatcherWake——跳过 owner 压制但保留
+	// claimInjection 互斥；非派发者（owner 补偿/legacy 回退路径）走 owner 判定。
 	let gateCtx: InjectionContext | null = null;
 	{
-		const gate = preInject({ key: runReceiptKey(runId, status), sessionId: myUuid ?? myScope, path: "legacy-eventbus" });
+		const gateSession = myUuid ?? myScope;
+		const gate = preInject(isDispatcher
+			? { key: runReceiptKey(runId, status), sessionId: gateSession, path: "legacy-eventbus", dispatcherWake: true }
+			: { key: runReceiptKey(runId, status), sessionId: gateSession, path: "legacy-eventbus" });
 		if (!gate.inject) return false;
-		gateCtx = { key: runReceiptKey(runId, status), sessionId: myUuid ?? myScope, path: "legacy-eventbus" };
+		gateCtx = { key: runReceiptKey(runId, status), sessionId: gateSession, path: "legacy-eventbus" };
 	}
 	// 跨实例幂等：原子领取通知权（双 watcher/双实例只有第一个注入）
 	if (!claimNotified(runsDir, runId)) {
