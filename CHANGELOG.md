@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1] — 2026-09-20 (backlog: mailbox command consumption + scope stale takeover)
+
+- **mailbox 命令信消费接线**：`agent://master_default` 域命令信在 fencing 复检后、注入前交由确定性执行器 `executeCommand`（红线：命令内容永不进 LLM——回执为逐字节固定模板+受控枚举，L4 三轮打磨内容隔离）；mailbox at-least-once ack × executor wx-claim 双层幂等；`{fileId, letter}` 唯一遍历源防 claim/执行错配；rejected/failed 终态 ack 不重投；ws/scope 域命令信维持现状。生产者 v1 仍为零（POST /v1/commands 不经 mailbox），接线为后续 agent 发起命令铺路。
+- **二级 master stale 恢复**：scope owner 心跳双写（agent_start+agent_end，30s 节流，含 pid+startedAt）；接管判据 v1 只做 **pid 死**（长 turn 心跳间隙不误杀）；`takeoverMaster` lease+CAS gen+1（双 session 竞争恰一生效、journal terminal 恰一条、败方 skip）；旧 owner 复活经 UUID 不匹配自动失效。hung-owner 接管、全局 stale 自动化、跨机均不做。
+- `SESSION_LIFECYCLE_TYPES` 补 taking_over/takeover/takeover_failed；`isProcessAlive` EPERM/ESRCH 语义单测锁定。
+
 ## [0.4.0] — 2026-09-20 (runtime GUI: G1–G5 vertical slice)
 
 - **Runtime Host（G2）**：`/runtime-host start|stop|status`，GET /v1/health|snapshot|events?after|attention|timeline?before + POST /v1/commands（唯一写端点）；host.json 动态端口发现（tri-state 探活）。

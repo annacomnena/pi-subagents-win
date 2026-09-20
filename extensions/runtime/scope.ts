@@ -13,11 +13,13 @@
  *     attach 全部失败 → 静默 no-op，只写一条 journal 审计（复用 attachMasterWithAudit），
  *     永不抛（session_start 主流程纪律）。不调 triggerOwnershipRecheck（scope-only
  *     owner 对它 no-op 但语义污染，research §5.2 形态 C 纪律）；
- *   - 权力上限 v1：本仓 tab 唤醒（scope mailbox 的 wake/命令类信驱动，spawn cwd =
+ *   - 权力上限 v1.1：本仓 tab 唤醒（scope mailbox 的 wake/命令类信驱动，spawn cwd =
  *     scope 仓 toplevel）+ 本地 attention（state/local-master-attention/<scope>.json，
  *     与全局 master-attention.json 不共享 marker 文件）。**无** succession /
- *     transfer / auto / stale / 心跳——全局 S2/S3/transfer 模块恒写死全局地址，
- *     「零改动」即防线（research §5.3）；
+ *     transfer / auto——全局 S2/S3/transfer 模块恒写死全局地址，「零改动」即防线
+ *    （research §5.3）。0920 backlog B 新增：scope owner stale 恢复（仅 pid 死判据，
+ *     judgeScopeOwnerStale + takeoverStaleScopeOwner，接管只动本 scope 的 attachment，
+ *     全局 forceStale 工具链与 master-attach 路径零触碰；hung 判定另案）；
  *   - REPORT 单投维持（选项 a，S7）：scope 消费端只吃 wake/命令类信，REPORT 形态
  *     直接 skip（不 claim、不 suppress 审计）；dedupeId / receipt key 不动，
  *     event-bus 归属锁不动；
@@ -36,8 +38,9 @@ import { gitToplevel, isWorktreePath, normalizeDriveColon } from "../launch.ts";
 import type { ObjectAddress } from "./address.ts";
 import { defaultRuntimeDir } from "./journal.ts";
 import { ackClaimedBy, claimLetters, defaultMailboxDir, listLetters, mailboxDirFor, type Letter } from "./mailbox.ts";
-import { attachMasterWithAudit } from "./adapters/session-lifecycle.ts";
+import { attachMasterWithAudit, takeoverMasterWithAudit } from "./adapters/session-lifecycle.ts";
 import { readAttachment, readCutover, type MasterAttachment } from "./registry.ts";
+import { isProcessAlive, readScopeLiveness, type ScopeLiveness } from "./liveness.ts";
 import { isInFlight, readWakeState, wakeHolder, writeWakeState, type WakeLetter } from "./wake.ts";
 
 // ── scope 键（S1 + L4 M1/M2/M3 返修，纯函数）──────────────────────────────────────────
@@ -127,6 +130,83 @@ export function silentScopeGenesis(sessionId: string, cwd?: string): ScopeGenesi
 			scope,
 			reason: r.reason === "owner-active" || r.reason === "bad-session" ? r.reason : "attach-failed",
 		};
+	} catch {
+		return { outcome: "skipped", reason: "io-error" };
+	}
+}
+
+// ── Scope owner stale 判定 + 接管（0920 backlog B，v1 只做 pid 死判据）───────
+
+export type ScopeOwnerStaleVerdict =
+	| { verdict: "stale"; evidence: { pid: number; livenessUpdatedAt: string } }
+	| { verdict: "alive" }
+	| { verdict: "skip"; reason: "no-liveness" | "identity-mismatch" };
+
+/**
+ * 保守判定（纯函数，判定收在本模块）：仅当 liveness 存在且 sessionId+generation 与当前
+ * attachment 严格匹配时才有判据——
+ *   1. isProcessAlive(liveness.pid) false（EPERM 视为活）→ stale；
+ *   2. pid 活但 liveness 过期（hung）→ v1 不做：无 health 端点撑腰的第二级探活，误杀面大
+ *     （另案）；长 turn 间隙天然被 pid 活挡住，不误杀；
+ *   3. liveness 缺失（owner 从未跑过新钩子）/ 身份不匹配（前代残留）/ pid 活 → skip
+ *     （现状行为）。判不了 = 不动，与「有 owner 无论死活一律不动」同保守度。
+ */
+export function judgeScopeOwnerStale(
+	att: Pick<MasterAttachment, "sessionId" | "generation">,
+	liveness: ScopeLiveness | null,
+	opts: { isProcessAlive?: (pid: number) => boolean } = {},
+): ScopeOwnerStaleVerdict {
+	if (!liveness) return { verdict: "skip", reason: "no-liveness" };
+	if (liveness.sessionId !== att.sessionId || liveness.generation !== att.generation) {
+		return { verdict: "skip", reason: "identity-mismatch" };
+	}
+	const alive = (opts.isProcessAlive ?? isProcessAlive)(liveness.pid);
+	if (!alive) return { verdict: "stale", evidence: { pid: liveness.pid, livenessUpdatedAt: liveness.updatedAt } };
+	return { verdict: "alive" };
+}
+
+export type ScopeTakeoverOutcome =
+	| { outcome: "took-over"; scope: string; attachment: MasterAttachment; prevSessionId: string; prevGeneration: number }
+	| { outcome: "skipped"; scope?: string; reason: "bad-session" | "no-cwd" | "no-owner" | "already-owner" | "owner-alive" | "no-liveness" | "identity-mismatch" | "takeover-failed" | "io-error" };
+
+/**
+ * Scope owner stale 接管编排（仿 silentScopeGenesis，永不抛）：cwd 解析 scope →
+ * attachment 在位且非本会话 → judgeScopeOwnerStale → stale 时 takeoverMasterWithAudit
+ *（lease+CAS gen+1；竞争败者经 generation-mismatch 自然回落 skip）。三层防线语义保持：
+ * 预检在调用方（mailbox-consumer genesis 检查点）、owner-active 门在此处、wx/lease 单赢在
+ * registry。took-over 时调用方负责 TUI notify。
+ */
+export function takeoverStaleScopeOwner(
+	sessionId: string,
+	cwd: string,
+	opts: { stateDir?: string; now?: Date } = {},
+): ScopeTakeoverOutcome {
+	try {
+		if (!sessionId || sessionId === "unknown") return { outcome: "skipped", reason: "bad-session" };
+		if (!cwd || !cwd.trim()) return { outcome: "skipped", reason: "no-cwd" };
+		const norm = normalizeDriveColon(cwd);
+		const scope = localMasterScope(norm);
+		const addr = localMasterAddress(scope);
+		const att = readAttachment(addr);
+		if (!att) return { outcome: "skipped", scope, reason: "no-owner" };
+		if (att.sessionId === sessionId) return { outcome: "skipped", scope, reason: "already-owner" };
+		const verdict = judgeScopeOwnerStale(att, readScopeLiveness(scope, opts.stateDir));
+		if (verdict.verdict === "alive") return { outcome: "skipped", scope, reason: "owner-alive" };
+		if (verdict.verdict === "skip") return { outcome: "skipped", scope, reason: verdict.reason };
+		const r = takeoverMasterWithAudit(
+			{
+				sessionId,
+				agent: addr,
+				expected: { sessionId: att.sessionId, generation: att.generation },
+				reason: "scope-owner-stale",
+				evidence: verdict.evidence,
+				...(opts.now ? { now: opts.now } : {}),
+			},
+		);
+		if (r.ok) {
+			return { outcome: "took-over", scope, attachment: r.attachment, prevSessionId: r.prevSessionId, prevGeneration: r.prevGeneration };
+		}
+		return { outcome: "skipped", scope, reason: "takeover-failed" };
 	} catch {
 		return { outcome: "skipped", reason: "io-error" };
 	}

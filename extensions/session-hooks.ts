@@ -14,11 +14,11 @@ import { isTraceWorker } from "./capabilities.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
-import { writeLiveness } from "./runtime/liveness.ts";
+import { writeLiveness, writeScopeLiveness } from "./runtime/liveness.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
 import { readAttachment } from "./runtime/registry.ts";
-import { noteScopeWakeInbox } from "./runtime/scope.ts";
+import { localMasterAddress, localMasterScope, noteScopeWakeInbox } from "./runtime/scope.ts";
 import {
 	DEFAULT_MASTER_SUCCESSION,
 	maybeAutoSucceed,
@@ -33,6 +33,25 @@ export interface SessionHooksDeps {
 	/** S3 自动交接：spawn 通道 + 配置读取闭包（缺省 = 不启用 S3 块） */
 	spawnSuccessor?: SpawnSuccessor;
 	masterSuccession?: () => MasterSuccessionConfig;
+}
+
+/**
+ * Scope owner liveness 双写（0920 backlog B6）：本会话是本 cwd 的 scope owner →
+ * 写 state/scope-liveness/<scope>.json（含 pid + startedAt；30s 节流 + never-throw，
+ * 复用 liveness.ts 原子写）。agent_start + agent_end 两处调用；全局 master-liveness
+ * 写手（下方 agent_end 全局分支）零改动，两分支严格分离不共享 marker 文件。
+ * stale 接管判据消费此文件（scope.ts judgeScopeOwnerStale：attachment pid 死 → 接管）。
+ */
+function writeScopeOwnerLiveness(sid: string): void {
+	try {
+		const cwd = process.cwd();
+		const scope = localMasterScope(cwd);
+		const att = readAttachment(localMasterAddress(scope));
+		if (!att || att.sessionId !== sid) return; // 身份门：非本 scope owner 零写（旧 owner 复活也挡在这）
+		writeScopeLiveness({ scopeKey: scope, sessionId: sid, generation: att.generation });
+	} catch {
+		/* gauge 永不打断主流程 */
+	}
 }
 
 export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): void {
@@ -202,8 +221,10 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			}
 
 			// ── scope 分支（local master v1）：与全局分支严格分离，不共享 marker 文件 ──
-			// 本会话是本 cwd 的 scope owner → 读本仓 wake 类信 → 追加 per-scope 本地 attention
+			// 本会话是本 cwd 的 scope owner → 先写 scope liveness（0920 backlog B6：stale 接管
+			// 的活性数据源），再读本仓 wake 类信 → 追加 per-scope 本地 attention
 			//（wake-pending，按 letterId 去重）；不碰 S2/S3/succession，不写全局 master-attention.json。
+			writeScopeOwnerLiveness(sid);
 			let cwd: string | null = null;
 			try {
 				cwd = process.cwd();
@@ -211,6 +232,17 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 				cwd = null;
 			}
 			if (cwd) noteScopeWakeInbox(sid, cwd);
+		} catch { /* gauge 永不打断主流程 */ }
+	});
+
+	// Scope owner liveness：agent_start 即写（0920 backlog B6 双写之二）——接管/genesis 后
+	// 新 owner 首个 agent 前就有活性记录；身份门在 writeScopeOwnerLiveness 内，非 owner 零写。
+	pi.on("agent_start", (_event, ctx) => {
+		try {
+			if (isSubagent()) return;
+			const sid = durableSessionIdentity(ctx as never);
+			if (!sid || sid === "unknown") return;
+			writeScopeOwnerLiveness(sid);
 		} catch { /* gauge 永不打断主流程 */ }
 	});
 }

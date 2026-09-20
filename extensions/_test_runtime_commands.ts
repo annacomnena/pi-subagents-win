@@ -636,7 +636,7 @@ try {
 		}
 	}
 
-	// ── G9 冒烟（续）：consumer 命令信 command-deferred（零行为变化）──
+	// ── G9 冒烟（续）：consumer 命令信接线（0920 backlog A：master_default 域 → executor）──
 	{
 		setCutover(true, "test");
 		const att = readAttachment(master)!;
@@ -644,18 +644,21 @@ try {
 		const runsDir = join(ROOT, "tab-runs");
 		mkdirSync(runsDir, { recursive: true });
 
-		// 命令信（issuedAt ≥ cutover）：显式 deferred、保持 pending、零注入
+		// 命令信（issuedAt ≥ cutover）：master_default 域 → executor 确定性执行；
+		// agent.wake 不在白名单 → rejected(not-implemented) → 纯报告回执 → ack 终态不重投
 		deliverCommand(newCommandFrame({
 			type: "agent.wake", to: master, issuedBy: "agent://agent_worker_1",
 			commandKey: "wake:smoke", issuedAt: iso(),
 		}), { mailboxDir: ROOT });
 		const sent: string[] = [];
 		const r = consumeMailboxOnce({ sessionId: sid, mailboxDir: ROOT, runsDir, sendUserMessage: (b) => { sent.push(b); } });
-		const cmdEntry = r.consumed.find((c) => c.reason === "command-deferred");
-		assert.ok(cmdEntry && cmdEntry.action === "skipped", "命令信显式 command-deferred（替换误导性 claim-missed）");
-		assert.equal(sent.length, 0, "零注入");
+		const cmdEntry = r.consumed.find((c) => c.action === "executed");
+		assert.ok(cmdEntry && cmdEntry.reason === "command-rejected:not-implemented", "命令信进 executor：白名单外 rejected(not-implemented)");
+		assert.equal(sent.length, 1, "恰一条回执 followUp（纯报告）");
+		assert.ok(sent[0]!.includes("命令回执") && sent[0]!.includes("rejected") && !sent[0]!.includes("待执行"), "回执是纯报告非指令（红线：命令不进 LLM 注入）");
 		const letters = listLetters(master, undefined, ROOT);
-		assert.ok(letters.some((l) => l.frame.frame === "command" && l.frame.commandKey === "wake:smoke" && l.status === "pending"), "命令信保持 pending 可审计");
+		const smoke = letters.find((l) => l.frame.frame === "command" && l.frame.commandKey === "wake:smoke");
+		assert.ok(smoke && smoke.status === "acked", "rejected 终态 ack（不重投，防毒信循环）");
 
 		// message 帧链路零回归：REPORT 照常注入 + ack
 		deliverLetter(newMessageFrame({
