@@ -9,7 +9,7 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -211,7 +211,28 @@ function readConfig(): AgentConfig {
 }
 
 function writeConfig(cfg: AgentConfig): void {
-	writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n");
+	// G4（§2.4③）：裸写 → tmp+rename 原子写（与 runtime/command-executor.ts 同款模式），
+	// 消除与 Host 侧 auto-handoff.set 并发时的 torn-write / JSON 损坏面。
+	// EPERM×3 重试（10ms backoff）：Windows 下并发 reader 持句柄时 rename 短暂 EPERM。
+	// 残余风险（显式记录）：read-modify-write 窗口非零，极小概率 lost update
+	//（另一进程在调用方 fresh read（reloadConfig）与本 rename 之间写入）——后果 = 对方
+	// 切片回退一次，重写自愈；跨进程文件锁不采（pi 侧写者不持锁，见 plans/0920_G4_cmdexec_plan.md §2.4）。
+	const path = configPath();
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+	writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n");
+	for (let attempt = 0; ; attempt++) {
+		try {
+			renameSync(tmp, path);
+			return;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EPERM" && attempt < 3) {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+				continue;
+			}
+			try { unlinkSync(tmp); } catch { /* ignore */ }
+			throw e;
+		}
+	}
 }
 
 function reloadConfig(): AgentConfig {

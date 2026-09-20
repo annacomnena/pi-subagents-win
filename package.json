@@ -81,6 +81,7 @@
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
     "test:runtime-host-projections": "node --experimental-strip-types ./extensions/_test_runtime_host_projections.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
+    "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts"
   },
   "dependencies": {

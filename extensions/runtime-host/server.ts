@@ -1,5 +1,5 @@
 /**
- * runtime-host/server.ts — G2：runtime-host 只读观察服务（总计划 §25/§26/§27 / G2 计划 §2）
+ * runtime-host/server.ts — G2 只读观察 + G4 唯一写端点（总计划 §25/§26/§27 / G2 计划 §2）
  *
  * 独立 node 入口（`node --experimental-strip-types server.ts`，bind **127.0.0.1:0**——端口
  * 动态，实际端口写 host.json 做发现；多实例固定端口必冲突，主会话拍板①）。不起则不存在
@@ -22,12 +22,16 @@
  *   - `GET /v1/timeline?limit=<opt>`（G3）journal 全事件 + 状态条目 + 溯源 enrichment
  *     （timeline.ts 纯函数；at 升序尾部 N 条，默认 200，拍板②）。
  *     与 /v1/events 分工正交（G2 research ④）：events = 低延迟增量，attention/timeline = 首屏全量 + 轮询。
+ *   - `POST /v1/commands`（G4）：**唯一命令入口**（mailbox 命令信不消费）。同步执行、
+ *     同步回执；业务全在 runtime/command-executor.ts 纯库（本文件只做薄绑定）；方法门
+ *     放宽仅此路径（GET 全放行 + POST 仅 /v1/commands，其余 405）。
  *
  * 明确不做（G2 计划 §4 / 主会话拍板③）：无 WS/SSE/push（纯 poll 足矣）；无 journal
  * compaction；无 fs.watch 正确性路径；S3/master-auto/mailbox 接线零改动。
  *
  * 红线：只 import node 内建 + `extensions/runtime/*` 纯函数 + ../timers.ts（session 心跳
- * 纯函数）+ ./snapshot.ts + ./discovery.ts；**禁** Pi API / extensions/index.ts。
+ * 纯函数）+ ./snapshot.ts + ./discovery.ts + ./commands.ts（薄 HTTP 层）；
+ * **禁** Pi API / extensions/index.ts。
  */
 
 import { spawn } from "node:child_process";
@@ -55,6 +59,13 @@ import { getMasterStatus } from "../runtime/master-control.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
 import { buildTimelineItems } from "./timeline.ts";
+import {
+	COMMAND_BODY_LIMIT_BYTES,
+	CommandRequestError,
+	commandOutcomeHttpResponse,
+	parseCommandRequest,
+} from "./commands.ts";
+import { executeCommand } from "../runtime/command-executor.ts";
 
 // ── 视图装配（纯读、never-throw；可注入路径/now 供测试隔离）────────
 
@@ -306,6 +317,8 @@ export interface RuntimeHostServerOptions {
 	journalPath?: string;
 	/** timeline 溯源用 links.jsonl 路径（缺省 defaultLinksPath()；测试注入隔离）。 */
 	linksPath?: string;
+	/** config.json 路径（auto-handoff.set 用；缺省包根 config.json，测试注入隔离）。 */
+	configPath?: string;
 }
 
 export interface RuntimeHostHandle {
@@ -321,12 +334,86 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const self: HostSelfInfo = { instanceId, pid: process.pid, port: 0, startedAt };
 	const hostPath = opts.hostPath ?? hostInfoPath();
 
+	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
+		try {
+			res.writeHead(status, { "content-type": "application/json" });
+			res.end(JSON.stringify(body));
+		} catch {
+			try {
+				res.destroy();
+			} catch {
+				/* ignore */
+			}
+		}
+	};
+
+	// G4：POST /v1/commands——唯一命令入口（body 异步读取后同步执行、同步回执；never-throw）
+	const handlePostCommand = (req: IncomingMessage, res: ServerResponse): void => {
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let responded = false;
+		req.on("data", (c: Buffer) => {
+			if (responded) return;
+			size += c.length;
+			if (size > COMMAND_BODY_LIMIT_BYTES) {
+				responded = true;
+				respondJson(res, 413, { error: "payload-too-large", hint: `body 限 ${COMMAND_BODY_LIMIT_BYTES} 字节` });
+				try { req.destroy(); } catch { /* ignore */ }
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("error", () => {
+			if (!responded) {
+				responded = true;
+				respondJson(res, 400, { error: "request-error" });
+			}
+		});
+		req.on("end", () => {
+			if (responded) return;
+			responded = true;
+			let status = 200;
+			let body: unknown;
+			try {
+				const frame = parseCommandRequest(Buffer.concat(chunks).toString("utf8"));
+				const outcome = executeCommand(frame, {
+					stateDir: opts.stateDir,
+					journalPath: opts.journalPath,
+					configPath: opts.configPath,
+				});
+				const http = commandOutcomeHttpResponse(outcome);
+				status = http.status;
+				body = http.body;
+			} catch (e) {
+				if (e instanceof CommandRequestError) {
+					status = e.status;
+					body = e.body;
+				} else {
+					// executeCommand never-throw，此分支仅防未来回归；server 不崩，继续服务
+					status = 500;
+					body = { error: "internal", message: e instanceof Error ? e.message : String(e) };
+				}
+			}
+			respondJson(res, status, body);
+		});
+	};
+
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
 		try {
 			const u = new URL(req.url ?? "/", "http://127.0.0.1");
-			if (req.method !== "GET") throw new HttpError(405, { error: "method-not-allowed", hint: "runtime-host 只读：仅 GET" });
+			if (u.pathname === "/v1/commands") {
+				// 唯一写端点：仅 POST；GET /v1/commands → 405（读投影不含命令）
+				if (req.method === "POST") {
+					handlePostCommand(req, res);
+					return;
+				}
+				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/commands 仅接受 POST（唯一命令入口）；读投影走其余 GET 端点" });
+			}
+			if (req.method !== "GET") {
+				throw new HttpError(405, { error: "method-not-allowed", hint: "读投影仅 GET；写操作唯一入口 POST /v1/commands" });
+			}
 			switch (u.pathname) {
 				case "/v1/health":
 					body = buildHealthView({
@@ -387,7 +474,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					break;
 				}
 				default:
-					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline" });
+					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline；POST /v1/commands（唯一命令入口）" });
 			}
 		} catch (e) {
 			if (e instanceof HttpError) {
@@ -399,16 +486,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				body = { error: "internal", message: e instanceof Error ? e.message : String(e) };
 			}
 		}
-		try {
-			res.writeHead(status, { "content-type": "application/json" });
-			res.end(JSON.stringify(body));
-		} catch {
-			try {
-				res.destroy();
-			} catch {
-				/* ignore */
-			}
-		}
+		respondJson(res, status, body);
 	};
 
 	return new Promise((resolvePromise, reject) => {

@@ -132,6 +132,14 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				reportPush(report, messageId, "skipped", "pre-cutover-legacy");
 				continue;
 			}
+			// command 帧：本消费端不做确定性执行——**POST /v1/commands 是唯一命令入口**（G4）。
+			// 此前 command 帧因定向 claim 只认 message id（frameId=undefined）而永远落到
+			// 误导性的 claim-missed；现显式 deferred：信保持 pending 可审计、不 ack 不注入，
+			// 行为零变化，为未来「agent 发起命令」接线留桩（plans/0920_G4_cmdexec_plan.md §3）。
+			if (letter.frame.frame === "command") {
+				reportPush(report, messageId, "skipped", "command-deferred");
+				continue;
+			}
 			// 定向 claim（单封）
 			const frameId = letter.frame.frame === "message" ? letter.frame.id : undefined;
 			const taken = frameId

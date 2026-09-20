@@ -48,9 +48,17 @@ export function isMessageKind(v: unknown): v is MessageKind {
 	return typeof v === "string" && (MESSAGE_KINDS as readonly string[]).includes(v);
 }
 
-// ── Command 词表（§26 示例 + v1 可扩展白名单）─────────────────────
+// ── Command 词表（§26 示例 + v1 可扩展白名单；G4 additive 批次一：
+// workstream.resume / master.handoff.accept / master.auto-handoff.set，只加不改）──
 
-export const COMMAND_TYPES = ["agent.wake", "task.cancel", "workstream.pause"] as const;
+export const COMMAND_TYPES = [
+	"agent.wake",
+	"task.cancel",
+	"workstream.pause",
+	"workstream.resume",
+	"master.handoff.accept",
+	"master.auto-handoff.set",
+] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
