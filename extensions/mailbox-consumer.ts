@@ -10,17 +10,29 @@
  * （pre-cutover-legacy），留给 legacy——9903 信即此类，永不重注。
  * 未切换（flag 关/无 registry）时本消费端零动作（legacy 原行为）。
  *
+ * 命令信接线（0920 backlog A，仅 agent://master_default 域）：command 分支不再一律
+ * deferred——recipient 全等 masterAddress() 时走确定性执行链：fileId claim → F16
+ * fencing 复检 → executeCommand(frame) 进程内直调 → 纯报告回执 → ack（三态全终态，
+ * 不重投）。红线：命令信绝不进 LLM 注入——executor 在 claim 链内执行，LLM 只收结果
+ * 报告。ws/scope 域命令信维持 command-deferred 现状（行为零变化；已知边界：这两域
+ * 命令信会被 LLM 唤醒链 claim 当触发器消费）。
+ *
  * 注册形态同 report 监听器：session_start（仅主会话）+ interval tick。
  * 所有异常内部吞掉，绝不破坏宿主会话。
  */
 
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
 	ackLetter,
 	claimLetters,
 	defaultMailboxDir,
 	listLetters,
+	mailboxDirFor,
 	type Letter,
 } from "./runtime/mailbox.ts";
+import { executeCommand, type CommandOutcome, type ExecuteCommandOptions } from "./runtime/command-executor.ts";
+import type { CommandFrame } from "./runtime/protocol.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
@@ -48,11 +60,13 @@ export interface ConsumeOptions {
 	runsDir?: string;
 	/** 注入实现（生产接 pi.sendUserMessage，测试传 fake） */
 	sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
+	/** executeCommand 选项透传（stateDir/configPath/commandsDir/journalPath；测试注入隔离用） */
+	executeCommandOptions?: ExecuteCommandOptions;
 }
 
 export interface ConsumeEntry {
 	messageId: string;
-	action: "injected" | "skipped";
+	action: "injected" | "skipped" | "executed";
 	reason?: string;
 }
 
@@ -86,6 +100,29 @@ function holderOf(sessionId: string): string {
 	return `mailbox-consumer:${sessionId}`;
 }
 
+/**
+ * master_default spool 的 pending 命令信（dir-list 帮手，照 scope.ts listScopeWakeLetters
+ * 模式）：command 帧无 frame.id、spool 落盘时才分配文件名=messageId（F7 不变量），
+ * 故 claim/ack 必须用 spool 文件名（fileId）。listLetters 不回文件名（mailbox API 零改动）。
+ */
+function listPendingCommandLetters(recipient: ObjectAddress, mailboxDir: string): Array<{ fileId: string; letter: Letter }> {
+	const dir = mailboxDirFor(recipient, mailboxDir);
+	if (!existsSync(dir)) return [];
+	const out: Array<{ fileId: string; letter: Letter }> = [];
+	for (const f of readdirSync(dir)) {
+		if (!f.endsWith(".json")) continue;
+		try {
+			const letter = JSON.parse(readFileSync(join(dir, f), "utf8")) as Letter;
+			if (letter.status !== "pending") continue;
+			if (letter.frame.frame !== "command") continue;
+			out.push({ fileId: f.slice(0, -".json".length), letter });
+		} catch {
+			continue;
+		}
+	}
+	return out;
+}
+
 /** 已审计过的 pre-cutover 键（进程内去重：tick 每轮重扫不再重复记审计；审计是诊断性的） */
 const auditedPreCutover = new Set<string>();
 
@@ -114,6 +151,22 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	const owner = attachment.sessionId;
 	report.owner = owner;
 
+	// 命令信 fileId 索引（仅 master_default 域；commandKey → pending fileId 队列，同键多封
+	// 各领一个 fileId——重放信由 executor 幂等回放 outcome，逐封 ack 终态）
+	const commandFileIds = new Map<string, string[]>();
+	if (recipient === masterAddress()) {
+		try {
+			for (const { fileId, letter } of listPendingCommandLetters(recipient, mailboxDir)) {
+				if (letter.frame.frame !== "command") continue;
+				const list = commandFileIds.get(letter.frame.commandKey);
+				if (list) list.push(fileId);
+				else commandFileIds.set(letter.frame.commandKey, [fileId]);
+			}
+		} catch {
+			commandFileIds.clear(); // 索引失败 → 命令信落 claim-missed（safe，不破坏 message 链）
+		}
+	}
+
 	const pending = listLetters(recipient, "pending", mailboxDir);
 	for (const letter of pending) {
 		const messageId = describeLetter(letter);
@@ -132,12 +185,51 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				reportPush(report, messageId, "skipped", "pre-cutover-legacy");
 				continue;
 			}
-			// command 帧：本消费端不做确定性执行——**POST /v1/commands 是唯一命令入口**（G4）。
-			// 此前 command 帧因定向 claim 只认 message id（frameId=undefined）而永远落到
-			// 误导性的 claim-missed；现显式 deferred：信保持 pending 可审计、不 ack 不注入，
-			// 行为零变化，为未来「agent 发起命令」接线留桩（plans/0920_G4_cmdexec_plan.md §3）。
+			// command 帧（0920 backlog A）：域路由拍板 v1 只接线 agent://master_default——
+			// recipient 全等门外的 ws/scope 域维持 command-deferred 现状（信保持 pending，
+			// 行为零变化；已知边界：投到这两域的命令信会被 LLM 唤醒链 claim 消费）。
 			if (letter.frame.frame === "command") {
-				reportPush(report, messageId, "skipped", "command-deferred");
+				if (recipient !== masterAddress()) {
+					reportPush(report, messageId, "skipped", "command-deferred");
+					continue;
+				}
+				// 定向 claim：command 帧无 frame.id，用 spool 文件名（fileId，F7）
+				const fileId = commandFileIds.get(letter.frame.commandKey)?.shift();
+				if (!fileId) {
+					reportPush(report, messageId, "skipped", "claim-missed");
+					continue;
+				}
+				const taken = claimLetters(recipient, { claimedBy: holderOf(opts.sessionId), mailboxDir, ids: [fileId], limit: 1 });
+				if (taken.length === 0) {
+					reportPush(report, messageId, "skipped", "claim-missed");
+					continue;
+				}
+				// F16 fencing 复检必须先于 execute：失去 owner 身份的会话不得执行命令
+				const fresh = resolveRecipient(recipient);
+				if (!fresh || fresh.sessionId !== opts.sessionId) {
+					reportPush(report, messageId, "skipped", "generation-moved");
+					continue; // 已 claim 的信留给 stale 回收
+				}
+				// 红线：命令信绝不进 LLM 注入——executor 进程内确定性执行（never-throw 三态），
+				// 跳过 preInject 统一门与 buildInjectBody 注入路径（命令侧去重 = executor wx claim）。
+				let outcome: CommandOutcome;
+				try {
+					outcome = executeCommand(letter.frame, opts.executeCommandOptions);
+				} catch (e) {
+					outcome = { status: "failed", reason: "failed", error: e instanceof Error ? e.message : String(e), replayed: false };
+				}
+				reportPush(report, messageId, "executed", `command-${outcome.status}${outcome.status === "rejected" ? `:${outcome.reason}` : ""}`);
+				// 回执：向 owner 会话发一条纯报告 followUp（无任何待执行指令语义；不走 preInject
+				// 门——回执重复无害）。best-effort，失败不影响 ack。
+				try {
+					opts.sendUserMessage?.(buildCommandReceiptBody(letter.frame, outcome), { deliverAs: "followUp" });
+				} catch {
+					/* best-effort */
+				}
+				// 三态全终态 ack、不重投：rejected 在 executor 幂等 claim 之前拒、不占键，重投必再拒；
+				// failed 留 pending/claimed 会经 10min stale reclaim 无限空转——重试语义由 issuer
+				// 换新 commandKey 重发承担。
+				ackLetter(recipient, fileId, { mailboxDir });
 				continue;
 			}
 			// 定向 claim（单封）
@@ -197,15 +289,28 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	return { owner, consumed: report.consumed };
 }
 
-function reportPush(report: ConsumeReport, messageId: string, action: "injected" | "skipped", reason?: string): void {
+function reportPush(report: ConsumeReport, messageId: string, action: "injected" | "skipped" | "executed", reason?: string): void {
 	report.consumed.push({ messageId, action, reason });
 }
 
-/** 注入正文（与 followUp 同风格，标注 mailbox 路径来源）。 */
+/**
+ * 命令回执正文（0920 backlog A5）：type/key + status + summary/reason/error + replayed
+ * 标注。固化纯报告模板——回执是报告不是指令，防 LLM 把回执当待执行命令。
+ */
+function buildCommandReceiptBody(frame: CommandFrame, outcome: CommandOutcome): string {
+	const head = `📬 命令回执：${frame.type}（key=${frame.commandKey}）→ ${outcome.status}${outcome.replayed ? "（重放：同 commandKey 已执行过，回放首次结果，零二次副作用）" : ""}`;
+	const line =
+		outcome.status === "accepted"
+			? `结果: ${outcome.summary}`
+			: outcome.status === "rejected"
+				? `拒绝原因: ${outcome.reason}${outcome.detail ? `（${outcome.detail}）` : ""}`
+				: `失败: ${outcome.reason}${outcome.error ? `（${outcome.error}）` : ""}`;
+	return [head, line, "（本条是确定性执行器的纯结果报告；命令信已执行并 ack，无需任何后续动作。）"].join("\n");
+}
+
+/** 注入正文（与 followUp 同风格，标注 mailbox 路径来源）。command 分支已删：命令信走
+ * executor 确定性执行（红线：绝不进 LLM 注入），本函数只服务 message 注入。 */
 function buildInjectBody(letter: Letter): string {
-	if (letter.frame.frame === "command") {
-		return `📬 mailbox 命令 ${letter.frame.type}（key=${letter.frame.commandKey}）待执行：请按命令语义处理。`;
-	}
 	const details = letter.frame.body.details as { tabRunId?: string; taskId?: string } | undefined;
 	const task = details?.taskId ? ` task=${details.taskId}` : "";
 	return [
