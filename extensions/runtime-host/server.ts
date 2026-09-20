@@ -6,7 +6,7 @@
  * = Mode A 回退（§21）；pi 侧仅 `/runtime-host start|stop|status` slash 命令接线（拍板②，
  * 无 master 工具，默认不启动，零行为变化）。
  *
- * 三端点（纯 poll、服务端**无状态**、全部只读、全部 handler never-throw）：
+ * 五端点（纯 poll、服务端**无状态**、全部只读、全部 handler never-throw）：
  *   - `GET /v1/health`   组合纯读：getMasterStatus（owner/代际）+ timers sessions/ 心跳
  *     （唯一真实活性信号，15s grace）+ journal 尾部 + **mailbox 只读 pending 计数**
  *     （拍板④：不产事件、never-throw 包裹，失败→0）+ host 自信息。
@@ -17,6 +17,11 @@
  *     `after=0`/缺省 = 从头；服务端不存 cursor（无状态，host 重启天然不断）；
  *     失效/越界 → `409 { reason:"cursor-invalid", resync:true }` + 重同步指引（客户端
  *     改走 /v1/snapshot 重建状态 + after=0）；幂等责任在消费端（envelope 自带 id+dedupeKey）。
+ *   - `GET /v1/attention?includeResolved=<opt>`（G3）状态聚合投影：`buildAttentionItems`
+ *     （attention.ts 纯函数；同源双条 source key 最新胜出；resolved 默认过滤，拍板①）。
+ *   - `GET /v1/timeline?limit=<opt>`（G3）journal 全事件 + 状态条目 + 溯源 enrichment
+ *     （timeline.ts 纯函数；at 升序尾部 N 条，默认 200，拍板②）。
+ *     与 /v1/events 分工正交（G2 research ④）：events = 低延迟增量，attention/timeline = 首屏全量 + 轮询。
  *
  * 明确不做（G2 计划 §4 / 主会话拍板③）：无 WS/SSE/push（纯 poll 足矣）；无 journal
  * compaction；无 fs.watch 正确性路径；S3/master-auto/mailbox 接线零改动。
@@ -30,6 +35,7 @@ import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildAttentionItems } from "./attention.ts";
 import {
 	PROTOCOL_VERSION,
 	classifyHost,
@@ -48,6 +54,7 @@ import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
 import { getMasterStatus } from "../runtime/master-control.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
+import { buildTimelineItems } from "./timeline.ts";
 
 // ── 视图装配（纯读、never-throw；可注入路径/now 供测试隔离）────────
 
@@ -208,6 +215,7 @@ export function buildSnapshotView(
 		stateDir?: string;
 		mailboxDir?: string;
 		journalPath?: string;
+		linksPath?: string;
 		now?: Date;
 	},
 ): RuntimeSnapshot {
@@ -215,6 +223,7 @@ export function buildSnapshotView(
 		stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state"),
 		mailboxDir: opts.mailboxDir ?? defaultMailboxDir(),
 		journalPath: opts.journalPath ?? defaultJournalPath(),
+		linksPath: opts.linksPath,
 		now: opts.now,
 	});
 	// buildRuntimeSnapshot never-throw（G1 契约）；host 注入 = 纯字段替换，无新抛点。
@@ -295,6 +304,8 @@ export interface RuntimeHostServerOptions {
 	stateDir?: string;
 	mailboxDir?: string;
 	journalPath?: string;
+	/** timeline 溯源用 links.jsonl 路径（缺省 defaultLinksPath()；测试注入隔离）。 */
+	linksPath?: string;
 }
 
 export interface RuntimeHostHandle {
@@ -331,6 +342,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						stateDir: opts.stateDir,
 						mailboxDir: opts.mailboxDir,
 						journalPath: opts.journalPath,
+						linksPath: opts.linksPath,
 					});
 					break;
 				case "/v1/events": {
@@ -351,8 +363,31 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, after: ev.after, count: ev.count, nextCursor: ev.nextCursor, envelopes: ev.envelopes };
 					break;
 				}
+				case "/v1/attention": {
+					// G3（拍板①）：includeResolved=1 看历史（resolved 默认过滤）
+					const includeResolved = (u.searchParams.get("includeResolved") ?? "") === "1";
+					const att = buildAttentionItems({
+						stateDir: opts.stateDir,
+						mailboxDir: opts.mailboxDir,
+						includeResolved,
+					});
+					body = { version: 1, count: att.length, attention: att };
+					break;
+				}
+				case "/v1/timeline": {
+					// G3（拍板②）：仅 limit（默认 200，at 升序尾部 N 条，无 cursor）
+					const tlRaw = u.searchParams.get("limit");
+					const tl = buildTimelineItems({
+						stateDir: opts.stateDir,
+						journalPath: opts.journalPath,
+						linksPath: opts.linksPath,
+						limit: tlRaw !== undefined ? Number(tlRaw) : undefined,
+					});
+					body = { version: 1, count: tl.length, timeline: tl };
+					break;
+				}
 				default:
-					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events" });
+					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline" });
 			}
 		} catch (e) {
 			if (e instanceof HttpError) {

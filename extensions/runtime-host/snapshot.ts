@@ -36,6 +36,8 @@
  */
 
 import { join } from "node:path";
+import { buildAttentionItems } from "./attention.ts";
+import { buildTimelineItems } from "./timeline.ts";
 import type { RuntimeEnvelope } from "../runtime/envelope.ts";
 import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
 import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
@@ -46,9 +48,10 @@ import { listTasks, listWorkstreams } from "../runtime/workstreams.ts";
 
 // ── 契约类型（G1 冻结，避免 G3/G5 改 version）──────────────────────
 
-/** G3 冻结真实形状（open issue 3）；G1 只保 schema 位。 */
+/** G1 保 schema 位（主会话拍板③：G3 只做加法、不收紧已有类型）；真实形状见
+ * runtime-host/attention.ts（type 别名，可赋值 Record<string, unknown>）。 */
 export type AttentionItem = Record<string, unknown>;
-/** G3 冻结真实形状（open issue 3）；G1 只保 schema 位。 */
+/** 同上；真实形状见 runtime-host/timeline.ts。 */
 export type TimelineItem = Record<string, unknown>;
 
 /** master 段：getMasterStatus 视图 + stale 派生位。 */
@@ -89,9 +92,9 @@ export interface RuntimeSnapshot {
 	workstreams: WorkstreamView[];
 	tasks: TaskView[];
 	runs: RunView[];
-	/** G1 恒 []（G3 投影，占位保 schema 稳定）。 */
+	/** G3 投影（runtime-host/attention.ts；段级 never-throw，降级 []）。 */
 	attention: AttentionItem[];
-	/** G1 恒 []（同上）。 */
+	/** G3 投影（runtime-host/timeline.ts；默认尾 200 条，at 升序；降级 []）。 */
 	timeline: TimelineItem[];
 	runtime: RuntimeView;
 	/**
@@ -110,6 +113,8 @@ export interface SnapshotOptions {
 	mailboxDir?: string;
 	/** 缺省 defaultJournalPath()。 */
 	journalPath?: string;
+	/** timeline 溯源用 links.jsonl 路径（缺省 defaultLinksPath()；G3 加法，拍板③）。 */
+	linksPath?: string;
 	/** Date 注入，测试确定性（generatedAt 与 stale 判定同源）。 */
 	now?: Date;
 }
@@ -248,7 +253,21 @@ export function buildRuntimeSnapshot(opts: SnapshotOptions = {}): RuntimeSnapsho
 			{ workstreams: workstreams.length, tasks: tasks.length, runs: runs.length },
 			sectionErrors,
 		);
-		body = { version: 1, master, workstreams, tasks, runs, attention: [], timeline: [], runtime };
+		// G3 填充预留位（拍板③：只做加法）：两纯函数本就 never-throw；外层 try/catch 仅兜
+		// 理论上的一切意外抛点 → 段级降级 [] + sectionErrors（与 G1 段纪律一致）。
+		let att: AttentionItem[] = [];
+		try {
+			att = buildAttentionItems({ stateDir, mailboxDir });
+		} catch (e) {
+			sectionErrors.push(err("attention", e));
+		}
+		let tl: TimelineItem[] = [];
+		try {
+			tl = buildTimelineItems({ stateDir, journalPath, linksPath: opts.linksPath });
+		} catch (e) {
+			sectionErrors.push(err("timeline", e));
+		}
+		body = { version: 1, master, workstreams, tasks, runs, attention: att, timeline: tl, runtime };
 	} catch (e) {
 		// 顶层兜底：「snapshot 构建失败」也不炸调用方（G2 GET /v1/snapshot 契约）。
 		sectionErrors.push(err("top", e));

@@ -13,7 +13,8 @@
  *   T3b sectionErrors 收窄语义可观测：state/workstreams 被换成普通文件 → readdirSync 抛
  *      ENOTDIR（底层未吞）→ 记录进 workstreams 段，其余段正常、不炸整体
  *   T6 never-throw：无效 Date 注入（new Date("invalid")）不抛，generatedAt 为合法 ISO 串
- *   T4 占位与幂等：attention===[] && timeline===[]；同种子 + 同 now 两次 deepStrictEqual
+ *   T4 占位与幂等：attention=[]（D1 无 attention 源）；timeline 已填（G3 拍板③：
+ *      journal 2 事件 → 2 条事件条目 at 升序）；同种子 + 同 now 两次 deepStrictEqual
  *   T5 大 journal 性能 smoke：10,000 行（5,000 dispatched + 5,000 completed）< 2000ms
  *
  * 运行：npm run test:runtime-snapshot
@@ -47,6 +48,7 @@ const snap = (dir: string, now?: Date) =>
 		stateDir: join(dir, "state"),
 		mailboxDir: join(dir, "mailbox"),
 		journalPath: join(dir, "events.jsonl"),
+		linksPath: join(dir, "links.jsonl"), // G3 加法：timeline 溯源隔离到测试目录（不读真实 ~/.pi/agent/links.jsonl）
 		now: now ?? new Date(),
 	});
 
@@ -246,8 +248,16 @@ try {
 	const fixed = new Date("2026-09-18T00:00:00.000Z");
 	const a = snap(D1, fixed);
 	const b = snap(D1, fixed);
-	assert.deepEqual(a.attention, [], "G1 attention 恒 []");
-	assert.deepEqual(a.timeline, [], "G1 timeline 恒 []");
+	assert.deepEqual(a.attention, [], "D1 无 attention 源（mailbox 仅 REPORT，非 escalation/question）→ []");
+	assert.equal(a.timeline.length, 2, "G3 填充：timeline = D1 journal 2 条事件（无 proposal、ws active → 无状态条目）");
+	assert.deepEqual(
+		a.timeline.map((t) => [t.kind, t.at] as const),
+		[
+			["event", "2026-09-17T19:00:00.000Z"],
+			["event", "2026-09-17T19:05:00.000Z"],
+		],
+		"timeline at 升序（run.dispatched → run.completed）",
+	);
 	assert.deepEqual(a, b, "同种子 + 同 now → 同输出（snapshot 是复制不是状态）");
 	assert.equal(a.generatedAt, "2026-09-18T00:00:00.000Z", "now 注入决定 generatedAt");
 
