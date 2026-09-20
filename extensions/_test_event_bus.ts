@@ -516,6 +516,35 @@ function writeResult(runId: string, status = "completed") {
 		console.log("ok - ⑨ DOG2 重启场景：flag 丢、UUID 存留 → 新实例注册+tick 投递");
 	}
 
+	// ── ⑭ 空结果守卫（T7 幻影完成，2026-09-20）──────────────────────────────
+	// fs.watch 的 rename 含删除事件 + 未写完/坏 JSON 时 result 为 null：此前照走全链，
+	// 产生 "(no summary)" 幻影完成并消耗 .notified。现在静默返回且不标 seen（可重试）。
+	{
+		resetOwnership(true); // cutover ON
+		attachMaster({ sessionId: "uuid-null-guard" });
+		delete process.env.PI_TAB_RUN_ID; // 主会话 owner
+		setCurrentSessionId("uuid-null-guard");
+		const sent14: string[] = [];
+		const opts14 = {
+			runsDir: ownerDir, toast: false, autoReclaim: true,
+			sendUserMessage: (c: string) => { sent14.push(c); },
+		};
+		// 不存在的文件（watch delete 事件形状）→ 三无
+		assert.equal(onTabResultFile(ownerDir, "tab_ghost.result.json", opts14), false, "⑭ 不存在文件不处理");
+		assert.equal(sent14.length, 0, "⑭ 零注入");
+		assert.equal(existsSync(join(ownerDir, "tab_ghost.notified")), false, "⑭ 不消耗认领");
+		assert.equal(listRuntimeEnvelopes({}).envelopes.filter((e) => e.subject === "run://tab/tab_ghost").length, 0, "⑭ 不 journal");
+		// torn 写（坏 JSON）→ false 且不污染 seen；补好后正常处理
+		writeFileSync(join(ownerDir, "tab_torn.result.json"), "{broken", "utf8");
+		assert.equal(onTabResultFile(ownerDir, "tab_torn.result.json", opts14), false, "⑭ 坏 JSON 不处理");
+		assert.equal(existsSync(join(ownerDir, "tab_torn.notified")), false, "⑭ 坏文件不消耗认领");
+		writeOwnerResult("tab_torn"); // 补好（覆盖）
+		assert.equal(onTabResultFile(ownerDir, "tab_torn.result.json", opts14), true, "⑭ 补好后可重试处理");
+		assert.equal(sent14.length, 1, "⑭ 恰好注入一次");
+		setCurrentSessionId(undefined);
+		console.log("ok - ⑭ 空结果守卫：删/坏文件零副作用，未写完可重试");
+	}
+
 	// ── ⑩ M1 回归：无身份哨兵 "unknown" 拒写 attachment（注册表层硬不变量）──────────
 	{
 		resetOwnership(true);

@@ -184,9 +184,14 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (selfDisabled) return false; // 旧实例已失效，不再注入
 	if (!fileName.endsWith(".result.json")) return false;
 	if (seenResults.has(fileName)) return false;
-	seenResults.add(fileName);
 	const runId = fileName.slice(0, -".result.json".length);
 	const result = readTabResultFile(runsDir, runId);
+	// 空结果守卫（2026-09-20 T7 幻影完成修复）：文件被删（fs.watch 的 rename 事件含删除，
+	// 回调不分事件类型）、未写完、JSON 损坏或校验失败时一律静默返回——不 journal、不 claim、
+	// 不注入；且不标 seen（未写完的可在下个事件/tick 重试；已删的不会再触发）。
+	// 此前 null 照走全链，产生 "(no summary)" 幻影完成 + 消耗掉 .notified 认领。
+	if (!result) return false;
+	seenResults.add(fileName);
 
 	// 会话定位（前置：fencing 豁免判定需要它）：由 links.jsonl 找到派发该 tab 的会话。
 	// 双匹配：links 记录派发时身份（sessionIdentity：tab runId 优先），重启后本进程 scope 可能

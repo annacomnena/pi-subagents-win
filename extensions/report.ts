@@ -147,9 +147,9 @@ export function claimReportNotified(reportsDir: string, id: string): boolean {
 export function onNewReport(reportsDir: string, id: string, opts: ReportListenerOptions): boolean {
 	if (selfDisabled) return false; // 旧实例已失效
 	if (seenReports.has(id)) return false;
-	seenReports.add(id);
 	const record = readReportFile(reportsDir, id);
-	if (!record) return false;
+	if (!record) return false; // 被删/未写完/损坏：不标 seen（下个事件/tick 可重试），与 event-bus 空结果守卫同理
+	seenReports.add(id);
 
 	if (opts.onReport) {
 		opts.onReport(record, id);
