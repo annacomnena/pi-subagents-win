@@ -35,12 +35,13 @@
  *   占位类型（主会话拍板③：snapshot.ts 只做加法、不收紧已有类型）。
  */
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { isObjectAddress, workstreamAddress, type ObjectAddress } from "../runtime/address.ts";
 import { readAttentionItems } from "../runtime/master-auto.ts";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { defaultMailboxDir, listLetters } from "../runtime/mailbox.ts";
+import type { Letter } from "../runtime/protocol.ts";
 import { readProposal } from "../runtime/master-succession.ts";
 import { listWorkstreams } from "../runtime/workstreams.ts";
 
@@ -148,12 +149,28 @@ function pushMailbox(mailboxDir: string, out: Candidate[]): void {
 	if (!existsSync(mailboxDir)) return;
 	for (const d of readdirSync(mailboxDir, { withFileTypes: true })) {
 		if (!d.isDirectory()) continue;
-		const recipient = unsanitizeRecipient(d.name);
-		// 反解失败（best-effort 碰撞）→ 该收件箱无法归属，静默跳过（source 可选，plan ③.3）
-		if (!recipient) continue;
-		for (const letter of listLetters(recipient, "pending", mailboxDir)) {
+		const recoveredRecipient = unsanitizeRecipient(d.name);
+		// 常见单段地址可由目录名反解，复用现成 tolerant reader。run:// 等地址中的
+		// 路径分隔符也被 sanitize 成 `_`，不可逆；此时从信封的 to 字段恢复真实 recipient，
+		// 而不是静默漏掉该收件箱的 attention。
+		let letters: Letter[];
+		if (recoveredRecipient) {
+			letters = listLetters(recoveredRecipient, "pending", mailboxDir);
+		} else {
+			letters = [];
+			for (const name of readdirSync(join(mailboxDir, d.name))) {
+				if (!name.endsWith(".json")) continue;
+				try {
+					const letter = JSON.parse(readFileSync(join(mailboxDir, d.name, name), "utf8")) as Letter;
+					if (letter.status === "pending") letters.push(letter);
+				} catch {
+					/* 坏信跳过（与 listLetters 一致） */
+				}
+			}
+		}
+		for (const letter of letters) {
 			const f = letter.frame;
-			if (f.frame !== "message" || (f.kind !== "ESCALATION" && f.kind !== "QUESTION")) continue;
+			if (f.frame !== "message" || (f.kind !== "ESCALATION" && f.kind !== "QUESTION") || !isObjectAddress(f.to)) continue;
 			const type: AttentionType = f.kind === "ESCALATION" ? "escalation" : "question";
 			const s = f.body.summary;
 			out.push({
@@ -162,7 +179,7 @@ function pushMailbox(mailboxDir: string, out: Candidate[]): void {
 				severity: type === "escalation" ? "warning" : "info",
 				title: `${type === "escalation" ? "Escalation" : "Question"}: ${s.slice(0, 48)}`,
 				summary: `${f.kind} ${f.id} from ${f.from} → ${f.to}: ${s}`,
-				source: recipient,
+				source: f.to,
 				status: "open",
 				createdAt: f.sentAt,
 				dedupeKey: f.id,

@@ -54,7 +54,7 @@ import { buildTimelineItems, TIMELINE_DEFAULT_LIMIT, TIMELINE_LIMIT_MAX, type Ti
 import { buildRuntimeSnapshot } from "./runtime-host/snapshot.ts";
 import { createRuntimeHostServer, type RuntimeHostHandle } from "./runtime-host/server.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
-import { masterAddress } from "./runtime/address.ts";
+import { masterAddress, tabRunAddress } from "./runtime/address.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import { newMessageFrame, type MessageKind } from "./runtime/protocol.ts";
@@ -117,13 +117,19 @@ function seedWorkstream(stateDir: string, id: string, status: string, updatedAt:
 	});
 }
 
-function deliver(mailboxDir: string, kind: MessageKind, sentAt: string, summary = `sum-${kind}`): string {
+function deliver(
+	mailboxDir: string,
+	kind: MessageKind,
+	sentAt: string,
+	summary = `sum-${kind}`,
+	to = masterAddress(),
+): string {
 	const { letter } = deliverLetter(
 		newMessageFrame({
 			id: newEnvelopeId("msg"),
 			kind,
 			from: "agent://worker_a",
-			to: masterAddress(),
+			to,
 			sentAt,
 			summary,
 		}),
@@ -355,6 +361,12 @@ async function main(): Promise<void> {
 		writeFileSync(join(dir, `${escId}.json`), JSON.stringify({ ...letter, status: "claimed" }), "utf8");
 		items = att(join(D, "state"), M);
 		assert.deepEqual(items.map((x) => x.id), [`question:${qstId}`], "claimed 信排除（listLetters status=pending）");
+		// run:// 地址的目录名会把第二个 / sanitize 成 `_`，不能靠目录名无损反解；
+		// 投影必须仍从信内 to 恢复 recipient，而非漏掉该收件箱。
+		const runId = deliver(M, "ESCALATION", at(7), "run-recipient", tabRunAddress("tab_mail"));
+		items = att(join(D, "state"), M);
+		const runRecipient = items.find((x) => x.id === `escalation:${runId}`)!;
+		assert.equal(runRecipient.source, "run://tab/tab_mail", "不可逆 spool 目录仍映射 mailbox attention（source = frame.to）");
 	}
 
 	// ── T6 workstream：blocked 出现 / 其它不出现 / 坏文件跳过 ─────
@@ -623,6 +635,19 @@ async function main(): Promise<void> {
 		assert.deepEqual(snap.attention, []);
 		assert.equal(snap.timeline.length, 1, "snapshot.timeline 不受坏 state 文件影响（journal 段独立）");
 		assert.deepEqual(snap.sectionErrors, [], "底层 tolerant 吞掉的坏文件不进 sectionErrors（G1 收窄语义）");
+		// HTTP 层也必须把全缺席/坏源降级为 200（而非只验证纯函数）。
+		const h = await createRuntimeHostServer({
+			hostPath: join(D, "host.json"), timersDir: join(D, "timers"), stateDir: S, mailboxDir: M,
+			journalPath: J, linksPath: join(D, "links.jsonl"),
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			for (const path of ["/v1/attention", "/v1/timeline", "/v1/snapshot"]) {
+				assert.equal((await fetch(`${base}${path}`)).status, 200, `${path}：缺席/坏源仍 200`);
+			}
+		} finally {
+			await h.close();
+		}
 	}
 
 	// 清理
