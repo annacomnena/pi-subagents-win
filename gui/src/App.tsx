@@ -43,7 +43,7 @@ export default function App() {
 			<TopBar />
 			{connection === "down" && (
 				<div className="border-b border-amber-900/60 bg-amber-950/60 px-4 py-1 text-center text-[11px] text-amber-300">
-					Host 连接中断（自动重试中）· 数据 as-of {fmtTime(lastAsOf)}
+					与后端服务断开，正在自动重试——以下数据截至 {fmtTime(lastAsOf)}
 				</div>
 			)}
 			<div className="flex min-h-0 flex-1">

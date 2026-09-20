@@ -1,11 +1,10 @@
 /**
- * Runtime 页（S6，§37）：Host / counts / journal / session 心跳 / 约定路径。
- * Runtime paths host 未暴露 → v0 硬编码 ~/.pi/agent/runtime 约定路径展示（拍板 2②）。
+ * Runtime 页（G5.1 人话化）：后端服务 / 数量一览 / 事件日志 / 会话心跳 / 约定路径。
+ * 约定路径 host 未暴露 → v0 硬编码 ~/.pi/agent/runtime 默认位置展示。
  */
 
 import { useGui } from "../store";
-import { fmtDateTime, fmtTime } from "../format";
-import { Badge, Card, EmptyState, naBadge } from "../ui";
+import { Badge, Card, EmptyState, PageIntro, RelTime, ShortId, Term, naBadge } from "../ui";
 
 export function RuntimePage() {
 	const health = useGui((s) => s.health);
@@ -13,98 +12,106 @@ export function RuntimePage() {
 
 	if (!health && !runtime) {
 		return (
-			<Card title="Runtime">
-				<EmptyState>等待 /v1/health 与 /v1/snapshot …（host 未就绪或连接中断）</EmptyState>
-			</Card>
+			<div className="space-y-3">
+				<PageIntro>后端全景：服务、信箱、任务、定时器</PageIntro>
+				<Card title={<Term zh="运行时" en="Runtime" />}>
+					<EmptyState>正在等待后端数据…（服务未就绪或连接中断）</EmptyState>
+				</Card>
+			</div>
 		);
 	}
 
 	const counts = runtime?.counts;
 	const journal = runtime?.journal;
-	const countsRows: [string, number | undefined][] = [
-		["workstreams", counts?.workstreams],
-		["tasks", counts?.tasks],
-		["runs", counts?.runs],
-		["pendingMailbox", counts?.pendingMailbox],
+	const countsRows: [string, string, number | undefined][] = [
+		["工作流", "workstreams", counts?.workstreams],
+		["任务", "tasks", counts?.tasks],
+		["运行", "runs", counts?.runs],
+		["待领信件", "pendingMailbox", counts?.pendingMailbox],
 	];
-	const journalRows: [string, number | undefined][] = [
-		["totalEvents", journal?.totalEvents],
-		["applied", journal?.applied],
-		["skipped", journal?.skipped],
-		["skippedBadLines", journal?.skippedBadLines],
+	const journalRows: [string, string, number | undefined][] = [
+		["总事件数", "totalEvents", journal?.totalEvents],
+		["已应用", "applied", journal?.applied],
+		["已跳过", "skipped", journal?.skipped],
+		["坏行跳过", "skippedBadLines", journal?.skippedBadLines],
 	];
 
 	return (
-		<div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-			<Card title="Host">
-				{health ? (
-					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
-						<dt className="text-zinc-500">instanceId</dt>
-						<dd className="font-mono break-all text-zinc-200">{health.host.instanceId}</dd>
-						<dt className="text-zinc-500">listen</dt>
-						<dd className="font-mono text-zinc-200">
-							127.0.0.1:{health.host.port} · pid {health.host.pid}
-						</dd>
-						<dt className="text-zinc-500">startedAt</dt>
-						<dd className="font-mono text-zinc-200">{fmtDateTime(health.host.startedAt)}</dd>
-						<dt className="text-zinc-500">protocolVersion</dt>
-						<dd className="font-mono text-zinc-200">{health.host.protocolVersion}</dd>
-						<dt className="text-zinc-500">generatedAt</dt>
-						<dd className="font-mono text-zinc-200">{fmtTime(health.generatedAt)}</dd>
-					</dl>
-				) : (
-					naBadge("health 未就绪")
-				)}
-			</Card>
+		<div className="space-y-3">
+			<PageIntro>后端全景：服务、信箱、任务、定时器</PageIntro>
+			<div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+				<Card title={<Term zh="服务" en="Host" />}>
+					{health ? (
+						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+							<dt className="text-zinc-500">实例 ID</dt>
+							<dd><ShortId value={health.host.instanceId} /></dd>
+							<dt className="text-zinc-500">监听地址</dt>
+							<dd className="font-mono text-zinc-200">
+								127.0.0.1:{health.host.port} · pid {health.host.pid}
+							</dd>
+							<dt className="text-zinc-500">启动时间</dt>
+							<dd><RelTime at={health.host.startedAt} className="text-zinc-200" /></dd>
+							<dt className="text-zinc-500">协议版本</dt>
+							<dd className="font-mono text-zinc-200">{health.host.protocolVersion}</dd>
+							<dt className="text-zinc-500">数据生成于</dt>
+							<dd><RelTime at={health.generatedAt} className="text-zinc-200" /></dd>
+						</dl>
+					) : (
+						naBadge("后端数据未就绪")
+					)}
+				</Card>
 
-			<Card title="Counts">
-				<div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-					{countsRows.map(([k, v]) => (
-						<div key={k} className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1.5">
-							<p className="font-mono text-lg text-zinc-100">{v ?? "—"}</p>
-							<p className="text-[10px] text-zinc-500">{k}</p>
-						</div>
-					))}
-				</div>
-			</Card>
-
-			<Card title="Journal（本次 rebuild）">
-				<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
-					{journalRows.map(([k, v]) => (
-						<RuntimeRow key={k} label={k} value={v === undefined ? "—" : String(v)} />
-					))}
-					<dt className="text-zinc-500">lastEnvelopeAt</dt>
-					<dd className="font-mono text-zinc-200">{health ? fmtDateTime(health.journalTail.lastEnvelopeAt) : "—"}</dd>
-				</dl>
-			</Card>
-
-			<Card title={`Session Heartbeats（${health?.sessionHeartbeats.length ?? 0}）`}>
-				{!health || health.sessionHeartbeats.length === 0 ? (
-					<EmptyState>无会话心跳（timers sessions/ 目录为空或 health 未就绪）</EmptyState>
-				) : (
-					<ul className="space-y-1 text-[11px]">
-						{health.sessionHeartbeats.map((h) => (
-							<li key={h.sessionId} className="flex items-center gap-2">
-								{h.alive ? <Badge tone="green">alive</Badge> : <Badge tone="gray">stale</Badge>}
-								<span className="font-mono break-all text-zinc-400">{h.sessionId}</span>
-								<span className="ml-auto shrink-0 text-zinc-600">{fmtTime(h.lastActiveAt)}</span>
-							</li>
+				<Card title={<Term zh="数量一览" en="counts" />}>
+					<div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+						{countsRows.map(([zh, en, v]) => (
+							<div key={en} className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1.5">
+								<p className="text-lg text-zinc-100">{v === undefined ? <span className="text-sm text-zinc-600">暂无</span> : v}</p>
+								<p className="text-[10px] text-zinc-500">
+									{zh} <span className="font-mono text-zinc-600">{en}</span>
+								</p>
+							</div>
 						))}
-					</ul>
-				)}
-			</Card>
+					</div>
+				</Card>
 
-			{/* dl 渲染放组件外（上方 PathsCard 内联 map 的占位实现废弃） */}
-			<PathsCardStatic />
+				<Card title={<Term zh="事件日志（本次重建）" en="journal" />}>
+					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+						{journalRows.map(([zh, en, v]) => (
+							<RuntimeRow key={en} label={<>{zh} <span className="font-mono text-zinc-600">{en}</span></>} value={v === undefined ? "暂无" : String(v)} />
+						))}
+						<dt className="text-zinc-500">最近事件</dt>
+						<dd><RelTime at={health ? health.journalTail.lastEnvelopeAt : null} className="text-zinc-200" /></dd>
+					</dl>
+				</Card>
+
+				<Card title={<Term zh={`会话心跳（${health?.sessionHeartbeats.length ?? 0}）`} en="session heartbeats" />}>
+					{!health || health.sessionHeartbeats.length === 0 ? (
+						<EmptyState>暂无会话心跳（还没有会话活动，或数据未就绪）</EmptyState>
+					) : (
+						<ul className="space-y-1 text-[11px]">
+							{health.sessionHeartbeats.map((h) => (
+								<li key={h.sessionId} className="flex items-center gap-2">
+									{h.alive ? <Badge tone="green" title="15 秒内有心跳">在线</Badge> : <Badge tone="gray" title="心跳超时">失联</Badge>}
+									<ShortId value={h.sessionId} className="text-zinc-400" />
+									<RelTime at={h.lastActiveAt} className="ml-auto shrink-0 text-zinc-600" />
+								</li>
+							))}
+						</ul>
+					)}
+				</Card>
+
+				{/* 约定路径（host 未暴露，展示默认位置） */}
+				<PathsCardStatic />
+			</div>
 		</div>
 	);
 }
 
-function RuntimeRow({ label, value }: { label: string; value: string }) {
+function RuntimeRow({ label, value }: { label: React.ReactNode; value: string }) {
 	return (
 		<>
 			<dt className="text-zinc-500">{label}</dt>
-			<dd className="font-mono text-zinc-200">{value}</dd>
+			<dd className="text-zinc-200">{value}</dd>
 		</>
 	);
 }
@@ -112,15 +119,15 @@ function RuntimeRow({ label, value }: { label: string; value: string }) {
 function PathsCardStatic() {
 	const base = "~/.pi/agent/runtime";
 	const rows: [string, string][] = [
-		["runtime dir", `${base}/（PI_RUNTIME_DIR 可覆盖）`],
-		["host.json", `${base}/host.json（hint 非 truth）`],
-		["journal", `${base}/events.jsonl`],
-		["state", `${base}/state/`],
-		["mailbox", `${base}/mailbox/`],
-		["links", "~/.pi/agent/links.jsonl"],
+		["运行目录", `${base}/（可用 PI_RUNTIME_DIR 覆盖）`],
+		["配置文件", `${base}/host.json（提示用，非权威）`],
+		["事件日志", `${base}/events.jsonl`],
+		["状态目录", `${base}/state/`],
+		["信箱目录", `${base}/mailbox/`],
+		["链接文件", "~/.pi/agent/links.jsonl"],
 	];
 	return (
-		<Card title="Runtime Paths（约定路径，host 未暴露）">
+		<Card title={<Term zh="约定路径（后端未提供，以下为默认位置）" en="paths" />}>
 			<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
 				{rows.map(([k, v]) => (
 					<span key={k} className="contents">

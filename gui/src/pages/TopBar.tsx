@@ -1,7 +1,8 @@
-/** 顶栏（plan §2）：Host● = masterOwnerAlive；Master % = 最近 proposal 时点压力 + as-of（无则 n/a）。 */
+/** 顶栏（G5.1 人话化）：服务●绿点=在线/灰点=离线（=值守会话心跳）；上下文压力=最近提案时点值 + 非实时标注。 */
 
 import { useGui } from "../store";
-import { fmtPct, fmtTime } from "../format";
+import { fmtPct, fmtRel, fmtTime } from "../format";
+import { Term } from "../ui";
 import type { AttentionItem } from "../api/types";
 
 function asString(v: unknown): string | undefined {
@@ -21,13 +22,21 @@ export function TopBar() {
 
 	const ownerAlive = health ? health.masterOwnerAlive : null;
 	const dot =
-		ownerAlive === null
+		ownerAlive === null || !ownerAlive
 			? "bg-zinc-600"
-			: ownerAlive
-				? "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.8)]"
-				: "bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.8)]";
+			: "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.8)]";
 	const dotLabel =
-		ownerAlive === null ? "Host（未 attach）" : ownerAlive ? "Host · owner 存活" : "Host · owner stale";
+		ownerAlive === null
+			? "服务（状态未知）"
+			: ownerAlive
+				? "服务（在线）"
+				: "服务（离线）";
+	const dotHint =
+		ownerAlive === null
+			? "还没有后端数据，无法判断在线状态"
+			: ownerAlive
+				? "值守会话心跳正常（15 秒内有动静）"
+				: "值守会话心跳超时——当前值守可能已断开";
 
 	const proposal = latestHandoffAttention(attention);
 	const pressure = proposal?.payload?.pressure;
@@ -36,13 +45,19 @@ export function TopBar() {
 	return (
 		<header className="flex items-center gap-4 border-b border-zinc-800 bg-zinc-900 px-4 py-2">
 			<span className="flex items-center gap-2 text-xs font-semibold">
-				<span className={`h-2.5 w-2.5 rounded-full ${dot}`} title={dotLabel} />
+				<span className={`h-2.5 w-2.5 rounded-full ${dot}`} title={dotHint} />
 				{dotLabel}
 			</span>
-			<span className="text-xs text-zinc-400">
-				Master{" "}
-				<span className="font-mono text-zinc-200">{fmtPct(typeof pressure === "number" ? pressure : null)}</span>
-				{typeof pressure === "number" && <span className="ml-1 text-[10px] text-zinc-500">as-of {fmtTime(asString(asOf))}（proposal 时点，非 live）</span>}
+			<span className="flex items-center gap-1 text-xs text-zinc-400">
+				<Term zh="上下文压力" en="context pressure" hint="会话记忆快满时会自动提议交接" />
+				<span className="font-mono text-zinc-200">
+					{typeof pressure === "number" ? fmtPct(pressure as number) : <span className="text-zinc-600">暂无数据</span>}
+				</span>
+				{typeof pressure === "number" && (
+					<span className="text-[10px] text-zinc-500" title={asString(asOf) ? fmtTime(asString(asOf)) : undefined}>
+						（{fmtRel(asString(asOf))}的提案值，非实时）
+					</span>
+				)}
 			</span>
 			<span className="ml-auto flex items-center gap-3 text-[11px] text-zinc-500">
 				{health && (
@@ -50,8 +65,8 @@ export function TopBar() {
 						<span className="font-mono">
 							127.0.0.1:{health.host.port} · pid {health.host.pid} · pv{health.host.protocolVersion}
 						</span>
-						<span className="font-mono">journal {health.journalTail.totalEvents}</span>
-						<span className="font-mono">mailbox {health.mailboxPending}</span>
+						<span className="font-mono" title="journal.totalEvents（事件日志总条数）">日志 {health.journalTail.totalEvents}</span>
+						<span className="font-mono" title="mailboxPending（未领信件数）">信箱 {health.mailboxPending}</span>
 					</>
 				)}
 			</span>
