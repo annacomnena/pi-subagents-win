@@ -230,7 +230,8 @@ export function readWakeState(workstreamId: string, stateDir?: string): WakeStat
 	}
 }
 
-function writeWakeState(stateDir: string, state: WakeState): void {
+/** 导出供 local master v1 复用：wake-state 以 <scope> 命名落盘（per-workstream 结构不变）。 */
+export function writeWakeState(stateDir: string, state: WakeState): void {
 	const dir = wakeStateDir(stateDir);
 	mkdirSync(dir, { recursive: true });
 	const path = join(dir, `${state.workstreamId}.json`);
@@ -239,7 +240,8 @@ function writeWakeState(stateDir: string, state: WakeState): void {
 	renameSync(tmp, path);
 }
 
-function wakeHolder(sessionId: string, workstreamId: string): string {
+/** 导出供 local master v1 复用（id 传 scope，同构 holder 规则）。 */
+export function wakeHolder(sessionId: string, workstreamId: string): string {
 	return `wake:${sessionId}:${workstreamId.slice(0, 14)}`;
 }
 
@@ -260,7 +262,8 @@ function describeLetter(letter: Letter): WakeLetter {
  * 在飞判定：无 result.json 且 dispatch 年轻（窗口内）→ 等；
  * dispatch 缺失/不可读/年老 → 视为 orphaned，可重生（at-least-once）。
  */
-function isInFlight(
+/** 导出供 local master v1 复用（同规则：无终态且 dispatch 年轻 → 在飞）。 */
+export function isInFlight(
 	tabRunId: string,
 	opts: { runsDir?: string; now: number; inFlightWindowMs?: number },
 ): boolean {

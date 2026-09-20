@@ -32,6 +32,9 @@ export interface MasterAttachment {
 	attachedAt: string;
 	lastHeartbeatAt: string;
 	attemptId: string;
+	/** 自由字段，注册表不解释。local master v1：认领时解析出的仓库 toplevel 完整路径
+	 *（spawn 唤醒 tab 的 cwd 来源；无 git 时回退 cwd 本身）。 */
+	detail?: string;
 }
 
 export interface HandoffToken {
@@ -92,6 +95,8 @@ export interface AttachInput {
 	forceStale?: boolean;
 	staleAfterMs?: number;
 	now?: Date;
+	/** 自由字段：genesis 时写入（local master v1：toplevel 路径）；后续 bump/刷新保留既有值 */
+	detail?: string;
 }
 
 export type AttachResult =
@@ -122,6 +127,7 @@ export function attachMaster(input: AttachInput): AttachResult {
 			attachedAt: now,
 			lastHeartbeatAt: now,
 			attemptId: newAttemptId(),
+			...(input.detail && input.detail.trim() ? { detail: input.detail.trim() } : {}),
 		};
 		try {
 			writeFileSync(attachmentPathFor(agent), JSON.stringify(genesis, null, 2), { flag: "wx", encoding: "utf8" });
@@ -183,6 +189,7 @@ function attachWithOwnerLocked(
 			attachedAt: now,
 			lastHeartbeatAt: now,
 			attemptId: newAttemptId(),
+			...(current.detail ? { detail: current.detail } : {}),
 		};
 		writeJsonAtomic(attachmentPathFor(agent), next);
 		return { ok: true, attachment: next, genesis: false };
@@ -199,6 +206,7 @@ function attachWithOwnerLocked(
 			attachedAt: now,
 			lastHeartbeatAt: now,
 			attemptId: newAttemptId(),
+			...(current.detail ? { detail: current.detail } : {}),
 		};
 		writeJsonAtomic(attachmentPathFor(agent), next);
 		return { ok: true, attachment: next, genesis: false };

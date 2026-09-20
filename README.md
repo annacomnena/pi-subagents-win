@@ -336,6 +336,30 @@ launch-tabs(batch N)                 # returns runIds
 
 Hours-long, unattended pipelines become a sequence of small orchestration steps.
 
+### 6.7 Local master v1 — per-repo local master
+
+A second-level master scoped **per repository** sits under the global master. Each repo gets its own local master address `agent://master_local_<scope>`; a pi session started in that repo silently becomes its owner (if the scope is unowned) and runs a per-repo wake loop for its scope mailbox. The global master (`agent://master_default`) and its event-bus registration are untouched.
+
+**Scope key rule** (`localMasterScope`, pure, never throws):
+- git repo → basename of `git rev-parse --show-toplevel` (a subdirectory cwd resolves to the repo root, not the subdirectory name);
+- non-git → basename of cwd;
+- worktree path → suffix `-worktree` (same title convention as launch-tabs), so a worktree and a same-named plain repo get distinct scopes;
+- drive-relative drive-letter input is deliberately canonicalized before every Git lookup (`C:a` → `C:/a`, equivalent here to `C:\a`), so both styles map to the same basename key.
+
+The result is always a short basename-style key (no `/`, no spaces) → parseable as a single-segment agent address and collision-free after attachment-file sanitize.
+
+**Silent genesis** (on `session_start`): if the scope has no owner, the session `attach`es the scope address (wx atomic — concurrent starts yield exactly one winner); the repo **toplevel full path** is written into the attachment `detail` free field (used as the wake spawn cwd; fallback = cwd). All failure paths (bad session, owner already present, IO) are silent — genesis never throws and never touches an existing owner's attachment.
+
+**Per-repo wake loop** (`registerScopeWakeLoop`): only the scope owner registers a tick; each tick reads cutover fresh (global cutover off → idle, Q4), then evaluates the scope mailbox: wake/command-class letters spawn a tab with `cwd` = the scope repo toplevel (read back from `attachment.detail`); REPORT-shape letters are skipped without claim (they belong to the global master, S7 double insurance). Spawn success confirms a `<scope>`-named wake state; spawn failure lands a per-scope attention item.
+
+**Per-scope attention**: `~/.pi/agent/state/local-master-attention/<scope>.json` — separate from the global `master-attention.json`; a session with both global and scope identity writes to both, with no shared marker files.
+
+**`preInject` recipient**: the injection gate accepts an optional `recipient` address. When absent, behavior is byte-identical to the global master path (zero regression). Scope consumers pass their scope address so owner suppression / dispatcher-wake exemption are judged per recipient.
+
+**Power boundary (v1 exclusions)**: no succession/transfer, no stale/heartbeat re-attach, no auto master selection, no `workstream --cwd`. A lost owner simply means the scope stays owned-but-inactive until the attachment is manually cleared.
+
+**Known limitation (Q2)**: the scope key is a basename — two *different* repos with the same name on different drives/paths (e.g. `D:\proj` and `E:\proj`) collide into one scope. Worktrees vs. same-named plain repos are distinguished by the `-worktree` suffix; cross-drive same-name repos are not (accepted in v1).
+
 ---
 
 ## 7. Trace Fusion Loop — three-lane parallel diagnosis (`/trace-fusion-loop`)

@@ -17,6 +17,7 @@ import { masterAddress } from "./runtime/address.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
 import { readAttachment } from "./runtime/registry.ts";
+import { noteScopeWakeInbox } from "./runtime/scope.ts";
 import {
 	DEFAULT_MASTER_SUCCESSION,
 	maybeAutoSucceed,
@@ -151,46 +152,61 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			// 所有权必须与 attach 写入侧同在持久 UUID 域：tab runId 只用于 links 路由。
 			const sid = durableSessionIdentity(ctx as never);
 			if (!sid || sid === "unknown") return;
+
+			// ── 全局分支（S2/S3，行为零变化）：仅当本会话是全局 owner 才做事 ──
 			const att = readAttachment(masterAddress());
-			if (!att || att.sessionId !== sid) return;
-			const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
-			if (typeof getUsage !== "function") return;
-			const reading = readPressure(getUsage.call(ctx) as never);
-			const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
-			const cfg = deps.masterSuccession?.() ?? DEFAULT_MASTER_SUCCESSION;
-			// S2：owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）；
-			// proposalPercent 缺省 0.75，与现状零差；enabled=false（总开关 off）→ 静默 null。
-			const r = maybePropose({ sessionId: sid, generation: att.generation, reading, proposalPercent: cfg.proposalPercent / 100, enabled: cfg.enabled });
-			if (r && r.proposed) {
-				try {
-					ui?.notify?.(
-						`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
-						"warning",
-					);
-				} catch { /* 通知尽力而为，proposal 已落盘 */ }
-			}
-			// S3 自动交接（A1）：gate 短路 + 失败回退全在 master-auto.ts；这里只做调用与尽力 notify。
-			// OFF 时 gate 第一关 auto-off 即返回，零写零事件零 spawn。
-			if (deps.masterSuccession) {
-				const auto = maybeAutoSucceed({
-					sessionId: sid,
-					generation: att.generation,
-					reading,
-					cfg,
-					spawn: deps.spawnSuccessor ?? null,
-				});
-				if (auto.action === "transferred") {
-					ui?.notify?.(
-						`Master 已自动交接：transfer=${auto.transferId} 后继=${auto.successorRunId}（gen ${auto.generation}→${auto.generation + 1}）`,
-						"info",
-					);
-				} else if (auto.action === "failed") {
-					ui?.notify?.(
-						`Master 自动交接失败（transfer=${auto.transferId}，${auto.error ?? "unknown"}）：你仍是 owner，已回退提议/人工：/master-transfer`,
-						"warning",
-					);
+			if (att && att.sessionId === sid) {
+				const getUsage = (ctx as unknown as { getContextUsage?: () => unknown }).getContextUsage;
+				if (typeof getUsage === "function") {
+					const reading = readPressure(getUsage.call(ctx) as never);
+					const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } }).ui;
+					const cfg = deps.masterSuccession?.() ?? DEFAULT_MASTER_SUCCESSION;
+					// S2：owner + 达线 + 同代未提过 → 落 pending + 尽力 notify（§10/§12）；
+					// proposalPercent 缺省 0.75，与现状零差；enabled=false（总开关 off）→ 静默 null。
+					const r = maybePropose({ sessionId: sid, generation: att.generation, reading, proposalPercent: cfg.proposalPercent / 100, enabled: cfg.enabled });
+					if (r && r.proposed) {
+						try {
+							ui?.notify?.(
+								`当前 Master context 已使用 ${r.proposal.pressure}%（proposal ${r.proposal.proposalId}）。建议无损 session handoff：回复“好”即交接；也可先继续。`,
+								"warning",
+							);
+						} catch { /* 通知尽力而为，proposal 已落盘 */ }
+					}
+					// S3 自动交接（A1）：gate 短路 + 失败回退全在 master-auto.ts；这里只做调用与尽力 notify。
+					// OFF 时 gate 第一关 auto-off 即返回，零写零事件零 spawn。
+					if (deps.masterSuccession) {
+						const auto = maybeAutoSucceed({
+							sessionId: sid,
+							generation: att.generation,
+							reading,
+							cfg,
+							spawn: deps.spawnSuccessor ?? null,
+						});
+						if (auto.action === "transferred") {
+							ui?.notify?.(
+								`Master 已自动交接：transfer=${auto.transferId} 后继=${auto.successorRunId}（gen ${auto.generation}→${auto.generation + 1}）`,
+								"info",
+							);
+						} else if (auto.action === "failed") {
+							ui?.notify?.(
+								`Master 自动交接失败（transfer=${auto.transferId}，${auto.error ?? "unknown"}）：你仍是 owner，已回退提议/人工：/master-transfer`,
+								"warning",
+							);
+						}
+					}
 				}
 			}
+
+			// ── scope 分支（local master v1）：与全局分支严格分离，不共享 marker 文件 ──
+			// 本会话是本 cwd 的 scope owner → 读本仓 wake 类信 → 追加 per-scope 本地 attention
+			//（wake-pending，按 letterId 去重）；不碰 S2/S3/succession，不写全局 master-attention.json。
+			let cwd: string | null = null;
+			try {
+				cwd = process.cwd();
+			} catch {
+				cwd = null;
+			}
+			if (cwd) noteScopeWakeInbox(sid, cwd);
 		} catch { /* gauge 永不打断主流程 */ }
 	});
 }

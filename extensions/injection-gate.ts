@@ -30,6 +30,11 @@ export interface InjectionContext {
 	/** 派发者唤醒（run 完成归派发者，不归 master owner）：跳过 owner 压制，但保留
 	 *  claimInjection 互斥（exactly-once 不变）。仅 links recipient 即本会话的 run 完成路径置位。 */
 	dispatcherWake?: boolean;
+	/** 接收逻辑地址（local master v1，S6）：owner 判定按此地址的 attachment；
+	 *  缺省 = 全局 masterAddress()（消费端不传 → 行为与现状逐字节一致，零回归）。
+	 *  语义：「消费端传谁的地址，就按谁的归属判」——scope 消费端传
+	 *  agent://master_local_<scope> 时不读全局 attachment（Q1-F6 落点）。 */
+	recipient?: ObjectAddress;
 }
 
 export type InjectionVerdict =
@@ -44,8 +49,9 @@ function holderOf(ctx: InjectionContext): string {
  * 注入前门。纯判定 + 原子 claim（claim 是唯一写操作；suppress 只写审计）。
  */
 export function preInject(ctx: InjectionContext): InjectionVerdict {
+	const recipient = ctx.recipient ?? masterAddress();
 	const cutover = readCutover();
-	const attachment = readAttachment(masterAddress());
+	const attachment = readAttachment(recipient);
 	// 未切换或无 registry → legacy 原行为
 	if (!cutover?.enabled || !attachment) return { inject: true, holder: holderOf(ctx) };
 
@@ -60,10 +66,11 @@ export function preInject(ctx: InjectionContext): InjectionVerdict {
 		return { inject: false, reason: "claimed-by-other" };
 	}
 
-	// owner 判定（新鲜快照；generation 前进视为易主）
-	const fresh = resolveRecipient(masterAddress());
+	// owner 判定（新鲜快照；generation 前进视为易主）：按 recipient 归属判（全局消费端缺省全局）
+	const fresh = resolveRecipient(recipient);
 	if (!fresh || fresh.sessionId !== ctx.sessionId) {
-		auditSuppression(ctx, "suppressed-not-owner", fresh);
+		// scope 侧 suppress 用 extra 带 recipient 区分（§5.4）；全局路径不传 recipient → 审计形状不变
+		auditSuppression(ctx, "suppressed-not-owner", fresh, ctx.recipient ? { recipient: ctx.recipient } : undefined);
 		return { inject: false, reason: "suppressed-not-owner" };
 	}
 

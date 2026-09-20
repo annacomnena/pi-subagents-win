@@ -79,7 +79,8 @@
     "test:runtime-hydrate": "node --experimental-strip-types ./extensions/_test_runtime_hydrate.ts",
     "test:runtime-snapshot": "node --experimental-strip-types ./extensions/_test_runtime_snapshot.ts",
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
-    "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts"
+    "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
+    "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

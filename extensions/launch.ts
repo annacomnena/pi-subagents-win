@@ -104,15 +104,25 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 }
 
 /**
+ * 驱动器相对冒号归一（纯函数）：`C:a` → `C:/a`（Windows 上 `C:a` 是 drive-relative，
+ * 与 `C:\a` 的 git 解析可能不同）；`C:\a` / `C:/a` / 非盘符路径原样返回。
+ * 所有 git 调用前必须先归一（L4 M3：旧实现无 capture group 却用 `$1`，实测产出 `$1:/a`）。
+ */
+export function normalizeDriveColon(p: string): string {
+	return p.replace(/^([A-Za-z]):(?![\\/])/g, "$1:/");
+}
+
+/**
  * Short repo name for tab titles.
  *
  * Priority: git origin remote basename (stable across main tree and worktrees)
  * → git toplevel basename → cwd path basename. Never throws.
  */
 export function repoName(cwd: string): string {
+	const norm = normalizeDriveColon(cwd);
 	const tryGit = (args: string[]): string => {
 		try {
-			const out = execFileSync("git", ["-C", cwd, ...args], {
+			const out = execFileSync("git", ["-C", norm, ...args], {
 				encoding: "utf8",
 				shell: false,
 				stdio: ["ignore", "pipe", "ignore"],
@@ -130,13 +140,28 @@ export function repoName(cwd: string): string {
 		if (base) return base;
 	}
 
-	const top = tryGit(["rev-parse", "--show-toplevel"]);
+	const top = gitToplevel(norm);
 	if (top) {
-		const base = top.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+		const base = normalizeDriveColon(top).split(/[\\/]/).pop();
 		if (base) return base;
 	}
 
-	return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+	return norm.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+}
+
+/** Git toplevel 的绝对路径（已去尾部分隔符）。永不抛错：非 git 仓 / 无 git / cwd 异常 → null。 */
+export function gitToplevel(cwd: string): string | null {
+	const norm = normalizeDriveColon(cwd);
+	try {
+		const out = execFileSync("git", ["-C", norm, "rev-parse", "--show-toplevel"], {
+			encoding: "utf8",
+			shell: false,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return out ? out.replace(/[\\/]+$/, "") : null;
+	} catch {
+		return null;
+	}
 }
 
 /** True when cwd sits inside a `worktrees/` directory (git worktree checkout). */

@@ -51,8 +51,9 @@ import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
-import { registerMailboxConsumer, registerWakeLoop } from "./mailbox-consumer.ts";
+import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
+import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
 	attachCurrentSession,
 	getMasterStatus,
@@ -1609,48 +1610,85 @@ export default function (pi: ExtensionAPI) {
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
 
+	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
+	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
+	const spawnOneShotTab = (args: {
+		sessionId: string;
+		taskId: string;
+		title: string;
+		prompt: string;
+		cwd: string;
+		linkDetail: string;
+	}): { runId: string; error?: string } => {
+		const wtPath = findWindowsTerminal();
+		if (!wtPath) return { runId: "", error: "no wt.exe" };
+		const piCli = findPiCli();
+		const runId = newTabRunId();
+		const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
+		const prompt = buildWorkflowTabPrompt(
+			{ taskId: args.taskId, title: args.title, prompt: args.prompt, model: undefined },
+			skillRef,
+			"execute",
+		);
+		const runsDir = defaultTabRunsDir();
+		const dispatch: TabDispatchRecord = {
+			id: runId, version: 1, taskId: args.taskId, mode: "execute", title: args.title, cwd: args.cwd,
+			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+		};
+		const markFailed = (err: Error): void => {
+			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+			writeTabDispatch(runsDir, failed);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+		};
+		writeTabDispatch(runsDir, dispatch);
+		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: args.linkDetail });
+		const result = spawnPiTab({
+			wtPath, piCli, cwd: args.cwd, title: args.title, prompt, tabRunId: runId, runsDir,
+			onSpawnError: (err) => markFailed(err),
+		});
+		if (result.error) {
+			markFailed(new Error(result.error));
+			return { runId, error: result.error };
+		}
+		return { runId };
+	};
+
 	// Sub-Master 唤醒循环（Phase 5c）：评估与消费同门；无 ws/无信/未切换时空转。
 	// spawn 走与 launch-tabs 相同的账本序列（dispatch→journal→link→spawn→failed 回写）。
 	collect(registerWakeLoop(pi, {
 		intervalMs: 30_000,
 		spawn: (decision: WakeDecision, sessionId: string | undefined) => {
 			if (!sessionId) throw new Error("wake spawn: session unknown");
-			const wtPath = findWindowsTerminal();
-			if (!wtPath) throw new Error("wake spawn: no wt.exe");
-			const piCli = findPiCli();
-			const runId = newTabRunId();
-			const taskId = `wake-${decision.workstreamId.slice(0, 14)}`;
-			const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
-			const title = `wake ${decision.workstreamId.slice(0, 14)} (${decision.letters.length} inputs)`;
-			const prompt = buildWorkflowTabPrompt(
-				{ taskId, title, prompt: decision.prompt ?? "", model: undefined },
-				skillRef,
-				"execute",
-			);
-			const cwd = process.cwd();
-			const runsDir = defaultTabRunsDir();
-			const dispatch: TabDispatchRecord = {
-				id: runId, version: 1, taskId, mode: "execute", title, cwd,
-				dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
-			};
-			writeTabDispatch(runsDir, dispatch);
-			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
-			recordLink({ sessionId, kind: "tab", targetId: runId, detail: `wake=${decision.workstreamId}` });
-			const result = spawnPiTab({
-				wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
-				onSpawnError: (err) => {
-					const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
-					writeTabDispatch(runsDir, failed);
-					emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				},
+			const r = spawnOneShotTab({
+				sessionId,
+				taskId: `wake-${decision.workstreamId.slice(0, 14)}`,
+				title: `wake ${decision.workstreamId.slice(0, 14)} (${decision.letters.length} inputs)`,
+				prompt: decision.prompt ?? "",
+				cwd: process.cwd(),
+				linkDetail: `wake=${decision.workstreamId}`,
 			});
-			if (result.error) {
-				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
-				writeTabDispatch(runsDir, failed);
-				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-				throw new Error(result.error);
-			}
-			return runId;
+			if (r.error) throw new Error(r.error);
+			return r.runId;
+		},
+	}));
+
+	// Local Master v1 唤醒循环（per-repo，0920）：本 scope 无 owner 时 session_start 静默认领；
+	// 本会话为 scope owner 才 tick。spawn cwd = scope 仓 toplevel（读回 attachment.detail，缺省回退 cwd）。
+	collect(registerScopeWakeLoop(pi, {
+		intervalMs: 30_000,
+		spawn: (decision: ScopeWakeDecision, sessionId: string | undefined) => {
+			if (!sessionId) throw new Error("scope wake spawn: session unknown");
+			const r = spawnOneShotTab({
+				sessionId,
+				taskId: `l2-${decision.scope.slice(0, 14)}`,
+				title: `l2 ${decision.scope.slice(0, 20)} (${decision.letters.length} inputs)`,
+				prompt: decision.prompt ?? "",
+				cwd: decision.repoCwd ?? process.cwd(),
+				linkDetail: `l2=${decision.scope}`,
+			});
+			if (r.error) throw new Error(r.error);
+			return r.runId;
 		},
 	}));
 

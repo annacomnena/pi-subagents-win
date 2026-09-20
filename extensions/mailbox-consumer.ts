@@ -27,9 +27,18 @@ import { resolveRecipient } from "./runtime/resolver.ts";
 import { auditSuppression, postInject, preInject } from "./injection-gate.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
-import { isMainSession, isSubagent } from "./identity.ts";
+import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
+import {
+	auditScopeWakeSpawnFailed,
+	confirmScopeWakeSpawn,
+	evaluateScopeWake,
+	localMasterAddress,
+	localMasterScope,
+	silentScopeGenesis,
+	type ScopeWakeDecision,
+} from "./runtime/scope.ts";
 
 export interface ConsumeOptions {
 	sessionId: string | undefined;
@@ -138,9 +147,9 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				reportPush(report, messageId, "skipped", "generation-moved");
 				continue; // 已 claim 的信留给 stale 回收（不丢）
 			}
-			// 统一门
+			// 统一门（S6：消费端传谁的 recipient 就按谁的归属判；缺省全局逐字节不变，零回归）
 			const key = receiptKeyFor(letter);
-			const verdict = preInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer" });
+			const verdict = preInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer", ...(opts.recipient ? { recipient: opts.recipient } : {}) });
 			if (!verdict.inject) {
 				if (verdict.reason === "already-injected") {
 					ackLetter(recipient, frameId!, { mailboxDir }); // 活干完了，收尾 ack
@@ -320,6 +329,89 @@ export function registerWakeLoop(
 			}
 		}, opts.intervalMs ?? 30_000);
 		interval.unref?.();
+	});
+	return () => {
+		sessionGen++;
+		if (interval) clearInterval(interval);
+		interval = null;
+	};
+}
+
+/**
+ * 注册 Local Master v1 唤醒循环（per-repo，0920）：与 registerWakeLoop 同形态但独立 interval。
+ *
+ * session_start（子 agent 恒跳过）：
+ *   1. 静默 genesis（S2）：本 scope 无 owner → 静默认领（有 owner / 身份 unknown /
+ *      attach 失败全静默 no-op，不重试不上报；不调 triggerOwnershipRecheck）；
+ *   2. 本会话是本 scope owner（新认领或在位）→ 启动 tick；否则零动作
+ *      （脑裂回归：同仓第二会话不注册消费端，在位者 attachment 无感）。
+ * tick：evaluateScopeWake（cutover off / 无 owner / 无 wake 类信 / in-flight → 空转，Q4）
+ *   → spawn（调用方注入，cwd 由调用方按 decision.repoCwd 传 scope 仓 toplevel）
+ *   → confirmScopeWakeSpawn（wake-state 以 <scope> 命名 + 同 holder ack）；
+ *   spawn 抛错 → per-scope attention（wake-spawn-failed），信留 claimed（stale 恢复）。
+ * 不碰全局 event-bus 注册逻辑；scope 消费端只吃 wake/命令类信（S7 谓词在 evaluate 内）。
+ */
+export function registerScopeWakeLoop(
+	pi: {
+		on: (event: string, cb: (event: unknown, ctx?: { sessionManager?: { sessionId?: string } }) => void) => void;
+	},
+	opts: {
+		/** scope 解析 cwd（缺省 session_start 时 process.cwd()；测试注入用） */
+		cwd?: string;
+		spawn: (decision: ScopeWakeDecision, sessionId: string | undefined) => string;
+		mailboxDir?: string;
+		stateDir?: string;
+		runsDir?: string;
+		intervalMs?: number;
+	},
+): () => void {
+	let interval: ReturnType<typeof setInterval> | null = null;
+	let sessionGen = 0;
+	pi.on("session_start", (_event, ctx) => {
+		try {
+			if (isSubagent()) return;
+			const sid = durableSessionIdentity(ctx ?? null);
+			if (!sid || sid === "unknown") return; // 身份 unknown → 静默 no-op（M1 哨兵，与 genesis 同纪律）
+			const cwd = opts.cwd ?? process.cwd();
+			const scope = localMasterScope(cwd);
+			const addr = localMasterAddress(scope);
+			// 静默 genesis：仅无 owner 时认领（有 owner 一律不动；失败静默，永不抛）
+			if (!readAttachment(addr)) silentScopeGenesis(sid, cwd);
+			// 仅当本会话是本 scope owner 才注册唤醒循环；否则零动作
+			const att = readAttachment(addr);
+			if (!att || att.sessionId !== sid) return;
+			const myGen = ++sessionGen;
+			const closed = (): boolean => myGen !== sessionGen;
+			if (interval) clearInterval(interval);
+			interval = setInterval(() => {
+				if (closed()) return;
+				try {
+					const d = evaluateScopeWake({
+						sessionId: sid,
+						scope,
+						mailboxDir: opts.mailboxDir,
+						stateDir: opts.stateDir,
+						runsDir: opts.runsDir,
+					});
+					if (!d.fire) return;
+					try {
+						const tabRunId = opts.spawn(d, sid);
+						confirmScopeWakeSpawn(scope, tabRunId, {
+							stateDir: opts.stateDir,
+							mailboxDir: opts.mailboxDir,
+							sessionId: sid,
+						});
+					} catch (e) {
+						auditScopeWakeSpawnFailed(scope, e instanceof Error ? e.message : String(e), opts.stateDir);
+					}
+				} catch {
+					/* 唤醒循环永不破坏会话 */
+				}
+			}, opts.intervalMs ?? 30_000);
+			interval.unref?.();
+		} catch {
+			/* genesis/注册失败永不破坏会话 */
+		}
 	});
 	return () => {
 		sessionGen++;
