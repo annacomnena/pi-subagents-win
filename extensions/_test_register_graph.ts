@@ -81,12 +81,23 @@ for (const n of flagNames) console.log(`  ${n}`);
 // ── 快照断言（把上面打印的实际集合写死进来）─────────────────────────
 // 工具快照（按名排序；2026-08-19 冻结）：timers 3 个（set/cancel/list-timers）、
 // tab 侧 2 个（tab-finish/tab-report）、主会话回收 2 个（tab-status/reclaim-tabs）、
-// wiki-nav 1 个、index.ts 2 个（launch-tabs 主会话、subagent-win）。
+// wiki-nav 1 个、index.ts 2 个（launch-tabs 主会话、subagent-win）、
+// 2026-09-19 master 工具组 8 个（attach/cutover/detach/dispatch/handoff/
+// pressure/status/transfer/transfer-confirm——Phase 5.5 S1）。
 assert.deepEqual(toolNames, [
 	"cancel-timer",
 	"hotspot",
 	"launch-tabs",
 	"list-timers",
+	"master-attach",
+	"master-cutover",
+	"master-detach",
+	"master-dispatch",
+	"master-handoff",
+	"master-pressure",
+	"master-status",
+	"master-transfer",
+	"master-transfer-confirm",
 	"reclaim-tabs",
 	"set-timer",
 	"subagent-win",
@@ -98,7 +109,9 @@ assert.deepEqual(toolNames, [
 ]);
 
 // 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets，
-// 2026-09-15 trace-fusion C6 补主会话专属 /trace-fusion-loop）：
+// 2026-09-15 trace-fusion C6 补主会话专属 /trace-fusion-loop，
+// 2026-09-20 补 master slash（attach/cutover/detach/handoff/status/succession/auto-handoff——
+// Phase 5.5 S1/A1/总开关）+ /runtime-host（G2））：
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
 // （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
 assert.deepEqual(commandNames, [
@@ -108,8 +121,16 @@ assert.deepEqual(commandNames, [
 	"launch",
 	"links",
 	"lite",
+	"master-attach",
+	"master-auto-handoff",
+	"master-cutover",
+	"master-detach",
+	"master-handoff",
+	"master-status",
+	"master-succession",
 	"notify",
 	"runs",
+	"runtime-host",
 	"searcher-mode",
 	"sub-models",
 	"sub-presets",

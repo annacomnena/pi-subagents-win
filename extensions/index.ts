@@ -38,6 +38,7 @@ import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trac
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
+import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
@@ -1761,6 +1762,55 @@ export default function (pi: ExtensionAPI) {
 			} catch (e) {
 				ctx.ui.notify(`master-handoff 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
 			}
+		},
+	});
+
+	// ── /runtime-host 命令（Phase 6 G2：只读观察服务；拍板② 仅 slash 命令，默认不启动，零行为变化）──
+	// start 派生独立 node 进程（bind 127.0.0.1:0，实际端口写 host.json 做发现）；stop 杀进程 +
+	// 清 host.json（含僵尸文件）；status 回显 host.json + 探活（alive/stale/dead/missing）。
+	pi.registerCommand("runtime-host", {
+		description: "Runtime Host（G2 只读观察服务）：/runtime-host start|stop|status",
+		handler: async (args, ctx) => {
+			const cmd = (args ?? "").trim().toLowerCase();
+			if (cmd === "start") {
+				const r = await startRuntimeHost();
+				if (r.error || !r.info) {
+					ctx.ui.notify(`runtime-host 启动失败：${r.error ?? "未知错误"}`, "warning");
+					return;
+				}
+				if (r.already) {
+					ctx.ui.notify(`runtime-host 已在跑：pid=${r.info.pid} port=${r.info.port} startedAt=${r.info.startedAt}（回显现有，未重新 spawn）`, "info");
+					return;
+				}
+				ctx.ui.notify(`runtime-host 已启动：127.0.0.1:${r.info.port} pid=${r.info.pid}（端口动态，实际值已写 host.json）`, "info");
+				return;
+			}
+			if (cmd === "stop") {
+				const r = await stopRuntimeHost();
+				if (!r.stopped) {
+					ctx.ui.notify(`runtime-host stop：${r.reason ?? "失败"}`, "warning");
+					return;
+				}
+				ctx.ui.notify(`runtime-host 已停止：pid=${r.info?.pid ?? "?"}（host.json 已清理）`, "info");
+				return;
+			}
+			if (cmd === "status") {
+				const s = await runtimeHostStatus();
+				if (s.state === "missing" || !s.info) {
+					ctx.ui.notify("runtime-host：未启动（无 host.json）——/runtime-host start 启动", "info");
+					return;
+				}
+				const i = s.info;
+				const probe = s.state === "alive" ? "health=OK" : s.state === "stale" ? "probe=timeout（进程在、服务面不可用）" : "pid=dead（僵尸文件，可 stop 清理）";
+				const master = (s.health as { master?: { attachment?: { sessionId?: string; generation?: number } | null } } | null)?.master;
+				const owner = master?.attachment ? `master=${master.attachment.sessionId.slice(0, 12)} gen=${master.attachment.generation}` : "master=未 attach";
+				ctx.ui.notify(
+					`runtime-host：${s.state} pid=${i.pid} port=${i.port} startedAt=${i.startedAt}\nprobe: ${probe}\n${owner}`,
+					s.state === "dead" || s.state === "stale" ? "warning" : "info",
+				);
+				return;
+			}
+			ctx.ui.notify("用法：/runtime-host start|stop|status", "warning");
 		},
 	});
 
