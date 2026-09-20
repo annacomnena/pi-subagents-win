@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0] — 2026-09-20 (runtime GUI: G1–G5 vertical slice)
+
+- **Runtime Host（G2）**：`/runtime-host start|stop|status`，GET /v1/health|snapshot|events?after|attention|timeline?before + POST /v1/commands（唯一写端点）；host.json 动态端口发现（tri-state 探活）。
+- **投影（G3）**：attention 三源聚合（§31 九字段、去重）、timeline journal 升序人话时间线；快照 additive 扩展 master.liveness / autoHandoff / per-ws wakeState+mailboxBacklog。
+- **命令执行器（G4）**：`runtime/command-executor.ts` 确定性执行首批命令 workstream.pause/resume、master.handoff.accept、master.auto-handoff.set、master.handoff.prepare；state/commands/ wx-claim 幂等（SHA-256 无碰撞工件名、dedupeKey=<type>:<commandKey>）+ journal command.* 审计；generation 级 proposal 原子 create（agent_end 与 prepare 双调用方防 TOCTOU）；writeConfig tmp+rename 原子化。L4 两轮 APPROVED（collision/master-only/payload 白名单/4 进程真并发）。
+- **GUI v0（G5）**：`gui/` vite+react+ts+tailwind4+zustand 浏览器工作台，五页（主控/时间线/需要关注/工作流/运行时），2s/6s 轮询+409 resync+诚实 as-of；中文白话化（G5.1）；GUI 独立 beforeCursor 分页容量策略（G5.2 R3）。server 零 CORS/零 dist 托管，vite dev proxy 同源。
+- **心跳写手**：session agent_end 节流落盘 master-liveness（活压力 + 值守会话心跳），prepare 仅认当前 owner 的活值（R1 绑定校验）。
+- **S2 Gate 终审（附录A）**：采 b 案（1 次自然提案 + 14 天浸泡至 2026-10-04 开放 S3 opt-in，默认仍 OFF）。
+- 事件链四层修复、dispatcher-wake、二级 master v1、`/master-succession` 总开关、档位表 proposal 线（详见 feat/trace-fusion-loop 0918–0920 提交序列）。
+
 ## [0.3.0] — 2026-09-17 (trace-fusion diagnose mode)
 
 - **新增主会话工具 `trace-fusion`**：agent 判断任务困难/根因不明时可自主触发只读诊断 rollout（强制 diagnose 模式，零磁盘零主仓库写入），发起后立即可继续其它工作，三路终态自动收集并通知；lane tab 不可见该工具（排除名单 + 运行时能力二次校验）。implement（worktree 读写）仍仅限人工命令。
