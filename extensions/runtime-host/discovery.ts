@@ -23,6 +23,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
+// isProcessAlive 唯一实现在 runtime/liveness.ts（0920 backlog B7 移居；runtime-host→runtime 方向合规）
+import { isProcessAlive } from "../runtime/liveness.ts";
+export { isProcessAlive };
 
 /** 协议版本（首版冻结；G5 GUI 对接时按此分叉）。 */
 export const PROTOCOL_VERSION = 1;
@@ -107,17 +110,6 @@ export function writeHostInfo(info: HostInfo, path: string = hostInfoPath()): bo
 }
 
 // ── 进程 / 探活探针（never-throw）─────────────────────────────────
-
-/** `process.kill(pid, 0)` 存活探针：EPERM = 进程在（无信号权限）；其余 = 不在。 */
-export function isProcessAlive(pid: number): boolean {
-	if (!Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (e) {
-		return (e as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
 
 /** 删 host.json（stop / 优雅退出用；幂等，永不 throw）。 */
 export function removeHostInfo(path: string = hostInfoPath()): void {

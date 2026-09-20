@@ -49,6 +49,7 @@ import {
 	localMasterAddress,
 	localMasterScope,
 	silentScopeGenesis,
+	takeoverStaleScopeOwner,
 	type ScopeWakeDecision,
 } from "./runtime/scope.ts";
 
@@ -488,10 +489,32 @@ export function registerScopeWakeLoop(
 			const cwd = opts.cwd ?? process.cwd();
 			const scope = localMasterScope(cwd);
 			const addr = localMasterAddress(scope);
-			// 静默 genesis：仅无 owner 时认领（有 owner 一律不动；失败静默，永不抛）
-			if (!readAttachment(addr)) silentScopeGenesis(sid, cwd);
-			// 仅当本会话是本 scope owner 才注册唤醒循环；否则零动作
-			const att = readAttachment(addr);
+			// Genesis 检查点三分支（0920 backlog B9；触发时机仍仅 session_start，无后台 reaper）：
+			//   unowned → silentScopeGenesis（不变）；
+			//   owned + 非本会话 → 尝试 stale 接管（判据：scope liveness 身份严格匹配 + attachment
+			//     pid 死；pid 活 / liveness 缺失 / 身份不匹配 → skip，与 v0「有 owner 一律不动」
+			//     同保守度；竞争败者经 registry CAS generation-mismatch 自然回落 skip）；
+			//   owned + 本会话 → 直接透传（在位 owner）。
+			// 三层防线语义保持：预检在此处、owner-active 门在 scope.ts、wx/lease 单赢在 registry。
+			let att = readAttachment(addr);
+			if (!att) {
+				// 静默 genesis：仅无 owner 时认领（失败静默，永不抛）
+				silentScopeGenesis(sid, cwd);
+				att = readAttachment(addr);
+			} else if (att.sessionId !== sid) {
+				const r = takeoverStaleScopeOwner(sid, cwd);
+				if (r.outcome === "took-over") {
+					// 新 owner TUI notify（best-effort；journal 审计已由 takeoverMasterWithAudit 落账）
+					try {
+						const ui = (ctx as unknown as { ui?: { notify?: (msg: string, level: string) => void } } | undefined)?.ui;
+						ui?.notify?.(`已接管僵尸 scope ${r.scope}（上代 gen ${r.prevGeneration} / 旧会话 ${r.prevSessionId.slice(0, 8)}）`, "info");
+					} catch {
+						/* 通知尽力而为 */
+					}
+				}
+				att = readAttachment(addr);
+			}
+			// 仅当本会话是本 scope owner（新接管或在位）才注册唤醒循环；否则零动作
 			if (!att || att.sessionId !== sid) return;
 			const myGen = ++sessionGen;
 			const closed = (): boolean => myGen !== sessionGen;

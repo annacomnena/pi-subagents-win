@@ -346,6 +346,66 @@ function releaseLease(path: string, ownContent: string): void {
 	}
 }
 
+// ── stale 接管（0920 backlog B：scope owner 恢复专用）──────────────────
+
+export interface TakeoverMasterInput {
+	sessionId: string;
+	/** 目标 attachment（缺省全局 master；scope stale 恢复传 scope 地址） */
+	agent?: ObjectAddress;
+	/** CAS 期望值：lease 内重读必须仍匹配 {sessionId, generation} 才写（F13 同款 fencing） */
+	expected: { sessionId: string; generation: number };
+	/** 断言的下一代（缺省 expected.generation+1；显式给出且不符 → generation-mismatch） */
+	generation?: number;
+	reason?: string;
+	/** 诊断证据（透传 journal payload；注册表不解释） */
+	evidence?: Record<string, unknown>;
+	now?: Date;
+}
+
+export type TakeoverMasterResult =
+	| { ok: true; attachment: MasterAttachment; prevSessionId: string; prevGeneration: number }
+	| { ok: false; reason: "bad-session" | "generation-mismatch" | "lease-contended" };
+
+/**
+ * Stale 接管：acquireRegistryLease → lease 内重读比对 expected（CAS）→ 覆盖写 gen+1
+ *（attachedAt/lastHeartbeatAt=now、新 attemptId、detail 保留）。与全局 forceStale 对齐
+ * gen/attempt 语义，但**不走**其 heartbeat-age 判据——scope 侧 lastHeartbeatAt 冻结在
+ * attach 时刻、age 判据恒真；stale 判定由调用方完成（scope.ts judgeScopeOwnerStale：
+ * attachment pid 死判据），这里只做原子换主。forceStale 工具链与 master-attach 全局
+ * 路径零触碰。竞争败者经 generation-mismatch 自然回落（调用方当 skip）。
+ */
+export function takeoverMaster(input: TakeoverMasterInput): TakeoverMasterResult {
+	const agent = input.agent ?? masterAddress();
+	const now = (input.now ?? new Date()).toISOString();
+	if (!input.sessionId || input.sessionId === "unknown") return { ok: false, reason: "bad-session" };
+	const lease = acquireRegistryLease(`takeover:${input.sessionId}`);
+	if (!lease.won) return { ok: false, reason: "lease-contended" };
+	try {
+		const fresh = readAttachment(agent);
+		if (!fresh || fresh.sessionId !== input.expected.sessionId || fresh.generation !== input.expected.generation) {
+			return { ok: false, reason: "generation-mismatch" }; // lease 等待期间有人先动了（CAS 败者）
+		}
+		const nextGeneration = fresh.generation + 1;
+		if (input.generation !== undefined && input.generation !== nextGeneration) {
+			return { ok: false, reason: "generation-mismatch" };
+		}
+		const detail = fresh.detail; // detail 恒保留（scope toplevel 路径不随接管丢失）
+		const next: MasterAttachment = {
+			agentAddress: agent,
+			sessionId: input.sessionId,
+			generation: nextGeneration,
+			attachedAt: now,
+			lastHeartbeatAt: now,
+			attemptId: newAttemptId(),
+			...(detail ? { detail } : {}),
+		};
+		writeJsonAtomic(attachmentPathFor(agent), next);
+		return { ok: true, attachment: next, prevSessionId: fresh.sessionId, prevGeneration: fresh.generation };
+	} finally {
+		lease.release();
+	}
+}
+
 // ── heartbeat（条件刷新）────────────────────────────────────────────
 /**
  * 条件心跳：sessionId+generation 必须同时匹配，否则 false。

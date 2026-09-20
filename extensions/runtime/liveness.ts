@@ -24,6 +24,116 @@ import { defaultRuntimeDir } from "./journal.ts";
 /** 同身份最小写间隔：≥30s 节流（G5.2 拍板：防 turn 密集写爆）。 */
 export const LIVENESS_THROTTLE_MS = 30_000;
 
+// ── Scope owner liveness（0920 backlog B6）：per-scope 活性文件 ───────────────
+//
+// 全局 master-liveness.json 的 scope 级对应物：state/scope-liveness/<scopeKey>.json。
+// 写手 = session-hooks 的 agent_start + agent_end 双写（仅本 scope owner）；读手 =
+// scope.ts judgeScopeOwnerStale（stale 接管判据）。与全局写手分支严格分离：
+// MasterAttachment 形状零改动（pid/startedAt 只住本文件，不进 registry）。
+
+export interface ScopeLiveness {
+	version: 1;
+	scopeKey: string;
+	sessionId: string;
+	generation: number;
+	/** 写手进程 pid（stale 判据 v1：isProcessAlive(pid) false → 僵尸） */
+	pid: number;
+	/** 进程起点估算（pid 复用防御第二因子；v1 仅记录，不进判定） */
+	startedAt: string;
+	updatedAt: string;
+}
+
+export interface WriteScopeLivenessInput {
+	scopeKey: string;
+	sessionId: string;
+	generation: number;
+	/** 缺省 process.pid（测试可注入） */
+	pid?: number;
+	/** 缺省 processStartedAt()（测试可注入） */
+	startedAt?: string;
+}
+
+let cachedProcessStartedAt: string | null = null;
+
+/** 进程起点估算（算一次存变量）：Date.now() - process.uptime()*1000。 */
+export function processStartedAt(): string {
+	if (cachedProcessStartedAt === null) {
+		cachedProcessStartedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
+	}
+	return cachedProcessStartedAt;
+}
+
+function scopeLivenessPath(scopeKey: string, stateDir?: string): string {
+	return join(stateDir ?? join(defaultRuntimeDir(), "state"), "scope-liveness", `${scopeKey}.json`);
+}
+
+/** 容忍读：缺失/坏 JSON/坏版本/关键字段缺失 → null（同 readLiveness 惯例）。 */
+export function readScopeLiveness(scopeKey: string, stateDir?: string): ScopeLiveness | null {
+	try {
+		const raw = JSON.parse(readFileSync(scopeLivenessPath(scopeKey, stateDir), "utf8")) as ScopeLiveness;
+		if (
+			raw?.version !== 1 ||
+			typeof raw.scopeKey !== "string" ||
+			typeof raw.sessionId !== "string" ||
+			typeof raw.generation !== "number" ||
+			typeof raw.pid !== "number" ||
+			typeof raw.updatedAt !== "string"
+		) {
+			return null;
+		}
+		return raw;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 写 scope 心跳（agent_start/agent_end 双写；≥30s 节流 + never-throw，同全局写手语义）。
+ * 同身份（sessionId+generation）且距上次 <30s → 跳写；身份变化（接管/新代）立即写。
+ * 返回 true = 本次实际写盘；false = 节流跳过或写失败（调用方无需关心）。
+ */
+export function writeScopeLiveness(input: WriteScopeLivenessInput, opts: { stateDir?: string; now?: Date } = {}): boolean {
+	try {
+		const path = scopeLivenessPath(input.scopeKey, opts.stateDir);
+		const now = opts.now ?? new Date();
+		const prev = readScopeLiveness(input.scopeKey, opts.stateDir);
+		if (prev && prev.sessionId === input.sessionId && prev.generation === input.generation) {
+			const age = now.getTime() - Date.parse(prev.updatedAt);
+			if (Number.isFinite(age) && age >= 0 && age < LIVENESS_THROTTLE_MS) return false;
+		}
+		const record: ScopeLiveness = {
+			version: 1,
+			scopeKey: input.scopeKey,
+			sessionId: input.sessionId,
+			generation: input.generation,
+			pid: input.pid ?? process.pid,
+			startedAt: input.startedAt ?? processStartedAt(),
+			updatedAt: now.toISOString(),
+		};
+		const dir = path.slice(0, Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")));
+		if (dir) mkdirSync(dir, { recursive: true });
+		const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+		renameSync(tmp, path);
+		return true;
+	} catch {
+		return false; // never-throw：写失败静默（gauge 永不打断主流程）
+	}
+}
+
+// ── 进程探活（唯一实现；runtime-host/discovery.ts 改此处 import）────────
+
+/** `process.kill(pid, 0)` 存活探针：EPERM = 进程在（无信号权限）；其余 = 不在。 */
+export function isProcessAlive(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 export interface MasterLiveness {
 	version: 1;
 	sessionId: string;
