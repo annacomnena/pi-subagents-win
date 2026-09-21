@@ -25,8 +25,14 @@
  *   - `POST /v1/commands`（G4）：**唯一命令入口**（mailbox 命令信不消费）。同步执行、
  *     同步回执；业务全在 runtime/command-executor.ts 纯库（本文件只做薄绑定）；方法门
  *     放宽仅此路径（GET 全放行 + POST 仅 /v1/commands，其余 405）。
+ *   - `GET /v1/sessions` + `GET /v1/sessions/:id/transcript?after=`（G6-P1）：pi 会话列表 +
+ *     转写投影行快照/增量分页（与 WS 同一投影函数）。
+ *   - `WS /v1/events/stream`（G6-P1，唯一升级路径）：journal + transcript 两路 JSON 帧多路复用，
+ *     subscribe(base:{seq,logEpoch}) 断线续传 + 30s ping/pong + 本机 token→HttpOnly cookie
+ *     fail-closed（token 落 host.json；无/错 token 握手 401；HTTP 端点零变化）。实现全在
+ *     runtime-host/ws.ts（手写最小 RFC6455 文本帧，零新依赖）。
  *
- * 明确不做（G2 计划 §4 / 主会话拍板③）：无 WS/SSE/push（纯 poll 足矣）；无 journal
+ * 明确不做（G2 计划 §4 / 主会话拍板③）：无 SSE/push（WS 为 G6 增量升级面）；无 journal
  * compaction；无 fs.watch 正确性路径；S3/master-auto/mailbox 接线零改动。
  *
  * 红线：只 import node 内建 + `extensions/runtime/*` 纯函数 + ../timers.ts（session 心跳
@@ -44,6 +50,7 @@ import {
 	PROTOCOL_VERSION,
 	classifyHost,
 	fetchHostHealth,
+	generateHostToken,
 	hostInfoPath,
 	isProcessAlive,
 	newInstanceId,
@@ -56,6 +63,12 @@ import {
 import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
 import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
 import { getMasterStatus } from "../runtime/master-control.ts";
+import {
+	defaultSessionsDir,
+	findSessionFile,
+	listPiSessions,
+	projectSession,
+} from "../runtime/transcript.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
 import { buildTimelineItems } from "./timeline.ts";
@@ -66,6 +79,7 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { executeCommand } from "../runtime/command-executor.ts";
+import { attachEventStream, WS_PATH } from "./ws.ts";
 
 // ── 视图装配（纯读、never-throw；可注入路径/now 供测试隔离）────────
 
@@ -322,6 +336,12 @@ export interface RuntimeHostServerOptions {
 	linksPath?: string;
 	/** config.json 路径（auto-handoff.set 用；缺省包根 config.json，测试注入隔离）。 */
 	configPath?: string;
+	/** G6-P1：pi sessions 根目录（缺省 defaultSessionsDir()；测试注入隔离）。 */
+	sessionsDir?: string;
+	/** G6-P1：WS live tail 轮询间隔 ms（缺省 250；测试注入更快）。 */
+	tailMs?: number;
+	/** G6-P1：WS ping 间隔 ms（缺省 30000）。 */
+	pingMs?: number;
 }
 
 export interface RuntimeHostHandle {
@@ -336,6 +356,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const startedAt = new Date().toISOString();
 	const self: HostSelfInfo = { instanceId, pid: process.pid, port: 0, startedAt };
 	const hostPath = opts.hostPath ?? hostInfoPath();
+	// G6-P1：本机 token 启动即生成，落 host.json（同机进程可读）；仅 WS 升级面校验，
+	// 绝不出现在 /v1/* HTTP 响应（HostSelfInfo 不含 token）。
+	const hostToken = generateHostToken();
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -479,8 +502,38 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, count: tl.length, timeline: tl };
 					break;
 				}
-				default:
-					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline；POST /v1/commands（唯一命令入口）" });
+				case "/v1/sessions": {
+					// G6-P1：pi 会话列表（首行头快读，不全读；startedAt 降序）
+					const sessions = listPiSessions(opts.sessionsDir ?? defaultSessionsDir());
+					body = { version: 1, count: sessions.length, sessions };
+					break;
+				}
+				default: {
+					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，
+					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
+					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
+					if (mt === null) {
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）` });
+					}
+					const sessionId = decodeURIComponent(mt[1]);
+					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
+					if (file === null) {
+						throw new HttpError(404, { error: "session-not-found", sessionId });
+					}
+					const afterRaw = u.searchParams.get("after");
+					const after = afterRaw !== null && /^\d+$/.test(afterRaw) ? parseInt(afterRaw, 10) : 0;
+					const proj = projectSession(file, after);
+					body = {
+						version: 1,
+						sessionId,
+						mode: after > 0 ? "delta" : "snapshot",
+						head: { seq: proj.head, logEpoch: proj.logEpoch },
+						count: proj.rows.length,
+						rows: proj.rows,
+						skippedUnknown: proj.skippedUnknown,
+						name: proj.name,
+					};
+				}
 			}
 		} catch (e) {
 			if (e instanceof HttpError) {
@@ -497,6 +550,14 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 
 	return new Promise((resolvePromise, reject) => {
 		const server = createServer(onReq);
+		// G6-P1：唯一 WS 升级路径 /v1/events/stream（幂等挂载；HTTP 路由零变化）
+		attachEventStream(server, {
+			token: hostToken,
+			journalPath: opts.journalPath,
+			sessionsDir: opts.sessionsDir,
+			tailMs: opts.tailMs,
+			pingMs: opts.pingMs,
+		});
 		server.on("error", (e: NodeJS.ErrnoException) => {
 			// fail-fast 报端口（risk8：不静默换端口）——:0 下正常不会 EADDRINUSE
 			reject(new Error(`runtime-host listen failed: ${e.message}${e.code ? ` (code=${e.code})` : ""}`));
@@ -504,7 +565,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		server.listen(0, "127.0.0.1", () => {
 			const addr = server.address();
 			const port = typeof addr === "object" && addr ? addr.port : 0;
-			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION };
+			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION, token: hostToken };
 			self.port = port;
 			writeHostInfo(info, hostPath); // 原子写（tmp+rename）；失败不炸（易失投影）
 			resolvePromise({

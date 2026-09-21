@@ -140,7 +140,11 @@ try {
 			const r = await getJson(base, "/v1/health");
 			assert.equal(r.status, 200, "health 200");
 			assert.equal(r.body.version, 1);
-			assert.deepEqual(r.body.host, { ...h.info, protocolVersion: PROTOCOL_VERSION }, "host 自信息 + protocolVersion");
+			// G6-P1：host.json 含本机 token，但 token 绝不进 HTTP 响应（剥密后比对）
+			const { token: _wsToken, ...hostInfoPublic } = h.info;
+			assert.equal(_wsToken === undefined || typeof _wsToken === "string", true);
+			assert.deepEqual(r.body.host, { ...hostInfoPublic, protocolVersion: PROTOCOL_VERSION }, "host 自信息 + protocolVersion（无 token）");
+			assert.equal((r.body.host as any).token, undefined, "token 绝不泄漏进 /v1/* 响应");
 			assert.equal(r.body.master.attachment, null);
 			assert.equal(r.body.master.cutover, false);
 			assert.equal(r.body.masterOwnerAlive, null, "无 attachment → null（未 attach = legacy）");

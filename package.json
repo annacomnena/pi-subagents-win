@@ -83,6 +83,7 @@
     "test:runtime-liveness": "node --experimental-strip-types ./extensions/_test_runtime_liveness.ts",
     "test:gui-store": "node --experimental-strip-types ./extensions/_test_gui_store_pagination.ts",
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
+    "test:runtime-host-ws": "node --experimental-strip-types ./extensions/_test_runtime_host_ws.ts",
     "test:runtime-host-projections": "node --experimental-strip-types ./extensions/_test_runtime_host_projections.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",

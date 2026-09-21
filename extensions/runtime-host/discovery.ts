@@ -20,6 +20,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
@@ -40,6 +41,9 @@ export interface HostInfo {
 	/** ISO 时间。 */
 	startedAt: string;
 	protocolVersion: number;
+	/** G6-P1：本机认证 token（host 启动生成；同机进程可读；仅 WS 升级面校验，
+	 *  绝不出现在任何 HTTP 响应里）。旧文件/测试夹具可缺省（可选字段）。 */
+	token?: string;
 }
 
 /** host 四态：missing（无/坏文件）、alive（探活成功）、stale（进程在但探活失败）、dead（进程不在，僵尸文件）。 */
@@ -56,6 +60,11 @@ export function hostInfoPath(): string {
 export function newInstanceId(now: Date = new Date()): string {
 	const rand = Math.random().toString(36).slice(2, 8);
 	return `host_${now.getTime().toString(36)}_${rand}`;
+}
+
+/** G6-P1：生成 WS 认证 token（192-bit 随机，base64url——URL/Cookie 安全字符集）。 */
+export function generateHostToken(): string {
+	return randomBytes(24).toString("base64url");
 }
 
 // ── 读（tolerant：缺失/坏 JSON/字段缺 → null，永不 throw）─────────
@@ -80,7 +89,14 @@ export function readHostInfo(path: string = hostInfoPath()): HostInfo | null {
 		) {
 			return null;
 		}
-		return { instanceId: v.instanceId, pid: v.pid, port: v.port, startedAt: v.startedAt, protocolVersion: v.protocolVersion };
+		return {
+			instanceId: v.instanceId,
+			pid: v.pid,
+			port: v.port,
+			startedAt: v.startedAt,
+			protocolVersion: v.protocolVersion,
+			...(typeof v.token === "string" && v.token.length > 0 ? { token: v.token } : {}),
+		};
 	} catch {
 		return null;
 	}
