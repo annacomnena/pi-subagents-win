@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.2] — 2026-09-22 (ZCode 1:1 workbench + autostart)
+
+- **gui/ 1:1 复刻 ZCode 主工作台**：zai-dark token 整表移植（原名）、14px 基准、滚动条/动画参数；radix-ui + CVA + 5 依赖；14 个零后端 ui 组件；左栏会话列表/中央 transcript 5 行型/user 气泡/工具折叠卡+扫光/composer/topbar h-12/设置层 grid 全 class 逐字对齐；发送链复用 P2（Stop/加号灰显占位；⌘K/文件树/git/账号不渲染）。旧 zinc 调色零残留。
+- **可读会话标题**：/v1/sessions 增 title+titleSource（tab-runs 台账→首条 user 剥前缀→shortId 回退；spawn --name 待冻结解除后补 1 行）。
+- **GUI 自动拉起**：`/gui on|off|status|open` + session_start 自动 ensure（默认 OFF；已为本机开启 autoStart）。
+
 ## [0.5.1] — 2026-09-22 (session-first GUI shell)
 
 - **gui/ 布局反转**（用户指示：会话为主、状态为辅，全面参照 ZCode Web 骨架）：会话列表常驻左栏（三段式列表项+背景色选中态+过滤）、中央永远是对话视图（sticky composer dock、贴底锚定+回看锁定+回到底部）、master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层、timeline 保留唯一次级全页、顶栏保留状态徽标露出口。八枚 zcode 语义 token（暗色 v1）；sessions 轮询上移 App 全局第七路；store 最小改动（TabId→chat|timeline 默认 chat + runtimeOverlay；chatActiveId 零改动）。L4 PASS（含覆盖层关闭/流式贴底/死 token 三项在审修复）。
