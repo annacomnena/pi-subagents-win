@@ -9,6 +9,7 @@ import { MasterPage } from "./pages/MasterPage";
 import { WorkstreamPage } from "./pages/WorkstreamPage";
 import { AttentionPage } from "./pages/AttentionPage";
 import { TimelinePage } from "./pages/TimelinePage";
+import { ChatPage } from "./pages/ChatPage";
 import { RuntimePage } from "./pages/RuntimePage";
 import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
@@ -21,6 +22,7 @@ const PAGES: Record<TabId, () => ReactElement> = {
 	attention: AttentionPage,
 	timeline: TimelinePage,
 	runtime: RuntimePage,
+	chat: ChatPage,
 };
 
 export default function App() {

@@ -8,6 +8,7 @@ const NAV: { id: TabId; zh: string; en: string }[] = [
 	{ id: "workstream", zh: "工作流", en: "Workstream" },
 	{ id: "attention", zh: "需要关注", en: "Attention" },
 	{ id: "timeline", zh: "时间线", en: "Timeline" },
+	{ id: "chat", zh: "会话", en: "Sessions" },
 	{ id: "runtime", zh: "运行时", en: "Runtime" },
 ];
 

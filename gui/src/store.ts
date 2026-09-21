@@ -9,16 +9,21 @@
 
 import { create } from "zustand";
 import { api, type ConnState, type FetchErr } from "./api/client";
+import { applyTranscriptOp } from "./api/transcript";
 import type {
 	AttentionItem,
 	CommandOutcomeBody,
 	HealthView,
 	RuntimeEnvelope,
 	RuntimeSnapshot,
+	SessionSummary,
 	TimelineItem,
+	TranscriptHead,
+	TranscriptRow,
 } from "./api/types";
+import type { StreamServerFrame, StreamState } from "./useEventStream";
 
-export type TabId = "master" | "workstream" | "attention" | "timeline" | "runtime";
+export type TabId = "master" | "workstream" | "attention" | "timeline" | "runtime" | "chat";
 
 /** envelope → 人话 TimelineItem（客户端小映射，参照 extensions/runtime-host/timeline.ts 模板；
  *  下一轮 timeline 全量轮询会用 server 侧精修+溯源版本按 id 覆盖）。 */
@@ -152,6 +157,25 @@ interface GuiState {
 	pollTimeline: () => Promise<void>;
 	/** G5.2：before= 历史翻页（加载更早；幂等可重按，end 后 no-op）。 */
 	loadEarlierTimeline: () => Promise<void>;
+
+	// ── G6-P1 会话页（chat slice，第 6 页；既有五页轮询零改动）──
+	chatSessions: SessionSummary[];
+	chatActiveId: string | null;
+	/** 会话 → 投影行终态（应用 op 后；进入页面由 GET 全量播种，WS 增量维护）。 */
+	chatRowsBySession: Record<string, TranscriptRow[]>;
+	/** 会话 → 投影头（seq/logEpoch；断线重连的 base 来源）。 */
+	chatHeadBySession: Record<string, TranscriptHead | null>;
+	/** 会话 → 已见最大帧 seq（防重放倒退；重放去重由 appended 幂等兑底）。 */
+	chatSeqBySession: Record<string, number>;
+	chatConn: StreamState;
+	/** bump → useEventStream 立即重订阅（snapshot/resync 全量重拉完成后）。 */
+	chatResyncKey: number;
+	pollChatSessions: () => Promise<void>;
+	openChatSession: (id: string) => Promise<void>;
+	reloadChatSession: (id: string) => Promise<void>;
+	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
+	setChatConn: (s: StreamState) => void;
+	bumpChatResync: () => void;
 }
 
 function isResync(e: FetchErr): boolean {
@@ -321,6 +345,74 @@ export const useGui = create<GuiState>((set, get) => ({
 		});
 		get().markUp(r.at);
 	},
+	// ── G6-P1 会话页实现 ────────────────────────────────────────
+
+	chatSessions: [],
+	chatActiveId: null,
+	chatRowsBySession: {},
+	chatHeadBySession: {},
+	chatSeqBySession: {},
+	chatConn: "idle",
+	chatResyncKey: 0,
+
+	pollChatSessions: async () => {
+		const r = await api.sessions();
+		if (r.ok) {
+			set({ chatSessions: r.data.sessions });
+			get().markUp(r.at);
+		} else {
+			get().markDown(r.at);
+		}
+	},
+
+	/** 进入会话/全量重拉（首屏 GET 播种；head 为后续 WS 续传 base）。 */
+	reloadChatSession: async (id) => {
+		const r = await api.transcript(id);
+		if (!r.ok) return;
+		set({
+			chatRowsBySession: { ...get().chatRowsBySession, [id]: r.data.rows },
+			chatHeadBySession: { ...get().chatHeadBySession, [id]: r.data.head },
+			chatSeqBySession: { ...get().chatSeqBySession, [id]: r.data.head?.seq ?? 0 },
+		});
+		get().markUp(r.at);
+	},
+
+	openChatSession: async (id) => {
+		set({ chatActiveId: id });
+		await get().reloadChatSession(id);
+		// 新 topic / 新 head → 立即重订阅（不走断线退避）
+		get().bumpChatResync();
+	},
+
+	/** WS 帧路由：op 增量应用；ack snapshot / resync → 全量重拉 + 重订阅。 */
+	applyChatFrame: async (frame) => {
+		if (frame.type === "error") return;
+		const sid = frame.topic.startsWith("transcript:") ? frame.topic.slice("transcript:".length) : null;
+		if (frame.type === "event" && sid !== null) {
+			if (frame.op === undefined) return;
+			const prevSeq = get().chatSeqBySession[sid] ?? 0;
+			if (frame.seq < prevSeq) return; // 已见段重放倒退防御（appended 幂等兑底不重不漏）
+			const view = applyTranscriptOp({ rows: get().chatRowsBySession[sid] ?? [], info: {} }, frame.op);
+			set({
+				chatRowsBySession: { ...get().chatRowsBySession, [sid]: view.rows },
+				chatSeqBySession: { ...get().chatSeqBySession, [sid]: Math.max(prevSeq, frame.seq) },
+			});
+			return;
+		}
+		if (frame.type === "ack" && frame.mode === "snapshot" && sid !== null) {
+			// 服务端不背快照：首屏/跨代 → 全量 GET 后重订阅（WS 只做增量）
+			await get().reloadChatSession(sid);
+			get().bumpChatResync();
+			return;
+		}
+		if (frame.type === "resync" && sid !== null) {
+			await get().reloadChatSession(sid);
+			get().bumpChatResync();
+		}
+	},
+
+	setChatConn: (s) => set({ chatConn: s }),
+	bumpChatResync: () => set({ chatResyncKey: get().chatResyncKey + 1 }),
 }));
 
 // ── 命令动作（POST commands；accepted 才落本地态，回执全文进 lastCommand）──

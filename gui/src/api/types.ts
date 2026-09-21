@@ -292,3 +292,80 @@ export type CommandOutcomeBody =
 	| { status: "accepted"; summary: string; replayed: boolean }
 	| { status: "rejected"; reason: string; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: string; error?: string; replayed: boolean };
+
+// ── G6-P1：GET /v1/sessions + /v1/sessions/:id/transcript（runtime/transcript.ts 手抄）──
+
+/** runtime/transcript.ts SessionSummary。 */
+export interface SessionSummary {
+	sessionId: string;
+	cwd: string | null;
+	startedAt: string | null;
+	parentSession: string | null;
+	file: string;
+	sizeBytes: number;
+	mtimeMs: number;
+}
+
+export interface SessionsBody {
+	version: 1;
+	count: number;
+	sessions: SessionSummary[];
+}
+
+/** 5 种自包含行（turn = 行上标签非容器；渲染任一行不需读别的行）。 */
+export type TranscriptRow =
+	| { kind: "turnHeader"; rowId: string; turnIndex: number; startedAt: string; durationMs?: number }
+	| { kind: "userInput"; rowId: string; turnIndex: number; at: string; text: string }
+	| { kind: "assistantText"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
+	| { kind: "reasoning"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
+	| {
+			kind: "toolCall";
+			rowId: string;
+			turnIndex: number;
+			at: string;
+			callId: string;
+			name: string;
+			arguments: unknown;
+			status: "running" | "done" | "error";
+			output?: string;
+			model?: string;
+			provider?: string;
+	  };
+
+/** 5 操作封闭集（P1 发射面 = appended/upserted/state.updated；delta/removed 定义留后续）。 */
+export type TranscriptOp =
+	| { kind: "row.appended"; row: TranscriptRow }
+	| { kind: "row.delta"; rowId: string; path: string; append: string }
+	| { kind: "row.upserted"; row: TranscriptRow }
+	| { kind: "row.removed"; rowId: string }
+	| { kind: "state.updated"; patch: Record<string, unknown> };
+
+export interface TranscriptHead {
+	seq: number;
+	logEpoch: string;
+}
+
+export interface TranscriptBody {
+	version: 1;
+	sessionId: string;
+	mode: "snapshot" | "delta";
+	head: TranscriptHead | null;
+	count: number;
+	rows: TranscriptRow[];
+	skippedUnknown: number;
+	name: string | null;
+}
+
+// ── G6-P1：WS /v1/events/stream 帧契约（runtime-host/ws.ts 手抄）──
+
+export interface StreamSubscribeMsg {
+	type: "subscribe";
+	topic: string;
+	base?: { seq?: number; logEpoch?: string };
+}
+
+export type StreamServerFrame =
+	| { type: "ack"; topic: string; mode: "resume" | "snapshot"; head: TranscriptHead | null }
+	| { type: "event"; topic: string; seq: number; envelope?: unknown; op?: TranscriptOp }
+	| { type: "resync"; topic: string; head: null }
+	| { type: "error"; topic: string | null; message: string };

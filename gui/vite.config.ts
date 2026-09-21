@@ -51,6 +51,8 @@ export default defineConfig({
 			"/v1": {
 				target: resolveProxyTarget(),
 				changeOrigin: false,
+				// G6-P1：WS /v1/events/stream 走同一代理面（http-proxy ws 升级转发）
+				ws: true,
 			},
 		},
 	},

@@ -163,7 +163,11 @@ async function main() {
 	});
 
 	const url = `http://localhost:${vitePort ?? 5173}`;
-	console.log(`[gui:dev] GUI: ${url}  （不自动开浏览器；/v1 → 127.0.0.1:${hostInfo?.port ?? "?"}）`);
+	// G6-P1：拼带本机 token 的 URL（浏览器捕获 → sessionStorage → WS 握手；HttpOnly cookie
+	// 由 host 在 ?token= 首握时种下）。host.json 不可读/无 token → 打印裸 URL（WS 401 fail-closed）。
+	const wsToken = typeof hostInfo?.token === "string" && hostInfo.token.length > 0 ? hostInfo.token : null;
+	const urlWithToken = wsToken !== null ? `${url}/?token=${encodeURIComponent(wsToken)}` : url;
+	console.log(`[gui:dev] GUI: ${urlWithToken}  （不自动开浏览器；/v1 → 127.0.0.1:${hostInfo?.port ?? "?"}${wsToken !== null ? "，URL 含 WS token" : "，警告：无 token，WS 将 401"}）`);
 
 	const cleanup = () => {
 		try {

@@ -13,7 +13,9 @@ import type {
 	EventsResponse,
 	HealthView,
 	RuntimeSnapshot,
+	SessionsBody,
 	TimelineResponse,
+	TranscriptBody,
 } from "./types";
 
 export type ConnState = "up" | "down";
@@ -149,4 +151,17 @@ export const api = {
 			issuedAt: new Date().toISOString(),
 			payload: { auto, ...(reason ? { reason } : {}) },
 		} satisfies CommandFrameInput),
+
+	// ── G6-P1：sessions / transcript（只读数据面；WS 增量之外的 HTTP 兜底）──
+
+	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。 */
+	sessions: (): Promise<FetchResult<SessionsBody>> => fetchJson<SessionsBody>("/v1/sessions"),
+
+	/** GET /v1/sessions/:id/transcript?after=：首屏全量（after 缺省/0）或增量触及行终态。 */
+	transcript: (sessionId: string, after?: number): Promise<FetchResult<TranscriptBody>> =>
+		fetchJson<TranscriptBody>(
+			`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${after !== undefined && after > 0 ? `?after=${after}` : ""}`,
+			undefined,
+			8000,
+		),
 };
