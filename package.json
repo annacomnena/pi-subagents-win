@@ -1,6 +1,6 @@
 {
   "name": "subagent-win",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Windows-compatible pi subagent extension: single/parallel/async execution, per-call model override, external CLI backends (Claude Code / Codex / Antigravity / AtomCode), Codex header compat, and workflow orchestration.",
   "keywords": [

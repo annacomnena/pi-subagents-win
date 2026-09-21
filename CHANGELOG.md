@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.5.1] — 2026-09-22 (session-first GUI shell)
+
+- **gui/ 布局反转**（用户指示：会话为主、状态为辅，全面参照 ZCode Web 骨架）：会话列表常驻左栏（三段式列表项+背景色选中态+过滤）、中央永远是对话视图（sticky composer dock、贴底锚定+回看锁定+回到底部）、master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层、timeline 保留唯一次级全页、顶栏保留状态徽标露出口。八枚 zcode 语义 token（暗色 v1）；sessions 轮询上移 App 全局第七路；store 最小改动（TabId→chat|timeline 默认 chat + runtimeOverlay；chatActiveId 零改动）。L4 PASS（含覆盖层关闭/流式贴底/死 token 三项在审修复）。
+
 ## [0.5.0] — 2026-09-22 (G6 Web Console: WS streaming, chat, interactions — ZCode-referenced)
 
 - **参照 ZCode（zai-org，2026-09-20 开源）架构**：解剖报告 `plans/0920_zcode_reference_research.md`，分阶段计划 `plans/0920_g6_webconsole_plan.md`；采纳其可续传订阅/封闭 delta 操作/审批状态投影/诚实投递语义思想，明确不抄二进制 RPC/SQLite/手机端。
