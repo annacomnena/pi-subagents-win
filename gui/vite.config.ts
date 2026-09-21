@@ -60,10 +60,14 @@ export default defineConfig({
 				// gui:dev 从 host.json 读取 token，仅在本机 proxy 的上游握手注入；浏览器 URL/日志不含 bearer。
 				ws: true,
 				configure: (proxy) => {
-					proxy.on("proxyReqWs", (proxyReq) => {
+					// G6-P1：WS 上游握手注入 cookie；G6-P2：HTTP 面（POST /v1/commands 等）同注入 ——
+					// 同源浏览器不持有 token（旧 UI 无感），curl/测试等价通道为 X-Command-Token header。
+					const inject = (proxyReq: { setHeader: (k: string, v: string) => void }) => {
 						const token = hostToken();
 						if (token !== null) proxyReq.setHeader("Cookie", `sw_host_token=${token}`);
-					});
+					};
+					proxy.on("proxyReq", inject);
+					proxy.on("proxyReqWs", inject);
 				},
 			},
 		},

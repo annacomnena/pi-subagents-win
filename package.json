@@ -85,6 +85,7 @@
     "test:runtime-snapshot": "node --experimental-strip-types ./extensions/_test_runtime_snapshot.ts",
     "test:runtime-liveness": "node --experimental-strip-types ./extensions/_test_runtime_liveness.ts",
     "test:gui-store": "node --experimental-strip-types ./extensions/_test_gui_store_pagination.ts",
+    "test:gui-chat-guard": "node --experimental-strip-types ./extensions/_test_gui_chat_guard.ts",
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
     "test:runtime-host-ws": "node --experimental-strip-types ./extensions/_test_runtime_host_ws.ts",
     "test:runtime-stream-gen": "node --experimental-strip-types ./extensions/_test_runtime_stream_gen.ts",
@@ -97,7 +98,8 @@
     "test:scope-stale-takeover": "node --experimental-strip-types ./extensions/_test_scope_stale_takeover.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts",
     "gui:dev": "node scripts/gui-dev.mjs",
-    "gui:build": "npm run build --prefix gui"
+    "gui:build": "npm run build --prefix gui",
+    "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

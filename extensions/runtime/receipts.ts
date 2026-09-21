@@ -76,8 +76,18 @@ function claimingPath(key: string): string {
 }
 
 /**
- * 声明注入权：wx first-wins；已 injected → injected-already；被占 → claimed-by-other；
- * 占位超 staleAfterMs（缺省 10min，同 mailbox 纪律）→ 接管（tookOver，at-least-once 重试）。
+ * 声明注入权：wx first-wins；已 injected → injected-already；被占（新鲜，含同 holder）→
+ * claimed-by-other；占位超 staleAfterMs（缺省 10min，同 mailbox 纪律）→ CAS 接管
+ * （tookOver，at-least-once 重试）。
+ *
+ * L4 返修（plans/0922_g6p2_review.md 必修 1）：stale 接管不再是「读-覆盖写」——旧实现两个
+ * 竞争者可读到同一过期 claim、双双无条件覆盖并各自返回 claimed（双注入）。改 unlink 门控
+ * CAS：unlink 是每代文件的唯一线性化点（恰一个成功 unlink），wx 竞败者重读重判；接管前
+ * 瞬时重读收窄 TOCTOU。残余 µs 级窗口（重读后、unlink 前他人恰好接管）由诚实 at-least-once
+ * + 目标端 dedupe（outboxId 稳定身份，见 outbox-bridge.ts）兜底——本函数只保证「重试收敛、
+ * 不永久双主」，不再声称 exactly-once。
+ * 同 holder 新鲜 claim 不自取回：claim→confirm 全程互斥是 injection-gate「同 key 双链互斥」
+ * 契约（_test_runtime_cutover §4）；崩溃自愈统一走 stale 接管，不开同 holder 捷径。
  * 三路注入（event-bus / reports / mailbox）在此互斥：同时查空不可能同时注入。
  */
 export function claimInjection(key: string, by: string, staleAfterMs = 10 * 60 * 1000): InjectionClaimResult {
@@ -85,23 +95,45 @@ export function claimInjection(key: string, by: string, staleAfterMs = 10 * 60 *
 	mkdirSync(receiptsDir(), { recursive: true });
 	if (hasNotificationReceipt(key)) return { status: "injected-already" };
 	const path = claimingPath(key);
-	const content = JSON.stringify({ key, by, claimedAt: new Date().toISOString() });
-	try {
-		writeFileSync(path, content, { flag: "wx", encoding: "utf8" });
-		return { status: "claimed", by };
-	} catch {
+	let tookOver = false;
+	for (let attempt = 0; attempt < 4; attempt++) {
+		try {
+			writeFileSync(path, JSON.stringify({ key, by, claimedAt: new Date().toISOString() }), { flag: "wx", encoding: "utf8" });
+			return tookOver ? { status: "claimed", by, tookOver: true } : { status: "claimed", by };
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "EEXIST") return { status: "claimed-by-other" };
+		}
+		// wx 竞败：单次读现状重判（by + claimedAt 同源；读失败 → 文件恰被删/重建，回 wx 重试）
+		let existingBy: string | undefined;
+		let fresh: boolean;
 		try {
 			const existing = JSON.parse(readFileSync(path, "utf8")) as { by?: string; claimedAt?: string };
+			existingBy = existing.by;
 			const age = Date.now() - Date.parse(existing.claimedAt ?? "");
-			if (Number.isFinite(age) && age > staleAfterMs) {
-				writeFileSync(path, content, "utf8"); // stale 接管（有意覆盖）
-				return { status: "claimed", by, tookOver: true };
-			}
-			return { status: "claimed-by-other", by: existing.by };
+			fresh = Number.isFinite(age) && age <= staleAfterMs;
 		} catch {
-			return { status: "claimed-by-other" };
+			continue;
 		}
+		if (hasNotificationReceipt(key)) return { status: "injected-already" };
+		// 新鲜（含同 holder）→ 让位（同 key 双链互斥契约，_test_runtime_cutover §4）
+		if (fresh) return { status: "claimed-by-other", by: existingBy };
+		// stale → 接管；unlink 前瞬时重读收窄 TOCTOU（他人刚接管 → 其 claimedAt 新鲜 → 放弃）
+		try {
+			const re = JSON.parse(readFileSync(path, "utf8")) as { by?: string; claimedAt?: string };
+			const reAge = Date.now() - Date.parse(re.claimedAt ?? "");
+			if (Number.isFinite(reAge) && reAge <= staleAfterMs) return { status: "claimed-by-other", by: re.by };
+		} catch {
+			continue; // 恰被删 → 回 wx 重试
+		}
+		try {
+			unlinkSync(path);
+			tookOver = true; // 接管成功（本代唯一）：wx 重建后带 tookOver 回传（at-least-once 重试语义）
+		} catch {
+			continue; // ENOENT：他人接管中 → 重读重判
+		}
+		// unlink 成功 = 本代唯一接管者；回 wx 重建（EEXIST = 全新 claimant 抢先 → 下一轮重判）
 	}
+	return { status: "claimed-by-other" };
 }
 
 /**

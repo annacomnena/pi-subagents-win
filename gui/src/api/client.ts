@@ -152,6 +152,18 @@ export const api = {
 			payload: { auto, ...(reason ? { reason } : {}) },
 		} satisfies CommandFrameInput),
 
+	/** G6-P2：session.message（to=pi://<sessionId>；payload {text} 1..8000 字节）。
+	 *  同源 cookie 认证（P2 起写端点 fail-closed；dev 由 vite proxy 注入）。 */
+	sessionMessage: (sessionId: string, text: string): Promise<FetchResult<CommandOutcomeBody>> =>
+		postJson<CommandOutcomeBody>("/v1/commands", {
+			frame: "command",
+			type: "session.message",
+			to: `pi://${sessionId}`,
+			commandKey: newCommandKey("msg"),
+			issuedAt: new Date().toISOString(),
+			payload: { text },
+		} satisfies CommandFrameInput, 8000),
+
 	// ── G6-P1：sessions / transcript（只读数据面；WS 增量之外的 HTTP 兜底）──
 
 	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。 */

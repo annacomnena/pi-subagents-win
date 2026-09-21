@@ -280,7 +280,13 @@ export const MASTER_ADDRESS = "agent://master_default";
 /** 客户端可不传 issuedBy——服务端注入 agent://runtime-host（commands.ts 拍板 2）。 */
 export interface CommandFrameInput {
 	frame: "command";
-	type: "workstream.pause" | "workstream.resume" | "master.handoff.accept" | "master.auto-handoff.set" | "master.handoff.prepare";
+	type:
+		| "workstream.pause"
+		| "workstream.resume"
+		| "master.handoff.accept"
+		| "master.auto-handoff.set"
+		| "master.handoff.prepare"
+		| "session.message";
 	to: string;
 	issuedBy?: string;
 	commandKey: string;
@@ -295,7 +301,8 @@ export type CommandOutcomeBody =
 
 // ── G6-P1：GET /v1/sessions + /v1/sessions/:id/transcript（runtime/transcript.ts 手抄）──
 
-/** runtime/transcript.ts SessionSummary。 */
+/** runtime/transcript.ts SessionSummary + G6-P2 L4 服务端权威 Master 标识（与 executor 护栏同源；
+ *  GUI 不再拿 health 心跳自猜）。 */
 export interface SessionSummary {
 	sessionId: string;
 	cwd: string | null;
@@ -304,12 +311,16 @@ export interface SessionSummary {
 	file: string;
 	sizeBytes: number;
 	mtimeMs: number;
+	/** 服务端权威：该会话是当前 master attachment 会话（POST 会 403 master-session-protected）。 */
+	masterProtected?: true;
 }
 
 export interface SessionsBody {
 	version: 1;
 	count: number;
 	sessions: SessionSummary[];
+	/** 服务端权威受保护会话 id（null = 无 attachment；GUI 禁输入标识以条目 flag 为准）。 */
+	masterProtectedSessionId: string | null;
 }
 
 /** 5 种自包含行（turn = 行上标签非容器；渲染任一行不需读别的行）。 */
@@ -371,3 +382,26 @@ export type StreamServerFrame =
 	| { type: "event"; topic: string; seq: number; envelope?: unknown; op?: TranscriptOp }
 	| { type: "resync"; topic: string; head: null }
 	| { type: "error"; topic: string | null; message: string };
+
+// ── G6-P2：session.message 两段回执（runtime/message-outbox.ts + journal 事件 payload 手抄）──
+
+/** 会话页发送状态（POST accepted → pending；WS outbox 事件推进终态；expired = TTL 过期）。 */
+export interface ChatOutboxEntry {
+	commandKey: string;
+	sessionId: string;
+	text: string;
+	/** sending=POST 在途；pending=已入 outbox 等桥注入；delivered/failed/expired=终态；rejected=HTTP 拒绝。 */
+	status: "sending" | "pending" | "delivered" | "failed" | "expired" | "rejected";
+	/** rejected/failed/expired 的补充（HTTP reason / 桥 error / TTL 说明）。 */
+	detail?: string;
+	at: string;
+}
+
+/** outbox 主题 journal 事件 payload（message.queued/delivered/failed 手抄）。 */
+export interface OutboxEventPayload {
+	commandKey?: string;
+	outboxId?: string;
+	sessionId?: string;
+	error?: string;
+	replayed?: boolean;
+}

@@ -1,8 +1,10 @@
 /**
  * runtime-host/ws.ts — G6-P1 C2/C4：`WS /v1/events/stream`（plans/0920_g6_webconsole_plan.md §1 拍板①）
  *
- * 单条 WS 连接 JSON 文本帧多路复用两路只读流：
+ * 单条 WS 连接 JSON 文本帧多路复用三路只读流：
  *   - topic "journal"：journal 增量帧 `{type:"event", topic, seq, envelope}`（seq=物理行号）。
+ *   - topic "outbox"（G6-P2）：journal 的类型过滤投影（message.queued/delivered/failed =
+ *     session.message 两段回执）；seq/epoch/gen 续传语义与 journal 同机（同一物理文件）。
  *   - topic "transcript:<sessionId>"：会话转写投影增量帧 `{type:"event", topic, seq, op}`
  *     （seq=session JSONL 物理行号；op = 5 操作封闭集，与 GET 端点同一投影函数）。
  *
@@ -352,6 +354,19 @@ function rawHttpResponse(socket: Duplex, status: number, statusText: string, bod
 	}
 }
 
+// ── G6-P2：outbox 主题 = journal 过滤投影（session.message 两段回执）─────────
+
+/** outbox 主题下发的 journal 事件类型（封闭：排队 / 送达 / 失败 / TTL 过期；正文永不入 journal）。 */
+export const OUTBOX_EVENT_TYPES: readonly string[] = ["message.queued", "message.delivered", "message.failed", "message.expired"];
+
+const OUTBOX_TOPIC = "outbox";
+
+function envelopeTypesMatch(envelope: unknown, types: readonly string[] | undefined): boolean {
+	if (types === undefined) return true;
+	const t = (envelope as { type?: unknown } | null)?.type;
+	return typeof t === "string" && types.includes(t);
+}
+
 // ── 订阅 hub（两路 topic；per-sub cursor/projector）───────────────
 
 type StreamTopicFrame =
@@ -363,6 +378,8 @@ type StreamTopicFrame =
 interface JournalSub {
 	kind: "journal";
 	cursor: JournalSeqCursor;
+	/** G6-P2：非空时只下发命中的 envelope type（outbox 主题 = journal 过滤投影；seq 语义不变）。 */
+	types?: readonly string[];
 }
 
 interface TranscriptSub {
@@ -570,6 +587,12 @@ class StreamHub {
 			this.subscribeJournal(topic, base);
 			return;
 		}
+		if (topic === OUTBOX_TOPIC) {
+			// G6-P2：outbox = journal 的类型过滤投影（session.message 两段回执）；seq/epoch/gen
+			// 续传语义与 journal 主题完全同机（同一物理文件，过滤只砍发送不砍 seq）。
+			this.subscribeJournal(topic, base, OUTBOX_EVENT_TYPES);
+			return;
+		}
 		if (topic.startsWith("transcript:")) {
 			const sid = topic.slice("transcript:".length);
 			if (sid.length === 0 || /[/\\\s]/.test(sid)) {
@@ -579,7 +602,7 @@ class StreamHub {
 			this.subscribeTranscript(topic, sid, base);
 			return;
 		}
-		this.send({ type: "error", topic, message: "unknown-topic（journal | transcript:<sessionId>）" });
+		this.send({ type: "error", topic, message: "unknown-topic（journal | outbox | transcript:<sessionId>）" });
 	}
 
 	private send(frame: StreamTopicFrame): boolean {
@@ -599,7 +622,7 @@ class StreamHub {
 
 	// ── journal 订阅 ─────────────────────────────────────────────
 
-	private subscribeJournal(topic: string, base: { seq: number; logEpoch: string }): void {
+	private subscribeJournal(topic: string, base: { seq: number; logEpoch: string }, types?: readonly string[]): void {
 		const journalPath = this.opts.journalPath ?? defaultJournalPath();
 		const scan = scanJournalSeq(journalPath);
 		// L4 判代：resume/subscribe 前校验 sidecar（同首行重写/轮转 → gen+1）
@@ -613,9 +636,11 @@ class StreamHub {
 			// 同代续传：补发 (base, head] 后转 live
 			if (!this.send({ type: "ack", topic, mode: "resume", head })) return;
 			for (const e of scan.entries) {
-				if (e.seq > base.seq && !this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
+				if (e.seq <= base.seq) continue;
+				if (!envelopeTypesMatch(e.envelope, types)) continue;
+				if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
 			}
-			this.subs.set(topic, { kind: "journal", cursor: { offset: scan.sizeBytes, nextLineNo: scan.head + 1 } });
+			this.subs.set(topic, { kind: "journal", cursor: { offset: scan.sizeBytes, nextLineNo: scan.head + 1 }, types });
 		} else {
 			// 跨代/越界/空 → snapshot：只回指针，且**不**激活 live tail。客户端必须先 GET
 			// 新代全量，再带该 head 重订阅；否则 GET 期间的 live op 能与旧代 UI 行暂时拼接。
@@ -693,7 +718,10 @@ class StreamHub {
 			return;
 		}
 		sub.cursor = r.cursor;
-		for (const e of r.entries) if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
+		for (const e of r.entries) {
+			if (!envelopeTypesMatch(e.envelope, sub.types)) continue;
+			if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
+		}
 	}
 
 	private tickTranscript(topic: string, sub: TranscriptSub): void {

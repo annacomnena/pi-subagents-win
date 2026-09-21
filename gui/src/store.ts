@@ -12,8 +12,10 @@ import { api, type ConnState, type FetchErr } from "./api/client";
 import { applyTranscriptOp } from "./api/transcript";
 import type {
 	AttentionItem,
+	ChatOutboxEntry,
 	CommandOutcomeBody,
 	HealthView,
+	OutboxEventPayload,
 	RuntimeEnvelope,
 	RuntimeSnapshot,
 	SessionSummary,
@@ -170,6 +172,13 @@ interface GuiState {
 	chatConn: StreamState;
 	/** bump → useEventStream 立即重订阅（snapshot/resync 全量重拉完成后）。 */
 	chatResyncKey: number;
+	// ── G6-P2：session.message 发送 + outbox 两段回执 ──
+	/** commandKey → 发送/回执状态（POST accepted 后由 WS outbox 主题推进终态）。 */
+	chatOutbox: Record<string, ChatOutboxEntry>;
+	/** outbox 主题续传指针（journal seq/epoch/gen 同机）。 */
+	chatOutboxHead: TranscriptHead | null;
+	/** 会话页输入框发送（POST /v1/commands session.message；never-throw，拒绝/失败落 failed/rejected）。 */
+	sendChatMessage: (sessionId: string, text: string) => Promise<void>;
 	pollChatSessions: () => Promise<void>;
 	openChatSession: (id: string) => Promise<void>;
 	reloadChatSession: (id: string) => Promise<void>;
@@ -354,6 +363,49 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatSeqBySession: {},
 	chatConn: "idle",
 	chatResyncKey: 0,
+	chatOutbox: {},
+	chatOutboxHead: null,
+
+	sendChatMessage: async (sessionId, text) => {
+		const commandKey = `gui_msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+		const entry: ChatOutboxEntry = { commandKey, sessionId, text, status: "sending", at: new Date().toISOString() };
+		set({ chatOutbox: { ...get().chatOutbox, [commandKey]: entry } });
+		const r = await api.sessionMessage(sessionId, text);
+		const cur = get().chatOutbox[commandKey];
+		if (cur === undefined) return; // 已被裁剪（理论不发生）
+		if (!r.ok) {
+			// 真实 403 回执驱动（G6-P2 L4 必修 4）：executor 护栏拒绝即权威终态，不靠 health 猜测
+			const rej = (typeof r.body === "object" && r.body !== null ? (r.body as { status?: unknown; reason?: unknown }) : null);
+			if (r.status === 403 && rej?.status === "rejected" && rej.reason === "master-session-protected") {
+				set({
+					chatOutbox: {
+						...get().chatOutbox,
+						[commandKey]: { ...cur, status: "rejected", detail: "Master 会话拒绝远程输入（403 master-session-protected）", at: new Date().toISOString() },
+					},
+				});
+				return;
+			}
+			set({
+				chatOutbox: {
+					...get().chatOutbox,
+					[commandKey]: { ...cur, status: "failed", detail: r.status === 401 ? "未授权（401）" : `网络/服务错误（${r.status}）`, at: new Date().toISOString() },
+				},
+			});
+			return;
+		}
+		const body = r.data as CommandOutcomeBody;
+		set({
+			chatOutbox: {
+				...get().chatOutbox,
+				[commandKey]: {
+					...cur,
+					status: body.status === "accepted" ? "pending" : "rejected",
+					detail: body.status === "accepted" ? undefined : body.reason,
+					at: new Date().toISOString(),
+				},
+			},
+		});
+	},
 
 	pollChatSessions: async () => {
 		const r = await api.sessions();
@@ -387,6 +439,42 @@ export const useGui = create<GuiState>((set, get) => ({
 	/** WS 帧路由：op 增量应用；ack snapshot / resync → 全量重拉 + 重订阅。 */
 	applyChatFrame: async (frame) => {
 		if (frame.type === "error") return;
+		// G6-P2：outbox 主题（journal 过滤投影）→ 发送状态推进 + 续传指针
+		if (frame.topic === "outbox") {
+			if (frame.type === "ack") {
+				if (frame.mode === "resume" && frame.head !== null) set({ chatOutboxHead: frame.head });
+				// snapshot：journal 即重放源，回退 base 从头重放（不重 GET）
+				if (frame.mode === "snapshot") {
+					set({ chatOutboxHead: null });
+					get().bumpChatResync();
+				}
+				return;
+			}
+			if (frame.type === "resync") {
+				set({ chatOutboxHead: null });
+				get().bumpChatResync();
+				return;
+			}
+			if (frame.type === "event" && frame.envelope !== undefined) {
+				const head = get().chatOutboxHead;
+				set({ chatOutboxHead: { seq: frame.seq, logEpoch: head?.logEpoch ?? "", ...(head?.gen !== undefined ? { gen: head.gen } : {}) } });
+				const p = (frame.envelope as { payload?: unknown }).payload as OutboxEventPayload | undefined;
+				const ck = p?.commandKey;
+				if (typeof ck !== "string" || ck.length === 0) return;
+				const cur = get().chatOutbox[ck];
+				if (cur === undefined || cur.status === "delivered" || cur.status === "failed" || cur.status === "expired") return; // 终态不可逆
+				const evType = (frame.envelope as { type?: string }).type;
+				if (evType === "message.delivered") {
+					set({ chatOutbox: { ...get().chatOutbox, [ck]: { ...cur, status: "delivered", detail: undefined, at: new Date().toISOString() } } });
+				} else if (evType === "message.failed") {
+					set({ chatOutbox: { ...get().chatOutbox, [ck]: { ...cur, status: "failed", detail: p?.error, at: new Date().toISOString() } } });
+				} else if (evType === "message.expired") {
+					// G6-P2 L4 必修 2：pending 超 TTL 转 expired（journal 回执投影到发送徽标）
+					set({ chatOutbox: { ...get().chatOutbox, [ck]: { ...cur, status: "expired", detail: "超过 24h 未投递，已过期", at: new Date().toISOString() } } });
+				}
+			}
+			return;
+		}
 		const sid = frame.topic.startsWith("transcript:") ? frame.topic.slice("transcript:".length) : null;
 		if (frame.type === "event" && sid !== null) {
 			if (frame.op === undefined) return;

@@ -7,12 +7,13 @@
  * - 红线：只读（无任何控制流；发消息属 Phase 2）；既有五页 usePoll 零改动。
  */
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { usePoll } from "../usePoll";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
-import { Badge, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
-import type { TranscriptRow } from "../api/types";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
+import type { ChatOutboxEntry, TranscriptRow } from "../api/types";
+import type { StreamSubscribeMsg } from "../api/types";
 
 function fmtDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
@@ -123,8 +124,10 @@ export function ChatPage() {
 	const rowsMap = useGui((s) => s.chatRowsBySession);
 	const conn = useGui((s) => s.chatConn);
 	const resyncKey = useGui((s) => s.chatResyncKey);
+	const outboxMap = useGui((s) => s.chatOutbox);
+	const [draft, setDraft] = useState("");
 
-	// gui:dev 的本机 Vite proxy 在上游 WS 握手注入 cookie；浏览器不持有 token。
+	// gui:dev 的本机 Vite proxy 在上游注入 cookie；浏览器不持有 token。
 	const url = useMemo(() => streamUrl(null), []);
 
 	// 会话列表低频轮询（chat 页内；既有五页 usePoll 零改动）
@@ -134,20 +137,31 @@ export function ChatPage() {
 		enabled: activeId !== null,
 		url,
 		resyncKey,
-		buildSubscriptions: () => {
-			const id = useGui.getState().chatActiveId;
-			if (id === null) return [];
-			const head = useGui.getState().chatHeadBySession[id];
-			return [
-				head !== null && head !== undefined
-					? {
-						type: "subscribe" as const,
-						topic: `transcript:${id}`,
-						// gen：持久流代际（L4）——同首行重写/轮转后旧 gen 被判不符 → snapshot 重拉
-						base: { seq: head.seq, logEpoch: head.logEpoch, ...(typeof head.gen === "number" ? { gen: head.gen } : {}) },
-					}
-					: { type: "subscribe" as const, topic: `transcript:${id}`, base: { seq: 0, logEpoch: "" } },
-			];
+		buildSubscriptions: (): StreamSubscribeMsg[] => {
+			const st = useGui.getState();
+			const subs: StreamSubscribeMsg[] = [];
+			const id = st.chatActiveId;
+			if (id !== null) {
+				const head = st.chatHeadBySession[id];
+				subs.push(
+					head !== null && head !== undefined
+						? {
+							type: "subscribe",
+							topic: `transcript:${id}`,
+							// gen：持久流代际（L4）——同首行重写/轮转后旧 gen 被判不符 → snapshot 重拉
+							base: { seq: head.seq, logEpoch: head.logEpoch, ...(typeof head.gen === "number" ? { gen: head.gen } : {}) },
+						}
+						: { type: "subscribe", topic: `transcript:${id}`, base: { seq: 0, logEpoch: "" } },
+				);
+			}
+			// G6-P2：outbox 主题（session.message 两段回执投影；journal 过滤流）
+			const oh = st.chatOutboxHead;
+			subs.push(
+				oh !== null
+					? { type: "subscribe", topic: "outbox", base: { seq: oh.seq, logEpoch: oh.logEpoch, ...(typeof oh.gen === "number" ? { gen: oh.gen } : {}) } }
+					: { type: "subscribe", topic: "outbox", base: { seq: 0, logEpoch: "" } },
+			);
+			return subs;
 		},
 		onFrame: (f) => {
 			void useGui.getState().applyChatFrame(f);
@@ -158,14 +172,34 @@ export function ChatPage() {
 	}, [wsState]);
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
+	// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——/v1/sessions 条目的 masterProtected
+	// flag（与 executor 护栏同源 getMasterStatus().attachment.sessionId）；不再拿 health 心跳
+	// 自猜（stale 心跳会错标）。POST 真 403 回执仍是最后防线（store 层映射 rejected 徽标）。
+	const activeSession = activeId !== null ? chatSessions.find((s) => s.sessionId === activeId) : undefined;
+	const isMasterSession = activeSession?.masterProtected === true;
+	const outboxEntries = useMemo(
+		() =>
+			Object.values(outboxMap)
+				.filter((e) => e.sessionId === activeId)
+				.sort((a, b) => a.at.localeCompare(b.at))
+				.slice(-20),
+		[outboxMap, activeId],
+	);
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 	useEffect(() => {
 		bottomRef.current?.scrollIntoView({ block: "end" });
-	}, [rows.length, activeId]);
+	}, [rows.length, outboxEntries.length, activeId]);
+
+	const send = async (): Promise<void> => {
+		const text = draft.trim();
+		if (text.length === 0 || activeId === null || isMasterSession) return;
+		setDraft("");
+		await useGui.getState().sendChatMessage(activeId, text);
+	};
 
 	return (
 		<div className="space-y-3">
-			<PageIntro>会话只读视图：pi 会话转写（自包含行投影；发消息属后续阶段）</PageIntro>
+			<PageIntro>会话视图：pi 会话转写（自包含行投影）；输入经 POST /v1/commands 两段式投递（WS 保持只读）</PageIntro>
 			<div className="flex h-[calc(100vh-11rem)] min-h-0 gap-3">
 				{/* 左：会话列表 */}
 				<Card title={<Term zh="会话" en="Sessions" />} >
@@ -189,6 +223,9 @@ export function ChatPage() {
 												<RelTime at={s.startedAt} className="shrink-0 text-[10px] text-zinc-500" />
 											</div>
 											<p className="mt-0.5 truncate font-mono text-[10px] text-zinc-600">{basename(s.cwd)}</p>
+										{s.masterProtected === true && (
+											<span className="mt-1 inline-block rounded border border-red-900/60 bg-red-950/40 px-1 py-0.5 text-[10px] text-red-300">拒绝远程输入</span>
+										)}
 										</button>
 									</li>
 								))}
@@ -211,18 +248,77 @@ export function ChatPage() {
 					<div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
 						{activeId === null ? (
 							<EmptyState>从左侧选择一个会话</EmptyState>
-						) : rows.length === 0 ? (
+						) : rows.length === 0 && outboxEntries.length === 0 ? (
 							<EmptyState>该会话暂无可投影内容（或正在加载）</EmptyState>
 						) : (
 							<>
 								{rows.map((row) => (
 									<RowView key={row.rowId} row={row} />
 								))}
+								{outboxEntries.map((e) => (
+									<OutboxRowView key={e.commandKey} e={e} />
+								))}
 								<div ref={bottomRef} />
 							</>
 						)}
 					</div>
+				{/* G6-P2：输入框（POST /v1/commands session.message；WS 只读红线不破——发消息仍走 HTTP） */}
+				<div className="border-t border-zinc-800 px-3 py-2">
+					{isMasterSession ? (
+						<p className="text-[11px] text-red-300/90">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
+					) : (
+						<form
+							onSubmit={(ev) => {
+								ev.preventDefault();
+								void send();
+							}}
+							className="flex items-end gap-2"
+						>
+							<textarea
+								value={draft}
+								onChange={(e) => setDraft(e.target.value)}
+								onKeyDown={(e) => {
+									if (e.key === 'Enter' && !e.shiftKey) {
+										e.preventDefault();
+										void send();
+									}
+								}}
+								maxLength={8000}
+								rows={Math.min(4, Math.max(1, draft.split("\n").length))}
+								placeholder={activeId !== null ? '输入消息发往该会话（Enter 发送，Shift+Enter 换行）' : '先选择会话'}
+								disabled={activeId === null}
+								className="max-h-32 min-h-[2.25rem] flex-1 resize-none rounded border border-zinc-700 bg-zinc-950/60 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none disabled:opacity-50"
+							/>
+							<Button onClick={() => void send()} disabled={activeId === null || draft.trim().length === 0}>
+								发送
+							</Button>
+						</form>
+					)}
 				</div>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+// ── G6-P2：发送两段回执状态徽标 ──────────────────────────────
+
+const OUTBOX_STATUS: Record<ChatOutboxEntry["status"], { tone: "gray" | "yellow" | "green" | "red"; label: string }> = {
+	sending: { tone: "yellow", label: "发送中" },
+	pending: { tone: "yellow", label: "已提交·等待注入" },
+	delivered: { tone: "green", label: "已送达" },
+	failed: { tone: "red", label: "失败" },
+	expired: { tone: "gray", label: "已过期（24h 未投递）" },
+	rejected: { tone: "red", label: "被拒绝" },
+};
+
+function OutboxRowView({ e }: { e: ChatOutboxEntry }) {
+	const s = OUTBOX_STATUS[e.status];
+	return (
+		<div className="my-1.5 flex justify-end">
+			<div className="flex max-w-[85%] items-start gap-2">
+				<div className="whitespace-pre-wrap rounded-lg rounded-br-sm border border-blue-900/30 bg-blue-950/20 px-3 py-1.5 text-sm text-blue-200/80">{e.text}</div>
+				<Badge tone={s.tone} title={e.detail ?? s.label}>{s.label}</Badge>
 			</div>
 		</div>
 	);

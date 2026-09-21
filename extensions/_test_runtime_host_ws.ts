@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { connect as netConnect, type Socket } from "node:net";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -602,6 +602,147 @@ try {
 		assert.ok(ping2 !== null, "pong 后下一拍 ping 仍到（keepalive 未误杀）");
 		if (ping2 !== null) p.ws!.sendPong(ping2.payload);
 		p.ws!.destroy();
+	}
+
+	// ── T8 outbox 主题（G6-P2）：journal 过滤投影 + 续传 + 过滤正确性 ──
+	{
+		// 种入混合类型：非 outbox 类型必须被过滤（journal 主题能看见、outbox 主题看不见）
+		const mkTyped = (type: string, n: number) =>
+			newEventEnvelope({ type, source: masterAddress(), payload: { n }, at: new Date(Date.parse("2026-09-22T11:00:00Z") + n * 1000).toISOString() });
+		const journalLines = readFileSync(journalPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+		const seqBase = journalLines.length; // 追加前的物理行数
+		const journalEpoch = (JSON.parse(journalLines[0]!) as { id: string }).id; // logEpoch = 首 envelope id
+		const q1 = mkTyped("message.queued", 1);
+		const noise1 = mkTyped("run.completed", 2);
+		const d1 = mkTyped("message.delivered", 3);
+		appendRuntimeEnvelope(q1, journalPath);
+		appendRuntimeEnvelope(noise1, journalPath);
+		appendRuntimeEnvelope(d1, journalPath);
+
+		const c = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(c.ok);
+		c.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: {} }));
+		const ack = await c.ws!.recvJson();
+		assert.ok(isAck(ack) && (ack as any).mode === "resume", "outbox 首 subscribe → resume（journal 即重放源）");
+		const f1 = await c.ws!.recvJson();
+		const f2 = await c.ws!.recvJson();
+		assert.ok(isEvent(f1) && (f1 as any).envelope.id === q1.id && (f1 as any).seq === seqBase + 1, "queued 帧到达（seq=journal 物理行号）");
+		assert.ok(isEvent(f2) && (f2 as any).envelope.id === d1.id && (f2 as any).seq === seqBase + 3, "delivered 帧到达；run.completed 被过滤");
+		const extra = await c.ws!.recvJson(300);
+		assert.equal(extra, null, "重放精确（无过滤漏网帧）");
+
+		// live：追加 failed + 噪声 → 只推 failed
+		const failEv = mkTyped("message.failed", 4);
+		appendRuntimeEnvelope(failEv, journalPath);
+		appendRuntimeEnvelope(mkTyped("test.tick", 5), journalPath);
+		const live = await c.ws!.recvJson();
+		assert.ok(isEvent(live) && (live as any).envelope.id === failEv.id, "live failed 事件推送（噪声被滤）");
+		c.ws!.destroy();
+
+		// 断线重连：base={seq:13, logEpoch} → 只补发命中类型
+		const c2 = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(c2.ok);
+		const doneEv = mkTyped("message.delivered", 6);
+		appendRuntimeEnvelope(doneEv, journalPath);
+		c2.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: { seq: seqBase + 3, logEpoch: journalEpoch } }));
+		const ack2 = await c2.ws!.recvJson();
+		assert.ok(isAck(ack2) && (ack2 as any).mode === "resume");
+		const b1 = await c2.ws!.recvJson();
+		assert.ok(isEvent(b1) && (b1 as any).envelope.id === failEv.id, "续传补发含 live 期 failed（base 之后全部命中类型）");
+		const b2 = await c2.ws!.recvJson();
+		assert.ok(isEvent(b2) && (b2 as any).envelope.id === doneEv.id, "续传补发 delivered");
+		const extra2 = await c2.ws!.recvJson(300);
+		assert.equal(extra2, null, "续传精确（test.tick 被滤、无多余帧）");
+		c2.ws!.destroy();
+
+		// journal 主题不过滤（对照：同文件全部类型可见）
+		const c3 = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(c3.ok);
+		c3.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "journal", base: { seq: 0, logEpoch: "" } }));
+		assert.ok(isAck(await c3.ws!.recvJson()));
+		let sawNoise = false;
+		for (let i = 0; i < 40; i += 1) {
+			const f = await c3.ws!.recvJson(500);
+			if (f === null) break;
+			if (isEvent(f) && (f as any).envelope.id === noise1.id) {
+				sawNoise = true;
+				break;
+			}
+		}
+		assert.ok(sawNoise, "journal 主题仍全量（过滤仅 outbox 主题）");
+		c3.ws!.destroy();
+
+		// T8a gen 判代（L4 必修 ④）：同首行重写 → 旧 base.gen 不符 → snapshot（outbox 与 journal 同机同语义）
+		{
+			const c4 = await wsHandshake(handle.info.port, wsPath(token!));
+			assert.ok(c4.ok);
+			c4.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: {} }));
+			const ack0 = (await c4.ws!.recvJson()) as any;
+			assert.ok(isAck(ack0) && ack0.mode === "resume");
+			const gen0: number = ack0.head.gen;
+			const seq0: number = ack0.head.seq;
+			assert.ok(Number.isInteger(gen0) && gen0 >= 1, "ack head.gen 存在（G6-P1 L4 持久代际）");
+			for (let i = 0; i < 200; i += 1) {
+				const drain = await c4.ws!.recvJson(200);
+				if (drain === null) break;
+			}
+			c4.ws!.destroy();
+
+			// 同首行重写（变长重写：保留首行 + 新 envelope，丢弃其余）→ validateStreamGen bump
+			const lines = readFileSync(journalPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+			const rewriteEv = mkTyped("message.queued", 9);
+			writeFileSync(journalPath, `${lines[0]}\n${JSON.stringify(rewriteEv)}\n`, "utf8");
+
+			const c5 = await wsHandshake(handle.info.port, wsPath(token!));
+			assert.ok(c5.ok);
+			c5.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: { seq: seq0, logEpoch: journalEpoch, gen: gen0 } }));
+			const ack1 = (await c5.ws!.recvJson()) as any;
+			assert.ok(isAck(ack1) && ack1.mode === "snapshot", "旧 base.gen → snapshot（不误判同代续传）");
+			assert.equal(ack1.head.gen, gen0 + 1, "服务端 bump gen");
+			c5.ws!.destroy();
+
+			// 新 gen 重订阅 → resume + 重放新代内容
+			const c5b = await wsHandshake(handle.info.port, wsPath(token!));
+			assert.ok(c5b.ok);
+			c5b.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: { seq: 0, logEpoch: journalEpoch, gen: gen0 + 1 } }));
+			const ack2 = (await c5b.ws!.recvJson()) as any;
+			assert.ok(isAck(ack2) && ack2.mode === "resume");
+			const rb = await c5b.ws!.recvJson();
+			assert.ok(isEvent(rb) && (rb as any).envelope.id === rewriteEv.id, "新代重放：重写后的 queued 可见");
+			c5b.ws!.destroy();
+		}
+
+		// T8b WS-command 反向覆盖（L4 必修 ④）：客户端帧只接受 subscribe ——
+		// {type:"command"} 只得 error 帧，零 executor/outbox/journal 副作用（WS 只读红线）
+		{
+			const countLines = (): number => readFileSync(journalPath, "utf8").split("\n").filter((l) => l.trim().length > 0).length;
+			const stateDir = join(ENV_DIR, "state");
+			const dirCount = (p: string): number => {
+				try {
+					return readdirSync(p).length;
+				} catch {
+					return 0;
+				}
+			};
+			const journalBefore = countLines();
+			const commandsBefore = dirCount(join(stateDir, "commands"));
+			const outboxBefore = dirCount(join(stateDir, "message-outbox"));
+
+			const c6 = await wsHandshake(handle.info.port, wsPath(token!));
+			assert.ok(c6.ok);
+			c6.ws!.sendText(JSON.stringify({ type: "command", commandKey: "ws-hack-1", to: masterAddress(), payload: { text: "bypass" } }));
+			const err1 = await c6.ws!.recvJson();
+			assert.ok(typeof err1 === "object" && err1 !== null && (err1 as any).type === "error", "command 帧 → error 帧");
+			assert.equal((err1 as any).topic, null);
+			c6.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "outbox", base: {} }));
+			assert.ok(isAck(await c6.ws!.recvJson()), "error 后连接仍可用（订阅照常）");
+			c6.ws!.destroy();
+
+			await new Promise((r) => setTimeout(r, 300)); // 静默窗：等潜在（不应存在的）副作用
+			assert.equal(countLines(), journalBefore, "journal 零增长（WS command 无 executor 副作用）");
+			assert.equal(dirCount(join(stateDir, "commands")), commandsBefore, "commands 盘面零变化（未占幂等键）");
+			assert.equal(dirCount(join(stateDir, "message-outbox")), outboxBefore, "outbox 盘面零变化");
+		}
 	}
 
 	console.log("_test_runtime_host_ws: all assertions passed");

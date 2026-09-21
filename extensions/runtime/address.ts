@@ -6,6 +6,7 @@
  *   agent://master                       逻辑 Master（session rollover 不变）
  *   workstream://<workstreamId>
  *   task://<taskId>
+ *   pi://<sessionId>                     pi 会话（G6-P2 session.message 目标；host 投影/存在性校验）
  *   run://tab/<tabRunId>                 引用现有 tab runId（不迁移、不重生）
  *   run://subagent/<runId>               引用现有 subagent runId
  *   run://trace/<fusionRunId>/<lane>     trace-fusion lane
@@ -24,6 +25,7 @@ export type ObjectAddress =
 	| `agent://${string}`
 	| `workstream://${string}`
 	| `task://${string}`
+	| `pi://${string}`
 	| `run://${string}`;
 
 // ── 构造 ───────────────────────────────────────────────────────────
@@ -45,6 +47,11 @@ export function tabRunAddress(tabRunId: string): ObjectAddress {
 	return `run://tab/${tabRunId}`;
 }
 
+/** pi 会话地址（G6-P2 session.message 目标；sessionId = pi session JSONL 的 id）。 */
+export function piSessionAddress(sessionId: string): ObjectAddress {
+	return `pi://${sessionId}`;
+}
+
 /** 现有 subagent-win async runId。 */
 export function subagentRunAddress(runId: string): ObjectAddress {
 	return `run://subagent/${runId}`;
@@ -61,6 +68,7 @@ export type ParsedObjectAddress =
 	| { scheme: "agent"; value: string }
 	| { scheme: "workstream"; value: string }
 	| { scheme: "task"; value: string }
+	| { scheme: "pi"; value: string }
 	| { scheme: "run"; kind: "tab"; value: string }
 	| { scheme: "run"; kind: "subagent"; value: string }
 	| { scheme: "run"; kind: "trace"; fusionRunId: string; lane: string };
@@ -82,9 +90,10 @@ export function parseObjectAddress(address: string): ParsedObjectAddress | null 
 		case "agent":
 		case "workstream":
 		case "task":
+		case "pi":
 			// 单段命名空间：不允许出现第二个 "/"（id 内不含路径）
 			if (rest.includes("/")) return null;
-			return { scheme, value: rest };
+			return { scheme, value: rest } as ParsedObjectAddress;
 		case "run": {
 			const parts = rest.split("/");
 			if (parts.length === 2 && (parts[0] === "tab" || parts[0] === "subagent")) {
