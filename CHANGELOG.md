@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0] — 2026-09-22 (G6 Web Console: WS streaming, chat, interactions — ZCode-referenced)
+
+- **参照 ZCode（zai-org，2026-09-20 开源）架构**：解剖报告 `plans/0920_zcode_reference_research.md`，分阶段计划 `plans/0920_g6_webconsole_plan.md`；采纳其可续传订阅/封闭 delta 操作/审批状态投影/诚实投递语义思想，明确不抄二进制 RPC/SQLite/手机端。
+- **P1 只读数据面**：手写 RFC6455 WebSocket `/v1/events/stream`（journal+transcript 两路复用，seq/logEpoch/gen 三元续传）；pi session JSONL → 5 种自包含行投影 + coalesce 纯函数（黄金 10 例）；GET /v1/sessions、/v1/sessions/:id/transcript?after=；启动 token 落 host.json（0600）fail-closed；GUI 第 6 页「会话」只读 chat。L4 NEEDS-CHANGES→PASS：持久 stream-gen sidecar 判代（同首行重写/轮转检出）+ RFC 层回归 10 项 + token hygiene 套件。
+- **P2 控制面**：`session.message` 命令（pi:// 寻址、master 会话双层 403 护栏、payload 白名单）；executor→outbox 纯状态盘面→桥 claimInjection 注入的两段式 **at-least-once** 投递（诚实语义：稳定 dedupe 身份 + 目标端去重，crash-window/双进程 CAS 竞速测试）；24h TTL expired 无永久孤儿；POST /v1/commands 认证 fail-closed（timing-safe）；GUI 输入框+两段回执徽标（服务端权威 masterProtected）。L4 BLOCK→PASS 四必修。
+- **P3 审批投影+多端附着**：`/v1/interactions` 纯只读投影（attention 1:1 + pending proposal 携 response 命令意图）+ WS interactions 主题（订阅即全量重放）；GUI 待决策徽标/按钮由投影驱动；多 client 独立游标互不干扰（[ws <cid>] 追踪）。
+- 全程 §22/§29 红线：Host 不拥有真相（JSONL 只读）、投影零控制流、WS 永不接受 client 命令帧；gui/ 五页轮询零改动，第 6 页走事件流。
+
 ## [0.4.1] — 2026-09-20 (backlog: mailbox command consumption + scope stale takeover)
 
 - **mailbox 命令信消费接线**：`agent://master_default` 域命令信在 fencing 复检后、注入前交由确定性执行器 `executeCommand`（红线：命令内容永不进 LLM——回执为逐字节固定模板+受控枚举，L4 三轮打磨内容隔离）；mailbox at-least-once ack × executor wx-claim 双层幂等；`{fileId, letter}` 唯一遍历源防 claim/执行错配；rejected/failed 终态 ack 不重投；ws/scope 域命令信维持现状。生产者 v1 仍为零（POST /v1/commands 不经 mailbox），接线为后续 agent 发起命令铺路。
