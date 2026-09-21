@@ -343,6 +343,8 @@ export type TranscriptOp =
 export interface TranscriptHead {
 	seq: number;
 	logEpoch: string;
+	/** 持久流代际（G6-P1 L4）：同首行重写/轮转 → 服务端 bump；重订阅带旧 gen → snapshot。 */
+	gen?: number;
 }
 
 export interface TranscriptBody {
@@ -361,7 +363,7 @@ export interface TranscriptBody {
 export interface StreamSubscribeMsg {
 	type: "subscribe";
 	topic: string;
-	base?: { seq?: number; logEpoch?: string };
+	base?: { seq?: number; logEpoch?: string; gen?: number };
 }
 
 export type StreamServerFrame =

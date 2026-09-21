@@ -19,7 +19,7 @@
  * 禁 Pi API。所有读/探活函数 never-throw（失败落 null / "dead" 等兜底值）。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
@@ -111,9 +111,15 @@ export function readHostInfo(path: string = hostInfoPath()): HostInfo | null {
 export function writeHostInfo(info: HostInfo, path: string = hostInfoPath()): boolean {
 	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
 	try {
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(tmp, `${JSON.stringify(info, null, 2)}\n`, "utf8");
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		// host.json 含 bearer token；不依赖进程 umask，POSIX 上强制 owner-only。
+		writeFileSync(tmp, `${JSON.stringify(info, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		renameSync(tmp, path);
+		try {
+			chmodSync(path, 0o600);
+		} catch {
+			// Windows ACL/不支持 chmod 时保留平台默认；写入本身仍成功。
+		}
 		return true;
 	} catch {
 		try {

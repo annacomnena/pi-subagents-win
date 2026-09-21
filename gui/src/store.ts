@@ -163,7 +163,7 @@ interface GuiState {
 	chatActiveId: string | null;
 	/** 会话 → 投影行终态（应用 op 后；进入页面由 GET 全量播种，WS 增量维护）。 */
 	chatRowsBySession: Record<string, TranscriptRow[]>;
-	/** 会话 → 投影头（seq/logEpoch；断线重连的 base 来源）。 */
+	/** 会话 → 投影头（seq/logEpoch/gen；断线重连的 base 来源）。 */
 	chatHeadBySession: Record<string, TranscriptHead | null>;
 	/** 会话 → 已见最大帧 seq（防重放倒退；重放去重由 appended 幂等兑底）。 */
 	chatSeqBySession: Record<string, number>;

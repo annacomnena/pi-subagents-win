@@ -119,20 +119,6 @@ export function useEventStream(opts: UseEventStreamOptions): StreamState {
 	return state;
 }
 
-/** 本机 token：gui-dev 打印的 ?token= URL 进入时捕获 → sessionStorage；后续读缓存。 */
-export function hostToken(): string | null {
-	try {
-		const q = new URLSearchParams(window.location.search).get("token");
-		if (q !== null && q.length > 0) {
-			window.sessionStorage.setItem("sw-host-token", q);
-			return q;
-		}
-		return window.sessionStorage.getItem("sw-host-token");
-	} catch {
-		return null;
-	}
-}
-
 /** WS 流地址（同源 /v1 经 vite proxy ws:true 转发到 runtime-host）。 */
 export function streamUrl(token: string | null): string | null {
 	const proto = window.location.protocol === "https:" ? "wss" : "ws";

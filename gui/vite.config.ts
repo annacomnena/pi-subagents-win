@@ -33,6 +33,11 @@ function readHostPortFromHostJson(): number | null {
 	}
 }
 
+function hostToken(): string | null {
+	const token = process.env.GUI_HOST_TOKEN;
+	return typeof token === "string" && token.length > 0 ? token : null;
+}
+
 function resolveProxyTarget(): string {
 	const envTarget = process.env.GUI_HOST_TARGET?.trim();
 	if (envTarget) return envTarget;
@@ -51,8 +56,15 @@ export default defineConfig({
 			"/v1": {
 				target: resolveProxyTarget(),
 				changeOrigin: false,
-				// G6-P1：WS /v1/events/stream 走同一代理面（http-proxy ws 升级转发）
+				// G6-P1：WS /v1/events/stream 走同一代理面（http-proxy ws 升级转发）。
+				// gui:dev 从 host.json 读取 token，仅在本机 proxy 的上游握手注入；浏览器 URL/日志不含 bearer。
 				ws: true,
+				configure: (proxy) => {
+					proxy.on("proxyReqWs", (proxyReq) => {
+						const token = hostToken();
+						if (token !== null) proxyReq.setHeader("Cookie", `sw_host_token=${token}`);
+					});
+				},
 			},
 		},
 	},

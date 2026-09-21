@@ -156,18 +156,16 @@ async function main() {
 
 	// 2) spawn vite（前台子进程；Ctrl+C 连带清理）
 	const vitePort = Number(process.env.GUI_VITE_PORT) > 0 ? String(Number(process.env.GUI_VITE_PORT)) : undefined;
+	// token 只通过 launcher → Vite proxy 的进程内环境传递；绝不拼进浏览器 URL 或日志。
+	const wsToken = typeof hostInfo?.token === "string" && hostInfo.token.length > 0 ? hostInfo.token : null;
 	const vite = spawn(process.execPath, [VITE_BIN, ...(vitePort ? ["--port", vitePort, "--strictPort"] : [])], {
 		cwd: GUI_DIR,
 		stdio: "inherit",
-		env: process.env,
+		env: { ...process.env, ...(wsToken !== null ? { GUI_HOST_TOKEN: wsToken } : {}) },
 	});
 
 	const url = `http://localhost:${vitePort ?? 5173}`;
-	// G6-P1：拼带本机 token 的 URL（浏览器捕获 → sessionStorage → WS 握手；HttpOnly cookie
-	// 由 host 在 ?token= 首握时种下）。host.json 不可读/无 token → 打印裸 URL（WS 401 fail-closed）。
-	const wsToken = typeof hostInfo?.token === "string" && hostInfo.token.length > 0 ? hostInfo.token : null;
-	const urlWithToken = wsToken !== null ? `${url}/?token=${encodeURIComponent(wsToken)}` : url;
-	console.log(`[gui:dev] GUI: ${urlWithToken}  （不自动开浏览器；/v1 → 127.0.0.1:${hostInfo?.port ?? "?"}${wsToken !== null ? "，URL 含 WS token" : "，警告：无 token，WS 将 401"}）`);
+	console.log(`[gui:dev] GUI: ${url}  （不自动开浏览器；/v1 → 127.0.0.1:${hostInfo?.port ?? "?"}${wsToken !== null ? "，WS 凭据由本机 proxy 注入" : "，警告：无 token，WS 将 401"}）`);
 
 	const cleanup = () => {
 		try {

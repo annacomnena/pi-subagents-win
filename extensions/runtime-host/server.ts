@@ -78,6 +78,7 @@ import {
 	commandOutcomeHttpResponse,
 	parseCommandRequest,
 } from "./commands.ts";
+import { validateStreamGen } from "../runtime/stream-gen.ts";
 import { executeCommand } from "../runtime/command-executor.ts";
 import { attachEventStream, WS_PATH } from "./ws.ts";
 
@@ -523,11 +524,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					const afterRaw = u.searchParams.get("after");
 					const after = afterRaw !== null && /^\d+$/.test(afterRaw) ? parseInt(afterRaw, 10) : 0;
 					const proj = projectSession(file, after);
+					// G6-P1 L4：head 带持久代际 gen（同首行重写/轮转检出；客户端重订阅带 base.gen）
+					const gen = validateStreamGen(`session:${sessionId}`, file, proj.logEpoch);
 					body = {
 						version: 1,
 						sessionId,
 						mode: after > 0 ? "delta" : "snapshot",
-						head: { seq: proj.head, logEpoch: proj.logEpoch },
+						head: { seq: proj.head, logEpoch: proj.logEpoch, gen },
 						count: proj.rows.length,
 						rows: proj.rows,
 						skippedUnknown: proj.skippedUnknown,

@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { usePoll } from "../usePoll";
 import { useGui } from "../store";
-import { hostToken, streamUrl, useEventStream } from "../useEventStream";
+import { streamUrl, useEventStream } from "../useEventStream";
 import { Badge, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
 import type { TranscriptRow } from "../api/types";
 
@@ -124,8 +124,8 @@ export function ChatPage() {
 	const conn = useGui((s) => s.chatConn);
 	const resyncKey = useGui((s) => s.chatResyncKey);
 
-	const token = useMemo(() => hostToken(), []);
-	const url = useMemo(() => (token !== null ? streamUrl(token) : null), [token]);
+	// gui:dev 的本机 Vite proxy 在上游 WS 握手注入 cookie；浏览器不持有 token。
+	const url = useMemo(() => streamUrl(null), []);
 
 	// 会话列表低频轮询（chat 页内；既有五页 usePoll 零改动）
 	usePoll(() => useGui.getState().pollChatSessions(), 6000);
@@ -140,7 +140,12 @@ export function ChatPage() {
 			const head = useGui.getState().chatHeadBySession[id];
 			return [
 				head !== null && head !== undefined
-					? { type: "subscribe" as const, topic: `transcript:${id}`, base: { seq: head.seq, logEpoch: head.logEpoch } }
+					? {
+						type: "subscribe" as const,
+						topic: `transcript:${id}`,
+						// gen：持久流代际（L4）——同首行重写/轮转后旧 gen 被判不符 → snapshot 重拉
+						base: { seq: head.seq, logEpoch: head.logEpoch, ...(typeof head.gen === "number" ? { gen: head.gen } : {}) },
+					}
 					: { type: "subscribe" as const, topic: `transcript:${id}`, base: { seq: 0, logEpoch: "" } },
 			];
 		},
@@ -200,16 +205,12 @@ export function ChatPage() {
 						</h2>
 						<div className="flex items-center gap-2 text-[11px]">
 							{activeId !== null && <ShortId value={activeId} />}
-							<ConnBadge conn={conn} hasToken={token !== null} />
+							<ConnBadge conn={conn} />
 						</div>
 					</header>
 					<div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
 						{activeId === null ? (
 							<EmptyState>从左侧选择一个会话</EmptyState>
-						) : token === null ? (
-							<EmptyState>
-								缺少本机 token：请从 <span className="font-mono">npm run gui:dev</span> 打印的带 token URL 进入（WS 认证 fail-closed）
-							</EmptyState>
 						) : rows.length === 0 ? (
 							<EmptyState>该会话暂无可投影内容（或正在加载）</EmptyState>
 						) : (
@@ -227,8 +228,7 @@ export function ChatPage() {
 	);
 }
 
-function ConnBadge({ conn, hasToken }: { conn: string; hasToken: boolean }) {
-	if (!hasToken) return <Badge tone="yellow" title="缺 token：WS 未连接，仅 GET 兜底">无凭据</Badge>;
+function ConnBadge({ conn }: { conn: string }) {
 	if (conn === "open") return <Badge tone="green" title="WS 已连接（增量推送）">实时</Badge>;
 	if (conn === "connecting") return <Badge tone="yellow">连接中</Badge>;
 	if (conn === "down") return <Badge tone="red" title="WS 断开，自动重连中（重连带 seq 续传）">重连中</Badge>;
