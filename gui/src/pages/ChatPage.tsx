@@ -1,17 +1,19 @@
 /**
- * gui/src/pages/ChatPage.tsx — G6-P1 第 6 页「会话」：pi 会话列表 + chat 只读渲染。
+ * gui/src/pages/ChatPage.tsx — 永久默认主视图「会话」（G6-P1 第 6 页 → 会话为主重构 S3/S5）。
  *
- * - 数据面：GET /v1/sessions（6s 轮询）+ GET transcript 首屏全量 + WS transcript 增量
- *   （useEventStream；断线重连带 seq/logEpoch，snapshot/resync → 全量重拉重订阅）；
+ * - 布局：会话列表已上移左栏（SessionList 常驻）；本页只剩 transcript+composer 同滚动视口，
+ *   composer 为滚动容器内 sticky dock（S5，替 h-[calc(100vh-…)] 魔法数）；贴底锚定 +
+ *   回看锁定阅读位 + 「回到底部」浮钮（单 scroll handler，不加依赖）；
+ * - 数据面：GET transcript 首屏全量 + WS transcript 增量（useEventStream；断线重连带
+ *   seq/logEpoch，snapshot/resync → 全量重拉重订阅）；sessions 6s 轮询已上移 App（S2）；
  * - 渲染：5 种自包含行（turnHeader/userInput/assistantText/reasoning/toolCall）；
- * - 红线：只读（无任何控制流；发消息属 Phase 2）；既有五页 usePoll 零改动。
+ * - 红线：WS 只读（发消息走 HTTP outbox）；既有五页 usePoll 零改动。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { usePoll } from "../usePoll";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
-import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
+import { Badge, Button, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
 import type { ChatOutboxEntry, TranscriptRow } from "../api/types";
 import type { StreamSubscribeMsg } from "../api/types";
 
@@ -21,13 +23,6 @@ function fmtDuration(ms: number): string {
 	const m = Math.floor(ms / 60_000);
 	const s = Math.round((ms % 60_000) / 1000);
 	return `${m}m${s.toString().padStart(2, "0")}s`;
-}
-
-function basename(p: string | null): string {
-	if (p === null) return "";
-	const norm = p.replace(/\\/g, "/");
-	const idx = norm.lastIndexOf("/");
-	return idx >= 0 ? norm.slice(idx + 1) : norm;
 }
 
 // ── 5 种行渲染组件 ────────────────────────────────────────────────
@@ -130,9 +125,6 @@ export function ChatPage() {
 	// gui:dev 的本机 Vite proxy 在上游注入 cookie；浏览器不持有 token。
 	const url = useMemo(() => streamUrl(null), []);
 
-	// 会话列表低频轮询（chat 页内；既有五页 usePoll 零改动）
-	usePoll(() => useGui.getState().pollChatSessions(), 6000);
-
 	const wsState = useEventStream({
 		enabled: activeId !== null,
 		url,
@@ -185,10 +177,36 @@ export function ChatPage() {
 				.slice(-20),
 		[outboxMap, activeId],
 	);
-	const bottomRef = useRef<HTMLDivElement | null>(null);
+	// S5：composer sticky dock + 贴底/回看锁定（替原 scrollIntoView）。
+	// 单 scroll handler 判 nearBottom（≤48px）：贴底→新内容自动锚定吸底；离开底部→锁定阅读位
+	//（不强制拉底），浮出「回到底部」钮。回看时消息从 dock 底下穿过（zcode composer dock 样板）。
+	const scrollRef = useRef<HTMLDivElement | null>(null);
+	const [atBottom, setAtBottom] = useState(true);
+
+	const handleScroll = (): void => {
+		const el = scrollRef.current;
+		if (el === null) return;
+		setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+	};
+
+	// 贴底锚定：仅在 atBottom 时跟随新行/回执滚动；回看（!atBottom）锁定阅读位
 	useEffect(() => {
-		bottomRef.current?.scrollIntoView({ block: "end" });
-	}, [rows.length, outboxEntries.length, activeId]);
+		const el = scrollRef.current;
+		if (el !== null && atBottom) el.scrollTop = el.scrollHeight;
+	}, [rows, outboxEntries, atBottom]);
+
+	// 切会话 → 重置贴底（先看最新）
+	useEffect(() => {
+		setAtBottom(true);
+		const el = scrollRef.current;
+		if (el !== null) el.scrollTop = el.scrollHeight;
+	}, [activeId]);
+
+	const scrollToLatest = (): void => {
+		setAtBottom(true);
+		const el = scrollRef.current;
+		if (el !== null) el.scrollTop = el.scrollHeight;
+	};
 
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
@@ -198,103 +216,83 @@ export function ChatPage() {
 	};
 
 	return (
-		<div className="space-y-3">
+		// S5：h-full flex-col 替代 h-[calc(100vh-…)] 魔法数（main 弹性列内自适应）
+		<div className="flex h-full min-h-0 flex-col gap-3">
 			<PageIntro>会话视图：pi 会话转写（自包含行投影）；输入经 POST /v1/commands 两段式投递（WS 保持只读）</PageIntro>
-			<div className="flex h-[calc(100vh-11rem)] min-h-0 gap-3">
-				{/* 左：会话列表 */}
-				<Card title={<Term zh="会话" en="Sessions" />} >
-					<div className="max-h-[calc(100vh-14rem)] w-64 shrink-0 overflow-y-auto">
-						{chatSessions.length === 0 ? (
-							<EmptyState>暂无会话（等待列表数据）</EmptyState>
-						) : (
-							<ul className="space-y-1">
-								{chatSessions.map((s) => (
-									<li key={s.sessionId}>
-										<button
-											type="button"
-											onClick={() => void useGui.getState().openChatSession(s.sessionId)}
-											title={s.file}
-											className={`w-full rounded px-2 py-1.5 text-left text-xs transition-colors ${
-												activeId === s.sessionId ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
-											}`}
-										>
-											<div className="flex items-center justify-between gap-1">
-												<ShortId value={s.sessionId} />
-												<RelTime at={s.startedAt} className="shrink-0 text-[10px] text-zinc-500" />
-											</div>
-											<p className="mt-0.5 truncate font-mono text-[10px] text-zinc-600">{basename(s.cwd)}</p>
-										{s.masterProtected === true && (
-											<span className="mt-1 inline-block rounded border border-red-900/60 bg-red-950/40 px-1 py-0.5 text-[10px] text-red-300">拒绝远程输入</span>
-										)}
-										</button>
-									</li>
-								))}
-							</ul>
-						)}
+			{/* 会话列表已上移左栏（SessionList 常驻）；中央只剩 transcript+composer 同滚动视口 */}
+			<div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-surface/60">
+				<header className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
+					<h2 className="text-xs font-semibold tracking-wide text-zinc-400">
+						<Term zh="对话" en="Transcript" />
+					</h2>
+					<div className="flex items-center gap-2 text-[11px]">
+						{activeId !== null && <ShortId value={activeId} />}
+						<ConnBadge conn={conn} />
 					</div>
-				</Card>
-
-				{/* 右：chat 只读渲染 */}
-				<div className="flex min-w-0 flex-1 flex-col rounded-lg border border-zinc-800 bg-zinc-900/60">
-					<header className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
-						<h2 className="text-xs font-semibold tracking-wide text-zinc-400">
-							<Term zh="对话" en="Transcript" />
-						</h2>
-						<div className="flex items-center gap-2 text-[11px]">
-							{activeId !== null && <ShortId value={activeId} />}
-							<ConnBadge conn={conn} />
-						</div>
-					</header>
-					<div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-						{activeId === null ? (
-							<EmptyState>从左侧选择一个会话</EmptyState>
-						) : rows.length === 0 && outboxEntries.length === 0 ? (
-							<EmptyState>该会话暂无可投影内容（或正在加载）</EmptyState>
-						) : (
-							<>
-								{rows.map((row) => (
-									<RowView key={row.rowId} row={row} />
-								))}
-								{outboxEntries.map((e) => (
-									<OutboxRowView key={e.commandKey} e={e} />
-								))}
-								<div ref={bottomRef} />
-							</>
-						)}
-					</div>
-				{/* G6-P2：输入框（POST /v1/commands session.message；WS 只读红线不破——发消息仍走 HTTP） */}
-				<div className="border-t border-zinc-800 px-3 py-2">
-					{isMasterSession ? (
-						<p className="text-[11px] text-red-300/90">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
-					) : (
-						<form
-							onSubmit={(ev) => {
-								ev.preventDefault();
-								void send();
-							}}
-							className="flex items-end gap-2"
-						>
-							<textarea
-								value={draft}
-								onChange={(e) => setDraft(e.target.value)}
-								onKeyDown={(e) => {
-									if (e.key === 'Enter' && !e.shiftKey) {
-										e.preventDefault();
+				</header>
+				<div className="relative min-h-0 flex-1">
+					<div ref={scrollRef} onScroll={handleScroll} className="h-full overflow-y-auto px-4 py-3">
+						<div className="flex min-h-full flex-col">
+							{activeId === null ? (
+								<EmptyState>从左栏选择一个会话</EmptyState>
+							) : rows.length === 0 && outboxEntries.length === 0 ? (
+								<EmptyState>该会话暂无可投影内容（或正在加载）</EmptyState>
+							) : (
+								<>
+									{rows.map((row) => (
+										<RowView key={row.rowId} row={row} />
+									))}
+									{outboxEntries.map((e) => (
+										<OutboxRowView key={e.commandKey} e={e} />
+									))}
+								</>
+							)}
+							{/* S5：composer sticky dock——与 transcript 同滚动视口，sticky 到滚动容器底部；
+							    mt-auto 兼短内容（空态时 dock 也贴视口底） */}
+							<div className="sticky bottom-0 z-10 mt-auto -mx-4 border-t border-border bg-surface/95 px-4 py-2 backdrop-blur-sm">
+							{isMasterSession ? (
+								<p className="text-[11px] text-red-300/90">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
+							) : (
+								<form
+									onSubmit={(ev) => {
+										ev.preventDefault();
 										void send();
-									}
-								}}
-								maxLength={8000}
-								rows={Math.min(4, Math.max(1, draft.split("\n").length))}
-								placeholder={activeId !== null ? '输入消息发往该会话（Enter 发送，Shift+Enter 换行）' : '先选择会话'}
-								disabled={activeId === null}
-								className="max-h-32 min-h-[2.25rem] flex-1 resize-none rounded border border-zinc-700 bg-zinc-950/60 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none disabled:opacity-50"
-							/>
-							<Button onClick={() => void send()} disabled={activeId === null || draft.trim().length === 0}>
-								发送
-							</Button>
-						</form>
+									}}
+									className="flex items-end gap-2"
+								>
+									<textarea
+										value={draft}
+										onChange={(e) => setDraft(e.target.value)}
+										onKeyDown={(e) => {
+											if (e.key === 'Enter' && !e.shiftKey) {
+												e.preventDefault();
+												void send();
+											}
+										}}
+										maxLength={8000}
+										rows={Math.min(4, Math.max(1, draft.split("\n").length))}
+										placeholder={activeId !== null ? '输入消息发往该会话（Enter 发送，Shift+Enter 换行）' : '先选择会话'}
+										disabled={activeId === null}
+										className="max-h-32 min-h-[2.25rem] flex-1 resize-none rounded border border-zinc-700 bg-background/60 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none disabled:opacity-50"
+									/>
+									<Button onClick={() => void send()} disabled={activeId === null || draft.trim().length === 0}>
+										发送
+									</Button>
+								</form>
+							)}
+							</div>
+						</div>
+					</div>
+					{/* 回看锁定阅读位时浮出「回到底部」钮（替原 scrollIntoView） */}
+					{!atBottom && activeId !== null && (
+						<button
+							type="button"
+							onClick={scrollToLatest}
+							className="absolute bottom-16 right-4 z-20 rounded-full border border-zinc-700 bg-background/90 px-3 py-1.5 text-[11px] text-zinc-200 shadow-lg backdrop-blur-sm transition-colors hover:bg-surface-hover"
+						>
+							↓ 回到底部
+						</button>
 					)}
-				</div>
 				</div>
 			</div>
 		</div>

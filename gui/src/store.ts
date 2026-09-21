@@ -26,7 +26,13 @@ import type {
 } from "./api/types";
 import type { StreamServerFrame, StreamState } from "./useEventStream";
 
-export type TabId = "master" | "workstream" | "attention" | "timeline" | "runtime" | "chat";
+/** 主视图 Tab（会话为主重构 S4 收窄）：chat=永久默认主视图；timeline=次级全页（排障刚需）。
+ *  原 master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（runtimeOverlay）。 */
+export type TabId = "chat" | "timeline";
+
+/** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0 z-10）：
+ *  null=关；值=打开并定位对应 section（attention/master/workstream/runtime 四页组件原样复用）。 */
+export type RuntimeOverlaySection = "attention" | "master" | "workstream" | "runtime";
 
 /** envelope → 人话 TimelineItem（客户端小映射，参照 extensions/runtime-host/timeline.ts 模板；
  *  下一轮 timeline 全量轮询会用 server 侧精修+溯源版本按 id 覆盖）。 */
@@ -119,6 +125,8 @@ interface GuiState {
 	// UI
 	activeTab: TabId;
 	setActiveTab: (t: TabId) => void;
+	runtimeOverlay: RuntimeOverlaySection | null;
+	setRuntimeOverlay: (s: RuntimeOverlaySection | null) => void;
 
 	// 连接面（never-throw：down 时保留旧数据）
 	connection: ConnState;
@@ -217,8 +225,10 @@ export function capTimelineItems(merged: TimelineItem[], historyAnchorId: string
 }
 
 export const useGui = create<GuiState>((set, get) => ({
-	activeTab: "master",
+	activeTab: "chat",
 	setActiveTab: (t) => set({ activeTab: t }),
+	runtimeOverlay: null,
+	setRuntimeOverlay: (s) => set({ runtimeOverlay: s }),
 
 	connection: "down",
 	lastAsOf: null,

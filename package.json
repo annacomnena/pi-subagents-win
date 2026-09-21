@@ -1,6 +1,6 @@
 {
   "name": "subagent-win",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Windows-compatible pi subagent extension: single/parallel/async execution, per-call model override, external CLI backends (Claude Code / Codex / Antigravity / AtomCode), Codex header compat, and workflow orchestration.",
   "keywords": [
@@ -94,6 +94,7 @@
     "test:runtime-host-projections": "node --experimental-strip-types ./extensions/_test_runtime_host_projections.ts",
     "test:runtime-interactions": "node --experimental-strip-types ./extensions/_test_runtime_interactions.ts",
     "test:gui-interaction-badge": "node --experimental-strip-types ./gui/src/_test_interaction_badge.ts",
+    "test:gui-session-first": "node --experimental-strip-types ./gui/src/_test_session_first.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",
     "test:mailbox-command-consume": "node --experimental-strip-types ./extensions/_test_mailbox_command_consume.ts",

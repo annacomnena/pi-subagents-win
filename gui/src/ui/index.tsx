@@ -8,10 +8,10 @@ import { fmtDateTime, fmtRel } from "../format";
 type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
-	primary: "bg-blue-600 hover:bg-blue-500 text-white border-blue-600",
-	secondary: "bg-zinc-800 hover:bg-zinc-700 text-zinc-100 border-zinc-700",
-	danger: "bg-red-700 hover:bg-red-600 text-white border-red-700",
-	ghost: "bg-transparent hover:bg-zinc-800 text-zinc-300 border-transparent",
+	primary: "bg-brand hover:bg-brand/85 text-white border-brand",
+	secondary: "bg-surface-hover hover:bg-selected text-white border-border",
+	danger: "bg-destructive hover:bg-destructive/85 text-white border-destructive",
+	ghost: "bg-transparent hover:bg-surface-hover text-white/80 border-transparent",
 };
 
 export function Button({
@@ -44,10 +44,10 @@ export function Button({
 
 export function Card({ title, right, children }: { title?: ReactNode; right?: ReactNode; children: ReactNode }) {
 	return (
-		<section className="rounded-lg border border-zinc-800 bg-zinc-900/60">
+		<section className="rounded-lg border border-border bg-surface/60">
 			{title !== undefined && (
-				<header className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
-					<h2 className="text-xs font-semibold tracking-wide text-zinc-400">{title}</h2>
+				<header className="flex items-center justify-between border-b border-border px-3 py-2">
+					<h2 className="text-xs font-semibold tracking-wide text-white/60">{title}</h2>
 					{right}
 				</header>
 			)}
@@ -61,13 +61,13 @@ export function Card({ title, right, children }: { title?: ReactNode; right?: Re
 type BadgeTone = "green" | "red" | "gray" | "yellow" | "blue" | "purple" | "na";
 
 const BADGE_TONES: Record<BadgeTone, string> = {
-	green: "bg-emerald-900/60 text-emerald-300 border-emerald-800",
-	red: "bg-red-900/60 text-red-300 border-red-800",
-	gray: "bg-zinc-800 text-zinc-400 border-zinc-700",
+	green: "bg-success/20 text-success border-success/60",
+	red: "bg-destructive/20 text-destructive border-destructive/60",
+	gray: "bg-surface-hover text-white/60 border-border",
 	yellow: "bg-amber-900/60 text-amber-300 border-amber-800",
-	blue: "bg-sky-900/60 text-sky-300 border-sky-800",
+	blue: "bg-brand/20 text-brand border-brand/60",
 	purple: "bg-violet-900/60 text-violet-300 border-violet-800",
-	na: "bg-zinc-900 text-zinc-600 border-zinc-800",
+	na: "bg-surface text-white/40 border-border",
 };
 
 export function Badge({ tone = "gray", title, children }: { tone?: BadgeTone; title?: string; children: ReactNode }) {
@@ -105,11 +105,11 @@ export function Toggle({ on, disabled, onChange, labels }: {
 			disabled={disabled}
 			onClick={() => onChange(!on)}
 			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-[10px] font-semibold transition-colors disabled:opacity-40 ${
-				on ? "border-emerald-700 bg-emerald-900/50 text-emerald-300" : "border-zinc-700 bg-zinc-800 text-zinc-400"
+				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-white/60"
 			}`}
 		>
-			<span className={`rounded-full px-1.5 py-0.5 ${on ? "" : "bg-zinc-700 text-zinc-200"}`}>{offLabel}</span>
-			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-emerald-700 text-white" : ""}`}>{onLabel}</span>
+			<span className={`rounded-full px-1.5 py-0.5 ${on ? "" : "bg-surface text-white/80"}`}>{offLabel}</span>
+			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-success text-white" : ""}`}>{onLabel}</span>
 		</button>
 	);
 }
@@ -120,7 +120,7 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
 	return (
 		<span className="group relative inline-flex">
 			{children}
-			<span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[10px] whitespace-nowrap text-zinc-300 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+			<span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 rounded border border-border bg-background px-2 py-1 text-[10px] whitespace-nowrap text-white/80 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
 				{text}
 			</span>
 		</span>
@@ -131,8 +131,8 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
 
 export function Spinner({ label }: { label?: string }) {
 	return (
-		<span className="inline-flex items-center gap-2 text-xs text-zinc-500">
-			<span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-600 border-t-transparent" />
+		<span className="inline-flex items-center gap-2 text-xs text-white/50">
+			<span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-transparent" />
 			{label}
 		</span>
 	);
@@ -141,13 +141,13 @@ export function Spinner({ label }: { label?: string }) {
 // ── 7. EmptyState ──────────────────────────────────────────────────
 
 export function EmptyState({ children }: { children: ReactNode }) {
-	return <div className="py-6 text-center text-xs text-zinc-600">{children}</div>;
+	return <div className="py-6 text-center text-xs text-white/40">{children}</div>;
 }
 
 // ── 8. ErrorText ───────────────────────────────────────────────────
 
 export function ErrorText({ children }: { children: ReactNode }) {
-	return <p className="font-mono text-[11px] text-red-400">{children}</p>;
+	return <p className="font-mono text-[11px] text-destructive">{children}</p>;
 }
 
 // ── G5.1 人话化微增组件 ────────────────────────────────────────────
@@ -157,14 +157,14 @@ export function Term({ zh, en, hint }: { zh: string; en?: string; hint?: string 
 	const word = (
 		<span className="inline-flex items-baseline gap-1">
 			{zh}
-			{en && <span className="text-[9px] font-normal tracking-normal text-zinc-600">{en}</span>}
+			{en && <span className="text-[9px] font-normal tracking-normal text-white/40">{en}</span>}
 		</span>
 	);
 	return hint ? (
 		<span className="inline-flex items-center gap-1">
 			{word}
 			<Tooltip text={hint}>
-				<span className="cursor-help rounded-full border border-zinc-700 px-1 text-[9px] leading-3 text-zinc-500">?</span>
+				<span className="cursor-help rounded-full border border-border px-1 text-[9px] leading-3 text-white/50">?</span>
 			</Tooltip>
 		</span>
 	) : (
@@ -174,7 +174,7 @@ export function Term({ zh, en, hint }: { zh: string; en?: string; hint?: string 
 
 /** 每页顶部白话导语（≤24 字）。 */
 export function PageIntro({ children }: { children: ReactNode }) {
-	return <p className="text-xs text-zinc-500">{children}</p>;
+	return <p className="text-xs text-white/50">{children}</p>;
 }
 
 /** 长 ID 短化：前 12 字符 + 「…」，悬停显全量，点击复制全量（G5.1 规格 4）。 */
@@ -195,7 +195,7 @@ export function ShortId({ value, chars = 12, className = "" }: { value: string; 
 		<span
 			title={copied ? "已复制全量 ID" : `点击复制全量：${value}`}
 			onClick={copy}
-			className={`cursor-pointer break-all font-mono ${copied ? "text-emerald-400" : ""} ${className}`}
+			className={`cursor-pointer break-all font-mono ${copied ? "text-success" : ""} ${className}`}
 		>
 			{short}
 		</span>

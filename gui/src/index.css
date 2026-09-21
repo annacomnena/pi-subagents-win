@@ -1,1 +1,18 @@
 @import "tailwindcss";
+
+/* ── 语义 token（zcode 命名，拍板 3：暗色一套 = 现状 zinc 暗色值映射进 token）──
+ * Tailwind v4 @theme 内联：--color-* 生成 bg-/text-/border- 语义工具类，theme 变量
+ * 即落在 :root（bg-surface/60 等透明度修饰符经 color-mix 生效）。
+ * .dark 覆盖位与明暗切换器 v1 不做——重构目标是布局不是主题，token 命名已留双主题扩展位。 */
+@theme {
+	/* 画布/面板层级 */
+	--color-background: #09090b; /* zinc-950 页面底色/画布 */
+	--color-surface: #18181b; /* zinc-900 卡片/面板 */
+	--color-surface-hover: #27272a; /* zinc-800 hover 面与静态件底色 */
+	--color-selected: #27272a; /* zinc-800 选中行纯背景（zcode bg-selected 语义位） */
+	--color-border: #27272a; /* zinc-800 描边 */
+	/* 状态/品牌 */
+	--color-destructive: #dc2626; /* red-600 error 状态槽/危险操作 */
+	--color-success: #10b981; /* emerald-500 在线/成功 */
+	--color-brand: #2563eb; /* blue-600 主操作 */
+}

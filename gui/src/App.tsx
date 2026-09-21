@@ -5,28 +5,24 @@
 
 import { TopBar } from "./pages/TopBar";
 import { Sidebar } from "./pages/Sidebar";
-import { MasterPage } from "./pages/MasterPage";
-import { WorkstreamPage } from "./pages/WorkstreamPage";
-import { AttentionPage } from "./pages/AttentionPage";
 import { TimelinePage } from "./pages/TimelinePage";
 import { ChatPage } from "./pages/ChatPage";
-import { RuntimePage } from "./pages/RuntimePage";
+import { RuntimeOverlay } from "./pages/RuntimeOverlay";
 import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
 import { usePoll } from "./usePoll";
 import { fmtTime } from "./format";
 
+// 会话为主重构 S4：TabId 收窄 chat|timeline（默认 chat）；master/workstream/attention/runtime
+// 四状态页收进「运行时」全屏覆盖层（RuntimeOverlay，不占主路由）
 const PAGES: Record<TabId, () => ReactElement> = {
-	master: MasterPage,
-	workstream: WorkstreamPage,
-	attention: AttentionPage,
-	timeline: TimelinePage,
-	runtime: RuntimePage,
 	chat: ChatPage,
+	timeline: TimelinePage,
 };
 
 export default function App() {
 	const activeTab = useGui((s) => s.activeTab);
+	const runtimeOverlay = useGui((s) => s.runtimeOverlay);
 	const connection = useGui((s) => s.connection);
 	const lastAsOf = useGui((s) => s.lastAsOf);
 	const lastCommand = useGui((s) => s.lastCommand);
@@ -38,11 +34,13 @@ export default function App() {
 	usePoll(() => useGui.getState().pollInteractions(), 2000); // G6-P3：待决策徽标 + proposal 卡直连
 	usePoll(() => useGui.getState().pollSnapshot(), 6000);
 	usePoll(() => useGui.getState().pollTimeline(), 6000);
+	// 会话为主重构 S2：sessions 轮询自 ChatPage 上移 App（第七路）——左栏会话列表常驻后徽标/状态槽任意页都活
+	usePoll(() => useGui.getState().pollChatSessions(), 6000);
 
 	const Page = PAGES[activeTab];
 
 	return (
-		<div className="flex h-screen flex-col bg-zinc-950 text-zinc-200">
+		<div className="relative flex h-screen flex-col bg-zinc-950 text-zinc-200">
 			<TopBar />
 			{connection === "down" && (
 				<div className="border-b border-amber-900/60 bg-amber-950/60 px-4 py-1 text-center text-[11px] text-amber-300">
@@ -55,6 +53,8 @@ export default function App() {
 					<Page />
 				</main>
 			</div>
+			{/* 「运行时」全屏覆盖层（null=不渲染；值=打开并定位 section） */}
+			{runtimeOverlay !== null && <RuntimeOverlay />}
 			{lastCommand && (
 				<div className="border-t border-zinc-800 bg-zinc-900 px-4 py-1.5 text-[11px] text-zinc-400">
 					<span className="mr-2 text-zinc-600">回执 {fmtTime(lastCommand.at)}</span>
