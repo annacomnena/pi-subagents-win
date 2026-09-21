@@ -97,6 +97,7 @@
     "test:runtime-interactions": "node --experimental-strip-types ./extensions/_test_runtime_interactions.ts",
     "test:gui-interaction-badge": "node --experimental-strip-types ./gui/src/_test_interaction_badge.ts",
     "test:gui-session-first": "node --experimental-strip-types ./gui/src/_test_session_first.ts",
+    "test:gui-workspace-group": "node --experimental-strip-types ./gui/src/_test_workspace_group.ts",
     "test:gui-zcode-replica": "node --experimental-strip-types ./gui/src/_test_zcode_replica.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",

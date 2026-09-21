@@ -8,8 +8,8 @@
  *   F2 合法值切换：setActiveTab("timeline"/"chat") 双向生效
  *   F3 runtimeOverlay：attention/master/workstream/runtime 四 section 值打开并保持定位；
  *      setRuntimeOverlay(null) 关闭复位
- *   F4 会话列表过滤谓词（session-title L3）：空查询全匹配；shortId/全量 ID/文件/cwd/title
- *      子串匹配；大小写不敏感；无命中 false（matchesSessionFilter，JSX-free 纯函数）
+ *   F4 会话列表过滤谓词（按仓库分组切片拍板 5 收窄）：空查询全匹配；title/shortId（sessionId
+ *      前 12 位）/basename(cwd) 子串匹配；大小写不敏感；全量 ID 尾部/文件全路径不再命中；无命中 false
  *
  * pollChatSessions 行为回归（never-throw / 失败保留旧数据 / masterProtected flag）由
  * test:gui-chat-guard 覆盖，此处不重复。
@@ -70,14 +70,18 @@ const fixture: SessionSummary = {
 };
 assert.equal(matchesSessionFilter(fixture, ""), true);
 ok("F4a 空查询 → 全匹配");
-assert.equal(matchesSessionFilter(fixture, "a1b2c3d4"), true); // shortId（sessionId 前缀）
-ok("F4b shortId 子串命中（sessionId 前缀）");
+assert.equal(matchesSessionFilter(fixture, "a1b2c3d4"), true); // shortId（sessionId 前 12 位内）
+ok("F4b shortId 子串命中（sessionId 前 12 位内）");
+assert.equal(matchesSessionFilter(fixture, "789012345678"), false); // 前 12 位之外的全量 ID 尾部不再命中
+ok("F4b2 全量 ID 超出前 12 位部分 → 不命中（谓词收窄）");
 assert.equal(matchesSessionFilter({ ...fixture, title: "会话可读标题样例", titleSource: "first-user" }, "可读标题"), true);
 ok("F4c title 子串命中（first-user 来源）");
 assert.equal(matchesSessionFilter({ ...fixture, title: "repo-G6-T-台账标题", titleSource: "ledger" }, "台账标题"), true);
 ok("F4d title 子串命中（ledger 来源）");
-assert.equal(matchesSessionFilter(fixture, "greencad"), true); // cwd 大小写不敏感
-ok("F4e cwd 子串命中（大小写不敏感）");
+assert.equal(matchesSessionFilter(fixture, "greencad"), true); // basename(cwd) 大小写不敏感
+ok("F4e basename(cwd) 子串命中（大小写不敏感）");
+assert.equal(matchesSessionFilter(fixture, "pi/sessions"), false); // 文件全路径不再命中（谓词收窄）
+ok("F4e2 file 全路径查询 → 不命中（谓词收窄）");
 assert.equal(matchesSessionFilter(fixture, "不存在的查询xyz"), false);
 ok("F4f 无命中 → false");
 
