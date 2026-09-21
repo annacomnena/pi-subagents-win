@@ -7,6 +7,10 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
+// 主题底座（ZCode 1:1 第 1 步）：Web 默认暗色口径——documentElement 常挂 zai-dark
+//（zcode web/main.tsx resolveWebInitialTheme 默认 zai-dark；亮色切换器不做）。
+document.documentElement.classList.add("theme-zai-dark");
+
 createRoot(document.getElementById("root")!).render(
 	<StrictMode>
 		<App />

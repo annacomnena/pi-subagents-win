@@ -8,10 +8,10 @@ import { fmtDateTime, fmtRel } from "../format";
 type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
-	primary: "bg-brand hover:bg-brand/85 text-white border-brand",
-	secondary: "bg-surface-hover hover:bg-selected text-white border-border",
-	danger: "bg-destructive hover:bg-destructive/85 text-white border-destructive",
-	ghost: "bg-transparent hover:bg-surface-hover text-white/80 border-transparent",
+	primary: "bg-brand hover:bg-brand/85 text-foreground-inverse border-brand",
+	secondary: "bg-surface-hover hover:bg-selected text-foreground border-border",
+	danger: "bg-destructive hover:bg-destructive/85 text-destructive-foreground border-destructive",
+	ghost: "bg-transparent hover:bg-surface-hover text-foreground-subtle border-transparent",
 };
 
 export function Button({
@@ -47,7 +47,7 @@ export function Card({ title, right, children }: { title?: ReactNode; right?: Re
 		<section className="rounded-lg border border-border bg-surface/60">
 			{title !== undefined && (
 				<header className="flex items-center justify-between border-b border-border px-3 py-2">
-					<h2 className="text-xs font-semibold tracking-wide text-white/60">{title}</h2>
+					<h2 className="text-xs font-semibold tracking-wide text-foreground-subtle">{title}</h2>
 					{right}
 				</header>
 			)}
@@ -63,11 +63,11 @@ type BadgeTone = "green" | "red" | "gray" | "yellow" | "blue" | "purple" | "na";
 const BADGE_TONES: Record<BadgeTone, string> = {
 	green: "bg-success/20 text-success border-success/60",
 	red: "bg-destructive/20 text-destructive border-destructive/60",
-	gray: "bg-surface-hover text-white/60 border-border",
-	yellow: "bg-amber-900/60 text-amber-300 border-amber-800",
+	gray: "bg-surface-hover text-foreground-subtle border-border",
+	yellow: "bg-warning/15 text-warning border-warning/40",
 	blue: "bg-brand/20 text-brand border-brand/60",
-	purple: "bg-violet-900/60 text-violet-300 border-violet-800",
-	na: "bg-surface text-white/40 border-border",
+	purple: "bg-accent/60 text-foreground border-border",
+	na: "bg-surface text-foreground-subtlest border-border",
 };
 
 export function Badge({ tone = "gray", title, children }: { tone?: BadgeTone; title?: string; children: ReactNode }) {
@@ -105,11 +105,11 @@ export function Toggle({ on, disabled, onChange, labels }: {
 			disabled={disabled}
 			onClick={() => onChange(!on)}
 			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-[10px] font-semibold transition-colors disabled:opacity-40 ${
-				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-white/60"
+				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-foreground-subtle"
 			}`}
 		>
-			<span className={`rounded-full px-1.5 py-0.5 ${on ? "" : "bg-surface text-white/80"}`}>{offLabel}</span>
-			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-success text-white" : ""}`}>{onLabel}</span>
+			<span className={`rounded-full px-1.5 py-0.5 ${on ? "" : "bg-surface text-foreground"}`}>{offLabel}</span>
+			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-success text-success-foreground" : ""}`}>{onLabel}</span>
 		</button>
 	);
 }
@@ -120,20 +120,9 @@ export function Tooltip({ text, children }: { text: string; children: ReactNode 
 	return (
 		<span className="group relative inline-flex">
 			{children}
-			<span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 rounded border border-border bg-background px-2 py-1 text-[10px] whitespace-nowrap text-white/80 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+			<span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 rounded border border-border bg-background px-2 py-1 text-[10px] whitespace-nowrap text-foreground-subtle opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
 				{text}
 			</span>
-		</span>
-	);
-}
-
-// ── 6. Spinner ─────────────────────────────────────────────────────
-
-export function Spinner({ label }: { label?: string }) {
-	return (
-		<span className="inline-flex items-center gap-2 text-xs text-white/50">
-			<span className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-transparent" />
-			{label}
 		</span>
 	);
 }
@@ -141,13 +130,7 @@ export function Spinner({ label }: { label?: string }) {
 // ── 7. EmptyState ──────────────────────────────────────────────────
 
 export function EmptyState({ children }: { children: ReactNode }) {
-	return <div className="py-6 text-center text-xs text-white/40">{children}</div>;
-}
-
-// ── 8. ErrorText ───────────────────────────────────────────────────
-
-export function ErrorText({ children }: { children: ReactNode }) {
-	return <p className="font-mono text-[11px] text-destructive">{children}</p>;
+	return <div className="py-6 text-center text-xs text-foreground-subtlest">{children}</div>;
 }
 
 // ── G5.1 人话化微增组件 ────────────────────────────────────────────
@@ -157,14 +140,14 @@ export function Term({ zh, en, hint }: { zh: string; en?: string; hint?: string 
 	const word = (
 		<span className="inline-flex items-baseline gap-1">
 			{zh}
-			{en && <span className="text-[9px] font-normal tracking-normal text-white/40">{en}</span>}
+			{en && <span className="text-[9px] font-normal tracking-normal text-foreground-subtlest">{en}</span>}
 		</span>
 	);
 	return hint ? (
 		<span className="inline-flex items-center gap-1">
 			{word}
 			<Tooltip text={hint}>
-				<span className="cursor-help rounded-full border border-border px-1 text-[9px] leading-3 text-white/50">?</span>
+				<span className="cursor-help rounded-full border border-border px-1 text-[9px] leading-3 text-foreground-subtlest">?</span>
 			</Tooltip>
 		</span>
 	) : (
@@ -174,7 +157,7 @@ export function Term({ zh, en, hint }: { zh: string; en?: string; hint?: string 
 
 /** 每页顶部白话导语（≤24 字）。 */
 export function PageIntro({ children }: { children: ReactNode }) {
-	return <p className="text-xs text-white/50">{children}</p>;
+	return <p className="text-xs text-foreground-subtlest">{children}</p>;
 }
 
 /** 长 ID 短化：前 12 字符 + 「…」，悬停显全量，点击复制全量（G5.1 规格 4）。 */

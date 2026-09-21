@@ -80,22 +80,22 @@ export function MasterPage() {
 						<EmptyState>还没有会话接管主控——接管后这里会显示值守信息</EmptyState>
 					) : (
 						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
-							<dt className="text-zinc-500"><Term zh="主控身份" en="logical id" /></dt>
+							<dt className="text-foreground-subtle"><Term zh="主控身份" en="logical id" /></dt>
 							<dd><ShortId value="agent://master_default" /></dd>
-							<dt className="text-zinc-500"><Term zh="当前值守会话" en="owner session" /></dt>
+							<dt className="text-foreground-subtle"><Term zh="当前值守会话" en="owner session" /></dt>
 							<dd><ShortId value={att.sessionId} /></dd>
-							<dt className="text-zinc-500"><Term zh="接班代数" en="generation" /></dt>
-							<dd className="text-zinc-200">第 {att.generation} 代</dd>
-							<dt className="text-zinc-500">接班时间</dt>
-							<dd><RelTime at={att.attachedAt} className="text-zinc-200" /></dd>
-							<dt className="text-zinc-500">值守状态</dt>
+							<dt className="text-foreground-subtle"><Term zh="接班代数" en="generation" /></dt>
+							<dd className="text-foreground">第 {att.generation} 代</dd>
+							<dt className="text-foreground-subtle">接班时间</dt>
+							<dd><RelTime at={att.attachedAt} className="text-foreground" /></dd>
+							<dt className="text-foreground-subtle">值守状态</dt>
 							<dd>
 								{health?.masterOwnerAlive === true && <Badge tone="green" title="15 秒内有心跳">值守中（心跳正常）</Badge>}
 								{health?.masterOwnerAlive === false && <Badge tone="red" title="心跳缺失或超过 15 秒">已失联（心跳超时）</Badge>}
 								{health === null && naBadge("后端数据未就绪")}
 								{master?.stale && <Badge tone="yellow" title="快照超过 10 分钟未更新">快照已过时（超 10 分钟）</Badge>}
 							</dd>
-							<dt className="text-zinc-500">
+							<dt className="text-foreground-subtle">
 								<Term zh="接管总开关" en="cutover" hint="开启后新会话才能接管消费端" />
 							</dt>
 							<dd>
@@ -107,10 +107,10 @@ export function MasterPage() {
 									<Badge tone="gray">已关闭</Badge>
 								)}
 							</dd>
-							<dt className="text-zinc-500"><Term zh="信箱（未领信件）" en="mailbox" /></dt>
+							<dt className="text-foreground-subtle"><Term zh="信箱（未领信件）" en="mailbox" /></dt>
 							<dd>
-								<span className="text-zinc-200">{health ? health.mailboxPending : "暂无"}</span>
-								{backlogPending > 0 && <span className="ml-2 text-[10px] text-zinc-500">主控信箱积压 {backlogPending} 封</span>}
+								<span className="text-foreground">{health ? health.mailboxPending : "暂无"}</span>
+								{backlogPending > 0 && <span className="ml-2 text-[10px] text-foreground-subtle">主控信箱积压 {backlogPending} 封</span>}
 							</dd>
 						</dl>
 					)}
@@ -121,23 +121,23 @@ export function MasterPage() {
 					<Card title={<Term zh="上下文压力" en="context pressure" hint="会话记忆快满时会自动提议交接" />}>
 						{livePct !== null && live ? (
 							<div className="flex items-baseline gap-3">
-								<span className="font-mono text-3xl text-zinc-100">{fmtPressurePct(live.pressure)}</span>
-								<span className="text-[11px] text-zinc-500">
+								<span className="font-mono text-3xl text-foreground">{fmtPressurePct(live.pressure)}</span>
+								<span className="text-[11px] text-foreground-subtle">
 									<Badge tone="green" title="值守会话 agent turn 结束时写盘的心跳活值">实时</Badge>
 									<RelTime at={live.updatedAt} /> 更新
 								</span>
 							</div>
 						) : proposalPct !== null ? (
 							<div className="flex items-baseline gap-3">
-								<span className="font-mono text-3xl text-zinc-100">{fmtPressurePct(proposal?.payload?.pressure)}</span>
-								<span className="text-[11px] text-zinc-500">
+								<span className="font-mono text-3xl text-foreground">{fmtPressurePct(proposal?.payload?.pressure)}</span>
+								<span className="text-[11px] text-foreground-subtle">
 									<RelTime at={proposal?.payload?.proposedAt as string | undefined} /> 提案时点值（非实时；暂无实时心跳）
 								</span>
 							</div>
 						) : (
 							<div className="flex items-center gap-2">
-								<span className="text-3xl text-zinc-600">暂无数据</span>
-								<span className="text-[11px] text-zinc-500">无实时心跳，也没有交接提案</span>
+								<span className="text-3xl text-foreground-subtlest">暂无数据</span>
+								<span className="text-[11px] text-foreground-subtle">无实时心跳，也没有交接提案</span>
 							</div>
 						)}
 					</Card>
@@ -150,13 +150,13 @@ export function MasterPage() {
 							<div className="space-y-1.5 text-xs">
 								<div className="flex items-center gap-2">
 									<Badge tone={statusTone(pStatus)}>{zhStatus(PROPOSAL_STATUS_ZH, pStatus)}</Badge>
-									<span className="text-zinc-400">接班代数：{genText}</span>
+									<span className="text-foreground-subtle">接班代数：{genText}</span>
 									{typeof proposal.payload?.transferId === "string" && (
-										<ShortId value={proposal.payload.transferId} className="text-[10px] text-zinc-500" />
+										<ShortId value={proposal.payload.transferId} className="text-[10px] text-foreground-subtle" />
 									)}
 								</div>
-								<p className="text-zinc-400">{proposal.summary}</p>
-								<p className="text-[10px] text-zinc-600">
+								<p className="text-foreground-subtle">{proposal.summary}</p>
+								<p className="text-[10px] text-foreground-subtlest">
 									<RelTime at={proposal.payload?.proposedAt as string | undefined} /> 提出提案
 									{proposal.payload?.decidedAt ? (
 										<>
@@ -194,7 +194,7 @@ export function MasterPage() {
 						<div className="flex items-center gap-3">
 							{autoHandoff === null ? (
 								<Tooltip text="后端数据未就绪，无法读取真实状态">
-									<span className="cursor-help border-b border-dashed border-zinc-600 text-sm text-zinc-500">状态未知</span>
+									<span className="cursor-help border-b border-dashed border-border-hover text-sm text-foreground-subtle">状态未知</span>
 								</Tooltip>
 							) : (
 								<Badge tone={autoHandoff ? "green" : "gray"} title="来自 snapshot.master.autoHandoff（config.masterSuccession 归一化切片）">
@@ -206,7 +206,7 @@ export function MasterPage() {
 								onChange={(next) => void setAutoHandoff(next)}
 								labels={["关", "开"]}
 							/>
-							<span className="text-[10px] text-zinc-500">POST master.auto-handoff.set {"{auto}"} → config.masterSuccession.auto</span>
+							<span className="text-[10px] text-foreground-subtle">POST master.auto-handoff.set {"{auto}"} → config.masterSuccession.auto</span>
 						</div>
 					</Card>
 				</div>
@@ -219,9 +219,9 @@ export function MasterPage() {
 						<ul className="space-y-1 text-xs">
 							{masterTimeline.map((t) => (
 								<li key={t.id} className="flex gap-2">
-									<RelTime at={t.at} className="w-20 shrink-0 text-[10px] text-zinc-600" />
-									<span className="shrink-0 font-mono text-[10px] text-zinc-500">{t.type}</span>
-									<span className="text-zinc-300">{t.summary}</span>
+									<RelTime at={t.at} className="w-20 shrink-0 text-[10px] text-foreground-subtlest" />
+									<span className="shrink-0 font-mono text-[10px] text-foreground-subtle">{t.type}</span>
+									<span className="text-foreground-subtle">{t.summary}</span>
 								</li>
 							))}
 						</ul>

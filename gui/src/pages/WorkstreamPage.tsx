@@ -27,14 +27,14 @@ function statusTone(s: WorkstreamView["status"]): "green" | "yellow" | "red" | "
 function DetailRow({ label, children }: { label: string; children: React.ReactNode }) {
 	return (
 		<>
-			<dt className="text-zinc-500">{label}</dt>
-			<dd className="text-zinc-200">{children}</dd>
+			<dt className="text-foreground-subtle">{label}</dt>
+			<dd className="text-foreground">{children}</dd>
 		</>
 	);
 }
 
 function Unset() {
-	return <span className="text-zinc-600">未设置</span>;
+	return <span className="text-foreground-subtlest">未设置</span>;
 }
 
 export function WorkstreamPage() {
@@ -70,19 +70,19 @@ export function WorkstreamPage() {
 										type="button"
 										onClick={() => setSelectedId(w.id)}
 										className={`w-full rounded px-2 py-1.5 text-left transition-colors ${
-											selected?.id === w.id ? "bg-zinc-800" : "hover:bg-zinc-900"
+											selected?.id === w.id ? "bg-surface-hover" : "hover:bg-surface"
 										}`}
 									>
 										<div className="flex items-center gap-2">
 											<Badge tone={statusTone(w.status)}>{zhStatus(WS_STATUS_ZH, w.status)}</Badge>
-											<ShortId value={w.id} className="text-[11px] text-zinc-400" />
+											<ShortId value={w.id} className="text-[11px] text-foreground-subtle" />
 											{/* G5.2：卡片直出唤醒/积压微摘要 */}
 											{w.mailboxBacklog.pending > 0 && (
 												<Badge tone="yellow" title="未领信件数（mailbox pending）">信 {w.mailboxBacklog.pending}</Badge>
 											)}
 											{w.wakeState.lastSpawnAt && <Badge tone="blue" title="最近一次被唤醒过">已唤醒</Badge>}
 										</div>
-										<p className="mt-0.5 line-clamp-2 text-[11px] text-zinc-500">{w.mission}</p>
+										<p className="mt-0.5 line-clamp-2 text-[11px] text-foreground-subtle">{w.mission}</p>
 									</button>
 								</li>
 							))}
@@ -100,7 +100,7 @@ export function WorkstreamPage() {
 							title="工作流详情"
 							right={
 								<div className="flex items-center gap-1.5">
-									<ShortId value={selected.id} className="text-[10px] text-zinc-500" />
+									<ShortId value={selected.id} className="text-[10px] text-foreground-subtle" />
 									<Button
 										disabled={selected.status === "paused"}
 										title={selected.status === "paused" ? "已经暂停了，无需重复暂停" : "暂停这个工作流"}
@@ -147,20 +147,20 @@ export function WorkstreamPage() {
 													运行 <ShortId value={selected.wakeState.lastTabRunId} />
 												</>
 											)}
-											<span className="ml-2 text-[10px] text-zinc-600">累计唤醒 {selected.wakeState.spawnAt.length} 次</span>
+											<span className="ml-2 text-[10px] text-foreground-subtlest">累计唤醒 {selected.wakeState.spawnAt.length} 次</span>
 										</span>
 									) : (
-										<span className="text-[11px] text-zinc-600">从未被唤醒过</span>
+										<span className="text-[11px] text-foreground-subtlest">从未被唤醒过</span>
 									)}
 								</DetailRow>
 								<DetailRow label="信箱积压（未领信件）">
 									{selected.mailboxBacklog.pending > 0 || selected.mailboxBacklog.claimed > 0 ? (
 										<span className="text-[11px]">
-											<span className="text-zinc-200">{selected.mailboxBacklog.pending}</span> 封未领
+											<span className="text-foreground">{selected.mailboxBacklog.pending}</span> 封未领
 											{selected.mailboxBacklog.claimed > 0 && ` · ${selected.mailboxBacklog.claimed} 封处理中`}
 										</span>
 									) : (
-										<span className="text-[11px] text-zinc-600">0 封（无积压）</span>
+										<span className="text-[11px] text-foreground-subtlest">0 封（无积压）</span>
 									)}
 								</DetailRow>
 								<DetailRow label="工作区">
@@ -184,8 +184,8 @@ export function WorkstreamPage() {
 													{zhStatus(TASK_STATUS_ZH, t.status)}
 												</Badge>
 												<span className="min-w-0">
-													{t.externalTaskId ? <ShortId value={t.externalTaskId} className="text-zinc-500" /> : null}
-													<span className="ml-2 text-zinc-300">{t.objective}</span>
+													{t.externalTaskId ? <ShortId value={t.externalTaskId} className="text-foreground-subtle" /> : null}
+													<span className="ml-2 text-foreground-subtle">{t.objective}</span>
 												</span>
 											</li>
 										))}
@@ -203,8 +203,8 @@ export function WorkstreamPage() {
 													{zhStatus(RUN_STATUS_ZH, r.status)}
 												</Badge>
 												<span className="min-w-0">
-													<ShortId value={r.subject} className="text-zinc-500" />
-													{r.summary && <span className="ml-2 text-zinc-400">{r.summary}</span>}
+													<ShortId value={r.subject} className="text-foreground-subtle" />
+													{r.summary && <span className="ml-2 text-foreground-subtle">{r.summary}</span>}
 												</span>
 											</li>
 										))}
