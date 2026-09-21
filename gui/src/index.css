@@ -1,18 +1,431 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
-/* ── 语义 token（zcode 命名，拍板 3：暗色一套 = 现状 zinc 暗色值映射进 token）──
- * Tailwind v4 @theme 内联：--color-* 生成 bg-/text-/border- 语义工具类，theme 变量
- * 即落在 :root（bg-surface/60 等透明度修饰符经 color-mix 生效）。
- * .dark 覆盖位与明暗切换器 v1 不做——重构目标是布局不是主题，token 命名已留双主题扩展位。 */
+/* streamdown/xterm/katex/shadcn 包不引：typography 插件只为语义 variant/动画工具类兜底 */
+@plugin "@tailwindcss/typography";
+
+/* 云端模板常用样式的构建保障（styles.css#L47 同款），不是运行时 class 白名单 */
+@source inline("text-center text-ui-base/relaxed text-foreground-subtle font-semibold font-normal text-foreground whitespace-nowrap underline decoration-foreground-subtle decoration-dashed underline-offset-4");
+
+/* ── 主题底座（ZCode 1:1 复刻 第 1 步）──────────────────────────────────
+ * 整表移植 zcode packages/ui/src/styles.css 必需集：token 保 zcode 原名，
+ * 值照抄 styles.css（:root 亮色定义 + .theme-zai-dark 生效值，Web 默认暗色口径）。
+ * .dark 层不搬（无切换器）；--color-muted/--color-ring 在 zcode 本就未定义，
+ * bg-muted / ring-ring / text-muted-foreground 等类为 no-op，照抄保留不补发明 token。 */
+
+:root {
+	--ui-font-size: 14px;
+}
+
+/* 亮色基底（zcode :root 同值；只留定义，不接切换器） */
 @theme {
-	/* 画布/面板层级 */
-	--color-background: #09090b; /* zinc-950 页面底色/画布 */
-	--color-surface: #18181b; /* zinc-900 卡片/面板 */
-	--color-surface-hover: #27272a; /* zinc-800 hover 面与静态件底色 */
-	--color-selected: #27272a; /* zinc-800 选中行纯背景（zcode bg-selected 语义位） */
-	--color-border: #27272a; /* zinc-800 描边 */
-	/* 状态/品牌 */
-	--color-destructive: #dc2626; /* red-600 error 状态槽/危险操作 */
-	--color-success: #10b981; /* emerald-500 在线/成功 */
-	--color-brand: #2563eb; /* blue-600 主操作 */
+	/* Windows 的 Consolas 不含中文字形：CJK 段显式加入（styles.css#L137） */
+	--font-mono:
+		ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+		"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", monospace;
+	--text-ui-xl: calc(var(--ui-font-size) + 4px);
+	--text-ui-lg: calc(var(--ui-font-size) + 2px);
+	--text-ui-base: var(--ui-font-size);
+	--text-ui-caption: calc(var(--ui-font-size) - 1px);
+	--text-ui-sm: calc(var(--ui-font-size) - 2px);
+	--text-ui-xs: calc(var(--ui-font-size) - 4px);
+	--text-ui-2xs: calc(var(--ui-font-size) - 5px);
+	--animated-gradient-text-strong: rgba(10, 10, 10, 1);
+	--animated-gradient-text-soft: rgba(10, 10, 10, 0.22);
+	--color-background: var(--color-neutral-50);
+	--color-background-alt: color-mix(in oklab, var(--color-neutral-100) 60%, transparent);
+	--color-background-win-alt: var(--color-neutral-200);
+	--color-brand: var(--color-sky-400);
+	--color-trajectory-user: #2563eb;
+	--color-trajectory-assistant: #0f766e;
+	--color-trajectory-reasoning: #7c3aed;
+	--color-trajectory-tool-call: #d97706;
+	--color-trajectory-tool-result: #0284c7;
+	--color-accent: var(--color-sky-50);
+	--color-border: color-mix(in oklab, var(--color-neutral-950) 10%, transparent);
+	--color-border-hover: color-mix(in oklab, var(--color-neutral-950) 20%, transparent);
+	--color-hover: var(--color-neutral-200);
+	--color-selected: color-mix(in oklab, var(--color-neutral-950) 10%, transparent);
+	--color-header: var(--color-neutral-100);
+	--color-panel: var(--color-neutral-100);
+	--color-sidebar: var(--color-neutral-100);
+	--color-surface: color-mix(in oklab, var(--color-neutral-950) 3%, transparent);
+	--color-surface-hover: color-mix(in oklab, var(--color-neutral-950) 5%, transparent);
+	--color-card: var(--color-white);
+	--color-card-selected: var(--color-neutral-200);
+	--color-card-border: var(--color-border);
+	--color-popover: var(--color-white);
+	--color-popover-foreground: var(--color-foreground);
+	--color-popover-header: var(--color-neutral-100);
+	--color-popover-border: var(--color-border);
+	--color-input: var(--color-white);
+	--color-input-focused: var(--color-neutral-50);
+	--color-input-border: var(--color-border);
+	--color-input-border-hover: var(--color-border-hover);
+	--color-input-border-focused: var(--color-brand);
+	--color-menu: var(--color-white);
+	--color-menu-hover: var(--color-neutral-100);
+	--color-primary: var(--color-neutral-950);
+	--color-primary-foreground: var(--color-neutral-50);
+	--color-secondary: var(--color-neutral-300);
+	--color-interaction-ask-surface: var(--color-sky-50);
+	--color-interaction-ask-foreground: var(--color-sky-700);
+	--color-interaction-ask-fill: color-mix(in oklab, var(--color-green-500) 20%, transparent);
+	--color-foreground: var(--color-neutral-700);
+	--color-foreground-subtle: color-mix(in oklab, var(--color-neutral-700) 60%, transparent);
+	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-700) 40%, transparent);
+	--color-foreground-inverse: var(--color-white);
+	--color-success: var(--color-green-600);
+	--color-success-foreground: var(--color-foreground-inverse);
+	--color-destructive: var(--color-red-600);
+	--color-destructive-foreground: var(--color-foreground-inverse);
+	--color-warning: var(--color-yellow-600);
+	--color-warning-foreground: var(--color-foreground-inverse);
+	--color-tag: var(--color-neutral-200);
+	--color-toast: var(--color-white);
+	--color-tooltip: var(--color-neutral-100);
+	--color-tooltip-foreground: var(--color-neutral-950);
+}
+
+/* 生效主题：Zai Dark（Web 默认暗色；main.tsx 给 documentElement 常挂 .theme-zai-dark）
+ * 值照抄 styles.css .theme-zai-dark 块（#L606-757）。 */
+.theme-zai-dark {
+	--animated-gradient-text-strong: rgba(255, 255, 255, 1);
+	--animated-gradient-text-soft: rgba(255, 255, 255, 0.22);
+	--color-background: #161616;
+	--color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
+	--color-background-win-alt: #2b2b2b;
+	--color-brand: #ffffff;
+	--color-trajectory-user: #60a5fa;
+	--color-trajectory-assistant: #2dd4bf;
+	--color-trajectory-reasoning: #a78bfa;
+	--color-trajectory-tool-call: #f59e0b;
+	--color-trajectory-tool-result: #38bdf8;
+	--color-accent: #001d3d;
+	--color-border: rgba(255, 255, 255, 0.1);
+	--color-border-hover: rgba(255, 255, 255, 0.15);
+	--color-hover: rgba(255, 255, 255, 0.05);
+	--color-selected: rgba(255, 255, 255, 0.1);
+	--color-header: #202020;
+	--color-panel: #202020;
+	--color-sidebar: #161616;
+	--color-surface: rgba(255, 255, 255, 0.05);
+	--color-surface-hover: rgba(255, 255, 255, 0.1);
+	--color-card: #2b2b2b;
+	--color-card-selected: var(--color-input);
+	--color-card-border: var(--color-border);
+	--color-popover: #2b2b2b;
+	--color-popover-foreground: var(--color-foreground);
+	--color-popover-header: #202020;
+	--color-popover-border: var(--color-border);
+	--color-input: #2b2b2b;
+	--color-input-focused: var(--color-input);
+	--color-input-border: var(--color-border);
+	--color-input-border-hover: var(--color-border-hover);
+	--color-input-border-focused: var(--color-border-hover);
+	--color-menu: #2b2b2b;
+	--color-menu-hover: #363636;
+	--color-primary: #ffffff;
+	--color-primary-foreground: #000000;
+	--color-secondary: #363636;
+	--color-interaction-ask-surface: #001d3d;
+	--color-interaction-ask-foreground: #80beff;
+	--color-interaction-ask-fill: rgba(70, 191, 114, 0.24);
+	--color-foreground: var(--color-neutral-300);
+	--color-foreground-subtle: color-mix(in oklab, var(--color-neutral-300) 60%, transparent);
+	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 30%, transparent);
+	--color-foreground-inverse: #000000;
+	--color-success: #46bf72;
+	--color-success-foreground: #000000;
+	--color-destructive: #ff5c5c;
+	--color-destructive-foreground: #ffffff;
+	--color-warning: #ff8a30;
+	--color-warning-foreground: #000000;
+	--color-tag: #363636;
+	--color-toast: #2b2b2b;
+	--color-tooltip: #2b2b2b;
+	--color-tooltip-foreground: #f8f8f8;
+}
+
+/* ── 全局基线 ─────────────────────────────────────────────────────── */
+
+html,
+body,
+#root {
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	min-height: 0;
+}
+
+body {
+	margin: 0;
+	overflow: hidden;
+}
+
+#root {
+	height: 100dvh;
+	overflow: hidden;
+}
+
+/* 系统级 focus 高亮复位（styles.css#L119-131 同款） */
+*:focus,
+*:focus-visible {
+	outline: none !important;
+	box-shadow: none !important;
+	-webkit-box-shadow: none !important;
+}
+
+@media (forced-colors: active) {
+	*:focus,
+	*:focus-visible {
+		outline: none !important;
+		box-shadow: none !important;
+	}
+}
+
+/* ── 全局原生滚动条（styles.css#L754-784 同款）────────────────────── */
+
+* {
+	scrollbar-width: auto;
+	scrollbar-color: var(--color-border) transparent;
+}
+
+*::-webkit-scrollbar {
+	width: 14px;
+	height: 14px;
+}
+
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+	min-height: 32px;
+	min-width: 32px;
+	border: 3px solid transparent;
+	border-radius: 9999px;
+	background: var(--color-border);
+	background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
+/* ── 复用动画（styles.css#L823-1000 同款）─────────────────────────── */
+
+@layer utilities {
+	/* 运行中工具/reasoning 扫光（= 流式光标替代；无光标字符） */
+	.animated-gradient-text {
+		display: inline-block;
+		background: linear-gradient(
+			90deg,
+			var(--animated-gradient-text-strong) 0%,
+			var(--animated-gradient-text-strong) 34%,
+			var(--animated-gradient-text-soft) 50%,
+			var(--animated-gradient-text-strong) 66%,
+			var(--animated-gradient-text-strong) 100%
+		);
+		background-size: 300% 100%;
+		background-clip: text;
+		-webkit-background-clip: text;
+		color: transparent;
+		-webkit-text-fill-color: transparent;
+		animation: gradient-flow 4s linear infinite;
+		will-change: background-position;
+		transform: translateZ(0);
+		backface-visibility: hidden;
+	}
+
+	@keyframes gradient-flow {
+		0% {
+			background-position: 100% 0;
+		}
+
+		50% {
+			background-position: 0% 0;
+		}
+
+		100% {
+			background-position: 0% 0;
+		}
+	}
+}
+
+/* 新行/工具卡入场（opacity 0→1；prefers-reduced-motion 归零） */
+@keyframes zcode-stream-text-in {
+	0% {
+		opacity: 0;
+	}
+
+	100% {
+		opacity: 1;
+	}
+}
+
+/* 值表其余四项：当前对应入口均按拍板 1 不渲染，仍完整保留主题动画参数。 */
+@keyframes zcode-draft-prompt-waterfall {
+	from {
+		opacity: 0;
+		clip-path: inset(0 0 100% 0);
+		transform: translateY(-12px);
+	}
+
+	to {
+		opacity: 1;
+		clip-path: inset(0 0 0 0);
+		transform: translateY(0);
+	}
+}
+
+.zcode-draft-prompt-waterfall {
+	animation: zcode-draft-prompt-waterfall 260ms cubic-bezier(0.22, 1, 0.36, 1)
+		var(--zcode-draft-prompt-waterfall-delay, 0ms) both;
+}
+
+@keyframes zcode-task-interaction-countdown {
+	from {
+		transform: scaleX(var(--zcode-interaction-progress, 1));
+	}
+
+	to {
+		transform: scaleX(0);
+	}
+}
+
+.zcode-task-interaction-countdown-fill {
+	animation: zcode-task-interaction-countdown var(--zcode-interaction-remaining-ms, 240000ms) linear forwards;
+}
+
+@keyframes task-search-result-highlight {
+	0% {
+		background-color: color-mix(in oklab, var(--color-brand) 20%, transparent);
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-brand) 28%, transparent);
+	}
+
+	45% {
+		background-color: color-mix(in oklab, var(--color-brand) 14%, transparent);
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-brand) 20%, transparent);
+	}
+
+	100% {
+		background-color: transparent;
+		box-shadow: inset 0 0 0 1px transparent;
+	}
+}
+
+.task-search-result-highlight {
+	animation: task-search-result-highlight 1.2s ease-out both;
+}
+
+@keyframes fork-highlight-pulse {
+	0% {
+		background-color: transparent;
+		box-shadow: inset 0 0 0 1px transparent;
+	}
+
+	20% {
+		background-color: color-mix(in oklab, var(--color-brand) 24%, transparent);
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-brand) 32%, transparent);
+	}
+
+	100% {
+		background-color: transparent;
+		box-shadow: inset 0 0 0 1px transparent;
+	}
+}
+
+[data-fork-highlight="true"] {
+	animation: fork-highlight-pulse 1.6s ease-out 1;
+	border-radius: 0.5rem;
+}
+
+[data-zcode-stream-animate="true"] {
+	animation: zcode-stream-text-in 900ms cubic-bezier(0.16, 1, 0.3, 1) var(--zcode-stream-animation-delay, 0ms) both;
+	will-change: opacity;
+}
+
+[data-zcode-tool-stream-animate="true"] {
+	animation: zcode-stream-text-in 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+	will-change: opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.animated-gradient-text,
+	.zcode-draft-prompt-waterfall,
+	.zcode-task-interaction-countdown-fill,
+	.task-search-result-highlight,
+	[data-fork-highlight="true"],
+	[data-zcode-stream-animate="true"],
+	[data-zcode-tool-stream-animate="true"] {
+		animation: none;
+	}
+
+	.zcode-task-interaction-countdown-fill {
+		transform: scaleX(var(--zcode-interaction-progress, 1));
+	}
+}
+
+/* ── shadcn 语义 variant（不引 shadcn 包：按用途手写，逐块抄 shadcn 4.1.1
+ * dist/tailwind.css——Radix data-state/orientation → data-active/data-horizontal 等）── */
+
+@custom-variant data-open {
+	&:where([data-state="open"]),
+	&:where([data-open]:not([data-open="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-closed {
+	&:where([data-state="closed"]),
+	&:where([data-closed]:not([data-closed="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-checked {
+	&:where([data-state="checked"]),
+	&:where([data-checked]:not([data-checked="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-unchecked {
+	&:where([data-state="unchecked"]),
+	&:where([data-unchecked]:not([data-unchecked="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-selected {
+	&:where([data-selected="true"]) {
+		@slot;
+	}
+}
+
+@custom-variant data-disabled {
+	&:where([data-disabled="true"]),
+	&:where([data-disabled]:not([data-disabled="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-active {
+	&:where([data-state="active"]),
+	&:where([data-active]:not([data-active="false"])) {
+		@slot;
+	}
+}
+
+@custom-variant data-horizontal {
+	&:where([data-orientation="horizontal"]) {
+		@slot;
+	}
+}
+
+@custom-variant data-vertical {
+	&:where([data-orientation="vertical"]) {
+		@slot;
+	}
 }

@@ -1,15 +1,22 @@
 /**
- * gui/src/pages/SessionList.tsx — 左栏常驻会话列表（会话为主重构 S3；ZCode TaskListItem 三段式样板）。
+ * gui/src/pages/SessionList.tsx — 左栏会话列表（ZCode 1:1 复刻 第 3 步；样板 TaskList +
+ * TaskListItem workspace 变体，class 串照抄锚 §2.a）。
  *
- * 列表项 = [16px 状态槽] + [标题行：title（可读标题；titleSource=id 时灰显 shortId）+ 盾标] / [元信息行：basename(cwd) · mtime 相对时间]。
- * 状态槽数据源（诚实映射，不伪造）：error = 该会话 outbox failed/expired/rejected（红点）；
- * masterProtected = 标题行盾标（非槽位）；「运行中/未读」无数据源 v1 留空。
- * 排序 mtimeMs desc + 顶部文本过滤（标题 / shortId / 文件 / cwd 子串，matchesSessionFilter）；选中态 = bg-selected 纯背景圆角行。
+ * 列表项三段式 = [16px 前置状态槽] + [标题行：title 链成果（titleSource=id 灰显 shortId）+
+ * masterProtected 盾标] / [元信息行：basename(cwd) · mtime 相对时间]。
+ * 行 class 逐字对齐 TaskListItem.tsx#L534-546：`group/task-item flex cursor-pointer gap-2
+ * rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow]`；
+ * 选中 `bg-selected` / hover `bg-surface-hover`（行高基准 32px、无分隔线无竖条）。
+ * 状态槽四态前置（error>未读>运行中>idle）中只有 error 有数据源（该会话 outbox 终态失败集）；
+ * unread/loading 无数据源 → 不渲染（拍板 1）。
+ * [无后端支撑]=不渲染：分组 Tabs、置顶/归档区、拖拽排序、工作流行、分页。
  */
 
 import { useMemo, useState } from "react";
+import { Clock, Shield } from "lucide-react";
 import { useGui } from "../store";
-import { EmptyState, RelTime, ShortId, Term } from "../ui";
+import { RelTime, ShortId } from "../ui";
+import { Input } from "../ui/input";
 import type { SessionSummary } from "../api/types";
 import { matchesSessionFilter } from "../sessionFilter";
 
@@ -45,65 +52,82 @@ export function SessionList() {
 	}, [chatSessions, filter]);
 
 	return (
-		<div className="flex min-h-0 flex-1 flex-col gap-1.5">
-			<div className="flex shrink-0 items-center justify-between px-1">
-				<span className="text-xs font-semibold tracking-wide text-zinc-400">
-					<Term zh="会话" en="Sessions" />
-				</span>
-				<span className="font-mono text-[10px] text-zinc-600">{chatSessions.length}</span>
-			</div>
-			<input
+		<div className="flex min-h-0 flex-1 flex-col gap-2 px-2">
+			{/* 过滤 Input（ui/input token 套件；zcode 搜索为按钮开面板——本处保留内联过滤成果） */}
+			<Input
 				value={filter}
 				onChange={(e) => setFilter(e.target.value)}
 				placeholder="过滤会话（标题 / ID / 路径）"
-				className="shrink-0 rounded border border-zinc-700 bg-background px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+				className="h-7 shrink-0"
 			/>
+			{/* 列表容器（TaskList.tsx#L383 flex flex-col gap-2 + #L450 ul space-y-0.5） */}
 			<ul className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
 				{sessions.length === 0 ? (
-					<EmptyState>{chatSessions.length === 0 ? "暂无会话（等待列表数据）" : "无匹配会话"}</EmptyState>
+					<li className="px-2.5 py-2 text-ui-sm text-foreground-subtlest">
+						{chatSessions.length === 0 ? "暂无会话（等待列表数据）" : "无匹配会话"}
+					</li>
 				) : (
 					sessions.map((s) => {
 						const hasError = failedSessions.has(s.sessionId);
+						const isActive = activeId === s.sessionId;
 						return (
-							<li key={s.sessionId}>
-								<button
-									type="button"
-									onClick={() => void useGui.getState().openChatSession(s.sessionId)}
-									title={s.file}
-									className={`flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
-										activeId === s.sessionId ? "bg-selected text-zinc-100" : "text-zinc-400 hover:bg-surface hover:text-zinc-200"
-									}`}
-								>
-									{/* 16px 状态槽：error 红点；「运行中/未读」无数据源 v1 留空 */}
-									<span className="flex h-4 w-4 shrink-0 items-center justify-center">
-										{hasError && <span className="h-2 w-2 rounded-full bg-destructive" title="该会话有发送失败/过期/被拒的消息" />}
-									</span>
-									<span className="min-w-0 flex-1">
-										{/* 标题行：可读 title（解析链 ledger|first-user）；titleSource=id 或旧 server 无 title → 灰显 shortId */}
-										<span className="flex min-w-0 items-center justify-between gap-1">
-											{s.title !== undefined && s.titleSource !== "id" ? (
-												<span className="min-w-0 flex-1 truncate text-zinc-200" title={s.title}>
-													{s.title}
-												</span>
-											) : (
-												<ShortId
-													value={s.sessionId}
-													className={s.titleSource === "id" ? "text-zinc-600" : undefined}
-												/>
-											)}
-											{s.masterProtected === true && (
-												<span className="shrink-0 text-[10px]" title="Master 会话拒绝远程输入（executor 层 403 护栏）">
-													🛡
-												</span>
-											)}
-										</span>
-										{/* 元信息行：basename(cwd) · mtime 相对时间 */}
-										<span className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
-											<span className="truncate font-mono">{basename(s.cwd)}</span>
-											<RelTime at={mtimeIso(s)} className="shrink-0" />
-										</span>
-									</span>
-								</button>
+							// 行体（TaskListItem.tsx#L534-546 逐字；workspace 变体单行居中）
+							<li
+								key={s.sessionId}
+								title={s.file}
+								onClick={() => void useGui.getState().openChatSession(s.sessionId)}
+								onKeyDown={(e) => {
+									if (e.key === "Enter" || e.key === " ") {
+										e.preventDefault();
+										void useGui.getState().openChatSession(s.sessionId);
+									}
+								}}
+								tabIndex={0}
+								className={`group/task-item flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow] ${
+									isActive ? "bg-selected" : "hover:bg-surface-hover"
+								}`}
+							>
+								{/* 前置状态槽 16×16（#L559-600）：error 红点；unread/loading 无数据源不渲染 */}
+								<div className="relative flex size-4 shrink-0 items-center justify-center">
+									{hasError && (
+										<span
+											data-error-indicator="true"
+											className="h-1.5 w-1.5 rounded-full bg-destructive"
+											title="该会话有发送失败/过期/被拒的消息"
+										/>
+									)}
+								</div>
+								<div className="flex min-w-0 flex-1 flex-col gap-0.5">
+									{/* 标题行：可读 title（解析链 ledger|first-user）；titleSource=id → 灰显 shortId */}
+									<div className="flex min-w-0 items-center gap-2">
+										{s.title !== undefined && s.titleSource !== "id" ? (
+											<span className="min-w-0 flex-1 truncate text-ui-base text-foreground" title={s.title}>
+												{s.title}
+											</span>
+										) : (
+											<ShortId
+												value={s.sessionId}
+												className={`min-w-0 flex-1 ${s.titleSource === "id" ? "text-foreground-subtlest" : ""}`}
+											/>
+										)}
+										{s.masterProtected === true && (
+											// masterProtected 盾标（我方数据面；zcode 无直接对应物）
+											<span
+												className="shrink-0 text-warning"
+												title="Master 会话拒绝远程输入（executor 层 403 护栏）"
+											>
+												<Shield className="size-3.5" />
+											</span>
+										)}
+									</div>
+									{/* 元信息行（#L745-770 同款刻度）：basename(cwd) · mtime 相对时间 */}
+									<div className="flex min-w-0 items-center gap-1 text-ui-sm text-foreground-subtle">
+										<span className="min-w-0 truncate">{basename(s.cwd)}</span>
+										<span className="shrink-0 text-foreground-subtlest">·</span>
+										<Clock className="size-3.5 shrink-0" />
+										<RelTime at={mtimeIso(s)} className="shrink-0" />
+									</div>
+								</div>
 							</li>
 						);
 					})

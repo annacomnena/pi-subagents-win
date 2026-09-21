@@ -125,6 +125,9 @@ interface GuiState {
 	// UI
 	activeTab: TabId;
 	setActiveTab: (t: TabId) => void;
+	/** 左栏折叠（ZCode 1:1 第 3 步）：折叠 = 宽度动画到 0 + opacity-0 + pointer-events-none。 */
+	sidebarCollapsed: boolean;
+	setSidebarCollapsed: (v: boolean) => void;
 	runtimeOverlay: RuntimeOverlaySection | null;
 	setRuntimeOverlay: (s: RuntimeOverlaySection | null) => void;
 
@@ -227,6 +230,8 @@ export function capTimelineItems(merged: TimelineItem[], historyAnchorId: string
 export const useGui = create<GuiState>((set, get) => ({
 	activeTab: "chat",
 	setActiveTab: (t) => set({ activeTab: t }),
+	sidebarCollapsed: false,
+	setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
 	runtimeOverlay: null,
 	setRuntimeOverlay: (s) => set({ runtimeOverlay: s }),
 

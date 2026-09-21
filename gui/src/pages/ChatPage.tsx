@@ -1,21 +1,35 @@
 /**
- * gui/src/pages/ChatPage.tsx — 永久默认主视图「会话」（G6-P1 第 6 页 → 会话为主重构 S3/S5）。
+ * gui/src/pages/ChatPage.tsx — 中央 transcript + composer（ZCode 1:1 复刻 第 5/6 步）。
  *
- * - 布局：会话列表已上移左栏（SessionList 常驻）；本页只剩 transcript+composer 同滚动视口，
- *   composer 为滚动容器内 sticky dock（S5，替 h-[calc(100vh-…)] 魔法数）；贴底锚定 +
- *   回看锁定阅读位 + 「回到底部」浮钮（单 scroll handler，不加依赖）；
- * - 数据面：GET transcript 首屏全量 + WS transcript 增量（useEventStream；断线重连带
- *   seq/logEpoch，snapshot/resync → 全量重拉重订阅）；sessions 6s 轮询已上移 App（S2）；
- * - 渲染：5 种自包含行（turnHeader/userInput/assistantText/reasoning/toolCall）；
- * - 红线：WS 只读（发消息走 HTTP outbox）；既有五页 usePoll 零改动。
+ * - 行型映射（拍板 5）：我方 5 种 TranscriptRow → zcode 行型（class 串照抄锚 §2.b）：
+ *   turnHeader→调试 turn header 行；userInput→右对齐气泡（rounded-tr-xs 缺角必抄）；
+ *   assistantText→行式纯文本 whitespace-pre-wrap；reasoning→Collapsible 默认收起；
+ *   toolCall→Collapsible 单行卡（运行中=animated-gradient-text 扫光≈流式；无光标字符）。
+ * - composer（拍板 6）：rounded-2xl border-input-border bg-input p-3 三态边框 + 发送钮
+ *   icon-md bg-brand ArrowUp；加号钮与 Stop 钮灰显占位（无后端，Tooltip「未接入」）。
+ * - 数据面零改动：GET transcript 首屏 + WS 增量（useEventStream）+ sendChatMessage
+ *   （P2 session.message POST + outbox 两段回执，OUTBOX_STATUS 文案沿用）。
+ * - 滚动：视口 [scrollbar-gutter:stable]；贴底锚定/回看锁定保留现逻辑；回看 mask 渐隐
+ *   （ConversationTimeline.tsx#L882-909 公式，FADE=24 / TRANSPARENT=96）+ 回到底部浮钮。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUp, ChevronRight, Plus, Square, Wrench } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
-import { Badge, Button, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
+import { RelTime } from "../ui";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import type { ChatOutboxEntry, TranscriptRow } from "../api/types";
 import type { StreamSubscribeMsg } from "../api/types";
+
+// 回看 mask 渐隐常数（ConversationTimeline.tsx#L99-100）
+const COMPOSER_MESSAGE_MASK_FADE_PX = 24;
+const COMPOSER_MESSAGE_MASK_TRANSPARENT_HEIGHT_PX = 96;
+// 工具卡收起延迟卸载（ToolLayout.tsx#L26）
+const TOOL_CONTENT_COLLAPSE_UNMOUNT_DELAY_MS = 300;
 
 function fmtDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
@@ -25,74 +39,182 @@ function fmtDuration(ms: number): string {
 	return `${m}m${s.toString().padStart(2, "0")}s`;
 }
 
-// ── 5 种行渲染组件 ────────────────────────────────────────────────
+/** 行壳（ConversationRowView.tsx#L128-147 RowShell）：入场动画 = zcode-stream-text-in。 */
+function RowShell({
+	rowId,
+	className,
+	children,
+}: {
+	rowId: string;
+	className?: string;
+	children: React.ReactNode;
+}) {
+	return (
+		<div data-row-id={rowId} data-zcode-stream-animate="true" className={className}>
+			{children}
+		</div>
+	);
+}
 
+// ── 5 种行 → zcode 行型 ───────────────────────────────────────────
+
+/** 调试 turn header 行（ConversationRowView.tsx#L1622-1628）。 */
 function TurnHeaderRowView({ row }: { row: Extract<TranscriptRow, { kind: "turnHeader" }> }) {
 	return (
-		<div className="my-3 flex items-center gap-2 text-[11px] text-zinc-500">
-			<span className="h-px flex-1 bg-zinc-800" />
-			<span className="font-mono">
-				对话轮 {row.turnIndex} · <RelTime at={row.startedAt} />
-				{row.durationMs !== undefined ? ` · ${fmtDuration(row.durationMs)}` : " · 进行中"}
-			</span>
-			<span className="h-px flex-1 bg-zinc-800" />
-		</div>
+		<RowShell
+			rowId={row.rowId}
+			className="border-b border-[var(--color-border)] py-1 text-ui-sm text-[var(--color-foreground-subtle)]"
+		>
+			对话轮 {row.turnIndex} · <RelTime at={row.startedAt} />
+			{row.durationMs !== undefined ? ` · ${fmtDuration(row.durationMs)}` : " · 进行中"}
+		</RowShell>
 	);
 }
 
+/** user 右对齐气泡全套（#L1190,1252-1270）：rounded-tr-xs 缺角必抄。 */
 function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userInput" }> }) {
 	return (
-		<div className="my-1.5 flex justify-end">
-			<div className="max-w-[85%] whitespace-pre-wrap rounded-lg rounded-br-sm border border-blue-900/50 bg-blue-950/40 px-3 py-1.5 text-sm text-blue-100">
-				{row.text.length > 0 ? row.text : <span className="text-blue-300/60">（非文本输入）</span>}
+		<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
+			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-surface px-4 py-3 text-ui-base text-foreground @min-[624px]/conversation:max-w-xl">
+				<div className="whitespace-pre-wrap">
+					{row.text.length > 0 ? row.text : <span className="text-foreground-subtlest">（非文本输入）</span>}
+				</div>
 			</div>
-		</div>
+		</RowShell>
 	);
 }
 
+/** assistant 行式正文（#L1512,1518）：纯文本 whitespace-pre-wrap（拍板 1 白名单）+ 注脚。 */
 function AssistantTextRowView({ row }: { row: Extract<TranscriptRow, { kind: "assistantText" }> }) {
 	return (
-		<div className="my-1.5 max-w-[90%] whitespace-pre-wrap text-sm leading-relaxed text-zinc-200">
-			{row.text}
-			{row.model !== undefined && <span className="ml-2 align-middle font-mono text-[10px] text-zinc-600">{row.model}</span>}
-		</div>
+		<RowShell rowId={row.rowId} className="group/assistant-row">
+			<div className="w-full text-ui-base">
+				<div className="whitespace-pre-wrap">{row.text}</div>
+				{(row.model !== undefined || row.provider !== undefined) && (
+					<div className="mt-1 font-mono text-ui-xs text-foreground-subtlest">
+						{row.model}
+						{row.provider !== undefined ? ` · ${row.provider}` : ""}
+					</div>
+				)}
+			</div>
+		</RowShell>
 	);
 }
 
+/** reasoning 折叠块：默认收起（streaming/complete 都收起 = zcode Reasoning 口径）。 */
 function ReasoningRowView({ row }: { row: Extract<TranscriptRow, { kind: "reasoning" }> }) {
 	return (
-		<details className="my-1 max-w-[90%] rounded border border-zinc-800/70 bg-zinc-900/50 px-2.5 py-1.5">
-			<summary className="cursor-pointer select-none text-xs text-zinc-500">
-				思考过程{row.model !== undefined && <span className="ml-2 font-mono text-[10px] text-zinc-600">{row.model}</span>}
-			</summary>
-			<div className="mt-1.5 whitespace-pre-wrap border-t border-zinc-800/60 pt-1.5 text-xs italic leading-relaxed text-zinc-500">{row.text}</div>
-		</details>
+		<RowShell rowId={row.rowId}>
+			<Collapsible className="w-full">
+				<CollapsibleTrigger className="group/reasoning inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base text-foreground-subtlest transition-colors hover:text-foreground-subtle">
+					<ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/collapsible:rotate-90" />
+					<span className="font-medium">思考过程</span>
+					{row.model !== undefined && (
+						<span className="font-mono text-ui-xs text-foreground-subtlest">{row.model}</span>
+					)}
+				</CollapsibleTrigger>
+				<CollapsibleContent className="text-popover-foreground outline-none">
+					<div className="pt-2 text-ui-sm text-foreground-subtle">
+						<div className="whitespace-pre-wrap">{row.text}</div>
+					</div>
+				</CollapsibleContent>
+			</Collapsible>
+		</RowShell>
 	);
 }
 
-const TOOL_STATUS_TONE = { running: "yellow", done: "green", error: "red" } as const;
+// ── toolCall：Collapsible 单行卡（ToolLayout 交互样板的最小移植）──────────────
+// 展开态按 rowId 存内存 Map 持久（ToolLayout.tsx#L44-46）；收起延迟卸载 300ms（#L26）。
+
+const toolCardOpenState = new Map<string, boolean>();
 
 function ToolCallRowView({ row }: { row: Extract<TranscriptRow, { kind: "toolCall" }> }) {
+	const isOpen = toolCardOpenState.get(row.rowId) ?? false;
+	// shouldRenderContent：收起后延迟 300ms 再卸载展开体（Radix closed 动画要读高度变量）
+	const [shouldRenderContent, setShouldRenderContent] = useState(isOpen);
+	const unmountDelayRef = useRef<number | null>(null);
+
+	useEffect(() => {
+		if (isOpen) {
+			if (unmountDelayRef.current !== null) {
+				window.clearTimeout(unmountDelayRef.current);
+				unmountDelayRef.current = null;
+			}
+			setShouldRenderContent(true);
+			return;
+		}
+		if (!shouldRenderContent) return;
+		unmountDelayRef.current = window.setTimeout(() => {
+			setShouldRenderContent(false);
+			unmountDelayRef.current = null;
+		}, TOOL_CONTENT_COLLAPSE_UNMOUNT_DELAY_MS);
+		return () => {
+			if (unmountDelayRef.current !== null) {
+				window.clearTimeout(unmountDelayRef.current);
+				unmountDelayRef.current = null;
+			}
+		};
+	}, [isOpen, shouldRenderContent]);
+
+	const isRunning = row.status === "running";
+	const isError = row.status === "error";
+	const statusLabel = isRunning ? "执行中" : isError ? "出错" : "完成";
+
 	return (
-		<div className="my-1.5 max-w-[90%] rounded border border-zinc-800 bg-zinc-900/60">
-			<div className="flex items-center gap-2 border-b border-zinc-800/70 px-2.5 py-1.5">
-				<span className="text-xs text-zinc-400">🔧</span>
-				<span className="font-mono text-xs text-zinc-200">{row.name}</span>
-				<Badge tone={TOOL_STATUS_TONE[row.status]}>{row.status === "running" ? "执行中" : row.status === "done" ? "完成" : "出错"}</Badge>
-				{row.provider !== undefined && <span className="ml-auto font-mono text-[10px] text-zinc-600">{row.provider}</span>}
-			</div>
-			<details className="px-2.5 py-1.5">
-				<summary className="cursor-pointer select-none text-[11px] text-zinc-500">参数与输出</summary>
-				<pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-all rounded bg-zinc-950/70 p-2 font-mono text-[11px] leading-relaxed text-zinc-400">
-					{JSON.stringify(row.arguments, null, 2)}
-				</pre>
-				{row.output !== undefined && (
-					<pre className={`mt-1.5 max-h-56 overflow-y-auto whitespace-pre-wrap break-all rounded p-2 font-mono text-[11px] leading-relaxed ${row.status === "error" ? "bg-red-950/30 text-red-300" : "bg-zinc-950/70 text-zinc-400"}`}>
-						{row.output}
-					</pre>
+		<RowShell rowId={row.rowId} className="py-0">
+			<Collapsible
+				open={isOpen}
+				onOpenChange={(open) => {
+					toolCardOpenState.set(row.rowId, open);
+					if (open) setShouldRenderContent(true);
+				}}
+				className="w-full flex flex-col"
+				data-zcode-tool-stream-animate="true"
+			>
+				{/* 摘要行（ToolSummaryRow.tsx canToggle 分支 + ToolLayout.tsx#L165-176）：图标刻意不转 */}
+				<CollapsibleTrigger className="group/tool-summary inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-input-border-focused">
+					<span className="shrink-0 text-foreground-subtlest [&_svg]:text-foreground-subtlest">
+						<Wrench className="size-3.5" />
+					</span>
+					<span
+						className={`font-medium whitespace-nowrap shrink-0 ${isRunning ? "animated-gradient-text" : "text-foreground-subtlest"}`}
+					>
+						{row.name}
+					</span>
+					<span className={`min-w-0 flex max-w-full items-center gap-2 text-foreground-subtlest`}>
+						<span
+							className={`whitespace-nowrap ${isError ? "text-destructive" : isRunning ? "animated-gradient-text" : ""}`}
+							title={isError ? "该工具执行出错（展开查看输出）" : undefined}
+						>
+							{statusLabel}
+						</span>
+					</span>
+					<ChevronRight
+						aria-hidden
+						className={`shrink-0 text-foreground-subtlest transition-transform group-data-[state=open]/collapsible:rotate-90`}
+					/>
+				</CollapsibleTrigger>
+				{shouldRenderContent && (
+					// 展开体（ToolLayout.tsx#L24-25 + 锚 §2.b）：pt-2 内容壳 + pre font-mono text-ui-sm
+					<CollapsibleContent className="text-popover-foreground outline-none">
+						<div className="pt-2">
+							<pre className="max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm text-foreground-subtle">
+								{JSON.stringify(row.arguments, null, 2)}
+							</pre>
+							{row.output !== undefined && (
+								<pre
+									className={`mt-1 max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm ${
+										isError ? "text-destructive" : "text-foreground-subtle"
+									}`}
+								>
+									{row.output}
+								</pre>
+							)}
+						</div>
+					</CollapsibleContent>
 				)}
-			</details>
-		</div>
+			</Collapsible>
+		</RowShell>
 	);
 }
 
@@ -121,6 +243,7 @@ export function ChatPage() {
 	const resyncKey = useGui((s) => s.chatResyncKey);
 	const outboxMap = useGui((s) => s.chatOutbox);
 	const [draft, setDraft] = useState("");
+	const [dragging, setDragging] = useState(false);
 
 	// gui:dev 的本机 Vite proxy 在上游注入 cookie；浏览器不持有 token。
 	const url = useMemo(() => streamUrl(null), []);
@@ -164,9 +287,7 @@ export function ChatPage() {
 	}, [wsState]);
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
-	// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——/v1/sessions 条目的 masterProtected
-	// flag（与 executor 护栏同源 getMasterStatus().attachment.sessionId）；不再拿 health 心跳
-	// 自猜（stale 心跳会错标）。POST 真 403 回执仍是最后防线（store 层映射 rejected 徽标）。
+	// Master 禁输入标识 = /v1/sessions masterProtected flag（服务端权威；POST 403 是最后防线）。
 	const activeSession = activeId !== null ? chatSessions.find((s) => s.sessionId === activeId) : undefined;
 	const isMasterSession = activeSession?.masterProtected === true;
 	const outboxEntries = useMemo(
@@ -177,16 +298,40 @@ export function ChatPage() {
 				.slice(-20),
 		[outboxMap, activeId],
 	);
-	// S5：composer sticky dock + 贴底/回看锁定（替原 scrollIntoView）。
-	// 单 scroll handler 判 nearBottom（≤48px）：贴底→新内容自动锚定吸底；离开底部→锁定阅读位
-	//（不强制拉底），浮出「回到底部」钮。回看时消息从 dock 底下穿过（zcode composer dock 样板）。
+	// 贴底锚定 + 回看锁定（原 S5 逻辑保留）：单 scroll handler 判 nearBottom（≤48px）；
+	// 贴底→新内容自动锚定吸底；离开底部→锁定阅读位 + 浮出「回到底部」钮 + 消息层 mask 渐隐。
 	const scrollRef = useRef<HTMLDivElement | null>(null);
+	const messageLayerRef = useRef<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
+
+	const syncMask = (): void => {
+		const el = scrollRef.current;
+		const layer = messageLayerRef.current;
+		if (el === null || layer === null) return;
+		if (el.scrollHeight - el.scrollTop - el.clientHeight < 48) {
+			// 贴底：消息在文档流末尾不经 sticky composer，保留 mask 会无意义淡出最后一条
+			layer.style.maskImage = "none";
+			layer.style.webkitMaskImage = "none";
+			return;
+		}
+		const viewportHeight = el.clientHeight;
+		const transparentStart = Math.max(0, viewportHeight - COMPOSER_MESSAGE_MASK_TRANSPARENT_HEIGHT_PX);
+		const opaqueEnd = Math.max(0, transparentStart - COMPOSER_MESSAGE_MASK_FADE_PX);
+		const viewportTopInLayer = Math.max(0, el.scrollTop - layer.offsetTop);
+		const maskImage = `linear-gradient(to bottom, black 0, black ${opaqueEnd}px, transparent ${transparentStart}px, transparent 100%)`;
+		layer.style.maskImage = maskImage;
+		layer.style.webkitMaskImage = maskImage;
+		layer.style.maskPosition = `0 ${viewportTopInLayer}px`;
+		layer.style.webkitMaskPosition = `0 ${viewportTopInLayer}px`;
+		layer.style.maskSize = `100% ${viewportHeight}px`;
+		layer.style.webkitMaskSize = `100% ${viewportHeight}px`;
+	};
 
 	const handleScroll = (): void => {
 		const el = scrollRef.current;
 		if (el === null) return;
 		setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+		syncMask();
 	};
 
 	// 贴底锚定：仅在 atBottom 时跟随新行/回执滚动；回看（!atBottom）锁定阅读位
@@ -208,6 +353,8 @@ export function ChatPage() {
 		if (el !== null) el.scrollTop = el.scrollHeight;
 	};
 
+	const canSend = activeId !== null && draft.trim().length > 0 && !isMasterSession;
+
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
 		if (text.length === 0 || activeId === null || isMasterSession) return;
@@ -216,115 +363,185 @@ export function ChatPage() {
 	};
 
 	return (
-		// S5：h-full flex-col 替代 h-[calc(100vh-…)] 魔法数（main 弹性列内自适应）
-		<div className="flex h-full min-h-0 flex-col gap-3">
-			<PageIntro>会话视图：pi 会话转写（自包含行投影）；输入经 POST /v1/commands 两段式投递（WS 保持只读）</PageIntro>
-			{/* 会话列表已上移左栏（SessionList 常驻）；中央只剩 transcript+composer 同滚动视口 */}
-			<div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-surface/60">
-				<header className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
-					<h2 className="text-xs font-semibold tracking-wide text-zinc-400">
-						<Term zh="对话" en="Transcript" />
-					</h2>
-					<div className="flex items-center gap-2 text-[11px]">
-						{activeId !== null && <ShortId value={activeId} />}
-						<ConnBadge conn={conn} />
+		<div className="flex h-full min-h-0 flex-col">
+			{/* 会话容器（ConversationTimeline 样板）：@container/conversation 供行宽断点 */}
+			<div className="@container/conversation relative flex min-h-0 flex-1 flex-col">
+				{/* 滚动视口（ConversationTimeline.tsx#L1747-1757 class 照抄） */}
+				<div
+					ref={scrollRef}
+					onScroll={handleScroll}
+					className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto [scrollbar-gutter:stable]"
+				>
+					{/* 消息层（mask 渐隐作用面）+ 内容列宽（conversationLayout.ts#L7-12 照抄） */}
+					<div
+						ref={messageLayerRef}
+						className="mx-auto flex w-full flex-col gap-4 px-4 py-4 @min-[864px]/conversation:w-[calc(100%_-_6rem)] @min-[864px]/conversation:max-w-4xl @min-[1280px]/conversation:w-[calc(100%_-_24rem)] @min-[1280px]/conversation:max-w-6xl"
+					>
+						{activeId === null ? (
+							<div className="py-6 text-center text-ui-sm text-foreground-subtlest">从左栏选择一个会话</div>
+						) : rows.length === 0 && outboxEntries.length === 0 ? (
+							<div className="py-6 text-center text-ui-sm text-foreground-subtlest">
+								该会话暂无可投影内容（或正在加载）
+							</div>
+						) : (
+							<>
+								{rows.map((row) => (
+									<RowView key={row.rowId} row={row} />
+								))}
+								{/* 发送两段回执：挂 user 气泡下的状态行（mt-1 text-right text-ui-sm） */}
+								{outboxEntries.map((e) => (
+									<OutboxRowView key={e.commandKey} e={e} />
+								))}
+							</>
+						)}
 					</div>
-				</header>
-				<div className="relative min-h-0 flex-1">
-					<div ref={scrollRef} onScroll={handleScroll} className="h-full overflow-y-auto px-4 py-3">
-						<div className="flex min-h-full flex-col">
-							{activeId === null ? (
-								<EmptyState>从左栏选择一个会话</EmptyState>
-							) : rows.length === 0 && outboxEntries.length === 0 ? (
-								<EmptyState>该会话暂无可投影内容（或正在加载）</EmptyState>
-							) : (
-								<>
-									{rows.map((row) => (
-										<RowView key={row.rowId} row={row} />
-									))}
-									{outboxEntries.map((e) => (
-										<OutboxRowView key={e.commandKey} e={e} />
-									))}
-								</>
-							)}
-							{/* S5：composer sticky dock——与 transcript 同滚动视口，sticky 到滚动容器底部；
-							    mt-auto 兼短内容（空态时 dock 也贴视口底） */}
-							<div className="sticky bottom-0 z-10 mt-auto -mx-4 border-t border-border bg-surface/95 px-4 py-2 backdrop-blur-sm">
-							{isMasterSession ? (
-								<p className="text-[11px] text-red-300/90">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
-							) : (
-								<form
-									onSubmit={(ev) => {
-										ev.preventDefault();
-										void send();
-									}}
-									className="flex items-end gap-2"
+					{/* composer sticky dock（ConversationTimeline.tsx#L1911-1929 + ChatPromptEditor.tsx#L346-361） */}
+					<div className="pointer-events-none sticky bottom-0 z-20 mt-auto flex w-full justify-center">
+						<div className="pointer-events-auto relative z-10 w-full shrink-0 px-4 pb-4">
+							{/* 回看锁定阅读位时浮出「回到底部」钮（#L1937-1944 位置口径） */}
+							{!atBottom && activeId !== null && (
+								<Button
+									type="button"
+									variant="secondary"
+									size="sm"
+									onClick={scrollToLatest}
+									className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-full shadow-sm"
 								>
-									<textarea
-										value={draft}
-										onChange={(e) => setDraft(e.target.value)}
-										onKeyDown={(e) => {
-											if (e.key === 'Enter' && !e.shiftKey) {
-												e.preventDefault();
-												void send();
-											}
-										}}
-										maxLength={8000}
-										rows={Math.min(4, Math.max(1, draft.split("\n").length))}
-										placeholder={activeId !== null ? '输入消息发往该会话（Enter 发送，Shift+Enter 换行）' : '先选择会话'}
-										disabled={activeId === null}
-										className="max-h-32 min-h-[2.25rem] flex-1 resize-none rounded border border-zinc-700 bg-background/60 px-2.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none disabled:opacity-50"
-									/>
-									<Button onClick={() => void send()} disabled={activeId === null || draft.trim().length === 0}>
-										发送
-									</Button>
-								</form>
+									↓ 回到底部
+								</Button>
 							)}
+							{/* 输入壳三态边框（hover / focus-within / 拖拽占位） */}
+							<div
+								onDragOver={(e) => {
+									e.preventDefault();
+									setDragging(true);
+								}}
+								onDragLeave={() => setDragging(false)}
+								onDrop={(e) => {
+									e.preventDefault();
+									setDragging(false); // 附件拖放无后端：占位高亮，落点不接收
+								}}
+								className={`relative flex flex-col gap-3 overflow-hidden rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused focus-within:bg-input-focused ${
+									dragging ? "border-brand bg-input-focused ring-1 ring-brand/30" : ""
+								}`}
+							>
+								{dragging && (
+									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-accent/55 backdrop-blur-sm">
+										<div className="flex items-center gap-2 rounded-full border border-border bg-accent px-4 py-2 text-ui-base text-foreground shadow-sm">
+											<span>附件拖放未接入</span>
+										</div>
+									</div>
+								)}
+								<textarea
+									value={draft}
+									onChange={(e) => setDraft(e.target.value)}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" && !e.shiftKey) {
+											e.preventDefault();
+											void send();
+										}
+									}}
+									maxLength={8000}
+									rows={Math.min(4, Math.max(1, draft.split("\n").length))}
+									placeholder={
+										activeId !== null
+											? "输入消息发往该会话（Enter 发送，Shift+Enter 换行）"
+											: "先选择会话"
+									}
+									disabled={activeId === null || isMasterSession}
+									className="max-h-32 w-full resize-none bg-transparent text-ui-base text-foreground outline-none placeholder:text-foreground-subtlest disabled:cursor-not-allowed disabled:opacity-50"
+								/>
+								{/* 工具栏行（ChatPromptEditor.tsx#L388-393）：左动作组 + 右主按钮组 */}
+								<div className="group/toolbar flex items-end gap-3">
+									<div className="flex min-w-0 flex-1 items-center">
+										<div className="flex shrink-0 items-center gap-1">
+											{/* 加号钮灰显占位（拍板 1：保工具栏骨架 1:1） */}
+											<Tooltip>
+												<TooltipTrigger asChild>
+													{/* disabled 原生 button 不派发 hover；包裹层只承接 Tooltip，不接任何动作。 */}
+													<span className="inline-flex">
+														<Button type="button" variant="ghost" size="icon-md" disabled aria-label="附件与命令（未接入）">
+															<Plus className="size-4" />
+														</Button>
+													</span>
+												</TooltipTrigger>
+												<TooltipContent>未接入（附件 / mention / slash 面板无后端）</TooltipContent>
+											</Tooltip>
+											<ConnBadge conn={conn} />
+										</div>
+									</div>
+									{isMasterSession ? (
+										// masterProtected 禁输入文案保留、换 token 色（拍板 5）
+										<p className="text-ui-sm text-destructive">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
+									) : (
+										<div className="flex shrink-0 items-center gap-2">
+											{/* Stop 钮灰显占位（无 interrupt 命令；zcode 口径 variant=secondary + Square fill-current） */}
+											<Tooltip>
+												<TooltipTrigger asChild>
+													{/* 同上：仅让 Tooltip 可达，Stop 仍为 disabled 且无 interrupt 副作用。 */}
+													<span className="inline-flex">
+														<Button type="button" variant="secondary" size="icon-md" disabled aria-label="停止（未接入）">
+															<Square className="size-4 fill-current" />
+														</Button>
+													</span>
+												</TooltipTrigger>
+												<TooltipContent>未接入（无 interrupt 命令）</TooltipContent>
+											</Tooltip>
+											{/* 发送钮（ConversationComposer.tsx#L2082-2095 整条 class） */}
+											<Button
+												type="submit"
+												size="icon-md"
+												disabled={!canSend}
+												onClick={() => void send()}
+												aria-label="发送"
+												className="cursor-pointer gap-1 rounded-lg bg-brand text-ui-base text-foreground-inverse hover:bg-brand/80"
+											>
+												<ArrowUp className="size-4" />
+											</Button>
+										</div>
+									)}
+								</div>
 							</div>
 						</div>
 					</div>
-					{/* 回看锁定阅读位时浮出「回到底部」钮（替原 scrollIntoView） */}
-					{!atBottom && activeId !== null && (
-						<button
-							type="button"
-							onClick={scrollToLatest}
-							className="absolute bottom-16 right-4 z-20 rounded-full border border-zinc-700 bg-background/90 px-3 py-1.5 text-[11px] text-zinc-200 shadow-lg backdrop-blur-sm transition-colors hover:bg-surface-hover"
-						>
-							↓ 回到底部
-						</button>
-					)}
 				</div>
 			</div>
 		</div>
 	);
 }
 
-// ── G6-P2：发送两段回执状态徽标 ──────────────────────────────
+// ── G6-P2：发送两段回执状态（OUTBOX_STATUS 文案沿用；换 user 气泡 + 状态行壳）─────
 
-const OUTBOX_STATUS: Record<ChatOutboxEntry["status"], { tone: "gray" | "yellow" | "green" | "red"; label: string }> = {
-	sending: { tone: "yellow", label: "发送中" },
-	pending: { tone: "yellow", label: "已提交·等待注入" },
-	delivered: { tone: "green", label: "已送达" },
-	failed: { tone: "red", label: "失败" },
-	expired: { tone: "gray", label: "已过期（24h 未投递）" },
-	rejected: { tone: "red", label: "被拒绝" },
+const OUTBOX_STATUS: Record<ChatOutboxEntry["status"], { label: string; destructive?: boolean }> = {
+	sending: { label: "发送中" },
+	pending: { label: "已提交·等待注入" },
+	delivered: { label: "已送达" },
+	failed: { label: "失败", destructive: true },
+	expired: { label: "已过期（24h 未投递）" },
+	rejected: { label: "被拒绝", destructive: true },
 };
 
 function OutboxRowView({ e }: { e: ChatOutboxEntry }) {
 	const s = OUTBOX_STATUS[e.status];
 	return (
-		<div className="my-1.5 flex justify-end">
-			<div className="flex max-w-[85%] items-start gap-2">
-				<div className="whitespace-pre-wrap rounded-lg rounded-br-sm border border-blue-900/30 bg-blue-950/20 px-3 py-1.5 text-sm text-blue-200/80">{e.text}</div>
-				<Badge tone={s.tone} title={e.detail ?? s.label}>{s.label}</Badge>
+		<div className="group/user-row flex flex-col items-end">
+			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-surface px-4 py-3 text-ui-base text-foreground @min-[624px]/conversation:max-w-xl">
+				<div className="whitespace-pre-wrap">{e.text}</div>
+			</div>
+			<div
+				className={`mt-1 text-right text-ui-sm ${s.destructive ? "text-destructive" : "text-foreground-subtlest"}`}
+				title={e.detail ?? s.label}
+				aria-live="polite"
+			>
+				{s.label}
 			</div>
 		</div>
 	);
 }
 
 function ConnBadge({ conn }: { conn: string }) {
-	if (conn === "open") return <Badge tone="green" title="WS 已连接（增量推送）">实时</Badge>;
-	if (conn === "connecting") return <Badge tone="yellow">连接中</Badge>;
-	if (conn === "down") return <Badge tone="red" title="WS 断开，自动重连中（重连带 seq 续传）">重连中</Badge>;
-	return <Badge tone="gray">未接入</Badge>;
+	if (conn === "open") return <Badge variant="secondary" title="WS 已连接（增量推送）">实时</Badge>;
+	if (conn === "connecting") return <Badge variant="secondary">连接中</Badge>;
+	if (conn === "down") return <Badge variant="destructive" title="WS 断开，自动重连中（重连带 seq 续传）">重连中</Badge>;
+	return <Badge variant="secondary">未接入</Badge>;
 }

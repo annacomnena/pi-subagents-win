@@ -11,9 +11,9 @@ import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } fro
 import type { AttentionItem, AttentionSeverity, InteractionResponse } from "../api/types";
 
 const SEV_BAND: Record<AttentionSeverity, string> = {
-	critical: "border-l-red-600",
-	warning: "border-l-amber-500",
-	info: "border-l-sky-600",
+	critical: "border-l-destructive",
+	warning: "border-l-warning",
+	info: "border-l-foreground-subtle",
 };
 
 const SEV_ZH: Record<AttentionSeverity, string> = {
@@ -44,15 +44,15 @@ function AttentionCard({ item, response }: { item: AttentionItem; response?: Int
 	// 无 response 的待决策项 v1 不自造按钮，防范围蔓延——plan §3 拍板）
 	const canAccept = response?.command === "master.handoff.accept";
 	return (
-		<li className={`rounded border border-zinc-800 border-l-4 bg-zinc-900/60 px-3 py-2 ${SEV_BAND[item.severity]}`} title={`级别：${SEV_ZH[item.severity]}`}>
+		<li className={`rounded border border-border border-l-4 bg-card/60 px-3 py-2 ${SEV_BAND[item.severity]}`} title={`级别：${SEV_ZH[item.severity]}`}>
 			<div className="flex flex-wrap items-center gap-2">
 				{typeBadge(item)}
 				<Badge tone={item.status === "open" ? "gray" : "green"}>{item.status === "open" ? "待处理" : "已处理"}</Badge>
-				<span className="text-xs font-medium text-zinc-200">{item.title}</span>
-				<RelTime at={item.createdAt} className="ml-auto text-[10px] text-zinc-600" />
+				<span className="text-xs font-medium text-foreground">{item.title}</span>
+				<RelTime at={item.createdAt} className="ml-auto text-[10px] text-foreground-subtlest" />
 			</div>
-			<p className="mt-1 text-[11px] break-all text-zinc-400">{item.summary}</p>
-			<p className="mt-0.5 font-mono text-[10px] text-zinc-600">
+			<p className="mt-1 text-[11px] break-all text-foreground-subtle">{item.summary}</p>
+			<p className="mt-0.5 font-mono text-[10px] text-foreground-subtlest">
 				类型 {item.type}
 				{item.source ? ` · ${item.source}` : ""}
 			</p>
@@ -86,9 +86,9 @@ export function AttentionPage() {
 		<div className="space-y-3">
 			<PageIntro>系统觉得需要你留意的事</PageIntro>
 			<div className="flex items-center gap-3">
-				<span className="text-xs text-zinc-500">已处理条目</span>
+				<span className="text-xs text-foreground-subtle">已处理条目</span>
 				<Toggle on={includeResolved} onChange={setIncludeResolved} labels={["隐藏", "显示"]} />
-				<span className="ml-auto text-[10px] text-zinc-600">/v1/attention{includeResolved ? "?includeResolved=1" : ""} · 2s</span>
+				<span className="ml-auto text-[10px] text-foreground-subtlest">/v1/attention{includeResolved ? "?includeResolved=1" : ""} · 2s</span>
 			</div>
 			<Card
 				title={<Term zh={`需要关注（${attention.length}${busy ? " · 刷新中" : ""}）`} en="Attention" />}

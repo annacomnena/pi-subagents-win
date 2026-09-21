@@ -43,18 +43,18 @@ export function RuntimePage() {
 				<Card title={<Term zh="服务" en="Host" />}>
 					{health ? (
 						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
-							<dt className="text-zinc-500">实例 ID</dt>
+							<dt className="text-foreground-subtle">实例 ID</dt>
 							<dd><ShortId value={health.host.instanceId} /></dd>
-							<dt className="text-zinc-500">监听地址</dt>
-							<dd className="font-mono text-zinc-200">
+							<dt className="text-foreground-subtle">监听地址</dt>
+							<dd className="font-mono text-foreground">
 								127.0.0.1:{health.host.port} · pid {health.host.pid}
 							</dd>
-							<dt className="text-zinc-500">启动时间</dt>
-							<dd><RelTime at={health.host.startedAt} className="text-zinc-200" /></dd>
-							<dt className="text-zinc-500">协议版本</dt>
-							<dd className="font-mono text-zinc-200">{health.host.protocolVersion}</dd>
-							<dt className="text-zinc-500">数据生成于</dt>
-							<dd><RelTime at={health.generatedAt} className="text-zinc-200" /></dd>
+							<dt className="text-foreground-subtle">启动时间</dt>
+							<dd><RelTime at={health.host.startedAt} className="text-foreground" /></dd>
+							<dt className="text-foreground-subtle">协议版本</dt>
+							<dd className="font-mono text-foreground">{health.host.protocolVersion}</dd>
+							<dt className="text-foreground-subtle">数据生成于</dt>
+							<dd><RelTime at={health.generatedAt} className="text-foreground" /></dd>
 						</dl>
 					) : (
 						naBadge("后端数据未就绪")
@@ -64,10 +64,10 @@ export function RuntimePage() {
 				<Card title={<Term zh="数量一览" en="counts" />}>
 					<div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
 						{countsRows.map(([zh, en, v]) => (
-							<div key={en} className="rounded border border-zinc-800 bg-zinc-900 px-2 py-1.5">
-								<p className="text-lg text-zinc-100">{v === undefined ? <span className="text-sm text-zinc-600">暂无</span> : v}</p>
-								<p className="text-[10px] text-zinc-500">
-									{zh} <span className="font-mono text-zinc-600">{en}</span>
+							<div key={en} className="rounded border border-border bg-surface px-2 py-1.5">
+								<p className="text-lg text-foreground">{v === undefined ? <span className="text-sm text-foreground-subtlest">暂无</span> : v}</p>
+								<p className="text-[10px] text-foreground-subtle">
+									{zh} <span className="font-mono text-foreground-subtlest">{en}</span>
 								</p>
 							</div>
 						))}
@@ -77,10 +77,10 @@ export function RuntimePage() {
 				<Card title={<Term zh="事件日志（本次重建）" en="journal" />}>
 					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
 						{journalRows.map(([zh, en, v]) => (
-							<RuntimeRow key={en} label={<>{zh} <span className="font-mono text-zinc-600">{en}</span></>} value={v === undefined ? "暂无" : String(v)} />
+							<RuntimeRow key={en} label={<>{zh} <span className="font-mono text-foreground-subtlest">{en}</span></>} value={v === undefined ? "暂无" : String(v)} />
 						))}
-						<dt className="text-zinc-500">最近事件</dt>
-						<dd><RelTime at={health ? health.journalTail.lastEnvelopeAt : null} className="text-zinc-200" /></dd>
+						<dt className="text-foreground-subtle">最近事件</dt>
+						<dd><RelTime at={health ? health.journalTail.lastEnvelopeAt : null} className="text-foreground" /></dd>
 					</dl>
 				</Card>
 
@@ -92,8 +92,8 @@ export function RuntimePage() {
 							{health.sessionHeartbeats.map((h) => (
 								<li key={h.sessionId} className="flex items-center gap-2">
 									{h.alive ? <Badge tone="green" title="15 秒内有心跳">在线</Badge> : <Badge tone="gray" title="心跳超时">失联</Badge>}
-									<ShortId value={h.sessionId} className="text-zinc-400" />
-									<RelTime at={h.lastActiveAt} className="ml-auto shrink-0 text-zinc-600" />
+									<ShortId value={h.sessionId} className="text-foreground-subtle" />
+									<RelTime at={h.lastActiveAt} className="ml-auto shrink-0 text-foreground-subtlest" />
 								</li>
 							))}
 						</ul>
@@ -110,8 +110,8 @@ export function RuntimePage() {
 function RuntimeRow({ label, value }: { label: React.ReactNode; value: string }) {
 	return (
 		<>
-			<dt className="text-zinc-500">{label}</dt>
-			<dd className="text-zinc-200">{value}</dd>
+			<dt className="text-foreground-subtle">{label}</dt>
+			<dd className="text-foreground">{value}</dd>
 		</>
 	);
 }
@@ -131,8 +131,8 @@ function PathsCardStatic() {
 			<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
 				{rows.map(([k, v]) => (
 					<span key={k} className="contents">
-						<dt className="text-zinc-500">{k}</dt>
-						<dd className="font-mono break-all text-zinc-300">{v}</dd>
+						<dt className="text-foreground-subtle">{k}</dt>
+						<dd className="font-mono break-all text-foreground-subtle">{v}</dd>
 					</span>
 				))}
 			</dl>

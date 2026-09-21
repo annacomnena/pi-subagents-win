@@ -12,6 +12,7 @@ import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
 import { usePoll } from "./usePoll";
 import { fmtTime } from "./format";
+import { TooltipProvider } from "./ui/tooltip";
 
 // 会话为主重构 S4：TabId 收窄 chat|timeline（默认 chat）；master/workstream/attention/runtime
 // 四状态页收进「运行时」全屏覆盖层（RuntimeOverlay，不占主路由）
@@ -40,27 +41,32 @@ export default function App() {
 	const Page = PAGES[activeTab];
 
 	return (
-		<div className="relative flex h-screen flex-col bg-zinc-950 text-zinc-200">
+		// ZCode 1:1 第 4 步：根壳 token 化（WorkspaceShellLayout 五层骨架）；
+		// TooltipProvider：radix Tooltip 全局 Provider（delayDuration=0 = zcode 默认）
+		<TooltipProvider delayDuration={0}>
+		<div className="relative flex h-screen flex-col bg-background text-foreground">
 			<TopBar />
 			{connection === "down" && (
-				<div className="border-b border-amber-900/60 bg-amber-950/60 px-4 py-1 text-center text-[11px] text-amber-300">
+				<div className="border-b border-warning/30 bg-warning/10 px-4 py-1 text-center text-ui-sm text-warning">
 					与后端服务断开，正在自动重试——以下数据截至 {fmtTime(lastAsOf)}
 				</div>
 			)}
-			<div className="flex min-h-0 flex-1">
+			<div className="flex min-h-0 min-w-[320px] flex-1">
 				<Sidebar />
-				<main className="min-w-0 flex-1 overflow-y-auto p-4">
+				{/* 内容列（WorkspaceShellLayout.tsx#L1638-1642 flex min-w-[320px] flex-1 flex-col） */}
+				<main className="min-w-0 flex-1 overflow-hidden">
 					<Page />
 				</main>
 			</div>
 			{/* 「运行时」全屏覆盖层（null=不渲染；值=打开并定位 section） */}
 			{runtimeOverlay !== null && <RuntimeOverlay />}
 			{lastCommand && (
-				<div className="border-t border-zinc-800 bg-zinc-900 px-4 py-1.5 text-[11px] text-zinc-400">
-					<span className="mr-2 text-zinc-600">回执 {fmtTime(lastCommand.at)}</span>
+				<div className="border-t border-border bg-surface px-4 py-1.5 text-ui-sm text-foreground-subtle">
+					<span className="mr-2 text-foreground-subtlest">回执 {fmtTime(lastCommand.at)}</span>
 					<span className="font-mono">{lastCommand.summary}</span>
 				</div>
 			)}
 		</div>
+		</TooltipProvider>
 	);
 }
