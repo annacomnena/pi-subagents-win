@@ -23,7 +23,8 @@ export function TopBar() {
 	const health = useGui((s) => s.health);
 	const attention = useGui((s) => s.attention);
 	const interactions = useGui((s) => s.interactions);
-	const setActiveTab = useGui((s) => s.setActiveTab);
+	// 会话为主重构 S4：待决策/运行时入口改道「运行时」全屏覆盖层（定位 section），不再切主路由 Tab
+	const setRuntimeOverlay = useGui((s) => s.setRuntimeOverlay);
 	const badge = pendingDecisionBadge(interactions);
 
 	const ownerAlive = health ? health.masterOwnerAlive : null;
@@ -84,14 +85,22 @@ export function TopBar() {
 				)}
 				<button
 					type="button"
-					onClick={() => setActiveTab("attention")}
+					onClick={() => setRuntimeOverlay("attention")}
 					className="flex items-center gap-1.5 text-[11px] text-zinc-400 transition-colors hover:text-zinc-200"
-					title="待决策交互（/v1/interactions 中带 response 的可决项）——点击进入 Attention 页；其他待关注事项仍在 Attention 列表"
+					title="待决策交互（/v1/interactions 中带 response 的可决项）——点击打开运行时覆盖层定位「需要关注」；其他待关注事项仍在同层"
 				>
 					<Term zh="待决策" en="pending decisions" hint="需要你处理的事项（审批即状态：可回放，不靠推送）" />
 					<Badge tone={badge.tone} title={`待决策 ${badge.count} 项${badge.tone === "red" ? "（含严重）" : ""}`}>
 						{badge.count}
 					</Badge>
+				</button>
+				<button
+					type="button"
+					onClick={() => setRuntimeOverlay("runtime")}
+					className="text-[11px] text-zinc-400 transition-colors hover:text-zinc-200"
+					title="运行时全景：服务、信箱、任务、心跳与主控/工作流/需要关注——打开全屏覆盖层"
+				>
+					⚙ <Term zh="运行时" en="runtime" />
 				</button>
 			</span>
 		</header>
