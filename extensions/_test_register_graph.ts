@@ -113,11 +113,13 @@ assert.deepEqual(toolNames, [
 // 2026-09-15 trace-fusion C6 补主会话专属 /trace-fusion-loop，
 // 2026-09-20 补 master slash（attach/cutover/detach/handoff/status/succession/auto-handoff——
 // Phase 5.5 S1/A1/总开关）+ /runtime-host（G2）+ /workstream* /task-*（Phase 5a A7 F18，旧漏项——此前被 tools 断言失败遮挡）：
+// 2026-09-22 补 /gui（G6 L3 GUI 自动拉起，gui-autostart.ts）：
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
 // （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
 assert.deepEqual(commandNames, [
 	"agents",
 	"codex-headers",
+	"gui",
 	"hotspot",
 	"launch",
 	"links",
