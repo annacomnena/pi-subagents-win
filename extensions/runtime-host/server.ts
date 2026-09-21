@@ -85,6 +85,7 @@ import {
 	listPiSessions,
 	projectSession,
 } from "../runtime/transcript.ts";
+import { resolveSessionTitles } from "./session-title.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
 import { buildTimelineItems } from "./timeline.ts";
@@ -355,6 +356,8 @@ export interface RuntimeHostServerOptions {
 	configPath?: string;
 	/** G6-P1：pi sessions 根目录（缺省 defaultSessionsDir()；测试注入隔离）。 */
 	sessionsDir?: string;
+	/** 会话列表标题解析链：tab-runs 台账根目录（缺省 tabRunsDir()＝env PI_TAB_RUNS_DIR 覆盖；测试注入隔离）。 */
+	tabRunsDir?: string;
 	/** G6-P1：WS live tail 轮询间隔 ms（缺省 250；测试注入更快）。 */
 	tailMs?: number;
 	/** G6-P1：WS ping 间隔 ms（缺省 30000）。 */
@@ -546,6 +549,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				case "/v1/sessions": {
 					// G6-P1：pi 会话列表（首行头快读，不全读；startedAt 降序）
 					const sessions = listPiSessions(opts.sessionsDir ?? defaultSessionsDir());
+					// 会话可读标题解析链（P1 台账 → P2 首条 user 剥前缀 → P3 shortId 兜底）；
+					// firstUserText 是解析链副产品，仅服务端内部用，不上线（契约只加 title/titleSource）
+					const titles = resolveSessionTitles(sessions, opts.tabRunsDir);
 					// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——与 executor 护栏同源
 					// （getMasterStatus().attachment.sessionId，护栏二同款读法）投影到列表条目；
 					// GUI 不再拿 health 心跳自猜。POST 真 403 仍是最后防线（护栏在 executor）。
@@ -558,8 +564,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = {
 						version: 1,
 						count: sessions.length,
-						sessions: sessions.map((s) => ({
+						sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => ({
 							...s,
+							...(titles.get(s.sessionId) ?? { title: s.sessionId, titleSource: "id" as const }),
 							...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
 						})),
 						masterProtectedSessionId: protectedSid,
