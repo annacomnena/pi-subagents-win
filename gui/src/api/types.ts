@@ -266,6 +266,34 @@ export interface AttentionResponse {
 	attention: AttentionItem[];
 }
 
+// ── G6-P3：GET /v1/interactions（runtime-host/interactions.ts 手抄）──
+
+/** 可选 response 语义（ZCode option.response 思想）：仅当既有确定性命令可决时给出；UI 只渲染按钮。 */
+export interface InteractionResponse {
+	/** G4 executor 白名单命令（唯一命令入口 POST /v1/commands）。 */
+	command: string;
+	args?: Record<string, unknown>;
+}
+
+/** 待决策交互项 = open attention 条目的直投（kind 沿用 attention 词表；不新增审批类型）。 */
+export interface InteractionItem {
+	id: string;
+	kind: "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked";
+	severity: AttentionSeverity;
+	createdAt: string;
+	title: string;
+	summary: string;
+	payload?: Record<string, unknown>;
+	/** 仅 pending handoff 提案携带（{command:"master.handoff.accept"}）；§29 决策走既有命令。 */
+	response?: InteractionResponse;
+}
+
+export interface InteractionsResponse {
+	version: 1;
+	count: number;
+	interactions: InteractionItem[];
+}
+
 export interface TimelineResponse {
 	version: 1;
 	count: number;

@@ -7,6 +7,18 @@
  *     session.message 两段回执）；seq/epoch/gen 续传语义与 journal 同机（同一物理文件）。
  *   - topic "transcript:<sessionId>"：会话转写投影增量帧 `{type:"event", topic, seq, op}`
  *     （seq=session JSONL 物理行号；op = 5 操作封闭集，与 GET 端点同一投影函数）。
+ *   - topic "interactions"（G6-P3）：待决策交互状态投影帧
+ *     `{type:"event", topic, seq, op:{kind:"state.updated", patch:{interactions:[...]}}}`。
+ *     学 ZCode pendingInteractions：审批单作为**状态**到达——每次订阅即全量重放（重连/新客户端
+ *     天然可回放，不靠内存推送），其后每 tick 重算 `buildInteractions`，内容变化才推下一帧
+ *     （seq = 本连接本主题单调计数，订阅即重置；**无可续传 base**——状态投影无游标语义，
+ *     ack 恒 `{mode:"snapshot", head:null}` 后紧跟 seq=1 全量帧；与 journal/transcript 的
+ *     「snapshot → 不激活 tail」不同：本主题每帧都是全量替换，无 GET→订阅竞态窗口）。
+ *     §29 红线：投影只读，决策仍走既有 POST /v1/commands（handoff.accept 等）。
+ *
+ * client 身份日志（G6-P3 多端附着 v1）：每连接随机短 id（3 字节 hex），运维日志前缀
+ *   `[ws <cid>]`（connected / subscribe / resync / backpressure / ping-timeout / closed），
+ *   多 client 并存时故障可归因。stderr 输出；host detached（stdio ignore）时无副作用。
  *
  * 续传语义（照 ZCode subscribe(base:{logEpoch,seq})，G6-P1 L4 增 gen 判代）：
  *   client `{type:"subscribe", topic, base:{seq, logEpoch, gen?}}` →
@@ -39,13 +51,17 @@
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, Server } from "node:http";
+import { join } from "node:path";
 import type { Duplex } from "node:stream";
+import { buildInteractions } from "./interactions.ts";
 import {
 	readJournalTail,
 	scanJournalSeq,
 	type JournalSeqCursor,
 } from "../runtime/journal-seq.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
+import { defaultRuntimeDir } from "../runtime/journal.ts";
+import { defaultMailboxDir } from "../runtime/mailbox.ts";
 import {
 	createTranscriptProjector,
 	defaultSessionsDir,
@@ -361,6 +377,9 @@ export const OUTBOX_EVENT_TYPES: readonly string[] = ["message.queued", "message
 
 const OUTBOX_TOPIC = "outbox";
 
+/** G6-P3：待决策交互状态投影主题（每帧全量替换，无可续传 base）。 */
+const INTERACTIONS_TOPIC = "interactions";
+
 function envelopeTypesMatch(envelope: unknown, types: readonly string[] | undefined): boolean {
 	if (types === undefined) return true;
 	const t = (envelope as { type?: unknown } | null)?.type;
@@ -390,7 +409,16 @@ interface TranscriptSub {
 	projector: ReturnType<typeof createTranscriptProjector>;
 }
 
-type SubState = JournalSub | TranscriptSub;
+/** G6-P3：交互状态投影订阅（per-connection 独立 lastJson——多 client 互不干扰的隔离单位）。 */
+interface InteractionsSub {
+	kind: "interactions";
+	/** 上次下发的 JSON（变更检测；null = 尚未发过）。 */
+	lastJson: string | null;
+	/** 下一帧 seq（本连接本主题单调；订阅即重置为 2——seq=1 是种子帧）。 */
+	nextSeq: number;
+}
+
+type SubState = JournalSub | TranscriptSub | InteractionsSub;
 
 function parseBase(x: unknown): { seq: number; logEpoch: string; gen?: number } {
 	const b = typeof x === "object" && x !== null ? (x as Record<string, unknown>) : {};
@@ -407,6 +435,10 @@ export interface EventStreamOptions {
 	journalPath?: string;
 	/** pi sessions 根目录（缺省 defaultSessionsDir()）。 */
 	sessionsDir?: string;
+	/** G6-P3：interactions 主题用 state 根（缺省 join(defaultRuntimeDir(), "state")）。 */
+	stateDir?: string;
+	/** G6-P3：interactions 主题用 mailbox 根（缺省 defaultMailboxDir()）。 */
+	mailboxDir?: string;
 	/** live tail 轮询间隔 ms（缺省 250）。 */
 	tailMs?: number;
 	/** 服务端 ping 间隔 ms（缺省 30000；两拍无 pong 断开）。 */
@@ -493,11 +525,25 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, opts:
 			return;
 		}
 
+		// G6-P3：client 身份日志——每连接随机短 id，多 client 并存时故障可归因
+		const cid = randomBytes(3).toString("hex");
+		const log = (msg: string): void => {
+			try {
+				console.error(`[ws ${cid}] ${msg}`);
+			} catch {
+				/* 日志永不炸连接 */
+			}
+		};
+		log("connected");
 		const hub = new StreamHub(opts);
+		hub.logger = log;
 		const conn = new WsConn(socket, {
 			onText: (text) => hub.onClientText(text),
 			onPong: () => hub.onPong(),
-			onClose: () => hub.dispose(),
+			onClose: () => {
+				log("closed");
+				hub.dispose();
+			},
 		});
 		hub.bind(conn);
 		conn.acceptHead(head);
@@ -520,10 +566,20 @@ class StreamHub {
 	private pongSeen = true;
 	private disposed = false;
 	private readonly opts: EventStreamOptions;
+	/** G6-P3：由 handleUpgrade 注入的 `[ws <cid>]` 日志前缀（测试可观察）。 */
+	logger: ((msg: string) => void) | null = null;
 
 	constructor(opts: EventStreamOptions) {
 		this.opts = opts;
 		// conn 在 handleUpgrade 中构造后回填（构造顺序：WsConn 构造即注册 data 监听）
+	}
+
+	private log(msg: string): void {
+		try {
+			this.logger?.(msg);
+		} catch {
+			/* 日志永不炸连接 */
+		}
 	}
 
 	/** 由 handleUpgrade 在 new WsConn 后回填连接。 */
@@ -536,6 +592,7 @@ class StreamHub {
 			if (this.disposed) return;
 			if (!this.pongSeen) {
 				// 两拍无 pong → 判死断开（防僵尸连接堆积）
+				this.log("close 1001 ping-timeout");
 				this.conn?.close(1001, "ping-timeout");
 				this.dispose();
 				return;
@@ -593,6 +650,10 @@ class StreamHub {
 			this.subscribeJournal(topic, base, OUTBOX_EVENT_TYPES);
 			return;
 		}
+		if (topic === INTERACTIONS_TOPIC) {
+			this.subscribeInteractions(topic);
+			return;
+		}
 		if (topic.startsWith("transcript:")) {
 			const sid = topic.slice("transcript:".length);
 			if (sid.length === 0 || /[/\\\s]/.test(sid)) {
@@ -602,7 +663,7 @@ class StreamHub {
 			this.subscribeTranscript(topic, sid, base);
 			return;
 		}
-		this.send({ type: "error", topic, message: "unknown-topic（journal | outbox | transcript:<sessionId>）" });
+		this.send({ type: "error", topic, message: "unknown-topic（journal | outbox | interactions | transcript:<sessionId>）" });
 	}
 
 	private send(frame: StreamTopicFrame): boolean {
@@ -611,6 +672,7 @@ class StreamHub {
 			// socket.write(false) 表示 Node 写缓冲已满；继续 fan-out 会形成无界堆积。
 			// P1 无可靠缓冲，断开后由 seq/epoch resume 安全补发。
 			if (!sent) {
+				this.log("close 1013 backpressure");
 				this.conn?.close(1013, "backpressure");
 				this.dispose();
 			}
@@ -641,13 +703,35 @@ class StreamHub {
 				if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
 			}
 			this.subs.set(topic, { kind: "journal", cursor: { offset: scan.sizeBytes, nextLineNo: scan.head + 1 }, types });
+			this.log(`subscribe ${topic} -> resume (replay to head ${head.seq})`);
 		} else {
 			// 跨代/越界/空 → snapshot：只回指针，且**不**激活 live tail。客户端必须先 GET
 			// 新代全量，再带该 head 重订阅；否则 GET 期间的 live op 能与旧代 UI 行暂时拼接。
 			// 重订阅的 (base, head] 回放补齐 GET 与订阅之间的竞态，故不会漏事件。
 			this.send({ type: "ack", topic, mode: "snapshot", head: scan.exists ? head : null });
+			this.log(`subscribe ${topic} -> snapshot (head ${scan.exists ? head.seq : "null"})`);
 			return;
 		}
+		this.startTail();
+	}
+
+	// ── interactions 订阅（G6-P3：状态投影，学 ZCode pendingInteractions）──────
+
+	/**
+	 * 待决策交互状态投影：订阅即 ack(snapshot, head:null) + seq=1 全量帧，之后每 tick 重算
+	 * `buildInteractions`，内容变化才推下一帧。与 journal/transcript 的「snapshot → 不激活
+	 * tail」刻意不同：本主题每帧都是全量替换（5 操作 state.updated 键级整体替换），不存在
+	 * GET→订阅竞态窗口，直接激活 live 是安全的；重连/新客户端重订阅即重放当前全量（可回放）。
+	 */
+	private subscribeInteractions(topic: string): void {
+		const stateDir = this.opts.stateDir ?? join(defaultRuntimeDir(), "state");
+		const mailboxDir = this.opts.mailboxDir ?? defaultMailboxDir();
+		if (!this.send({ type: "ack", topic, mode: "snapshot", head: null })) return;
+		const items = buildInteractions({ stateDir, mailboxDir });
+		const json = JSON.stringify(items);
+		if (!this.send({ type: "event", topic, seq: 1, op: { kind: "state.updated", patch: { interactions: items } } })) return;
+		this.subs.set(topic, { kind: "interactions", lastJson: json, nextSeq: 2 });
+		this.log("subscribe interactions -> snapshot (full-state seed)");
 		this.startTail();
 	}
 
@@ -701,7 +785,8 @@ class StreamHub {
 		for (const [topic, sub] of this.subs) {
 			try {
 				if (sub.kind === "journal") this.tickJournal(topic, sub);
-				else this.tickTranscript(topic, sub);
+				else if (sub.kind === "transcript") this.tickTranscript(topic, sub);
+				else this.tickInteractions(topic, sub);
 			} catch {
 				// 单订阅故障不炸连接；下一 tick 重试
 			}
@@ -713,6 +798,7 @@ class StreamHub {
 		const r = readJournalTail(journalPath, sub.cursor);
 		if (r.truncated) {
 			this.subs.delete(topic);
+			this.log(`resync ${topic} (journal truncated)`);
 			this.send({ type: "resync", topic, head: null });
 			this.maybeStopTail();
 			return;
@@ -728,6 +814,7 @@ class StreamHub {
 		const r = readSessionTail(sub.file, sub.cursor);
 		if (r.truncated) {
 			this.subs.delete(topic);
+			this.log(`resync ${topic} (session truncated)`);
 			this.send({ type: "resync", topic, head: null });
 			this.maybeStopTail();
 			return;
@@ -738,6 +825,19 @@ class StreamHub {
 				if (!this.send({ type: "event", topic, seq: l.seq, op })) return;
 			}
 		}
+	}
+
+	/** 交互状态投影 tick：重算 → 内容变化才推（每帧全量替换，seq 本连接单调）。 */
+	private tickInteractions(topic: string, sub: InteractionsSub): void {
+		const stateDir = this.opts.stateDir ?? join(defaultRuntimeDir(), "state");
+		const mailboxDir = this.opts.mailboxDir ?? defaultMailboxDir();
+		const items = buildInteractions({ stateDir, mailboxDir });
+		const json = JSON.stringify(items);
+		if (json === sub.lastJson) return;
+		sub.lastJson = json;
+		const seq = sub.nextSeq;
+		sub.nextSeq = seq + 1;
+		if (!this.send({ type: "event", topic, seq, op: { kind: "state.updated", patch: { interactions: items } } })) return;
 	}
 
 	private maybeStopTail(): void {

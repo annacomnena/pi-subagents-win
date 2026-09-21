@@ -16,13 +16,13 @@
  *      （全量 / 空 / 增量触及行终态）；缺失会话 404
  *   T6 双 WS 并发 fan-out：两连接同 topic 均收到 live 帧
  *   T7 帧卫生：坏 JSON / 未知 topic / 非 subscribe → error 帧且连接不断；服务端 ping 到达
+ *   T8 outbox 主题（G6-P2）：journal 过滤投影 + 续传 + 过滤正确性 + gen 判代 + WS 只读红线
+ *   T9 双 client 异 base（G6-P3 多端附着 v1）：各自独立 base 续传互不干扰 + live fan-out 隔离
  *
  * 运行：npm run test:runtime-host-ws
  */
 
 import assert from "node:assert/strict";
-import { connect as netConnect, type Socket } from "node:net";
-import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -35,226 +35,10 @@ import { newEventEnvelope } from "./runtime/envelope.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { appendRuntimeEnvelope } from "./runtime/journal.ts";
 import { applyTranscriptOps, type TranscriptOp, type TranscriptRow } from "./runtime/transcript.ts";
+import { wsHandshake, isAck } from "./_test_ws_client.ts";
 
 const ENV_DIR = process.env.PI_RUNTIME_DIR!;
 const DIRS: string[] = [ENV_DIR, process.env.PI_SESSIONS_DIR!];
-
-// ── 手写最小 WS 测试客户端（零依赖；仅本测试用）────────────────────
-
-interface ServerFrame {
-	opcode: number;
-	payload: Buffer;
-}
-
-class TestWs {
-	socket: Socket;
-	private buf: Buffer = Buffer.alloc(0);
-	private queue: ServerFrame[] = [];
-	private waiters: ((f: ServerFrame | null) => void)[] = [];
-	responseHead: string | null = null;
-	headers: Map<string, string> = new Map();
-	closed = false;
-
-	private constructor(socket: Socket) {
-		this.socket = socket;
-		socket.on("data", (chunk: Buffer) => this.onData(chunk));
-		socket.on("close", () => {
-			this.closed = true;
-			this.notify();
-		});
-		socket.on("error", () => {
-			/* 测试客户端忽略（close 跟进） */
-		});
-	}
-
-	private onData(chunk: Buffer): void {
-		if (this.responseHead === null) {
-			const idx = chunk.indexOf("\r\n\r\n");
-			if (idx < 0) {
-				this.headPartial = (this.headPartial ?? Buffer.alloc(0)).length > 0 ? Buffer.concat([this.headPartial!, chunk]) : chunk;
-				return;
-			}
-			const headPart = this.headPartial && this.headPartial.length > 0 ? Buffer.concat([this.headPartial, chunk.subarray(0, idx)]) : chunk.subarray(0, idx);
-			this.headPartial = Buffer.alloc(0);
-			this.responseHead = headPart.toString("utf8");
-			for (const line of this.responseHead.split("\r\n").slice(1)) {
-				const c = line.indexOf(":");
-				if (c > 0) this.headers.set(line.slice(0, c).trim().toLowerCase(), line.slice(c + 1).trim());
-			}
-			this.onData(chunk.subarray(idx + 4));
-			return;
-		}
-		this.buf = Buffer.concat([this.buf, chunk]);
-		for (;;) {
-			if (this.buf.length < 2) break;
-			const opcode = this.buf[0] & 0x0f;
-			const masked = (this.buf[1] & 0x80) !== 0;
-			let len = this.buf[1] & 0x7f;
-			let offset = 2;
-			if (len === 126) {
-				if (this.buf.length < 4) break;
-				len = this.buf.readUInt16BE(2);
-				offset = 4;
-			} else if (len === 127) {
-				if (this.buf.length < 10) break;
-				len = Number(this.buf.readBigUInt64BE(2));
-				offset = 10;
-			}
-			if (masked) offset += 4; // 服务端帧不应带掩码；测试客户端不实现
-			if (this.buf.length < offset + len) break;
-			this.queue.push({ opcode, payload: Buffer.from(this.buf.subarray(offset, offset + len)) });
-			this.buf = this.buf.subarray(offset + len);
-		}
-		this.notify();
-	}
-
-	private headPartial: Buffer | null = null;
-
-	/** 仅唤醒所有 recv（帧不直接递给 waiter——由 recv 自行重查 queue，防丢帧/乱序）。 */
-	private notify(): void {
-		const waiters = this.waiters;
-		this.waiters = [];
-		for (const w of waiters) w();
-	}
-
-	/** 等下一帧（opcode 过滤可选；非匹配帧保留在队首，序不乱）；超时/连接关闭 → null。 */
-	async recv(timeoutMs = 3000, opcode?: number): Promise<ServerFrame | null> {
-		const deadline = Date.now() + timeoutMs;
-		for (;;) {
-			const idx = opcode === undefined ? 0 : this.queue.findIndex((f) => f.opcode === opcode);
-			if (idx >= 0) {
-				const [f] = this.queue.splice(idx, 1);
-				return f;
-			}
-			if (this.closed) return null;
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) return null;
-			await new Promise<void>((r) => {
-				this.waiters.push(r);
-				setTimeout(() => {
-					const i = this.waiters.indexOf(r);
-					if (i >= 0) {
-						this.waiters.splice(i, 1);
-						r();
-					}
-				}, remaining);
-			});
-		}
-	}
-
-	/** 等下一条 JSON 文本帧；跳过 ping。 */
-	async recvJson(timeoutMs = 3000): Promise<unknown | null> {
-		for (;;) {
-			const f = await this.recv(timeoutMs, 0x1);
-			if (f === null) return null;
-			try {
-				return JSON.parse(f.payload.toString("utf8"));
-			} catch {
-				continue;
-			}
-		}
-	}
-
-	sendText(text: string): void {
-		this.socket.write(clientFrame(0x1, Buffer.from(text, "utf8")));
-	}
-
-	sendPong(payload: Buffer): void {
-		this.socket.write(clientFrame(0xa, payload));
-	}
-
-	destroy(): void {
-		try {
-			this.socket.destroy();
-		} catch {
-			/* ignore */
-		}
-	}
-}
-
-function clientFrame(opcode: number, payload: Buffer): Buffer {
-	const mask = randomBytes(4);
-	const masked = Buffer.from(payload);
-	for (let i = 0; i < masked.length; i += 1) masked[i] ^= mask[i % 4];
-	let header: Buffer;
-	if (payload.length < 126) {
-		header = Buffer.from([0x80 | opcode, 0x80 | payload.length]);
-	} else if (payload.length < 65536) {
-		header = Buffer.alloc(4);
-		header[0] = 0x80 | opcode;
-		header[1] = 0x80 | 126;
-		header.writeUInt16BE(payload.length, 2);
-	} else {
-		header = Buffer.alloc(10);
-		header[0] = 0x80 | opcode;
-		header[1] = 0x80 | 127;
-		header.writeBigUInt64BE(BigInt(payload.length), 2);
-	}
-	return Buffer.concat([header, mask, masked]);
-}
-
-interface HandshakeResult {
-	ok: boolean;
-	statusLine: string;
-	ws: TestWs | null;
-}
-
-/** 发起 WS 握手：101 → ok+TestWs；其它状态码 → ok:false（响应头可断言）。 */
-function wsHandshake(port: number, path: string, extraHeaders: string[] = [], timeoutMs = 3000): Promise<HandshakeResult> {
-	return new Promise((resolve) => {
-		const socket = netConnect(port, "127.0.0.1");
-		let settled = false;
-		let head = Buffer.alloc(0);
-		const finish = (r: HandshakeResult): void => {
-			if (settled) return;
-			settled = true;
-			resolve(r);
-		};
-		const ws = new TestWs(socket);
-		const onResponse = (): void => {
-			const statusLine = (ws.responseHead ?? "").split("\r\n")[0] ?? "";
-			if (statusLine.includes(" 101")) {
-				finish({ ok: true, statusLine, ws });
-			} else {
-				socket.destroy();
-				finish({ ok: false, statusLine, ws: null });
-			}
-		};
-		// 复用 TestWs 的头部收集：轮询 responseHead
-		const poll = setInterval(() => {
-			if (ws.responseHead !== null) {
-				clearInterval(poll);
-				onResponse();
-			}
-		}, 5);
-		socket.on("close", () => {
-			clearInterval(poll);
-			if (!settled) finish({ ok: false, statusLine: ws.responseHead ?? "", ws: null });
-		});
-		socket.on("connect", () => {
-			const key = randomBytes(16).toString("base64");
-			const req = [
-				`GET ${path} HTTP/1.1`,
-				"Host: 127.0.0.1",
-				"Upgrade: websocket",
-				"Connection: Upgrade",
-				`Sec-WebSocket-Key: ${key}`,
-				"Sec-WebSocket-Version: 13",
-				...extraHeaders,
-				"",
-				"",
-			].join("\r\n");
-			socket.write(req);
-		});
-		setTimeout(() => {
-			clearInterval(poll);
-			if (!settled) {
-				socket.destroy();
-				finish({ ok: false, statusLine: ws.responseHead ?? "", ws: null });
-			}
-		}, timeoutMs);
-	});
-}
 
 // ── 夹具 ─────────────────────────────────────────────────────────
 
@@ -309,10 +93,6 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<boolean> 
 		await new Promise((r) => setTimeout(r, 20));
 	}
 	return pred();
-}
-
-function isAck(f: unknown): f is { type: "ack"; topic: string; mode: string; head: { logEpoch: string; seq: number } | null } {
-	return typeof f === "object" && f !== null && (f as any).type === "ack";
 }
 
 function isEvent(f: unknown): f is { type: "event"; topic: string; seq: number; envelope?: any; op?: TranscriptOp } {
@@ -743,6 +523,85 @@ try {
 			assert.equal(dirCount(join(stateDir, "commands")), commandsBefore, "commands 盘面零变化（未占幂等键）");
 			assert.equal(dirCount(join(stateDir, "message-outbox")), outboxBefore, "outbox 盘面零变化");
 		}
+	}
+
+	// ── T9 双 client 异 base 续传隔离（G6-P3 多端附着 v1）：同一端点多 client 订阅互不干扰 ──
+	{
+		// 种基准：记录当前 journal 头（前序块已写入若干条）
+		const lines0 = readFileSync(journalPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+		const epoch9 = (JSON.parse(lines0[0]!) as { id: string }).id;
+		const head9 = lines0.length;
+		const mk = (n: number) =>
+			newEventEnvelope({ type: "test.tick", source: masterAddress(), payload: { n }, at: new Date(Date.parse("2026-09-22T12:00:00Z") + n * 1000).toISOString() });
+
+		// 预置两条（seq head9+1 / head9+2）：client A 从头补发、client B 从 head9+2 起
+		const a1 = mk(1);
+		const a2 = mk(2);
+		appendRuntimeEnvelope(a1, journalPath);
+		appendRuntimeEnvelope(a2, journalPath);
+
+		const cA = await wsHandshake(handle.info.port, wsPath(token!));
+		const cB = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(cA.ok && cB.ok);
+		// A：base 空 = 全量重放（基线：同一连接内 base 独立）；B：base = head9 → 只补 head9 之后的增量
+		cA.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "journal", base: {} }));
+		const ackA = await cA.ws!.recvJson();
+		assert.ok(isAck(ackA) && (ackA as any).mode === "resume");
+		// 排干 A 的全量重放（应恰为 head9+2 条）
+		const replayA: number[] = [];
+		for (;;) {
+			const f = await cA.ws!.recvJson(500);
+			if (f === null) break;
+			if (isEvent(f)) replayA.push((f as any).seq);
+		}
+		assert.equal(replayA.length, head9 + 2, "A 全量重放条数 = 当前头");
+		assert.deepEqual(replayA, Array.from({ length: head9 + 2 }, (_, i) => i + 1), "A 重放 seq 连续不重不漏");
+
+		cB.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "journal", base: { seq: head9, logEpoch: epoch9 } }));
+		const ackB = await cB.ws!.recvJson();
+		assert.ok(isAck(ackB) && (ackB as any).mode === "resume", "B 同代续传 resume");
+		const b1 = await cB.ws!.recvJson();
+		const b2 = await cB.ws!.recvJson();
+		assert.ok(isEvent(b1) && (b1 as any).seq === head9 + 1, "B 只补 base 之后的（不重：无 1..head9）");
+		assert.ok(isEvent(b2) && (b2 as any).seq === head9 + 2);
+		await (async () => { const q = await cB.ws!.recvJson(300); assert.equal(q, null, "B 补发精确止于 head"); })();
+
+		// C 的非法 base 只令 C snapshot/resync，不改 A/B 各自已激活 cursor。
+		const cR = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(cR.ok);
+		cR.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "journal", base: { seq: head9 + 99, logEpoch: epoch9 } }));
+		const ackR = await cR.ws!.recvJson();
+		assert.ok(isAck(ackR) && (ackR as any).mode === "snapshot", "C 越界 base 独立进入 snapshot");
+		cR.ws!.destroy();
+
+		// live 追加一条 → 两个 cursor 独立推进，fan-out 各得一份同 seq 帧；C 的 resync 不影响它们
+		const a3 = mk(3);
+		appendRuntimeEnvelope(a3, journalPath);
+		const la = await cA.ws!.recvJson();
+		const lb = await cB.ws!.recvJson();
+		assert.ok(isEvent(la) && (la as any).seq === head9 + 3, "A live 帧到达");
+		assert.ok(isEvent(lb) && (lb as any).seq === head9 + 3, "B live 帧到达（cursor 独立）");
+		assert.equal((la as any).envelope.id, (lb as any).envelope.id, "fan-out 同一事件两连接各一份");
+
+		// 一端断开不影响另一端（互不干扰）：B 断开 → 再追加 → A 仍收到
+		cB.ws!.destroy();
+		const a4 = mk(4);
+		appendRuntimeEnvelope(a4, journalPath);
+		const la2 = await cA.ws!.recvJson();
+		assert.ok(isEvent(la2) && (la2 as any).seq === head9 + 4, "B 断开后 A 仍独立收到 live 帧");
+		cA.ws!.destroy();
+
+		// 重连续传游标也各自独立：新 client C 从 A 断开处续传 → 只补 a4
+		const cC = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.ok(cC.ok);
+		cC.ws!.sendText(JSON.stringify({ type: "subscribe", topic: "journal", base: { seq: head9 + 3, logEpoch: epoch9 } }));
+		const ackC = await cC.ws!.recvJson();
+		assert.ok(isAck(ackC) && (ackC as any).mode === "resume");
+		const r1 = await cC.ws!.recvJson();
+		assert.ok(isEvent(r1) && (r1 as any).seq === head9 + 4 && (r1 as any).envelope.id === a4.id, "C 从自己 base 精确补发");
+		const qc = await cC.ws!.recvJson(300);
+		assert.equal(qc, null, "C 补发精确止于 head");
+		cC.ws!.destroy();
 	}
 
 	console.log("_test_runtime_host_ws: all assertions passed");

@@ -92,6 +92,8 @@
     "test:runtime-ws-rfc": "node --experimental-strip-types ./extensions/_test_runtime_ws_rfc.ts",
     "test:runtime-token-hygiene": "node --experimental-strip-types ./extensions/_test_runtime_token_hygiene.ts",
     "test:runtime-host-projections": "node --experimental-strip-types ./extensions/_test_runtime_host_projections.ts",
+    "test:runtime-interactions": "node --experimental-strip-types ./extensions/_test_runtime_interactions.ts",
+    "test:gui-interaction-badge": "node --experimental-strip-types ./gui/src/_test_interaction_badge.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",
     "test:mailbox-command-consume": "node --experimental-strip-types ./extensions/_test_mailbox_command_consume.ts",

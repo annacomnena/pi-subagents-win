@@ -1,12 +1,14 @@
 /**
- * Attention 页（G5.1 人话化）：三源待关注列表（severity 色带 + 类型 + 摘要）。
- * actions 恒缺省 → GUI 按 type 自造按钮：master-handoff 待处理 → 接受提案。
+ * Attention 页（G5.1 人话化 + G6-P3 交互投影升级）：三源待关注列表（severity 色带 + 类型 + 摘要）。
+ * actions 恒缺省 → 按钮由交互投影（/v1/interactions）的 response 语义驱动（pendingInteractions
+ * 思想：UI 只渲染按钮，不解释语义）；无投影命中的条目不自造按钮（§29 决策走既有命令）。
  */
 
 import { useEffect, useState } from "react";
 import { acceptHandoff, useGui } from "../store";
+import { pendingDecisionBadge } from "../interactionBadge";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
-import type { AttentionItem, AttentionSeverity } from "../api/types";
+import type { AttentionItem, AttentionSeverity, InteractionResponse } from "../api/types";
 
 const SEV_BAND: Record<AttentionSeverity, string> = {
 	critical: "border-l-red-600",
@@ -37,9 +39,10 @@ function typeBadge(a: AttentionItem) {
 	}
 }
 
-function AttentionCard({ item }: { item: AttentionItem }) {
-	const proposalStatus = typeof item.payload?.status === "string" ? (item.payload.status as string) : undefined;
-	const canAccept = item.type === "master-handoff" && proposalStatus === "pending";
+function AttentionCard({ item, response }: { item: AttentionItem; response?: InteractionResponse }) {
+	// G6-P3：按钮 = 投影 response 语义直渲染（仅 master.handoff.accept 一个既有确定性命令可决；
+	// 无 response 的待决策项 v1 不自造按钮，防范围蔓延——plan §3 拍板）
+	const canAccept = response?.command === "master.handoff.accept";
 	return (
 		<li className={`rounded border border-zinc-800 border-l-4 bg-zinc-900/60 px-3 py-2 ${SEV_BAND[item.severity]}`} title={`级别：${SEV_ZH[item.severity]}`}>
 			<div className="flex flex-wrap items-center gap-2">
@@ -66,10 +69,12 @@ function AttentionCard({ item }: { item: AttentionItem }) {
 
 export function AttentionPage() {
 	const attention = useGui((s) => s.attention);
+	const interactions = useGui((s) => s.interactions);
 	const includeResolved = useGui((s) => s.attentionIncludeResolved);
 	const setIncludeResolved = useGui((s) => s.setAttentionIncludeResolved);
 	const pollAttention = useGui((s) => s.pollAttention);
 	const [busy, setBusy] = useState(false);
+	const badge = pendingDecisionBadge(interactions);
 
 	// 切 resolved 视图立即补一拍（不等下一轮 2s）
 	useEffect(() => {
@@ -85,13 +90,20 @@ export function AttentionPage() {
 				<Toggle on={includeResolved} onChange={setIncludeResolved} labels={["隐藏", "显示"]} />
 				<span className="ml-auto text-[10px] text-zinc-600">/v1/attention{includeResolved ? "?includeResolved=1" : ""} · 2s</span>
 			</div>
-			<Card title={<Term zh={`需要关注（${attention.length}${busy ? " · 刷新中" : ""}）`} en="Attention" />}>
+			<Card
+				title={<Term zh={`需要关注（${attention.length}${busy ? " · 刷新中" : ""}）`} en="Attention" />}
+				right={
+					<Badge tone={badge.tone} title={`待决策交互（/v1/interactions）${badge.count} 项——已处理条目不计入`}>
+						待决策 {badge.count}
+					</Badge>
+				}
+			>
 				{attention.length === 0 ? (
 					<EmptyState>{includeResolved ? "暂无条目（历史也是空的）" : "暂无待关注"}</EmptyState>
 				) : (
 					<ul className="space-y-2">
 						{attention.map((a) => (
-							<AttentionCard key={a.id} item={a} />
+							<AttentionCard key={a.id} item={a} response={interactions.find((i) => i.id === a.id)?.response} />
 						))}
 					</ul>
 				)}

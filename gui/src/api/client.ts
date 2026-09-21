@@ -12,6 +12,7 @@ import type {
 	CommandOutcomeBody,
 	EventsResponse,
 	HealthView,
+	InteractionsResponse,
 	RuntimeSnapshot,
 	SessionsBody,
 	TimelineResponse,
@@ -99,6 +100,9 @@ export const api = {
 
 	attention: (includeResolved: boolean): Promise<FetchResult<AttentionResponse>> =>
 		fetchJson<AttentionResponse>(`/v1/attention${includeResolved ? "?includeResolved=1" : ""}`),
+
+	/** G6-P3：待决策交互投影（pendingInteractions 思想；open attention 直投 + response 语义）。 */
+	interactions: (): Promise<FetchResult<InteractionsResponse>> => fetchJson<InteractionsResponse>("/v1/interactions"),
 
 	/** limit 尾窗 + G5.2 before=（排他上界历史翻页；undefined/空串 = 不启用）。 */
 	timeline: (limit = 200, before?: string): Promise<FetchResult<TimelineResponse>> =>

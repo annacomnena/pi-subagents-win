@@ -1,11 +1,11 @@
 /**
- * Master 页（G5.1 人话化 + G5.2 接真数据）：主控身份/当前值守会话/接班代数/交接提案/接管总开关/信箱 +
- * 上下文压力（优先 liveness 实时心跳值 + as-of，无心跳回退提案时点值）+ 最近交接时间线 +
- * 接受提案/自动交接开关（读 snapshot 真实态）。Prepare 启用（两步确认，确定性提案路径）。
+ * Master 页（G5.1 人话化 + G5.2 接真数据 + G6-P3 proposal 卡直连交互投影）：主控身份/当前值守会话/
+ * 接班代数/交接提案/接管总开关/信箱 + 上下文压力（优先 liveness 实时心跳值 + as-of，无心跳回退
+ * 提案时点值）+ 最近交接时间线 + 接受提案/自动交接开关（读 snapshot 真实态）。Prepare 启用
+ * （两步确认，确定性提案路径）。既有按钮并存不冲突：接受提案的可用性由投影 response 语义驱动。
  */
 
 import { useRef, useState } from "react";
-import { latestHandoffAttention } from "./TopBar";
 import { acceptHandoff, prepareHandoff, setAutoHandoff, useGui } from "../store";
 import { PROPOSAL_STATUS_ZH, fmtPressurePct, pressurePct, zhStatus } from "../format";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, Toggle, Tooltip, naBadge } from "../ui";
@@ -30,7 +30,7 @@ function statusTone(status: string | undefined): "yellow" | "blue" | "red" | "gr
 export function MasterPage() {
 	const health = useGui((s) => s.health);
 	const snapshot = useGui((s) => s.snapshot);
-	const attention = useGui((s) => s.attention);
+	const interactions = useGui((s) => s.interactions);
 	const timeline = useGui((s) => s.timeline);
 	const autoHandoff = useGui((s) => s.autoHandoff);
 
@@ -51,9 +51,11 @@ export function MasterPage() {
 
 	const master = snapshot?.master ?? null;
 	const att = health?.master.attachment ?? master?.attachment ?? null;
-	const proposal = latestHandoffAttention(attention);
+	// G6-P3：proposal 卡只读 interactions 投影；不以 attention payload 在客户端猜测 pending 状态。
+	const proposal = interactions.find((i) => i.kind === "master-handoff") ?? null;
 	const pStatus = typeof proposal?.payload?.status === "string" ? (proposal.payload.status as string) : undefined;
-	const pending = pStatus === "pending";
+	// 按钮可用性只来自服务端 response 语义；决策仍由 acceptHandoff POST /v1/commands。
+	const pending = proposal?.response?.command === "master.handoff.accept";
 	const backlogPending = master?.backlog.reduce((n, b) => n + b.pending, 0) ?? 0;
 	// G5.2：压力显示——优先 liveness 活值（含 as-of），无心跳/无有效读数回退提案时点值
 	const live = master?.liveness ?? null;

@@ -1,8 +1,11 @@
-/** 顶栏（G5.1 人话化 + G5.2 接真数据）：服务●绿点=在线/灰点=离线；上下文压力=优先 liveness 实时心跳值（as-of），无心跳回退最近提案时点值。 */
+/** 顶栏（G5.1 人话化 + G5.2 接真数据 + G6-P3 待决策徽标）：服务●绿点=在线/灰点=离线；
+ *  上下文压力=优先 liveness 实时心跳值（as-of），无心跳回退最近提案时点值；
+ *  待决策徽标=交互投影 /v1/interactions 数量（pendingDecisionBadge 纯函数映射；点击进 Attention 页）。 */
 
 import { useGui } from "../store";
+import { pendingDecisionBadge } from "../interactionBadge";
 import { fmtPressurePct, fmtRel, fmtTime, pressurePct } from "../format";
-import { Term } from "../ui";
+import { Badge, Term } from "../ui";
 import type { AttentionItem } from "../api/types";
 
 function asString(v: unknown): string | undefined {
@@ -19,6 +22,9 @@ export function latestHandoffAttention(items: AttentionItem[]): AttentionItem | 
 export function TopBar() {
 	const health = useGui((s) => s.health);
 	const attention = useGui((s) => s.attention);
+	const interactions = useGui((s) => s.interactions);
+	const setActiveTab = useGui((s) => s.setActiveTab);
+	const badge = pendingDecisionBadge(interactions);
 
 	const ownerAlive = health ? health.masterOwnerAlive : null;
 	const dot =
@@ -76,6 +82,17 @@ export function TopBar() {
 						<span className="font-mono" title="mailboxPending（未领信件数）">信箱 {health.mailboxPending}</span>
 					</>
 				)}
+				<button
+					type="button"
+					onClick={() => setActiveTab("attention")}
+					className="flex items-center gap-1.5 text-[11px] text-zinc-400 transition-colors hover:text-zinc-200"
+					title="待决策交互（/v1/interactions 中带 response 的可决项）——点击进入 Attention 页；其他待关注事项仍在 Attention 列表"
+				>
+					<Term zh="待决策" en="pending decisions" hint="需要你处理的事项（审批即状态：可回放，不靠推送）" />
+					<Badge tone={badge.tone} title={`待决策 ${badge.count} 项${badge.tone === "red" ? "（含严重）" : ""}`}>
+						{badge.count}
+					</Badge>
+				</button>
 			</span>
 		</header>
 	);

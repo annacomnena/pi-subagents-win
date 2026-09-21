@@ -19,6 +19,10 @@
  *     改走 /v1/snapshot 重建状态 + after=0）；幂等责任在消费端（envelope 自带 id+dedupeKey）。
  *   - `GET /v1/attention?includeResolved=<opt>`（G3）状态聚合投影：`buildAttentionItems`
  *     （attention.ts 纯函数；同源双条 source key 最新胜出；resolved 默认过滤，拍板①）。
+ *   - `GET /v1/interactions`（G6-P3）：待决策交互投影（pendingInteractions 思想）——open
+ *     attention 1:1 直投 + 可选 response 语义（仅 pending handoff 提案 → master.handoff.accept；
+ *     interactions.ts 纯函数，不新增真相；§29 决策仍走既有 POST /v1/commands）。
+ *     WS 对应主题 "interactions"（状态投影帧，ws.ts）。
  *   - `GET /v1/timeline?limit=<opt>`（G3）journal 全事件 + 状态条目 + 溯源 enrichment
  *     （timeline.ts 纯函数；at 升序尾部 N 条，默认 200，拍板②）。
  *     与 /v1/events 分工正交（G2 research ④）：events = 低延迟增量，attention/timeline = 首屏全量 + 轮询。
@@ -53,6 +57,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAttentionItems } from "./attention.ts";
+import { buildInteractions } from "./interactions.ts";
 import {
 	PROTOCOL_VERSION,
 	classifyHost,
@@ -518,6 +523,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, count: att.length, attention: att };
 					break;
 				}
+				case "/v1/interactions": {
+					// G6-P3：待决策交互投影（只读纯函数重算既有 state；§29 决策走 POST /v1/commands）
+					const ix = buildInteractions({ stateDir: opts.stateDir, mailboxDir: opts.mailboxDir });
+					body = { version: 1, count: ix.length, interactions: ix };
+					break;
+				}
 				case "/v1/timeline": {
 					// G3（拍板②）+ G5.2：limit（默认 200，at 升序尾部 N 条）+ before=（历史翻页排他上界）
 					const q = u.searchParams;
@@ -560,7 +571,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
-						throw new HttpError(404, { error: "not-found", hint: `端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）` });
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）` });
 					}
 					const sessionId = decodeURIComponent(mt[1]);
 					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
@@ -600,10 +611,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	return new Promise((resolvePromise, reject) => {
 		const server = createServer(onReq);
 		// G6-P1：唯一 WS 升级路径 /v1/events/stream（幂等挂载；HTTP 路由零变化）
+		// G6-P3：stateDir/mailboxDir 透传——interactions 主题与 GET 端点同源（测试注入隔离一致）
 		attachEventStream(server, {
 			token: hostToken,
 			journalPath: opts.journalPath,
 			sessionsDir: opts.sessionsDir,
+			stateDir: opts.stateDir,
+			mailboxDir: opts.mailboxDir,
 			tailMs: opts.tailMs,
 			pingMs: opts.pingMs,
 		});

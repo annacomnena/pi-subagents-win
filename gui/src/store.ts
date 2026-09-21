@@ -15,6 +15,7 @@ import type {
 	ChatOutboxEntry,
 	CommandOutcomeBody,
 	HealthView,
+	InteractionItem,
 	OutboxEventPayload,
 	RuntimeEnvelope,
 	RuntimeSnapshot,
@@ -143,6 +144,8 @@ interface GuiState {
 	attention: AttentionItem[];
 	attentionIncludeResolved: boolean;
 	setAttentionIncludeResolved: (v: boolean) => void;
+	/** G6-P3：待决策交互投影（/v1/interactions；TopBar 徽标 + Master 卡 + Attention 页 response 驱动）。 */
+	interactions: InteractionItem[];
 	nextCursor: string;
 
 	// 命令面
@@ -156,6 +159,7 @@ interface GuiState {
 	pollSnapshot: () => Promise<void>;
 	pollEvents: () => Promise<void>;
 	pollAttention: () => Promise<void>;
+	pollInteractions: () => Promise<void>;
 	pollTimeline: () => Promise<void>;
 	/** G5.2：before= 历史翻页（加载更早；幂等可重按，end 后 no-op）。 */
 	loadEarlierTimeline: () => Promise<void>;
@@ -230,6 +234,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	attention: [],
 	attentionIncludeResolved: false,
 	setAttentionIncludeResolved: (v) => set({ attentionIncludeResolved: v }),
+	interactions: [],
 	nextCursor: "0",
 
 	autoHandoff: null,
@@ -304,6 +309,17 @@ export const useGui = create<GuiState>((set, get) => ({
 		const r = await api.attention(get().attentionIncludeResolved);
 		if (r.ok) {
 			set({ attention: r.data.attention });
+			get().markUp(r.at);
+		} else {
+			get().markDown(r.at);
+		}
+	},
+
+	/** G6-P3：待决策交互投影（2s 轮询；失败保留旧数据，同 never-throw 纪律）。 */
+	pollInteractions: async () => {
+		const r = await api.interactions();
+		if (r.ok) {
+			set({ interactions: r.data.interactions });
 			get().markUp(r.at);
 		} else {
 			get().markDown(r.at);
