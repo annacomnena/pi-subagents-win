@@ -1,16 +1,17 @@
 /**
  * gui/src/pages/SessionList.tsx — 左栏常驻会话列表（会话为主重构 S3；ZCode TaskListItem 三段式样板）。
  *
- * 列表项 = [16px 状态槽] + [标题行：ShortId + 盾标] / [元信息行：basename(cwd) · mtime 相对时间]。
+ * 列表项 = [16px 状态槽] + [标题行：title（可读标题；titleSource=id 时灰显 shortId）+ 盾标] / [元信息行：basename(cwd) · mtime 相对时间]。
  * 状态槽数据源（诚实映射，不伪造）：error = 该会话 outbox failed/expired/rejected（红点）；
  * masterProtected = 标题行盾标（非槽位）；「运行中/未读」无数据源 v1 留空。
- * 排序 mtimeMs desc + 顶部文本过滤（ID / 文件 / cwd 子串）；选中态 = bg-selected 纯背景圆角行。
+ * 排序 mtimeMs desc + 顶部文本过滤（标题 / shortId / 文件 / cwd 子串，matchesSessionFilter）；选中态 = bg-selected 纯背景圆角行。
  */
 
 import { useMemo, useState } from "react";
 import { useGui } from "../store";
 import { EmptyState, RelTime, ShortId, Term } from "../ui";
 import type { SessionSummary } from "../api/types";
+import { matchesSessionFilter } from "../sessionFilter";
 
 function basename(p: string | null): string {
 	if (p === null) return "";
@@ -40,11 +41,7 @@ export function SessionList() {
 
 	const sessions = useMemo(() => {
 		const sorted = [...chatSessions].sort((a, b) => b.mtimeMs - a.mtimeMs);
-		const q = filter.trim().toLowerCase();
-		if (q.length === 0) return sorted;
-		return sorted.filter(
-			(s) => s.sessionId.toLowerCase().includes(q) || s.file.toLowerCase().includes(q) || (s.cwd !== null && s.cwd.toLowerCase().includes(q)),
-		);
+		return sorted.filter((s) => matchesSessionFilter(s, filter));
 	}, [chatSessions, filter]);
 
 	return (
@@ -58,7 +55,7 @@ export function SessionList() {
 			<input
 				value={filter}
 				onChange={(e) => setFilter(e.target.value)}
-				placeholder="过滤会话（ID / 路径）"
+				placeholder="过滤会话（标题 / ID / 路径）"
 				className="shrink-0 rounded border border-zinc-700 bg-background px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
 			/>
 			<ul className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
@@ -82,9 +79,18 @@ export function SessionList() {
 										{hasError && <span className="h-2 w-2 rounded-full bg-destructive" title="该会话有发送失败/过期/被拒的消息" />}
 									</span>
 									<span className="min-w-0 flex-1">
-										{/* 标题行：ShortId + masterProtected 盾标（非槽位） */}
-										<span className="flex items-center justify-between gap-1">
-											<ShortId value={s.sessionId} />
+										{/* 标题行：可读 title（解析链 ledger|first-user）；titleSource=id 或旧 server 无 title → 灰显 shortId */}
+										<span className="flex min-w-0 items-center justify-between gap-1">
+											{s.title !== undefined && s.titleSource !== "id" ? (
+												<span className="min-w-0 flex-1 truncate text-zinc-200" title={s.title}>
+													{s.title}
+												</span>
+											) : (
+												<ShortId
+													value={s.sessionId}
+													className={s.titleSource === "id" ? "text-zinc-600" : undefined}
+												/>
+											)}
 											{s.masterProtected === true && (
 												<span className="shrink-0 text-[10px]" title="Master 会话拒绝远程输入（executor 层 403 护栏）">
 													🛡

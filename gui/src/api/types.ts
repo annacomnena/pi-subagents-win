@@ -341,6 +341,10 @@ export interface SessionSummary {
 	mtimeMs: number;
 	/** 服务端权威：该会话是当前 master attachment 会话（POST 会 403 master-session-protected）。 */
 	masterProtected?: true;
+	/** 列表标题（服务端解析链产物；缺省 = 旧 server，GUI 回退 shortId）。 */
+	title?: string;
+	/** 标题来源：ledger 台账 | first-user 首条用户消息剥前缀 | id 会话 id 兜底（GUI 灰显 shortId）。 */
+	titleSource?: "ledger" | "first-user" | "id";
 }
 
 export interface SessionsBody {

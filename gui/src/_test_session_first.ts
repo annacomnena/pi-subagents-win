@@ -8,6 +8,8 @@
  *   F2 合法值切换：setActiveTab("timeline"/"chat") 双向生效
  *   F3 runtimeOverlay：attention/master/workstream/runtime 四 section 值打开并保持定位；
  *      setRuntimeOverlay(null) 关闭复位
+ *   F4 会话列表过滤谓词（session-title L3）：空查询全匹配；shortId/全量 ID/文件/cwd/title
+ *      子串匹配；大小写不敏感；无命中 false（matchesSessionFilter，JSX-free 纯函数）
  *
  * pollChatSessions 行为回归（never-throw / 失败保留旧数据 / masterProtected flag）由
  * test:gui-chat-guard 覆盖，此处不重复。
@@ -22,6 +24,8 @@ import { register } from "node:module";
 register("../../extensions/_gui_store_ts_loader.mjs", import.meta.url);
 
 const { useGui } = await import("./store.ts");
+const { matchesSessionFilter } = await import("./sessionFilter.ts");
+import type { SessionSummary } from "./api/types.ts";
 
 let n = 0;
 const ok = (name: string): void => {
@@ -53,5 +57,28 @@ ok("F3a runtimeOverlay 四 section 值均可打开并保持定位（attention/ma
 useGui.getState().setRuntimeOverlay(null);
 assert.equal(useGui.getState().runtimeOverlay, null);
 ok("F3b setRuntimeOverlay(null) 关闭覆盖层");
+
+// ── F4 会话列表过滤谓词（会话可读标题 L3：title + shortId 匹配）──────
+const fixture: SessionSummary = {
+	sessionId: "a1b2c3d4e5f6789012345678",
+	cwd: "C:/work/GreenCAD",
+	startedAt: null,
+	parentSession: null,
+	file: "C:/pi/sessions/0922_a1b2c3d4e5f6789012345678.jsonl",
+	sizeBytes: 1024,
+	mtimeMs: 1,
+};
+assert.equal(matchesSessionFilter(fixture, ""), true);
+ok("F4a 空查询 → 全匹配");
+assert.equal(matchesSessionFilter(fixture, "a1b2c3d4"), true); // shortId（sessionId 前缀）
+ok("F4b shortId 子串命中（sessionId 前缀）");
+assert.equal(matchesSessionFilter({ ...fixture, title: "会话可读标题样例", titleSource: "first-user" }, "可读标题"), true);
+ok("F4c title 子串命中（first-user 来源）");
+assert.equal(matchesSessionFilter({ ...fixture, title: "repo-G6-T-台账标题", titleSource: "ledger" }, "台账标题"), true);
+ok("F4d title 子串命中（ledger 来源）");
+assert.equal(matchesSessionFilter(fixture, "greencad"), true); // cwd 大小写不敏感
+ok("F4e cwd 子串命中（大小写不敏感）");
+assert.equal(matchesSessionFilter(fixture, "不存在的查询xyz"), false);
+ok("F4f 无命中 → false");
 
 console.log(`_test_session_first: all assertions passed (${n})`);

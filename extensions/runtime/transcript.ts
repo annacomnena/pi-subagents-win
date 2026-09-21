@@ -693,6 +693,8 @@ export interface SessionSummary {
 	file: string;
 	sizeBytes: number;
 	mtimeMs: number;
+	/** 头部 32KB 窗口内首条 user 文本（截 2000 字符；会话列表标题解析链 P1 探测 / P2 派生的副产品）。 */
+	firstUserText: string | null;
 }
 
 function defaultSessionsDirPath(): string {
@@ -713,26 +715,60 @@ function sessionFileId(sessionsDir: string, file: string): string | null {
 	return idx >= 0 ? base.slice(idx + 1) : base;
 }
 
-/** 读首行头（只读前 8KB，避免大文件全读；tolerant）。 */
-function readHeader(path: string): Record<string, unknown> | null {
+// ── 头部窗口（标题解析链副产品，plans/0922_session_title_research.md §5）──
+
+const HEAD_READ_BYTES = 32768;
+const FIRST_USER_TEXT_CAP = 2000;
+
+interface SessionHead {
+	header: Record<string, unknown> | null;
+	firstUserText: string | null;
+}
+
+/** 读头 32KB：首行头 + 顺带扫窗口内首条 user message 文本（tolerant；坏行/半截行 skip，never-throw）。 */
+function readHead(path: string): SessionHead {
 	let fd: number;
 	try {
 		fd = openSync(path, "r");
 	} catch {
-		return null;
+		return { header: null, firstUserText: null };
 	}
 	try {
-		const tmp = Buffer.alloc(8192);
+		const tmp = Buffer.alloc(HEAD_READ_BYTES);
 		const n = readSync(fd, tmp, 0, tmp.length, 0);
-		if (n <= 0) return null;
+		if (n <= 0) return { header: null, firstUserText: null };
 		const head = tmp.subarray(0, n).toString("utf8");
-		const nl = head.indexOf("\n");
-		const first = (nl >= 0 ? head.slice(0, nl) : head).trim();
-		if (first.length === 0) return null;
-		const parsed: unknown = JSON.parse(first);
-		return asRecord(parsed);
+		const lines = head.split("\n");
+		// 窗口打满且末尾无换行 → 末段是被截断的半截行，丢弃（完整行不受影响）
+		if (n === tmp.length && !head.endsWith("\n")) lines.pop();
+		let header: Record<string, unknown> | null = null;
+		let firstUserText: string | null = null;
+		for (const raw of lines) {
+			const line = raw.trim();
+			if (line.length === 0) continue;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const entry = asRecord(parsed);
+			if (entry === null) continue;
+			if (header === null) header = entry; // 首个可解析行 = 头（与旧 readHeader 同语义，不校验 type）
+			if (firstUserText === null && entry.type === "message") {
+				const message = asRecord(entry.message);
+				if (message !== null && message.role === "user") {
+					const text = joinTextParts(contentParts(message));
+					if (text.trim().length > 0) {
+						firstUserText = text.length > FIRST_USER_TEXT_CAP ? text.slice(0, FIRST_USER_TEXT_CAP) : text;
+					}
+				}
+			}
+			if (header !== null && firstUserText !== null) break;
+		}
+		return { header, firstUserText };
 	} catch {
-		return null;
+		return { header: null, firstUserText: null };
 	} finally {
 		try {
 			closeSync(fd);
@@ -761,7 +797,7 @@ export function listPiSessions(sessionsDir: string = defaultSessionsDir()): Sess
 		} catch {
 			return;
 		}
-		const header = readHeader(full);
+		const { header, firstUserText } = readHead(full);
 		const id = (header !== null ? str(header.id) : null) ?? sessionFileId(dir, file);
 		if (id === null) return;
 		out.push({
@@ -772,6 +808,7 @@ export function listPiSessions(sessionsDir: string = defaultSessionsDir()): Sess
 			file: full,
 			sizeBytes: st.size,
 			mtimeMs: st.mtimeMs,
+			firstUserText,
 		});
 	};
 	for (const name of top) {
