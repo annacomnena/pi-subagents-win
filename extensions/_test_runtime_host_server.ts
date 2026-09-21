@@ -25,6 +25,9 @@
  *   T13 stale 接管（L4 必修回归）：pid 活但探活失败（PID 重用形状，含过期 startedAt）的
  *      host.json，start → 覆盖成功（非回显）+ note「检测到僵尸，已接管」+ health 可达；
  *      另：fresh host 重复 start → 回显现有不重起（T11 r2 断言保留）
+ *   T14 G6-P2 L4：非默认 sessionsDir 可列表可 POST（executor 存在性校验同源）；
+ *      /v1/sessions 服务端权威 masterProtected（列表 flag + POST 真 403 同源）；
+ *      host 启动扫 pending outbox：超 24h TTL → expired + journal message.expired 回执
  *
  * 运行：npm run test:runtime-host-server
  */
@@ -58,11 +61,13 @@ import {
 	stopRuntimeHost,
 	type RuntimeHostHandle,
 } from "./runtime-host/server.ts";
-import { attachMaster } from "./runtime/registry.ts";
+import { attachMaster, attachmentPathFor, readAttachment } from "./runtime/registry.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { appendRuntimeEnvelope } from "./runtime/journal.ts";
+import { listRuntimeEnvelopes } from "./runtime/journal.ts";
+import { newOutboxItem, writeOutboxItem } from "./runtime/message-outbox.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, touchSessionHeartbeat } from "./timers.ts";
@@ -140,7 +145,11 @@ try {
 			const r = await getJson(base, "/v1/health");
 			assert.equal(r.status, 200, "health 200");
 			assert.equal(r.body.version, 1);
-			assert.deepEqual(r.body.host, { ...h.info, protocolVersion: PROTOCOL_VERSION }, "host 自信息 + protocolVersion");
+			// G6-P1：host.json 含本机 token，但 token 绝不进 HTTP 响应（剥密后比对）
+			const { token: _wsToken, ...hostInfoPublic } = h.info;
+			assert.equal(_wsToken === undefined || typeof _wsToken === "string", true);
+			assert.deepEqual(r.body.host, { ...hostInfoPublic, protocolVersion: PROTOCOL_VERSION }, "host 自信息 + protocolVersion（无 token）");
+			assert.equal((r.body.host as any).token, undefined, "token 绝不泄漏进 /v1/* 响应");
 			assert.equal(r.body.master.attachment, null);
 			assert.equal(r.body.master.cutover, false);
 			assert.equal(r.body.masterOwnerAlive, null, "无 attachment → null（未 attach = legacy）");
@@ -510,6 +519,107 @@ try {
 			if (r.info && isProcessAlive(r.info.pid)) {
 				await stopRuntimeHost({ hostPath: hp }).catch(() => undefined);
 			}
+		}
+	}
+
+	// ── T14 G6-P2 L4 必修 3/4/2：非默认 sessionsDir 可列表可 POST；/v1/sessions 服务端权威
+	// masterProtected；启动扫 pending outbox（TTL → expired + journal 回执）───────
+
+	{
+		const D = mkdtempDir("runtime-host-t14-");
+		DIRS.push(D);
+		// 前序 T1 已 attach sess-S（同 env 注册表）→ 物理清除 attachment，保证无 attachment 基线
+		const prevAtt = readAttachment(masterAddress());
+		if (prevAtt) rmSync(attachmentPathFor(masterAddress()), { force: true });
+		const sessionsDirCustom = join(D, "sessions-custom"); // 有意 ≠ env PI_SESSIONS_DIR/缺省目录
+		mkdirSync(sessionsDirCustom, { recursive: true });
+		const sidCustom = "c1111111-2222-3333-4444-555555555555";
+		writeFileSync(join(sessionsDirCustom, `2026-09-22T14-00-00-000Z_${sidCustom}.jsonl`),
+			`{"type":"session","version":3,"id":"${sidCustom}","timestamp":"2026-09-22T14:00:00.000Z","cwd":"C:\\ws\\t14"}\n`, "utf8");
+		const stateDir = join(D, "state");
+		const journalPath = join(D, "events.jsonl");
+
+		const h = await createRuntimeHostServer({
+			hostPath: join(D, "host.json"),
+			stateDir,
+			journalPath,
+			timersDir: join(D, "timers"),
+			mailboxDir: join(D, "mailbox"),
+			sessionsDir: sessionsDirCustom, // 非默认：executor 存在性校验必须同源（L4 必修 3）
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			const post = async (body: unknown, tok: string): Promise<{ status: number; body: any }> => {
+				const res = await fetch(`${base}/v1/commands`, {
+					method: "POST",
+					headers: { "content-type": "application/json", "x-command-token": tok },
+					body: JSON.stringify(body),
+				});
+				return { status: res.status, body: await res.json() };
+			};
+			const sm = (commandKey: string, to: string) => ({
+				frame: "command", type: "session.message", to, commandKey,
+				issuedAt: new Date().toISOString(), payload: { text: "t14" },
+			});
+
+			// 可列表：非默认 sessionsDir 的会话出现在 /v1/sessions（修复前：读投影用自定义目录、
+			// executor 用缺省目录 → 可见但 POST no-session，E2E 因 env 恰同而掩盖）
+			const lst = await getJson(base, "/v1/sessions");
+			assert.equal(lst.status, 200);
+			const entry = (lst.body.sessions as any[]).find((s) => s.sessionId === sidCustom);
+			assert.ok(entry, "非默认 sessionsDir 会话可列表");
+			assert.equal(entry.masterProtected, undefined, "无 attachment → 非受保护");
+			assert.equal(lst.body.masterProtectedSessionId, null);
+
+			// 可 POST：session.message → accepted（修复前误判 no-session 404）
+			const post1 = await post(sm("t14-post-1", `pi://${sidCustom}`), h.info.token);
+			assert.equal(post1.status, 200, `非默认 sessionsDir POST accepted（实际 ${post1.status} ${JSON.stringify(post1.body)}）`);
+			assert.equal(post1.body.status, "accepted");
+
+			// 服务端权威 masterProtected：attach 后列表条目带 flag + 顶层 id；POST 该会话 → 真 403
+			attachMaster({ sessionId: sidCustom, generation: 1 });
+			const lst2 = await getJson(base, "/v1/sessions");
+			const entry2 = (lst2.body.sessions as any[]).find((s) => s.sessionId === sidCustom);
+			assert.equal(entry2.masterProtected, true, "服务端权威 masterProtected flag（executor 护栏同源）");
+			assert.equal(lst2.body.masterProtectedSessionId, sidCustom);
+			const post403 = await post(sm("t14-post-403", `pi://${sidCustom}`), h.info.token);
+			assert.equal(post403.status, 403);
+			assert.equal(post403.body.reason, "master-session-protected", "POST 真 403（与列表 flag 同源，非前端猜测）");
+			// 还原注册表（T14 结束后不留 sidCustom attachment）
+			rmSync(attachmentPathFor(masterAddress()), { force: true });
+
+			// 启动扫（必修 2）：预置超龄 pending → 新 server 启动即转 expired + journal 回执
+			const obDir = join(stateDir, "message-outbox");
+			mkdirSync(obDir, { recursive: true });
+			const old = newOutboxItem({
+				dedupeKey: "session.message:t14-expired",
+				commandKey: "t14-expired",
+				to: `pi://${sidCustom}` as any,
+				sessionId: sidCustom,
+				text: "orphan",
+				now: new Date(Date.now() - 25 * 60 * 60 * 1000), // 25h 前 → 超 24h TTL
+			});
+			writeOutboxItem(obDir, old);
+			const h2 = await createRuntimeHostServer({
+				hostPath: join(D, "host2.json"),
+				stateDir,
+				journalPath,
+				timersDir: join(D, "timers"),
+				mailboxDir: join(D, "mailbox"),
+				sessionsDir: sessionsDirCustom,
+			});
+			try {
+				const swept = JSON.parse(readFileSync(join(obDir, `${old.id}.json`), "utf8")) as { status: string; expiredBy?: string };
+				assert.equal(swept.status, "expired", "host 启动扫：超龄 pending → expired（不留永久孤儿）");
+				assert.equal(swept.expiredBy, "runtime-host");
+				const evs = listRuntimeEnvelopes({ path: journalPath }).envelopes.filter((e) => e.type === "message.expired");
+				assert.equal(evs.length, 1, "journal message.expired 回执一条");
+				assert.equal((evs[0]!.payload as any).outboxId, old.id);
+			} finally {
+				await h2.close().catch(() => undefined);
+			}
+		} finally {
+			await h.close().catch(() => undefined);
 		}
 	}
 } finally {

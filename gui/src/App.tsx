@@ -9,6 +9,7 @@ import { MasterPage } from "./pages/MasterPage";
 import { WorkstreamPage } from "./pages/WorkstreamPage";
 import { AttentionPage } from "./pages/AttentionPage";
 import { TimelinePage } from "./pages/TimelinePage";
+import { ChatPage } from "./pages/ChatPage";
 import { RuntimePage } from "./pages/RuntimePage";
 import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
@@ -21,6 +22,7 @@ const PAGES: Record<TabId, () => ReactElement> = {
 	attention: AttentionPage,
 	timeline: TimelinePage,
 	runtime: RuntimePage,
+	chat: ChatPage,
 };
 
 export default function App() {
@@ -33,6 +35,7 @@ export default function App() {
 	usePoll(() => useGui.getState().pollHealth(), 2000);
 	usePoll(() => useGui.getState().pollEvents(), 2000);
 	usePoll(() => useGui.getState().pollAttention(), 2000);
+	usePoll(() => useGui.getState().pollInteractions(), 2000); // G6-P3：待决策徽标 + proposal 卡直连
 	usePoll(() => useGui.getState().pollSnapshot(), 6000);
 	usePoll(() => useGui.getState().pollTimeline(), 6000);
 

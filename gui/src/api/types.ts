@@ -266,6 +266,34 @@ export interface AttentionResponse {
 	attention: AttentionItem[];
 }
 
+// ── G6-P3：GET /v1/interactions（runtime-host/interactions.ts 手抄）──
+
+/** 可选 response 语义（ZCode option.response 思想）：仅当既有确定性命令可决时给出；UI 只渲染按钮。 */
+export interface InteractionResponse {
+	/** G4 executor 白名单命令（唯一命令入口 POST /v1/commands）。 */
+	command: string;
+	args?: Record<string, unknown>;
+}
+
+/** 待决策交互项 = open attention 条目的直投（kind 沿用 attention 词表；不新增审批类型）。 */
+export interface InteractionItem {
+	id: string;
+	kind: "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked";
+	severity: AttentionSeverity;
+	createdAt: string;
+	title: string;
+	summary: string;
+	payload?: Record<string, unknown>;
+	/** 仅 pending handoff 提案携带（{command:"master.handoff.accept"}）；§29 决策走既有命令。 */
+	response?: InteractionResponse;
+}
+
+export interface InteractionsResponse {
+	version: 1;
+	count: number;
+	interactions: InteractionItem[];
+}
+
 export interface TimelineResponse {
 	version: 1;
 	count: number;
@@ -280,7 +308,13 @@ export const MASTER_ADDRESS = "agent://master_default";
 /** 客户端可不传 issuedBy——服务端注入 agent://runtime-host（commands.ts 拍板 2）。 */
 export interface CommandFrameInput {
 	frame: "command";
-	type: "workstream.pause" | "workstream.resume" | "master.handoff.accept" | "master.auto-handoff.set" | "master.handoff.prepare";
+	type:
+		| "workstream.pause"
+		| "workstream.resume"
+		| "master.handoff.accept"
+		| "master.auto-handoff.set"
+		| "master.handoff.prepare"
+		| "session.message";
 	to: string;
 	issuedBy?: string;
 	commandKey: string;
@@ -292,3 +326,110 @@ export type CommandOutcomeBody =
 	| { status: "accepted"; summary: string; replayed: boolean }
 	| { status: "rejected"; reason: string; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: string; error?: string; replayed: boolean };
+
+// ── G6-P1：GET /v1/sessions + /v1/sessions/:id/transcript（runtime/transcript.ts 手抄）──
+
+/** runtime/transcript.ts SessionSummary + G6-P2 L4 服务端权威 Master 标识（与 executor 护栏同源；
+ *  GUI 不再拿 health 心跳自猜）。 */
+export interface SessionSummary {
+	sessionId: string;
+	cwd: string | null;
+	startedAt: string | null;
+	parentSession: string | null;
+	file: string;
+	sizeBytes: number;
+	mtimeMs: number;
+	/** 服务端权威：该会话是当前 master attachment 会话（POST 会 403 master-session-protected）。 */
+	masterProtected?: true;
+}
+
+export interface SessionsBody {
+	version: 1;
+	count: number;
+	sessions: SessionSummary[];
+	/** 服务端权威受保护会话 id（null = 无 attachment；GUI 禁输入标识以条目 flag 为准）。 */
+	masterProtectedSessionId: string | null;
+}
+
+/** 5 种自包含行（turn = 行上标签非容器；渲染任一行不需读别的行）。 */
+export type TranscriptRow =
+	| { kind: "turnHeader"; rowId: string; turnIndex: number; startedAt: string; durationMs?: number }
+	| { kind: "userInput"; rowId: string; turnIndex: number; at: string; text: string }
+	| { kind: "assistantText"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
+	| { kind: "reasoning"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
+	| {
+			kind: "toolCall";
+			rowId: string;
+			turnIndex: number;
+			at: string;
+			callId: string;
+			name: string;
+			arguments: unknown;
+			status: "running" | "done" | "error";
+			output?: string;
+			model?: string;
+			provider?: string;
+	  };
+
+/** 5 操作封闭集（P1 发射面 = appended/upserted/state.updated；delta/removed 定义留后续）。 */
+export type TranscriptOp =
+	| { kind: "row.appended"; row: TranscriptRow }
+	| { kind: "row.delta"; rowId: string; path: string; append: string }
+	| { kind: "row.upserted"; row: TranscriptRow }
+	| { kind: "row.removed"; rowId: string }
+	| { kind: "state.updated"; patch: Record<string, unknown> };
+
+export interface TranscriptHead {
+	seq: number;
+	logEpoch: string;
+	/** 持久流代际（G6-P1 L4）：同首行重写/轮转 → 服务端 bump；重订阅带旧 gen → snapshot。 */
+	gen?: number;
+}
+
+export interface TranscriptBody {
+	version: 1;
+	sessionId: string;
+	mode: "snapshot" | "delta";
+	head: TranscriptHead | null;
+	count: number;
+	rows: TranscriptRow[];
+	skippedUnknown: number;
+	name: string | null;
+}
+
+// ── G6-P1：WS /v1/events/stream 帧契约（runtime-host/ws.ts 手抄）──
+
+export interface StreamSubscribeMsg {
+	type: "subscribe";
+	topic: string;
+	base?: { seq?: number; logEpoch?: string; gen?: number };
+}
+
+export type StreamServerFrame =
+	| { type: "ack"; topic: string; mode: "resume" | "snapshot"; head: TranscriptHead | null }
+	| { type: "event"; topic: string; seq: number; envelope?: unknown; op?: TranscriptOp }
+	| { type: "resync"; topic: string; head: null }
+	| { type: "error"; topic: string | null; message: string };
+
+// ── G6-P2：session.message 两段回执（runtime/message-outbox.ts + journal 事件 payload 手抄）──
+
+/** 会话页发送状态（POST accepted → pending；WS outbox 事件推进终态；expired = TTL 过期）。 */
+export interface ChatOutboxEntry {
+	commandKey: string;
+	sessionId: string;
+	text: string;
+	/** sending=POST 在途；pending=已入 outbox 等桥注入；delivered/failed/expired=终态；rejected=HTTP 拒绝。 */
+	status: "sending" | "pending" | "delivered" | "failed" | "expired" | "rejected";
+	/** rejected/failed/expired 的补充（HTTP reason / 桥 error / TTL 说明）。 */
+	detail?: string;
+	at: string;
+}
+
+/** outbox 主题 journal 事件 payload（message.queued/delivered/failed 手抄）。 */
+export interface OutboxEventPayload {
+	commandKey?: string;
+	outboxId?: string;
+	sessionId?: string;
+	error?: string;
+	replayed?: boolean;
+}

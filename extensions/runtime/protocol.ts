@@ -50,7 +50,9 @@ export function isMessageKind(v: unknown): v is MessageKind {
 
 // ── Command 词表（§26 示例 + v1 可扩展白名单；G4 additive 批次一：
 // workstream.resume / master.handoff.accept / master.auto-handoff.set，只加不改；
-// G5.2 additive：master.handoff.prepare——GUI Prepare 按钮 + 确定性提案路径）──
+// G5.2 additive：master.handoff.prepare——GUI Prepare 按钮 + 确定性提案路径；
+// G6-P2 additive：session.message——Web Console 远程会话输入（outbox 两段式投递，
+// to=pi://<sessionId>；agent://master_default executor 层 403 拒收）──
 
 export const COMMAND_TYPES = [
 	"agent.wake",
@@ -60,6 +62,7 @@ export const COMMAND_TYPES = [
 	"master.handoff.accept",
 	"master.auto-handoff.set",
 	"master.handoff.prepare",
+	"session.message",
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
@@ -74,7 +77,7 @@ export function isCommandType(v: unknown): v is CommandType {
 export interface CommandFrame {
 	frame: "command";
 	type: CommandType;
-	/** 目标逻辑对象（agent://master 等）——resolver 决定物理承载 */
+	/** 目标逻辑对象（agent://master 等；session.message 用 pi://<sessionId>）——resolver 决定物理承载 */
 	to: ObjectAddress;
 	/** 发起方 */
 	issuedBy: ObjectAddress;

@@ -12,8 +12,11 @@ import type {
 	CommandOutcomeBody,
 	EventsResponse,
 	HealthView,
+	InteractionsResponse,
 	RuntimeSnapshot,
+	SessionsBody,
 	TimelineResponse,
+	TranscriptBody,
 } from "./types";
 
 export type ConnState = "up" | "down";
@@ -98,6 +101,9 @@ export const api = {
 	attention: (includeResolved: boolean): Promise<FetchResult<AttentionResponse>> =>
 		fetchJson<AttentionResponse>(`/v1/attention${includeResolved ? "?includeResolved=1" : ""}`),
 
+	/** G6-P3：待决策交互投影（pendingInteractions 思想；open attention 直投 + response 语义）。 */
+	interactions: (): Promise<FetchResult<InteractionsResponse>> => fetchJson<InteractionsResponse>("/v1/interactions"),
+
 	/** limit 尾窗 + G5.2 before=（排他上界历史翻页；undefined/空串 = 不启用）。 */
 	timeline: (limit = 200, before?: string): Promise<FetchResult<TimelineResponse>> =>
 		fetchJson<TimelineResponse>(`/v1/timeline?limit=${limit}${before ? `&before=${encodeURIComponent(before)}` : ""}`),
@@ -149,4 +155,29 @@ export const api = {
 			issuedAt: new Date().toISOString(),
 			payload: { auto, ...(reason ? { reason } : {}) },
 		} satisfies CommandFrameInput),
+
+	/** G6-P2：session.message（to=pi://<sessionId>；payload {text} 1..8000 字节）。
+	 *  同源 cookie 认证（P2 起写端点 fail-closed；dev 由 vite proxy 注入）。 */
+	sessionMessage: (sessionId: string, text: string): Promise<FetchResult<CommandOutcomeBody>> =>
+		postJson<CommandOutcomeBody>("/v1/commands", {
+			frame: "command",
+			type: "session.message",
+			to: `pi://${sessionId}`,
+			commandKey: newCommandKey("msg"),
+			issuedAt: new Date().toISOString(),
+			payload: { text },
+		} satisfies CommandFrameInput, 8000),
+
+	// ── G6-P1：sessions / transcript（只读数据面；WS 增量之外的 HTTP 兜底）──
+
+	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。 */
+	sessions: (): Promise<FetchResult<SessionsBody>> => fetchJson<SessionsBody>("/v1/sessions"),
+
+	/** GET /v1/sessions/:id/transcript?after=：首屏全量（after 缺省/0）或增量触及行终态。 */
+	transcript: (sessionId: string, after?: number): Promise<FetchResult<TranscriptBody>> =>
+		fetchJson<TranscriptBody>(
+			`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${after !== undefined && after > 0 ? `?after=${after}` : ""}`,
+			undefined,
+			8000,
+		),
 };

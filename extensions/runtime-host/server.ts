@@ -19,14 +19,31 @@
  *     改走 /v1/snapshot 重建状态 + after=0）；幂等责任在消费端（envelope 自带 id+dedupeKey）。
  *   - `GET /v1/attention?includeResolved=<opt>`（G3）状态聚合投影：`buildAttentionItems`
  *     （attention.ts 纯函数；同源双条 source key 最新胜出；resolved 默认过滤，拍板①）。
+ *   - `GET /v1/interactions`（G6-P3）：待决策交互投影（pendingInteractions 思想）——open
+ *     attention 1:1 直投 + 可选 response 语义（仅 pending handoff 提案 → master.handoff.accept；
+ *     interactions.ts 纯函数，不新增真相；§29 决策仍走既有 POST /v1/commands）。
+ *     WS 对应主题 "interactions"（状态投影帧，ws.ts）。
  *   - `GET /v1/timeline?limit=<opt>`（G3）journal 全事件 + 状态条目 + 溯源 enrichment
  *     （timeline.ts 纯函数；at 升序尾部 N 条，默认 200，拍板②）。
  *     与 /v1/events 分工正交（G2 research ④）：events = 低延迟增量，attention/timeline = 首屏全量 + 轮询。
  *   - `POST /v1/commands`（G4）：**唯一命令入口**（mailbox 命令信不消费）。同步执行、
  *     同步回执；业务全在 runtime/command-executor.ts 纯库（本文件只做薄绑定）；方法门
- *     放宽仅此路径（GET 全放行 + POST 仅 /v1/commands，其余 405）。
+ *     放宽仅此路径（GET 全放行 + POST 仅 /v1/commands，其余 405）。G6-P2 起 fail-closed
+ *     token 认证（X-Command-Token header / Cookie sw_host_token，同 P1 token 面；无/错 → 401）。
+ *   - `GET /v1/sessions` + `GET /v1/sessions/:id/transcript?after=`（G6-P1）：pi 会话列表 +
+ *     转写投影行快照/增量分页（与 WS 同一投影函数）。
+ *   - `WS /v1/events/stream`（G6-P1，唯一升级路径）：journal + transcript 两路 JSON 帧多路复用，
+ *     subscribe(base:{seq,logEpoch}) 断线续传 + 30s ping/pong + 本机 token→HttpOnly cookie
+ *     fail-closed（token 落 host.json；无/错 token 握手 401；HTTP 端点零变化）。实现全在
+ *     runtime-host/ws.ts（手写最小 RFC6455 文本帧，零新依赖）。
+ *   - 启动时扫 pending outbox（G6-P2 L4 必修 2）：TTL 超 24h 的 pending 项转 expired +
+ *     journal message.expired 回执（sweepExpiredOutboxItems；目标会话永不重启时 pending
+ *     不再是永久孤儿——任一项至多存活到下次 host 启动；桥侧另在每个消费 tick 扫）。
+ *     唯一读投影例外，best-effort never-throw；POST /v1/commands 仍是唯一命令入口。
+ *   - `/v1/sessions` 每条目附服务端权威 `masterProtected`（与 executor 护栏同源
+ *     getMasterStatus().attachment.sessionId；G6-P2 L4 必修 4：GUI 不再拿 health 心跳自猜）。
  *
- * 明确不做（G2 计划 §4 / 主会话拍板③）：无 WS/SSE/push（纯 poll 足矣）；无 journal
+ * 明确不做（G2 计划 §4 / 主会话拍板③）：无 SSE/push（WS 为 G6 增量升级面）；无 journal
  * compaction；无 fs.watch 正确性路径；S3/master-auto/mailbox 接线零改动。
  *
  * 红线：只 import node 内建 + `extensions/runtime/*` 纯函数 + ../timers.ts（session 心跳
@@ -40,10 +57,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAttentionItems } from "./attention.ts";
+import { buildInteractions } from "./interactions.ts";
 import {
 	PROTOCOL_VERSION,
 	classifyHost,
 	fetchHostHealth,
+	generateHostToken,
 	hostInfoPath,
 	isProcessAlive,
 	newInstanceId,
@@ -56,6 +75,16 @@ import {
 import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
 import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
 import { getMasterStatus } from "../runtime/master-control.ts";
+import {
+	outboxDir,
+	sweepExpiredOutboxItems,
+} from "../runtime/message-outbox.ts";
+import {
+	defaultSessionsDir,
+	findSessionFile,
+	listPiSessions,
+	projectSession,
+} from "../runtime/transcript.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
 import { buildTimelineItems } from "./timeline.ts";
@@ -65,7 +94,9 @@ import {
 	commandOutcomeHttpResponse,
 	parseCommandRequest,
 } from "./commands.ts";
+import { validateStreamGen } from "../runtime/stream-gen.ts";
 import { executeCommand } from "../runtime/command-executor.ts";
+import { attachEventStream, WS_PATH, parseCookieToken, tokenMatches } from "./ws.ts";
 
 // ── 视图装配（纯读、never-throw；可注入路径/now 供测试隔离）────────
 
@@ -322,6 +353,12 @@ export interface RuntimeHostServerOptions {
 	linksPath?: string;
 	/** config.json 路径（auto-handoff.set 用；缺省包根 config.json，测试注入隔离）。 */
 	configPath?: string;
+	/** G6-P1：pi sessions 根目录（缺省 defaultSessionsDir()；测试注入隔离）。 */
+	sessionsDir?: string;
+	/** G6-P1：WS live tail 轮询间隔 ms（缺省 250；测试注入更快）。 */
+	tailMs?: number;
+	/** G6-P1：WS ping 间隔 ms（缺省 30000）。 */
+	pingMs?: number;
 }
 
 export interface RuntimeHostHandle {
@@ -336,6 +373,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const startedAt = new Date().toISOString();
 	const self: HostSelfInfo = { instanceId, pid: process.pid, port: 0, startedAt };
 	const hostPath = opts.hostPath ?? hostInfoPath();
+	// G6-P1：本机 token 启动即生成，落 host.json（同机进程可读）；仅 WS 升级面校验，
+	// 绝不出现在 /v1/* HTTP 响应（HostSelfInfo 不含 token）。
+	const hostToken = generateHostToken();
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -351,7 +391,24 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	};
 
 	// G4：POST /v1/commands——唯一命令入口（body 异步读取后同步执行、同步回执；never-throw）
+	// G6-P2：认证补强（fail-closed，同 P1 token）：X-Command-Token header（curl/测试等价通道）
+	// 或 Cookie sw_host_token（同源 UI 无感）；无/错 token → 401，不读 body。只覆盖本写端点，
+	// GET 读投影维持 P1 现状（本机 loopback 只读面）。
+	const authorizeCommand = (req: IncomingMessage): boolean => {
+		const h = req.headers["x-command-token"];
+		const headerToken = typeof h === "string" && h.length > 0 ? h : (Array.isArray(h) ? (h[0] ?? null) : null);
+		const presented = headerToken ?? parseCookieToken(req.headers.cookie);
+		return tokenMatches(presented, hostToken);
+	};
 	const handlePostCommand = (req: IncomingMessage, res: ServerResponse): void => {
+		if (!authorizeCommand(req)) {
+			respondJson(res, 401, {
+				error: "unauthorized",
+				hint: "POST /v1/commands 需本机 token：X-Command-Token header 或 Cookie sw_host_token（token 见 runtime 目录 host.json）",
+			});
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
 		const chunks: Buffer[] = [];
 		let size = 0;
 		let responded = false;
@@ -383,6 +440,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					stateDir: opts.stateDir,
 					journalPath: opts.journalPath,
 					configPath: opts.configPath,
+					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）
 				});
 				const http = commandOutcomeHttpResponse(outcome);
 				status = http.status;
@@ -465,6 +523,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, count: att.length, attention: att };
 					break;
 				}
+				case "/v1/interactions": {
+					// G6-P3：待决策交互投影（只读纯函数重算既有 state；§29 决策走 POST /v1/commands）
+					const ix = buildInteractions({ stateDir: opts.stateDir, mailboxDir: opts.mailboxDir });
+					body = { version: 1, count: ix.length, interactions: ix };
+					break;
+				}
 				case "/v1/timeline": {
 					// G3（拍板②）+ G5.2：limit（默认 200，at 升序尾部 N 条）+ before=（历史翻页排他上界）
 					const q = u.searchParams;
@@ -479,8 +543,57 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, count: tl.length, timeline: tl };
 					break;
 				}
-				default:
-					throw new HttpError(404, { error: "not-found", hint: "端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/timeline；POST /v1/commands（唯一命令入口）" });
+				case "/v1/sessions": {
+					// G6-P1：pi 会话列表（首行头快读，不全读；startedAt 降序）
+					const sessions = listPiSessions(opts.sessionsDir ?? defaultSessionsDir());
+					// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——与 executor 护栏同源
+					// （getMasterStatus().attachment.sessionId，护栏二同款读法）投影到列表条目；
+					// GUI 不再拿 health 心跳自猜。POST 真 403 仍是最后防线（护栏在 executor）。
+					let protectedSid: string | null = null;
+					try {
+						protectedSid = getMasterStatus().attachment?.sessionId ?? null;
+					} catch {
+						protectedSid = null;
+					}
+					body = {
+						version: 1,
+						count: sessions.length,
+						sessions: sessions.map((s) => ({
+							...s,
+							...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
+						})),
+						masterProtectedSessionId: protectedSid,
+					};
+					break;
+				}
+				default: {
+					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，
+					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
+					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
+					if (mt === null) {
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）` });
+					}
+					const sessionId = decodeURIComponent(mt[1]);
+					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
+					if (file === null) {
+						throw new HttpError(404, { error: "session-not-found", sessionId });
+					}
+					const afterRaw = u.searchParams.get("after");
+					const after = afterRaw !== null && /^\d+$/.test(afterRaw) ? parseInt(afterRaw, 10) : 0;
+					const proj = projectSession(file, after);
+					// G6-P1 L4：head 带持久代际 gen（同首行重写/轮转检出；客户端重订阅带 base.gen）
+					const gen = validateStreamGen(`session:${sessionId}`, file, proj.logEpoch);
+					body = {
+						version: 1,
+						sessionId,
+						mode: after > 0 ? "delta" : "snapshot",
+						head: { seq: proj.head, logEpoch: proj.logEpoch, gen },
+						count: proj.rows.length,
+						rows: proj.rows,
+						skippedUnknown: proj.skippedUnknown,
+						name: proj.name,
+					};
+				}
 			}
 		} catch (e) {
 			if (e instanceof HttpError) {
@@ -497,6 +610,17 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 
 	return new Promise((resolvePromise, reject) => {
 		const server = createServer(onReq);
+		// G6-P1：唯一 WS 升级路径 /v1/events/stream（幂等挂载；HTTP 路由零变化）
+		// G6-P3：stateDir/mailboxDir 透传——interactions 主题与 GET 端点同源（测试注入隔离一致）
+		attachEventStream(server, {
+			token: hostToken,
+			journalPath: opts.journalPath,
+			sessionsDir: opts.sessionsDir,
+			stateDir: opts.stateDir,
+			mailboxDir: opts.mailboxDir,
+			tailMs: opts.tailMs,
+			pingMs: opts.pingMs,
+		});
 		server.on("error", (e: NodeJS.ErrnoException) => {
 			// fail-fast 报端口（risk8：不静默换端口）——:0 下正常不会 EADDRINUSE
 			reject(new Error(`runtime-host listen failed: ${e.message}${e.code ? ` (code=${e.code})` : ""}`));
@@ -504,9 +628,20 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		server.listen(0, "127.0.0.1", () => {
 			const addr = server.address();
 			const port = typeof addr === "object" && addr ? addr.port : 0;
-			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION };
+			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION, token: hostToken };
 			self.port = port;
 			writeHostInfo(info, hostPath); // 原子写（tmp+rename）；失败不炸（易失投影）
+			// G6-P2 L4 必修 2：host 启动扫 pending outbox → TTL 转 expired + journal 回执。
+			// 覆盖「目标会话永不重启」的孤儿面：任一项至多存活到下次 host 启动；桥侧另在每个
+			// 消费 tick 扫（活跃会话更快收敛）。best-effort never-throw（投影面，不阻塞启动）。
+			try {
+				sweepExpiredOutboxItems(outboxDir(outboxStateDirFor(opts)), {
+					...(opts.journalPath !== undefined ? { journalPath: opts.journalPath } : {}),
+					by: "runtime-host",
+				});
+			} catch {
+				/* 启动扫描失败不炸 host */
+			}
 			resolvePromise({
 				server,
 				info,
@@ -534,6 +669,11 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 }
 
 // ── slash 命令用的进程控制（start 已跑 → 回显现有；stop 清理僵尸文件）──
+
+/** 启动扫描用的 outbox state 根（与 executor 同款缺省；env PI_RUNTIME_DIR 隔离）。 */
+function outboxStateDirFor(opts: RuntimeHostServerOptions): string {
+	return opts.stateDir ?? join(defaultRuntimeDir(), "state");
+}
 
 export interface HostStartResult {
 	started: boolean;

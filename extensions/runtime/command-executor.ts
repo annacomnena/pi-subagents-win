@@ -50,8 +50,14 @@ import { newEventEnvelope } from "./envelope.ts";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
 import { readLiveness } from "./liveness.ts";
 import { DEFAULT_MASTER_SUCCESSION, normalizeMasterSuccession } from "./master-auto.ts";
+import {
+	newOutboxItem,
+	outboxDir,
+	writeOutboxItem,
+} from "./message-outbox.ts";
 import { decideProposal, maybePropose, readProposal } from "./master-succession.ts";
 import { readAttachment } from "./registry.ts";
+import { defaultSessionsDir, findSessionFile } from "./transcript.ts";
 import { validateCommandFrame, type CommandFrame } from "./protocol.ts";
 import { readWorkstream, updateWorkstream } from "./workstreams.ts";
 
@@ -64,6 +70,7 @@ export const IMPLEMENTED_COMMAND_TYPES = [
 	"master.handoff.accept",
 	"master.auto-handoff.set",
 	"master.handoff.prepare",
+	"session.message",
 ] as const;
 
 export type ImplementedCommandType = (typeof IMPLEMENTED_COMMAND_TYPES)[number];
@@ -76,16 +83,19 @@ const MASTER_ONLY_TYPES: readonly string[] = [
 ];
 
 /** 拒绝 reason 词表（HTTP 映射：400 invalid-payload·unknown-command·not-implemented /
- *  404 no-workstream·no-proposal / 409 bad-state·not-owner·not-attached·replay-unknown-outcome）。 */
+ *  403 master-session-protected（G6-P2：Master 会话拒收远程输入，executor 层护栏） /
+ *  404 no-workstream·no-proposal·no-session / 409 bad-state·not-owner·not-attached·replay-unknown-outcome）。 */
 export type CommandRejectReason =
 	| "invalid-payload"
 	| "unknown-command"
 	| "not-implemented"
 	| "no-workstream"
 	| "no-proposal"
+	| "no-session"
 	| "bad-state"
 	| "not-owner"
 	| "not-attached"
+	| "master-session-protected"
 	| "replay-unknown-outcome";
 
 export type CommandOutcome =
@@ -97,7 +107,7 @@ export type CommandOutcome =
 // ── 选项与路径 ─────────────────────────────────────────────────────
 
 export interface ExecuteCommandOptions {
-	/** runtime state 根（缺省 <runtime>/state）；workstream/commands 派生自它。 */
+	/** runtime state 根（缺省 <runtime>/state）；workstream/commands/message-outbox 派生自它。 */
 	stateDir?: string;
 	/** config.json 路径（auto-handoff.set 用；缺省包根 config.json——S3 真相在 config 切片，
 	 *  跟随现状不新造第二位置，迁移属未决）。 */
@@ -105,6 +115,8 @@ export interface ExecuteCommandOptions {
 	journalPath?: string;
 	/** 幂等 claim/outcome 目录（缺省 <stateDir>/commands；不做 compaction，§23 纪律同 journal）。 */
 	commandsDir?: string;
+	/** G6-P2：pi sessions 根目录（session.message 存在性校验用；缺省 defaultSessionsDir()）。 */
+	sessionsDir?: string;
 	now?: Date;
 }
 
@@ -146,6 +158,14 @@ function executeCommandInner(frame: CommandFrame, opts: ExecuteCommandOptions): 
 	}
 	// master-only 钉死：accept / auto-handoff.set 只认精确 master 地址（字符串全等）
 	if (MASTER_ONLY_TYPES.includes(frame.type) && frame.to !== masterAddress()) return reject("invalid-payload");
+	// G6-P2 session.message 护栏（executor 层拒收，非 UI 层）：agent://master_default 一律
+	// 403 master-session-protected——主权会话不接受远程输入，先于 to scheme 校验给出专用拒绝码
+	if (frame.type === "session.message" && frame.to === masterAddress()) return reject("master-session-protected");
+	// G6-P2 session.message 寻址封闭：只收 pi://<sessionId>（plan §3 拍板）；其它 scheme → invalid-payload
+	if (frame.type === "session.message") {
+		const parsedTo = parseObjectAddress(frame.to);
+		if (!parsedTo || parsedTo.scheme !== "pi") return reject("invalid-payload");
+	}
 	// payload 白名单：多余/非法字段一律拒绝（封闭字段集）
 	if (!commandPayloadOk(frame)) return reject("invalid-payload");
 
@@ -184,9 +204,41 @@ function commandPayloadOk(frame: CommandFrame): boolean {
 			return payloadShapeOk(frame.payload, {}, { reason: "string" });
 		case "master.auto-handoff.set":
 			return payloadShapeOk(frame.payload, { auto: "boolean" }, { reason: "string" });
+		case "session.message":
+			return sessionMessagePayloadOk(frame.payload);
 		default:
 			return true; // not-implemented 层已拒，无 handler type 的 payload 留待对应批次
 	}
+}
+
+/**
+ * session.message payload 白名单（G6-P2）：必需 text（string，1..8000 UTF-8 字节），
+ * 可选 reason（string ≤512 字节，同 message body.summary 预算纪律）；多余字段拒绝。
+ * 恶意输入面：空文本 / 超长 / 控制字符（C0 除 \t\n\r 外 + DEL）一律拒绝——\t\n\r 是
+ * 正常聊天换行/缩进，保留。
+ */
+export const SESSION_MESSAGE_TEXT_MAX_BYTES = 8000;
+
+function sessionMessageTextOk(text: string): boolean {
+	if (text.length === 0) return false;
+	if (Buffer.byteLength(text, "utf8") > SESSION_MESSAGE_TEXT_MAX_BYTES) return false;
+	// eslint-disable-next-line no-control-regex -- 控制字符检测就是本职责
+	if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) return false;
+	return true;
+}
+
+function sessionMessagePayloadOk(payload: unknown): boolean {
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
+	const rec = payload as Record<string, unknown>;
+	for (const key of Object.keys(rec)) {
+		if (key !== "text" && key !== "reason") return false; // 封闭字段集
+	}
+	if (typeof rec.text !== "string" || !sessionMessageTextOk(rec.text)) return false;
+	if (rec.reason !== undefined) {
+		if (typeof rec.reason !== "string") return false;
+		if (Buffer.byteLength(rec.reason, "utf8") > 512) return false;
+	}
+	return true;
 }
 
 /** 封闭校验：字段名必须在 required/optional 内且类型匹配；缺 required → false。 */
@@ -220,6 +272,8 @@ function dispatchHandler(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 			return runAutoHandoffSet(frame, opts);
 		case "master.handoff.prepare":
 			return runHandoffPrepare(opts);
+		case "session.message":
+			return runSessionMessage(frame, opts);
 		default:
 			return reject("not-implemented");
 	}
@@ -402,6 +456,81 @@ function runHandoffPrepare(opts: ExecuteCommandOptions): CommandOutcome {
 			// no-decision / below-threshold：pressure 已非空 + 阈值 0 下不可达；防御性拒绝
 			return { status: "rejected", reason: "bad-state", detail: `maybePropose: ${r.reason}`, replayed: false };
 	}
+}
+
+// ── 2.6 session.message（G6-P2：Web Console 远程会话输入，两段式第一段）──
+
+/**
+ * session.message handler —— **§29 纪律：消息投递是确定性两段状态机，非 LLM 链**。
+ *
+ * 第一段（本函数，同步）：校验（已前置：master 403 / pi scheme / payload 白名单均在 claim
+ * 之前）→ 目标会话存在性校验（post-claim，同 no-workstream 口径）→ 写 outbox 信封
+ * status:"pending"（纯状态迁移）→ journal message.queued。不碰 pi 会话文件、不注入 LLM。
+ * 第二段（异步，extensions/outbox-bridge.ts）：pending → delivered|failed 回写 + journal
+ * message.delivered|failed；GUI 经 WS outbox 主题看两段回执。
+ *
+ * 护栏（默认拒收）：to=agent://master_default → 403（入口已拒）；to 的 sessionId == 当前
+ * master attachment 会话 → 同拒（换皮地址也进不来；attachment 缺失/未 attach → 不拦截）。
+ */
+function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): CommandOutcome {
+	const parsed = parseObjectAddress(frame.to);
+	if (!parsed || parsed.scheme !== "pi" || parsed.value.length === 0) return reject("invalid-payload");
+	const sessionId = parsed.value;
+
+	// 护栏二：当前 master owner 会话拒收（attachment 缺失 = 未 attach，不拦截）
+	const att = readAttachment(masterAddress());
+	if (att && att.sessionId === sessionId) return reject("master-session-protected");
+
+	// 目标存在性校验（post-claim，与 no-workstream 同口径：读盘面后的业务拒绝可重放）
+	const sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
+	if (findSessionFile(sessionsDir, sessionId) === null) return reject("no-session");
+
+	const payload = frame.payload as { text: string; reason?: string };
+	const dedupeKey = `${frame.type}:${frame.commandKey}`;
+	const dir = outboxDir(stateRoot(opts));
+	try {
+		mkdirSync(dir, { recursive: true });
+	} catch (e) {
+		return { status: "failed", reason: "io-error", error: `mkdir outbox: ${msg(e)}`, replayed: false };
+	}
+	const item = newOutboxItem({
+		dedupeKey,
+		commandKey: frame.commandKey,
+		to: frame.to,
+		sessionId,
+		text: payload.text,
+		...(payload.reason !== undefined ? { reason: payload.reason } : {}),
+		now: opts.now ?? new Date(),
+	});
+	try {
+		writeOutboxItem(dir, item);
+	} catch (e) {
+		return { status: "failed", reason: "io-error", error: `write outbox: ${msg(e)}`, replayed: false };
+	}
+
+	// journal message.queued（safe wrapper：写失败不影响回执；正文不进 journal，§15 大内容不进信封）
+	try {
+		const at = (opts.now ?? new Date()).toISOString();
+		appendRuntimeEnvelopeSafe(
+			newEventEnvelope({
+				type: "message.queued",
+				source: frame.issuedBy,
+				subject: frame.to,
+				at,
+				recordedAt: at,
+				payload: { commandKey: frame.commandKey, outboxId: item.id, sessionId },
+				dedupeKey: `message.queued:${item.id}`,
+			}),
+			opts.journalPath ?? defaultJournalPath(),
+		);
+	} catch {
+		/* safe wrapper 自吞，双保险 */
+	}
+	return {
+		status: "accepted",
+		summary: `message queued → pi://${sessionId}（outbox ${item.id.slice(0, 8)}；两段式：扩展桥注入后回写 delivered/failed）`,
+		replayed: false,
+	};
 }
 
 function readConfigRaw(configPath: string): Record<string, unknown> {

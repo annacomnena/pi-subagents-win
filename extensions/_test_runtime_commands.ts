@@ -2,7 +2,7 @@
  * _test_runtime_commands.ts — G4 测试：deterministic command executor
  * （plans/0920_G4_cmdexec_plan.md §6 测试清单，9 组）
  *
- *   G1 白名单：COMMAND_TYPES +3 过 validateCommandFrame；未知 type 仍拒
+ *   G1 白名单：COMMAND_TYPES additive 全集过 validateCommandFrame；未知 type 仍拒
  *   G2 去重：同 commandKey 重放返回首次 outcome，状态/journal 零二次变化
  *   G3 journal：command.accepted|rejected|failed 各一事件（subject/dedupeKey）+ safe wrapper
  *   G4 四命令行为：pause/resume 迁移校验与幂等 no-op；accept 全分支（含 master-only target
@@ -28,7 +28,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-commands-env-")
 const ROOT = process.env.PI_RUNTIME_DIR!;
 const STATE = join(ROOT, "state");
 
-import { masterAddress, workstreamAddress } from "./runtime/address.ts";
+import { masterAddress, piSessionAddress, workstreamAddress } from "./runtime/address.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 import { createWorkstream, listAudit, readWorkstream, updateWorkstream } from "./runtime/workstreams.ts";
 import { COMMAND_TYPES, newCommandFrame, newMessageFrame, validateCommandFrame, type CommandFrame } from "./runtime/protocol.ts";
@@ -40,6 +40,7 @@ import {
 	type ExecuteCommandOptions,
 } from "./runtime/command-executor.ts";
 import { readAttachment, setCutover, attachMaster } from "./runtime/registry.ts";
+import { listOutboxItems, outboxDir, readOutboxItem } from "./runtime/message-outbox.ts";
 import { maybePropose, readProposal } from "./runtime/master-succession.ts";
 import { writeLiveness } from "./runtime/liveness.ts";
 import { deliverCommand, deliverLetter, listLetters } from "./runtime/mailbox.ts";
@@ -85,10 +86,13 @@ function commandsFiles(commandsDir: string): string[] {
 	return existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [];
 }
 
-async function postJson(base: string, path: string, body: unknown): Promise<{ status: number; body: any }> {
+let AUTH_TOKEN: string | null = null; // G6-P2：POST /v1/commands 认证（G8 服务端创建后置值；缺省 null = 裸发）
+
+async function postJson(base: string, path: string, body: unknown, opts: { headers?: Record<string, string> } = {}): Promise<{ status: number; body: any }> {
+	const headers: Record<string, string> = { "content-type": "application/json", ...(AUTH_TOKEN !== null ? { "x-command-token": AUTH_TOKEN } : {}), ...(opts.headers ?? {}) };
 	const res = await fetch(`${base}${path}`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers,
 		body: typeof body === "string" ? body : JSON.stringify(body),
 	});
 	const text = await res.text();
@@ -100,8 +104,8 @@ try {
 	{
 		assert.deepEqual(
 			[...COMMAND_TYPES],
-			["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare"],
-			"词表 additive（G4 +3 / G5.2 +prepare，只加不改）",
+			["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare", "session.message"],
+			"词表 additive（G4 +3 / G5.2 +prepare / G6-P2 +session.message，只加不改）",
 		);
 		for (const type of ["workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare"] as const) {
 			const f = newCommandFrame({ type, to: master, issuedBy: "agent://x", commandKey: `k-${type}`, issuedAt: iso() });
@@ -400,6 +404,21 @@ try {
 		});
 		const base = `http://127.0.0.1:${h.info.port}`;
 		try {
+			// G6-P2 认证矩阵：无凭据 401 / 错 token 401 / X-Command-Token 200 / Cookie 200
+			AUTH_TOKEN = h.info.token;
+			assert.ok(typeof AUTH_TOKEN === "string" && AUTH_TOKEN.length > 0, "host token 已生成");
+			const saved = AUTH_TOKEN;
+			AUTH_TOKEN = null;
+			const unauth = await postJson(base, "/v1/commands", { frame: "command", type: "workstream.pause", to, commandKey: "noauth", issuedAt: iso() });
+			assert.equal(unauth.status, 401, "无凭据 → 401 fail-closed");
+			assert.equal(unauth.body.error, "unauthorized");
+			const badTok = await postJson(base, "/v1/commands", { frame: "command", type: "workstream.pause", to, commandKey: "badtok", issuedAt: iso() }, { headers: { "x-command-token": "wrong" } });
+			assert.equal(badTok.status, 401, "错 token → 401");
+			const badCookie = await fetch(`${base}/v1/commands`, { method: "POST", headers: { "content-type": "application/json", cookie: "sw_host_token=nope" }, body: JSON.stringify({ frame: "command", type: "workstream.pause", to, commandKey: "badck", issuedAt: iso() }) });
+			assert.equal(badCookie.status, 401, "错 cookie → 401");
+			const okCookie = await fetch(`${base}/v1/commands`, { method: "POST", headers: { "content-type": "application/json", cookie: `sw_host_token=${saved}` }, body: JSON.stringify({ frame: "command", type: "workstream.pause", to, commandKey: "okck-noop", issuedAt: iso() }) });
+			assert.equal(okCookie.status, 200, "对 cookie → 200（同源 UI 通道）");
+			AUTH_TOKEN = saved;
 			// POST 合法帧 → 200 + 回执；同键重放 → replayed:true
 			const p1 = await postJson(base, "/v1/commands", { frame: "command", type: "workstream.pause", to, commandKey: "http-1", issuedAt: iso() });
 			assert.equal(p1.status, 200);
@@ -634,6 +653,111 @@ try {
 			assert.equal(proposed5.length, 1, "恰一条 proposed journal");
 			assert.equal((proposed5[0]!.payload as { proposalId?: string }).proposalId, prop5.proposalId);
 		}
+	}
+
+	// ── G11 session.message（G6-P2）：Master 403 护栏 / pi scheme 封闭 / 存在性校验 / payload 恶意输入 / outbox 两段式第一段 ──
+	{
+		const SM = join(ROOT, "state-sm");
+		mkdirSync(SM, { recursive: true });
+		const J11 = join(ROOT, "events-sm.jsonl");
+		const sessionsDir = join(ROOT, "sessions-sm");
+		mkdirSync(sessionsDir, { recursive: true });
+		const targetSid = "11111111-2222-3333-4444-555555555555";
+		writeFileSync(join(sessionsDir, `2026-09-22T09-00-00-000Z_${targetSid}.jsonl`), `{\"type\":\"session\",\"version\":3,\"id\":\"${targetSid}\",\"timestamp\":\"2026-09-22T09:00:00.000Z\",\"cwd\":\"C:\\\\ws\\\\sm\"}\n`, "utf8");
+		const sm = (commandKey: string, to: string, payload?: Record<string, unknown>) =>
+			frame({ type: "session.message", to, commandKey, payload });
+		const msg = (text: string, extra?: Record<string, unknown>) => ({ text, ...(extra ?? {}) });
+		const obDir = outboxDir(SM);
+		const outboxCount = (): number => listOutboxItems(obDir).length;
+
+		// 护栏一：to=agent://master_default → 403 master-session-protected（executor 层，先于 scheme/payload 校验）
+		const r403 = exec(sm("sm-master", master, msg("hi")), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(r403.status === "rejected" && r403.reason === "master-session-protected", `master_default → 403：${JSON.stringify(r403)}`);
+		assert.equal(outboxCount(), 0, "403 不写 outbox");
+		assert.equal(commandsFiles(join(SM, "commands")).length, 0, "403 前置拒绝不占幂等键");
+		assert.equal(listRuntimeEnvelopes({ path: J11 }).envelopes.length, 0, "403 不进 journal");
+
+		// 护栏二：pi://<当前 master attachment 会话> → 同 403（换皮地址）
+		const att11 = readAttachment(master)!;
+		const r403b = exec(sm("sm-master-sid", piSessionAddress(att11.sessionId), msg("hi")), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(r403b.status === "rejected" && r403b.reason === "master-session-protected", "master attachment 会话换 pi 地址 → 同 403");
+
+		// pi scheme 封闭：其它 scheme → invalid-payload
+		assert.equal(exec(sm("sm-ws", "workstream://whatever", msg("hi")), { stateDir: SM, sessionsDir }).reason, "invalid-payload");
+		assert.equal(exec(sm("sm-agent", "agent://other_worker", msg("hi")), { stateDir: SM, sessionsDir }).reason, "invalid-payload");
+
+		// 存在性校验：pi://<不存在的会话> → no-session（post-claim，可重放）
+		const rMissing = exec(sm("sm-missing", piSessionAddress("99999999-9999-9999-9999-999999999999"), msg("hi")), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(rMissing.status === "rejected" && rMissing.reason === "no-session", "目标不存在 → no-session");
+		const rMissing2 = exec(sm("sm-missing", piSessionAddress("99999999-9999-9999-9999-999999999999"), msg("hi")), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(rMissing2.status === "rejected" && rMissing2.replayed, "no-session 幂等重放（outcome 已落）");
+
+		// payload 恶意输入矩阵（结构性拒绝，claim 之前）
+		const smDir = (k: string, payload: unknown) => exec(sm(k, piSessionAddress(targetSid), payload as Record<string, unknown>), { stateDir: SM, sessionsDir });
+		assert.equal(smDir("sm-empty", { text: "" }).reason, "invalid-payload", "空文本拒绝");
+		assert.equal(smDir("sm-missing-text", {}).reason, "invalid-payload", "缺 text 拒绝");
+		assert.equal(smDir("sm-num", { text: 42 }).reason, "invalid-payload", "text 非字符串拒绝");
+		assert.equal(smDir("sm-long", { text: "x".repeat(8001) }).reason, "invalid-payload", "超长（8001 字节）拒绝");
+		assert.equal(smDir("sm-ctrl", { text: "a\u0000b" }).reason, "invalid-payload", "控制字符 NUL 拒绝");
+		assert.equal(smDir("sm-esc", { text: "a\u001bb" }).reason, "invalid-payload", "控制字符 ESC 拒绝");
+		assert.equal(smDir("sm-extra", { text: "hi", extra: 1 }).reason, "invalid-payload", "多余字段拒绝");
+		assert.equal(smDir("sm-reason-long", { text: "hi", reason: "r".repeat(513) }).reason, "invalid-payload", "reason >512 字节拒绝");
+		assert.equal(outboxCount(), 0, "恶意输入零 outbox 盘面");
+
+		// G6-P2 L4 补矩阵：多字节字节上限 / DEL / 全量 C0（保留 \t\n\r）/ 结构拒绝不占幂等键
+		assert.equal(smDir("sm-mb-over", { text: "中".repeat(2667) }).reason, "invalid-payload", "多字节 8001 字节拒绝（UTF-8 字节上限非字符数）");
+		assert.equal(smDir("sm-mb-mixed", { text: "中".repeat(2666) + "abc" }).reason, "invalid-payload", "混合 8001 字节拒绝");
+		{
+			const rMbOk = smDir("sm-mb-ok", { text: "中".repeat(2666) + "a" });
+			assert.ok(rMbOk.status === "accepted", `恰 7999 字节多字节放行（2666×3+1）：${JSON.stringify(rMbOk)}`);
+		}
+		assert.equal(smDir("sm-del", { text: "a\u007fb" }).reason, "invalid-payload", "DEL 拒绝");
+		for (let code = 1; code <= 31; code++) {
+			if (code === 9 || code === 10 || code === 13) continue; // \t\n\r 保留
+			assert.equal(smDir(`sm-c0-${code}`, { text: `a${String.fromCodePoint(code)}b` }).reason, "invalid-payload", `C0 ${code} 拒绝`);
+		}
+		// 结构性拒绝发生在 claim 之前：同键先 invalid 后 valid → valid 全新执行（非 replay）
+		assert.equal(smDir("sm-key-reuse", { text: "" }).reason, "invalid-payload");
+		{
+			const rReuse = smDir("sm-key-reuse", { text: "reuse" });
+			assert.ok(rReuse.status === "accepted" && rReuse.replayed === false, "结构拒绝不占幂等键：同键 valid 全新执行");
+		}
+
+		// 边界放行：8000 字节整 / \t\n\r 保留 / reason 512 字节
+		const r8000 = smDir("sm-8000", { text: "y".repeat(8000) });
+		assert.ok(r8000.status === "accepted", "8000 字节整 → accepted");
+		const rWs = smDir("sm-wschars", { text: "line1\nline2\ttab\rcr" });
+		assert.ok(rWs.status === "accepted", "\t\n\r 放行");
+		const itemWs = listOutboxItems(obDir).find((it) => it.commandKey === "sm-wschars")!;
+		assert.equal(itemWs.text, "line1\nline2\ttab\rcr", "正文逐字保留");
+
+		// happy path：accepted → outbox pending 落盘 + journal queued；正文不进 journal
+		const jBefore = listRuntimeEnvelopes({ path: J11 }).envelopes;
+		const rOk = exec(sm("sm-ok", piSessionAddress(targetSid), msg("你好，远程会话", { reason: "gui" })), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(rOk.status === "accepted" && rOk.summary.includes("queued"), `accepted：${JSON.stringify(rOk)}`);
+		const items = listOutboxItems(obDir);
+		const item = items.find((it) => it.commandKey === "sm-ok")!;
+		assert.ok(item, "outbox 项已落盘");
+		assert.equal(item.status, "pending", "第一段状态 = pending");
+		assert.equal(item.to, piSessionAddress(targetSid));
+		assert.equal(item.sessionId, targetSid);
+		assert.equal(item.text, "你好，远程会话");
+		assert.equal(item.reason, "gui");
+		const jAfter = listRuntimeEnvelopes({ path: J11 }).envelopes;
+		const accepted = jAfter.find((e) => e.type === "command.accepted" && (e.payload as any)?.commandKey === "sm-ok");
+		const queued = jAfter.find((e) => e.type === "message.queued" && (e.payload as any)?.commandKey === "sm-ok");
+		assert.ok(accepted && queued, "journal 双事件（command.accepted + message.queued）");
+		assert.equal((queued!.payload as any).outboxId, item.id, "queued.outboxId 关联");
+		assert.equal((queued!.payload as any).sessionId, targetSid);
+		assert.equal(JSON.stringify(jAfter).includes("你好"), false, "正文绝不进 journal");
+		// pi 会话文件零接触（§29：executor 不写会话，注入是桥的事）
+		assert.equal(readFileSync(join(sessionsDir, `2026-09-22T09-00-00-000Z_${targetSid}.jsonl`), "utf8").split("\n").filter((l) => l.trim()).length, 1, "目标会话文件未被触碰");
+
+		// 同键幂等重放：replayed:true、单文件、queued 不重复
+		const rReplay = exec(sm("sm-ok", piSessionAddress(targetSid), msg("你好，远程会话")), { stateDir: SM, journalPath: J11, sessionsDir });
+		assert.ok(rReplay.status === "accepted" && rReplay.replayed, "同键重放幂等");
+		assert.equal(listOutboxItems(obDir).filter((it) => it.commandKey === "sm-ok").length, 1, "单 outbox 文件");
+		assert.equal(listRuntimeEnvelopes({ path: J11 }).envelopes.filter((e) => e.type === "message.queued" && (e.payload as any)?.commandKey === "sm-ok").length, 1, "queued 不重复");
 	}
 
 	// ── G9 冒烟（续）：consumer 命令信接线（0920 backlog A：master_default 域 → executor）──

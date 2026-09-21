@@ -1,6 +1,6 @@
 {
   "name": "subagent-win",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "type": "module",
   "description": "Windows-compatible pi subagent extension: single/parallel/async execution, per-call model override, external CLI backends (Claude Code / Codex / Antigravity / AtomCode), Codex header compat, and workflow orchestration.",
   "keywords": [
@@ -41,6 +41,8 @@
     "test:no-poll": "node --experimental-strip-types ./extensions/_test_no_poll.ts",
     "test:runtime-core": "node --experimental-strip-types ./extensions/_test_runtime_core.ts",
     "test:runtime-journal": "node --experimental-strip-types ./extensions/_test_runtime_journal.ts",
+    "test:runtime-journal-seq": "node --experimental-strip-types ./extensions/_test_runtime_journal_seq.ts",
+    "test:runtime-transcript": "node --experimental-strip-types ./extensions/_test_runtime_transcript.ts",
     "test:runtime-projector": "node --experimental-strip-types ./extensions/_test_runtime_projector.ts",
     "test:capabilities": "node --experimental-strip-types ./extensions/_test_capabilities.ts",
     "test:runner-tools": "node --experimental-strip-types ./extensions/_test_runner_tools.ts",
@@ -57,6 +59,9 @@
     "test:tab-runs-runtime": "node --experimental-strip-types ./extensions/_test_tab_runs_runtime.ts",
     "test:timers": "node --experimental-strip-types ./extensions/_test_timers.ts",
     "test:timers-runtime": "node --experimental-strip-types ./extensions/_test_timers_runtime.ts",
+    "test:tui-progress": "node --experimental-strip-types ./extensions/_test_tui_progress.ts",
+    "test:memory-guard": "node --experimental-strip-types ./extensions/_test_memory_guard.ts",
+    "test:gc-cleaner": "node --experimental-strip-types ./extensions/_test_gc_cleaner.ts",
     "test:async-panel": "node --experimental-strip-types ./extensions/_test_async_panel.ts",
     "test:links": "node --experimental-strip-types ./extensions/_test_links.ts",
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
@@ -80,15 +85,23 @@
     "test:runtime-snapshot": "node --experimental-strip-types ./extensions/_test_runtime_snapshot.ts",
     "test:runtime-liveness": "node --experimental-strip-types ./extensions/_test_runtime_liveness.ts",
     "test:gui-store": "node --experimental-strip-types ./extensions/_test_gui_store_pagination.ts",
+    "test:gui-chat-guard": "node --experimental-strip-types ./extensions/_test_gui_chat_guard.ts",
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
+    "test:runtime-host-ws": "node --experimental-strip-types ./extensions/_test_runtime_host_ws.ts",
+    "test:runtime-stream-gen": "node --experimental-strip-types ./extensions/_test_runtime_stream_gen.ts",
+    "test:runtime-ws-rfc": "node --experimental-strip-types ./extensions/_test_runtime_ws_rfc.ts",
+    "test:runtime-token-hygiene": "node --experimental-strip-types ./extensions/_test_runtime_token_hygiene.ts",
     "test:runtime-host-projections": "node --experimental-strip-types ./extensions/_test_runtime_host_projections.ts",
+    "test:runtime-interactions": "node --experimental-strip-types ./extensions/_test_runtime_interactions.ts",
+    "test:gui-interaction-badge": "node --experimental-strip-types ./gui/src/_test_interaction_badge.ts",
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",
     "test:mailbox-command-consume": "node --experimental-strip-types ./extensions/_test_mailbox_command_consume.ts",
     "test:scope-stale-takeover": "node --experimental-strip-types ./extensions/_test_scope_stale_takeover.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts",
     "gui:dev": "node scripts/gui-dev.mjs",
-    "gui:build": "npm run build --prefix gui"
+    "gui:build": "npm run build --prefix gui",
+    "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
