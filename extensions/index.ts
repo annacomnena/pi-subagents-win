@@ -53,6 +53,7 @@ import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
 import { registerOutboxBridge } from "./outbox-bridge.ts";
+import { registerGuiAutoStart } from "./gui-autostart.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
 import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
@@ -1632,6 +1633,7 @@ export default function (pi: ExtensionAPI) {
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
+	collect(registerGuiAutoStart(pi));
 
 	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
 	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
