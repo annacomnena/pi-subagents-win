@@ -20,6 +20,8 @@ import {
 	decodeSessionsDirName,
 	formatRecentScopes,
 	listRecentScopes,
+	normalizeRepoKey,
+	resolveDecodedPath,
 } from "./runtime/recent-scopes.ts";
 
 const NOW = Date.parse("2026-09-22T12:00:00.000Z");
@@ -37,12 +39,32 @@ function write(p: string, obj: unknown): void {
 	writeFileSync(p, JSON.stringify(obj), "utf8");
 }
 
-// R4：目录名解码
+// R4：目录名解码（有损最佳努力）+ 归一化键
 {
 	assert.equal(decodeSessionsDirName("--G--code--GreenCAD--"), "G:/code/GreenCAD");
 	assert.equal(decodeSessionsDirName("--C--Users--Annacomnena--"), "C:/Users/Annacomnena");
 	assert.equal(decodeSessionsDirName("not-encoded"), "not-encoded");
 	assert.equal(decodeSessionsDirName("--X--"), "X");
+	// 归并键：分隔符/大小写差异塌缩
+	assert.equal(normalizeRepoKey("G:\\code\\GreenCAD"), normalizeRepoKey("G:/code/GreenCAD"));
+	assert.equal(normalizeRepoKey("G:/code/GreenCAD"), "gcodegreencad");
+	// 回填：真实存在的目录拼回去；不存在的保留原样
+	const tmpRoot = mkdtempSync(join(tmpdir(), "resolve-test-"));
+	try {
+		mkdirSync(join(tmpRoot, "my-repo"), { recursive: true });
+		mkdirSync(join(tmpRoot, "pi-packages", "subagent-win"), { recursive: true });
+		const slash = (s: string): string => s.replace(/\\/g, "/");
+		// 尾部单 join
+		assert.ok(slash(resolveDecodedPath(slash(join(tmpRoot, "my", "repo")))).endsWith("my-repo"));
+		// 中间段 join（pi-packages 在中间）
+		const mid = slash(resolveDecodedPath(slash(join(tmpRoot, "pi", "packages", "subagent", "win"))));
+		assert.ok(mid.endsWith("pi-packages/subagent-win"), mid);
+		// 全不存在 → 原样
+		const nope = slash(join(tmpRoot, "no", "such"));
+		assert.equal(slash(resolveDecodedPath(nope)), nope);
+	} finally {
+		rmSync(tmpRoot, { recursive: true, force: true });
+	}
 }
 
 // R1+R2+R3：三账本归并 + 窗口 + 去噪
@@ -77,8 +99,9 @@ function write(p: string, obj: unknown): void {
 		const keys = items.map((i) => i.key);
 		// GreenCAD 三证据归并一条（liveness 的 scope: 键与路径键是两条，属不同命名空间）
 		assert.ok(keys.includes("scope:GreenCAD"), "liveness 命中");
-		assert.ok(keys.includes("G:/code/GreenCAD"), "tab+session 归并命中");
-		const repo = items.find((i) => i.key === "G:/code/GreenCAD")!;
+		// tab 精确路径与 session 有损解码按归一化键合并，展示用精确路径
+		assert.ok(keys.includes("G:/code/GreenCAD") || keys.includes("G:\\code\\GreenCAD"), "tab+session 归并命中");
+		const repo = items.find((i) => i.key === "G:/code/GreenCAD" || i.key === "G:\\code\\GreenCAD")!;
 		assert.deepEqual(repo.sources.sort(), ["session", "tab:101"]);
 		assert.equal(repo.lastActiveAt, new Date(NOW - 2 * DAY).toISOString(), "取最新证据时间");
 		// 窗口外 + 噪音排除

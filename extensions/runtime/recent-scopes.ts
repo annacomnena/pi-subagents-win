@@ -45,19 +45,96 @@ function isNoise(s: string, includeNoise: boolean): boolean {
 	return !includeNoise && NOISE_RE.test(s);
 }
 
-/** pi sessions 目录名 → 可读路径（`--G--code-GreenCAD--` → `G:/code/GreenCAD`；失败原样） */
+/** pi sessions 目录名 → 可读路径（`--G--code-GreenCAD--` → `G:/code/GreenCAD`）。
+ *
+ * 注意 pi 编码本身有损：字面 `-`（如 `subagent-win`）与分隔符 `-` 不作区分，
+ * 故本函数是最佳努力展示，不保证逐字符还原。精确路径以 tab-runs/liveness 的
+ * 原始值为准（归并时见 normalizeRepoKey）。失败原样回显，永不抛。 */
 export function decodeSessionsDirName(name: string): string {
 	try {
 		if (!name.startsWith("--") || !name.endsWith("--")) return name;
 		const inner = name.slice(2, -2);
 		const parts = inner.split("--");
 		if (parts.length >= 2 && /^[A-Za-z]$/.test(parts[0]!)) {
-			return `${parts[0]}:/${parts.slice(1).join("/")}`;
+			// 盘符后的剩余段按单 `-` 切分（有损，见上注）
+			const rest = parts.slice(1).join("-").split("-").filter((s) => s.length > 0);
+			return `${parts[0]}:/${rest.join("/")}`;
 		}
 		return parts.join("/");
 	} catch {
 		return name;
 	}
+}
+
+/**
+ * 仓库归并键：去分隔符（`/\:-`）+ 小写。用途：把 tab-runs 的精确路径
+ * （`G:\code\GreenCAD`）与 sessions 的有损解码（`G:/code/GreenCAD`，甚至
+ * 过切分的 `G:/code/GreenCAD/169/Jig`）归到同一条。scope 键（basename）
+ * 另行处理（见下）。
+ */
+export function normalizeRepoKey(s: string): string {
+	return s.replace(/[\\/:\-]+/g, "").toLowerCase();
+}
+
+/**
+ * sessions 解码回填：pi 编码有损（字面 `-` 被切散），解码串若在磁盘上不存在，
+ * 按 join 数从少到多试不同分组（`a/b/c` → `a-b/c`、`a/b-c` → `a-b-c`），
+ * 命中第一个存在的即返回。BFS 上限 maxChecks 次 existsSync（缺省 24），
+ * 全不存在则保留解码串（证据有效性不受影响，只是展示欠精确）。never-throw。
+ */
+export function resolveDecodedPath(guess: string, maxChecks = 24): string {
+	try {
+		if (existsSync(guess)) return guess;
+		const parts = guess.split("/");
+		if (parts.length < 2) return guess;
+		// 组合数由 k<=3 与 maxChecks 双重封顶（与 parts 深度无关；前导固定段多只影响单次 existsSync 成本）
+		let checks = 0;
+		const gaps = parts.length - 1;
+		const build = (joinSet: Set<number>): string => {
+			const out: string[] = [parts[0]!];
+			for (let i = 0; i < gaps; i++) {
+				if (joinSet.has(i)) out[out.length - 1] += `-${parts[i + 1]}`;
+				else out.push(parts[i + 1]!);
+			}
+			return out.join("/");
+		};
+		// k=1..gaps：先少 join 后多 join；同 k 内优先尾部（仓库名多半在尾）
+		for (let k = 1; k <= gaps && checks < maxChecks; k++) {
+			const combos = gapCombinations(gaps, k);
+		// 尾部优先：按最大 join 位置倒序
+		combos.sort((a, b) => Math.max(...b) - Math.max(...a));
+		for (const c of combos) {
+			if (checks >= maxChecks) break;
+			checks++;
+			const cand = build(new Set(c));
+			if (existsSync(cand)) return cand;
+		}
+		if (combos.length === 0) break;
+		// 组合数过大（C(9,4)=126）时只试尾部优先的前 maxChecks 个，k 即停
+		if (k >= 3) break;
+		}
+		return guess;
+	} catch {
+		return guess;
+	}
+}
+
+/** C(n,k) 间隙组合（n<=9 才调，调用方已限深） */
+function gapCombinations(n: number, k: number): number[][] {
+	const out: number[][] = [];
+	const rec = (start: number, acc: number[]): void => {
+		if (acc.length === k) {
+			out.push([...acc]);
+			return;
+		}
+		for (let i = start; i < n; i++) {
+			acc.push(i);
+			rec(i + 1, acc);
+			acc.pop();
+		}
+	};
+	rec(0, []);
+	return out;
 }
 
 function readJsonFile(path: string): Record<string, unknown> | null {
@@ -85,19 +162,28 @@ function toMs(v: unknown): number | null {
  * 只跳过该账本，不整体失败；空目录/空结果返回 []。
  */
 export function listRecentScopes(opts: RecentScopesOptions = {}): RecentScope[] {
-	const out = new Map<string, { last: number; sources: Set<string> }>();
+	const out = new Map<string, { last: number; sources: Set<string>; display: string }>();
 	try {
 		const now = opts.now ?? Date.now();
 		const since = now - (opts.sinceMs ?? DEFAULT_SINCE_MS);
 		const agentDir = opts.agentDir ?? join(homedir(), ".pi", "agent");
 		const includeNoise = opts.includeNoise ?? false;
-		const touch = (key: string, atMs: number | null, source: string): void => {
+		// touch 用归并键合并，但展示保留最精确的原始串（tab-runs 的真实 cwd 优先于
+		// sessions 的有损解码；scope: 键自成命名空间，不与路径合并）。
+		const touch = (rawKey: string, atMs: number | null, source: string): void => {
 			if (atMs === null || atMs < since || atMs > now + 60_000) return;
-			if (isNoise(key, includeNoise)) return;
-			const e = out.get(key) ?? { last: 0, sources: new Set<string>() };
+			if (isNoise(rawKey, includeNoise)) return;
+			const mergeKey = rawKey.startsWith("scope:")
+				? rawKey
+				: `repo:${normalizeRepoKey(rawKey)}`;
+			const e = out.get(mergeKey) ?? { last: 0, sources: new Set<string>(), display: rawKey };
 			if (atMs > e.last) e.last = atMs;
+			// 展示优先级：含路径分隔符的精确串 > 纯解码猜测 > 短键
+			const score = (s: string): number =>
+				(s.includes("\\") ? 3 : 0) + (s.includes("/") ? 2 : 0) + (s.includes(":") ? 1 : 0) + Math.min(s.length / 64, 1);
+			if (score(rawKey) > score(e.display)) e.display = rawKey;
 			e.sources.add(source);
-			out.set(key, e);
+			out.set(mergeKey, e);
 		};
 
 		// ① scope-liveness 心跳
@@ -148,22 +234,22 @@ export function listRecentScopes(opts: RecentScopesOptions = {}): RecentScope[] 
 				} catch {
 					continue;
 				}
-				if (latest > 0) touch(decodeSessionsDirName(d), latest, "session");
+				if (latest > 0) touch(resolveDecodedPath(decodeSessionsDirName(d)), latest, "session");
 			}
 		} catch {
 			/* 账本缺失只跳过 */
 		}
 
 		return [...out.entries()]
-			.map(([key, e]) => ({
-				key,
+			.map(([, e]) => ({
+				key: e.display,
 				lastActiveAt: new Date(e.last).toISOString(),
 				sources: [...e.sources].sort(),
 			}))
 			.sort((a, b) => (a.lastActiveAt < b.lastActiveAt ? 1 : -1));
 	} catch {
-		return [...out.entries()].map(([key, e]) => ({
-			key,
+		return [...out.entries()].map(([, e]) => ({
+			key: e.display,
 			lastActiveAt: new Date(e.last).toISOString(),
 			sources: [...e.sources].sort(),
 		}));
