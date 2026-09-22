@@ -52,6 +52,7 @@ import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsy
 import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
+import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import { registerOutboxBridge } from "./outbox-bridge.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts";
 import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
@@ -1612,13 +1613,13 @@ export default function (pi: ExtensionAPI) {
 			const outcome = maybeAutoCollectTraceRun(finishedTabRunId);
 			if (!outcome.isTrace) return false; // 普通 tab → 默认 toast + reclaim 注入
 			if (outcome.phase === "started") {
-				try {
-					pi.sendUserMessage?.(
-						`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
+				// L3：await send 结果吞掉 busy 拒绝（防逃逸到 bindCore 报成 Extension "<runtime>" error）；
+				// 通知尽力而为（busy/failed 不阻塞），收集已在后台，用 /trace-fusion-status 查进度。
+				injectFollowUpQuietly(
+					pi.sendUserMessage,
+					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
 进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
-						{ deliverAs: "followUp" },
-					);
-				} catch { /* 通知尽力而为，收集已在后台 */ }
+				);
 			}
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
 		},

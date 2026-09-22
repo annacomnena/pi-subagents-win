@@ -25,14 +25,15 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { watch, type FSWatcher } from "node:fs";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
 import { claimNotified, shouldRegisterWatcher } from "./event-bus.ts";
 import { getCurrentSessionId, setCurrentSessionId } from "./identity.ts";
-import { preInject, postInject, type InjectionContext } from "./injection-gate.ts";
+import { preInject, postInject, injectFollowUpQuietly, type InjectionContext } from "./injection-gate.ts";
+import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
@@ -126,6 +127,25 @@ function readRunRecord(runsDir: string, runId: string): RunRecord | null {
 // ── 核心处理 ───────────────────────────────────────────────────────────
 
 /**
+ * 释放 async run 的注入认领（L3 忙时冲突静默重试，best-effort）。
+ *
+ * send 被 busy 拒绝（agent 忙，消息**未真正注入**）时：不 confirm（postInject）、不 selfDisable，
+ * 而是释放本 run 的三层去重/认领，让下 tick / 下次 fs 事件重新领取并重试：
+ *   1. unlink `<runId>.notified`   （跨实例去重，event-bus claimNotified 的 .notified）
+ *   2. releaseInjectionClaim(key, holder)  （注入互斥，.claiming.json；holder 门禁 + best-effort）
+ *   3. seenRunIds.delete(runId)    （进程内去重；不删则 onRunFile/pollUnnotified 会跳过，无法重试）
+ *
+ * at-least-once 收敛：最坏是「释放与投递竞态」→ 重复注入一条，目标（主会话 LLM）可容忍
+ * （通知体幂等、status 重取内容相同）。各步 best-effort，失败不抛（残留认领会经 10min stale
+ * 接管收敛，不丢消息）。
+ */
+function releaseAsyncResultClaim(runsDir: string, runId: string, key: string, holder: string): void {
+	try { unlinkSync(join(runsDir, `${runId}.notified`)); } catch { /* best-effort */ }
+	releaseInjectionClaim(key, holder); // 内部已 best-effort；holder 门禁不误放 stale 接管者
+	seenRunIds.delete(runId);
+}
+
+/**
  * 处理单个 run 文件（幂等 + 三重去重）。
  * 返回 true 表示已注入/已消费；false 表示跳过。
  */
@@ -190,19 +210,28 @@ export function onRunFile(
 	try { refreshAsyncPanel(runsDir); } catch { /* best-effort */ }
 
 	// 注入（核心：向归属会话发 followUp 唤醒）
+	// L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条链 async，防竞态面扩大）。
 	if (opts.autoInject !== false) {
-		try {
-			const body = [
-				`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}`,
-				`产物: ${join(runsDir, `${runId}.json`)}`,
-				`下一步: 用 subagent-win({ action: "status", runId: "${runId}" }) 取全文。`,
-				NO_POLL_HINT,
-			].join("\n");
-			opts.sendUserMessage?.(body, { deliverAs: "followUp" });
-			postInject(gateCtx, true);
-		} catch {
-			selfDisabled = true; // stale 实例 → 停止注入
-		}
+		const body = [
+			`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}`,
+			`产物: ${join(runsDir, `${runId}.json`)}`,
+			`下一步: 用 subagent-win({ action: "status", runId: "${runId}" }) 取全文。`,
+			NO_POLL_HINT,
+		].join("\n");
+		injectFollowUpQuietly(opts.sendUserMessage, body).then((status) => {
+			if (status === "sent") {
+				postInject(gateCtx, true); // 注入成功 → 确认收据（receipt 只在 sent 后）
+			} else if (status === "busy") {
+				// agent 忙，消息未真正注入：不 confirm、不 selfDisable；释放本次认领供下 tick 重试
+				//（at-least-once：最坏重投一条，目标可容忍；详见 releaseAsyncResultClaim）。
+				releaseAsyncResultClaim(runsDir, runId, key, gate.holder);
+			} else if (status === "failed") {
+				selfDisabled = true; // 真实失败 → 停止注入（原失败路径）
+			} else {
+				// no-injector：没有实际发送，不能伪造 receipt；释放后等待注入通道恢复再重试。
+				releaseAsyncResultClaim(runsDir, runId, key, gate.holder);
+			}
+		});
 	} else {
 		postInject(gateCtx, true);
 	}

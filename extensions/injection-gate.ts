@@ -93,6 +93,51 @@ export function postInject(ctx: InjectionContext, ok: boolean): void {
 	}
 }
 
+// ── L3 忙时冲突静默重试（注入发送结果分类）──────────────────────────
+
+/**
+ * 注入发送结果分类（L3 修复：await send 结果，busy 冲突不再逃逸到 bindCore）。
+ *   - "sent"        发送成功（Promise resolve）→ 调用方走原 receipt 路径（postInject/confirm/ack）
+ *   - "busy"        发送 reject 且含 "already processing"（agent 忙）→ 消息**未真正注入**；
+ *                   调用方不得记 delivered、不得 selfDisable，应释放本次 claim 供下 tick 重试
+ *   - "failed"      其余 reject / 同步 throw（真实失败）→ 调用方走原失败路径（可 selfDisable）
+ *   - "no-injector" send 非函数（host 进程 / 测试桩未接注入通道）→ 调用方走原 no-injector 路径
+ */
+export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector";
+
+/**
+ * 静默发送一条 followUp 注入并 await 其结果（L3 修复核心）。
+ *
+ * 根因：`pi.sendUserMessage` 运行时是 async（返回 Promise，类型却标 void），旧调用点用**同步**
+ * try/catch 包着——busy 时的 rejection 逃过 try/catch，落到 bindCore 的包装器（agent-session.js
+ * `sendUserMessage(...).catch(err => emitError({ extensionPath: "<runtime>", ... }))`），被统一报成
+ * `Extension "<runtime>" error: Agent is already processing a prompt…`（<runtime> 是硬编码标签，
+ * 并非某个扩展名）。本函数 await send 结果并把异常**分类吞掉**（永不 reject），调用方即可据此
+ * 决定 receipt 时机与 claim 释放。
+ *
+ * 用法约束（调用方多为同步函数）：
+ *   - 用 `.then` 链衔接 receipt，**不要**把整条消费链改 async（防竞态面扩大）；
+ *   - **receipt 只在 "sent" 之后**："busy" 不得 postInject/confirm/ack（未真正注入，不得伪造终态）；
+ *   - 同步 throw（send 同步抛）与异步 reject（Promise reject）都被 `.catch` 捕获并分类。
+ *
+ * @param send  注入实现（生产接 pi.sendUserMessage，测试传 fake；undefined = 无注入通道）。
+ *              形参用 `unknown` 兼容「类型 void / 运行时 Promise」的 sendUserMessage。
+ * @param body  注入正文（字符串）。
+ */
+export function injectFollowUpQuietly(
+	send: ((body: string, opts?: { deliverAs?: string }) => unknown) | undefined,
+	body: string,
+): Promise<InjectionSendStatus> {
+	if (typeof send !== "function") return Promise.resolve("no-injector");
+	return Promise.resolve()
+		.then(() => send(body, { deliverAs: "followUp" }))
+		.then(() => "sent")
+		.catch((e: unknown): InjectionSendStatus => {
+			const msg = e instanceof Error ? e.message : String(e);
+			return /already processing/i.test(msg) ? "busy" : "failed";
+		});
+}
+
 export interface SuppressionRecord {
 	at: string;
 	path: InjectionPath;
