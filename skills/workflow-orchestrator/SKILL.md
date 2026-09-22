@@ -428,7 +428,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 ### 上下文纪律（lite 成败关键）
 
-- **只用 sync / parallel**：async 的 status 只回 500 字符预览，拿不到全文
+- **默认 async 非阻塞**：产物落盘 + 路径优先短摘要，靠完成事件/async-result-watcher 注入/timer 收割（status 预览仅 500 字符，细节住磁盘）；仅本轮就要用结果（下一步依赖、L4 复核）才派 sync；同批独立任务用 parallel
 - **交接默认落盘**：>30 行产物让 general 写 `plans/` 或 Wiki，回复只带路径 + ≤10 行摘要——细节住磁盘，不住主会话上下文（每阶段主会话开销 ~1K，不随任务规模增长）
 - **升级线**：预计中转材料 >10K token、fan-out ≥3、需跨会话存活 → 停用 lite，改 `launch-tabs` 完整链（mode=workflow/adaptive）；用户单次说「这次走完整链」可临时覆盖
 - 任务 tab 的模式纪律（workflow/research/execute/adaptive）不受 lite 影响
@@ -463,7 +463,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 → **execute 模式**：跳过搜索与计划 → implementer 按交接结论/计划实现 → code-reviewer 审查 → **Wiki 收尾（功能页）**。
 
 **"lite 走一遍：xxx" / "轻量走一遍：xxx"**（需 /lite on 或 /lite auto 已开启，或用户本次明确要求 lite）  
-→ **lite 模式**：不开 tab、不用角色 agent，主会话直接编排 general：L1 检索（small）→ L2 计划（medium）→ L3 实现（medium）→ L4 独立审查（large，交 diff 不可省）→ L5 Wiki 收尾（small，可结论「无」）；交接默认落盘（>30 行写文件，回复只带路径+摘要）；只派 sync/parallel；中转材料 >10K token 或 fan-out≥3 → 升级 launch-tabs 完整链。
+→ **lite 模式**：不开 tab、不用角色 agent，主会话直接编排 general：L1 检索（small）→ L2 计划（medium）→ L3 实现（medium）→ L4 独立审查（large，交 diff 不可省）→ L5 Wiki 收尾（small，可结论「无」）；交接默认落盘（>30 行写文件，回复只带路径+摘要）；默认派 async（本轮就要用结果才 sync）；中转材料 >10K token 或 fan-out≥3 → 升级 launch-tabs 完整链。
 
 **"自适应执行：xxx"（任务书含根因+方案+文件域+验收标准，但不确定假设是否仍成立）**  
 → **adaptive 模式**（mode: "adaptive"）：tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链；A0 档（A 档条件 + 文件域 ≤3 文件/单模块/验收可跑通）由 tab 自执行 + 事件驱动咨询（咨询不替代升档）+ code-reviewer 独立审查（交 diff）；A 档先 ≤3 轮校验性核对验证假设，再按档位链条执行；执行中假设失效则升档并声明，降级禁止。

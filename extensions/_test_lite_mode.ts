@@ -68,7 +68,7 @@ assert("链段含 general", onLines[1].includes('agent="general"'));
 assert("链段投影 small=searcher 模型", onLines[1].includes("agens/agnes-3.0-flash"));
 assert("链段投影 medium=implementer 模型", onLines[1].includes("opencodego/omen-alpha"));
 assert("链段投影 large=consultant 模型", onLines[1].includes("openai-codex/gpt-5.6-terra"));
-assert("纪律段含 sync-only", onLines[2].includes("只派 sync / parallel"));
+assert("纪律段含 async-default", onLines[2].includes("默认派 async 非阻塞"));
 assert("纪律段含落盘交接", onLines[2].includes(">30 行"));
 assert("纪律段含独立审查", onLines[2].includes("交 git diff"));
 assert("纪律段含升级线", onLines[2].includes("launch-tabs"));

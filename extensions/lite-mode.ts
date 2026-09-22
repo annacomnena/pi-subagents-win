@@ -53,7 +53,7 @@ const CHAIN = (t: { small: string; medium: string; large: string }) =>
 	`[lite 链] L1 检索 → L2 计划 → L3 实现 → L4 独立审查 → L5 Wiki/文档收尾。全部 agent="general"（无角色身份），档位由调用方以 model= 传入——这是 lite 的既定机制而非例外 override：small（检索/文档/找证据）= ${t.small}；medium（实现/常规计划）= ${t.medium}；large（咨询/修订计划/独立审查）= ${t.large}。`;
 
 const DISCIPLINE =
-	"[lite 纪律] ①只派 sync / parallel（async 的 status 只回 500 字符预览，拿不到全文）；②交接默认落盘：>30 行的产物让 general 写 plans/ 或 Wiki，回复只带路径 + ≤10 行摘要——细节住磁盘，不住主会话上下文；③检索事实每条仍带代码位置 + Wiki 章节引用 + 校准状态；④searcher-mode 串/并行约束对 L1 检索同样生效；⑤L4 审查必须独立 general 进程 + 交 git diff，不可省、不可自己审自己；⑥升级线：预计中转材料 >10K token、fan-out ≥3、或需跨会话存活 → 停用 lite，改 launch-tabs 完整链（mode=workflow/adaptive）。";
+	"[lite 纪律] ①默认派 async 非阻塞（产物落盘 plans/ + 路径优先短摘要，靠 async-result-watcher 完成注入/完成事件/timer 收割；status 预览仅 500 字符，细节住磁盘）；仅当本轮就要用结果（下一步依赖、L4 复核点）才派 sync；同批独立任务用 parallel；②交接默认落盘：>30 行的产物让 general 写 plans/ 或 Wiki，回复只带路径 + ≤10 行摘要——细节住磁盘，不住主会话上下文；③检索事实每条仍带代码位置 + Wiki 章节引用 + 校准状态；④searcher-mode 串/并行约束对 L1 检索同样生效；⑤L4 审查必须独立 general 进程 + 交 git diff，不可省、不可自己审自己；⑥升级线：预计中转材料 >10K token、fan-out ≥3、或需跨会话存活 → 停用 lite，改 launch-tabs 完整链（mode=workflow/adaptive）。";
 
 const BOUNDARY =
 	"[lite 边界] 本段只约束本会话内的工作流编排；任务 tab（首行「根据workflow/research/execute/adaptive进行工作」）仍按其模式纪律块执行，不受本段影响。用户单次说「这次走完整链」可临时覆盖回 launch-tabs。切换：/lite on|auto|off。";
