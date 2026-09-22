@@ -37,6 +37,18 @@ export interface SymbolRef {
 	name: string;
 }
 
+/** 手写边（0922 组合计划 ②/§14.2“存判断算事实”）：codegraph 不可推导的
+ * 关系（范式复用/业务线/协作）由人手写，真相源是人的判断；调用/依赖类关系
+ * 不手写（①动态投影自动给）。upsert 时校验 topic_id 存在性 gate。 */
+export interface Rel {
+	/** 指向的已存在主题 ID（upsert 时存在性 gate；read 时失效标 [失效]） */
+	topic_id: string;
+	/** 关系种类（业务线/范式复用/协作…，≤20 字） */
+	kind: string;
+	/** 一句话说明（可选，≤80 字） */
+	note?: string;
+}
+
 export interface HotspotEntry {
 	topicId: string;
 	title: string;
@@ -49,6 +61,8 @@ export interface HotspotEntry {
 	updatedAt: string;
 	/** 最近引用验证时间（ISO）：只说明指针经过检查，不代表业务结论被验证 */
 	verifiedAt: string;
+	/** 手写边（可选，缺省 []；不 bump SCHEMA_VERSION，向后兼容旧文件） */
+	rel?: Rel[];
 }
 
 export interface HotspotFile {
@@ -73,6 +87,7 @@ export const MULTI_FIELD_LABELS = {
 	wiki: "Wiki",
 	symbols: "入口",
 	evidence: "证据",
+	rel: "关联",
 } as const;
 
 export function nowIso(): string {
@@ -85,4 +100,7 @@ export const ENTRY_LIMITS = {
 	scope: 80,
 	refs: 5,
 	topics: 8,
+	rel: 5,
+	relKind: 20,
+	relNote: 80,
 } as const;

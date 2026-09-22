@@ -28,6 +28,7 @@ import {
 	type HotspotEntry,
 	type HotspotFile,
 	type ParseResult,
+	type Rel,
 	type SymbolRef,
 	type WikiRef,
 } from "./types.ts";
@@ -85,6 +86,10 @@ export function readHotspot(path: string): ReadResult {
 
 const WIKI_RE = /^(.+?)(?:\s+→\s+(.+))?$/u; // path 或 path → section（懒惰匹配：第一个 " → " 分隔）
 
+/** 手写边行格式：`topic_id → kind（note?）`——topic_id 严格（TOPIC_ID 字符集），
+ *  → 分隔，末尾全角括号可选为 note。 */
+const REL_RE = /^([a-z0-9][a-z0-9-]{0,63})\s+→\s+(.+?)(?:\s*（([^）]*)）)?\s*$/u;
+
 export function parseHotspot(raw: string): ParseResult {
 	const lines = raw.split(/\r?\n/);
 	let i = 0;
@@ -110,7 +115,7 @@ export function parseHotspot(raw: string): ParseResult {
 	if (!Number.isInteger(revision) || revision < 0) return { ok: false, error: `revision 非法: ${revision}` };
 
 	const entries: HotspotEntry[] = [];
-	let cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[] } | null = null;
+	let cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[]; rel?: Rel[] } | null = null;
 	const seenTopics = new Set<string>();
 	const fail = (msg: string): ParseResult => ({ ok: false, error: `${msg}（行 ${i + 1}）` });
 
@@ -127,7 +132,7 @@ export function parseHotspot(raw: string): ParseResult {
 			}
 			if (seenTopics.has(topic[1]!)) return { ok: false, error: `主题重复: ${topic[1]}` };
 			seenTopics.add(topic[1]!);
-			cur = { topicId: topic[1]!, wiki: [], symbols: [], evidence: [] };
+			cur = { topicId: topic[1]!, wiki: [], symbols: [], evidence: [], rel: [] };
 			continue;
 		}
 		const field = /^-\s+([^：]+)：(.*)$/u.exec(trimmed);
@@ -171,6 +176,12 @@ export function parseHotspot(raw: string): ParseResult {
 				cur.symbols!.push({ path: v.slice(0, idx), name: v.slice(idx + 2) });
 				break;
 			}
+			case MULTI_FIELD_LABELS.rel: {
+				const m = REL_RE.exec(v);
+				if (!m) return fail(`关联格式应为 topic_id → kind（note?）: ${v}`);
+				cur.rel!.push({ topic_id: m[1]!, kind: m[2]!, ...(m[3] !== undefined ? { note: m[3] } : {}) });
+				break;
+			}
 			default:
 				return fail(`未知字段: ${label}`);
 		}
@@ -184,7 +195,7 @@ export function parseHotspot(raw: string): ParseResult {
 }
 
 function finalizeEntry(
-	cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[] },
+	cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[]; rel?: Rel[] },
 ): { ok: true; entry: HotspotEntry } | { ok: false; error: string } {
 	const missing: string[] = [];
 	if (!cur.title) missing.push(FIELD_LABELS.title);
@@ -202,6 +213,7 @@ function finalizeEntry(
 			evidence: cur.evidence ?? [],
 			updatedAt: cur.updatedAt!,
 			verifiedAt: cur.verifiedAt!,
+			rel: cur.rel ?? [],
 		},
 	};
 }
@@ -216,6 +228,7 @@ export function serializeHotspot(file: HotspotFile): string {
 		for (const w of e.wiki) out.push(`- ${MULTI_FIELD_LABELS.wiki}：${w.path}${w.section ? ` → ${w.section}` : ""}`);
 		for (const s of e.symbols) out.push(`- ${MULTI_FIELD_LABELS.symbols}：${s.path}::${s.name}`);
 		for (const ev of e.evidence) out.push(`- ${MULTI_FIELD_LABELS.evidence}：${ev.path}${ev.section ? ` → ${ev.section}` : ""}`);
+		for (const r of e.rel ?? []) out.push(`- ${MULTI_FIELD_LABELS.rel}：${r.topic_id} → ${r.kind}${r.note ? `（${r.note}）` : ""}`);
 		out.push(`- ${FIELD_LABELS.updatedAt}：${e.updatedAt}`, `- ${FIELD_LABELS.verifiedAt}：${e.verifiedAt}`, "");
 	}
 	return out.join("\n") + "\n";

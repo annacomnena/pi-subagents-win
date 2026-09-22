@@ -66,8 +66,30 @@ export function validateEntryShape(entry: HotspotEntry, root: string): Validatio
 			if (p) problems.push({ field, message: p });
 		}
 	}
-	for (const s of entry.symbols) {
+for (const s of entry.symbols) {
 		if (!s.name?.trim()) problems.push({ field: "entry.symbols", message: `符号名为空: ${s.path}` });
+	}
+	// ② 手写边：数量/形态（topic_id 严格字符集；kind 非空且不含全角括号——行格式歧义面）
+	const rels = entry.rel ?? [];
+	if (rels.length > ENTRY_LIMITS.rel) {
+		problems.push({ field: "entry.rel", message: `超过 ${ENTRY_LIMITS.rel} 条上限` });
+	}
+	for (const r of rels) {
+		if (!TOPIC_ID_RE.test(r.topic_id ?? "")) {
+			problems.push({ field: "entry.rel", message: `关联 topic_id 须匹配 ${TOPIC_ID_RE}: ${r.topic_id}` });
+		}
+		if (!r.kind?.trim()) problems.push({ field: "entry.rel", message: `关联 kind 不能为空: ${r.topic_id}` });
+		else if ([...r.kind].length > ENTRY_LIMITS.relKind) {
+			problems.push({ field: "entry.rel", message: `关联 kind 超过 ${ENTRY_LIMITS.relKind} 字: ${r.kind}` });
+		} else if (/[（）]/.test(r.kind)) {
+			problems.push({ field: "entry.rel", message: `关联 kind 不得含全角括号（行格式歧义）: ${r.kind}` });
+		}
+		if (r.note && [...r.note].length > ENTRY_LIMITS.relNote) {
+			problems.push({ field: "entry.rel", message: `关联 note 超过 ${ENTRY_LIMITS.relNote} 字: ${r.note}` });
+		} else if (r.note && /[（）]/.test(r.note)) {
+			// serialize 使用全角括号承载 note，允许其出现在正文会破坏 parse/serialize 往返。
+			problems.push({ field: "entry.rel", message: `关联 note 不得含全角括号（行格式歧义）: ${r.note}` });
+		}
 	}
 	for (const ts of [entry.updatedAt, entry.verifiedAt] as const) {
 		if (!ts || Number.isNaN(Date.parse(ts))) {
@@ -90,11 +112,13 @@ export function validateRepoRelativePath(p: string, root: string): string | null
 	return null;
 }
 
-/** 引用验证：文件存在 + 章节标题存在（精确匹配，trim 比较）；符号经 CodeGraph 验证。 */
+/** 引用验证：文件存在 + 章节标题存在（精确匹配，trim 比较）；符号经 CodeGraph 验证。
+ *  ② 手写边存在性 gate：`rel.topic_id` 必须指向已存在条目（knownTopics，含本条目自身），
+ *  指向不存在 → problem 拒写（手写边过期会误导，§14.2）。 */
 export function verifyReferences(
 	entry: HotspotEntry,
 	root: string,
-	opts: { codegraph?: boolean; codegraphTimeoutMs?: number } = {},
+	opts: { codegraph?: boolean; codegraphTimeoutMs?: number; knownTopics?: Set<string> } = {},
 ): EntryValidation {
 	const problems: ValidationProblem[] = [];
 	const refChecks: RefCheck[] = [];
@@ -124,6 +148,14 @@ export function verifyReferences(
 	for (const w of entry.wiki) checkRef(w);
 	for (const ev of entry.evidence) checkRef(ev);
 	for (const s of entry.symbols) checkRef({ path: s.path });
+
+	// ② 手写边存在性 gate（upsert 时拒写；read 时仅标 [失效] 不拒读）
+	const known = opts.knownTopics ?? new Set([entry.topicId]);
+	for (const r of entry.rel ?? []) {
+		if (!known.has(r.topic_id)) {
+			problems.push({ field: "entry.rel", message: `关联指向的主题不存在: ${r.topic_id}（请先 upsert 该主题或移除此关联）` });
+		}
+	}
 
 	// 符号验证（CodeGraph 可用时）
 	let symbolVerified = entry.symbols.length === 0; // 无符号条目视为“符号验证通过”（无符号可验）
@@ -174,7 +206,7 @@ export function sectionExists(absPath: string, section: string): boolean {
 
 // ── CodeGraph 桥（CLI 文本解析；符号名白名单校验后进命令行）──────────────
 
-const SYMBOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
+export const SYMBOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
 
 export function codegraphAvailable(root: string): boolean {
 	// Windows 下 .cmd 必须经 shell 调用（Node 安全限制）；--version 零退出即视为 CLI 可用。
@@ -238,7 +270,7 @@ export function checkStoreBudget(file: HotspotFile): ValidationProblem[] {
 	return [];
 }
 
-/** 用于 upsert 的“相同内容”判定：忽略时间戳差异只比较路由内容。 */
+/** 用于 upsert 的“相同内容”判定：忽略时间戳差异只比较路由内容（含手写边）。 */
 export function sameRoutingContent(a: HotspotEntry, b: HotspotEntry): boolean {
 	return (
 		a.topicId === b.topicId &&
@@ -246,7 +278,8 @@ export function sameRoutingContent(a: HotspotEntry, b: HotspotEntry): boolean {
 		(a.scope ?? "") === (b.scope ?? "") &&
 		JSON.stringify(a.wiki) === JSON.stringify(b.wiki) &&
 		JSON.stringify(a.symbols) === JSON.stringify(b.symbols) &&
-		JSON.stringify(a.evidence) === JSON.stringify(b.evidence)
+		JSON.stringify(a.evidence) === JSON.stringify(b.evidence) &&
+		JSON.stringify(a.rel ?? []) === JSON.stringify(b.rel ?? [])
 	);
 }
 
