@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { isMainSession } from "./identity.ts";
 import { classifyHost, readHostInfo, type HostInfo } from "./runtime-host/discovery.ts";
 import { startRuntimeHost } from "./runtime-host/server.ts";
+import { traceSpawn } from "./spawn-trace.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const GUI_DIR = join(REPO_ROOT, "gui");
@@ -158,6 +159,7 @@ function defaultSpawnVite(o: { port: number; token: string | null; guiDir: strin
 	error?: string;
 } {
 	try {
+		traceSpawn("console-child", `vite pid-less spawn cwd=${o.guiDir} port=${o.port} exec=${process.execPath}`);
 		const child = spawn(process.execPath, [o.viteBin, "--port", String(o.port), "--strictPort"], {
 			detached: true,
 			stdio: "ignore",
@@ -176,6 +178,7 @@ export function openInBrowser(url: string): { ok: boolean; error?: string } {
 	try {
 		const bin = process.platform === "win32" ? "cmd.exe" : process.platform === "darwin" ? "open" : "xdg-open";
 		const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+		traceSpawn("browser", `${bin} ${args.join(" ")}`);
 		const child = spawn(bin, args, { detached: true, stdio: "ignore" });
 		child.unref();
 		return { ok: true };

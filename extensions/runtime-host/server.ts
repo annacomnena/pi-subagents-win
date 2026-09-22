@@ -101,6 +101,7 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
+import { traceSpawn } from "../spawn-trace.ts";
 import { executeCommand } from "../runtime/command-executor.ts";
 import { attachEventStream, WS_PATH, parseCookieToken, tokenMatches } from "./ws.ts";
 
@@ -741,6 +742,9 @@ export async function startRuntimeHost(opts?: {
 	return new Promise((resolvePromise) => {
 		let child: ReturnType<typeof spawn>;
 		try {
+			// 取证：host 是 detached（无控制台）进程；它再派生控制台子进程会被 Windows
+			// 分配新控制台 → 默认终端应用弹窗（spawn-trace.ts 头注 ②）
+			traceSpawn("console-child", `runtime-host detached spawn exec=${process.execPath} server=${serverPath}`);
 			child = spawn(
 			process.execPath,
 			["--experimental-strip-types", serverPath],

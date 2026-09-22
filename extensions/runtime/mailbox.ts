@@ -253,6 +253,28 @@ export function ackLetter(recipient: ObjectAddress, messageId: string, opts: { m
 }
 
 /**
+ * 释放一封已 claimed 的信（L3 忙时冲突静默重试）：claimed → pending，供下 tick 重新领取并重试。
+ *
+ * sendUserMessage 被 busy 拒绝（agent 忙，消息**未真正注入**）时，调用方**不得** ack/confirm
+ * （未投递，不得伪造终态）；应把信退回 pending 供下 tick 重试（at-least-once：最坏重投一条，
+ * 目标端按稳定 messageId 幂等去重）。
+ *
+ * 安全：仅当当前持有者匹配（claimedBy）才释放，避免误放已被他人 stale 接管（claimedBy 已变）
+ * 的信；状态/持有者不匹配时静默 no-op（返回 null）。
+ */
+export function releaseClaimed(
+	recipient: ObjectAddress,
+	messageId: string,
+	claimedBy: string,
+	opts: { mailboxDir?: string } = {},
+): Letter | null {
+	return mutateLetter(recipient, messageId, opts, (l) =>
+		l.status === "claimed" && l.claimedBy === claimedBy
+			? { ...l, status: "pending", claimedAt: undefined, claimedBy: undefined }
+			: null);
+}
+
+/**
  * 按 holder 批量 ack（wake 确认专用：claim 时 holder=`wake:<sid>:<ws>`，
  * 确认时同 holder 全收，无需逐文件名——command 信无 frame.id 也可收尾）。
  * 返回 ack 数量。

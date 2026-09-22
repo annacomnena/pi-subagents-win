@@ -2265,10 +2265,10 @@ export default function (pi: ExtensionAPI) {
 			"这是无头 subagent 工具，不会打开 Windows Terminal 标签页；sync/parallel/async 都仍是 subagent，不是 tab。需要可见独立标签页时，只有主会话才能调用 launch-tabs。",
 			"单 agent: { agent, task, model?, cwd? }",
 			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency? }",
-			"异步: { agent, task, model?, cwd?, async: true }（仍是无头 subagent）",
+			"异步: { agent, task, model?, cwd? }（**缺省就是异步**，仍是无头 subagent；本轮就要结果才显式 async: false 走同步）",
 			"查状态: { action: \"status\", runId? }（async subagent 的 runId 只能用这里查询）",
 			"不要对 async subagent 使用 tab-status、reclaim-tabs、tab-finish 或 set-timer。",
-			"【async 决策准则】结果马上要用 → 同步/并行 subagent；结果本回合不需要 → async subagent，然后只用 subagent-win action=status 查询。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
+			"【async 决策准则】缺省即异步（非阻塞，返回 runId，产物落盘 plans/，靠完成事件/async-result-watcher/status 收割）；只有结果本轮马上要用（下一步依赖、L4 复核）才显式 async: false 同步等待；同批独立任务用 tasks: [...] 并行（并行本身阻塞）。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
 			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\" | \"cli:zcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
 			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",
@@ -2289,7 +2289,7 @@ export default function (pi: ExtensionAPI) {
 				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
-			async: Type.Optional(Type.Boolean({ description: "异步执行" })),
+			async: Type.Optional(Type.Boolean({ description: "异步执行；**缺省 true（非阻塞，返回 runId 后靠完成事件/status 收割）**，只有本轮就要结果时才显式传 false 走同步等待" })),
 			action: Type.Optional(Type.String({ description: "status" })),
 			runId: Type.Optional(Type.String({ description: "异步 run id" })),
 			systemPrompt: Type.Optional(Type.String()),
@@ -2490,7 +2490,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (p.async) {
+			// 默认异步（用户 2026-09-22 指令）：只认「显式 false」为同步，其余（缺省/true）一律非阻塞。
+			// 动机：把「默认非阻塞」落到工具实现，而不是只靠提示词约束调用方（模型漏传 async 时旧实现会静默阻塞）。
+			if (p.async !== false) {
 				const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };

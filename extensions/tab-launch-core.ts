@@ -21,6 +21,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { traceSpawn } from "./spawn-trace.ts";
 
 export interface PiLaunchArgsOptions {
 	cwd: string;
@@ -192,6 +193,8 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 	if (!existsSync(options.execPath)) {
 		return { title, prompt, model, error: `preflight: node exec not found: ${options.execPath}` };
 	}
+	// 取证：wt.exe 派生是「空壳 WT 窗口」的第一嫌疑人（见 spawn-trace.ts 头注；PI_SPAWN_TRACE=0 关）
+	traceSpawn("wt", `title=${title} cwd=${cwd} runId=${tabRunId ?? "-"} wt=${wtPath}`);
 	try {
 		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, tabRunId), {
 			cwd,

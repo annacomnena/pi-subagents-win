@@ -11,6 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { traceSpawn } from "./spawn-trace.ts";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -60,6 +61,8 @@ export function sendWindowsToast(opts: NotifyOptions): void {
 			"[Windows.UI.Notifications.ToastNotification]::New($xml))",
 	].join("; ");
 
+	// 取证：powershell.exe 是控制台程序；无控制台的调用方（detached host）派生它会产生新控制台
+	traceSpawn("toast", `powershell.exe title=${title}`);
 	execFile(
 		"powershell.exe",
 		["-NoProfile", "-NonInteractive", "-Command", psScript],

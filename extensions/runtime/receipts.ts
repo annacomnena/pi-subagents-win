@@ -157,3 +157,29 @@ export function confirmInjection(key: string, by: string): boolean {
 	}
 	return true;
 }
+
+/**
+ * 释放注入互斥占位（best-effort，L3 忙时冲突静默重试）：仅 holder 一致时删 `<key>.claiming.json`。
+ *
+ * send 被 busy 拒绝（agent 忙，消息**未真正注入**）时，调用方**不得** confirm（写 injected
+ * 收据 = 伪造终态）；应释放本次 claim 供下 tick 重新领取并重试（下 tick = 10s 轮询，而非
+ * 10min stale 接管）。
+ *
+ * at-least-once 收敛语义：最坏情形是「释放与投递竞态」——目标其实已收到（释放稍迟）→ 重投
+ * 会重复一条消息，由目标端按稳定身份（outboxId / runId / messageId）幂等去重兜底，可接受。
+ * 本函数只保证「释放后可被重新领取」，不保证 exactly-once。
+ *
+ * best-effort：文件不存在、holder 已变或 IO 错误均不抛——占位若残留，10min
+ * stale 接管（claimInjection）终会收敛，不丢消息。
+ */
+export function releaseInjectionClaim(key: string, by: string): void {
+	if (!key || /\s/.test(key) || !by) return;
+	const path = claimingPath(key);
+	try {
+		const existing = JSON.parse(readFileSync(path, "utf8")) as { by?: string };
+		if (existing.by !== by) return;
+		unlinkSync(path);
+	} catch {
+		/* best-effort：ENOENT、已接管或其他 IO 错误静默容忍 */
+	}
+}
