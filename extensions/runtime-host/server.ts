@@ -742,14 +742,16 @@ export async function startRuntimeHost(opts?: {
 	return new Promise((resolvePromise) => {
 		let child: ReturnType<typeof spawn>;
 		try {
-			// 取证：host 是 detached（无控制台）进程；它再派生控制台子进程会被 Windows
-			// 分配新控制台 → 默认终端应用弹窗（spawn-trace.ts 头注 ②）
-			traceSpawn("console-child", `runtime-host detached spawn exec=${process.execPath} server=${serverPath}`);
+			// 2026-09-22 空壳 WT 根因修复（同 gui-autostart defaultSpawnVite）：不用 `detached: true`
+			//（DETACHED_PROCESS → 无控制台 → 任何子进程只能分配新控制台 → 默认终端 WT 弹窗）。
+			// 改用 `windowsHide: true`（CREATE_NO_WINDOW → host 拥有隐藏控制台，子树继承，不再分配
+			// 新控制台）。`unref()` 保留：pi 退出不连带杀 host（隐藏控制台属于 host 自身）。
+			traceSpawn("console-child", `runtime-host spawn exec=${process.execPath} server=${serverPath}`);
 			child = spawn(
 			process.execPath,
 			["--experimental-strip-types", serverPath],
 			{
-				detached: true,
+				windowsHide: true,
 				stdio: "ignore",
 				cwd: dirname(serverPath),
 				// 钉子进程的 runtime 目录 = hostPath 所在目录（默认场景下与现状一致；测试注入隔离时
