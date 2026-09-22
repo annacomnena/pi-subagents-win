@@ -1,6 +1,6 @@
 {
   "name": "subagent-win",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "description": "Windows-compatible pi subagent extension: single/parallel/async execution, per-call model override, external CLI backends (Claude Code / Codex / Antigravity / AtomCode), Codex header compat, and workflow orchestration.",
   "keywords": [
@@ -44,6 +44,7 @@
     "test:runtime-journal-seq": "node --experimental-strip-types ./extensions/_test_runtime_journal_seq.ts",
     "test:runtime-transcript": "node --experimental-strip-types ./extensions/_test_runtime_transcript.ts",
     "test:session-title": "node --experimental-strip-types ./extensions/_test_session_title.ts",
+    "test:session-pin": "node --experimental-strip-types ./extensions/_test_session_pin.ts",
     "test:runtime-projector": "node --experimental-strip-types ./extensions/_test_runtime_projector.ts",
     "test:capabilities": "node --experimental-strip-types ./extensions/_test_capabilities.ts",
     "test:runner-tools": "node --experimental-strip-types ./extensions/_test_runner_tools.ts",
@@ -64,6 +65,7 @@
     "test:memory-guard": "node --experimental-strip-types ./extensions/_test_memory_guard.ts",
     "test:gc-cleaner": "node --experimental-strip-types ./extensions/_test_gc_cleaner.ts",
     "test:async-panel": "node --experimental-strip-types ./extensions/_test_async_panel.ts",
+    "test:async-result-watcher": "node --experimental-strip-types ./extensions/_test_async_result_watcher.ts",
     "test:links": "node --experimental-strip-types ./extensions/_test_links.ts",
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
     "test:report": "node --experimental-strip-types ./extensions/_test_report.ts",
@@ -102,6 +104,7 @@
     "test:runtime-wake": "node --experimental-strip-types ./extensions/_test_runtime_wake.ts",
     "test:runtime-commands": "node --experimental-strip-types ./extensions/_test_runtime_commands.ts",
     "test:mailbox-command-consume": "node --experimental-strip-types ./extensions/_test_mailbox_command_consume.ts",
+    "test:injection-gate": "node --experimental-strip-types ./extensions/_test_injection_gate.ts",
     "test:scope-stale-takeover": "node --experimental-strip-types ./extensions/_test_scope_stale_takeover.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts",
     "gui:dev": "node scripts/gui-dev.mjs",

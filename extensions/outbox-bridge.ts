@@ -48,7 +48,8 @@ import {
 	type OutboxItem,
 } from "./runtime/message-outbox.ts";
 import { piSessionAddress } from "./runtime/address.ts";
-import { claimInjection, confirmInjection } from "./runtime/receipts.ts";
+import { claimInjection, confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
+import { injectFollowUpQuietly } from "./injection-gate.ts";
 import { isSubagent } from "./identity.ts";
 
 export interface ConsumeOutboxOptions {
@@ -145,33 +146,40 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 				report.consumed.push({ outboxId: item.id, action: "delivered", reason: "receipt-replayed" });
 				continue;
 			}
-			// 注入本会话（既有用户消息注入路径；抛异常 = failed）
-			let ok = false;
-			let error: string | undefined;
-			try {
-				opts.sendUserMessage(buildOutboxInjectBody(item), { deliverAs: "followUp" });
-				ok = true;
-			} catch (e) {
-				error = (e instanceof Error ? e.message : String(e)).slice(0, 512);
-				ok = false;
-			}
-			// 必修 1：confirm 返回值必须核实——失败（收据未落地/claim 被他人接管）不回写
-			// delivered（防伪造终态）；留 pending 交下轮收据回放或重投（目标端 dedupe 幂等）。
-			const confirmed = ok ? confirmInjection(claimKeyFor(item), holderOf(opts.sessionId)) : false;
-			if (ok && !confirmed) {
-				report.consumed.push({ outboxId: item.id, action: "skipped", reason: "confirm-failed" });
-				continue;
-			}
-			const marked = markOutboxItem(dir, item.id, {
-				status: ok ? "delivered" : "failed",
-				at: now(),
-				by: holderOf(opts.sessionId),
-				...(ok ? {} : { error: error ?? "inject-failed" }),
+			// 注入本会话（既有用户消息注入路径）。L3：await send 结果再分支；**receipt 只在 "sent"
+			// 之后**（.then 衔接，不改整条消费链 async，防竞态面扩大）。
+			const holder = holderOf(opts.sessionId);
+			const claimKey = claimKeyFor(item);
+			injectFollowUpQuietly(opts.sendUserMessage, buildOutboxInjectBody(item)).then((status) => {
+				if (status === "sent") {
+					// 必修 1：confirm 返回值必须核实——失败（收据未落地/claim 被他人接管）不回写
+					// delivered（防伪造终态）；留 pending 交下轮收据回放或重投（目标端 dedupe 幂等）。
+					const confirmed = confirmInjection(claimKey, holder);
+					if (!confirmed) {
+						report.consumed.push({ outboxId: item.id, action: "skipped", reason: "confirm-failed" });
+						return;
+					}
+					const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holder });
+					if (marked !== null) appendBridgeJournalEvent("message.delivered", item, opts, {});
+					report.consumed.push({ outboxId: item.id, action: "delivered" });
+				} else if (status === "busy") {
+					// agent 忙，消息未真正注入：不 confirm、不回写 delivered（留 pending）、不 selfDisable；
+					// 释放本次注入互斥（.claiming.json）供下 tick 重新领取重试。
+					// at-least-once 收敛：最坏重投一条，目标端按 dedupe:outbox:<id> 标记幂等去重。
+					releaseInjectionClaim(claimKey, holder);
+					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "busy-retry" });
+				} else if (status === "failed") {
+					// 真实失败：原失败路径——回写 failed（终态，不再重试）+ journal message.failed 可审计。
+					// 不释放/不 confirm（与旧行为一致；.claiming.json 残留经 stale 收敛，item 已终态无害）。
+					const error = "inject-failed";
+					const marked = markOutboxItem(dir, item.id, { status: "failed", at: now(), by: holder, error });
+					if (marked !== null) appendBridgeJournalEvent("message.failed", item, opts, { error });
+					report.consumed.push({ outboxId: item.id, action: "failed", reason: error });
+				} else {
+					// no-injector：原 skipped 路径（同步预检 typeof!==function 已 continue，理论不可达；双保险）。
+					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "no-injector" });
+				}
 			});
-			if (marked !== null) {
-				appendBridgeJournalEvent(ok ? "message.delivered" : "message.failed", item, opts, ok ? {} : { error });
-			}
-			report.consumed.push({ outboxId: item.id, action: ok ? "delivered" : "failed", ...(ok ? {} : { reason: error }) });
 		} catch (e) {
 			report.consumed.push({ outboxId: item.id, action: "skipped", reason: e instanceof Error ? e.message : String(e) });
 		}

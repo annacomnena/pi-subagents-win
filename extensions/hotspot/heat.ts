@@ -7,11 +7,14 @@
  * 解析失败降级并在诊断中说明，不强行归类。
  * v2 §8.2 修订（2026-09-17）：注入头附带"最近任务/最近改动"两行——纯现算派生数据，
  * 零存储零腐烂；不复制任务状态（权威源仍是 recentwork）。
+ * 0922 组合计划 ④：加 14 天使用率项（×2/次，封顶 +6，与 churn 同量级）；
+ * 从未 used 标"死重候选"（reason 内标记，不自动删）。
  */
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { usedCount14d } from "./log.ts";
 import type { HotspotEntry } from "./types.ts";
 
 export interface HeatScore {
@@ -80,7 +83,8 @@ export function recentworkActiveLines(root: string): { id: string; text: string 
 	}
 }
 
-function dirPrefixes(p: string): string[] {
+/** 路径的各级目录前缀（`a/b/c.ts` → `a/`、`a/b/`）；目录级命中用。 */
+export function dirPrefixes(p: string): string[] {
 	const parts = p.split("/");
 	const out: string[] = [];
 	for (let i = 1; i < parts.length; i++) out.push(parts.slice(0, i).join("/") + "/");
@@ -94,7 +98,9 @@ function titleTerms(title: string, scope?: string): string[] {
 		.filter((t) => [...t].length >= 2);
 }
 
-/** 热度打分与排序。工作树命中 ×5 / 目录 ×2（正在改最热）；churn 命中 ×3 / 目录 ×1；标题词命中活跃 Item 行 ×2。 */
+/** 热度打分与排序。工作树命中 ×5 / 目录 ×2（正在改最热）；churn 命中 ×3 / 目录 ×1；
+ * 14 天 used ×2/次封顶 +6（使用率，held-out 门控后只算真实外部使用）；
+ * 标题词命中活跃 Item 行 ×2；从未 used 标"死重候选"（只标记不删除）。 */
 export function computeHeat(root: string, entries: HotspotEntry[]): HeatResult {
 	const degraded: string[] = [];
 	const churn = gitChurnFiles(root);
@@ -103,6 +109,7 @@ export function computeHeat(root: string, entries: HotspotEntry[]): HeatResult {
 	if (!wt) degraded.push("工作树 diff 不可用（非 git 仓库或 git 失败）");
 	const active = recentworkActiveLines(root);
 	if (active.length === 0) degraded.push("recentwork 无活跃行（文件缺失或无 🔧/📋/⚠️ 条目）");
+	const used = usedCount14d(root);
 
 	const scored = entries.map((entry) => {
 		let score = 0;
@@ -144,6 +151,15 @@ export function computeHeat(root: string, entries: HotspotEntry[]): HeatResult {
 				score += Math.min(hits, 2) * 2;
 				reasons.push(`recentwork 活跃行命中×${hits}`);
 			}
+		}
+		// ④ 14 天使用率：×2/次，封顶 +6（与 churn 同量级）；used 只进热度不进存储
+		const usedCount = used.get(entry.topicId) ?? 0;
+		if (usedCount > 0) {
+			const add = Math.min(usedCount, 3) * 2;
+			score += add;
+			reasons.push(`used×${usedCount}（+${add}，14 天）`);
+		} else {
+			reasons.push("死重候选（14 天无 used 信号，仅标记不删除）");
 		}
 		if (score === 0) reasons.push("仅按内容更新时间排序");
 		return { entry, score, reasons };

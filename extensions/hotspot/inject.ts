@@ -9,6 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isSubagent } from "../identity.ts";
 import { computeHeat, recentActivitySummary, type RecentActivity } from "./heat.ts";
+import { logEvent } from "./log.ts";
 import { findRepoRoot, hotspotPath, readHotspot } from "./store.ts";
 import {
 	DEFAULT_INJECT_CHAR_BUDGET,
@@ -129,6 +130,8 @@ export function registerInject(pi: ExtensionAPI): void {
 		} catch {
 			/* 持久标识失败时 entries 检查仍兜底（用户消息即将入档） */
 		}
+		// 0922 ④：kind=inject 埋点（现类型有、调用无，research P0-3；给 P1 校准注入覆盖率/命中率）
+		logEvent(root, { kind: "inject", topics: plan.selected.map((e) => e.topicId), revision: read.file.revision, ok: true });
 		return { action: "transform", text: `${text}\n\n${reminder}` } as const;
 	});
 

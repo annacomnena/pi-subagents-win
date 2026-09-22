@@ -14,6 +14,7 @@ import {
 	parseLaunchRequest,
 	repoName,
 	sanitizeWtTitle,
+	spawnPiTab,
 	taskTitleLabel,
 	workflowDisciplineBlock,
 	wtPromptArg,
@@ -300,6 +301,26 @@ assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 p
 	// 旗标都在 --tab-run-id 与最终 prompt 之前，且 prompt 恒为最后参数
 	assert.ok(idx("--session-profile") < idx("--tab-run-id") && idx("--tab-run-id") < traced.length - 1);
 	assert.equal(traced[traced.length - 1], "p");
+}
+
+// Pre-flight（空 WT 窗口根因修复）：非法参数在 spawn 前拦截，失败路径永不触达 spawn。
+// 注意：wtPath 用 process.execPath 占位（存在即可），失败断言均在 spawn 之前返回。
+{
+	const badCwd = spawnPiTab({
+		wtPath: process.execPath, piCli: process.execPath, execPath: process.execPath,
+		cwd: "C:/definitely-not-a-real-dir-9f8e7d6c5b4a", title: "t", prompt: "p",
+	});
+	assert.ok(badCwd.error?.startsWith("preflight: cwd not found"), `缺失 cwd 应 preflight 拦截：${badCwd.error}`);
+	const badCli = spawnPiTab({
+		wtPath: process.execPath, piCli: "C:/definitely-not-a-real-cli-9f8e7d6c5b4a.js", execPath: process.execPath,
+		cwd: ".", title: "t", prompt: "p",
+	});
+	assert.ok(badCli.error?.startsWith("preflight: pi CLI not found"), `缺失 piCli 应 preflight 拦截：${badCli.error}`);
+	const badExec = spawnPiTab({
+		wtPath: process.execPath, piCli: process.execPath, execPath: "C:/definitely-not-a-real-node-9f8e7d6c5b4a.exe",
+		cwd: ".", title: "t", prompt: "p",
+	});
+	assert.ok(badExec.error?.startsWith("preflight: node exec not found"), `缺失 execPath 应 preflight 拦截：${badExec.error}`);
 }
 
 console.log("launch tests passed");

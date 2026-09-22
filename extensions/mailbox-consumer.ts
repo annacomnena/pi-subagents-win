@@ -34,6 +34,7 @@ import {
 	defaultMailboxDir,
 	listLetters,
 	mailboxDirFor,
+	releaseClaimed,
 	type Letter,
 } from "./runtime/mailbox.ts";
 import { executeCommand, type CommandOutcome, type ExecuteCommandOptions } from "./runtime/command-executor.ts";
@@ -41,7 +42,8 @@ import { COMMAND_TYPES, type CommandFrame } from "./runtime/protocol.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
-import { auditSuppression, postInject, preInject } from "./injection-gate.ts";
+import { auditSuppression, postInject, preInject, injectFollowUpQuietly } from "./injection-gate.ts";
+import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
@@ -225,29 +227,31 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				}
 				continue;
 			}
-			// 注入
-			let ok = false;
-			try {
-				opts.sendUserMessage?.(buildInjectBody(letter), { deliverAs: "followUp" });
-				ok = true;
-			} catch {
-				ok = false;
-			}
-			postInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer" }, ok);
-			if (!ok) {
-				reportPush(report, messageId, "skipped", "inject-failed");
-				continue;
-			}
-			// .notified 补认领（best-effort：堵 legacy 路径重注，terra 三路去重）
-			try {
-				if (letter.frame.frame === "message" && letter.frame.subject?.startsWith("run://tab/")) {
-					claimNotified(opts.runsDir ?? defaultTabRunsDir(), letter.frame.subject.slice("run://tab/".length));
+			// 注入。L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条消费链
+			// async，防竞态面扩大）。没有 injector 也未投递，必须释放 claim 后重试，不能伪造已消费。
+			injectFollowUpQuietly(opts.sendUserMessage, buildInjectBody(letter)).then((status) => {
+				if (status === "sent") {
+					postInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer" }, true);
+					// .notified 补认领（best-effort：堵 legacy 路径重注，terra 三路去重）
+					try {
+						if (letter.frame.frame === "message" && letter.frame.subject?.startsWith("run://tab/")) {
+							claimNotified(opts.runsDir ?? defaultTabRunsDir(), letter.frame.subject.slice("run://tab/".length));
+						}
+					} catch { /* best-effort */ }
+					ackLetter(recipient, frameId!, { mailboxDir });
+					reportPush(report, messageId, "injected");
+				} else if (status === "busy" || status === "no-injector") {
+					// agent 忙或没有注入通道，消息均未真正注入：不 ack/confirm、不 selfDisable；释放注入互斥
+					// + 把信退回 pending，供下 tick 重试。at-least-once 收敛：最坏重投一条，目标端按稳定
+					// messageId 幂等去重。
+					releaseInjectionClaim(key, verdict.holder);
+					if (frameId) releaseClaimed(recipient, frameId, holderOf(opts.sessionId), { mailboxDir });
+					reportPush(report, messageId, "skipped", status === "busy" ? "busy-retry" : "no-injector");
+				} else {
+					// failed：原失败路径——不 confirm（信留 claimed，10min stale 接管处理）。
+					reportPush(report, messageId, "skipped", "inject-failed");
 				}
-			} catch {
-				/* best-effort */
-			}
-			ackLetter(recipient, frameId!, { mailboxDir });
-			reportPush(report, messageId, "injected");
+			});
 		} catch {
 			reportPush(report, messageId, "skipped", "error");
 		}
@@ -296,12 +300,10 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			}
 			reportPush(report, messageId, "executed", `command-${outcome.status}${outcome.status === "rejected" ? `:${outcome.reason}` : ""}`);
 			// 回执：向 owner 会话发一条纯报告 followUp（固定模板+受控枚举，M1；无任何待执行
-			// 指令语义；不走 preInject 门——回执重复无害）。best-effort，失败不影响 ack。
-			try {
-				opts.sendUserMessage?.(buildCommandReceiptBody(letter.frame, outcome), { deliverAs: "followUp" });
-			} catch {
-				/* best-effort */
-			}
+			// 指令语义；不走 preInject 门——回执重复无害）。L3：await send 结果吞掉 busy 拒绝（防逃逸到
+			// bindCore 报成 Extension "<runtime>" error）；best-effort，busy/failed 不影响 ack（命令已
+			// 确定性执行并 ack，回执只是通知）。
+			injectFollowUpQuietly(opts.sendUserMessage, buildCommandReceiptBody(letter.frame, outcome));
 			// 三态全终态 ack、不重投（同 fileId 收尾）：rejected 在 executor 幂等 claim 之前拒、
 			// 不占键，重投必再拒；failed 留 pending/claimed 会经 10min stale reclaim 无限空转——
 			// 重试语义由 issuer 换新 commandKey 重发承担。

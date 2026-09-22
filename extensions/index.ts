@@ -52,8 +52,10 @@ import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsy
 import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
+import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import { registerOutboxBridge } from "./outbox-bridge.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts";
+import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
 import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
@@ -1611,13 +1613,13 @@ export default function (pi: ExtensionAPI) {
 			const outcome = maybeAutoCollectTraceRun(finishedTabRunId);
 			if (!outcome.isTrace) return false; // 普通 tab → 默认 toast + reclaim 注入
 			if (outcome.phase === "started") {
-				try {
-					pi.sendUserMessage?.(
-						`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
+				// L3：await send 结果吞掉 busy 拒绝（防逃逸到 bindCore 报成 Extension "<runtime>" error）；
+				// 通知尽力而为（busy/failed 不阻塞），收集已在后台，用 /trace-fusion-status 查进度。
+				injectFollowUpQuietly(
+					pi.sendUserMessage,
+					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
 进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
-						{ deliverAs: "followUp" },
-					);
-				} catch { /* 通知尽力而为，收集已在后台 */ }
+				);
 			}
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
 		},
@@ -1634,6 +1636,7 @@ export default function (pi: ExtensionAPI) {
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
 	collect(registerGuiAutoStart(pi));
+	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
 	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
 	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
@@ -2105,7 +2108,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
 		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode/zcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
-		lines.push("Sync/async decision applies to subagent-win only: SYNC (no `async`) when the result is needed immediately; PARALLEL (`tasks: [...]`) for independent headless subagents you must all wait for; ASYNC (`async: true`) for a headless subagent whose result is not needed this turn. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
+		lines.push("Sync/async decision applies to subagent-win only: DEFAULT ASYNC (`async: true`, non-blocking; products drop to disk with path-first short summary, collected via completion event/watcher/timer); SYNC only when the result is needed this turn (dependent next step, L4 re-verification); PARALLEL (`tasks: [...]`) for independent headless subagents you must all wait for; ASYNC (`async: true`) for a headless subagent whose result is not needed this turn. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
