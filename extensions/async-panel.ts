@@ -75,6 +75,18 @@ function readAsyncRecords(runsDir: string): AsyncPanelRecord[] {
 /** 终态卡片可见时长：过期即从面板消失（此前常驻不清除，见 plans/0922_async_tui_widget_diagnosis.md）。 */
 export const ASYNC_DONE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * 任务短标签：取首行，遇到中英文句读即截断（L 链任务首句即主题，
+ * 后面全是交接纪律废话）；超 36 字符再硬截。解决此前 slice(0,40)
+ * 把“完成后不提交，回复…”纪律文本拦腰截断上墙的问题。
+ */
+export function shortTaskLabel(task: string): string {
+	const first = task.replace(/\s+/g, " ");
+	const cut = first.search(/[。；！？!?;]/);
+	const base = cut >= 0 ? first.slice(0, cut + 1) : first;
+	return base.length > 36 ? `${base.slice(0, 35)}…` : base;
+}
+
 /** 刷新面板：running 任务列表（widget）+ 摘要（status）。无 UI 时静默。 */
 export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: ExtensionUIContext | null = lastUi): void {
 	if (!ui) return;
@@ -110,17 +122,21 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 			lines.push(`⏳ ${running.length} running`);
 			for (const r of running) {
 				const agent = r.agent ?? "subagent";
-				const task = r.task.replace(/\s+/g, " ").slice(0, 40);
 				const age = formatAge(r.startedAt);
-				lines.push(`  ${agent}: ${task} (${r.id} · ${age})`);
+				lines.push(`  ${agent}: ${shortTaskLabel(r.task)} (${r.id} · ${age})`);
 			}
 		}
-		for (const r of recentlyDone) {
-			const icon = r.status === "completed" ? "✓" : "✗";
+		// 终态区压缩：失败/取消逐条（需要人看），成功只记条数。
+		// 此前每条 done 占一行，3 条历史把面板撑成 6 行噪音。
+		const failed = recentlyDone.filter((r) => r.status !== "completed");
+		const doneCount = recentlyDone.length - failed.length;
+		for (const r of failed) {
 			const agent = r.agent ?? "subagent";
-			const task = r.task.replace(/\s+/g, " ").slice(0, 40);
-			const err = r.status !== "completed" && r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
-			lines.push(`  ${icon} ${agent}: ${task} (${r.id})${err}`);
+			const err = r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
+			lines.push(`  ✗ ${agent}: ${shortTaskLabel(r.task)} (${r.id})${err}`);
+		}
+		if (doneCount > 0) {
+			lines.push(`  ✓ ${doneCount} completed`);
 		}
 	}
 	try {

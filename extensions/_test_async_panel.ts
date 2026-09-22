@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { refreshAsyncPanel, bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, type AsyncPanelRecord } from "./async-panel.ts";
+import { refreshAsyncPanel, bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, shortTaskLabel, type AsyncPanelRecord } from "./async-panel.ts";
 
 // P0-1 同款：隔离进程环境（本模块不读 PI_*，但保持测试可移植）
 delete process.env.PI_SUBAGENT;
@@ -57,8 +57,27 @@ const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json
 	refreshAsyncPanel(dirDone, ui);
 	const lines = ui.widgets.get("subagent-async");
 	assert.ok(lines, "应有 widget");
-	assert.ok(lines.some((l) => l.includes("✓ searcher")), `应显示完成: ${lines.join(" | ")}`);
+	assert.ok(lines.some((l) => l.includes("✓ 1 completed")), `成功应压缩为计数行: ${lines.join(" | ")}`);
+	assert.ok(!lines.some((l) => l.includes("调研 X")), "成功任务明细不应逐条上墙");
 	assert.equal(ui.statuses.get("subagent-async"), undefined, "无 running 时状态栏摘要应清除");
+}
+
+// ── 短标签：句读截断 + 超长硬截 ───────────────────────────────────
+{
+	assert.equal(shortTaskLabel("L3 实现：会话 rail 三件套。完成后不提交，回复…"), "L3 实现：会话 rail 三件套。");
+	assert.equal(shortTaskLabel("short"), "short");
+	assert.ok(shortTaskLabel("无句读但超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长").endsWith("…"), "超长应硬截");
+}
+
+// ── 失败逐条保留（含 error 尾） ────────────────────────────────────
+{
+	const ui = makeFakeUi();
+	const dirFail = join(dir, "fail");
+	mkdirSync(dirFail, { recursive: true });
+	writeFileSync(join(dirFail, "run_f.json"), JSON.stringify({ id: "run_f", agent: "general", task: "做 X。细节", status: "failed", startedAt: new Date().toISOString(), result: { error: "boom happened" } }), "utf8");
+	refreshAsyncPanel(dirFail, ui);
+	const lines = ui.widgets.get("subagent-async");
+	assert.ok(lines.some((l) => l.includes("✗ general") && l.includes("boom")) , `失败应逐条+error 尾: ${lines?.join(" | ")}`);
 }
 
 // ── bindAsyncPanelUi + 默认 runsDir 路径（无 UI 时静默）──────────
