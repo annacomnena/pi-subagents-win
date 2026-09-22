@@ -1,15 +1,16 @@
 /**
  * _test_workspace_group.ts — 左栏「按仓库分组会话」L3 冒烟（plans/0922_workspace_group_plan.md 切片 S4）。
  *
- * 纯函数直载（workspaceGroup/workspaceExpansion/sessionFilter 均 JSX-free；sessionFilter 对
+ * 纯函数直载（workspaceGroup/workspaceExpansion/sessionFilter/workspaceSort 均 JSX-free；sessionFilter 对
  * workspaceGroup 为 extensionless 值导入 → 复用 _gui_store_ts_loader 补 .ts，同 _test_session_first 模式；
- * G6 用 Map 支撑的 localStorage 桩，在 import 前注入 globalThis）：
+ * G6/G8 用 Map 支撑的 localStorage 桩，在 import 前注入 globalThis）：
  *   G1 归一化 cwd 键：`\`→`/`、Windows 盘符小写、去尾 `/`、null → 未分组键
  *   G2 分组：同 cwd 合并、null→未分组、count/maxMtimeMs、basename 显示名、全路径 tooltip、hasError
  *   G3 排序：组序 maxMtimeMs 降序（未分组垫底）、组内 updated（mtimeMs 降）/created（startedAt 降）
  *   G4 过滤谓词收窄：title/shortId(12)/basename(cwd) 命中、大小写不敏感、无命中
  *   G5 过滤后组内空 → 整组隐藏（含未分组）
  *   G6 折叠持久化：save→load 回读、prune 删失效组键、坏 JSON/非对象容错
+ *   G8 组内排序持久化：save→load 回读（saw-ws-sort）、坏 JSON/非合法值/非字符串容错、写异常吞
  *
  * 运行：npm run test:gui-workspace-group
  */
@@ -45,6 +46,7 @@ const { matchesSessionFilter } = await import("./sessionFilter.ts");
 const { loadExpansionState, saveExpansionState, pruneExpansionState } = await import(
 	"./workspaceExpansion.ts"
 );
+const { loadSortBy, saveSortBy } = await import("./workspaceSort.ts");
 import type { SessionSummary } from "./api/types.ts";
 
 let n = 0;
@@ -243,6 +245,32 @@ assert.doesNotThrow(() => saveExpansionState({ "c:/a": false }));
 assert.doesNotThrow(() => pruneExpansionState({ "c:/a": false }, ["c:/a"]));
 (globalThis as Record<string, unknown>).localStorage = workingStorage;
 ok("G6g localStorage 配额异常被吞掉，不影响 UI 交互");
+
+// ── G8 组内排序维度持久化（saw-ws-sort，机制同 saw-ws-expansion，P1-3）────────
+lsBacking.clear();
+assert.equal(loadSortBy(), "updated"); // 无数据 → 默认 updated
+ok("G8a 无数据 loadSortBy → 默认 updated");
+saveSortBy("created");
+assert.equal(loadSortBy(), "created"); // save→load 回读
+assert.equal(lsBacking.get("saw-ws-sort"), JSON.stringify("created")); // 落盘 = JSON 单值
+ok("G8b save→load 回读 created + 落盘 key = saw-ws-sort");
+lsBacking.set("saw-ws-sort", "{这不是JSON");
+assert.equal(loadSortBy(), "updated"); // 坏 JSON → 默认
+ok("G8c 坏 JSON 容错 → 默认 updated");
+lsBacking.set("saw-ws-sort", JSON.stringify("bogus"));
+assert.equal(loadSortBy(), "updated"); // 非合法值（非 updated/created）→ 默认
+ok("G8d 非合法值 → 默认 updated");
+lsBacking.set("saw-ws-sort", JSON.stringify(123));
+assert.equal(loadSortBy(), "updated"); // 非字符串类型 → 默认
+ok("G8e 非字符串（数字）→ 默认 updated");
+const workingStorage2 = globalThis.localStorage;
+(globalThis as Record<string, unknown>).localStorage = {
+	getItem: () => null,
+	setItem: () => { throw new Error("QuotaExceededError"); },
+};
+assert.doesNotThrow(() => saveSortBy("updated")); // 写异常被吞
+(globalThis as Record<string, unknown>).localStorage = workingStorage2;
+ok("G8f localStorage 配额异常被吞掉，不影响 UI 交互");
 
 // 附：basename/cwdLabel 迁入后行为不变
 assert.equal(basename("C:\\w\\x\\y"), "y");

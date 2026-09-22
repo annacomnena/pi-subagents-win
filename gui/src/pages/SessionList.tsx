@@ -5,9 +5,11 @@
  * radix Collapsible 折叠」；组头 h-8 整行 CollapsibleTrigger（Folder/FolderOpen 16px 随展开态
  * 切换 + basename + 计数 badge + 无 chevron + title=全路径 tooltip 兜 basename 冲突）；
  * 组内会话行 JSX 原样保留（TaskListItem.tsx#L534-546 同款刻度）。
- * 组序 = 组内最大 mtimeMs 降序、未分组垫底；组内默认 updated（mtimeMs 降序）、过滤框旁
- * segmented 切 created（startedAt 降序），不持久化；折叠态 localStorage `saw-ws-expansion`
- * 双写（toggle 时 save+prune，workspaceExpansion 容错）。
+ * 组序 = 组内最大 mtimeMs 降序、未分组垫底（[future] 组拖拽排序持久化未做——无 tab/拖拽
+ * 持久化后端；届时补 SortableContext + settingService 级持久，组序策略再向 ZCode 全对齐，P1-4）；
+ * 组内默认 updated（mtimeMs 降序）、过滤框旁 segmented 切 created（startedAt 降序），排序维度
+ * 持久化 localStorage `saw-ws-sort`（workspaceSort，机制同 saw-ws-expansion）；折叠态
+ * localStorage `saw-ws-expansion` 双写（toggle 时 save+prune，workspaceExpansion 容错）。
  * 组头状态点：失败红点有数据源（failedSessions 聚合）；蓝点（未读）无数据源不渲染——
  * 与 SessionList 现拍板 1（行级 unread 不渲染）同先例。
  * [无后端支撑]=不渲染：「+ 新建」组头钮（Sidebar 新建钮现状维持灰显占位）、组拖拽、组内分页。
@@ -24,6 +26,7 @@ import { matchesSessionFilter } from "../sessionFilter";
 import { basename, groupSessions, sortGroups } from "../workspaceGroup";
 import type { SessionSortBy } from "../workspaceGroup";
 import { loadExpansionState, pruneExpansionState, saveExpansionState } from "../workspaceExpansion";
+import { loadSortBy, saveSortBy } from "../workspaceSort";
 
 function mtimeIso(s: SessionSummary): string | null {
 	return Number.isFinite(s.mtimeMs) && s.mtimeMs > 0 ? new Date(s.mtimeMs).toISOString() : null;
@@ -39,8 +42,8 @@ export function SessionList() {
 	const activeId = useGui((s) => s.chatActiveId);
 	const outboxMap = useGui((s) => s.chatOutbox);
 	const [filter, setFilter] = useState("");
-	// 组内排序维度（默认 updated；不持久化——第一版）
-	const [sortBy, setSortBy] = useState<SessionSortBy>("updated");
+	// 组内排序维度（默认 updated；持久化到 localStorage `saw-ws-sort`，机制同 saw-ws-expansion）
+	const [sortBy, setSortBy] = useState<SessionSortBy>(() => loadSortBy());
 	// 组折叠态（cwdKey → boolean，false=收起，缺省=展开）；localStorage 双写
 	const [expansion, setExpansion] = useState<Record<string, boolean>>(() => loadExpansionState());
 
@@ -54,6 +57,8 @@ export function SessionList() {
 	}, [outboxMap]);
 
 	// filter → group → sort（过滤后组内空 → 整组隐藏，含「未分组」）
+	// [future] 组拖拽排序持久化未做（P1-4）：组序当前 = maxMtimeMs 降序（未分组垫底）。
+	// ZCode 用 SortableContext 拖拽 + settingService 级持久；届时再向 ZCode 组序策略全对齐。
 	const groups = useMemo(() => {
 		const filtered = chatSessions.filter((s) => matchesSessionFilter(s, filter));
 		return sortGroups(groupSessions(filtered, sortBy, failedSessions));
@@ -99,7 +104,10 @@ export function SessionList() {
 						<button
 							key={value}
 							type="button"
-							onClick={() => setSortBy(value)}
+							onClick={() => {
+								setSortBy(value);
+								saveSortBy(value); // 维度切换落盘 `saw-ws-sort`（机制同 saw-ws-expansion）
+							}}
 							aria-pressed={sortBy === value}
 							className={`px-1.5 text-ui-sm transition-colors ${
 								sortBy === value
@@ -128,6 +136,8 @@ export function SessionList() {
 									zcode bg-tag 未搬）+ 无 chevron + title=全路径 tooltip；未分组灰显 Inbox */}
 								<CollapsibleTrigger asChild>
 									<div
+										role="button"
+										tabIndex={0}
 										title={g.tooltip}
 										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-surface-hover"
 									>
@@ -138,13 +148,8 @@ export function SessionList() {
 					) : (
 						<Folder className="size-4 shrink-0 text-foreground-subtle" />
 					)}
-										<span
-											className={`min-w-0 flex-1 truncate text-ui-base ${
-												g.ungrouped ? "text-foreground-subtle" : "text-foreground"
-											}`}
-										>
-											{g.label}
-										</span>
+										{/* 组头 label 统一 subtle 档（对齐 ZCode 组头 label text-foreground-subtle）；未分组灰显行由图标（Inbox + text-foreground-subtlest）承载差异 */}
+										<span className="min-w-0 flex-1 truncate text-ui-base text-foreground-subtle">{g.label}</span>
 										{/* 组内失败红点（数据源=failedSessions 聚合）；蓝点（未读）无数据源不渲染 */}
 										{g.hasError && (
 											<span
