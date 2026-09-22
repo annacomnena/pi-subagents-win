@@ -64,6 +64,7 @@
     "test:memory-guard": "node --experimental-strip-types ./extensions/_test_memory_guard.ts",
     "test:gc-cleaner": "node --experimental-strip-types ./extensions/_test_gc_cleaner.ts",
     "test:async-panel": "node --experimental-strip-types ./extensions/_test_async_panel.ts",
+    "test:async-result-watcher": "node --experimental-strip-types ./extensions/_test_async_result_watcher.ts",
     "test:links": "node --experimental-strip-types ./extensions/_test_links.ts",
     "test:event-bus": "node --experimental-strip-types ./extensions/_test_event_bus.ts",
     "test:report": "node --experimental-strip-types ./extensions/_test_report.ts",

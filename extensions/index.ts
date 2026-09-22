@@ -54,6 +54,7 @@ import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
 import { registerOutboxBridge } from "./outbox-bridge.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts";
+import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
 import type { WakeDecision } from "./runtime/wake.ts";
 import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
@@ -1634,6 +1635,7 @@ export default function (pi: ExtensionAPI) {
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
 	collect(registerGuiAutoStart(pi));
+	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
 	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
 	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。

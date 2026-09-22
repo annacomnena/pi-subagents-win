@@ -14,7 +14,7 @@
 
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { sendWindowsToast } from "./notify-windows.ts";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -33,6 +33,8 @@ export interface AsyncPanelRecord {
 		usage?: { cost?: number; turns?: number };
 	};
 	startedAt: string;
+	/** 文件 mtime（终态 TTL 用；run 文件无 finishedAt 字段，以最后写入时刻为准）。 */
+	mtimeMs?: number;
 }
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
@@ -55,7 +57,13 @@ function readAsyncRecords(runsDir: string): AsyncPanelRecord[] {
 		.filter((f) => f.endsWith(".json"))
 		.map((f) => {
 			try {
-				return JSON.parse(readFileSync(join(runsDir, f), "utf8")) as AsyncPanelRecord;
+				const rec = JSON.parse(readFileSync(join(runsDir, f), "utf8")) as AsyncPanelRecord;
+				try {
+				rec.mtimeMs = statSync(join(runsDir, f)).mtimeMs;
+				} catch {
+				/* stat 失败则无 TTL（常驻旧行为），不炸面板 */
+				}
+				return rec;
 			} catch {
 				return null;
 			}
@@ -63,6 +71,9 @@ function readAsyncRecords(runsDir: string): AsyncPanelRecord[] {
 		.filter((r): r is AsyncPanelRecord => r !== null)
 		.sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""));
 }
+
+/** 终态卡片可见时长：过期即从面板消失（此前常驻不清除，见 plans/0922_async_tui_widget_diagnosis.md）。 */
+export const ASYNC_DONE_TTL_MS = 30 * 60 * 1000;
 
 /** 刷新面板：running 任务列表（widget）+ 摘要（status）。无 UI 时静默。 */
 export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: ExtensionUIContext | null = lastUi): void {
@@ -74,13 +85,27 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 		return;
 	}
 	const running = records.filter((r) => r.status === "running");
-	const recentlyDone = records.filter((r) => r.status !== "running").slice(0, 3);
+	// 终态只保留 TTL 内的可见性：过期即消失（此前常驻不清除）；completed 不再挂 error 尾巴
+	// （终态文件的 result.error 常是中途 transient 失败的残留，✓+错误尾自相矛盾）。
+	const now = Date.now();
+	const recentlyDone = records
+		.filter((r) => r.status !== "running")
+		.filter((r) => r.mtimeMs === undefined || now - r.mtimeMs < ASYNC_DONE_TTL_MS)
+		.slice(0, 3);
 
-	// Widget：opencode 风格任务面板（编辑器上方）
-	const lines: string[] = [];
+	// Widget：opencode 风格任务面板（编辑器上方）。全空时传 undefined 让 pi 移除卡片
+	// （此前常驻 "No async subagents" 行，无自清除路径）。
 	if (running.length === 0 && recentlyDone.length === 0) {
-		lines.push("No async subagents");
-	} else {
+		try {
+			ui.setWidget(ASYNC_WIDGET_KEY, undefined);
+			ui.setStatus(ASYNC_STATUS_KEY, undefined);
+		} catch {
+			/* 非 TUI 模式下忽略 */
+		}
+		return;
+	}
+	const lines: string[] = [];
+	{
 		if (running.length > 0) {
 			lines.push(`⏳ ${running.length} running`);
 			for (const r of running) {
@@ -94,7 +119,7 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 			const icon = r.status === "completed" ? "✓" : "✗";
 			const agent = r.agent ?? "subagent";
 			const task = r.task.replace(/\s+/g, " ").slice(0, 40);
-			const err = r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
+			const err = r.status !== "completed" && r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
 			lines.push(`  ${icon} ${agent}: ${task} (${r.id})${err}`);
 		}
 	}

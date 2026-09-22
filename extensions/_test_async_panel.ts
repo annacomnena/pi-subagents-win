@@ -23,11 +23,11 @@ function makeFakeUi() {
 const dir = mkdtempSync(join(tmpdir(), "async-panel-test-"));
 const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json`), JSON.stringify(rec), "utf8");
 
-// ── 无记录 → 空面板 ───────────────────────────────────────────────
+// ── 无记录 → 清除卡片（传 undefined 让 pi 移除 widget，而非常驻一行） ─────
 {
 	const ui = makeFakeUi();
 	refreshAsyncPanel(dir, ui);
-	assert.deepEqual(ui.widgets.get("subagent-async"), ["No async subagents"]);
+	assert.equal(ui.widgets.get("subagent-async"), undefined, "空面板应清除 widget");
 	assert.equal(ui.statuses.get("subagent-async"), undefined);
 }
 
@@ -70,10 +70,10 @@ const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json
 	// 清除引用后不崩
 	bindAsyncPanelUi(null);
 	refreshAsyncPanel();
-	// 假 runsDir（不存在）→ 静默空面板
+	// 假 runsDir（不存在）→ 静默清除卡片
 	const ui2 = makeFakeUi();
 	refreshAsyncPanel(join(dir, "does-not-exist"), ui2);
-	assert.deepEqual(ui2.widgets.get("subagent-async"), ["No async subagents"]);
+	assert.equal(ui2.widgets.get("subagent-async"), undefined, "不存在的 runsDir 应清除 widget");
 }
 
 // ── notifyAsyncCompletion 不抛错（toast 是 fire-and-forget）───────
