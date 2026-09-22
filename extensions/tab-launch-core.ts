@@ -18,7 +18,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -182,6 +182,16 @@ export interface TabSpawnResult {
  */
 export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 	const { wtPath, piCli, cwd, title, prompt, model, skills, tabRunId, runsDir, onSpawnError } = options;
+	// Pre-flight（空 WT 窗口根因修复）：wt -w 0 匹配不到就开新窗，但 new-tab 参数非法时
+	// 执行失败只剩空框。本层 spawn(wt) 只要 wt.exe 起来就算成功，new-tab 的死活无从得知，
+	// 故非法参数必须在 spawn 前拦截，直接回 error 走上层 markFailed（launch_failed 账本），
+	// 不弹空窗、不留永远 dispatched 的幽灵记录。
+	if (!existsSync(wtPath)) return { title, prompt, model, error: `preflight: wt not found: ${wtPath}` };
+	if (!existsSync(piCli)) return { title, prompt, model, error: `preflight: pi CLI not found: ${piCli}` };
+	if (!existsSync(cwd)) return { title, prompt, model, error: `preflight: cwd not found: ${cwd}` };
+	if (!existsSync(options.execPath)) {
+		return { title, prompt, model, error: `preflight: node exec not found: ${options.execPath}` };
+	}
 	try {
 		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, tabRunId), {
 			cwd,
