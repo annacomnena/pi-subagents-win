@@ -38,6 +38,7 @@ import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trac
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
+import { formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -1721,6 +1722,15 @@ export default function (pi: ExtensionAPI) {
 	}));
 
 	// ── /master-* 命令（Phase 4d，A5 F9/F11）──
+	// master 原生感知：最近活跃仓库/scope（一行摘要）。三账本只读归并（recent-scopes.ts），
+	// 任一账本不可读只降级为 "(unknown)"，永不打断 status。
+	function recentScopesLine(): string {
+		try {
+			return formatRecentScopes(listRecentScopes());
+		} catch {
+			return "(unknown)";
+		}
+	}
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
 		handler: async (_args, ctx) => {
@@ -1730,6 +1740,7 @@ export default function (pi: ExtensionAPI) {
 				`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
 				`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
 				`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
+				`recent: ${recentScopesLine()}`,
 			];
 			ctx.ui.notify(`Master status:\n${lines.join("\n")}`, "info");
 		},
