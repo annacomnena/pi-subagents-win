@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.3] — 2026-09-22 (rail trio + hotspot graph + async overhaul + launch preflight)
+
+- **会话 rail 三件套**：master 置顶区 + scope master 组内置顶（`isMaster/isScopeMaster`，session-pin + /v1/sessions additive）；每仓库最多 6 个（overflow 展开持久化）；全 tab 组默认折叠。
+- **hotspot 知识图谱+评分**：动态关系投影（read 现算一跳边，边不存）+ 手写 rel 边（存在性 gate）+ 拒收回显（superseded）+ used 度量（held-out 防自嗨）+ 14 天热度项 + P0 自动探测（pending 队列，永不直写）。
+- **async 大修**：完成 watcher（终态 followUp 注入）+ TUI 卡片清零/TTL/去 error 尾/短标签/成功折叠计数 + 默认派发切非阻塞 async + 注入忙冲突静默重试（根治 Extension "<runtime>" 刷屏）。
+- **tab 启动 pre-flight**：spawnPiTab 拦截非法 cwd/execPath/piCli（空 WT 窗口根因），失败进 launch_failed 账本。
+- **仓库分组 P1 跟进**：组头键盘可达、subtle label、sortBy 持久化。
+
 ## [0.5.2] — 2026-09-22 (ZCode 1:1 workbench + autostart)
 
 - **gui/ 1:1 复刻 ZCode 主工作台**：zai-dark token 整表移植（原名）、14px 基准、滚动条/动画参数；radix-ui + CVA + 5 依赖；14 个零后端 ui 组件；左栏会话列表/中央 transcript 5 行型/user 气泡/工具折叠卡+扫光/composer/topbar h-12/设置层 grid 全 class 逐字对齐；发送链复用 P2（Stop/加号灰显占位；⌘K/文件树/git/账号不渲染）。旧 zinc 调色零残留。
