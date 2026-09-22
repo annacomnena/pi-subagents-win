@@ -48,6 +48,7 @@ const { loadExpansionState, saveExpansionState, pruneExpansionState } = await im
 );
 const { loadSortBy, saveSortBy } = await import("./workspaceSort.ts");
 import type { SessionSummary } from "./api/types.ts";
+import type { WorkspaceGroup } from "./workspaceGroup.ts";
 
 let n = 0;
 const ok = (name: string): void => {
@@ -278,5 +279,138 @@ assert.equal(basename("C:/w"), "w");
 assert.equal(basename(null), "");
 assert.equal(cwdLabel(null), "未分组");
 ok("G7 basename/cwdLabel 自 SessionList 迁入后行为不变");
+
+// ── P 段：会话 rail 三件套 L3（置顶 / 每组最多 6 个 / 全 tab 组默认折叠）──
+const { GROUP_VISIBLE_LIMIT, buildGroupDisplay, resolveGroupOpen } = await import("./workspaceGroup.ts");
+const { loadRailExpand, saveRailExpand, pruneRailExpand, OVERFLOW_KEY, TABGROUP_KEY, MAX_PERSISTED_GROUPS } = await import(
+	"./workspaceRailExpand.ts"
+);
+
+// P 段 fixture：直接构造（不走 mk 的 title 联动；可显式标 isScopeMaster/isMaster）
+const raw = (id: string, cwd: string, o: Partial<SessionSummary> = {}): SessionSummary => ({
+	sessionId: id,
+	cwd,
+	startedAt: o.startedAt ?? null,
+	parentSession: null,
+	file: `C:/pi/sessions/${id}.jsonl`,
+	sizeBytes: 10,
+	mtimeMs: o.mtimeMs ?? 1,
+	...(o.title !== undefined ? { title: o.title, titleSource: o.titleSource ?? "first-user" } : {}),
+	...(o.isScopeMaster === true ? { isScopeMaster: true } : {}),
+	...(o.isMaster === true ? { isMaster: true } : {}),
+});
+
+// ── P1 置顶排序：isScopeMaster 行置顶，其余按现有组内序（buildGroupDisplay 纯函数）──
+{
+	const g = {
+		key: "c:/r",
+		label: "r",
+		tooltip: "c:/r",
+		cwd: "c:/r",
+		ungrouped: false,
+		count: 4,
+		maxMtimeMs: 400,
+		hasError: false,
+		sessions: [
+			raw("a1", "c:/r", { mtimeMs: 100 }),
+			raw("a2", "c:/r", { mtimeMs: 400, isScopeMaster: true }), // 置顶（组内序第 2）
+			raw("a3", "c:/r", { mtimeMs: 300 }),
+			raw("a4", "c:/r", { mtimeMs: 200 }),
+		],
+	} as WorkspaceGroup;
+	const d = buildGroupDisplay(g, false);
+	assert.deepEqual(d.pinned.map((s) => s.sessionId), ["a2"]);
+	assert.deepEqual(d.visible.map((s) => s.sessionId), ["a1", "a3", "a4"]); // 其余按现有组内序（mtime 降）
+	assert.equal(d.hiddenCount, 0); // 非置顶 3 个 ≤ 6 → 无「还有 N 个」行
+	ok("P1a 组内 isScopeMaster 行置顶（pinned），其余按现有组内序（visible）");
+}
+// P2 每组最多 6 个：非置顶行默认前 6，超出收进「还有 N 个」；置顶行不受截断影响
+{
+	const n = 10;
+	const sessions = Array.from({ length: n }, (_, i) => raw(`b${i}`, "c:/r2", { mtimeMs: n - i }));
+	sessions[7].isScopeMaster = true; // 第 8 新（mtime 第 3）为置顶
+	const g = {
+		key: "c:/r2",
+		label: "r2",
+		tooltip: "c:/r2",
+		cwd: "c:/r2",
+		ungrouped: false,
+		count: n,
+		maxMtimeMs: n,
+		hasError: false,
+		sessions,
+	} as WorkspaceGroup;
+	assert.equal(GROUP_VISIBLE_LIMIT, 6, "上限常量 = 6");
+	const dClosed = buildGroupDisplay(g, false);
+	assert.equal(dClosed.pinned.length, 1, "置顶行 1 个");
+	assert.equal(dClosed.visible.length, 6, "收起态非置顶行 = 前 6（组内现有序）");
+	assert.deepEqual(dClosed.visible.map((s) => s.sessionId), ["b0", "b1", "b2", "b3", "b4", "b5"]);
+	assert.equal(dClosed.hiddenCount, 3, "超出 3 个 → 「还有 3 个 · 展开查看全部」");
+	const dOpen = buildGroupDisplay(g, true);
+	assert.equal(dOpen.visible.length, 9, "展开态非置顶行全量");
+	assert.equal(dOpen.hiddenCount, 3, "展开态 hiddenCount 不变（行文案切「收起」）");
+	ok("P2a 每组最多 6 个（非置顶前 6 + 「还有 N 个」）；展开态全量");
+	// 置顶行不受 6 个截断影响：置顶 2 个 + 非置顶 8 个 → 置顶全显，非置顶前 6
+	const sessions2 = Array.from({ length: 10 }, (_, i) => raw(`c${i}`, "c:/r3", { mtimeMs: 10 - i }));
+	sessions2[0].isScopeMaster = true;
+	sessions2[5].isScopeMaster = true;
+	const g2 = { ...g, key: "c:/r3", label: "r3", tooltip: "c:/r3", cwd: "c:/r3", count: 10, sessions: sessions2 } as WorkspaceGroup;
+	const d2 = buildGroupDisplay(g2, false);
+	assert.deepEqual(d2.pinned.map((s) => s.sessionId).sort(), ["c0", "c5"], "置顶 2 行永远可见");
+	assert.equal(d2.visible.length, 6);
+	assert.equal(d2.hiddenCount, 2);
+	ok("P2b 置顶行不受 6 个截断影响（2 置顶 + 前 6 非置顶 + 还有 2 个）");
+}
+// P3 全 tab 组首次加载默认折叠（titleSource==='ledger'）；用户显式展开后以持久化为准
+{
+	const tabSessions = [raw("t1", "c:/t", { title: "tab-1", titleSource: "ledger" }), raw("t2", "c:/t", { title: "tab-2", titleSource: "ledger" })];
+	const gt = { key: "c:/t", label: "t", tooltip: "c:/t", cwd: "c:/t", ungrouped: false, count: 2, maxMtimeMs: 2, hasError: false, sessions: tabSessions } as WorkspaceGroup;
+	assert.equal(resolveGroupOpen(gt, {}, {}), false, "首次加载（无持久化）→ 默认收起");
+	assert.equal(resolveGroupOpen(gt, {}, { ["c:/t"]: true }), true, "用户展开后持久化 true → 展开（以持久化为准）");
+	assert.equal(resolveGroupOpen(gt, {}, { ["c:/t"]: false }), false, "显式收起 → 收起");
+	assert.equal(buildGroupDisplay(gt, false).allTab, true);
+	ok("P3 全 tab 组（titleSource==='ledger'）首次加载默认折叠，用户展开后以持久化为准");
+}
+// P4 混合组不动：维持 saw-ws-expansion 现状（缺省展开、false=收起），不读 tab 展开 key
+{
+	const mixed = [raw("m1", "c:/m", { title: "台账", titleSource: "ledger" }), raw("m2", "c:/m", { title: "首问", titleSource: "first-user" })];
+	const gm = { key: "c:/m", label: "m", tooltip: "c:/m", cwd: "c:/m", ungrouped: false, count: 2, maxMtimeMs: 2, hasError: false, sessions: mixed } as WorkspaceGroup;
+	assert.equal(resolveGroupOpen(gm, {}, {}), true, "混合组首次加载 → 展开（现状不变）");
+	assert.equal(resolveGroupOpen(gm, { ["c:/m"]: false }, {}), false, "用户收起 → 收起（saw-ws-expansion）");
+	assert.equal(resolveGroupOpen(gm, {}, { ["c:/m"]: true }), true, "tab 展开 key 对混合组无效（缺省展开）");
+	assert.equal(resolveGroupOpen(gm, { ["c:/m"]: false }, { ["c:/m"]: true }), false, "tab 展开 key 不能推翻混合组的显式收起");
+	assert.equal(buildGroupDisplay(gm, false).allTab, false);
+	ok("P4 混合组不动（缺省展开 / false=收起；tab 展开 key 不作用）");
+}
+// P5 rail 展开态持久化（saw-ws-overflow / saw-ws-tabgroups，机制同 saw-ws-expansion）
+{
+	lsBacking.clear();
+	assert.deepEqual(loadRailExpand(OVERFLOW_KEY), {});
+	saveRailExpand(OVERFLOW_KEY, { "c:/a": true, "c:/b": false });
+	assert.deepEqual(loadRailExpand(OVERFLOW_KEY), { "c:/a": true }, "回读仅保留非缺省 true（false 冗余丢弃）");
+	assert.deepEqual(loadRailExpand(TABGROUP_KEY), {}, "两 key 互不干扰");
+	saveRailExpand(TABGROUP_KEY, { "c:/t": true });
+	assert.deepEqual(loadRailExpand(TABGROUP_KEY), { "c:/t": true });
+	ok("P5a save→load 回读（两 key 独立；仅保留 true）");
+	assert.equal(lsBacking.get(OVERFLOW_KEY)?.includes('"c:/a"') === true, true, "落盘 key = saw-ws-overflow（save 原样落盘，冗余值由 prune/load 清理）");
+	assert.equal(lsBacking.get(TABGROUP_KEY)?.includes('"c:/t"') === true, true, "落盘 key = saw-ws-tabgroups");
+	ok("P5b 落盘 key 名正确（saw-ws-overflow / saw-ws-tabgroups）");
+	const pruned = pruneRailExpand(OVERFLOW_KEY, { "c:/a": true, "c:/gone": true, "c:/x": false }, ["c:/a"]);
+	assert.deepEqual(pruned, { "c:/a": true }, "prune 删失效键与冗余 false 并落盘");
+	const many = Object.fromEntries(Array.from({ length: MAX_PERSISTED_GROUPS + 1 }, (_, i) => [`c:/r${i}`, true]));
+	assert.equal(Object.keys(pruneRailExpand(OVERFLOW_KEY, many, Object.keys(many))).length, MAX_PERSISTED_GROUPS, "prune 500 上限");
+	lsBacking.set(OVERFLOW_KEY, "{坏JSON");
+	assert.deepEqual(loadRailExpand(OVERFLOW_KEY), {}, "坏 JSON 容错 → 空态");
+	lsBacking.set(OVERFLOW_KEY, "[1]");
+	assert.deepEqual(loadRailExpand(OVERFLOW_KEY), {}, "非对象容错");
+	lsBacking.set(TABGROUP_KEY, JSON.stringify({ "c:/a": "x", "c:/b": true, "c:/c": 1 }));
+	assert.deepEqual(loadRailExpand(TABGROUP_KEY), { "c:/b": true }, "非布尔值丢弃、合法 true 保留");
+	const working = globalThis.localStorage;
+	(globalThis as Record<string, unknown>).localStorage = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
+	assert.doesNotThrow(() => saveRailExpand(OVERFLOW_KEY, { "c:/a": true }));
+	assert.doesNotThrow(() => pruneRailExpand(OVERFLOW_KEY, { "c:/a": true }, ["c:/a"]));
+	(globalThis as Record<string, unknown>).localStorage = working;
+	ok("P5c prune 失效键/冗余 false + 500 上限 + 坏数据容错 + 写异常吞");
+}
 
 console.log(`_test_workspace_group: all assertions passed (${n})`);

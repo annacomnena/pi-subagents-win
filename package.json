@@ -44,6 +44,7 @@
     "test:runtime-journal-seq": "node --experimental-strip-types ./extensions/_test_runtime_journal_seq.ts",
     "test:runtime-transcript": "node --experimental-strip-types ./extensions/_test_runtime_transcript.ts",
     "test:session-title": "node --experimental-strip-types ./extensions/_test_session_title.ts",
+    "test:session-pin": "node --experimental-strip-types ./extensions/_test_session_pin.ts",
     "test:runtime-projector": "node --experimental-strip-types ./extensions/_test_runtime_projector.ts",
     "test:capabilities": "node --experimental-strip-types ./extensions/_test_capabilities.ts",
     "test:runner-tools": "node --experimental-strip-types ./extensions/_test_runner_tools.ts",

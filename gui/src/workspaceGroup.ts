@@ -111,6 +111,47 @@ export function sortGroups(groups: WorkspaceGroup[]): WorkspaceGroup[] {
 	return [...normal, ...ungrouped];
 }
 
+// ── 会话 rail 三件套 L3：置顶 / 每组最多 6 个 / 全 tab 组默认折叠（纯函数，JSX-free）──
+
+/** 每组默认显示的非置顶会话上限（置顶行不受截断影响，永远可见）。 */
+export const GROUP_VISIBLE_LIMIT = 6;
+
+/** 组内显示模型（置顶优先 + 6 个截断 + 全 tab 组判定）：
+ *  - pinned：组内 isScopeMaster 行（置顶，永远可见，不受 6 个限制）；
+ *  - visible：非置顶行，收起态最多 GROUP_VISIBLE_LIMIT 个（其余序），展开态全量；
+ *  - hiddenCount：被截断隐藏的非置顶行数（0 = 不渲染「还有 N 个」行）；
+ *  - allTab：组内会话全部为派发 tab（titleSource==='ledger'）→ 首次加载默认折叠数据源。 */
+export interface GroupDisplay {
+	pinned: SessionSummary[];
+	visible: SessionSummary[];
+	hiddenCount: number;
+	allTab: boolean;
+}
+
+export function buildGroupDisplay(g: WorkspaceGroup, overflowOpen: boolean): GroupDisplay {
+	const pinned = g.sessions.filter((s) => s.isScopeMaster === true);
+	const rest = g.sessions.filter((s) => s.isScopeMaster !== true);
+	const visible = overflowOpen ? rest : rest.slice(0, GROUP_VISIBLE_LIMIT);
+	const hiddenCount = Math.max(0, rest.length - GROUP_VISIBLE_LIMIT);
+	const allTab = g.sessions.length > 0 && g.sessions.every((s) => s.titleSource === "ledger");
+	return { pinned, visible, hiddenCount, allTab };
+}
+
+/**
+ * 组有效展开态（用户显式操作优先于默认）：
+ *  - 全 tab 组（allTab）：首次加载默认收起；用户展开后以持久化值为准（tabExpansion 显式 true）；
+ *  - 混合组：维持 saw-ws-expansion 现状（缺省展开、false=收起）。
+ */
+export function resolveGroupOpen(
+	g: WorkspaceGroup,
+	expansion: Record<string, boolean>,
+	tabExpansion: Record<string, boolean>,
+): boolean {
+	const allTab = g.sessions.length > 0 && g.sessions.every((s) => s.titleSource === "ledger");
+	if (allTab) return tabExpansion[g.key] === true;
+	return expansion[g.key] !== false;
+}
+
 /** 最近活动优先文件 mtime；缺失/损坏时回退会话创建时间。 */
 function updatedMs(s: SessionSummary): number {
 	return Number.isFinite(s.mtimeMs) && s.mtimeMs > 0 ? s.mtimeMs : startedMs(s);

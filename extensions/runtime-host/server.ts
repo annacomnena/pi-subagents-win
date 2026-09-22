@@ -42,6 +42,10 @@
  *     唯一读投影例外，best-effort never-throw；POST /v1/commands 仍是唯一命令入口。
  *   - `/v1/sessions` 每条目附服务端权威 `masterProtected`（与 executor 护栏同源
  *     getMasterStatus().attachment.sessionId；G6-P2 L4 必修 4：GUI 不再拿 health 心跳自猜）。
+ *   - `/v1/sessions` 每条目另附置顶标记（L3 会话 rail 三件套，session-pin.ts 纯读）：
+ *     `isMaster`（全局 master，与 masterProtected 同源）+ `isScopeMaster`（命中某 scope
+ *     attachment 且该 scope 解码 basename == 会话 cwd basename；解码失败不标）。均 additive，
+ *     仅 true 时挂出。
  *
  * 明确不做（G2 计划 §4 / 主会话拍板③）：无 SSE/push（WS 为 G6 增量升级面）；无 journal
  * compaction；无 fs.watch 正确性路径；S3/master-auto/mailbox 接线零改动。
@@ -86,6 +90,7 @@ import {
 	projectSession,
 } from "../runtime/transcript.ts";
 import { resolveSessionTitles } from "./session-title.ts";
+import { computeSessionPinFlags } from "./session-pin.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
 import { buildTimelineItems } from "./timeline.ts";
@@ -561,14 +566,23 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					} catch {
 						protectedSid = null;
 					}
+					// L3 置顶数据源（会话 rail 三件套）：isMaster = 全局 master（与 masterProtected 同源）；
+					// isScopeMaster = 命中某 scope attachment 且该 scope 解码 basename == 会话 cwd basename
+					//（解码失败不标；session-pin.ts 纯读 never-throw；字段 additive，仅 true 挂出）。
+					const pins = computeSessionPinFlags(sessions);
 					body = {
 						version: 1,
 						count: sessions.length,
-						sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => ({
-							...s,
-							...(titles.get(s.sessionId) ?? { title: s.sessionId, titleSource: "id" as const }),
-							...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
-						})),
+						sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => {
+							const pin = pins.get(s.sessionId);
+							return {
+								...s,
+								...(titles.get(s.sessionId) ?? { title: s.sessionId, titleSource: "id" as const }),
+								...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
+								...(pin?.isMaster ? { isMaster: true as const } : {}),
+								...(pin?.isScopeMaster ? { isScopeMaster: true as const } : {}),
+							};
+						}),
 						masterProtectedSessionId: protectedSid,
 					};
 					break;
