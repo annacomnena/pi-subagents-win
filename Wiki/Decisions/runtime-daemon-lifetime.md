@@ -46,8 +46,11 @@ source_paths:
   legacy 弱确权失败、**活锁占用**、**交接等待**（活方持有）——一律不 spawn、不 kill、不删锁、不覆盖。
 - **典型症状与恢复**：重启电脑后 daemon 死、host.json 与锁变僵尸 ⇒ 以前 `/gui on` 永远报
   `未确权（dead）… GUI 地址未知`（只能手工删文件）；现在应自动"检测到僵尸，已接管（持锁重建）"。
-- **残余**：坏锁（不可解析 ⇒ 无法证死）仍 fail-closed（需人工删锁 / `stop --force`）；清抢存在
-  微秒级 TOCTOU（daemon 启动侧二次抢锁串行化）；同进程 own-pid 锁重入仍 fail-closed。
+- **残余**（L4 独立复核后确认，`plans/0923_daemon_dead_rebuild_review.md`）：
+  - 坏锁（不可解析 ⇒ 无法证死）在 **ensure 侧 fail-closed**，而 **server 侧 `server.ts:462` 对 `!existing` 会删锁** —— 两侧**口径不对称**，坏锁用户会卡在 ensure 路径（低危；建议后续把 ensure 侧也允许清抢/重试不可解析锁）。
+  - 清抢存在微秒级 TOCTOU（读锁→判死→rm），但**比既有 `server.ts:461-471` 的 steal 更严**（多了 instanceId 复核且不删坏锁）；即便双持，daemon 启动侧 `acquireDaemonLockOrThrow` 会再次串行化，损害≈一个自杀子进程。
+  - 同进程 own-pid 锁重入仍 fail-closed（改动前后一致）。
+  - `legacy 弱确权失败` 分支**无任何测试覆盖**（既有缺口，非本次引入）。
 
 ## Evidence
 

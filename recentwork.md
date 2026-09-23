@@ -52,9 +52,9 @@
 - **产物**：本地 `plans/0923_daemon_dead_rebuild_fix.md`（+ L4 复核 `plans/0923_daemon_dead_rebuild_review.md` 并发中）
 - **Wiki**：[[Runtime Daemon 存活机制]]（新增"dead 僵尸 / 孤儿锁重建契约"节）
 - **Priority**：P1
-- **Status**：complete（L4 复核并发中；若有 must-fix 另起提交）
+- **Status**：complete（**L4 独立复核 PASS / 无 must-fix**）
 - **Commit**：`e262eb8`
-- **Verification**：`npx tsx extensions/_test_ensure_dead_rebuild.ts` 五夹具全过（dead 无锁→重建、dead+孤儿锁→重建、stale→uncertain spawn=0、runtimeId 不符→uncertain spawn=0、dead+活锁→fail-closed 且锁/host.json 未动）；smoke OK；daemon-lifecycle/gui-autostart/runtime-host-server 相邻测试全过。
+- **Verification**：L4 独立复核 `plans/0923_daemon_dead_rebuild_review.md` **PASS**（真退出的死 pid 端到端复现 A 孤儿锁→重建 / B 活锁→fail-closed / C 活 handoff→fail-closed；实测真实 runtime 目录 mtime 未变；确认 `stealStaleLock` 只 rm 锁+重新 wx 取锁、绝不 kill、并对清抢后二次抢锁串行化）。`npx tsx extensions/_test_ensure_dead_rebuild.ts` 五夹具全过（dead 无锁→重建、dead+孤儿锁→重建、stale→uncertain spawn=0、runtimeId 不符→uncertain spawn=0、dead+活锁→fail-closed 且锁/host.json 未动）；smoke OK；daemon-lifecycle/gui-autostart/runtime-host-server 相邻测试全过。
 
 ### Item 20 - hotspot 工具 pending 队列误写仓库根 state/（待修）
 
