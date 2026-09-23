@@ -16,9 +16,20 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
-| 6 | P1 | 本机 GUI 解锁 master 切片（通道已落地，端到端验收待补） | Item 4 | 补注入验收，转 Wiki current |
+| 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 10 - GUI 扫码连接微信切片（v1 绑定/解绑/状态）
+
+- **日期**：2026-09-23
+- **一句话**：设计完成、协议已源码验证、待实现（v1 只做扫码绑定 + 解绑 + 状态显示，不做消息收发）。
+- **涉及模块**：`gui/src/pages/ChannelsPage.tsx`（新，拟）、`extensions/runtime-host/wechat-bind.ts`（拟）、`extensions/runtime-host/server.ts`
+- **产物**：`plans/0923_wechat_gui_bind_plan.md`（本地 gitignored）
+- **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
+- **Priority**：P1
+- **Status**：planning/active（尚未实现）
+- **Commit**：<!--COMMIT_HASH-->
 
 ### Item 6 - 本机 GUI 解锁 master 切片
 
