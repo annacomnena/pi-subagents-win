@@ -92,6 +92,53 @@ export function mailboxDirForTab(timersDir: string, tabRunId: string): string {
 	return join(timersDir, "mail", tabRunId);
 }
 
+/**
+ * 归一化 set-timer 的 target 参数（2026-09-23：string|object 联合体在校验层恒败修复）。
+ *
+ * 背景：模型常把对象参数序列化为 JSON 字符串（'{"tabRunId":"…"}'）或直接传裸 runId
+ * 字符串；旧 schema（Literal("self") | Object）把这类值在 pi 校验层直接拒绝，
+ * execute 根本跑不到。本函数在 schema 放宽（增加 String 分支）之后做归一化：
+ *   - undefined / null / "" / "self" → "self"
+ *   - { tabRunId, taskId? } → 原样（taskId 非字符串则丢弃）
+ *   - JSON 对象字符串（含 "tabRunId"）→ 解析为对象
+ *   - 其他非空字符串 → 视为裸 tabRunId 简写 { tabRunId: s }
+ * 非法输入返回 { error }（tabRunId 缺失/空）；路径注入安全性仍由 mailboxDirForTab
+ * 的 SAFE_ID_PART 在落账时强制保证。
+ */
+export function normalizeTargetParam(raw: unknown): TimerTarget | { error: string } {
+	if (raw === undefined || raw === null) return "self";
+	if (typeof raw === "string") {
+		const s = raw.trim();
+		if (!s || s === "self") return "self";
+		if (s.startsWith("{")) {
+			try {
+				const parsed = JSON.parse(s) as Record<string, unknown>;
+				if (parsed && typeof parsed === "object") {
+					if (typeof parsed.tabRunId === "string" && parsed.tabRunId.trim()) {
+						return {
+							tabRunId: parsed.tabRunId.trim(),
+							taskId: typeof parsed.taskId === "string" ? parsed.taskId : undefined,
+						};
+					}
+					return { error: "target.tabRunId required when target is an object" };
+				}
+			} catch {
+				return { error: `target 不是合法 JSON 且不是 tabRunId: ${s.slice(0, 60)}` };
+			}
+			return { error: "target.tabRunId required when target is an object" };
+		}
+		return { tabRunId: s };
+	}
+	if (typeof raw === "object") {
+		const t = raw as Record<string, unknown>;
+		if (typeof t.tabRunId === "string" && t.tabRunId.trim()) {
+			return { tabRunId: t.tabRunId.trim(), taskId: typeof t.taskId === "string" ? t.taskId : undefined };
+		}
+		return { error: "target.tabRunId required when target is an object" };
+	}
+	return { error: "target must be \"self\" or { tabRunId }" };
+}
+
 /** 单个 timer 的账本文件路径：target=self → <timersDir>/<id>.json；tab → mail/<tabRunId>/<id>.json。 */
 export function timerFilePath(timersDir: string, timerId: string, tabRunId?: string): string {
 	if (!SAFE_ID_PART.test(timerId)) throw new Error(`unsafe timerId component: ${timerId}`);

@@ -23,10 +23,23 @@
 | 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 |
 | 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） |
 | 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） |
+| 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 19 - set-timer 的 target 参数 schema 恒拒修复
+
+- **日期**：2026-09-23
+- **一句话**：`set-timer` 的 `target` 对象参数被 pi 校验层恒拒（`Type.Union([Literal("self"), Object])` 对模型序列化出的 JSON 字符串 / 裸 runId 全分支失败，execute 根本跑不到）；改为先归一化再校验。
+- **涉及模块**：`extensions/timers.ts`（新增 `normalizeTargetParam` 纯函数）、`extensions/timers-runtime.ts`（schema 增 `Type.String()` 分支 + `resolveWriteScope`/execute 归一化 + `renderCall` 兼容）、`extensions/_test_timers_target_compat.ts`（新回归测试）
+- **产物**：本 tab 会话内直接完成（无独立 plans 报告）
+- **Wiki**：无（Wiki 无 timers 主题页；契约记入工具 description 与代码注释）
+- **Priority**：P2
+- **Status**：complete
+- **Commit**：`<!--COMMIT_HASH-->`
+- **Verification**：`npx tsx extensions/_test_timers_target_compat.ts` 通过 + `npm run smoke:extension-load` OK。
 
 ### Item 18 - outbox 事件唤醒（消息入会话延迟 5s → 9ms/≤200ms）
 

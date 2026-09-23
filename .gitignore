@@ -29,3 +29,6 @@ Thumbs.db
 Wiki/_navigation.json
 Wiki/_search.json
 Wiki/_keywords.json
+
+# hotspot 工具 pending 队列误写 CWD（应在 agentDir）——见 recentwork Item 20 待办
+state/

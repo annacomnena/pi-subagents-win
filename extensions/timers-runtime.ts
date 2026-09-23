@@ -27,6 +27,7 @@ import {
 	dueAtFromDelay,
 	isLate,
 	mailboxDirForTab,
+	normalizeTargetParam,
 	readAllTimers,
 	readTimerFile,
 	rootTimerConsumable,
@@ -258,19 +259,25 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 	if (isSubagent()) return cleanup;
 
 	// ── 写目标解析：主会话 → 根目录（self）或邮箱（tab）；标签页 → 仅自己邮箱 ──
+	// 2026-09-23：先经 normalizeTargetParam 归一化——模型常把对象序列化为 JSON 字符串
+	// 或直接传裸 runId；旧的 Literal|Object 联合 schema 在 pi 校验层恒败，execute 跑不到。
 	const resolveWriteScope = (
 		target: string | { tabRunId?: string; taskId?: string } | undefined,
 	): { tabRunId?: string } | { error: string } => {
 		const myRunId = getTabRunId(); // 惰性：工具执行时 flag 已就绪
+		const normalized = normalizeTargetParam(target);
+		if (typeof normalized === "object" && normalized !== null && "error" in normalized) {
+			return { error: (normalized as { error: string }).error };
+		}
 		if (myRunId) {
 			// 标签页：只允许 self（=自己的邮箱）或自己
-			if (target === undefined || target === "self") return { tabRunId: myRunId };
-			const t = target as { tabRunId?: string };
+			if (normalized === "self") return { tabRunId: myRunId };
+			const t = normalized as { tabRunId?: string };
 			if (t.tabRunId === myRunId) return { tabRunId: myRunId };
 			return { error: "标签页只能给自己设 timer；给其他 tab 设 timer 请用主会话" };
 		}
-		if (typeof target === "object" && target && (target as { tabRunId?: string }).tabRunId) {
-			return { tabRunId: (target as { tabRunId: string }).tabRunId };
+		if (typeof normalized === "object" && (normalized as { tabRunId?: string }).tabRunId) {
+			return { tabRunId: (normalized as { tabRunId: string }).tabRunId };
 		}
 		return {};
 	};
@@ -296,14 +303,21 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 					tabRunId: Type.String({ description: "目标标签页 runId" }),
 					taskId: Type.Optional(Type.String()),
 				}),
+				// 2026-09-23: String branch tolerates model-serialized targets (bare runId or JSON string);
+				// without it such values fail pi schema validation (anyOf) before execute runs.
+				// See normalizeTargetParam in ./timers.ts.
+				Type.String({ description: "target shorthand: bare tabRunId or JSON" }),
 			], { description: "缺省 self（当前会话）；{tabRunId} 指向标签页邮箱" })),
 			label: Type.Optional(Type.String({ description: "可读说明" })),
 			repeatMs: Type.Optional(Type.Number({ description: "周期重发间隔（≥10000ms）" })),
 		}),
 		renderCall(args, theme) {
 			const label = args.label ? ` ${theme.fg("muted", args.label)}` : "";
-			const target = typeof args.target === "object" && args.target?.tabRunId
-				? theme.fg("accent", `→tab:${args.target.tabRunId}`)
+			const targetTab = typeof args.target === "object" && (args.target as { tabRunId?: string })?.tabRunId
+				? (args.target as { tabRunId: string }).tabRunId
+				: (typeof args.target === "string" && args.target !== "self" ? args.target : undefined);
+			const target = targetTab
+				? theme.fg("accent", `→tab:${targetTab}`)
 				: theme.fg("accent", "→self");
 			const when = args.delayMs
 				? `${Math.round(args.delayMs / 1000)}s`
@@ -353,6 +367,12 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 			// pending 上限
 			const scope = resolveWriteScope(p.target as never);
 			if ("error" in scope) return { content: [{ type: "text", text: scope.error }], isError: true };
+			// 2026-09-23: store the normalized target (string shorthands coerced to object here;
+			// scope above already rejected invalid shapes, so this is a valid TimerTarget).
+			const normalizedTarget = normalizeTargetParam(p.target);
+			if (typeof normalizedTarget === "object" && normalizedTarget !== null && "error" in normalizedTarget) {
+				return { content: [{ type: "text", text: (normalizedTarget as { error: string }).error }], isError: true };
+			}
 			if (countPending(timersDir, scope.tabRunId) >= MAX_PENDING_TIMERS) {
 				return { content: [{ type: "text", text: `pending timer 已达上限 ${MAX_PENDING_TIMERS}` }], isError: true };
 			}
@@ -362,7 +382,7 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 				version: 1,
 				dueAt,
 				message,
-				target: p.target ?? "self",
+				target: normalizedTarget,
 				source,
 				label: typeof p.label === "string" && p.label.trim() ? p.label.trim() : undefined,
 				repeatMs: p.repeatMs,
