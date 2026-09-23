@@ -46,13 +46,13 @@
 ### Item 6 - 本机 GUI 解锁 master 切片
 
 - **日期**：2026-09-23
-- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已实现，但**仅在未提交工作树**（bootstrap OTT + 护栏），端到端验收待补，进行中。
-- **涉及模块**：`extensions/runtime/master-injection.ts`（新增）、`extensions/runtime/command-executor.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`
-- **Commit**：通道代码（bootstrap OTT、`master-injection.ts`、`master-offline:409` 映射）仅在未提交工作树，尚未合入任何提交；`c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为同域历史提交，**不含**本通道代码；本切片验收未合。
+- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已实现并提交（bootstrap OTT + 窄口护栏 + B 案凭据作用域化）；**仅剩端到端 GUI 注入的人工验收**未做。
+- **涉及模块**：`extensions/runtime/master-injection.ts`（新增）、`extensions/runtime/command-executor.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/ws.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`、`gui/src/**`
+- **Commit**：`00202cb`（切片 + B 案 + 两轮 must-fix）；`c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为同域历史提交，不含本通道代码。
 - **Wiki**：[[GUI 解锁 Master]]（`status: draft`）
 - **Priority**：P1
-- **Status**：active
-- **Verification**：待补（占用锁、审计行、`master-offline` 文案的端到端验收）。当前真实状态：B 案（浏览器凭据作用域化，`sw_gui_token`）**已决策、未实现**；must-fix（M1–M3）**已实现、独立 L4 复核进行中结论未定**；通道代码仍仅在未提交工作树。
+- **Status**：active（代码完整，人工验收待补）
+- **Verification**：四轮独立 L4 逐轮收敛（PASS-WITH-MUST-FIX → PASS → 发现并修掉 `/v1/challenge` 预言机与 `/gui off` WS 缺口 → 聚焦复验 PASS）；**仍待人工**：开启 GUI 后注入一条消息，看占用锁/审计行/`master-offline` 文案的端到端表现。。当前真实状态：B 案（浏览器凭据作用域化，`sw_gui_token`）**已决策、未实现**；must-fix（M1–M3）**已实现、独立 L4 复核进行中结论未定**；通道代码仍仅在未提交工作树。
 
 ### Item 5 - 微信 iLink 探针
 
