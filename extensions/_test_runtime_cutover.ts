@@ -51,6 +51,9 @@ function suppressions(): string[] {
 	return readFileSync(p, "utf8").trim().split("\n").filter(Boolean);
 }
 
+// L3：message send + 收据（postInject/.notified/ack）走 .then 微任务 → 断言 sent/收据前先 flush 微任务队列。
+const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+
 try {
 	// ── 1. 门：flag 关 → 恒放行 ────────────────────────────────────
 	{
@@ -106,6 +109,7 @@ try {
 			runsDir: RUNSDIR,
 			sendUserMessage: (b) => { sent.push(b); },
 		});
+		await flush(); // L3：message send + 收据 在 .then 微任务
 		assert.equal(r.owner, "sess-A");
 		assert.equal(r.consumed.length, 1);
 		assert.equal(r.consumed[0]!.action, "injected");
@@ -143,6 +147,7 @@ try {
 			sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR,
 			sendUserMessage: () => { throw new Error("inject boom"); },
 		});
+		await flush(); // L3：failed 路径 report 在 .then 微任务
 		const failed = r2.consumed.find((c) => c.reason === "inject-failed");
 		assert.ok(failed, "注入失败记录");
 		assert.equal(hasNotificationReceipt("run-tab_c2-completed"), false, "失败不确认收据");
@@ -152,7 +157,21 @@ try {
 		assert.equal(c2.status, "claimed", "失败信停 claimed（stale 回收重试，不丢）");
 	}
 
-	// ── 8. legacy 门：flag 开 + 他人 owner → 双链抑制 ────────────────
+	// ── 8. L3：缺注入通道不伪造 mailbox receipt，退回 pending 供恢复后重试 ──
+	{
+		const now = new Date().toISOString();
+		deliverLetter(report("tab_c3", now), { mailboxDir: MAILBOX });
+		const r = consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR });
+		await flush();
+		assert.ok(r.consumed.some((c) => c.reason === "no-injector"), "无 injector 明确记录，不 ack");
+		assert.equal(hasNotificationReceipt("run-tab_c3-completed"), false, "未发送不得确认收据");
+		assert.equal(existsSync(join(RUNSDIR, "tab_c3.notified")), false, "未发送不得认领 .notified");
+		const { listLetters } = await import("./runtime/mailbox.ts");
+		const c3 = listLetters(master, undefined, MAILBOX).find((l) => l.frame.frame === "message" && l.frame.subject === "run://tab/tab_c3")!;
+		assert.equal(c3.status, "pending", "无 injector 的信退回 pending");
+	}
+
+	// ── 9. legacy 门：flag 开 + 他人 owner → 双链抑制 ────────────────
 	{
 		const { onTabResultFile, _resetEventBus } = await import("./event-bus.ts");
 		const { onNewReport } = await import("./report.ts");

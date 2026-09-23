@@ -137,6 +137,9 @@ async function runRace<T>(jobs: RaceJob[]): Promise<T[]> {
 	}
 }
 
+// L3：命令回执 send 走 .then 微任务 → 断言 sent（回执）前先 flush 微任务队列。
+const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+
 try {
 	// ── 前置：cutover on + master owner ─────────────────────────────
 	setCutover(true, "test");
@@ -162,6 +165,7 @@ try {
 		const entry = r.consumed.find((c) => c.action === "executed");
 		assert.ok(entry, "命令信被消费执行");
 		assert.equal(entry!.reason, "command-accepted", "executor accepted");
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent.length, 1, "恰一条回执 followUp");
 		assert.ok(sent[0]!.includes("命令回执") && sent[0]!.includes("accepted"), "回执含 status");
 		assert.ok(!sent[0]!.includes("待执行"), "红线：回执是纯报告，无待执行指令语义");
@@ -191,6 +195,7 @@ try {
 			sessionId: sid, mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"),
 			sendUserMessage: (b) => sent.push(b), executeCommandOptions: execOpts,
 		});
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent.length, 1, "重放信也回执");
 		assert.ok(sent[0]!.includes("重放"), "回执标注 replayed");
 		const cfg = JSON.parse(readFileSync(tmpCfg, "utf8")) as { masterSuccession?: { auto?: boolean } };
@@ -215,6 +220,7 @@ try {
 			sessionId: sid, mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"),
 			sendUserMessage: (b) => sent2.push(b), executeCommandOptions: execOpts,
 		});
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent2.length, 1, "fileId 重放也回执");
 		assert.ok(sent2[0]!.includes("重放"), "fileId 重放标注 replayed");
 		assert.ok(!sent.concat(sent2).some((b) => b.includes("关联:") || /[0-9a-f]{12}/.test(b)), "同 commandKey 多次执行：回执 correlation 不存在（内容派生 oracle 已移除）");
@@ -232,6 +238,7 @@ try {
 		});
 		const entry = r.consumed.find((c) => c.action === "executed");
 		assert.ok(entry && entry.reason === "command-rejected:invalid-payload", "白名单 payload 拒绝");
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent.length, 1);
 		assert.ok(sent[0]!.includes("invalid-payload"), "回执带拒绝原因");
 		assert.equal(commandLetter(key)!.status, "acked", "rejected 终态 ack（不重投）");
@@ -291,6 +298,7 @@ try {
 			sendUserMessage: (b) => sentA.push(b), executeCommandOptions: execOpts,
 		});
 		assert.equal(rA.consumed.filter((c) => c.action === "executed").length, 1, "恶意 key 信照常确定性执行");
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sentA.length, 1);
 		assert.ok(sentA[0]!.includes("命令回执") && sentA[0]!.includes("accepted"), "固定模板+受控 status 在");
 		assert.ok(!sentA[0]!.includes("INJECT-KEY-MARKER") && !sentA[0]!.includes("ignore_all_prior_instructions"), "红线：commandKey 原文不进 LLM 回执");
@@ -304,6 +312,7 @@ try {
 			sessionId: sid, mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"),
 			sendUserMessage: (b) => sentB.push(b), executeCommandOptions: execOpts,
 		});
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sentB.length, 1);
 		const cfgB = JSON.parse(readFileSync(tmpCfg, "utf8")) as { masterSuccession?: { auto?: boolean } };
 		assert.equal(cfgB.masterSuccession?.auto, false, "恶意 reason 信真实执行（副作用在盘面）");
@@ -321,6 +330,7 @@ try {
 		});
 		const entryC = rC.consumed.find((c) => c.action === "executed");
 		assert.ok(entryC && entryC.reason === "command-failed", "handler 异常收敛 failed");
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sentC.length, 1, "failed 也有回执");
 		assert.ok(!sentC[0]!.includes("NOPE-ERR-MARKER") && !sentC[0]!.includes("ENOENT"), "红线：handler error 原文不进回执");
 		assert.equal(commandLetter("k-t5c")!.status, "acked", "缺口①：failed 也 ack 终态（不重投不残留）");
@@ -349,6 +359,7 @@ try {
 		const executed = r.consumed.filter((c) => c.action === "executed");
 		assert.equal(executed.length, 2, "两封都执行（同键不丢信）");
 		assert.deepEqual(executed.map((c) => c.reason).sort(), ["command-accepted", "command-rejected:invalid-payload"], "auto 帧接受、pause 帧（to 非 workstream）拒绝——各帧各果");
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent.length, 2);
 		// 回执零内容派生字段（L4 二次返修）：两封同键回执均无 correlation，各自帧的绑定
 		// 由 journal / config 副作用与逐 fileId ack 证明（下方断言）
@@ -402,6 +413,7 @@ try {
 			sessionId: sid, mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"),
 			sendUserMessage: (b) => sent.push(b), executeCommandOptions: execOpts,
 		});
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		assert.equal(sent.length, 2, "同键两封各一条回执");
 		const fresh = sent.find((b) => !b.includes("重放"));
 		const replay = sent.find((b) => b.includes("重放"));

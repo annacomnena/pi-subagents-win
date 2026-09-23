@@ -53,6 +53,8 @@ try {
 			},
 			executeCommandOptions: { configPath: j.configPath, journalPath: j.journalPath },
 		});
+		// L3：命令回执 send 走 .then 微任务 → flush 后 receipts 才落定
+		await new Promise((r) => setImmediate(r));
 		done({ consumed: r.consumed, receipts });
 	} else {
 		const j = job as JobBase & { sessionId: string; cwd: string };

@@ -86,6 +86,9 @@ function commandsFiles(commandsDir: string): string[] {
 	return existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [];
 }
 
+// L3：命令回执 / message 注入 send 走 .then 微任务 → 断言 sent 前先 flush 微任务队列。
+const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+
 let AUTH_TOKEN: string | null = null; // G6-P2：POST /v1/commands 认证（G8 服务端创建后置值；缺省 null = 裸发）
 
 async function postJson(base: string, path: string, body: unknown, opts: { headers?: Record<string, string> } = {}): Promise<{ status: number; body: any }> {
@@ -776,6 +779,7 @@ try {
 		}), { mailboxDir: ROOT });
 		const sent: string[] = [];
 		const r = consumeMailboxOnce({ sessionId: sid, mailboxDir: ROOT, runsDir, sendUserMessage: (b) => { sent.push(b); } });
+		await flush(); // L3：命令回执 send 在 .then 微任务
 		const cmdEntry = r.consumed.find((c) => c.action === "executed");
 		assert.ok(cmdEntry && cmdEntry.reason === "command-rejected:not-implemented", "命令信进 executor：白名单外 rejected(not-implemented)");
 		assert.equal(sent.length, 1, "恰一条回执 followUp（纯报告）");
@@ -792,6 +796,7 @@ try {
 		}), { mailboxDir: ROOT });
 		const sent2: string[] = [];
 		const r2 = consumeMailboxOnce({ sessionId: sid, mailboxDir: ROOT, runsDir, sendUserMessage: (b) => { sent2.push(b); } });
+		await flush(); // L3：message 注入 + ack 在 .then 微任务
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 1, "message 帧照常注入");
 		assert.equal(sent2.length, 1);
 		assert.ok(!listLetters(master, undefined, ROOT).some((l) => l.frame.frame === "message" && l.frame.body.summary === "smoke report" && l.status === "pending"), "message 信已 ack");
