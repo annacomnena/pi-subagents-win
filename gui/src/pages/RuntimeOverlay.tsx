@@ -1,7 +1,9 @@
 /**
  * gui/src/pages/RuntimeOverlay.tsx — 「运行时」全屏覆盖层（ZCode 1:1 复刻 第 6 步）。
  *
- * 壳 = zcode WorkspaceSettingsLayer（absolute inset-0 z-10，无遮罩动画，挂载即整层替换）；
+ * 壳 = zcode WorkspaceSettingsLayer（absolute inset-0，无遮罩动画，挂载即整层替换）；
+ * 0923 2003 遮挡修复：根层叠上下文内 z-10 < composer dock z-20 被压（plans/0923_gui_ux_fix_plan.md A），
+ * 抬到 z-30 → 根序 toast 9999 > dropdown 60 > dialog/tooltip 50 > RuntimeOverlay 30 > composer 20。
  * 内部骨架 = SettingsPage.tsx#L1375 同款 grid：窄栅 68px 图标栏 / ≥lg 268px 全栏；
  * 返回钮 = #L1408 圆角-xl 套件（m-1 w-[calc(100%-0.5rem)] justify-start rounded-xl…）。
  * 四 section（attention/master/workstream/runtime）组件**原样复用**为右栏内容；
@@ -70,7 +72,7 @@ export function RuntimeOverlay() {
 			role="dialog"
 			aria-modal="true"
 			aria-label="运行时"
-			className="absolute inset-0 z-10"
+			className="absolute inset-0 z-30"
 		>
 			{/* SettingsPage 骨架（SettingsPage.tsx#L1375 照抄）：68px 图标栏 / ≥lg 268px 全栏 */}
 			<div className="relative grid h-screen min-h-full w-full grid-cols-[68px_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] bg-background lg:grid-cols-[268px_minmax(0,1fr)]">

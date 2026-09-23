@@ -30,7 +30,8 @@ import type { StreamServerFrame, StreamState } from "./useEventStream";
  *  原 master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（runtimeOverlay）。 */
 export type TabId = "chat" | "timeline";
 
-/** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0 z-10）：
+/** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0；0923 2003 遮挡修复后
+ *  根层叠 z-30，见 RuntimeOverlay.tsx 头注）：
  *  null=关；值=打开并定位对应 section（attention/master/workstream/runtime 四页组件原样复用；
  *  0923 wechat = 「微信连接」（未启用 403 时 RuntimeOverlay 隐藏该入口））。 */
 export type RuntimeOverlaySection = "attention" | "master" | "workstream" | "runtime" | "wechat";
@@ -183,6 +184,8 @@ interface GuiState {
 	chatRowsBySession: Record<string, TranscriptRow[]>;
 	/** 会话 → 投影头（seq/logEpoch/gen；断线重连的 base 来源）。 */
 	chatHeadBySession: Record<string, TranscriptHead | null>;
+	/** 0923 2003 C4：journal 主题续传指针（WS journal ack/event 推进；纯指针，不改既有数据结构）。 */
+	chatJournalHead: TranscriptHead | null;
 	/** 会话 → 已见最大帧 seq（防重放倒退；重放去重由 appended 幂等兑底）。 */
 	chatSeqBySession: Record<string, number>;
 	chatConn: StreamState;
@@ -198,6 +201,8 @@ interface GuiState {
 	pollChatSessions: () => Promise<void>;
 	openChatSession: (id: string) => Promise<void>;
 	reloadChatSession: (id: string) => Promise<void>;
+	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
+	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
 	setChatConn: (s: StreamState) => void;
 	bumpChatResync: () => void;
@@ -392,6 +397,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatActiveId: null,
 	chatRowsBySession: {},
 	chatHeadBySession: {},
+	chatJournalHead: null,
 	chatSeqBySession: {},
 	chatConn: "idle",
 	chatResyncKey: 0,
@@ -471,6 +477,45 @@ export const useGui = create<GuiState>((set, get) => ({
 		get().markUp(r.at);
 	},
 
+	/** 0923 2003 C3②：WS 重连强制 resync——启用 client.ts transcript 的 after= 增量：
+	 *  有 head → GET ?after=head.seq 拿「触及行终态」按 rowId upsert 合并（回填保位、新行按响应
+	 *  序追加）；无 head 或增量失败 → 回退全量 reloadChatSession。rowId 幂等 + seq 倒退防御
+	 *  （applyChatFrame）保证双通道不重不漏。 */
+	resyncChatSession: async (id) => {
+		const head = get().chatHeadBySession[id];
+		const canDelta = head !== null && head !== undefined && head.seq > 0;
+		const r = canDelta ? await api.transcript(id, head.seq) : await api.transcript(id);
+		if (!r.ok) {
+			if (canDelta) await get().reloadChatSession(id);
+			return;
+		}
+		// WS 帧可能在 HTTP 请求途中先到；不得让较旧响应倒退 head/覆盖较新行。
+		const currentSeq = get().chatSeqBySession[id] ?? 0;
+		const responseSeq = r.data.head?.seq ?? 0;
+		if (currentSeq > responseSeq) return;
+		if (r.data.mode === "delta") {
+			const rows = get().chatRowsBySession[id] ?? [];
+			const merged = rows.slice();
+			for (const row of r.data.rows) {
+				const idx = merged.findIndex((m) => m.rowId === row.rowId);
+				if (idx >= 0) merged[idx] = row; // 回填：保原位、换终态
+				else merged.push(row); // 新行：按响应（投影）序追加
+			}
+			set({
+				chatRowsBySession: { ...get().chatRowsBySession, [id]: merged },
+				chatHeadBySession: { ...get().chatHeadBySession, [id]: r.data.head },
+				chatSeqBySession: { ...get().chatSeqBySession, [id]: r.data.head?.seq ?? head?.seq ?? 0 },
+			});
+		} else {
+			set({
+				chatRowsBySession: { ...get().chatRowsBySession, [id]: r.data.rows },
+				chatHeadBySession: { ...get().chatHeadBySession, [id]: r.data.head },
+				chatSeqBySession: { ...get().chatSeqBySession, [id]: r.data.head?.seq ?? 0 },
+			});
+		}
+		get().markUp(r.at);
+	},
+
 	openChatSession: async (id) => {
 		set({ chatActiveId: id });
 		await get().reloadChatSession(id);
@@ -514,6 +559,41 @@ export const useGui = create<GuiState>((set, get) => ({
 					// G6-P2 L4 必修 2：pending 超 TTL 转 expired（journal 回执投影到发送徽标）
 					set({ chatOutbox: { ...get().chatOutbox, [ck]: { ...cur, status: "expired", detail: "超过 24h 未投递，已过期", at: new Date().toISOString() } } });
 				}
+			}
+			return;
+		}
+		// 0923 2003 C4：journal 主题（全量事件流 → envelope 按 id 并入 timeline；推进续传指针）。
+		// HTTP 2s 轮询保留作 WS 断开兜底，双通道按 id 去重天然不重复。
+		if (frame.topic === "journal") {
+			if (frame.type === "ack") {
+				if (frame.head !== null) set({ chatJournalHead: frame.head });
+				// 跨代 → 换新 head 重订阅（journal 自身即重放源，免 HTTP GET）；
+				// head=null（journal 缺失）不 bump，防无限重连循环——HTTP 轮询兼覆盖
+				if (frame.mode === "snapshot" && frame.head !== null) get().bumpChatResync();
+				return;
+			}
+			if (frame.type === "resync") {
+				set({ chatJournalHead: null });
+				get().bumpChatResync();
+				return;
+			}
+			if (frame.type === "event" && frame.envelope !== undefined) {
+				const env = frame.envelope as RuntimeEnvelope;
+				if (typeof env.id !== "string" || env.id.length === 0) return;
+				const prev = get().chatJournalHead;
+				set({
+					timeline: capTimelineItems(mergeTimelineItems(get().timeline, [envelopeToTimelineItem(env)]), get().historyAnchorId),
+					chatJournalHead: prev !== null ? { ...prev, seq: Math.max(prev.seq, frame.seq) } : { seq: frame.seq, logEpoch: "" },
+				});
+				return;
+			}
+			return;
+		}
+		// 0923 2003 C4：interactions 主题（状态投影：每帧全量替换，订阅即重放全量）
+		if (frame.topic === "interactions") {
+			if (frame.type === "event" && frame.op !== undefined && frame.op.kind === "state.updated") {
+				const items = (frame.op.patch as { interactions?: unknown }).interactions;
+				if (Array.isArray(items)) set({ interactions: items as InteractionItem[] });
 			}
 			return;
 		}

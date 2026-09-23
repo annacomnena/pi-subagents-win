@@ -3,7 +3,8 @@
  *
  * - 行型映射（拍板 5）：我方 5 种 TranscriptRow → zcode 行型（class 串照抄锚 §2.b）：
  *   turnHeader→调试 turn header 行；userInput→右对齐气泡（rounded-tr-xs 缺角必抄）；
- *   assistantText→行式纯文本 whitespace-pre-wrap；reasoning→Collapsible 默认收起；
+ *   assistantText→行式 <Markdown>（0923 2003 自研零依赖渲染器，替换 whitespace-pre-wrap 纯文本）；
+ *   reasoning→Collapsible 默认收起（正文同 Markdown）；
  *   toolCall→Collapsible 单行卡（运行中=animated-gradient-text 扫光≈流式；无光标字符）。
  * - composer（拍板 6）：rounded-2xl border-input-border bg-input p-3 三态边框 + 发送钮
  *   icon-md bg-brand ArrowUp；加号钮与 Stop 钮灰显占位（无后端，Tooltip「未接入」）。
@@ -17,6 +18,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronRight, Plus, Square, Wrench } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
+import { usePoll } from "../usePoll";
+import { Markdown } from "../ui/Markdown";
 import { RelTime } from "../ui";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -84,12 +87,15 @@ function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userIn
 	);
 }
 
-/** assistant 行式正文（#L1512,1518）：纯文本 whitespace-pre-wrap（拍板 1 白名单）+ 注脚。 */
+/** assistant 行式正文（#L1512,1518）：0923 2003 正文换 <Markdown>（自研零依赖渲染器，
+ *  替换 whitespace-pre-wrap 纯文本；外层 className 布局类保留）+ 注脚。 */
 function AssistantTextRowView({ row }: { row: Extract<TranscriptRow, { kind: "assistantText" }> }) {
 	return (
 		<RowShell rowId={row.rowId} className="group/assistant-row">
 			<div className="w-full text-ui-base">
-				<div className="whitespace-pre-wrap">{row.text}</div>
+				<div className="whitespace-pre-wrap">
+					<Markdown text={row.text} />
+				</div>
 				{(row.model !== undefined || row.provider !== undefined) && (
 					<div className="mt-1 font-mono text-ui-xs text-foreground-subtlest">
 						{row.model}
@@ -115,7 +121,9 @@ function ReasoningRowView({ row }: { row: Extract<TranscriptRow, { kind: "reason
 				</CollapsibleTrigger>
 				<CollapsibleContent className="text-popover-foreground outline-none">
 					<div className="pt-2 text-ui-sm text-foreground-subtle">
-						<div className="whitespace-pre-wrap">{row.text}</div>
+						<div className="whitespace-pre-wrap">
+							<Markdown text={row.text} />
+						</div>
 					</div>
 				</CollapsibleContent>
 			</Collapsible>
@@ -276,15 +284,38 @@ export function ChatPage() {
 					? { type: "subscribe", topic: "outbox", base: { seq: oh.seq, logEpoch: oh.logEpoch, ...(typeof oh.gen === "number" ? { gen: oh.gen } : {}) } }
 					: { type: "subscribe", topic: "outbox", base: { seq: 0, logEpoch: "" } },
 			);
+			// 0923 2003 C4：journal 全量事件流 + interactions 状态投影（服务端 ws.ts 已支持；
+			// 首连 logEpoch 空 = bootstrap 全量重放，重连带 chatJournalHead 续传）
+			const jh = st.chatJournalHead;
+			subs.push(
+				jh !== null
+					? { type: "subscribe", topic: "journal", base: { seq: jh.seq, logEpoch: jh.logEpoch, ...(typeof jh.gen === "number" ? { gen: jh.gen } : {}) } }
+					: { type: "subscribe", topic: "journal", base: { seq: 0, logEpoch: "" } },
+			);
+			subs.push({ type: "subscribe", topic: "interactions" });
 			return subs;
 		},
 		onFrame: (f) => {
 			void useGui.getState().applyChatFrame(f);
 		},
+		// 0923 2003 C3①：WS 断线重连后强制 resync——每次连接建立（含重连）触发 transcript
+		// 重载：有 head 走 after= 增量补差，无 head 走全量（复用 store，不改其数据结构）
+		onOpen: () => {
+			const st = useGui.getState();
+			if (st.chatActiveId !== null) void st.resyncChatSession(st.chatActiveId);
+		},
 	});
 	useEffect(() => {
 		useGui.getState().setChatConn(wsState);
 	}, [wsState]);
+
+	// 0923 2003 C3 回退策略：WS 断线期间 HTTP 兜底——chatConn!="open" 且有活跃会话时
+	// 每 3s 全量 reloadChatSession（rowId 幂等 + seq 倒退防御保证双通道不重不漏）；
+	// WS 恢复即停（onopen resync 接管增量）。
+	usePoll(() => {
+		const st = useGui.getState();
+		if (st.chatConn !== "open" && st.chatActiveId !== null) void st.reloadChatSession(st.chatActiveId);
+	}, 3000);
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
 	// Master 禁输入标识 = /v1/sessions masterProtected flag（服务端权威；POST 403 是最后防线）。

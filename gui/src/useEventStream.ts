@@ -2,8 +2,9 @@
  * gui/src/useEventStream.ts — G6-P1：WS 事件流 hook（usePoll 的增量升级面，仅供会话页起步；
  * 既有五页轮询零改动）。
  *
- * - 自动重连（1s 起 ×2 退避，封顶 10s）；连接建立/每次重连后用 buildSubscriptions() 取
- *   **最新** base 重订阅（断线续传：seq/logEpoch 由调用方 store 持有）；
+ * - 自动重连（1s 起 ×2 退避，封顶 10s）；连接建立/每次重连后先调 onOpen（调用方强制
+ *   resync，0923 2003 C3），再用 buildSubscriptions() 取 **最新** base 重订阅（断线续传：
+ *   seq/logEpoch 由调用方 store 持有）；
  * - ack mode:"snapshot" → 调用方应重 HTTP GET 全量（server 不背大二进制快照）；
  *   resync → 调用方 reGet() 后 bump resyncKey 触发重订阅；
  * - onFrame 回调 ref 化（每拍取最新闭包，usePoll 同款）；never-throw（坏帧忽略）。
@@ -26,6 +27,8 @@ export interface UseEventStreamOptions {
 	buildSubscriptions: () => StreamSubscribeMsg[];
 	/** 服务端帧（ack/event/resync/error）。 */
 	onFrame: (frame: StreamServerFrame) => void;
+	/** 0923 2003 C3：连接建立（含每次重连）时触发——调用方强制 resync（transcript 增量/全量重载）。 */
+	onOpen?: () => void;
 	/** resync/snapshot 后调用方重拉全量完成时 bump 此键 → 立即重订阅（不等断线）。 */
 	resyncKey?: number;
 }
@@ -59,6 +62,12 @@ export function useEventStream(opts: UseEventStreamOptions): StreamState {
 				if (stopped) return;
 				attempt = 0;
 				setState("open");
+				// 0923 2003 C3①：断线重连后强制 resync（先补数据再重订阅；帧幂等+seq 防御保不重不漏）
+				try {
+					ref.current.onOpen?.();
+				} catch {
+					/* never-throw */
+				}
 				const subs = ref.current.buildSubscriptions();
 				for (const m of subs) {
 					try {
