@@ -31,6 +31,7 @@ import {
 	listLetters,
 	mailboxBacklog,
 	markDelivered,
+	releaseClaimed,
 } from "./runtime/mailbox.ts";
 import { newCommandFrame, newMessageFrame } from "./runtime/protocol.ts";
 
@@ -180,6 +181,27 @@ try {
 		const mid = legacy.id;
 		const acked = ackLetter(master, mid, { mailboxDir: MAILBOX });
 		assert.ok(acked && acked.status === "acked", "旧命名信件 ack 可达（scan 兜底）");
+	}
+
+	// ── 11. L3 releaseClaimed：claimed→pending（忙时冲突释放认领，供下 tick 重试）────────
+	{
+		const letter = deliverLetter(msg("REPORT", new Date().toISOString()), { mailboxDir: MAILBOX });
+		const mid = letter.letter.frame.frame === "message" ? letter.letter.frame.id : "";
+		const holder = "mailbox-consumer:holder-A";
+		const taken = claimLetters(master, { claimedBy: holder, mailboxDir: MAILBOX, ids: [mid], limit: 1 });
+		assert.equal(taken.length, 1, "定向 claim 成功");
+		assert.equal(taken[0]!.status, "claimed");
+		// 持有者不匹配 → no-op（避免误放已被他人 stale 接管、claimedBy 已变的信）
+		assert.equal(releaseClaimed(master, mid, "mailbox-consumer:other", { mailboxDir: MAILBOX }), null, "异 holder → no-op");
+		assert.equal(listLetters(master, "claimed", MAILBOX).find((l) => l.frame.frame === "message" && l.frame.id === mid)?.status, "claimed", "no-op 后仍 claimed");
+		// 同 holder → 释放（claimed→pending，清 claimedAt/claimedBy），下 tick 可重新领取
+		const released = releaseClaimed(master, mid, holder, { mailboxDir: MAILBOX });
+		assert.ok(released && released.status === "pending", "同 holder → 释放回 pending");
+		assert.equal(released!.claimedBy, undefined, "claimedBy 已清");
+		assert.equal(released!.claimedAt, undefined, "claimedAt 已清");
+		const retaken = claimLetters(master, { claimedBy: holder, mailboxDir: MAILBOX, ids: [mid], limit: 1 });
+		assert.equal(retaken.length, 1, "释放后可重新领取（下 tick 重试收敛）");
+		assert.ok(ackLetter(master, mid, { mailboxDir: MAILBOX }), "收尾：置终态不干扰后续枚举");
 	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });

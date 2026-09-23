@@ -119,6 +119,7 @@ assert.deepEqual(toolNames, [
 assert.deepEqual(commandNames, [
 	"agents",
 	"codex-headers",
+	"gc",
 	"gui",
 	"hotspot",
 	"launch",
@@ -137,6 +138,7 @@ assert.deepEqual(commandNames, [
 	"searcher-mode",
 	"sub-models",
 	"sub-presets",
+	"subagent-gc",
 	"tabs",
 	"task-close",
 	"task-create",

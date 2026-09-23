@@ -63,9 +63,18 @@ export interface EventBusOptions {
 	sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => void;
 }
 
+const MAX_SEEN_RESULTS = 500;
 let watcher: FSWatcher | null = null;
 let seenResults = new Set<string>();
 let selfDisabled = false; // 旧实例 stale 后停止注入，避免反复报错
+
+function markResultSeen(fileName: string): void {
+	seenResults.add(fileName);
+	if (seenResults.size > MAX_SEEN_RESULTS) {
+		const first = seenResults.values().next().value;
+		if (first) seenResults.delete(first);
+	}
+}
 let watcherGen = 0; // 每次 (重)建 / close watcher 自增；回调据此判 stale（防双 watcher / reload 死 watcher）
 let startWatch: (() => void) | null = null; // 当前周期的"按需(重)启动 watch"闭包；owner 易主（master-attach）后由 triggerOwnershipRecheck 触发
 
@@ -128,7 +137,7 @@ function snapshotExisting(runsDir: string): void {
 	seenResults = new Set<string>();
 	if (!existsSync(runsDir)) return;
 	for (const f of readdirSync(runsDir)) {
-		if (f.endsWith(".result.json")) seenResults.add(f);
+		if (f.endsWith(".result.json")) markResultSeen(f);
 	}
 }
 
@@ -191,7 +200,7 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	// 不注入；且不标 seen（未写完的可在下个事件/tick 重试；已删的不会再触发）。
 	// 此前 null 照走全链，产生 "(no summary)" 幻影完成 + 消耗掉 .notified 认领。
 	if (!result) return false;
-	seenResults.add(fileName);
+	markResultSeen(fileName);
 
 	// 会话定位（前置：fencing 豁免判定需要它）：由 links.jsonl 找到派发该 tab 的会话。
 	// 双匹配：links 记录派发时身份（sessionIdentity：tab runId 优先），重启后本进程 scope 可能
@@ -394,4 +403,9 @@ export function _resetEventBus(): void {
 	selfDisabled = false;
 	startWatch = null;
 	closeWatcher(); // 关在途 watcher + 使其回调 stale
+}
+
+/** 清理已读缓存集合（GC 时调用）。 */
+export function clearEventBusCache(): void {
+	seenResults.clear();
 }

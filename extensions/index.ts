@@ -54,12 +54,12 @@ import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
 import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
+import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
-import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import { registerOutboxBridge } from "./outbox-bridge.ts";
-import { registerGuiAutoStart } from "./gui-autostart.ts";
-import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
+import { registerGuiAutoStart } from "./gui-autostart.ts"; // G6 L3：GUI 自动拉起（opt-in）
+import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import type { WakeDecision } from "./runtime/wake.ts";
 import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
@@ -107,6 +107,7 @@ import {
 	type LaunchMode,
 } from "./launch.ts";
 import { launchWorkflowTab, masterDispatchLaunch } from "./launch-workflow.ts";
+import { runSystemGc } from "./gc-cleaner.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
@@ -121,9 +122,15 @@ const WORKFLOW_SKILL_FILE = join(WORKFLOW_SKILL_ROOT, "workflow-orchestrator", "
 
 // ── pi CLI 路径探测 ────────────────────────────────────────────────
 
+let cachedPiCli: string | null = null;
+
 function findPiCli(): string {
+	if (cachedPiCli && existsSync(cachedPiCli)) return cachedPiCli;
 	const env = process.env.PI_CLI_PATH;
-	if (env && existsSync(env)) return resolve(env);
+	if (env && existsSync(env)) {
+		cachedPiCli = resolve(env);
+		return cachedPiCli;
+	}
 	const piDir = dirname(process.argv[1] ?? "");
 	const candidates = [
 		join(piDir, "dist", "cli.js"),
@@ -131,25 +138,36 @@ function findPiCli(): string {
 		join(dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
 	];
 	for (const c of candidates) {
-		if (existsSync(c)) return resolve(c);
+		if (existsSync(c)) {
+			cachedPiCli = resolve(c);
+			return cachedPiCli;
+		}
 	}
 	try {
 		const which = execFileSync("where", ["pi"], { encoding: "utf8", shell: true }).split("\n")[0].trim();
 		if (which && existsSync(which)) {
 			const content = readFileSync(which, "utf8");
 			const match = content.match(/node\s+"?([^"\s]+dist[\\/]cli\.js)"?/);
-			if (match && existsSync(match[1])) return resolve(match[1]);
+			if (match && existsSync(match[1])) {
+				cachedPiCli = resolve(match[1]);
+				return cachedPiCli;
+			}
 		}
 	} catch { /* ignore */ }
 	throw new Error("Cannot find pi CLI. Set PI_CLI_PATH env var.");
 }
 
+let cachedWtPath: string | null | undefined = undefined;
+
 function findWindowsTerminal(): string | null {
+	if (cachedWtPath !== undefined) return cachedWtPath;
 	try {
 		// WindowsApps is protected, so trust `where` rather than existsSync.
 		const result = execFileSync("where", ["wt.exe"], { encoding: "utf8", shell: true });
-		return result.split("\n")[0].trim() || null;
+		cachedWtPath = result.split("\n")[0].trim() || null;
+		return cachedWtPath;
 	} catch {
+		cachedWtPath = null;
 		return null;
 	}
 }
@@ -614,6 +632,29 @@ interface SubagentResult {
 	priorFailures?: AttemptFailure[];
 	error?: string;
 	agent?: string;
+	durationMs?: number;
+	toolCallsCount?: number;
+}
+
+export interface SubagentProgressInfo {
+	agent?: string;
+	model?: string;
+	status: string;
+	detail?: string;
+	currentTool?: string;
+	currentToolDetail?: string;
+	turn?: number;
+	toolCallsCount?: number;
+	startedAt: number;
+	elapsedMs: number;
+	recentEvents: string[];
+	latestTextSnippet?: string;
+}
+
+export interface ParallelProgressInfo {
+	startedAt: number;
+	elapsedMs: number;
+	tasks: SubagentProgressInfo[];
 }
 
 /** Assistant text snippets collected across multi-turn subagent runs. */
@@ -664,6 +705,7 @@ function parseJsonEvents(
 	opts?: {
 		timedOut?: () => boolean;
 		candidates?: AssistantTextCandidate[];
+		onProgressEvent?: (ev: { type: "tool" | "turn" | "text" | "done"; toolName?: string; detail?: string; turn?: number; text?: string }) => void;
 	},
 ): void {
 	const candidates = opts?.candidates;
@@ -675,9 +717,15 @@ function parseJsonEvents(
 				const args = ev.args ?? {};
 				let detail = "";
 				if (toolName === "bash" && args.command) detail = String(args.command).slice(0, 60);
-				else if (toolName === "read" && args.path) detail = String(args.path);
-				else if (toolName === "write" && args.path) detail = String(args.path);
-				else if (toolName === "edit" && args.path) detail = String(args.path);
+				else if ((toolName === "read" || toolName === "write" || toolName === "edit") && args.path) detail = String(args.path);
+				else if (toolName === "wiki-nav") detail = `${args.action ?? "tree"} ${args.query ?? args.id ?? ""}`.trim();
+				else if (args.query) detail = String(args.query).slice(0, 60);
+				else if (args.path) detail = String(args.path);
+				else if (args.command) detail = String(args.command).slice(0, 60);
+				else {
+					try { detail = JSON.stringify(args).slice(0, 50); } catch { detail = ""; }
+				}
+				opts?.onProgressEvent?.({ type: "tool", toolName, detail });
 				onUpdate?.(`⚡ ${toolName}`, detail);
 			}
 			if (ev.type === "message_end" && ev.message?.role === "assistant") {
@@ -715,6 +763,7 @@ function parseJsonEvents(
 					candidates?.push({ text, stopReason, turn: result.usage.turns });
 					// Always recompute best text; do not let a short toolUse narration clobber a prior answer.
 					result.text = pickBestAssistantText(candidates ?? [{ text, stopReason, turn: result.usage.turns }]);
+					opts?.onProgressEvent?.({ type: "text", text: result.text });
 				}
 
 				// Timeout/cancel win over intermediate completed turns.
@@ -731,6 +780,7 @@ function parseJsonEvents(
 
 				// toolUse / intermediate turns are progress, not completion.
 				if (stopReason === "toolUse") {
+					opts?.onProgressEvent?.({ type: "turn", turn: result.usage.turns, text });
 					onUpdate?.(`↻ turn ${result.usage.turns}`, text.slice(0, 120) || "tool call");
 					continue;
 				}
@@ -750,6 +800,7 @@ function parseJsonEvents(
 				// or completed empty if model truly returned nothing.
 				result.status = "completed";
 				if (stopReason === "length") result.error ??= "length";
+				opts?.onProgressEvent?.({ type: "done", text: result.text });
 				onUpdate?.("✓ done", result.text.slice(0, 120));
 			}
 		} catch { /* skip */ }
@@ -850,8 +901,22 @@ async function runSingle(
 		excludeTools,
 	});
 
-	// 首次进度：显示真正传给 pi 的模型
-	onUpdate?.(`🤖 ${resolvedModel ?? "default"}`, "starting...");
+	const startTime = Date.now();
+	let toolCallsCount = 0;
+	const recentEvents: string[] = [];
+	let latestSnippet = "";
+	let currentToolName: string | undefined;
+	let currentToolDetail: string | undefined;
+	let currentStatusDesc = `🤖 ${resolvedModel ?? "default"}`;
+	let currentTextArg = "starting...";
+
+	const pushTimeline = (evStr: string) => {
+		const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+		recentEvents.push(`[${elapsed}s] ${evStr}`);
+		if (recentEvents.length > 5) recentEvents.shift();
+	};
+
+	pushTimeline(`子进程启动 (${resolvedModel ?? "default"})`);
 
 	return new Promise((resolve_) => {
 		const child = spawn(process.execPath, argv, {
@@ -872,7 +937,7 @@ async function runSingle(
 				PI_TRACE_LANE: "",
 			},
 		});
-		let buf = "", lineBuf = "", stderrBuf = "";
+
 		const result: SubagentResult = {
 			status: "failed",
 			text: "",
@@ -881,6 +946,36 @@ async function runSingle(
 			runId: randomUUID(),
 			requestedModel: resolvedModel,
 		};
+
+		const buildProg = (): SubagentProgressInfo => ({
+			agent: agent?.name,
+			model: resolvedModel,
+			status: currentStatusDesc,
+			detail: currentTextArg,
+			currentTool: currentToolName,
+			currentToolDetail: currentToolDetail,
+			turn: result.usage.turns,
+			toolCallsCount,
+			startedAt: startTime,
+			elapsedMs: Date.now() - startTime,
+			recentEvents: [...recentEvents],
+			latestTextSnippet: latestSnippet || undefined,
+		});
+
+		const emitUpdate = (s: string, t: string) => {
+			currentStatusDesc = s;
+			currentTextArg = t;
+			onUpdate?.(s, t, buildProg());
+		};
+
+		emitUpdate(`🤖 ${resolvedModel ?? "default"}`, "starting...");
+
+		// 1 秒心跳：持续刷新动态已耗时秒数，消除静默死机感
+		const heartbeat = setInterval(() => {
+			onUpdate?.(currentStatusDesc, currentTextArg, buildProg());
+		}, 1000);
+
+		let buf = "", lineBuf = "", stderrBuf = "";
 		const textCandidates: AssistantTextCandidate[] = [];
 		let timedOut = false;
 		let forceKill: ReturnType<typeof setTimeout> | null = null;
@@ -898,7 +993,7 @@ async function runSingle(
 				timedOut = true;
 				result.status = "failed";
 				result.error = "stall-timeout";
-				onUpdate?.("⏱ stalled", `killing ${resolvedModel ?? "default"} (no output for ${Math.round(timeoutMs / 1000)}s)`);
+				emitUpdate("⏱ stalled", `killing ${resolvedModel ?? "default"} (no output for ${Math.round(timeoutMs / 1000)}s)`);
 				kill();
 			}, timeoutMs);
 		};
@@ -906,7 +1001,28 @@ async function runSingle(
 
 		// 输出缓冲上限 5MB，防止子进程输出过大撑爆 RangeError
 		const MAX_BUF = 5_000_000;
-		const parseOpts = { timedOut: () => timedOut, candidates: textCandidates };
+		const parseOpts = {
+			timedOut: () => timedOut,
+			candidates: textCandidates,
+			onProgressEvent: (e: { type: string; toolName?: string; detail?: string; turn?: number; text?: string }) => {
+				if (e.type === "tool") {
+					toolCallsCount++;
+					currentToolName = e.toolName;
+					currentToolDetail = e.detail;
+					pushTimeline(`⚡ ${e.toolName}${e.detail ? `: ${e.detail}` : ""}`);
+					emitUpdate(`⚡ ${e.toolName}`, e.detail ?? "");
+				} else if (e.type === "turn") {
+					currentToolName = undefined;
+					currentToolDetail = undefined;
+					pushTimeline(`↻ Turn ${e.turn}: 请求工具调用`);
+					emitUpdate(`↻ turn ${e.turn}`, "tool call");
+				} else if (e.type === "text") {
+					latestSnippet = e.text ?? "";
+				} else if (e.type === "done") {
+					pushTimeline("✓ 子 agent 顺利完成");
+				}
+			},
+		};
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			resetStall(); // 有进展：重置停顿计时
@@ -920,7 +1036,7 @@ async function runSingle(
 				const line = lineBuf.slice(0, nl);
 				lineBuf = lineBuf.slice(nl + 1);
 				if (!line.trim()) continue;
-				parseJsonEvents(line + "\n", result, onUpdate, parseOpts);
+				parseJsonEvents(line + "\n", result, (s, t) => emitUpdate(s, t), parseOpts);
 			}
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
@@ -928,25 +1044,50 @@ async function runSingle(
 			if (stderrBuf.length < MAX_BUF) stderrBuf += chunk.toString("utf8");
 		});
 		child.on("error", (err) => {
+			clearInterval(heartbeat);
 			if (stallTimer) clearTimeout(stallTimer);
+			buf = ""; lineBuf = ""; stderrBuf = ""; textCandidates.length = 0;
+			try {
+				child.stdout?.removeAllListeners();
+				child.stderr?.removeAllListeners();
+				child.removeAllListeners();
+			} catch { /* ignore */ }
 			result.status = "failed";
 			result.error = err.message;
 			result.agent = agent?.name;
+			result.durationMs = Date.now() - startTime;
+			result.toolCallsCount = toolCallsCount;
 			resolve_(result);
 		});
 		child.on("close", (code) => {
+			clearInterval(heartbeat);
 			if (stallTimer) clearTimeout(stallTimer);
 			if (forceKill) clearTimeout(forceKill);
+			result.durationMs = Date.now() - startTime;
+			result.toolCallsCount = toolCallsCount;
 			// 处理缓冲区中剩余行（即使中断也有部分结果）
-			if (lineBuf.trim()) parseJsonEvents(lineBuf + "\n", result, onUpdate, parseOpts);
+			if (lineBuf.trim()) parseJsonEvents(lineBuf + "\n", result, (s, t) => emitUpdate(s, t), parseOpts);
 			// Final text selection across all assistant turns.
 			const best = pickBestAssistantText(textCandidates);
-			if (best) result.text = best;
+			if (best) {
+				// 强制断开切片字符串对母 5MB 缓冲区的强引用（Flatten string）
+				result.text = Buffer.from(best).toString("utf8");
+			}
+			// 立即释放所有临时大缓冲区与事件监听器引用
+			buf = "";
+			lineBuf = "";
+			stderrBuf = "";
+			textCandidates.length = 0;
+			try {
+				child.stdout?.removeAllListeners();
+				child.stderr?.removeAllListeners();
+				child.removeAllListeners();
+			} catch { /* ignore */ }
 			if (signal?.aborted) {
 				result.status = "cancelled";
 				result.error ??= "aborted";
 				result.agent = agent?.name;
-				if (onUpdate) onUpdate("⛔ cancelled", result.text.slice(0, 200));
+				emitUpdate("⛔ cancelled", result.text.slice(0, 200));
 				resolve_(result);
 				return;
 			}
@@ -1027,7 +1168,7 @@ async function runWithFallback(
 	model?: string,
 	timeoutMs?: number,
 	signal?: AbortSignal,
-	onUpdate?: (status: string, text?: string) => void,
+	onUpdate?: (status: string, text?: string, progress?: SubagentProgressInfo) => void,
 	opts?: RunDispatchOptions,
 ): Promise<SubagentResult> {
 	// 未显式设置超时时使用默认值（10 分钟），避免长时间无响应
@@ -1136,11 +1277,44 @@ async function runParallel(
 	concurrency: number,
 	allAgents: AgentDef[],
 	signal?: AbortSignal,
-	onUpdate?: (status: string, text: string) => void,
+	onUpdate?: (status: string, text: string, parallelProgress?: ParallelProgressInfo) => void,
 ): Promise<SubagentResult[]> {
 	const limit = Math.max(1, Math.min(concurrency, MAX_CONCURRENCY));
 	const results: SubagentResult[] = [];
 	let next = 0;
+	const startTime = Date.now();
+
+	const tasksProgress: SubagentProgressInfo[] = tasks.map((t, idx) => {
+		const agentDef = t.agent ? allAgents.find((a) => a.name === t.agent) ?? null : null;
+		return {
+			agent: agentDef?.name ?? t.agent ?? `task-${idx + 1}`,
+			model: t.model ?? agentDefaultModel(agentDef),
+			status: "pending",
+			detail: "排队等待中...",
+			startedAt: Date.now(),
+			elapsedMs: 0,
+			recentEvents: [],
+		};
+	});
+
+	const buildParallelProg = (): ParallelProgressInfo => ({
+		startedAt: startTime,
+		elapsedMs: Date.now() - startTime,
+		tasks: [...tasksProgress],
+	});
+
+	// 并行心跳定时器（1000ms），持续刷新已耗时和活跃状态
+	const heartbeat = setInterval(() => {
+		const doneCount = tasksProgress.filter((p) => p.status === "completed" || p.status === "failed" || p.status === "cancelled").length;
+		const runningCount = tasksProgress.filter((p) => p.status !== "pending" && p.status !== "completed" && p.status !== "failed" && p.status !== "cancelled").length;
+		for (const p of tasksProgress) {
+			if (p.status !== "pending" && p.status !== "completed" && p.status !== "failed" && p.status !== "cancelled") {
+				p.elapsedMs = Date.now() - p.startedAt;
+			}
+		}
+		onUpdate?.(`↻ parallel (${doneCount}/${tasks.length} 完成, ${runningCount} 运行中)`, `${((Date.now() - startTime) / 1000).toFixed(0)}s`, buildParallelProg());
+	}, 1000);
+
 	const worker = async (): Promise<void> => {
 		while (true) {
 			const idx = next++;
@@ -1152,16 +1326,48 @@ async function runParallel(
 					status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId: randomUUID(),
 					error: `unknown agent: ${t.agent}`, agent: t.agent,
 				};
+				tasksProgress[idx] = {
+					...tasksProgress[idx],
+					status: "failed",
+					detail: `unknown agent: ${t.agent}`,
+				};
 				continue;
 			}
-			const agentName = agentDef?.name ?? t.agent ?? `task-${idx}`;
+			const agentName = agentDef?.name ?? t.agent ?? `task-${idx + 1}`;
+			tasksProgress[idx].startedAt = Date.now();
+			tasksProgress[idx].status = "starting";
+			tasksProgress[idx].detail = "启动中...";
+
 			const taskCb = onUpdate
-				? (s: string, _t: string) => onUpdate(`[${idx + 1}/${tasks.length}] ${agentName} ${s}`, _t)
+				? (s: string, _t?: string, prog?: SubagentProgressInfo) => {
+					if (prog) {
+						tasksProgress[idx] = prog;
+					} else {
+						tasksProgress[idx].status = s;
+						tasksProgress[idx].detail = _t;
+						tasksProgress[idx].elapsedMs = Date.now() - tasksProgress[idx].startedAt;
+					}
+					onUpdate(`[${idx + 1}/${tasks.length}] ${agentName} ${s}`, _t ?? "", buildParallelProg());
+				}
 				: undefined;
-			results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools });
+
+			try {
+				results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools });
+				tasksProgress[idx].status = results[idx].status;
+				tasksProgress[idx].elapsedMs = results[idx].durationMs ?? (Date.now() - tasksProgress[idx].startedAt);
+				tasksProgress[idx].detail = results[idx].status === "completed" ? "完成" : (results[idx].error ?? "失败");
+			} catch (err: any) {
+				tasksProgress[idx].status = "failed";
+				tasksProgress[idx].detail = err?.message || String(err);
+			}
 		}
 	};
-	await Promise.all(Array.from({ length: limit }, () => worker()));
+
+	try {
+		await Promise.all(Array.from({ length: limit }, () => worker()));
+	} finally {
+		clearInterval(heartbeat);
+	}
 	return results;
 }
 
@@ -1591,9 +1797,13 @@ export default function (pi: ExtensionAPI) {
 	registerCapabilityFlags(pi);
 
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
-	// 禁止注册 launch-tabs 工具与 /launch 命令，杜绝子 agent 开新标签页。
-	// （主会话不受影响；工具排除名单之外仍有兜底保护。）
-	const isSubagentProcess = isSubagent();
+	// Fast-Path 彻底早退：跳过所有编排器组件、后台定时器、文件监听器与重型钩子，
+	// 消除子 agent 进程重复加载全量设施的冷启动与系统开销。
+	if (isSubagent()) {
+		registerCodexHeaders(pi);
+		registerWikiNav(pi);
+		return;
+	}
 
 	// Codex 请求头兼容（独立配置 ~/.pi/agent/codex-headers.json，命令 /codex-headers）
 	registerCodexHeaders(pi);
@@ -1611,6 +1821,9 @@ export default function (pi: ExtensionAPI) {
 
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
 	collect(registerAsyncPanel(pi));
+
+	// async subagent 完成注入（0922）：监听 subagent-runs/，终态时向归属会话 followUp 唤醒
+	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
 	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）；
 	// trace-fusion lane tab 则由 supervisor 自动后台收集（不注入 reclaim 提示）
@@ -1641,8 +1854,8 @@ export default function (pi: ExtensionAPI) {
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
+	// G6 L3：GUI 自动拉起（opt-in，gui.autoStart=true 才有动作；subagent 早退分支不达此处，tick 内 isMainSession 双保险）
 	collect(registerGuiAutoStart(pi));
-	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
 	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
 	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
@@ -2147,7 +2360,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
 		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode/zcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
-		lines.push("Sync/async decision applies to subagent-win only: DEFAULT ASYNC (`async: true`, non-blocking; products drop to disk with path-first short summary, collected via completion event/watcher/timer); SYNC only when the result is needed this turn (dependent next step, L4 re-verification); PARALLEL (`tasks: [...]`) for independent headless subagents you must all wait for; ASYNC (`async: true`) for a headless subagent whose result is not needed this turn. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
+		lines.push("Sync/async decision applies to subagent-win only: DEFAULT ASYNC (`async: true`, non-blocking; products drop to disk with path-first short summary, collected via completion event/watcher/timer); SYNC only when the result is needed this turn (dependent next step, L4 re-verification); PARALLEL (`tasks: [...]`) for independent headless subagents in one batch. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
 		lines.push("consultant 派发规则：当用户显式点名某模型并要求评估/审查/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」「请opus4.6点评一下」）时，dispatch agent=\"consultant\" 并把用户点名的模型作为 model override（短名如 glm / gpt5.6 / opus4.6 会自动展开为 provider/id）；该 subagent 以被点名模型的视角作答。这类请求不得派给 searcher / code-reviewer / planner 顶替。用户未点名模型时，用 consultant 的 config 默认模型，或由你根据任务判断选择合适的 model override。截图场景：把截图路径写进 task，让 consultant 用 read 读取图片后仿照设计。");
 		lines.push("TUI call line shows `override:<model>` when model is overridden; tool result header shows the requested model.");
 		lines.push("Do NOT permanently rewrite config.json just to try another model once; use the per-call `model` field.");
@@ -2297,6 +2510,49 @@ export default function (pi: ExtensionAPI) {
 	});
 	}
 
+	const MAX_SUBAGENT_RETURN_CHARS = 1500;
+
+	function formatSubagentTextForParent(text: string, runId?: string): string {
+		if (!text || text.length <= MAX_SUBAGENT_RETURN_CHARS) {
+			return text;
+		}
+		try {
+			if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
+			const fileId = runId ?? `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+			const fullPath = join(RUNS_DIR, `${fileId}_full.md`);
+			writeFileSync(fullPath, text, "utf8");
+			const head = text.slice(0, 1200);
+			return `${head}\n\n...(输出共 ${text.length} 字符已截断，完整内容已落盘至: ${fullPath}，主 agent 如需完整输出可通过 read 读取)...`;
+		} catch {
+			return text.slice(0, MAX_SUBAGENT_RETURN_CHARS) + "\n\n...(输出较长已截断)...";
+		}
+	}
+
+	/** 瘦身 SubagentResult 用于 details，防止宿主会话历史树累积几十万字符和无用事件导致内存爆炸。 */
+	function sanitizeResultForDetails(r: SubagentResult): SubagentResult {
+		let text = r.text || "";
+		if (text.length > 2500) {
+			const artifactMatch = text.match(/(subagent-runs[\\/][^\s)]+\.md)/);
+			const ref = artifactMatch ? `\n\n[完整输出见: ${artifactMatch[1]}]` : "\n\n[完整输出已由 subagent-win 落盘]";
+			text = text.slice(0, 2000) + ref;
+		}
+		return {
+			status: r.status,
+			text,
+			usage: r.usage,
+			usageEvents: [], // 剥离事件列表，彻底减轻 Session 内存堆积
+			runId: r.runId,
+			model: r.model,
+			requestedModel: r.requestedModel,
+			triedModels: r.triedModels,
+			priorFailures: r.priorFailures,
+			error: r.error ? r.error.slice(0, 500) : undefined,
+			agent: r.agent,
+			durationMs: r.durationMs,
+			toolCallsCount: r.toolCallsCount,
+		};
+	}
+
 	pi.registerTool({
 		name: "subagent-win",
 		label: "Subagent Win",
@@ -2371,9 +2627,89 @@ export default function (pi: ExtensionAPI) {
 			return new Text(`${title} ${theme.fg("accent", agentName)}${modelTag} ${theme.fg("dim", taskPreview)}`, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded, isPartial }, theme) {
 			const d = result.details as Record<string, any> | undefined;
 			const mdTheme = getMarkdownTheme();
+
+			// ── 1. 运行中动态进度渲染（解决卡死/静默感）──
+			if (isPartial) {
+				if (d?.parallelProgress) {
+					const p = d.parallelProgress as ParallelProgressInfo;
+					const total = p.tasks.length;
+					const done = p.tasks.filter((t) => t.status === "completed" || t.status === "failed" || t.status === "cancelled").length;
+					const active = p.tasks.filter((t) => t.status !== "pending" && t.status !== "completed" && t.status !== "failed" && t.status !== "cancelled").length;
+					const elapsedSec = (p.elapsedMs / 1000).toFixed(1);
+
+					const c = new Container();
+					const header = `${theme.fg("warning", "↻")} ${theme.fg("toolTitle", theme.bold("subagent-win"))} ${theme.fg("accent", "parallel")} ${theme.fg("muted", `(${done}/${total} 完成, ${active} 运行中)`)} ${theme.fg("dim", `[${elapsedSec}s]`)}`;
+					c.addChild(new Text(header, 0, 0));
+
+					for (let i = 0; i < p.tasks.length; i++) {
+						const t = p.tasks[i];
+						const isDone = t.status === "completed";
+						const isFail = t.status === "failed" || t.status === "cancelled";
+						const isPending = t.status === "pending";
+						const icon = isDone ? theme.fg("success", "✓") : isFail ? theme.fg("error", "✗") : isPending ? theme.fg("dim", "⏳") : theme.fg("warning", "↻");
+						const modelTag = t.model ? theme.fg("muted", ` (${t.model})`) : "";
+						const taskSec = t.startedAt ? `${((t.elapsedMs || 0) / 1000).toFixed(1)}s` : "0.0s";
+
+						let statusDesc = "";
+						if (isDone) {
+							statusDesc = theme.fg("success", "已完成");
+						} else if (isFail) {
+							statusDesc = theme.fg("error", t.detail || "失败");
+						} else if (isPending) {
+							statusDesc = theme.fg("dim", "排队等待中...");
+						} else {
+							const toolInfo = t.currentTool ? `⚡ ${t.currentTool}${t.currentToolDetail ? `: ${t.currentToolDetail}` : ""}` : (t.status || "执行中");
+							statusDesc = `${theme.fg("accent", toolInfo)} ${theme.fg("dim", `[${taskSec}]`)}`;
+						}
+
+						c.addChild(new Text(`  ${icon} [${i + 1}/${total}] ${theme.bold(t.agent ?? `task-${i + 1}`)}${modelTag}: ${statusDesc}`, 0, 0));
+						if (!isDone && !isFail && !isPending && t.recentEvents && t.recentEvents.length > 0) {
+							const lastEv = t.recentEvents[t.recentEvents.length - 1];
+							c.addChild(new Text(theme.fg("dim", `      ↳ ${lastEv}`), 0, 0));
+						}
+					}
+					return c;
+				}
+
+				if (d?.progress) {
+					const p = d.progress as SubagentProgressInfo;
+					const elapsedSec = (p.elapsedMs / 1000).toFixed(1);
+					const c = new Container();
+
+					const titleLine = `${theme.fg("warning", "↻")} ${theme.fg("toolTitle", theme.bold(p.agent ?? "subagent"))} ${theme.fg("muted", `(${p.model ?? "default"})`)} ${theme.fg("accent", `[${elapsedSec}s]`)} ${theme.fg("dim", p.status)}`;
+					c.addChild(new Text(titleLine, 0, 0));
+
+					const toolLabel = p.currentTool
+						? `${theme.fg("warning", `⚡ ${p.currentTool}`)}${p.currentToolDetail ? ` ${theme.fg("dim", p.currentToolDetail)}` : ""}`
+						: theme.fg("dim", p.detail || "思考与推理中...");
+					const statLabel = theme.fg("muted", `Turn ${p.turn ?? 1} · 工具调用 ${p.toolCallsCount ?? 0} 次`);
+					c.addChild(new Text(`  ${theme.bold("当前")}: ${toolLabel}  (${statLabel})`, 0, 0));
+
+					if (p.recentEvents && p.recentEvents.length > 0) {
+						c.addChild(new Text(theme.fg("muted", "  执行轨迹:"), 0, 0));
+						const showEvents = p.recentEvents.slice(-3);
+						for (const ev of showEvents) {
+							c.addChild(new Text(theme.fg("dim", `    ↳ ${ev}`), 0, 0));
+						}
+					}
+
+					if (p.latestTextSnippet && p.latestTextSnippet.trim()) {
+						const cleanSnippet = p.latestTextSnippet.trim().replace(/\s+/g, " ").slice(0, 100);
+						c.addChild(new Text(theme.fg("dim", `  💭 最新输出: "${cleanSnippet}..."`), 0, 0));
+					}
+
+					return c;
+				}
+
+				const text = result.content[0];
+				const raw = text?.type === "text" ? text.text : "running...";
+				return new Text(`${theme.fg("warning", "↻")} ${theme.fg("toolTitle", "subagent-win")} ${theme.fg("dim", raw)}`, 0, 0);
+			}
+
+			// ── 2. 并行任务完成态渲染 ──
 			if (d?.results) {
 				const results = d.results as SubagentResult[];
 				const ok = results.filter((r) => r.status === "completed").length;
@@ -2395,14 +2731,32 @@ export default function (pi: ExtensionAPI) {
 					}
 					return c;
 				}
-				const lines = results.map((r) => {
-					const mark = r.status === "completed" ? "✓" : r.status === "cancelled" ? "⛔" : "✗";
-					const modelTag = (r.requestedModel ?? r.model) ? ` (${r.requestedModel ?? r.model})` : "";
-					const fbMark = r.priorFailures?.length ? ` ↺fallback` : "";
-					return `${mark} ${r.agent ?? "?"}${modelTag}${fbMark}: ${(r.text ?? r.error ?? "").slice(0, 80)}`;
-				});
-				return new Text(`${icon} parallel ${ok}/${results.length}\n${lines.join("\n")}`, 0, 0);
+
+				// 未展开状态：充实篇幅卡片
+				const c = new Container();
+				let totalCost = 0;
+				let totalTurns = 0;
+				for (const r of results) {
+					totalCost += r.usage?.cost || 0;
+					totalTurns += r.usage?.turns || 0;
+				}
+				const summaryHeader = `${icon} ${theme.fg("toolTitle", theme.bold("subagent-win parallel"))} ${theme.fg("accent", `${ok}/${results.length} 成功`)}  ${theme.fg("dim", `${totalTurns} turns · $${totalCost.toFixed(4)}`)}`;
+				c.addChild(new Text(summaryHeader, 0, 0));
+
+				for (let i = 0; i < results.length; i++) {
+					const r = results[i];
+					const mark = r.status === "completed" ? theme.fg("success", "✓") : r.status === "cancelled" ? theme.fg("warning", "⛔") : theme.fg("error", "✗");
+					const modelTag = (r.requestedModel ?? r.model) ? theme.fg("muted", ` (${r.requestedModel ?? r.model})`) : "";
+					const durTag = r.durationMs ? theme.fg("dim", ` [${(r.durationMs / 1000).toFixed(1)}s]`) : "";
+					const preview = (r.text ?? r.error ?? "").trim().split("\n").filter((l) => l.trim().length > 0)[0] || "(无输出)";
+					const cleanPreview = preview.replace(/^#+\s*/, "").slice(0, 70);
+					c.addChild(new Text(`  ${mark} ${theme.bold(r.agent ?? `task-${i + 1}`)}${modelTag}${durTag}: ${theme.fg("dim", cleanPreview)}`, 0, 0));
+				}
+				c.addChild(new Text(theme.fg("dim", "  (按 Ctrl+O 展开查看完整各任务输出与详情)"), 0, 0));
+				return c;
 			}
+
+			// ── 3. 单任务完成态渲染 ──
 			const r = d?.result as SubagentResult | undefined;
 			if (!r) {
 				const text = result.content[0];
@@ -2410,18 +2764,17 @@ export default function (pi: ExtensionAPI) {
 			}
 			const isOk = r.status === "completed";
 			const icon = isOk ? theme.fg("success", "✓") : r.status === "cancelled" ? theme.fg("warning", "⛔") : theme.fg("error", "✗");
-			// Prefer requestedModel (provider/id actually passed to pi); fall back to assistant-reported bare id.
 			const modelLabel = r.requestedModel ?? r.model ?? "";
 			const fbChain = r.priorFailures?.length ? fallbackChainText(r) : "";
-			// When a fallback happened, surface the chain (warning color) instead of just the final model,
-			// so it's clear the requested override failed and a fallback was used.
 			const modelTag = fbChain
 				? theme.fg("warning", fbChain)
 				: modelLabel ? theme.fg("dim", modelLabel) : "";
-			const usageTag = r.usage?.turns ? theme.fg("dim", `↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}`) : "";
+			const durTag = r.durationMs ? theme.fg("accent", `took ${(r.durationMs / 1000).toFixed(1)}s`) : "";
+			const turnsTag = r.usage?.turns ? theme.fg("muted", `${r.usage.turns} turns${r.toolCallsCount ? `, ${r.toolCallsCount} tools` : ""}`) : "";
+			const usageTag = r.usage?.cost ? theme.fg("dim", `$${r.usage.cost.toFixed(4)}`) : "";
 
-			// status line: agent name + actual requested model + usage
-			const statusLine = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent ?? "subagent"))}  ${modelTag}  ${usageTag}`.replace(/\s{2,}/g, " ");
+			const metaBits = [durTag, turnsTag, usageTag, modelTag].filter(Boolean).join(" · ");
+			const statusLine = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent ?? "subagent"))}  ${metaBits}`.replace(/\s{2,}/g, " ");
 
 			if (expanded) {
 				const c = new Container();
@@ -2435,9 +2788,42 @@ export default function (pi: ExtensionAPI) {
 				if (r.text) { c.addChild(new Spacer(1)); c.addChild(new Markdown(r.text.trim(), 0, 0, mdTheme)); }
 				return c;
 			}
-			// collapsed: show status line + first line of output
-			const preview = (r.text ?? r.error ?? "").slice(0, 200).split("\n")[0];
-			return new Text(`${statusLine}\n${theme.fg("dim", " " + preview)}${r.text?.length > 200 ? "... (Ctrl+O)" : ""}`, 0, 0);
+
+			// 未展开状态：充实屏幕篇幅，展示 4~6 行结构化摘要卡片
+			const c = new Container();
+			c.addChild(new Text(statusLine, 0, 0));
+
+			if (r.priorFailures?.length) {
+				for (const f of r.priorFailures) {
+					c.addChild(new Text(theme.fg("warning", `  ⚠ 候选回退: ${f.model} (${f.kind})`), 0, 0));
+				}
+			}
+			if (r.error && !isOk) {
+				c.addChild(new Text(theme.fg("error", `  ✗ 错误: ${r.error.slice(0, 300)}`), 0, 0));
+			}
+
+			// 检查是否有落地完整报告文件
+			const artifactMatch = (r.text || "").match(/(subagent-runs[\\/][^\s)]+\.md)/);
+			if (artifactMatch) {
+				c.addChild(new Text(theme.fg("accent", `  📄 完整报告已落盘: ${artifactMatch[1]}`), 0, 0));
+			}
+
+			// 提取 4~6 行有效非空文本摘要
+			const rawLines = (r.text ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+			const cleanLines = rawLines.map((l) => l.replace(/^#+\s*/, ""));
+			const displayLines = cleanLines.slice(0, 5);
+
+			if (displayLines.length > 0) {
+				c.addChild(new Text(theme.fg("muted", "  摘要概览:"), 0, 0));
+				for (const line of displayLines) {
+					const truncated = line.length > 90 ? line.slice(0, 87) + "..." : line;
+					c.addChild(new Text(theme.fg("dim", `    │ ${truncated}`), 0, 0));
+				}
+			}
+
+			const moreLines = cleanLines.length > 5;
+			c.addChild(new Text(theme.fg("dim", `  ${moreLines ? "... " : ""}(按 Ctrl+O 展开查看完整输出)`), 0, 0));
+			return c;
 		},
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, _ctx) {
@@ -2564,15 +2950,24 @@ export default function (pi: ExtensionAPI) {
 			if (p.tasks && Array.isArray(p.tasks) && p.async === false) {
 				const tasks = p.tasks as TaskInput[];
 				const results = await runParallel(tasks, p.concurrency ?? 3, agents, signal,
-					onUpdate ? (msg, _d) => onUpdate({ content: [{ type: "text", text: msg }] }) : undefined,
+					onUpdate
+						? (msg, _d, parallelProgress) =>
+							onUpdate({
+								content: [{ type: "text", text: msg }],
+								details: parallelProgress ? { parallelProgress } : undefined,
+							})
+						: undefined,
 				);
 				for (const r of results) recordUsage(r.agent, r);
 				const parts = results.map(function(r, i) {
 					var icon = r.status === "completed" ? "\u2713" : "\u2717";
-					var body =
+					var rawBody =
 						r.status === "completed"
 							? (r.text || "(no output)")
 							: formatFailureForMainAgent(r, r.triedModels);
+					var body = r.status === "completed"
+						? formatSubagentTextForParent(rawBody, r.runId)
+						: rawBody;
 					var effModel = r.requestedModel ?? r.model ?? "(default)";
 					return "### " + icon + " " + (r.agent || "task-" + (i + 1)) + "/" + effModel + " (" + r.status + ")\n\n" + body;
 				});
@@ -2591,7 +2986,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: header + "\n\n" + parts.join("\n\n---\n\n") }],
-					details: { results },
+					details: { results: results.map(sanitizeResultForDetails) },
 					isError: failed.length > 0 && okCount === 0,
 				};
 			}
@@ -2632,7 +3027,13 @@ export default function (pi: ExtensionAPI) {
 				if (p.agent && !agentDef) {
 					return { content: [{ type: "text", text: `Unknown agent "${p.agent}". Available: ${agents.map((a) => a.name).join(", ")}` }], isError: true };
 				}
-				const cb = onUpdate ? (s: string, t: string) => onUpdate({ content: [{ type: "text", text: s + " " + t }] }) : undefined;
+				const cb = onUpdate
+					? (s: string, t?: string, progress?: SubagentProgressInfo) =>
+						onUpdate({
+							content: [{ type: "text", text: s + (t ? " " + t : "") }],
+							details: progress ? { progress } : undefined,
+						})
+					: undefined;
 				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
@@ -2649,18 +3050,20 @@ export default function (pi: ExtensionAPI) {
 					? `⚠ Requested model failed and a fallback was used: ${fallbackChainText(result)}\n`
 					: "";
 				const modelLine = (modelBits || fallbackHint) ? `[subagent ${modelBits}]\n\n${fallbackHint}` : "";
-				// L3 模型披露（纯加法）：Agent:/Model: 头——Model 取实际跑起来的 requestedModel（含 default 回退链）。
+				// L3 模型披露（纯加法）：Agent:/Model: 头——Model 取实际跑起来的 requestedModel（含 default 回退链），
+				// 与 runWithFallback 内实际传给 runSingle 的值一致。
 				let headerResolve: string | undefined;
 				try { headerResolve = resolveCallModel(p.model, agentDef); } catch { headerResolve = undefined; }
 				const effectiveModel = result.requestedModel ?? result.model ?? headerResolve ?? "(default)";
 				const identityHeader = `Agent: ${agentDef?.name ?? p.agent ?? "(none)"}\nModel: ${effectiveModel}\n\n`;
 				// Timeout may still leave partial text; surface it instead of empty "(no output)".
 				if (result.status === "completed") {
-					return { content: [{ type: "text", text: identityHeader + modelLine + (result.text || "(no output)") }], details: { result } };
+					const body = formatSubagentTextForParent(result.text || "(no output)", result.runId);
+					return { content: [{ type: "text", text: identityHeader + modelLine + body }], details: { result: sanitizeResultForDetails(result) } };
 				}
 				// Failed: structured error for main agent (usage cap → switch higher-tier model).
 				const body = formatFailureForMainAgent(result, result.triedModels);
-				return { content: [{ type: "text", text: identityHeader + modelLine + body }], isError: true, details: { result } };
+				return { content: [{ type: "text", text: identityHeader + modelLine + body }], isError: true, details: { result: sanitizeResultForDetails(result) } };
 			}
 
 			return { content: [{ type: "text", text: "Invalid params" }], isError: true };
@@ -2986,6 +3389,31 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /sub-presets 命令（模型预设槽位，逻辑在 model-presets.ts）──
 	registerSubPresetsCommand(pi, { reloadConfig, writeConfig });
+
+	// ── /subagent-gc 与 /gc 命令：手动回收内存与清理碎片 ──
+	const handleGc = async (args: string | undefined, ctx: ExtensionCommandContext) => {
+		const raw = (args ?? "").trim();
+		const parsed = raw ? parseInt(raw, 10) : 48;
+		const maxAgeHours = Number.isFinite(parsed) ? Math.max(0, parsed) : 48;
+		const res = await runSystemGc({
+			maxAgeHours,
+			onClearCustomCaches: () => {
+				cachedPiCli = null;
+				cachedWtPath = undefined;
+			},
+		});
+		ctx.ui.notify(res.summary, "info");
+	};
+
+	pi.registerCommand("subagent-gc", {
+		description: "手动回收内存与清理磁盘碎片：/subagent-gc [maxAgeHours=48]（传 0 归档所有终态跑次）",
+		handler: handleGc,
+	});
+
+	pi.registerCommand("gc", {
+		description: "/subagent-gc 快捷别名",
+		handler: handleGc,
+	});
 
 	// ── /notify on|off 命令 ──
 	pi.registerCommand("notify", {

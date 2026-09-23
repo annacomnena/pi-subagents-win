@@ -31,12 +31,15 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-auto-env-"));
+
+/** home 守卫迁移（0923）：控制层必填 cwd/initialCwd；存量用例以真实 home 通过门（仅作比较，不写 home）。 */
+const HOME = homedir();
 
 import { attachCurrentSession, issueMasterHandoffToken } from "./runtime/master-control.ts";
 import { readAttachment, setCutover } from "./runtime/registry.ts";
@@ -110,7 +113,7 @@ const OK_SPAWN = () => ({ successorRunId: "run_stub" });
 // T3 Gate 矩阵
 const OWNER = "sess_auto_owner";
 {
-	const a = attachCurrentSession({ sessionId: OWNER });
+	const a = attachCurrentSession({ sessionId: OWNER, cwd: HOME, initialCwd: HOME });
 	assert.equal(a.ok, true);
 	setCutover(false, OWNER); // 先关，供 cutover-off 一击
 	const gate = (over: Partial<{ cfg: MasterSuccessionConfig; spawn: unknown; sessionId: string; reading: unknown }>) =>
@@ -195,7 +198,7 @@ let transferId5 = "";
 	const rec = readTransferRecord(transferId5);
 	assert.equal(rec?.status, "spawned");
 	// 后继凭 token attach（gen+1）→ confirm 闭环 → proposal completed
-	const a2 = attachCurrentSession({ sessionId: "sess_auto_gen2", token: rec?.token });
+	const a2 = attachCurrentSession({ sessionId: "sess_auto_gen2", token: rec?.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a2.ok, true);
 	if (a2.ok) assert.equal(a2.attachment.generation, 2);
 	const c = confirmTransferAttach({ transferId: transferId5, sessionId: "sess_auto_gen2" });
@@ -248,7 +251,7 @@ let transferId5 = "";
 	const tok = issueMasterHandoffToken({ sessionId: "sess_auto_gen2", reason: "t7" });
 	assert.equal(tok.ok, true);
 	if (!tok.ok || !("token" in tok) || !tok.token) throw new Error("unreachable");
-	const a3 = attachCurrentSession({ sessionId: "sess_auto_gen3", token: tok.token });
+	const a3 = attachCurrentSession({ sessionId: "sess_auto_gen3", token: tok.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a3.ok, true);
 	if (a3.ok) assert.equal(a3.attachment.generation, 3);
 	let spawnCalls = 0;
@@ -264,7 +267,7 @@ let transferId5 = "";
 	assert.equal(spawnCalls, 1);
 	// 收尾：完成 T7 的 transfer（避免 in-flight 阻断 T8）
 	const rec = readTransferRecord(r.transferId)!;
-	const a4 = attachCurrentSession({ sessionId: "sess_auto_gen4", token: rec.token });
+	const a4 = attachCurrentSession({ sessionId: "sess_auto_gen4", token: rec.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a4.ok, true);
 	if (a4.ok) assert.equal(a4.attachment.generation, 4);
 	assert.equal(confirmTransferAttach({ transferId: r.transferId, sessionId: "sess_auto_gen4" }).ok, true);
@@ -374,7 +377,7 @@ let transferId5 = "";
 	const tok = issueMasterHandoffToken({ sessionId: "sess_auto_gen4", reason: "t11" });
 	assert.equal(tok.ok, true);
 	if (!tok.ok || !("token" in tok) || !tok.token) throw new Error("unreachable");
-	const a5 = attachCurrentSession({ sessionId: "sess_auto_gen5", token: tok.token });
+	const a5 = attachCurrentSession({ sessionId: "sess_auto_gen5", token: tok.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a5.ok, true);
 	if (a5.ok) assert.equal(a5.attachment.generation, 5);
 
@@ -411,7 +414,7 @@ let transferId5 = "";
 	assert.equal(readAutoMarker()?.lastAttemptGeneration, 5);
 	// 收尾：attach gen+1 + confirm（清 in-flight，避免干扰 T12 的 gate ⑤）
 	const rec = readTransferRecord(high.transferId)!;
-	const a6 = attachCurrentSession({ sessionId: "sess_auto_gen6", token: rec.token });
+	const a6 = attachCurrentSession({ sessionId: "sess_auto_gen6", token: rec.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a6.ok, true);
 	if (a6.ok) assert.equal(a6.attachment.generation, 6);
 	assert.equal(confirmTransferAttach({ transferId: high.transferId, sessionId: "sess_auto_gen6" }).ok, true);

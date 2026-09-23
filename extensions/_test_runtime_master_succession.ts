@@ -12,10 +12,13 @@
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-succession-env-"));
+
+/** home 守卫迁移（0923）：控制层必填 cwd/initialCwd；存量用例以真实 home 通过门（仅作比较，不写 home）。 */
+const HOME = homedir();
 
 import { attachCurrentSession, issueMasterHandoffToken } from "./runtime/master-control.ts";
 import {
@@ -36,7 +39,7 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 const OWNER = "sess_owner_m5";
 
 {
-	const a = attachCurrentSession({ sessionId: OWNER });
+	const a = attachCurrentSession({ sessionId: OWNER, cwd: HOME, initialCwd: HOME });
 	assert.equal(a.ok, true);
 	ok("genesis 接管");
 }
@@ -95,7 +98,7 @@ let proposalId = "";
 	const tok = issueMasterHandoffToken({ sessionId: OWNER });
 	assert.equal(tok.ok, true);
 	if (!tok.ok || !("token" in tok) || !tok.token) throw new Error("unreachable");
-	const a2 = attachCurrentSession({ sessionId: "sess_m5_gen2", token: tok.token });
+	const a2 = attachCurrentSession({ sessionId: "sess_m5_gen2", token: tok.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a2.ok, true);
 	const r = maybePropose({ sessionId: "sess_m5_gen2", generation: 2, reading: { tokens: 160000, contextWindow: 200000, percent: 80 } });
 	assert.equal(r.proposed, true);
@@ -119,7 +122,7 @@ let proposalId = "";
 	const tok3 = issueMasterHandoffToken({ sessionId: "sess_m5_gen2" });
 	assert.equal(tok3.ok, true);
 	if (!tok3.ok || !("token" in tok3) || !tok3.token) throw new Error("unreachable");
-	const a3 = attachCurrentSession({ sessionId: "sess_m5_gen3", token: tok3.token });
+	const a3 = attachCurrentSession({ sessionId: "sess_m5_gen3", token: tok3.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a3.ok, true);
 	const staleClaim = join(claimsDir, "gen-3.claim");
 	writeFileSync(staleClaim, JSON.stringify({ pid: -1, acquiredAt: "2026-09-20T00:00:00.000Z" }));
@@ -139,7 +142,7 @@ let proposalId = "";
 	const tok4 = issueMasterHandoffToken({ sessionId: "sess_m5_gen3" });
 	assert.equal(tok4.ok, true);
 	if (!tok4.ok || !("token" in tok4) || !tok4.token) throw new Error("unreachable");
-	const a4 = attachCurrentSession({ sessionId: "sess_m5_gen4", token: tok4.token });
+	const a4 = attachCurrentSession({ sessionId: "sess_m5_gen4", token: tok4.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a4.ok, true);
 	const freshClaim = join(claimsDir, "gen-4.claim");
 	writeFileSync(freshClaim, JSON.stringify({ pid: -1, acquiredAt: new Date().toISOString() }));
