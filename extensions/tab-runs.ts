@@ -16,9 +16,9 @@
  *   - 缺失显式结果时一律标 unconfirmed/resultMissing，绝不静默当完成。
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { modePrefix, type LaunchMode } from "./launch.ts";
 
 // ── 类型 ───────────────────────────────────────────────────────────
@@ -539,8 +539,8 @@ export function readTabDispatch(runsDir: string, runId: string): TabDispatchReco
 	}
 }
 
-/** 列出全部派发记录（按 dispatchedAt 倒序）。 */
-export function listTabDispatches(runsDir: string): TabDispatchRecord[] {
+/** 列出全部派发记录（按 dispatchedAt 倒序，支持 limit）。 */
+export function listTabDispatches(runsDir: string, limit = 100): TabDispatchRecord[] {
 	if (!existsSync(runsDir)) return [];
 	const out: TabDispatchRecord[] = [];
 	for (const f of readdirSync(runsDir)) {
@@ -548,7 +548,114 @@ export function listTabDispatches(runsDir: string): TabDispatchRecord[] {
 		const r = readTabDispatch(runsDir, f.slice(0, -".json".length));
 		if (r) out.push(r);
 	}
-	return out.sort((a, b) => Date.parse(b.dispatchedAt) - Date.parse(a.dispatchedAt));
+	out.sort((a, b) => Date.parse(b.dispatchedAt) - Date.parse(a.dispatchedAt));
+	return limit > 0 ? out.slice(0, limit) : out;
+}
+
+/**
+ * 自动归档已完成/失败且超龄的 tab-runs 文件到 _archived 目录，防止活跃目录文件无限积压导致内存和 I/O 爆炸。
+ * @param runsDir tab-runs 根目录
+ * @param maxAgeHours 超过多少小时的已终态跑次移入 _archived（默认 72 小时 / 3 天）
+ * @returns 成功归档的 runId 数量
+ */
+export function archiveStaleTabRuns(runsDir: string, maxAgeHours = 72): number {
+	if (!existsSync(runsDir)) return 0;
+	const archiveDir = join(runsDir, "_archived");
+	const cutoffMs = Date.now() - maxAgeHours * 3600 * 1000;
+	let archivedCount = 0;
+
+	try {
+		const files = readdirSync(runsDir);
+		const runIds = new Set<string>();
+		for (const f of files) {
+			if (f.endsWith(".json") && !f.endsWith(".state.json") && !f.endsWith(".result.json") && !f.endsWith(".tmp")) {
+				runIds.add(f.slice(0, -".json".length));
+			}
+		}
+
+		for (const id of runIds) {
+			const dispatchPath = join(runsDir, `${id}.json`);
+			const resultPath = join(runsDir, `${id}.result.json`);
+			const statePath = join(runsDir, `${id}.state.json`);
+			const notifiedPath = join(runsDir, `${id}.notified`);
+
+			// 防护：若任务明确处于 working / attached 活跃状态，绝不归档
+			if (existsSync(statePath)) {
+				try {
+					const s = JSON.parse(readFileSync(statePath, "utf8"));
+					if (s && (s.phase === "working" || s.phase === "attached")) {
+						continue;
+					}
+				} catch { /* ignore */ }
+			}
+
+			// 传 maxAgeHours === 0 时：仅归档已具备终态的跑次
+			if (maxAgeHours === 0) {
+				const hasResult = existsSync(resultPath);
+				let isTerminalState = false;
+				if (existsSync(statePath)) {
+					try {
+						const s = JSON.parse(readFileSync(statePath, "utf8"));
+						if (s && ["completed", "failed", "cancelled", "orphaned"].includes(s.phase)) {
+							isTerminalState = true;
+						}
+					} catch { /* ignore */ }
+				}
+				const isFailedDispatch = dispatch?.dispatchStatus === "launch_failed";
+				if (!hasResult && !isTerminalState && !isFailedDispatch) {
+					continue;
+				}
+			}
+
+			// 判断是否超龄：优先读取 dispatch 的 dispatchedAt，其次 raw JSON，再次 stat.mtimeMs
+			let targetTime = 0;
+			const dispatch = readTabDispatch(runsDir, id);
+			if (dispatch?.dispatchedAt) {
+				const parsed = Date.parse(dispatch.dispatchedAt);
+				if (!Number.isNaN(parsed)) targetTime = parsed;
+			}
+			if (targetTime === 0 && existsSync(dispatchPath)) {
+				try {
+					const raw = JSON.parse(readFileSync(dispatchPath, "utf8"));
+					if (raw?.dispatchedAt) {
+						const parsed = Date.parse(raw.dispatchedAt);
+						if (!Number.isNaN(parsed)) targetTime = parsed;
+					}
+				} catch { /* ignore */ }
+			}
+			if (targetTime === 0) {
+				try {
+					if (existsSync(resultPath)) {
+						targetTime = statSync(resultPath).mtimeMs;
+					} else if (existsSync(dispatchPath)) {
+						targetTime = statSync(dispatchPath).mtimeMs;
+					}
+				} catch {
+					continue;
+				}
+			}
+
+			if (targetTime > 0 && targetTime < cutoffMs) {
+				if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
+				const related = [dispatchPath, resultPath, statePath, notifiedPath];
+				for (const p of related) {
+					if (existsSync(p)) {
+						const dest = join(archiveDir, basename(p));
+						try {
+							if (existsSync(dest)) unlinkSync(dest);
+							renameSync(p, dest);
+						} catch {
+							/* ignore individual file move error */
+						}
+					}
+				}
+				archivedCount++;
+			}
+		}
+	} catch {
+		/* ignore errors */
+	}
+	return archivedCount;
 }
 
 /** 校验 TabState（宽松校验）。 */

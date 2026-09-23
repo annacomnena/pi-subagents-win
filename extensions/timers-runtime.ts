@@ -40,6 +40,7 @@ import {
 	type TimerRecord,
 } from "./timers.ts";
 import {
+	archiveStaleTabRuns,
 	defaultTabRunsDir,
 	readTabResultFile,
 	readTabState,
@@ -215,10 +216,14 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 					if (sid) touchSessionHeartbeat(timersDir, sid); // 会话活性信号（所有权门槛依据）
 					pumpDueTimers(pi, timersDir, { cwd: process.cwd(), sessionId: sid, runsDir: opts?.runsDir });
 				}
-				// 定期维护（每 12 tick ≈ 60s）：终态 timer GC + 失活心跳清理
+				// 定期维护（每 12 tick ≈ 60s）：终态 timer GC + 失活心跳清理 + tab-runs 归档
 				if (++tickCount % 12 === 0) {
 					sweepTerminalTimers(timersDir, tabRunId);
-					if (!tabRunId) sweepStaleHeartbeats(timersDir);
+					if (!tabRunId) {
+						sweepStaleHeartbeats(timersDir);
+						const rDir = opts?.runsDir || process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir();
+						archiveStaleTabRuns(rDir);
+					}
 				}
 				tickFailCount = 0;
 			} catch (err) {

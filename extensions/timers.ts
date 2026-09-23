@@ -425,11 +425,43 @@ export function sweepTerminalTimers(
 	let swept = 0;
 	for (const id of listTimerFiles(timersDir, tabRunId)) {
 		const r = readTimerFile(timersDir, id, tabRunId);
-		if (!r || r.status === "pending") continue;
+		if (!r) continue;
+		if (r.status === "pending") {
+			// 标签页邮箱特权 GC：若 pending timer 到期时间已超过 maxAge（宿主 tab 早就退役且永不消费），作为孤儿清理
+			if (tabRunId) {
+				const dueAtMs = Date.parse(r.dueAt);
+				if (Number.isFinite(dueAtMs) && now.getTime() - dueAtMs > maxAge) {
+					rmSync(timerFilePath(timersDir, id, tabRunId), { force: true });
+					swept++;
+				}
+			}
+			continue;
+		}
 		const terminalAt = Date.parse(r.skippedAt ?? r.firedAt ?? r.createdAt);
 		if (now.getTime() - terminalAt > maxAge) {
 			rmSync(timerFilePath(timersDir, id, tabRunId), { force: true });
 			swept++;
+		}
+	}
+	// 当主会话执行 GC 时（tabRunId 为空），同步清理 timers/mail/<tabRunId>/ 目录下超龄的终态 timer 并清理空目录
+	if (!tabRunId) {
+		const mailDir = join(timersDir, "mail");
+		if (existsSync(mailDir)) {
+			try {
+				for (const sub of readdirSync(mailDir)) {
+					const subPath = join(mailDir, sub);
+					try {
+						swept += sweepTerminalTimers(timersDir, sub, opts);
+						if (existsSync(subPath) && readdirSync(subPath).length === 0) {
+							rmSync(subPath, { recursive: true, force: true });
+						}
+					} catch {
+						/* ignore */
+					}
+				}
+			} catch {
+				/* ignore */
+			}
 		}
 	}
 	return swept;

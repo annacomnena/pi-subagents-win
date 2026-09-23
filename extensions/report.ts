@@ -110,14 +110,23 @@ export function listReportIds(reportsDir: string): string[] {
 
 // ── 主会话监听 ───────────────────────────────────────────────────
 
+const MAX_SEEN_REPORTS = 500;
 let seenReports = new Set<string>();
 let watcher: FSWatcher | null = null;
 let selfDisabled = false; // 旧实例 stale 后停止注入
 
+function markReportSeen(id: string): void {
+	seenReports.add(id);
+	if (seenReports.size > MAX_SEEN_REPORTS) {
+		const first = seenReports.values().next().value;
+		if (first) seenReports.delete(first);
+	}
+}
+
 /** 启动时快照：已有报告视为已处理（重启不重复注入）。 */
 function snapshotExisting(reportsDir: string): void {
 	seenReports = new Set<string>();
-	for (const id of listReportIds(reportsDir)) seenReports.add(id);
+	for (const id of listReportIds(reportsDir)) markReportSeen(id);
 }
 
 export interface ReportListenerOptions {
@@ -149,7 +158,7 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	if (seenReports.has(id)) return false;
 	const record = readReportFile(reportsDir, id);
 	if (!record) return false; // 被删/未写完/损坏：不标 seen（下个事件/tick 可重试），与 event-bus 空结果守卫同理
-	seenReports.add(id);
+	markReportSeen(id);
 
 	if (opts.onReport) {
 		opts.onReport(record, id);
@@ -285,4 +294,9 @@ export function _resetReportListener(): void {
 		watcher?.close();
 	} catch { /* ignore */ }
 	watcher = null;
+}
+
+/** 清理已读缓存集合（GC 时调用）。 */
+export function clearReportCache(): void {
+	seenReports.clear();
 }

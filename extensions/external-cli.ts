@@ -155,11 +155,20 @@ export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
 
 // ── command resolution (Windows-aware) ─────────────────────────────────────
 
+const commandCache = new Map<ExternalBackend, string | undefined>();
+
+export function clearExternalCliCache(): void {
+	commandCache.clear();
+	winInetCache.clear();
+}
+
 function resolveExternalCommand(backend: ExternalBackend): string | undefined {
+	if (commandCache.has(backend)) return commandCache.get(backend);
 	// Special case: zcode is a Node.js script (zcode.cjs), not a standalone
 	// executable — run it through node. The script's absolute path is appended
 	// by buildZcodeArgs/runZcode.
 	if (backend === "zcode") {
+		commandCache.set(backend, "node");
 		return "node";
 	}
 	if (backend === "mimo") {
@@ -167,11 +176,17 @@ function resolveExternalCommand(backend: ExternalBackend): string | undefined {
 		// default. Allow an explicit override, then probe the local install
 		// location before falling back to normal PATH resolution.
 		const configured = process.env.MIMOCODE_BIN?.trim();
-		if (configured && existsSync(configured)) return configured;
+		if (configured && existsSync(configured)) {
+			commandCache.set(backend, configured);
+			return configured;
+		}
 		const localInstall = process.env.USERPROFILE
 			? join(process.env.USERPROFILE, ".mimocode", "bin", "mimo.exe")
 			: undefined;
-		if (localInstall && existsSync(localInstall)) return localInstall;
+		if (localInstall && existsSync(localInstall)) {
+			commandCache.set(backend, localInstall);
+			return localInstall;
+		}
 	}
 
 	const candidates =
@@ -192,12 +207,16 @@ function resolveExternalCommand(backend: ExternalBackend): string | undefined {
 				.split(/\r?\n/)
 				.map((s) => s.trim())
 				.find((s) => s && existsSync(s));
-			if (found) return found;
+			if (found) {
+				commandCache.set(backend, found);
+				return found;
+			}
 		} catch {
 			/* try next */
 		}
 	}
 	// PATH lookup failed — still return bare name so spawn error is clear
+	commandCache.set(backend, undefined);
 	return undefined;
 }
 
@@ -208,6 +227,7 @@ function commandForSpawn(backend: ExternalBackend): string {
 // ── proxy environment ──────────────────────────────────────────────────────
 
 const WININET_SETTINGS_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+const winInetCache = new Map<string, string | undefined>();
 
 function getEnvValue(env: NodeJS.ProcessEnv, names: readonly string[]): string | undefined {
 	for (const name of names) {
@@ -225,6 +245,7 @@ function getEnvValue(env: NodeJS.ProcessEnv, names: readonly string[]): string |
 
 function readWinInetRegistryValue(name: string): string | undefined {
 	if (process.platform !== "win32") return undefined;
+	if (winInetCache.has(name)) return winInetCache.get(name);
 	try {
 		const output = execFileSync("reg", ["query", WININET_SETTINGS_KEY, "/v", name], {
 			encoding: "utf8",
@@ -234,9 +255,15 @@ function readWinInetRegistryValue(name: string): string | undefined {
 		const line = output.split(/\r?\n/).find((candidate) =>
 			new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+`, "i").test(candidate),
 		);
-		if (!line) return undefined;
-		return line.replace(new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+`, "i"), "").trim() || undefined;
+		if (!line) {
+			winInetCache.set(name, undefined);
+			return undefined;
+		}
+		const val = line.replace(new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+`, "i"), "").trim() || undefined;
+		winInetCache.set(name, val);
+		return val;
 	} catch {
+		winInetCache.set(name, undefined);
 		return undefined;
 	}
 }
