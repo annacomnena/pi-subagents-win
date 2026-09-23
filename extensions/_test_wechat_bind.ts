@@ -20,6 +20,11 @@
  *   T11 opt-in ON：idle→start（幂等）→qr-image data URL→bound（原始响应文本无 token）→
  *       409 already-bound→unbind（removed+idle+文件删）→qr-image 409 no-active-session→
  *       start+cancel→idle
+ *   T12 enable/disable 开关端点（L3 UX 修复：可控开关，不开新鉴权面）：无/错 token → 401
+ *       （不因 opt-in OFF 而 403——否则鸡生蛋）；enable → 200 {enabled:true} + 写盘保留
+ *       gui/channels/顶层其它字段 + status 403→200；enable/disable 均幂等；disable → status
+ *       回 403 wechat-disabled；写盘失败（configPath=目录）→ 500 config-write-failed 如实报错
+ *       （不谎称成功）；setWechatEnabled 拒绝覆盖非对象 config（{ok:false}，文件原样）。
  *
  * 红线自证：token 永不进任何 HTTP 响应（T11 对 start/status/qr-image 原始文本扫描）；
  * 凭据 0600（win32 仅尽力——非 Windows 才断言 mode，Windows 断言内容正确）。
@@ -27,7 +32,7 @@
 
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -43,6 +48,7 @@ import {
 	parseQrStatus,
 	readWechatCreds,
 	readWechatEnabled,
+	setWechatEnabled,
 	unwrapPayload,
 	writeWechatCreds0600,
 	wechatCredsPath,
@@ -642,6 +648,102 @@ async function t11(): Promise<void> {
 	}
 }
 
+// ── T12 enable/disable 开关（L3 UX 修复：可控开关，不开新鉴权面）──────
+
+async function t12(): Promise<void> {
+	const D = mkdtemp("wechat-t12-");
+	const D2 = mkdtemp("wechat-t12b-");
+	let h: RuntimeHostHandle | null = null;
+	let h2: RuntimeHostHandle | null = null;
+	try {
+		// 夹具：带 gui / channels 其它键 + 顶层字段的 config——断言开关写盘不清除它们
+		const cfgPath = join(D, "config.json");
+		const fixture = { gui: { autoStart: true, x: 1 }, channels: { wechat: { enabled: false }, email: { enabled: true } }, keepTop: "me" };
+		writeFileSync(cfgPath, JSON.stringify(fixture, null, 2) + "\n", "utf8");
+		h = await createRuntimeHostServer(mkServerOpts(D, { configPath: cfgPath }) as Parameters<typeof createRuntimeHostServer>[0]);
+		const base = `http://127.0.0.1:${h.info.port}`;
+		const tok = h.info.token;
+		const post = async (path: string, headers: Record<string, string>): Promise<{ status: number; body: any }> => {
+			const res = await fetch(`${base}${path}`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: "{}" });
+			return { status: res.status, body: await res.json().catch(() => null) };
+		};
+		const getStatus = async (): Promise<{ status: number; error?: unknown }> => {
+			const res = await fetch(`${base}/v1/wechat/bind/status`, { headers: { "x-command-token": tok } });
+			return { status: res.status, error: ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error };
+		};
+
+		// a) 无/错 token → 401（enable/disable 不被 opt-in 闸挡成 403，否则鸡生蛋）
+		for (const p of ["/v1/wechat/enable", "/v1/wechat/disable"]) {
+			let r = await post(p, {});
+			assert.equal(r.status, 401, `无 token POST ${p} → 401（不是 403）`);
+			r = await post(p, { "x-command-token": "wrong-token" });
+			assert.equal(r.status, 401, `错 token POST ${p} → 401`);
+		}
+		// b) OFF 时 status → 403；enable → 200 {enabled:true}；status 403 → 200
+		assert.equal((await getStatus()).status, 403, "未启用 → status 403");
+		let r = await post("/v1/wechat/enable", { "x-command-token": tok });
+		assert.equal(r.status, 200, `enable 200（${JSON.stringify(r.body)}）`);
+		assert.equal(r.body.enabled, true, "回执 = 当前 enabled");
+		assert.equal((await getStatus()).status, 200, "enable 后 status 403 → 200");
+		// c) 写盘保留其它字段（read-modify-write + 原子写）
+		const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as any;
+		assert.equal(cfg.gui?.autoStart, true, "gui.autoStart 保留");
+		assert.equal(cfg.gui?.x, 1, "gui 其它键保留");
+		assert.equal(cfg.channels?.email?.enabled, true, "channels 其它段保留");
+		assert.equal(cfg.keepTop, "me", "顶层其它字段保留");
+		assert.equal(cfg.channels?.wechat?.enabled, true, "目标字段已写");
+		// d) 幂等：重复 enable → 200 enabled:true
+		r = await post("/v1/wechat/enable", { "x-command-token": tok });
+		assert.equal(r.status, 200);
+		assert.equal(r.body.enabled, true, "enable 幂等");
+		// e) disable → 200 {enabled:false}；status 回 403 wechat-disabled；重复 disable 幂等
+		r = await post("/v1/wechat/disable", { "x-command-token": tok });
+		assert.equal(r.status, 200);
+		assert.equal(r.body.enabled, false);
+		const st = await getStatus();
+		assert.equal(st.status, 403, "disable 后 status 回 403");
+		assert.equal(st.error, "wechat-disabled");
+		r = await post("/v1/wechat/disable", { "x-command-token": tok });
+		assert.equal(r.status, 200);
+		assert.equal(r.body.enabled, false, "disable 幂等");
+		// 往返写盘零丢失（enable→disable 后与夹具仅 enabled 值回到 false）
+		const cfg2 = JSON.parse(readFileSync(cfgPath, "utf8")) as unknown;
+		assert.deepEqual(cfg2, fixture, "enable→disable 往返后其它字段零丢失");
+
+		// f) 写盘失败如实报错：configPath 指向目录 → 500 config-write-failed（不谎称成功）
+		const dirCfg = join(D2, "cfg-as-dir");
+		mkdirSync(dirCfg, { recursive: true });
+		h2 = await createRuntimeHostServer(mkServerOpts(D2, { configPath: dirCfg }) as Parameters<typeof createRuntimeHostServer>[0]);
+		const base2 = `http://127.0.0.1:${h2.info.port}`;
+		const res2 = await fetch(`${base2}/v1/wechat/enable`, {
+			method: "POST",
+			headers: { "x-command-token": h2.info.token, "content-type": "application/json" },
+			body: "{}",
+		});
+		const b2 = (await res2.json()) as { error?: unknown; enabled?: unknown; message?: unknown };
+		assert.equal(res2.status, 500, `写盘失败 → 500（${res2.status}）`);
+		assert.equal(b2.error, "config-write-failed");
+		assert.equal(b2.enabled, false, "回执不谎称已启用");
+		assert.ok(typeof b2.message === "string" && b2.message.length > 0, "带可读错误消息");
+		// 401 门仍在写失败之前（无 token 不泄露写失败细节）
+		const res3 = await fetch(`${base2}/v1/wechat/enable`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+		assert.equal(res3.status, 401, "写失败场景无 token 仍 401");
+
+		// g) setWechatEnabled 拒绝覆盖非对象 config（{ok:false}，文件原样）
+		const arrCfg = join(D2, "arr.json");
+		writeFileSync(arrCfg, "[1,2]\n", "utf8");
+		const w = setWechatEnabled(true, arrCfg);
+		assert.equal(w.ok, false, "非对象 config → 拒绝写");
+		assert.ok((w.error ?? "").includes("拒绝覆盖写"), "错误如实说明拒绝覆盖写");
+		assert.equal(readFileSync(arrCfg, "utf8"), "[1,2]\n", "非对象 config 原样未被覆盖");
+	} finally {
+		if (h !== null) await h.close();
+		if (h2 !== null) await h2.close();
+		rmSync(D, { recursive: true, force: true });
+		rmSync(D2, { recursive: true, force: true });
+	}
+}
+
 // ── main ────────────────────────────────────────────────────────────
 
 const t0 = Date.now();
@@ -658,6 +760,7 @@ try {
 	await test("T9 readWechatEnabled：缺段/坏 JSON/非布尔 → false；true → true（默认 OFF）", t9);
 	await test("T10 opt-in OFF：5 端点 无/错 token → 401；对 token → 403 wechat-disabled", t10);
 	await test("T11 opt-in ON：idle→start（幂等）→qr-image→bound（无 token）→409→unbind→409→start+cancel", t11);
+	await test("T12 enable/disable：无 token 401 / 开关幂等 / 写盘保留其它字段 / status 403↔200 / 写失败 500", t12);
 } catch (e) {
 	console.error(`主流程异常: ${e instanceof Error ? e.stack : String(e)}`);
 	process.exitCode = 1;

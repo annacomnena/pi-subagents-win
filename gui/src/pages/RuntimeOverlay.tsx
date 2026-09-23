@@ -7,15 +7,15 @@
  * 内部骨架 = SettingsPage.tsx#L1375 同款 grid：窄栅 68px 图标栏 / ≥lg 268px 全栏；
  * 返回钮 = #L1408 圆角-xl 套件（m-1 w-[calc(100%-0.5rem)] justify-start rounded-xl…）。
  * 四 section（attention/master/workstream/runtime）组件**原样复用**为右栏内容；
- * 0923 加第 5 项「微信连接」（ChannelsPage；仅 /v1/wechat/bind/status 200 时渲染——
- * 未启用 403 wechat-disabled / 401 / 网络错均隐藏，不渲染空壳入口）；
+ * 0923 加第 5 项「微信连接」（ChannelsPage）；L3 UX 修复：入口**始终渲染**——
+ * 不再按 /v1/wechat/bind/status 200 探测隐藏（403 wechat-disabled → 页内「启用微信连接」按钮；
+ * 401 → 页内给 /gui open 引导文案），消除「功能存在但不可发现」陷阱；
  * runtimeOverlay 值 = 打开并定位指定 section（左栏高亮）；Esc 关闭保留。
  * [无后端支撑]=不渲染：⌘K CommandCenter、文件树、diff 审查、git 摘要、账号页（拍板 1）。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { ArrowLeft } from "lucide-react";
-import { api } from "../api/client";
 import { useGui, type RuntimeOverlaySection } from "../store";
 import { AttentionPage } from "./AttentionPage";
 import { ChannelsPage } from "./ChannelsPage";
@@ -37,24 +37,6 @@ export const overlaySectionId = (id: RuntimeOverlaySection): string => `overlay-
 export function RuntimeOverlay() {
 	const section = useGui((s) => s.runtimeOverlay);
 	const setRuntimeOverlay = useGui((s) => s.setRuntimeOverlay);
-	// 0923 微信 opt-in 可见性：仅当 /v1/wechat/bind/status 200 时渲染入口；
-	// 403（wechat-disabled，config channels.wechat.enabled 缺省 OFF）/ 401 / 网络错 → 隐藏。
-	const [wechatVisible, setWechatVisible] = useState(false);
-	const open = section !== null;
-	useEffect(() => {
-		if (!open) {
-			setWechatVisible(false);
-			return;
-		}
-		let cancelled = false;
-		void api.wechatBindStatus().then((r) => {
-			if (cancelled) return;
-			setWechatVisible(r.ok);
-		});
-		return () => {
-			cancelled = true;
-		};
-	}, [open]);
 
 	// Esc 关闭（zcode Dialog 口径）；grid 铺满 inset-0，遮罩点击关闭保留在根节点空白命中
 	useEffect(() => {
@@ -90,8 +72,8 @@ export function RuntimeOverlay() {
 						<span className="truncate text-ui-base">返回</span>
 					</Button>
 					<div className="mt-1 flex flex-col gap-0.5">
-						{/* 0923：wechat 入口仅 200 可见（403 wechat-disabled/401/网络错 → 不渲染） */}
-						{SECTIONS.filter((sec) => sec.id !== "wechat" || wechatVisible).map((sec) => (
+						{/* 0923 L3 UX 修复：wechat 入口始终显示（不再按 status 200 过滤） */}
+						{SECTIONS.map((sec) => (
 							<Button
 								key={sec.id}
 								type="button"
@@ -127,8 +109,8 @@ export function RuntimeOverlay() {
 							{sec.id === "master" && <MasterPage />}
 							{sec.id === "workstream" && <WorkstreamPage />}
 							{sec.id === "runtime" && <RuntimePage />}
-							{/* 0923：未启用（403）时 section 不渲染（与左栏入口同一可见性） */}
-							{sec.id === "wechat" && wechatVisible && <ChannelsPage />}
+							{/* 0923 L3 UX 修复：section 始终渲染（未启用/无凭据由 ChannelsPage 页内提示 + 启用按钮） */}
+							{sec.id === "wechat" && <ChannelsPage />}
 						</section>
 					))}
 				</div>

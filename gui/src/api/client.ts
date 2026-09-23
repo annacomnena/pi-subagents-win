@@ -20,6 +20,7 @@ import type {
 	WechatBindStartBody,
 	WechatBindStatusBody,
 	WechatQrImageBody,
+	WechatToggleBody,
 	WechatUnbindBody,
 } from "./types";
 
@@ -186,10 +187,11 @@ export const api = {
 		),
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
-	//  生产 sw_gui_token 派生凭据）；全 5 端点 fail-closed（无/错 → 401；
-	//  channels.wechat.enabled off → 403 wechat-disabled）。token 永不进任何响应。──
+	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；
+	//  channels.wechat.enabled off → 403 wechat-disabled）；enable/disable 只要 401 门、
+	//  不受 opt-in 闸限制（否则鸡生蛋）。token 永不进任何响应。──
 
-	/** GET /v1/wechat/bind/status（状态投影；403 = 未启用 → 上层隐藏入口）。 */
+	/** GET /v1/wechat/bind/status（状态投影；403 = 未启用 → 页内显示「启用微信连接」按钮）。 */
 	wechatBindStatus: (): Promise<FetchResult<WechatBindStatusBody>> =>
 		fetchJson<WechatBindStatusBody>("/v1/wechat/bind/status"),
 
@@ -208,4 +210,12 @@ export const api = {
 	/** POST /v1/wechat/unbind（删凭据回 idle）。 */
 	wechatUnbind: (): Promise<FetchResult<WechatUnbindBody>> =>
 		postJson<WechatUnbindBody>("/v1/wechat/unbind", {}),
+
+	/** POST /v1/wechat/enable（写 config channels.wechat.enabled=true；幂等；回执 = 当前 enabled）。 */
+	wechatEnable: (): Promise<FetchResult<WechatToggleBody>> =>
+		postJson<WechatToggleBody>("/v1/wechat/enable", {}),
+
+	/** POST /v1/wechat/disable（写 false；幂等；回执 = 当前 enabled）。 */
+	wechatDisable: (): Promise<FetchResult<WechatToggleBody>> =>
+		postJson<WechatToggleBody>("/v1/wechat/disable", {}),
 };

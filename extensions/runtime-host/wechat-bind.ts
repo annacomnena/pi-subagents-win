@@ -29,7 +29,7 @@
  * 红线：只 import node 内建 + ../runtime/* 纯函数。fetch 可注入（单测 fake fetch）。
  */
 
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { defaultPkgConfigPath } from "../runtime/master-injection.ts";
@@ -181,6 +181,59 @@ export function readWechatEnabled(configPath: string): boolean {
 
 /** 缺省 config 路径（包根 config.json；与 readGuiEnabled 同源，独立 re-export 供 server 测试）。 */
 export const readWechatConfigPath = defaultPkgConfigPath;
+
+const cfgErrMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * 写 `channels.wechat.enabled`（true/false）。实现风格复用 gui-autostart.ts::setGuiAutoStart：
+ * read-modify-write 保留**其余全部字段**（顶层 + channels + channels.wechat 其它键）+
+ * tmp+rename 原子写 + EPERM×3 重试。config.json 不可读/非 JSON 对象时**拒绝覆盖写**（防整文件损毁），
+ * 返回 {ok:false, error} 不抛——写失败如实报错，调用方不得谎称成功。同值重写 = 幂等。
+ */
+export function setWechatEnabled(on: boolean, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {
+	let raw: Record<string, unknown>;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			return { ok: false, error: "config.json 不是 JSON 对象——拒绝覆盖写（防损坏）" };
+		}
+		raw = parsed as Record<string, unknown>;
+	} catch (e) {
+		return { ok: false, error: `config.json 不可读（${cfgErrMsg(e)}）——拒绝覆盖写` };
+	}
+	const channels = (
+		typeof raw.channels === "object" && raw.channels !== null && !Array.isArray(raw.channels) ? raw.channels : {}
+	) as Record<string, unknown>;
+	const wechat = (
+		typeof channels.wechat === "object" && channels.wechat !== null && !Array.isArray(channels.wechat) ? channels.wechat : {}
+	) as Record<string, unknown>;
+	wechat.enabled = on;
+	channels.wechat = wechat;
+	raw.channels = channels;
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+	try {
+		writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n");
+		for (let attempt = 0; ; attempt++) {
+			try {
+				renameSync(tmp, path);
+				return { ok: true };
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code === "EPERM" && attempt < 3) {
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+					continue;
+				}
+				throw e;
+			}
+		}
+	} catch (e) {
+		try {
+			unlinkSync(tmp);
+		} catch {
+			/* ignore */
+		}
+		return { ok: false, error: `config.json 写入失败：${cfgErrMsg(e)}` };
+	}
+}
 
 // ── 协议解析（纯函数；fake fetch 单测面）────────────────────────────
 

@@ -33,7 +33,7 @@ export type TabId = "chat" | "timeline";
 /** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0；0923 2003 遮挡修复后
  *  根层叠 z-30，见 RuntimeOverlay.tsx 头注）：
  *  null=关；值=打开并定位对应 section（attention/master/workstream/runtime 四页组件原样复用；
- *  0923 wechat = 「微信连接」（未启用 403 时 RuntimeOverlay 隐藏该入口））。 */
+ *  0923 wechat = 「微信连接」（L3 UX 修复：入口始终显示，未启用 403 由 ChannelsPage 页内给启用按钮））。 */
 export type RuntimeOverlaySection = "attention" | "master" | "workstream" | "runtime" | "wechat";
 
 /** envelope → 人话 TimelineItem（客户端小映射，参照 extensions/runtime-host/timeline.ts 模板；

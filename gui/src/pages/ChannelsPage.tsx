@@ -4,8 +4,9 @@
  * 状态机 idle→waiting(qr)→scanned→bound | expired | error（server /v1/wechat/bind/status 唯一真相源；
  * token 永不进任何响应/浏览器）。waiting/scanned 每 2s 轮询 status（daemon 驱动服务端 2.5s 轮询；
  * 前端不直连腾讯）。二维码 = daemon /v1/wechat/bind/qr-image 的 data URL（≤200KB/10s；失败回退
- * 图片 URL 文本 + 复制，前端永不拿轮询凭证串渲染）。未启用（403 wechat-disabled）→ RuntimeOverlay
- * 隐藏本 section（本页的 disabled 分支只是防御性兜底）。
+ * 图片 URL 文本 + 复制，前端永不拿轮询凭证串渲染）。L3 UX 修复：入口始终渲染（RuntimeOverlay
+ * 不再过滤）——未启用（403 wechat-disabled）→ 页内明确说明 +「启用微信连接」按钮（POST
+ * /v1/wechat/enable 后自动刷新 status）；401 → 引导本机 TUI `/gui open` 后刷新。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -108,20 +109,29 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 export function ChannelsPage() {
 	const [status, setStatus] = useState<WechatBindStatusBody | null>(null);
 	const [disabled, setDisabled] = useState(false);
-	const [busy, setBusy] = useState<"start" | "cancel" | "unbind" | null>(null);
+	const [unauthorized, setUnauthorized] = useState(false);
+	const [busy, setBusy] = useState<"start" | "cancel" | "unbind" | "enable" | null>(null);
 	const [actionError, setActionError] = useState<string | null>(null);
 	const [qrImage, setQrImage] = useState<WechatQrImageBody | null>(null);
 
 	const uiState: UiState = status?.state ?? "loading";
 	const polling = uiState === "waiting" || uiState === "scanned";
 
-	/** status 唯一真相源（never-throw；403 = 未启用 → 上层隐藏入口，此处置 disabled 兜底）。 */
+	/** status 唯一真相源（never-throw）。403 = 未启用 → 页内显启用按钮；401 = 无本机凭据 → 引导 /gui open。 */
 	const refreshStatus = useCallback(async (): Promise<void> => {
 		const r = await api.wechatBindStatus();
 		if (!r.ok) {
-			if (r.status === 403) setDisabled(true);
+			if (r.status === 403) {
+				setDisabled(true);
+				setUnauthorized(false);
+			} else if (r.status === 401) {
+				setUnauthorized(true);
+				setDisabled(false);
+			}
 			return;
 		}
+		setDisabled(false);
+		setUnauthorized(false);
 		setStatus(r.data);
 		setActionError(null);
 	}, []);
@@ -193,6 +203,24 @@ export function ChannelsPage() {
 		}
 	};
 
+	const doEnable = async (): Promise<void> => {
+		// L3 UX 正常启用路径：POST /v1/wechat/enable（本机凭据鉴权，不受 opt-in 闸限制）
+		// → 成功自动刷新 status（403 → 正常绑定页）；失败如实展示 server message/hint。
+		setBusy("enable");
+		setActionError(null);
+		const r = await api.wechatEnable();
+		setBusy(null);
+		if (!r.ok) {
+			setActionError(describeActionError(r));
+			return;
+		}
+		if (r.data.enabled) {
+			await refreshStatus();
+		} else {
+			setActionError(r.data.message ?? "启用未生效（回执 enabled=false）");
+		}
+	};
+
 	const doUnbind = async (): Promise<void> => {
 		setBusy("unbind");
 		setActionError(null);
@@ -206,15 +234,51 @@ export function ChannelsPage() {
 		}
 	};
 
-	// 防御性兜底：未启用（RuntimeOverlay 已按 403 隐藏入口；走到这里只可能是竞态）
+	// 未启用（403 wechat-disabled）：入口始终可见 → 页内给正常启用路径（不再要求手工改 config.json）
 	if (disabled) {
 		return (
 			<div className="space-y-3">
 				<PageIntro>微信连接</PageIntro>
-				<Card title={<Term zh="未启用" en="wechat-disabled" />}>
-					<EmptyState>
-						微信通道未启用：config.json 设 channels.wechat.enabled=true 后重开覆盖层（未启用时本入口隐藏）
-					</EmptyState>
+				<Card
+					title={
+						<Term
+							zh="未启用"
+							en="wechat-disabled"
+							hint="config.json channels.wechat.enabled 缺省 OFF；启用走 POST /v1/wechat/enable（本机凭据鉴权，写盘保留其余字段）"
+						/>
+					}
+				>
+					<div className="space-y-3">
+						<EmptyState>
+							微信连接功能尚未启用（channels.wechat.enabled = off）。点击下方按钮启用后，即可在本页生成绑定二维码。
+						</EmptyState>
+						<p className="text-xs text-foreground-subtle">启用后需在本机 TUI 侧完成扫码。</p>
+						<div className="flex gap-2">
+							<Button variant="primary" onClick={() => void doEnable()} disabled={busy !== null}>
+								{busy === "enable" ? "启用中…" : "启用微信连接"}
+							</Button>
+						</div>
+						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+					</div>
+				</Card>
+			</div>
+		);
+	}
+
+	// 无本机凭据（401）：引导先在本机 TUI /gui open 换 cookie，再刷新（当前用户真实卡点文案）
+	if (unauthorized) {
+		return (
+			<div className="space-y-3">
+				<PageIntro>微信连接</PageIntro>
+				<Card title={<Term zh="未获得本机凭据" en="401 unauthorized" />}>
+					<div className="space-y-3">
+						<EmptyState>未获得本机凭据：请先在本机 TUI 执行 /gui open 后再刷新。</EmptyState>
+						<div className="flex gap-2">
+							<Button variant="secondary" onClick={() => void refreshStatus()} disabled={busy !== null}>
+								刷新
+							</Button>
+						</div>
+					</div>
 				</Card>
 			</div>
 		);

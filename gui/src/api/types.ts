@@ -481,3 +481,11 @@ export interface WechatQrImageBody {
 export interface WechatUnbindBody extends WechatBindStatusBody {
 	removed: boolean;
 }
+
+/** POST /v1/wechat/enable | disable（写 config channels.wechat.enabled；回执 = 写后当前 enabled，幂等；
+ *  写盘失败 → 500 {error:"config-write-failed", message, enabled=写前读值}——如实报错不谎称成功）。 */
+export interface WechatToggleBody {
+	enabled: boolean;
+	error?: string;
+	message?: string;
+}
