@@ -1,4 +1,8 @@
 ---
+title: Hotspot 路由缓存
+kind: concept
+status: current
+updated: 2026-09-23
 schema_version: 1
 revision: 1
 ---

@@ -82,7 +82,10 @@ export function readHotspot(path: string): ReadResult {
 	};
 }
 
-// ── 解析（严格：未知字段/重复单值字段/坏时间戳 → 整体失败）──────────────
+// ── 解析（白名单校验 + frontmatter 未知字段容忍保留：已知字段仍严格校验；
+// 未知 frontmatter 字段原样收入 file.frontmatterExtra，写回逐字保留。
+// 条目未知字段/重复单值字段/坏时间戳仍整体失败；YAML 语法错误、schema_version
+// 不支持、revision 非法仍拒绝——fail-closed 保护语义不变）──────────────
 
 const WIKI_RE = /^(.+?)(?:\s+→\s+(.+))?$/u; // path 或 path → section（懒惰匹配：第一个 " → " 分隔）
 
@@ -95,6 +98,7 @@ export function parseHotspot(raw: string): ParseResult {
 	let i = 0;
 	let schemaVersion = 0;
 	let revision = -1;
+	const frontmatterExtra: Array<{ key: string; value: string }> = [];
 
 	// frontmatter（可选前导空行；--- 开始）
 	while (i < lines.length && lines[i]!.trim() === "") i++;
@@ -105,7 +109,7 @@ export function parseHotspot(raw: string): ParseResult {
 			if (!m) return { ok: false, error: `frontmatter 行无法解析: ${lines[i]}` };
 			if (m[1] === "schema_version") schemaVersion = Number(m[2]);
 			else if (m[1] === "revision") revision = Number(m[2]);
-			else return { ok: false, error: `frontmatter 未知字段: ${m[1]}` };
+			else frontmatterExtra.push({ key: m[1], value: m[2] }); // 未知字段容忍：原样保留
 			i++;
 		}
 		if (i >= lines.length) return { ok: false, error: "frontmatter 未闭合（缺 ---）" };
@@ -191,7 +195,7 @@ export function parseHotspot(raw: string): ParseResult {
 		if (!done.ok) return done;
 		entries.push(done.entry);
 	}
-	return { ok: true, file: { schemaVersion, revision, entries } };
+	return { ok: true, file: { schemaVersion, revision, entries, frontmatterExtra } };
 }
 
 function finalizeEntry(
@@ -221,7 +225,9 @@ function finalizeEntry(
 // ── 序列化（与解析对称；工具生成的唯一合法格式）──────────────────────────
 
 export function serializeHotspot(file: HotspotFile): string {
-	const out: string[] = ["---", `schema_version: ${file.schemaVersion}`, `revision: ${file.revision}`, "---", ""];
+	// 未知字段逐字保留：按解析时顺序写在已知字段之前（顺序稳定，不丢弃外部工具加的 frontmatter）
+	const extra = (file.frontmatterExtra ?? []).map((f) => `${f.key}: ${f.value}`);
+	const out: string[] = ["---", ...extra, `schema_version: ${file.schemaVersion}`, `revision: ${file.revision}`, "---", ""];
 	for (const e of file.entries) {
 		out.push(`## ${e.topicId}`, "", `- ${FIELD_LABELS.title}：${e.title}`);
 		if (e.scope) out.push(`- ${FIELD_LABELS.scope}：${e.scope}`);

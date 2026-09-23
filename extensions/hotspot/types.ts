@@ -65,10 +65,18 @@ export interface HotspotEntry {
 	rel?: Rel[];
 }
 
+/** frontmatter 未知字段（Wiki 校验器等外部工具加的 title/kind/status/updated）：原样保留、写回逐字保留 */
+export interface FrontmatterField {
+	key: string;
+	value: string;
+}
+
 export interface HotspotFile {
 	schemaVersion: number;
 	revision: number;
 	entries: HotspotEntry[];
+	/** 未知 frontmatter 字段（按文件中出现顺序）；缺省/空 = 无 */
+	frontmatterExtra?: FrontmatterField[];
 }
 
 export type ParseResult =

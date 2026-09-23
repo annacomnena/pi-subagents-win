@@ -94,6 +94,39 @@ function mkEntry(topicId: string, over: Partial<HotspotEntry> = {}): HotspotEntr
 	assert.ok(!parseHotspot("random content").ok);
 }
 
+// ── frontmatter 兼容：未知字段容忍保留 + fail-closed 保持（0923）──────────────
+{
+	// ① 未知字段可解析（不报错）：Wiki 校验器要的 title/kind/status/updated 被容忍
+	const withExtra = "---\ntitle: Hotspot 路由缓存\nkind: concept\nstatus: current\nupdated: 2026-09-23\nschema_version: 1\nrevision: 2\n---\n\n## t\n- 标题：x\n- 内容更新：2026-01-01T00:00:00.000Z\n- 引用验证：2026-01-01T00:00:00.000Z\n";
+	const p1 = parseHotspot(withExtra);
+	assert.ok(p1.ok, `未知 frontmatter 应容忍: ${!p1.ok && p1.error}`);
+	assert.deepEqual(p1.file.frontmatterExtra, [
+		{ key: "title", value: "Hotspot 路由缓存" },
+		{ key: "kind", value: "concept" },
+		{ key: "status", value: "current" },
+		{ key: "updated", value: "2026-09-23" },
+	]);
+	assert.equal(p1.file.schemaVersion, 1);
+	assert.equal(p1.file.revision, 2);
+	// ② upsert/写回后未知字段仍在（逐字保留、顺序稳定；正文按序列化规范格式）
+	const back = serializeHotspot(p1.file);
+	const fmBlock = back.split("---\n")[1]!;
+	assert.equal(fmBlock, "title: Hotspot 路由缓存\nkind: concept\nstatus: current\nupdated: 2026-09-23\nschema_version: 1\nrevision: 2\n", "未知字段应逐字保留（含顺序，在已知字段之前）");
+	const p2 = parseHotspot(back);
+	assert.ok(p2.ok && p2.file.revision === 2);
+	assert.deepEqual(p2.file.frontmatterExtra, p1.file.frontmatterExtra);
+	// 旧文件（无未知字段）往返不变
+	const plain: HotspotFile = { schemaVersion: SCHEMA_VERSION, revision: 1, entries: [mkEntry("fm-ok")] };
+	assert.ok(parseHotspot(serializeHotspot(plain)).ok);
+	// ③ 真 YAML 语法错误仍被拒（无冒号的行）
+	assert.ok(!parseHotspot("---\ntitle Hotspot 缺冒号\nschema_version: 1\nrevision: 1\n---\n").ok, "坏 frontmatter 行应拒绝");
+	assert.ok(!parseHotspot("---\nschema_version: 1\nrevision: 1\n").ok, "frontmatter 未闭合应拒绝");
+	// ④ schema_version/revision 非法仍被拒（fail-closed）
+	assert.ok(!parseHotspot("---\ntitle: x\nschema_version: 2\nrevision: 1\n---\n").ok, "schema_version 不支持应拒绝");
+	assert.ok(!parseHotspot("---\ntitle: x\nschema_version: 1\nrevision: -1\n---\n").ok, "revision 负数应拒绝");
+	assert.ok(!parseHotspot("---\ntitle: x\nschema_version: 1\nrevision: abc\n---\n").ok, "revision 非数字应拒绝");
+}
+
 // ── commit：新建、冲突、相同内容幂等、并发保护 ───────────────────────
 {
 	const path = hotspotPath(dir);
