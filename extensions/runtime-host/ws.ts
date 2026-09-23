@@ -231,10 +231,21 @@ export class WsConn {
 		for (const f of frames) {
 			switch (f.opcode) {
 				case OP_TEXT:
-					try {
-						this.handlers.onText?.(f.payload.toString("utf8"));
-					} catch {
-						/* handler 自兜；连接不断 */
+					{
+						// RFC 6455 §8.1：文本帧必须是合法 UTF-8；非法 → close 1007 且不投 onText
+						//（0924：旧 toString("utf8") 静默烧 U+FFFD。ignoreBOM:true 保持合法路径与旧行为同轨）
+						let text: string;
+						try {
+							text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(f.payload);
+						} catch {
+							this.close(1007, "invalid-utf8");
+							return;
+						}
+						try {
+							this.handlers.onText?.(text);
+						} catch {
+							/* handler 自兜；连接不断 */
+						}
 					}
 					break;
 				case OP_PING:

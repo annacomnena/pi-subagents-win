@@ -29,6 +29,7 @@ const ROOT = process.env.PI_RUNTIME_DIR!;
 const STATE = join(ROOT, "state");
 
 import { masterAddress, piSessionAddress, workstreamAddress } from "./runtime/address.ts";
+import { CommandRequestError, decodeCommandBody } from "./runtime-host/commands.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 import { createWorkstream, listAudit, readWorkstream, updateWorkstream } from "./runtime/workstreams.ts";
 import { COMMAND_TYPES, newCommandFrame, newMessageFrame, validateCommandFrame, type CommandFrame } from "./runtime/protocol.ts";
@@ -800,6 +801,61 @@ try {
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 1, "message 帧照常注入");
 		assert.equal(sent2.length, 1);
 		assert.ok(!listLetters(master, undefined, ROOT).some((l) => l.frame.frame === "message" && l.frame.body.summary === "smoke report" && l.status === "pending"), "message 信已 ack");
+	}
+
+	// ── 0924：decodeCommandBody 严格解码（远程中文 U+FFFD 烧毁修复；plans/0924_remote_input_encoding_fix.md）──
+	{
+		// (a) 合法 UTF-8 必须与旧 toString("utf8") 逐字节恒等（零回归基线，多例：BOM/emoji/混合 ASCII/空）
+		for (const s of [
+			"",
+			"ascii only 123",
+			"你好，远程会话",
+			"(主会话链路自检：可忽略)",
+			"emoji 🚀 混合 mixed 123",
+			"\uFEFFBOM 开头",
+			"é ü 中 文",
+			"line1\nline2\ttab",
+		]) {
+			const buf = Buffer.from(s, "utf8");
+			assert.equal(decodeCommandBody(buf), buf.toString("utf8"), `合法 UTF-8 与旧路径同轨：${JSON.stringify(s)}`);
+		}
+		// BOM 字节（EF BB BF）：与旧路径同轨（两者都保留 U+FEFF，不吞）
+		const bom = Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0x42]);
+		assert.equal(decodeCommandBody(bom), bom.toString("utf8"), "BOM 处理与旧路径同轨");
+
+		const expectErr = (fn: () => string, error: string, label: string): void => {
+			try {
+				fn();
+				assert.fail(`${label} 应抛 CommandRequestError(${error})`);
+			} catch (e) {
+				assert.ok(e instanceof CommandRequestError, `${label}：抛 CommandRequestError（实际 ${e instanceof Error ? e.constructor.name : typeof e}）`);
+				assert.equal(e.status, 400, `${label}：status 400`);
+				assert.equal(e.body.error, error, `${label}：body.error=${error}`);
+			}
+		};
+
+		// (b) 本 bug 复现字节：GBK「(主会话链路自检：可忽略)」（无 charset 声明）→ 正确还原，无 U+FFFD
+		const gbkRepro = Buffer.from("28d6f7bbe1bbb0c1b4c2b7d7d4bceca3babfc9baf6c2d429", "hex");
+		const dec = decodeCommandBody(gbkRepro);
+		assert.equal(dec, "(主会话链路自检：可忽略)", "GBK 复现字节还原（不再烧 U+FFFD）");
+		assert.ok(!dec.includes("\uFFFD"), "解码结果无 U+FFFD");
+
+		// (c) 显式声明 charset=gbk / gb18030 / cp936 + GBK 字节 → 还原（大小写不敏感）
+		assert.equal(decodeCommandBody(gbkRepro, "application/json; charset=gbk"), "(主会话链路自检：可忽略)");
+		assert.equal(decodeCommandBody(gbkRepro, "text/plain; charset=GB18030"), "(主会话链路自检：可忽略)");
+		assert.equal(decodeCommandBody(gbkRepro, "text/plain; charset=cp936"), "(主会话链路自检：可忽略)");
+
+		// (d) charset=utf-8 声明 + GBK 字节 → 400 invalid-encoding（尊重声明，不兜底）
+		expectErr(() => decodeCommandBody(gbkRepro, "application/json; charset=utf-8"), "invalid-encoding", "charset=utf-8 + GBK 字节");
+		expectErr(() => decodeCommandBody(gbkRepro, "application/json; charset=UTF-8"), "invalid-encoding", "charset=UTF-8 大小写 + GBK 字节");
+
+		// (e) 双重非法（28 ff 29：既非合法 UTF-8 也非合法 GB18030）→ 400 invalid-encoding（fail-closed）
+		const bothBad = Buffer.from("28ff29", "hex");
+		expectErr(() => decodeCommandBody(bothBad), "invalid-encoding", "双重非法 28ff29（无声明）");
+		expectErr(() => decodeCommandBody(bothBad, "text/plain; charset=utf-8"), "invalid-encoding", "双重非法 + utf-8 声明");
+
+		// (f) 未知 charset → 400 unsupported-charset
+		expectErr(() => decodeCommandBody(Buffer.from("ok", "utf8"), "text/plain; charset=latin-1"), "unsupported-charset", "未知 charset");
 	}
 } finally {
 	rmSync(ROOT, { recursive: true, force: true });

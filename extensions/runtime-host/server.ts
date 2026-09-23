@@ -112,6 +112,7 @@ import {
 	COMMAND_BODY_LIMIT_BYTES,
 	CommandRequestError,
 	commandOutcomeHttpResponse,
+	decodeCommandBody,
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
@@ -627,7 +628,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			let status = 200;
 			let body: unknown;
 			try {
-				const raw = Buffer.concat(chunks).toString("utf8");
+				const raw = decodeCommandBody(Buffer.concat(chunks), req.headers["content-type"]);
 				// L3 窄路径策略（peek 容错解析；失败→undefined=旧行为，parseCommandRequest 照常 400）：
 				// 仅 session.message→当前 master owner 才计算三证据并显式传入 executor。
 				let trustedMasterInjection: TrustedMasterInjectionPolicy | undefined;
@@ -733,7 +734,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			if (responded) return;
 			responded = true;
 			try {
-				const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { nonce?: unknown };
+				const parsed = JSON.parse(decodeCommandBody(Buffer.concat(chunks), req.headers["content-type"])) as { nonce?: unknown };
 				const ans = answerChallenge(hostToken, typeof parsed.nonce === "string" ? parsed.nonce : "", challengeMeta);
 				if (!ans) {
 					respondJson(res, 400, { error: "bad-challenge", hint: "body 需 {nonce: 8..256 字符随机串}；服务端无秘钥时 503" });

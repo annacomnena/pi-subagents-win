@@ -33,6 +33,52 @@ export class CommandRequestError extends Error {
 }
 
 /**
+ * POST /v1/commands 请求体解码：严格 UTF-8 →（无 charset 声明时）GB18030 兜底 → 400。
+ * 永不有损替换（U+FFFD 只允许来自客户端原文）。
+ *
+ * 0924：Windows curl 等 cp936 客户端按系统代码页发请求体，旧 `toString("utf8")` 把非 UTF-8
+ * 字节静默烧成 U+FFFD 并照常落盘 outbox，事后不可恢复。策略（按序，先命中先返回）：
+ *   - charset=utf-8/utf8 → 仅严格 UTF-8（声明了还错 → 400，尊重声明，不兜底）；
+ *   - charset=gbk/gb18030/cp936 → TextDecoder("gb18030",{fatal:true})，失败 → 400；
+ *   - 其他未知 charset → 400 unsupported-charset；
+ *   - 无 charset 声明 → 先严格 UTF-8，失败再 GB18030 兜底（cp936 客户端事实标准）；
+ *     两路皆失败 → 400 invalid-encoding（fail-closed，不写任何状态）。
+ * `ignoreBOM:true` 显式传：合法 UTF-8 路径与旧 `Buffer.toString("utf8")` 逐字节一致（含 BOM 同轨）。
+ * 只用 Node 内置 TextDecoder（零新依赖）；经兜底成功解码的请求不写任何审计/标记（v1 不加面）。
+ */
+export function decodeCommandBody(buf: Buffer, contentType?: string | string[]): string {
+	const ct = Array.isArray(contentType) ? contentType.join(";") : (contentType ?? "");
+	const m = /charset\s*=\s*["']?([A-Za-z0-9_.-]+)["']?/i.exec(ct);
+	if (m) {
+		const c = m[1]!.replace(/-/g, "").toLowerCase();
+		if (c === "utf8") {
+			try {
+				return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
+			} catch {
+				throw new CommandRequestError(400, { error: "invalid-encoding", hint: `charset=${m[1]} 已声明但 body 非合法 UTF-8；已拒收，未写入任何状态` });
+			}
+		}
+		if (c === "gbk" || c === "gb18030" || c === "cp936") {
+			try {
+				return new TextDecoder("gb18030", { fatal: true }).decode(buf);
+			} catch {
+				throw new CommandRequestError(400, { error: "invalid-encoding", hint: `charset=${m[1]} 已声明但 body 非合法 GB18030；已拒收，未写入任何状态` });
+			}
+		}
+		throw new CommandRequestError(400, { error: "unsupported-charset", hint: `charset=${m[1]} 不支持（仅 utf-8/gbk/gb18030/cp936）；已拒收，未写入任何状态` });
+	}
+	try {
+		return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
+	} catch {
+		try {
+			return new TextDecoder("gb18030", { fatal: true }).decode(buf);
+		} catch {
+			throw new CommandRequestError(400, { error: "invalid-encoding", hint: "body 必须是 UTF-8（或声明 charset=gbk/gb18030）；已拒收，未写入任何状态" });
+		}
+	}
+}
+
+/**
  * 解析并校验 POST /v1/commands 请求体 → CommandFrame。
  * issuedBy 缺失时服务端注入 RUNTIME_HOST_ISSUER；结构非法一律 CommandRequestError(400)。
  */

@@ -303,3 +303,5 @@
 - **Wiki**：无（发布纪要，无新增耐久页）
 - **Priority**：P0
 - **Status**：complete
+
+0924 远程输入编码契约修复 → 更新 `Wiki/Architecture/gui-message-pipeline.md#输入编码契约（intake 侧）`；plans：`plans/0924_remote_input_encoding_fix.md` / `_impl.md` / `_review.md`

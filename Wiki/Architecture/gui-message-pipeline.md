@@ -2,12 +2,14 @@
 title: GUI 消息管道与延迟贡献项
 kind: concept
 status: current
-updated: 2026-09-23
+updated: 2026-09-24
 source_paths:
   - gui/src/useEventStream.ts
   - gui/src/store.ts
   - gui/src/api/client.ts
   - gui/src/pages/ChatPage.tsx
+  - extensions/runtime-host/commands.ts
+  - extensions/runtime-host/server.ts
   - extensions/runtime-host/ws.ts
   - extensions/outbox-bridge.ts
 ---
@@ -30,6 +32,19 @@ source_paths:
 
 **不重不漏的机制**：增量帧按 `rowId` 幂等 upsert（回填保位、新行按投影序追加）；`frame.seq` 倒退防御（丢弃）；HTTP resync 响应若 `seq` 低于已收帧 seq 则丢弃（**避免旧响应覆盖新状态**——这是独立 L4 复核发现并修掉的竞态）。
 
+## 输入编码契约（intake 侧）
+
+客户端 → runtime-host 的两条 intake 通道均为**严格解码、永不有损替换**（`U+FFFD` 只允许来自客户端原文）。动因：Windows curl 等 cp936 客户端按系统代码页发请求体，旧 `toString("utf8")` 把非 UTF-8 字节静默烧成 `U+FFFD` 并照常落盘 outbox，事后不可恢复——故全链路改 fail-closed。
+
+1. **HTTP `POST /v1/commands`（及 challenge）请求体** — `decodeCommandBody`（`extensions/runtime-host/commands.ts#L49`），按序先命中先返回：
+   - `charset=utf-8/utf8` → 仅严格 UTF-8，出错 → `400 invalid-encoding`（**尊重声明，不兜底**）；
+   - `charset=gbk/gb18030/cp936` → `TextDecoder("gb18030",{fatal:true})`，失败 → `400`；
+   - 其他未知 charset → `400 unsupported-charset`；
+   - 无 charset 声明 → 先严格 UTF-8，失败再 **GB18030 兜底**（cp936 客户端事实标准）；两路皆败 → `400 invalid-encoding`。
+   - **fail-closed 语义**：400 时零写盘（outbox / commands 状态均不动）；合法 UTF-8 路径显式 `ignoreBOM:true`，与旧 `Buffer.toString("utf8")` 逐字节同轨（含 BOM）。零新依赖（Node 内置 TextDecoder）。
+   - 接线：`extensions/runtime-host/server.ts` 的 `/v1/commands`（`#L642`）与 challenge（`#L748`），按 `content-type` 的 charset 分派。
+2. **WS `OP_TEXT` 帧** — `extensions/runtime-host/ws.ts` 严格 UTF-8（`ignoreBOM:true`）；非法帧 → `close(1007, "invalid-utf8")` 且**不投 `onText`**（RFC 6455 §8.1：文本帧必须是合法 UTF-8）。
+
 ## 实测证据（C1 实验，257 次采样）
 
 - 新会话流式 5000 字/154s：采样全程**无文件**（pi 首条 assistant 前内存暂存不落盘），文件首次出现即 6 行，且 `mtime == assistant 条目 ts`（毫秒级一致）。
@@ -46,6 +61,7 @@ source_paths:
 - `extensions/runtime-host/ws.ts` 的 `journal`/`interactions` 主题支持。
 - 独立 L4 复核：本地 `plans/0923_gui_ux_fix_review.md`；计划 `plans/0923_gui_ux_fix_plan.md`；实现 `plans/0923_gui_ux_fix_impl.md`（含 27 例 XSS/兼容实测）。
 - 提交：`6d4ba67`（管道修复）、`911c397`（markdown 测试入库 + 围栏收紧）、`e7475e3`（outbox 事件唤醒）。
+- 输入编码契约：本地 `plans/0924_remote_input_encoding_fix.md` / `_impl.md` / `_review.md`（PASS-WITH-FIXES）；`extensions/_test_runtime_commands.ts`（`decodeCommandBody` 单测）、`extensions/_test_runtime_host_server.ts`（端到端：GBK 字节 → 200 中文完好；双重非法 → 400 且 outbox/commands 目录零新增）。
 
 ## Links Out
 

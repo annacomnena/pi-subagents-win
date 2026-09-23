@@ -68,7 +68,7 @@ import { masterAddress } from "./runtime/address.ts";
 import { appendRuntimeEnvelope } from "./runtime/journal.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 import { RUNTIME_SCHEMA_VERSION, verifyChallengeResponse } from "./runtime-host/identity.ts";
-import { newOutboxItem, writeOutboxItem } from "./runtime/message-outbox.ts";
+import { listOutboxItems, newOutboxItem, outboxDir, writeOutboxItem } from "./runtime/message-outbox.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, touchSessionHeartbeat } from "./timers.ts";
@@ -709,6 +709,69 @@ try {
 				/单实例锁/,
 				"T15⑲ 同 hostPath 双跑被拒绝",
 			);
+		} finally {
+			await h.close();
+		}
+	}
+
+	// ── T16 0924：HTTP 请求体严格解码（GBK 还原；双重非法 → 400 且 outbox 零新增，
+	//    plans/0924_remote_input_encoding_fix.md §4）──────────────────────────────
+	{
+		const D = mkdtempDir("runtime-host-t16-");
+		DIRS.push(D);
+		const stateDir = join(D, "s");
+		const sessionsDir = join(D, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		const sid = "a1111111-2222-3333-4444-555555555555";
+		writeFileSync(join(sessionsDir, `2026-09-24T09-00-00-000Z_${sid}.jsonl`),
+			`{"type":"session","version":3,"id":"${sid}","timestamp":"2026-09-24T09:00:00.000Z","cwd":"C:\\ws\\t16"}\n`, "utf8");
+		const obDir = outboxDir(stateDir);
+		const h = await createRuntimeHostServer({
+			hostPath: join(D, "host.json"),
+			stateDir,
+			journalPath: join(D, "e.jsonl"),
+			timersDir: join(D, "t"),
+			mailboxDir: join(D, "m"),
+			sessionsDir,
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			// raw 字节 POST（无 charset 声明；GBK 体 = Windows curl -d 本 bug 复现形状）
+			const postRaw = async (buf: Buffer, contentType: string): Promise<{ status: number; body: any }> => {
+				const res = await fetch(`${base}/v1/commands`, {
+					method: "POST",
+					headers: { "content-type": contentType, "x-command-token": h.info.token },
+					body: new Uint8Array(buf),
+				});
+				return { status: res.status, body: await res.json() };
+			};
+			const frameBytes = (commandKey: string, textBytes: Buffer): Buffer =>
+				Buffer.concat([
+					Buffer.from(`{"frame":"command","type":"session.message","to":"pi://${sid}","commandKey":"${commandKey}","issuedAt":"${new Date().toISOString()}","payload":{"text":"`, "utf8"),
+					textBytes,
+					Buffer.from(`"}}`, "utf8"),
+				]);
+
+			// (a) GBK 字节（本 bug 复现字节）POST → 200 + outbox text 为正确中文（无 U+FFFD）
+			const gbkText = Buffer.from("28d6f7bbe1bbb0c1b4c2b7d7d4bceca3babfc9baf6c2d429", "hex");
+			const rGbk = await postRaw(frameBytes("t16-gbk", gbkText), "application/json");
+			assert.equal(rGbk.status, 200, `GBK 体 POST 200（实际 ${rGbk.status} ${JSON.stringify(rGbk.body)}）`);
+			assert.equal(rGbk.body.status, "accepted");
+			const item = listOutboxItems(obDir).find((it) => it.commandKey === "t16-gbk");
+			assert.ok(item, "GBK 体正确解码落盘（修复前会烧 U+FFFD 落盘）");
+			assert.equal(item.text, "(主会话链路自检：可忽略)", "outbox text 为正确中文");
+			assert.ok(!item.text.includes("\uFFFD"), "无 U+FFFD");
+
+			// (b) 双重非法字节（28 ff 29：既非合法 UTF-8 也非合法 GB18030）POST →
+			//     400 invalid-encoding 且 outbox 目录零新增（fail-closed 不写盘）
+			const before = readdirSync(obDir).sort();
+			const commandsDir = join(stateDir, "commands");
+			const commandsBefore = existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [];
+			const rBad = await postRaw(frameBytes("t16-bad", Buffer.from([0x28, 0xff, 0x29])), "application/json");
+			assert.equal(rBad.status, 400, `双重非法体 400（实际 ${rBad.status} ${JSON.stringify(rBad.body)}）`);
+			assert.equal(rBad.body.error, "invalid-encoding", "400 error=invalid-encoding");
+			assert.deepEqual(readdirSync(obDir).sort(), before, "outbox 目录零新增（拒收不落盘）");
+			assert.deepEqual(existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [], commandsBefore, "commands 状态目录零新增（拒收不落盘）");
 		} finally {
 			await h.close();
 		}
