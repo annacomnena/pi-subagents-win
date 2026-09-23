@@ -272,6 +272,12 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 			return fail(`身份不符：host.json runtimeId=${file.runtimeId} ≠ 本目录 ${runtimeId}（fail-closed，未复用）`, { uncertain: true, info: file, pid: file.pid, port: file.port });
 		}
 		const state = await classifyHost(file, { timeoutMs: opts.challengeTimeoutMs ?? 2000 });
+		if (state === "dead") {
+			// 仅放行 dead：不可复用 ≠ 不确定——返回 null（=「不可复用，继续往下走」）。
+			// 由**已持锁**的主路径（下方「重读 → dead → 僵尸接管重建」分支）决策；
+			// stale（pid 活但探活超时）/身份不符/挑战失败/legacy 弱确权失败仍 fail-closed。
+			return null;
+		}
 		if (state !== "alive") {
 			return fail(`host 不可确权（${state}）：fail-closed，未复用、未重建、未 kill`, { uncertain: true, info: file, pid: file.pid, port: file.port });
 		}
@@ -326,6 +332,19 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 	// B) 取 handoff 锁后决策（确已持锁；race 输了 → 回 A 只读路径）
 	const handoff: RuntimeLock = { kind: "handoff", pid: process.pid, instanceId: newHandoffId(), runtimeId, acquiredAt: now() };
 	let ac = acquireRuntimeLock(lockPath, handoff);
+	if (!ac.acquired && ac.existing) {
+		// 取锁失败且读到现有锁：仅**可证持有人已死**的孤儿/僵尸锁（daemon 崩溃遗留）才清抢，
+		// 使 dead host.json 能进入下方持锁重建（否则永远停在 fail-closed = 用户症状根因）。
+		// 重读复核 instanceId + 仍死才 rm（防误删他方新锁）；stealStaleLock 语义不变：活锁永不强删。
+		// 活持有人（真竞争）与坏锁（不可证死）→ 仍走下方 fail-closed，不 kill 不覆盖。
+		const cur = readRuntimeLock(lockPath);
+		if (
+			cur && cur.instanceId === ac.existing.instanceId &&
+			!lockHolderAlive(cur) && stealStaleLock(lockPath, handoff)
+		) {
+			ac = { acquired: true, existing: null };
+		}
+	}
 	if (!ac.acquired) {
 		const cur = readHostInfo(hostPath);
 		if (cur) {
@@ -374,7 +393,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 				} catch {
 					/* ignore */
 				}
-				return fail(`新实例确权失败（${r?.error ?? "未知"}）：已要求回收子进程，fail-closed`, { uncertain: true, info: fresh, pid: fresh.pid, port: fresh.port });
+				return fail(`新实例确权失败（${r?.error ?? "dead：spawn 后新实例未存活"}）：已要求回收子进程，fail-closed`, { uncertain: true, info: fresh, pid: fresh.pid, port: fresh.port });
 			}
 			if (Date.now() - t0 > waitMs) {
 				try {
