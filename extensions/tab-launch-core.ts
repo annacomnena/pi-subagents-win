@@ -21,6 +21,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { traceSpawn } from "./spawn-trace.ts";
+
 /**
  * WT 启动器解析 + 别名失效回退（2026-09-23 空壳 tab 根因修复）。
  *
@@ -53,10 +55,11 @@ export function probeWtHelp(exePath: string, timeoutMs = 2500): boolean {
 	}
 }
 
-/** 包内直调路径：扫 WindowsApps 取最高版本（读目录即可，无需 powershell）。 */
+/** 包内直调路径：扫 WindowsApps 取最高版本（读目录即可，无需 powershell）。
+ * 测试注入：`PI_WT_APPS_DIR` 非空则改扫该目录（fail-closed 回归测试用）。 */
 export function resolveDirectTerminalExe(): string | null {
 	try {
-		const dir = "C:/Program Files/WindowsApps";
+		const dir = process.env.PI_WT_APPS_DIR || "C:/Program Files/WindowsApps";
 		const entries = readdirSync(dir);
 		let best: { ver: number[]; path: string } | null = null;
 		for (const e of entries) {

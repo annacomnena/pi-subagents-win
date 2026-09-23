@@ -344,6 +344,21 @@ _resetLauncherCache();
 const bad = healthyLauncher("C:/no/such/wt.exe");
 assert.ok(bad === null || typeof bad.exe === "string", "全坏时返回 null 或可用项，不抛");
 _resetLauncherCache();
+// fail-closed 回归（2026-09-23 缺 import 事故）：合法 pre-flight 参数 + 双启动器全坏
+// → 必须返回 error（不抛、不开窗）。走到 traceSpawn 行即验证 import 存活。
+_resetLauncherCache();
+process.env.PI_WT_APPS_DIR = "C:/no/such/apps";
+const doomed = spawnPiTab({
+  // 存在但不可执行的文件：过 pre-flight existsSync，但 --help 探针必失败
+  wtPath: new URL("../package.json", import.meta.url).pathname.replace(/^\//, ""),
+  piCli: process.execPath,
+  cwd: process.cwd(),
+  title: "doomed",
+  prompt: "hi",
+});
+delete process.env.PI_WT_APPS_DIR;
+_resetLauncherCache();
+assert.ok(doomed.error && doomed.error.length > 0, `双坏应 fail closed：${doomed.error}`);
 }
 
 console.log("launch tests passed");
