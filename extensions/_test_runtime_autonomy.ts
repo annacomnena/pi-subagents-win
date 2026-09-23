@@ -31,7 +31,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // 测试隔离：defaultRuntimeDir() 全部走 temp（_test_runtime_master_auto 同款模式）
@@ -791,21 +791,35 @@ check("A9.5 parseDurationMs（ms/s/m/h/d；垃圾 null）", () => {
 console.log("A10 零侵入");
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EXT_ROOT = join(REPO_ROOT, "extensions");
-check("A10.1 extensions/ 下除 autonomy/** 与本测试文件外，无文件引用 runtime/autonomy", () => {
+check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 allowlist（Task 2006）", () => {
+	// v2 接线后生产文件 import 合法化：零 import 不变量改为 allowlist 双向精确匹配
+	//（多一个 = 红线违规；少一个 = 接线被静默拆除）。相对路径与相对名 ALLOW 对齐（L2 审查要点 ①）。
+	const ALLOW = ["index.ts", "master-tools.ts"]; // 相对 EXT_ROOT（2026-09-23 v2 接线）
 	const offenders: string[] = [];
 	const walk = (dir: string): void => {
 		for (const e of readdirSync(dir, { withFileTypes: true })) {
 			const p = join(dir, e.name);
 			if (e.isDirectory()) {
-				if (p === join(EXT_ROOT, "runtime", "autonomy")) continue;
+				if (p === join(EXT_ROOT, "runtime", "autonomy")) continue; // autonomy/** 自身
 				walk(p);
-			} else if (e.isFile() && e.name.endsWith(".ts") && p !== join(EXT_ROOT, "_test_runtime_autonomy.ts")) {
-				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(p);
+			} else if (e.isFile() && e.name.endsWith(".ts")) {
+				// 本测试文件（v1 既有排除）+ v2 接线测试文件自身 import runtime/autonomy 字面量（不排除即假红，L2 审查要点 ②）
+				if (p === join(EXT_ROOT, "_test_runtime_autonomy.ts")) continue;
+				if (p === join(EXT_ROOT, "_test_autonomy_wiring.ts")) continue;
+				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p));
 			}
 		}
 	};
 	walk(EXT_ROOT);
-	assert.deepEqual(offenders, []);
+	assert.deepEqual(offenders.sort(), [...ALLOW].sort());
+});
+check("A10.1b wake.ts 接线存在性（字面量盲区堵漏）", () => {
+	// wake.ts 位于 runtime/ 内，import 写作 "./autonomy/gate.ts"，不含字面量 "runtime/autonomy"
+	// → 字面量 tripwire 天然看不见它；用正向断言钉死接线（被静默拆除时红）。
+	assert.ok(
+		readFileSync(join(EXT_ROOT, "runtime", "wake.ts"), "utf8").includes('"./autonomy/gate.ts"'),
+		"wake.ts 必须 import \"./autonomy/gate.ts\"（v2 接线）",
+	);
 });
 check("A10.2 config.json 无 autonomy 键 → readAutonomyConfig 全默认（零侵入：无注册无循环无读盘）", () => {
 	const p = join(cfgRoot, "nokey2.json");

@@ -25,6 +25,7 @@ import { readAutonomyConfig } from "./config.ts";
 import { buildFrontier, mapPhaseToProjectState, type FrontierDiff, type FrontierSnapshot } from "./frontier.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./kill-switch.ts";
 import { evaluateWatchdogChecks, type WatchdogReport } from "./watchdog.ts";
+import type { WakeGateState } from "./wake-gate.ts";
 
 /** 自有 namespace：`<stateDir>/autonomy`（stateDir 缺省 = `<runtimeDir>/state`，同 liveness 模式）。 */
 export function autonomyDir(stateDir?: string): string {
@@ -109,11 +110,11 @@ export interface AutonomyInputs {
  *   pending 合计（recipient 目录名映射同 mailboxDirFor）；runStateMismatch = details 里 pidAlive===false
  *   且非终态（visible zombie）；heartbeatAgeMs 来自 readLiveness（null = no-liveness → 检查 7 unknown）。
  */
-export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: string; now?: number }): AutonomyInputs {
+export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: string; now?: number; configPath?: string }): AutonomyInputs {
 	const stateDir = opts?.stateDir;
 	try {
 		const now = opts?.now ?? Date.now();
-		const cfg = readAutonomyConfig();
+		const cfg = readAutonomyConfig({ configPath: opts?.configPath }); // v2（Task 2006 工程约束 3）：optional configPath 透传；不传 = 原行为逐字节不变
 		const kill = readKillSwitch({ stateDir });
 		const gating = evaluateAutonomyGating(cfg, kill);
 		if (!gating.active) appendAuditLine(`gating no-wake reason=${gating.reason}`, { stateDir }); // 红线条款 2：每次 gate 短路产审计行
@@ -164,5 +165,72 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 			watchdog: { wakeRecommended: false, checks: {}, auditLine: "watchdog no-wake reason=collect-failed" },
 			gating: { active: false, reason: "collect-failed" },
 		};
+	}
+}
+
+// ── v2（Task 2006 L2）IO/审计 helpers（D-G/D-H；只写自有 namespace，全部 never-throw）──────────
+
+/** 容忍读：缺失/坏 JSON/字段漂移 → null（派生缓存，与 frontier 快照同一自愈口径）。 */
+export function readWakeGateState(opts?: { stateDir?: string }): WakeGateState | null {
+	try {
+		const raw = JSON.parse(readFileSync(join(autonomyDir(opts?.stateDir), "wake-gate.json"), "utf8")) as WakeGateState;
+		if (
+			typeof raw !== "object" ||
+			raw === null ||
+			(raw.lastDecisionAt !== null && typeof raw.lastDecisionAt !== "number") ||
+			(raw.lastWakeAt !== null && typeof raw.lastWakeAt !== "number") ||
+			(raw.batchFirstSeenAt !== null && typeof raw.batchFirstSeenAt !== "number") ||
+			(raw.lastReason !== undefined && raw.lastReason !== null && typeof raw.lastReason !== "string")
+		) {
+			return null;
+		}
+		return raw;
+	} catch {
+		return null;
+	}
+}
+
+/** 原子写（tmp+rename，never-throw）：`state/autonomy/wake-gate.json`。返回是否实际写盘（false = 失败，调用方无需处理——派生状态）。 */
+export function writeWakeGateState(state: WakeGateState, opts?: { stateDir?: string }): boolean {
+	try {
+		const dir = autonomyDir(opts?.stateDir);
+		mkdirSync(dir, { recursive: true });
+		const value: Record<string, unknown> = {
+			lastDecisionAt: state.lastDecisionAt,
+			lastWakeAt: state.lastWakeAt,
+			batchFirstSeenAt: state.batchFirstSeenAt,
+		};
+		if (state.lastReason !== undefined) value.lastReason = state.lastReason;
+		writeJsonAtomic(join(dir, "wake-gate.json"), value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * v2 结构化审计行（D-H）：`ts=<ISO> cat=<gating|wake|kill> concl=<...> reason=<...> acted=false`
+ * 与 v1 的 appendAuditLine（无 ts 前缀的行）共写同一 audit.jsonl，两格式共存（计划文档化）。
+ * acted 恒 false：v2 无任何自动动作（kill/clear 是用户手动运维命令，学术诚实定性）。
+ * reason 消毒（换行/制表符 → 空格，截断 200，空 → "-"）保护行式格式；never-throw。
+ */
+export function appendAuditEvent(cat: "gating" | "wake" | "kill", concl: string, reason: string, stateDir?: string): void {
+	try {
+		const safe = reason.replace(/[\r\n\t]+/g, " ").trim().slice(0, 200) || "-";
+		appendAuditLine(`ts=${new Date().toISOString()} cat=${cat} concl=${concl} reason=${safe} acted=false`, { stateDir });
+	} catch {
+		/* never-throw：审计不阻塞主流程 */
+	}
+}
+
+/** 容忍读 audit.jsonl 尾部 ≤limit 行（默认 5，/autonomy status 用）；缺失/不可读 → []。 */
+export function readAuditTail(opts?: { stateDir?: string; limit?: number }): string[] {
+	const limit = Math.max(1, opts?.limit ?? 5);
+	try {
+		const lines = readFileSync(join(autonomyDir(opts?.stateDir), "audit.jsonl"), "utf8").split("\n");
+		while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+		return lines.slice(-limit);
+	} catch {
+		return [];
 	}
 }

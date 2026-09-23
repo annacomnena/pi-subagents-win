@@ -28,7 +28,7 @@ source_paths:
 - [[Runtime Daemon 架构]] — 三层结构、写侧迁移顺序、G0/G1 闸口（`status: draft`）
 - [[统一审批门架构]] — 三端共用一门、TOCTOU、超时（`status: proposed`）
 - [[微信 iLink 通道]] — Client Plane 通道定位、七项待测未知项（`status: proposed`）
-- [[主动性套件（Autonomy Suite）]] — 主动权 v1 纯函数层（未接线）（`status: draft`）
+- [[主动性套件（Autonomy Suite）]] — v1 纯函数层 + v2 唤醒总门 / 状态行 / /autonomy 命令已接线（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
 
 ## Links Out

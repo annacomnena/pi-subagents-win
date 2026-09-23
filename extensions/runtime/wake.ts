@@ -30,6 +30,7 @@ import {
 	type Letter,
 } from "./mailbox.ts";
 import { defaultTabRunsDir, readTabDispatch } from "../tab-runs.ts";
+import { evaluateAutonomyWakeGate } from "./autonomy/gate.ts";
 import {
 	auditWorkstreamOp,
 	listWorkstreams,
@@ -69,6 +70,8 @@ export interface WakeOptions {
 	/** fake clock（毫秒，测试用；缺省 Date.now()） */
 	now?: number;
 	inFlightWindowMs?: number;
+	/** test-only：autonomy config.json 注入（同 now/inFlightWindowMs 先例；生产不传，gate 读包根缺省） */
+	autonomyConfigPath?: string;
 }
 
 export interface WakeState {
@@ -94,6 +97,10 @@ export function evaluateWakes(opts: WakeOptions): WakeDecision[] {
 
 	const stateDir = opts.stateDir ?? join(defaultRuntimeDir(), "state");
 	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
+	// v2 autonomy 总门（Task 2006 L2，D-A/D-E）：owner 门后、ws 遍历前；传已解析 stateDir。
+	// enabled!==true → 完全旁路（零行为零写盘）；enabled → kill/collect fail-closed 压制 legacy fire。
+	const autonomyGate = evaluateAutonomyWakeGate({ stateDir, configPath: opts.autonomyConfigPath, now });
+	if (autonomyGate.engaged && !autonomyGate.proceed) return [];
 	const decisions: WakeDecision[] = [];
 
 	for (const ws of listWorkstreams(stateDir)) {

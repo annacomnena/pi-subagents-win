@@ -26,6 +26,9 @@ import {
 	setMasterCutover,
 } from "./runtime/master-control.ts";
 import { readAttachment, type MasterAttachment } from "./runtime/registry.ts";
+import { readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
+import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
+import { readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { globalViewLogic } from "./runtime/global-view.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readScopeLiveness } from "./runtime/liveness.ts";
@@ -67,6 +70,41 @@ function localStatusLine(cwd: string): string {
 	return `local: ${addr} owner=${att.sessionId.slice(0, 12)} gen=${att.generation} liveness=${liveness}`;
 }
 
+/**
+ * autonomy 足迹谓词（Task 2006 D-B；零行为变化的关键）：仅当 cfg.enabled===true 或 kill 在场或
+ * frontier 快照/wake-gate state 存在时显示状态行；纯净默认态（从未启用、从未 engage、无快照）
+ * → 无此行 → /master-status 与 master-status tool 输出逐字节一致。四读全 never-throw
+ * （容忍读失败 → 视为无足迹；W3 断言）。
+ */
+function autonomyFootprintExists(): boolean {
+	try {
+		return (
+			readAutonomyConfig().enabled === true ||
+			readKillSwitch() !== null ||
+			readFrontierSnapshot() !== null ||
+			readWakeGateState() !== null
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** autonomy 状态行（D-B 四要素：enabled / kill / frontier 快照时间 / wake-gate 最近判定；容忍读，never-throw）。 */
+function autonomyStatusLine(): string {
+	try {
+		const cfg = readAutonomyConfig();
+		const kill = readKillSwitch();
+		const frontier = readFrontierSnapshot();
+		const gate = readWakeGateState();
+		return `autonomy: enabled=${cfg.enabled === true ? "on" : "off"}` +
+			` kill=${kill ? `on(${kill.reason.slice(0, 40)} @${kill.at.slice(0, 19)})` : "off"}` +
+			` frontier=${frontier ? `${new Date(frontier.asof).toISOString().slice(0, 19)} (${frontier.projects.length} projects)` : "(none)"}` +
+			` wake-gate=${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? new Date(gate.lastDecisionAt).toISOString().slice(0, 19) : "?"}` : "(never)"}`;
+	} catch {
+		return "autonomy: (unreadable)";
+	}
+}
+
 /** 与 /master-status 同文案；带 cfg 时多一行 auto-handoff 观测（S3，缺省不显示）；
  * 末尾追加 local 归属行（cwd 缺省 process.cwd()，global 各行顺序与文案不变）。 */
 export function masterStatusLogic(cfg?: MasterSuccessionConfig, opts: { cwd?: string } = {}): ToolOutcome {
@@ -78,6 +116,8 @@ export function masterStatusLogic(cfg?: MasterSuccessionConfig, opts: { cwd?: st
 		`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
 		...(cfg ? [autoHandoffLine(cfg)] : []),
 		localStatusLine(opts.cwd ?? process.cwd()),
+		// v2（Task 2006 D-B）：仅自治足迹出现后常驻一行（opt-in 可见性）；纯净默认态无此行（零行为）。
+		...(autonomyFootprintExists() ? [autonomyStatusLine()] : []),
 	];
 	return { text: `Master status:\n${lines.join("\n")}` };
 }

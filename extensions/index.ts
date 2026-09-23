@@ -44,6 +44,9 @@ import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { localAgentFromCwd, masterStatusLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
+import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
+import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
@@ -1957,6 +1960,68 @@ export default function (pi: ExtensionAPI) {
 			// 与 master-status 工具共用 masterStatusLogic（含 local 归属行，纯追加）。
 			const out = masterStatusLogic(undefined, { cwd: ctx.cwd });
 			ctx.ui.notify(`${out.text}\nrecent: ${recentScopesLine()}`, "info");
+		},
+	});
+	// ── /autonomy（Task 2006 L2，D-I）──
+	// 学术诚实定性：kill/clear 是用户在交互会话手动键入的运维命令（不新增 LLM 可调 tool，
+	// tool 快照与 dispatch 侧零变化）；启用 autonomy = 用户手动在 config.json 加
+	// "autonomy":{"enabled":true}（本命令不写 config——禁动约束）。全部状态读为容忍读 never-throw。
+	pi.registerCommand("autonomy", {
+		description: "autonomy 套件总门：/autonomy [status] | /autonomy kill [reason] | /autonomy clear（kill/clear 为手动运维命令；启用需手动在 config.json 加 autonomy.enabled=true）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const sub = parts[0] ?? "status";
+			const sid = durableSessionIdentity(ctx as never);
+			if (sub === "kill" || sub === "clear") {
+				// subagent 会话拦截 kill/clear（与 master 工具组 subBlocked 同款）
+				if (isSubagent()) {
+					ctx.ui.notify("autonomy: 子 agent 会话不可操作 kill-switch（手动运维命令）", "warning");
+					return;
+				}
+				if (sub === "kill") {
+					const reason = parts.slice(1).join(" ").trim() || "manual";
+					const by = `user:${sid?.slice(0, 12) ?? "cli"}`;
+					// 用非 Audited 变体：*Audited 已产 v1 格式审计行，叠加 appendAuditEvent 会同一动作双行（D-I）。
+					const ok = engageKillSwitch({ reason, by });
+					appendAuditEvent("kill", "engage", reason);
+					const note = readAutonomyConfig().enabled === true
+						? ""
+						: "\n提示：当前 enabled=off——kill 文件仅在 autonomy 启用后被唤醒路径消费；legacy 唤醒不受影响（D-E；停 legacy 唤醒用 /master-cutover off）";
+					ctx.ui.notify(`autonomy kill ok=${ok} reason=${reason} by=${by}${note}`, ok ? "info" : "warning");
+					return;
+				}
+				const ok = clearKillSwitch();
+				appendAuditEvent("kill", "clear", "-");
+				ctx.ui.notify(`autonomy clear ok=${ok}`, ok ? "info" : "warning");
+				return;
+			}
+			if (sub !== "status") {
+				ctx.ui.notify("用法：/autonomy [status] | /autonomy kill [reason] | /autonomy clear", "warning");
+				return;
+			}
+			// status：全容忍读，never-throw（D-I 列表项逐行渲染）
+			let body: string;
+			try {
+				const cfg = readAutonomyConfig();
+				const kill = readKillSwitch();
+				const gating = evaluateAutonomyGating(cfg, kill);
+				const frontier = readFrontierSnapshot();
+				const gate = readWakeGateState();
+				const tail = readAuditTail({ limit: 5 });
+				const iso = (t: number): string => new Date(t).toISOString().slice(0, 19);
+				body = [
+					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（启用 = 手动在 config.json 加 "autonomy":{"enabled":true}；本命令不写 config）`,
+					`kill-switch: ${kill ? `on (reason=${kill.reason} @${kill.at.slice(0, 19)} by=${kill.by})` : "off"}`,
+					`gating: ${gating.active ? "active" : `inactive (${gating.reason})`}`,
+					`frontier: ${frontier ? `asof=${iso(frontier.asof)} baseline=${frontier.baseline} projects=${frontier.projects.length} triggers(last)=${frontier.triggers.length}` : "(none)"}`,
+					`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
+					`audit (最近 ${tail.length} 行):`,
+					...(tail.length ? tail.map((l) => `  ${l}`) : ["  (空)"]),
+				].join("\n");
+			} catch {
+				body = "autonomy status: (状态不可读)";
+			}
+			ctx.ui.notify(body, "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。

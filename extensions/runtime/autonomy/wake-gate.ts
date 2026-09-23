@@ -31,6 +31,8 @@ export interface WakeGateState {
 	lastWakeAt: number | null;
 	/** 调用层在首个触发出现时刻写入 state（debounce 窗锚点；v1 由 L2 装配层维护）。 */
 	batchFirstSeenAt: number | null;
+	/** v2（Task 2006 D-G）：最近一次 wake-gate 判定 reason（展示用；optional——v1 测试构造的 state 不含此字段，不受影响）。 */
+	lastReason?: string | null;
 }
 
 export interface WakeGateDecision {
