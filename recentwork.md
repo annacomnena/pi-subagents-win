@@ -20,10 +20,23 @@
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
 | 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
 | 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 |
+| 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 16 - GUI 三毛病修复（设置层遮挡 / markdown 渲染 / 消息不及时）
+
+- **日期**：2026-09-23
+- **一句话**：逐项定位并修复：设置层被输入区压住（同层叠上下文 z 倒挂）、正文未渲染 markdown、消息延迟（WS 断线盲区 + 非 chat 页从未订阅 WS）；并**实验证实**主导延迟项属 pi core（assistant 仅 message_end 落盘）。
+- **涉及模块**：`gui/src/ui/Markdown.tsx`（新）、`gui/src/pages/{ChatPage,RuntimeOverlay}.tsx`、`gui/src/{store,useEventStream,index.css}`、`gui/src/api/client.ts`
+- **产物**：本地 `plans/0923_gui_ux_fix_{plan,impl,review}.md`
+- **Wiki**：[[GUI 消息管道与延迟贡献项]]（`status: current`）
+- **Priority**：P1
+- **Status**：complete（三项已修；C1 流式属 pi core，记为已知限制）
+- **Commit**：`6d4ba67`
+- **Verification**：`cd gui && npx tsc --noEmit` 0 错误 + `vite build` 成功（JS gzip 129.65 kB，持平）；27 例 XSS/兼容实测（临时脚本）；tab 内独立 L4 通过并修掉 resync 竞态。**待人工**：打开 GUI 目视确认遮挡消失 + markdown 渲染 + 更新及时性。
 
 ### Item 15 - global master 主动性套件 v1（纯函数层，未接线）
 
