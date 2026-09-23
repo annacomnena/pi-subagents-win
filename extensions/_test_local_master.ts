@@ -26,6 +26,14 @@
  *       master-succession.json / master-auto.json / master-transfers/ / 全局 master-attention.json
  *   U10 既有全量测试回归（shell 侧跑 npm run test:* 全绿）
  *
+ * L3（0923 local master 认领缺口）：
+ *   L1  仓 cwd + local:true → 写 agent://master_local_<scope>（genesis gen=1），global attachment 零变化
+ *   L2  旧 owner（心跳 1 小时前）：local+forceStale 无 confirm 拒；带 confirm 接管（gen+1、owner 换）
+ *   L3  同会话重复 local:true → 刷心跳、不 bump gen；local+token 交接可共存
+ *   L4  home 根目录会话 local:true → 仍设 local（不回退 global）；global 成功回执标（global …）
+ *   L5  master-status local 行：(none) / alive / stale / skip:no-liveness 四夹具 + global 行顺序不变
+ *   L6  回归：不带 local → 全局路径、home 守卫拒仓会话且零写
+ *
  * E2E（计划 §5 可打勾验收 5 项）：
  *   E1  仓 A 启动 pi-1（静默成 scope owner），再启 pi-2（同仓）：pi-2 不 attach、不唤醒，pi-1 无感
  *   E2  主会话给仓 A 的 scope 发 wake 信 → pi-1 唤醒本仓 tab（cwd 正确、信 acked、wake-state 落盘）
@@ -86,7 +94,8 @@ import {
 import { readWakeState } from "./runtime/wake.ts";
 import { gitToplevel, repoName, normalizeDriveColon } from "./launch.ts";
 import { registerScopeWakeLoop } from "./mailbox-consumer.ts";
-import { masterDispatchGate } from "./master-tools.ts";
+import { masterDispatchGate, masterAttachLogic, masterStatusLogic } from "./master-tools.ts";
+import { isProcessAlive, writeScopeLiveness } from "./runtime/liveness.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import type { CommandFrame, MessageFrame } from "./runtime/protocol.ts";
 import type { ObjectAddress } from "./runtime/address.ts";
@@ -820,6 +829,132 @@ let agentEndHandler: ((event: unknown, ctx?: { sessionManager?: { sessionId?: st
 	assert.equal(readAttachment(repoAddr)!.sessionId, "sess-dual");
 }
 
+// ══════════════════════════════════════════════════════════════════
+// L3 — local master 认领缺口（master-attach local:true）+ master-status local 归属行
+// ══════════════════════════════════════════════════════════════════
+const L3_HOME = mkPlainDir("l3home");
+const l3gate = (cwd: string): { cwd: string; initialCwd: string; env: { home: string; platform: NodeJS.Platform } } => ({
+	cwd,
+	initialCwd: cwd,
+	env: { home: L3_HOME, platform: process.platform },
+});
+const reEsc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+{
+	// L1：仓 cwd + local:true → genesis 落 local 地址，global attachment 零变化
+	const repo1 = mkGitRepo("repoL3claim");
+	const addr1 = localMasterAddress(localMasterScope(repo1.cwd));
+	const globalBefore = readBytes(attFileOf(masterAddress()));
+	const r1 = masterAttachLogic("sess-l3-1", { local: true }, l3gate(repo1.cwd));
+	assert.equal(r1.isError, undefined, `L1 应成功：${r1.text}`);
+	assert.match(r1.text, new RegExp(`master-attach 成功（local ${reEsc(addr1)}）：gen=1（genesis）`), "L1 回执标出 local + 地址");
+	const att1 = readAttachment(addr1)!;
+	assert.equal(att1.sessionId, "sess-l3-1");
+	assert.equal(att1.generation, 1);
+	assert.equal(readBytes(attFileOf(masterAddress())), globalBefore, "L1 global attachment 零变化");
+
+	// L2：旧 owner（lastHeartbeatAt = 1 小时前）→ forceStale 无 confirm 拒、带 confirm 接管
+	const repo2 = mkGitRepo("repoL3stale");
+	const addr2 = localMasterAddress(localMasterScope(repo2.cwd));
+	assert.equal(attachMaster({ sessionId: "sess-l3-old", agent: addr2, now: new Date(Date.now() - 3600_000) }).ok, true, "夹具：旧 owner 心跳 1 小时前");
+	const rej = masterAttachLogic("sess-l3-2", { local: true, forceStale: true }, l3gate(repo2.cwd));
+	assert.equal(rej.isError, true, "forceStale 无 confirm 必拒");
+	assert.match(rej.text, /confirm/);
+	assert.equal(readAttachment(addr2)!.sessionId, "sess-l3-old", "拒绝后 attachment 不变");
+	const take = masterAttachLogic("sess-l3-2", { local: true, forceStale: true, confirm: true }, l3gate(repo2.cwd));
+	assert.equal(take.isError, undefined, `L2 应接管：${take.text}`);
+	const att2 = readAttachment(addr2)!;
+	assert.equal(att2.sessionId, "sess-l3-2", "owner 换成当前会话");
+	assert.equal(att2.generation, 2, "gen+1");
+
+	// L3a：同会话重复 local:true（无 token/forceStale）→ 刷心跳、不 bump gen
+	await sleep(10);
+	const r3 = masterAttachLogic("sess-l3-2", { local: true }, l3gate(repo2.cwd));
+	assert.equal(r3.isError, undefined, r3.text);
+	const att3 = readAttachment(addr2)!;
+	assert.equal(att3.generation, 2, "同会话刷新不 bump gen");
+	assert.ok(Date.parse(att3.lastHeartbeatAt) > Date.parse(att2.lastHeartbeatAt), "心跳已刷新");
+
+	// L3b：local + token 共存（local 交接）
+	const det = detachMaster({ sessionId: "sess-l3-2", generation: 2, agent: addr2 });
+	assert.equal(det.ok, true);
+	const rTok = masterAttachLogic("sess-l3-3", { local: true, token: det.token! }, l3gate(repo2.cwd));
+	assert.equal(rTok.isError, undefined, `L3b token+local 应成功：${rTok.text}`);
+	const attTok = readAttachment(addr2)!;
+	assert.equal(attTok.sessionId, "sess-l3-3");
+	assert.equal(attTok.generation, 3);
+
+	// L4：home 根目录会话 local:true → 仍设 local（不回退 global）
+	const globalBefore4 = readBytes(attFileOf(masterAddress()));
+	const addrHome = localMasterAddress(localMasterScope(L3_HOME));
+	const r4 = masterAttachLogic("sess-l3-4", { local: true }, l3gate(L3_HOME));
+	assert.equal(r4.isError, undefined, `L4 应成功：${r4.text}`);
+	assert.match(r4.text, new RegExp(`（local ${reEsc(addrHome)}）`), "home 会话持 local");
+	assert.equal(readAttachment(addrHome)!.sessionId, "sess-l3-4");
+	assert.equal(readAttachment(addrHome)!.generation, 1);
+	assert.equal(readBytes(attFileOf(masterAddress())), globalBefore4, "home 会话 local:true 不碰 global");
+
+	// L6：不带 local → 既有行为完全不变（home 守卫拒仓会话、零写）
+	const repo6 = mkGitRepo("repoL3regress");
+	const addr6 = localMasterAddress(localMasterScope(repo6.cwd));
+	const globalBefore6 = readBytes(attFileOf(masterAddress()));
+	const r6 = masterAttachLogic("sess-l3-6", {}, l3gate(repo6.cwd));
+	assert.equal(r6.isError, true, "不带 local 的仓库会话仍被 home 守卫拒");
+	assert.match(r6.text, /只能在用户 home/);
+	assert.ok(!existsSync(attFileOf(addr6)), "不带 local 不碰 local 地址");
+	assert.equal(readBytes(attFileOf(masterAddress())), globalBefore6, "拒绝零写（global 不变）");
+
+	// L7：global 成功回执标（global agent://master_default）（home 会话 + token 交接）
+	const attG = readAttachment(masterAddress())!;
+	const detG = detachMaster({ sessionId: attG.sessionId, generation: attG.generation, agent: masterAddress() });
+	assert.equal(detG.ok, true);
+	const rG = masterAttachLogic("sess-l3-7", { token: detG.token! }, l3gate(L3_HOME));
+	assert.equal(rG.isError, undefined, `L7 应成功：${rG.text}`);
+	assert.match(rG.text, new RegExp(`master-attach 成功（global ${reEsc(masterAddress())}）：`), "global 回执标出 global + 地址");
+	assert.equal(readAttachment(masterAddress())!.sessionId, "sess-l3-7", "global 路径语义不变（token 交接）");
+}
+
+// ── L5：master-status local 行（(none) / alive / stale / skip:no-liveness）──
+{
+	const repo5 = mkGitRepo("repoL3status");
+	const scope5 = localMasterScope(repo5.cwd);
+	const addr5 = localMasterAddress(scope5);
+	const localPrefix = `local: ${addr5}`;
+
+	// 夹具 1：无 owner → (none)；且既有 global 四行顺序与文案不变、local 为追加行
+	const stNone = masterStatusLogic(undefined, { cwd: repo5.cwd });
+	assert.match(stNone.text, new RegExp(`${reEsc(localPrefix)} \\(none\\)`), "无 owner 显示 (none)");
+	let idx = -1;
+	for (const key of ["attachment:", "cutover:", "resolver:", "mailbox:"]) {
+		const i = stNone.text.indexOf(key);
+		assert.ok(i > idx, `既有 global 行顺序不变：${key}`);
+		idx = i;
+	}
+	assert.ok(stNone.text.indexOf(localPrefix) > idx, "local 行纯追加在 global 行之后");
+
+	// 夹具 2：owner + liveness pid 存活 → alive
+	assert.equal(attachMaster({ sessionId: "sess-l3-st", agent: addr5 }).ok, true);
+	assert.equal(writeScopeLiveness({ scopeKey: scope5, sessionId: "sess-l3-st", generation: 1, pid: process.pid }), true);
+	const stAlive = masterStatusLogic(undefined, { cwd: repo5.cwd });
+	assert.match(stAlive.text, new RegExp(`${reEsc(localPrefix)} owner=sess-l3-st gen=1 liveness=alive`), stAlive.text);
+
+	// 夹具 3：liveness pid 已死 → stale（先删旧文件绕开 30s 同身份节流）
+	const liveFile = join(RUNTIME, "state", "scope-liveness", `${scope5}.json`);
+	rmSync(liveFile, { force: true });
+	const deadPid: number = await new Promise((resolve) => {
+		const p = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+		p.on("exit", () => resolve(p.pid!));
+	});
+	assert.equal(isProcessAlive(deadPid), false, "夹具：pid 已退出");
+	assert.equal(writeScopeLiveness({ scopeKey: scope5, sessionId: "sess-l3-st", generation: 1, pid: deadPid }), true);
+	const stStale = masterStatusLogic(undefined, { cwd: repo5.cwd });
+	assert.match(stStale.text, new RegExp(`${reEsc(localPrefix)} owner=sess-l3-st gen=1 liveness=stale`), stStale.text);
+
+	// 夹具 4：liveness 文件缺失 → skip:no-liveness（如实，不猜）
+	rmSync(liveFile, { force: true });
+	const stSkip = masterStatusLogic(undefined, { cwd: repo5.cwd });
+	assert.match(stSkip.text, new RegExp(`${reEsc(localPrefix)} owner=sess-l3-st gen=1 liveness=skip:no-liveness`), stSkip.text);
+}
+
 rmSync(tmpRoot, { recursive: true, force: true });
 rmSync(RUNTIME, { recursive: true, force: true });
-console.log("_test_local_master: all assertions passed (U1-U9 + E1-E5)");
+console.log("_test_local_master: all assertions passed (U1-U9 + E1-E5 + L1-L7)");

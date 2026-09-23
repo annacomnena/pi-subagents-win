@@ -27,7 +27,9 @@ import {
 } from "./runtime/master-control.ts";
 import { readAttachment, type MasterAttachment } from "./runtime/registry.ts";
 import { globalViewLogic } from "./runtime/global-view.ts";
-import { masterAddress } from "./runtime/address.ts";
+import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
+import { readScopeLiveness } from "./runtime/liveness.ts";
+import { judgeScopeOwnerStale, localMasterAddress, localMasterScope } from "./runtime/scope.ts";
 import {
 	confirmTransferAttach,
 	transferMaster,
@@ -48,8 +50,26 @@ export interface ToolOutcome {
 	details?: Record<string, unknown>;
 }
 
-/** 与 /master-status 同文案；带 cfg 时多一行 auto-handoff 观测（S3，缺省不显示）。 */
-export function masterStatusLogic(cfg?: MasterSuccessionConfig): ToolOutcome {
+/** 从可信会话 cwd 派生 local master 地址（工具与 /master-attach --local 共用；
+ * 不接受用户传入 scope/路径/地址——防设置到别的仓库）。 */
+export function localAgentFromCwd(cwd: string): ObjectAddress {
+	return localMasterAddress(localMasterScope(cwd));
+}
+
+/** local 归属行（纯追加；liveness 判不了如实 skip:reason，不猜）。 */
+function localStatusLine(cwd: string): string {
+	const scope = localMasterScope(cwd);
+	const addr = localMasterAddress(scope);
+	const att = readAttachment(addr);
+	if (!att) return `local: ${addr} (none)`;
+	const verdict = judgeScopeOwnerStale(att, readScopeLiveness(scope));
+	const liveness = verdict.verdict === "skip" ? `skip:${verdict.reason}` : verdict.verdict;
+	return `local: ${addr} owner=${att.sessionId.slice(0, 12)} gen=${att.generation} liveness=${liveness}`;
+}
+
+/** 与 /master-status 同文案；带 cfg 时多一行 auto-handoff 观测（S3，缺省不显示）；
+ * 末尾追加 local 归属行（cwd 缺省 process.cwd()，global 各行顺序与文案不变）。 */
+export function masterStatusLogic(cfg?: MasterSuccessionConfig, opts: { cwd?: string } = {}): ToolOutcome {
 	const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
 	const lines = [
 		`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
@@ -57,6 +77,7 @@ export function masterStatusLogic(cfg?: MasterSuccessionConfig): ToolOutcome {
 		`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
 		`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
 		...(cfg ? [autoHandoffLine(cfg)] : []),
+		localStatusLine(opts.cwd ?? process.cwd()),
 	];
 	return { text: `Master status:\n${lines.join("\n")}` };
 }
@@ -68,17 +89,20 @@ function autoHandoffLine(cfg: MasterSuccessionConfig): string {
 
 export function masterAttachLogic(
 	sessionId: string,
-	input: { token?: string; forceStale?: boolean; confirm?: boolean } = {},
+	input: { token?: string; forceStale?: boolean; confirm?: boolean; local?: boolean } = {},
 	gate: { cwd: string; initialCwd: string | null; env?: { home: string; platform: NodeJS.Platform } },
 ): ToolOutcome {
 	if (input.forceStale && !input.confirm) {
 		return { text: "master-attach: --force-stale 须与 confirm 同用（二次人工确认），拒绝", isError: true };
 	}
 	const home = gate.env?.home ?? homedir();
+	// local 认领：地址只从可信 gate.cwd 派生（不接受用户 scope/路径/地址，防设置到别的仓库）。
+	const localAgent = input.local ? localAgentFromCwd(gate.cwd) : undefined;
 	const r = attachCurrentSession({
 		sessionId,
 		token: input.token,
 		forceStale: input.forceStale || undefined,
+		...(localAgent ? { agent: localAgent } : {}),
 		cwd: gate.cwd,
 		initialCwd: gate.initialCwd,
 		...(gate.env ? { env: gate.env } : {}),
@@ -93,9 +117,10 @@ export function masterAttachLogic(
 		}
 		return { text: `master-attach 失败：${r.reason}`, isError: true };
 	}
+	const agent = localAgent ?? masterAddress();
 	return {
-		text: `master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sessionId.slice(0, 12)}`,
-		details: { generation: r.attachment.generation, genesis: r.genesis },
+		text: `master-attach 成功（${localAgent ? "local" : "global"} ${agent}）：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sessionId.slice(0, 12)}`,
+		details: { generation: r.attachment.generation, genesis: r.genesis, agent, local: Boolean(localAgent) },
 	};
 }
 
@@ -286,7 +311,7 @@ export function registerMasterTools(
 	pi.registerTool({
 		name: "master-status",
 		label: "Master Status",
-		description: `查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压。只读，随时可调。${USER_DIRECTIVE}`,
+		description: `查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压 + 本仓 local 归属行。只读，随时可调。${USER_DIRECTIVE}`,
 		parameters: Type.Object({}),
 		renderCall(_args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("master-status"))}`, 0, 0);
@@ -295,8 +320,11 @@ export function registerMasterTools(
 			const text = (result.details as { text?: string } | undefined)?.text ?? "";
 			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
 		},
-		async execute(_toolCallId, _rawParams) {
-			const outcome = masterStatusLogic(opts.masterSuccession?.());
+		async execute(_toolCallId, _rawParams, _signal, _onUpdate, ctx) {
+			// 与 master-attach 同源：cwd 取可信调用上下文，不取 tool 参数。
+			const ctxCwd = (ctx as unknown as { cwd?: unknown }).cwd;
+			const cwd = typeof ctxCwd === "string" && ctxCwd ? ctxCwd : process.cwd();
+			const outcome = masterStatusLogic(opts.masterSuccession?.(), { cwd });
 			return textResult({ ...outcome, details: { text: outcome.text } });
 		},
 	});
@@ -325,11 +353,12 @@ export function registerMasterTools(
 	pi.registerTool({
 		name: "master-attach",
 		label: "Master Attach",
-		description: `显式接管逻辑 Master（genesis / token 交接 / forceStale 强接需 confirm 双确认）。全局 Master 只能在用户 home 根目录会话执行，仓库会话请持对应 local Master。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		description: `显式接管逻辑 Master（genesis / token 交接 / forceStale 强接需 confirm 双确认）。仓库会话持本仓 local（加 local:true），home 会话持 global；global 只能在用户 home 根目录会话执行，仓库会话设 global 必被 home 守卫拒。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
 		parameters: Type.Object({
-			token: Type.Optional(Type.String({ description: "handoff token（接班时用）" })),
+			token: Type.Optional(Type.String({ description: "handoff token（接班时用；可与 local 同用 = local 交接）" })),
 			forceStale: Type.Optional(Type.Boolean({ description: "owner 失联时强接（必须与 confirm 同用）" })),
 			confirm: Type.Optional(Type.Boolean({ description: "与 forceStale 同用的二次确认" })),
+			local: Type.Optional(Type.Boolean({ description: "true = 认领本仓库 local Master（agent://master_local_<scope>，地址由可信会话 cwd 派生，不接受自定义 scope/路径/地址）。仓库会话持 local、home 会话持 global" })),
 		}),
 		renderCall(_args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("master-attach"))}`, 0, 0);
@@ -342,7 +371,7 @@ export function registerMasterTools(
 			if (subBlocked()) return textResult({ text: "子 agent 不可接管 Master", isError: true });
 			const sid = toolSession(ctx);
 			if (!sid || sid === "unknown") return textResult({ text: "master-attach: 无法确定当前会话身份，拒绝", isError: true });
-			const params = rawParams as { token?: string; forceStale?: boolean; confirm?: boolean };
+			const params = rawParams as { token?: string; forceStale?: boolean; confirm?: boolean; local?: boolean };
 			// 会话实际 cwd 来自调用上下文，不取 tool 参数；启动快照按同 UUID 读取（缺失 fail closed）。
 			const ctxCwd = (ctx as unknown as { cwd?: unknown }).cwd;
 			const cwd = typeof ctxCwd === "string" && ctxCwd ? ctxCwd : process.cwd();

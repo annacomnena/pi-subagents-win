@@ -43,7 +43,7 @@ import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { localAgentFromCwd, masterStatusLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
@@ -64,7 +64,6 @@ import type { WakeDecision } from "./runtime/wake.ts";
 import type { ScopeWakeDecision } from "./runtime/scope.ts";
 import {
 	attachCurrentSession,
-	getMasterStatus,
 	issueMasterHandoffToken,
 	prepareMasterHandoff,
 	setMasterCutover,
@@ -1955,15 +1954,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
 		handler: async (_args, ctx) => {
-			const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
-			const lines = [
-				`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
-				`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
-				`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
-				`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
-				`recent: ${recentScopesLine()}`,
-			];
-			ctx.ui.notify(`Master status:\n${lines.join("\n")}`, "info");
+			// 与 master-status 工具共用 masterStatusLogic（含 local 归属行，纯追加）。
+			const out = masterStatusLogic(undefined, { cwd: ctx.cwd });
+			ctx.ui.notify(`${out.text}\nrecent: ${recentScopesLine()}`, "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。
@@ -1990,7 +1983,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			// home 守卫（0923）：会话实际 cwd 取自可信 Pi ctx；启动快照按同 UUID 读取（缺失 fail closed）。
-			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined, cwd: ctx.cwd, initialCwd: readSessionStartCwd(sid) });
+			const localAgent = parts.includes("--local") ? localAgentFromCwd(ctx.cwd) : undefined; // --local：local 地址只从可信 ctx.cwd 派生（不接受自定义 scope/路径）
+			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined, ...(localAgent ? { agent: localAgent } : {}), cwd: ctx.cwd, initialCwd: readSessionStartCwd(sid) });
 			if (!r.ok) {
 				if (r.reason === "not-home-dir") {
 					ctx.ui.notify(formatNotHomeDirMessage(homedir(), { hasToken: Boolean(token) }), "warning");
@@ -2001,7 +1995,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
 			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
-			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
+			ctx.ui.notify(`master-attach 成功${localAgent ? `（local ${localAgent}）` : ""}：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
 		},
 	});
 	pi.registerCommand("master-cutover", {
