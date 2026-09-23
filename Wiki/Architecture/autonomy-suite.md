@@ -37,7 +37,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **collect**（`collect.ts`，薄 IO 层，**唯一批量 IO 文件**）：`collectAutonomyInputs` 只读聚合 + **只写自有 namespace**（frontier 快照、审计行），顶层 never-throw。
 - **红线**（规格条款 7/C1）：不写共享账本、不改其它仓库、不消费/ack 他人 mailbox；只写自有 namespace `<stateDir>/autonomy/`。
 
-### v2 接线（未提交，工作树 9 文件）
+### v2 接线（已提交 `1972aac`）
 
 - **装配层**（`gate.ts`，新）：`evaluateAutonomyWakeGate`（never-throw）——
   - **D-E 默认 no-op**：`cfg.enabled !== true` → 完全旁路（不读 kill、不评估 wake-gate、不审计、零写盘），唯一额外成本 = 每 tick 一次 `config.json` 读；**kill 文件仅在 `enabled===true` 时被唤醒路径消费**（kill 是套件内灭火开关，不是唤醒循环总开关；紧急停 legacy 唤醒 = `/master-cutover off`）。

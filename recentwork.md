@@ -27,10 +27,23 @@
 | 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
 | 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
 | 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ C1 Broker 开工 | none | C1（新包 `pi-packages/computer-use`）→ C2 pi 工具 → C3 skill |
+| 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 23 - 主动性套件 v2 接线（可观察/可开关/可审计，不自动动手）
+
+- **日期**：2026-09-23
+- **一句话**：把 v1 纯函数层接进生产路径（唤醒总门 + master-status 增量行 + `/autonomy kill|clear` + 结构化审计），并保证 **enabled 缺省时零行为变化、无任何自动动作**（审计行 `acted=false` 恒真）。
+- **涉及模块**：`extensions/runtime/autonomy/{gate.ts（新）,collect.ts,wake-gate.ts}`、`extensions/runtime/wake.ts`、`extensions/master-tools.ts`、`extensions/index.ts`、测试三个
+- **产物**：本地 `plans/0923_autonomy_suite_v2_{plan,impl,review}.md`、`plans/0923_autonomy_v2_L1B_research.md`
+- **Wiki**：[[主动性套件（Autonomy Suite）]]（`draft` → `current`，含 v1 休眠库 / v2 接线两节）
+- **Priority**：P2
+- **Status**：complete（L4 PASS，must-fix 0）
+- **Commit**：`1972aac`
+- **Verification**：`_test_autonomy_wiring.ts` 14 项 + `_test_runtime_autonomy.ts` 56 项 + `_test_register_graph.ts` 全绿 + smoke OK；tab 内独立 L4 PASS。未决：R4（enabled=true 预期语义，ws-mail 不触发）、R5（审计文件无轮转）、watchdog #3/#8 数据源缺口。
 
 ### Item 22 - ComputerUse（CUA）立项：C0 可行性探针通过 → C1 开工
 
