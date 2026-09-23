@@ -43,6 +43,7 @@ source_paths:
 - [[Wiki 索引]]
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
+- [[Local Master 认领与接管]]
 
 ## Open Questions
 

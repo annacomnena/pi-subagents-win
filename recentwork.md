@@ -16,11 +16,24 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
-| 12 | P2 | global-view phase 2 探测深度增强（设计已定，实现中） | none | 按 `plans/0923_global_view_depth_plan.md` 实现并提交 |
+| 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
+| 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 13 - Local Master 可得性修复（工具/命令可设 local + status 可见）
+
+- **日期**：2026-09-23
+- **一句话**：补上"仓库会话无法认领自己的 local master、僵尸 owner 无法显式回收"的能力缺口（底层早已支持，只是入参表面没暴露）。
+- **涉及模块**：`extensions/master-tools.ts`、`extensions/index.ts`、`extensions/_test_local_master.ts`
+- **产物**：本地 `plans/0923_local_master_attach_impl.md`、`plans/0923_local_master_attach_review.md`（独立 L4 PASS）
+- **Wiki**：[[Local Master 认领与接管]]（`status: current`）
+- **Priority**：P1
+- **Status**：complete
+- **Commit**：`5b56ecf`
+- **Verification**：`npx tsx extensions/_test_local_master.ts`（U1-U9/E1-E5/L1-L7）+ `npm run smoke:extension-load`；L4 核对真实 registry/scope-liveness/attachments-backup 零污染。已知缺口（自动回收在 no-liveness 时恒 skip；回执不含被顶掉的 owner）写入 Wiki 页"已知缺口"节待裁定。
 
 ### Item 12 - global-view phase 2 探测深度增强
 

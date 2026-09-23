@@ -21,6 +21,7 @@ source_paths:
 - [[Host 暴露面加固]] — loopback 默认 + opt-in 暴露 + 不热切换（`status: proposed`，未实现）
 - [[Runtime Daemon 存活机制]] — 切片一已验证的存活/身份机制（`status: current`）
 - [[GUI 解锁 Master]] — 本机受信 GUI 注入 master 的边界（`status: draft`）
+- [[Local Master 认领与接管]] — local/global 认领合同、僵尸接管、已知缺口（`status: current`）
 
 ### 架构（Architecture）
 
@@ -34,6 +35,7 @@ source_paths:
 - [[Host 暴露面加固]]
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
+- [[Local Master 认领与接管]]
 - [[Runtime Daemon 架构]]
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
@@ -44,6 +46,7 @@ source_paths:
 - [[Host 暴露面加固]]
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
+- [[Local Master 认领与接管]]
 - [[Runtime Daemon 架构]]
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
