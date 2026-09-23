@@ -163,6 +163,19 @@ const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*)$/;
 const HR_RE = /^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/;
 const QUOTE_RE = /^\s{0,3}>\s?(.*)$/;
 const LIST_ITEM_RE = /^(\s*)([-*+]|\d{1,9}\.)\s+(.*)$/;
+
+/**
+ * 闭合围栏判定（CommonMark 口径）：同种字符（` 或 ~ 不混用）、run 长度≥开启长度、
+ * 至多 3 空格缩进、行内除前后空白外无他物（闭合行不带 info string）。
+ * 旧逻辑 `trimStart().startsWith(marker)` 偏宽：会把带尾随内容（如 ```js 尾巴）的行
+ * 误判为闭合，且无视 ≥4 空格缩进。注意 run 更长（如 ```` 闭合 ```）按口径是合法闭合。
+ */
+function isClosingFence(line: string, openChar: string, openLen: number): boolean {
+	const m = /^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+	if (m === null || m[1] === undefined) return false;
+	const run: string = m[1];
+	return run[0] === openChar && run.length >= openLen;
+}
 const TABLE_SEP_RE = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
 
 function splitTableRow(line: string): string[] {
@@ -335,9 +348,11 @@ export function renderBlocks(src: string): ReactNode[] {
 			flushPara();
 			const marker = fence[1];
 			const lang = fence[2];
+			const openChar = marker[0] as string;
+			const openLen = marker.length;
 			const buf: string[] = [];
 			i += 1;
-			while (i < lines.length && !lines[i].trimStart().startsWith(marker)) {
+			while (i < lines.length && !isClosingFence(lines[i] as string, openChar, openLen)) {
 				buf.push(lines[i]);
 				i += 1;
 			}
