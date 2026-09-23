@@ -23,7 +23,7 @@ source_paths:
 | 贡献项 | 量级 | 归属 | 现状 |
 |---|---|---|---|
 | assistant 仅 `message_end` 落盘 ⇒ 投影延迟 = 单条生成时长（秒~分钟级） | **主导项** | **pi core**（`dist/core/agent-session.js`） | 已知限制；本仓无 `row.delta` 生产者（`extensions/runtime/transcript.ts` 只应用既有 op）。修复需 pi 侧提供流式事件或 delta op |
-| 用户消息入会话走 outbox-bridge 10s tick（`extensions/outbox-bridge.ts:278`；mailbox-consumer 同 10s） | 均值 +5s / 最大 +10s | 本仓 | **未改**（后续项）；GUI 侧用户自己的话已有乐观回执（`store.ts` 本地 entry 即时渲染） |
+| 用户消息入会话原走 outbox-bridge 10s tick | 均值 +5s / 最大 +10s → **已修至 ~9ms（同进程）/ ≤200ms（跨进程）** | 本仓 | **已修**：`notifyOutboxArrived` 同进程钩子 + `fs.watch` debounce 200ms 双唤醒，10s tick 降级为兜底（claim 幂等保证不重复）；mailbox-consumer 的 10s tick 属 master 域 mailbox 消费，与本路径独立、**未动** |
 | WS 断线盲区：退避 1→10s 期间 transcript 零刷新 | 0~10s+ → **已修至 ≤3s** | 本仓 | 已修：`useEventStream` 的 `onOpen`（每次连接建立含重连先触发）即时用 `after=<head.seq>` 增量补差 + 断线 3s 兜底轮询 |
 | 非 chat 页从未订阅 WS：仅靠轮询（2s/6s 档） | 2s/6s → **已修至 ≤300ms**（WS 连接期） | 本仓 | 已修：订阅 `journal`/`interactions` 主题（服务端 `ws.ts` 早已支持）+ store 帧路由 |
 | 轮询档位本身（events/attention/interactions 2s；snapshot/timeline/sessions 6s） | 均值 +1s/+3s | 本仓 | 保留作为 WS 断开时的兜底（双通道按 id 去重，不重复） |
@@ -45,7 +45,7 @@ source_paths:
 - `gui/src/useEventStream.ts`（`onOpen` 回调）、`gui/src/store.ts`（`chatJournalHead` 指针、`resyncChatSession`、journal/interactions 帧路由、seq 防御）、`gui/src/api/client.ts`（`after=` 增量）。
 - `extensions/runtime-host/ws.ts` 的 `journal`/`interactions` 主题支持。
 - 独立 L4 复核：本地 `plans/0923_gui_ux_fix_review.md`；计划 `plans/0923_gui_ux_fix_plan.md`；实现 `plans/0923_gui_ux_fix_impl.md`（含 27 例 XSS/兼容实测）。
-- 提交：`6d4ba67`（管道修复）、`911c397`（markdown 测试入库 + 围栏收紧）。
+- 提交：`6d4ba67`（管道修复）、`911c397`（markdown 测试入库 + 围栏收紧）、`e7475e3`（outbox 事件唤醒）。
 
 ## Links Out
 
@@ -58,5 +58,5 @@ source_paths:
 ## Open Questions
 
 - 是否推动 pi 侧提供流式 delta（`row.delta` op 生产者）以实现打字机效果；若推动，投影侧需定义 delta 合并与终态对齐规则。
-- outbox-bridge 10s tick 是否缩短或事件化（影响用户消息入会话延迟）。
+- ~~outbox-bridge 10s tick 是否缩短或事件化~~ **已做（`e7475e3`）**；剩余：mailbox-consumer 的 10s tick（master 域 mailbox 消费）是否同样事件化——需先解决 `readCutover`/`readAttachment` 前置门的复用风险。
 - ~~自研 markdown 渲染器尚无入库回归测试；围栏闭合识别偏宽~~ **已关闭（`911c397`）**：新增 `gui/tests/markdown.test.mjs`（node 直跑、零新增依赖、33 项断言含 XSS/元素清单/流式容错/围栏正反例/golden），并把围栏闭合收紧到 CommonMark 口径（`isClosingFence`：同种字符 + run 长度≥开启长度 + ≤3 空格缩进 + 独占一行）。

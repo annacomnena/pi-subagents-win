@@ -22,10 +22,23 @@
 | 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 |
 | 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 |
 | 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） |
+| 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 18 - outbox 事件唤醒（消息入会话延迟 5s → 9ms/≤200ms）
+
+- **日期**：2026-09-23
+- **一句话**：outbox 投递从"10s tick 轮询"改为"同进程钩子 + `fs.watch` debounce 双唤醒"，tick 降级为兜底；用户消息入会话延迟从均值 5s 降到同进程 ~9ms / 跨进程 ≤200ms。
+- **涉及模块**：`extensions/outbox-bridge.ts`（+90）、`extensions/_test_outbox_latency.ts`（新探针）
+- **产物**：本地 `plans/0923_outbox_latency_{impl,review}.md`
+- **Wiki**：[[GUI 消息管道与延迟贡献项]]（该行状态已更新，Open Question 划掉）
+- **Priority**：P1
+- **Status**：complete
+- **Commit**：`e7475e3`
+- **Verification**：探针 `npx tsx extensions/_test_outbox_latency.ts`（前后 67ms→9ms、不重复断言 `injectedCount===1`）；`_test_message_outbox.ts` 通过（含 crash-window 重投幂等）；smoke OK；独立 L4 复核通过。未动 `mailbox-consumer.ts`（master 域 mailbox 消费，独立路径）。
 
 ### Item 17 - markdown 渲染器回归测试入库 + 围栏闭合收紧
 
