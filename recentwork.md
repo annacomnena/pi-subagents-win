@@ -26,10 +26,23 @@
 | 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
 | 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
 | 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
+| 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ C1 Broker 开工 | none | C1（新包 `pi-packages/computer-use`）→ C2 pi 工具 → C3 skill |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 22 - ComputerUse（CUA）立项：C0 可行性探针通过 → C1 开工
+
+- **日期**：2026-09-23
+- **一句话**：把 iCloud 的 CUA 设计文集（8 篇）落成工程：先做 C0 可行性探针（Windows UIA 能否不抢焦点地观察+动作），得出**关键证伪**后立项新包 `pi-packages/computer-use`，C1（pwsh 常驻 Broker 守护进程）已开工。
+- **涉及模块**：新包 `C:/Users/Annacomnena/pi-packages/computer-use`（独立仓库；`bin/cua-broker.ps1`、`roadmap.md`、`reports/`）
+- **产物**：本地 `plans/20260923_cua_c0_probe.md`（C0 结论 + 实测输出）、`plans/.cua-probe/`（探针脚本，已拷为新包 `probe-seed/`）
+- **Wiki**：无（新包自带 README/roadmap；本仓 Wiki 不承载其设计）
+- **Priority**：P1（新方向）
+- **Status**：C0 complete；C1 active（tab 3001）
+- **Commit**：—（新包未提交；本仓仅此记录）
+- **Verification（C0 实测结论）**：传输选型 = **PowerShell + System.Windows.Automation 常驻进程**（冷启动太贵⇒必须常驻；Python/node-ffi-napi 出局）；**`ValuePattern.SetValue` 被证伪会抢前台焦点**（干净基线、两窗口复现；`WM_SETTEXT` 已证不抢、`Invoke` 未决）；树 22–26 节点/62–122ms、扁平化 ≈600–750 tokens/窗；字段级 diff 可行但**主键须改用 RuntimeId**；截屏证实。⇒ 动作能力必须分三档 + 内建 FG 断言器。
 
 ### Item 21 - dead 僵尸 host.json / 孤儿锁重建（修「重启后 GUI 永远起不来」）
 
