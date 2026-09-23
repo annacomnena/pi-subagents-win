@@ -37,6 +37,7 @@
  */
 
 import { join } from "node:path";
+import { mkdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./runtime/journal.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import {
@@ -65,6 +66,37 @@ export interface ConsumeOutboxOptions {
 	/** pending TTL（缺省 24h；测试注入更短触发 expired 扫描）。 */
 	pendingTtlMs?: number;
 	now?: Date;
+}
+
+// ── 事件驱动唤醒（2004：降低 GUI→会话消息入会话延迟）──────────────────────
+// 原 10s tick 保留为兜底（安全网），正常路径由以下两路即时唤醒：
+//   (a) 同进程：notifyOutboxArrived(sessionId) — executor/写入侧在 writeOutboxItem 后
+//       同进程调用；若目标会话在本进程则零延迟消费。
+//   (b) 跨进程：fs.watch(outboxDir) debounce ~200ms — 新 .json 出现即触发一次
+//       consumeOutboxOnce（watch 不可用时静默退化到 tick）。
+// 进程内 in-flight 守卫：防唤醒与 tick 并发双扫（纯优化，claimInjection 才是去重权威）。
+
+const inFlight = new Set<string>();
+const sessionConsumers = new Map<string, (sessionId: string) => void>();
+
+/**
+ * 同进程唤醒钩子（事件驱动路径 a）：executor / 写入侧在 writeOutboxItem 成功后调用，
+ * 若目标会话桥在本进程则立即 consumeOutboxOnce（零 tick 等待）；跨进程时 no-op
+ * （由 fs.watch 路径 b 兜底，最迟 ~200ms）。
+ *
+ * 约束：
+ *   - 不替代 claimInjection 去重（in-flight 守卫只是减少冗余枚举，claim 是权威互斥）；
+ *   - 异常内部吞掉（fail-closed），只走 tick 兜底；
+ *   - 不引入第二写者（注入仍走 sendUserMessage 路径）。
+ */
+export function notifyOutboxArrived(sessionId: string): void {
+	const wake = sessionConsumers.get(sessionId);
+	if (!wake) return; // 跨进程或本会话无桥：no-op（tick/fs.watch 兜底）
+	try {
+		wake(sessionId);
+	} catch {
+		/* fail-closed：吞掉只走 tick 兜底 */
+	}
 }
 
 export interface OutboxConsumeEntry {
@@ -237,6 +269,12 @@ function appendBridgeJournalEvent(
  * 子 agent 恒不注册；sessionId 不可得时不注册（无地址可匹配，注入必错投）。
  * 启动即扫（必修 2 重启 reclaim：目标会话重启后不等首个 tick 即消费遗留 pending）。
  * cutover 状态无关：outbox 项按会话寻址，投递不依赖 master 域开关。
+ *
+ * 2004 事件驱动唤醒：
+ *   - (a) 同进程：sessionConsumers 注册唤醒处理器；notifyOutboxArrived 即时消费；
+ *   - (b) 跨进程：fs.watch(outboxDir) debounce ~200ms 触发消费；watch 失败静默退化 tick；
+ *   - tick 10s 保留为兜底（安全网），不缩短（防竞态面扩大）。
+ *   - in-flight 守卫防并发双扫（纯优化；claimInjection 是去重权威，不可替代）。
  */
 export function registerOutboxBridge(
 	pi: {
@@ -246,6 +284,8 @@ export function registerOutboxBridge(
 	opts: { stateDir?: string; journalPath?: string; intervalMs?: number; sourceLabel?: string; pendingTtlMs?: number } = {},
 ): () => void {
 	let interval: ReturnType<typeof setInterval> | null = null;
+	let watcher: FSWatcher | null = null;
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
@@ -258,9 +298,17 @@ export function registerOutboxBridge(
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen;
 		if (interval) clearInterval(interval);
+		if (watcher) { try { watcher.close(); } catch { /* */ } watcher = null; }
+		if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
 		const send = pi.sendUserMessage?.bind(pi);
-		const tick = (): void => {
+		const stateDir = opts.stateDir ?? join(defaultRuntimeDir(), "state");
+		const outDir = outboxDir(stateDir);
+
+		// 核心消费（带 in-flight 守卫：防唤醒/tick 并发双扫；不替代 claimInjection）
+		const doConsume = (): void => {
 			if (closed()) return;
+			if (inFlight.has(sid)) return; // 已有消费在飞：本次跳过（tick/watch 会再试）
+			inFlight.add(sid);
 			try {
 				consumeOutboxOnce({
 					sessionId: sid,
@@ -272,15 +320,56 @@ export function registerOutboxBridge(
 				});
 			} catch {
 				/* 桥永不破坏宿主会话 */
+			} finally {
+				// 延迟清除 in-flight：.then 微任务（注入+回写）跑完后再清
+				setImmediate(() => { inFlight.delete(sid); });
 			}
 		};
+
+		// tick（10s 兜底安全网，保留不缩短）
+		const tick = (): void => { doConsume(); };
 		tick(); // 启动即扫：重启 reclaim 不等首个 tick
 		interval = setInterval(tick, opts.intervalMs ?? 10_000);
 		interval.unref?.();
+
+		// (a) 同进程唤醒：注册到 sessionConsumers（notifyOutboxArrived 按 sessionId 查找）
+		sessionConsumers.set(sid, doConsume);
+
+		// (b) 跨进程：fs.watch outbox 目录，debounce 200ms 后触发一次消费
+		//     watch 失败/不可用 → 静默退化到 tick（fail-closed，不影响宿主会话）
+		try {
+			// The directory may not exist until the first outbox write; create it so watch
+			// is active before that write instead of silently falling back to the 10s tick.
+			mkdirSync(outDir, { recursive: true });
+			const currentWatcher = fsWatch(outDir, { persistent: false }, (_event, filename) => {
+				// 只对 .json 文件事件触发（排除 .tmp 原子写中间态）
+				if (!filename || !filename.endsWith(".json")) return;
+				if (debounceTimer) clearTimeout(debounceTimer);
+				debounceTimer = setTimeout(() => {
+					debounceTimer = null;
+					doConsume();
+				}, 200);
+				debounceTimer.unref?.();
+			});
+			watcher = currentWatcher;
+			currentWatcher.on("error", () => {
+				/* watch 错误静默：退化 tick 兜底 */
+				try { currentWatcher.close(); } catch { /* */ }
+				if (watcher === currentWatcher) watcher = null;
+			});
+		} catch {
+			/* fs.watch 不可用（某些 FS/平台）→ 静默退化 tick */
+			watcher = null;
+		}
 	});
 	return () => {
 		sessionGen++;
 		if (interval) clearInterval(interval);
 		interval = null;
+		if (watcher) { try { watcher.close(); } catch { /* */ } watcher = null; }
+		if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+		// 清理同进程唤醒注册（按当前 session；sessionGen 已失配 → closed()=true → doConsume no-op）
+		// 不清 sessionConsumers（doConsume 内有 closed() 守卫，安全）；
+		// 下一次 session_start 会覆盖同 key。
 	};
 }
