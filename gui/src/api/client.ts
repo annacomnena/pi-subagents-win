@@ -17,6 +17,10 @@ import type {
 	SessionsBody,
 	TimelineResponse,
 	TranscriptBody,
+	WechatBindStartBody,
+	WechatBindStatusBody,
+	WechatQrImageBody,
+	WechatUnbindBody,
 } from "./types";
 
 export type ConnState = "up" | "down";
@@ -180,4 +184,28 @@ export const api = {
 			undefined,
 			8000,
 		),
+
+	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
+	//  生产 sw_gui_token 派生凭据）；全 5 端点 fail-closed（无/错 → 401；
+	//  channels.wechat.enabled off → 403 wechat-disabled）。token 永不进任何响应。──
+
+	/** GET /v1/wechat/bind/status（状态投影；403 = 未启用 → 上层隐藏入口）。 */
+	wechatBindStatus: (): Promise<FetchResult<WechatBindStatusBody>> =>
+		fetchJson<WechatBindStatusBody>("/v1/wechat/bind/status"),
+
+	/** POST /v1/wechat/bind/start（幂等；取码 10s 超时 → 客户端 15s 上限）。 */
+	wechatBindStart: (): Promise<FetchResult<WechatBindStartBody>> =>
+		postJson<WechatBindStartBody>("/v1/wechat/bind/start", {}, 15000),
+
+	/** GET /v1/wechat/bind/qr-image（daemon 代理取图 → data URL；10s 超时 → 客户端 15s 上限）。 */
+	wechatBindQrImage: (): Promise<FetchResult<WechatQrImageBody>> =>
+		fetchJson<WechatQrImageBody>("/v1/wechat/bind/qr-image", undefined, 15000),
+
+	/** POST /v1/wechat/bind/cancel（取消在途流程；不删已有凭据）。 */
+	wechatBindCancel: (): Promise<FetchResult<WechatBindStatusBody>> =>
+		postJson<WechatBindStatusBody>("/v1/wechat/bind/cancel", {}),
+
+	/** POST /v1/wechat/unbind（删凭据回 idle）。 */
+	wechatUnbind: (): Promise<FetchResult<WechatUnbindBody>> =>
+		postJson<WechatUnbindBody>("/v1/wechat/unbind", {}),
 };

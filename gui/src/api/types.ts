@@ -441,3 +441,43 @@ export interface OutboxEventPayload {
 	error?: string;
 	replayed?: boolean;
 }
+
+// ── 0923 微信 iLink 绑定（v1：绑定/解绑/状态；token 永不进任何响应）──
+
+/** 绑定状态机（server /v1/wechat/bind/status 唯一真相源）。 */
+export type WechatStateName = "idle" | "waiting" | "scanned" | "bound" | "expired" | "error";
+
+/** GET /v1/wechat/bind/status（token 永不出现；bot id 只报存在性）。 */
+export interface WechatBindStatusBody {
+	state: WechatStateName;
+	/** waiting/scanned：QR 图片 URL（「手机微信里打开」直链；不是轮询凭证串）。 */
+	qrImageUrl: string | null;
+	/** waiting/scanned：过期时刻（ms epoch）。 */
+	expiresAt: number | null;
+	/** waiting/scanned：有效期秒数（服务端 expires_in）。 */
+	expiresIn: number | null;
+	/** bound：绑定时刻（ISO）。 */
+	boundAt: string | null;
+	/** bound：是否取到 bot id（值不出现，只存在性）。 */
+	botIdPresent: boolean;
+	/** error：用户可读消息（不含 token）。 */
+	message: string | null;
+}
+
+/** POST /v1/wechat/bind/start（幂等：同未过期会话重调返回同一 qr+expiresAt）。 */
+export interface WechatBindStartBody {
+	state: "waiting";
+	qr: { qrImageUrl: string; expiresAt: number; expiresIn: number };
+}
+
+/** GET /v1/wechat/bind/qr-image（daemon 代理转 data URL；dataUrl=null → GUI 回退 URL 文本 + 复制）。 */
+export interface WechatQrImageBody {
+	dataUrl: string | null;
+	url: string;
+	error: string | null;
+}
+
+/** POST /v1/wechat/unbind（删凭据回 idle；removed = 是否删到了文件）。 */
+export interface WechatUnbindBody extends WechatBindStatusBody {
+	removed: boolean;
+}

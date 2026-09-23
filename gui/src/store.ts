@@ -31,8 +31,9 @@ import type { StreamServerFrame, StreamState } from "./useEventStream";
 export type TabId = "chat" | "timeline";
 
 /** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0 z-10）：
- *  null=关；值=打开并定位对应 section（attention/master/workstream/runtime 四页组件原样复用）。 */
-export type RuntimeOverlaySection = "attention" | "master" | "workstream" | "runtime";
+ *  null=关；值=打开并定位对应 section（attention/master/workstream/runtime 四页组件原样复用；
+ *  0923 wechat = 「微信连接」（未启用 403 时 RuntimeOverlay 隐藏该入口））。 */
+export type RuntimeOverlaySection = "attention" | "master" | "workstream" | "runtime" | "wechat";
 
 /** envelope → 人话 TimelineItem（客户端小映射，参照 extensions/runtime-host/timeline.ts 模板；
  *  下一轮 timeline 全量轮询会用 server 侧精修+溯源版本按 id 覆盖）。 */

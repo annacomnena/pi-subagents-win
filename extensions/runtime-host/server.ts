@@ -45,6 +45,13 @@
  *     journal message.expired 回执（sweepExpiredOutboxItems；目标会话永不重启时 pending
  *     不再是永久孤儿——任一项至多存活到下次 host 启动；桥侧另在每个消费 tick 扫）。
  *     唯一读投影例外，best-effort never-throw；POST /v1/commands 仍是唯一命令入口。
+ *   - 0923 微信 iLink 绑定 5 端点（v1：绑定/解绑/状态）：`POST /v1/wechat/bind/start`（幂等）/
+ *     `GET /v1/wechat/bind/status` / `GET /v1/wechat/bind/qr-image`（daemon 代理转 data URL）/
+ *     `POST /v1/wechat/bind/cancel` / `POST /v1/wechat/unbind`。鉴权沿用 authorizeCommand 链
+ *     （无/错 → 401）；opt-in OFF（config channels.wechat.enabled!==true）→ 全 403 wechat-disabled。
+ *     bot_token 永不进任何响应/日志（只记存在性）；凭据落 <runtimeDir>/wechat/credentials.json
+ *     （0600 尽力 + 原子 rename）；有界异步流程（取码 10s + ≤120s/2.5s 轮询 + 结束即释放，
+ *     D14 进程放置）全在 wechat-bind.ts（纯库 + 可注入 fetch）。
  *   - `/v1/sessions` 每条目附服务端权威 `masterProtected`（与 executor 护栏同源
  *     getMasterStatus().attachment.sessionId；G6-P2 L4 必修 4：GUI 不再拿 health 心跳自猜）。
  *   - `/v1/sessions` 每条目另附置顶标记（L3 会话 rail 三件套，session-pin.ts 纯读）：
@@ -118,6 +125,14 @@ import {
 	readGuiEnabled,
 } from "../runtime/master-injection.ts";
 import { attachEventStream, WS_PATH, parseCookieToken, parseNamedCookie, tokenMatches } from "./ws.ts";
+import {
+	WechatAlreadyBoundError,
+	WechatBindManager,
+	WechatCancelledError,
+	WechatNoActiveSessionError,
+	readWechatEnabled,
+	type WechatFetch,
+} from "./wechat-bind.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
 import {
 	RUNTIME_SCHEMA_VERSION,
@@ -409,6 +424,14 @@ export interface RuntimeHostServerOptions {
 	distDir?: string;
 	/** 第一切片：启动时等待交接锁释放的最长 ms（缺省 15000；测试用空闲锁，零等待）。 */
 	lockWaitMs?: number;
+	/** 0923 wechat：runtime 根目录（凭据 <dir>/wechat/credentials.json；缺省 defaultRuntimeDir()；测试注入隔离）。 */
+	wechatRuntimeDir?: string;
+	/** 0923 wechat：iLink base URL（缺省 https://ilinkai.weixin.qq.com；本地 stub 测试）。 */
+	wechatBaseUrl?: string;
+	/** 0923 wechat：fetch 注入（缺省 global fetch；测试 fake fetch）。 */
+	wechatFetch?: WechatFetch;
+	/** 0923 wechat：QR 轮询节拍 ms（缺省 2500；测试注入加速）。 */
+	wechatPollIntervalMs?: number;
 }
 
 export interface RuntimeHostHandle {
@@ -486,6 +509,15 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	// L3：Bootstrap OTT 进程内存签发/核销（单实例 daemon 持有；gui 未启用时只 403，零落盘）
 	const bootstrapStore = createBootstrapStore();
 	const configPath = opts.configPath ?? defaultPkgConfigPath();
+	// 0923 微信 iLink 绑定（v1：绑定/解绑/状态；D14 进程放置：daemon 内有界异步任务，取码 1 次
+	// 10s + ≤120s/2.5s 轮询 + 结束即释放，非长驻 worker）。token 永不进任何 HTTP 响应/日志/WS/argv
+	// （只记存在性）；凭据落 <runtimeDir>/wechat/credentials.json（0600 尽力 + 原子 rename）。
+	const wechat = new WechatBindManager({
+		...(opts.wechatRuntimeDir !== undefined ? { runtimeDir: opts.wechatRuntimeDir } : {}),
+		...(opts.wechatBaseUrl !== undefined ? { baseUrl: opts.wechatBaseUrl } : {}),
+		...(opts.wechatFetch !== undefined ? { fetchImpl: opts.wechatFetch } : {}),
+		...(opts.wechatPollIntervalMs !== undefined ? { pollIntervalMs: opts.wechatPollIntervalMs } : {}),
+	});
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -803,6 +835,94 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		}
 	};
 
+	// 0923 微信 iLink 绑定（v1）：5 端点薄绑定，业务全在 wechat-bind.ts（纯库 + 可注入 fetch）。
+	// 鉴权链 = authorizeCommand（header 本体 / cookie 本体或 B 案派生 sw_gui_token；无/错 → 401）；
+	// opt-in 闸 = readWechatEnabled（config channels.wechat.enabled===true；缺省 OFF）→ 未启用全 403。
+	// token 永不进任何响应（状态只回存在性）；QR 图片由 daemon 代理转 data URL（≤200KB/10s，
+	// 失败回退 URL 文本）；POST body 不消费（客户端发空对象），drain 保 keep-alive 不被残留字节污染。
+	const WECHAT_DISABLED_BODY: Record<string, unknown> = {
+		error: "wechat-disabled",
+		hint: "微信通道未启用：config.json 设 channels.wechat.enabled=true（未启用时本端点全 403，GUI「微信连接」入口隐藏）",
+	};
+	const WECHAT_UNAUTHORIZED_BODY: Record<string, unknown> = {
+		error: "unauthorized",
+		hint: "/v1/wechat/* 需本机 token：X-Command-Token header（host token 本体）或 Cookie sw_host_token / sw_gui_token（token 见 runtime 目录 host.json）",
+	};
+	const drainWechatBody = (req: IncomingMessage): void => {
+		let size = 0;
+		req.on("data", (c: Buffer) => {
+			size += c.length;
+			if (size > 4096) {
+				try { req.destroy(); } catch { /* ignore */ }
+			}
+		});
+		req.on("error", () => { /* ignore */ });
+	};
+	const handleWechat = (req: IncomingMessage, res: ServerResponse, u: URL): void => {
+		if (!authorizeCommand(req)) {
+			respondJson(res, 401, WECHAT_UNAUTHORIZED_BODY);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if (!readWechatEnabled(configPath)) {
+			respondJson(res, 403, WECHAT_DISABLED_BODY);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		const p = u.pathname;
+		if (p === "/v1/wechat/bind/start" && req.method === "POST") {
+			// 幂等：同未过期会话重调返回同一 qr+expiresAt；已绑定 → 409 already-bound（需先解绑）。
+			// 取码 10s 超时 → 本请求最长 ~10s（GUI 客户端 15s 上限）；失败 → 502（含 ret≠0/字段缺失）。
+			drainWechatBody(req);
+			wechat.start().then((r) => {
+				respondJson(res, 200, { state: "waiting" as const, qr: r });
+			}).catch((e: unknown) => {
+				if (e instanceof WechatAlreadyBoundError) {
+					respondJson(res, 409, { error: "already-bound", hint: "已有绑定中的微信凭据；先 POST /v1/wechat/unbind 解绑" });
+				} else if (e instanceof WechatCancelledError) {
+					respondJson(res, 409, { error: "cancelled", hint: "绑定流程已取消" });
+				} else {
+					respondJson(res, 502, { error: "bind-failed", message: e instanceof Error ? e.message : String(e) });
+				}
+			});
+			return;
+		}
+		if (p === "/v1/wechat/bind/status" && req.method === "GET") {
+			// 状态投影（pending/scanned/bound/expired/error/idle；token 永不出现，bot id 只报存在性）
+			respondJson(res, 200, wechat.getState());
+			return;
+		}
+		if (p === "/v1/wechat/bind/qr-image" && req.method === "GET") {
+			// daemon 代理取图转 data URL（防浏览器直连第三方；≤200KB/10s；失败回退 {dataUrl:null,url,error}
+			// 由 GUI 显示 URL 文本 + 复制）。无在途会话 → 409 no-active-session。
+			wechat.fetchQrImage().then((r) => {
+				respondJson(res, 200, r);
+			}).catch((e: unknown) => {
+				if (e instanceof WechatNoActiveSessionError) {
+					respondJson(res, 409, { error: "no-active-session", hint: "无进行中的绑定会话（先 POST /v1/wechat/bind/start 生成二维码）" });
+				} else {
+					respondJson(res, 502, { error: "qr-image-failed", message: e instanceof Error ? e.message : String(e) });
+				}
+			});
+			return;
+		}
+		if (p === "/v1/wechat/bind/cancel" && req.method === "POST") {
+			// 取消在途流程（不删已有凭据；已绑定不受影响）；幂等
+			drainWechatBody(req);
+			wechat.cancel();
+			respondJson(res, 200, wechat.getState());
+			return;
+		}
+		if (p === "/v1/wechat/unbind" && req.method === "POST") {
+			// 解绑 = 取消在途 + unlink 凭据（不留空壳）→ 回 idle；removed = 是否删到了文件
+			drainWechatBody(req);
+			const removed = wechat.unbind();
+			respondJson(res, 200, { ...wechat.getState(), removed });
+			return;
+		}
+		respondJson(res, 405, { error: "method-not-allowed", hint: "/v1/wechat/*：POST bind/start | bind/cancel | unbind；GET bind/status | bind/qr-image" });
+	};
+
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
@@ -838,6 +958,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					return;
 				}
 				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/commands 仅接受 POST（唯一命令入口）；读投影走其余 GET 端点" });
+			}
+			// 0923 微信 iLink 绑定 5 端点（v1：绑定/解绑/状态）：鉴权沿用 authorizeCommand 链
+			// （无/错 → 401，同 /v1/commands 面）；opt-in OFF（config channels.wechat.enabled!==true）
+			// → 全 403 wechat-disabled（不分端点；GUI 亦不渲染「微信连接」入口）。token 永不进任何响应。
+			if (u.pathname.startsWith("/v1/wechat/")) {
+				handleWechat(req, res, u);
+				return;
 			}
 			if (req.method !== "GET") {
 				throw new HttpError(405, { error: "method-not-allowed", hint: "读投影仅 GET；写操作唯一入口 POST /v1/commands" });
@@ -951,7 +1078,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
-						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）` });
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）| /v1/wechat/bind/{start,status,qr-image,cancel} + /v1/wechat/unbind（微信 iLink 绑定，channels.wechat.enabled on）` });
 					}
 					const sessionId = decodeURIComponent(mt[1]);
 					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
@@ -1039,6 +1166,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				server,
 				info,
 				close: async () => {
+					// 0923 wechat：停有界绑定流程（不动磁盘——bound 凭据跨重启保留）
+					try {
+						wechat.dispose();
+					} catch {
+						/* ignore */
+					}
 					await new Promise<void>((r) => {
 						try {
 							server.close(() => r());
