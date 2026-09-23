@@ -184,3 +184,220 @@ for (const f of ["broken.json"] as const) {
 }
 
 console.log(`global-view OK: tabs=${snap.tabsActive} hidden_orphaned=${snap.totals.orphaned} lines=${lines.length} repos=${snap.reposTotal}`);
+
+// ── phase2 探测深度增强（0923 global-view depth plan §1-§7）──────────────────
+// 隔离 agentDir2：零干扰既有断言。覆盖：明细列+来源降级、置顶序、+/-/~ 差分、
+// 跨仓闸口容错全套、无基线首次运行、collector 纯只读、零侵入回归。
+import { collectGlobalView as collect2, formatGlobalView as format2, globalViewLogic as logic2, rankDetail, readGateStatus } from "./runtime/global-view.ts";
+import { sessionBucketForCwd as bucket2 } from "./tab-runs.ts";
+
+const agent2 = mkAgent();
+const NOW2 = Date.now();
+const repoC = mkdtempSync(join(tmpdir(), "gv2-repoC-"));
+const repoD = mkdtempSync(join(tmpdir(), "gv2-repoD-"));
+const repoE = mkdtempSync(join(tmpdir(), "gv2-repoE-"));
+const repoF = mkdtempSync(join(tmpdir(), "gv2-repoF-"));
+for (const r of [repoC, repoD, repoE, repoF]) mkdirSync(join(r, ".git"), { recursive: true });
+// repoC：有表 + Status waiting → gate=awaiting
+writeFileSync(join(repoC, "recentwork.md"),
+	`# recent\n\n## Active Tasks\n\n### Task Index\n\n| Item | Priority | Summary | Dependency | Next action |\n| R1 | P0 | demo | none | wait human |\n\n**Status**：waiting（等人工确认）\n`, "utf8");
+// repoE：超 64KB → unknown
+writeFileSync(join(repoE, "recentwork.md"), "x".repeat(70 * 1024), "utf8");
+// repoF：表头漂移 → unknown
+writeFileSync(join(repoF, "recentwork.md"),
+	`# recent\n\n## Active Tasks\n\n### Task Index\n\n| Foo | Bar | Baz |\n| a | b | c |\n`, "utf8");
+// repoD：缺 recentwork.md → unknown（不污染他仓）
+
+const d2 = (id: string, cwd: string, atMs: number, task: string): void => {
+	write(join(agent2, "tab-runs", `${id}.json`), { id, version: 1, taskId: task, mode: "workflow", cwd, dispatchedAt: iso(atMs), dispatchStatus: "dispatched" });
+};
+const s2 = (id: string, phase: string, terminal: boolean, atMs: number, extra: Record<string, unknown> = {}): void => {
+	write(join(agent2, "tab-runs", `${id}.state.json`), { id, phase, turn: "working", terminal, lastActivityAt: iso(atMs), ...extra });
+};
+// w_stale：working + 无进展 60min(>45min 阈值) + 长摘要(>120) + 产物 missing + repoC gate awaiting → needsHuman
+const LONG = "摘".repeat(200);
+d2("w_stale", repoC, NOW2 - 3 * HOUR, "C1");
+s2("w_stale", "working", false, NOW2 - 60 * 60_000, { lastStopReason: "stop", lastAssistantText: LONG });
+write(join(agent2, "tab-runs", "w_stale_extra.json"), { noop: 1 }); // 干扰文件：dispatch 校验失败应被忽略
+// w_wait：waiting 近期 → awaitingInput → needsHuman（repoD gate unknown 照样成立）
+d2("w_wait", repoD, NOW2 - 3 * HOUR, "D1");
+s2("w_wait", "waiting", false, NOW2 - 5 * 60_000, { lastStopReason: "stop" });
+// t_term：终态无 result → 待审 visible（rank 2）
+d2("t_term", repoD, NOW2 - 3 * HOUR, "D2");
+s2("t_term", "completed", true, NOW2 - 10 * 60_000);
+// p_probe：state 缺 stop/摘要 → 走 tail-capped 会话探活补 stop=error + 摘要
+const PTASK = "PT1";
+d2("p_probe", repoD, NOW2 - 3 * HOUR, PTASK);
+s2("p_probe", "working", false, NOW2 - 5 * 60_000);
+const sessBucket = join(agent2, "sessions", bucket2(repoD));
+mkdirSync(sessBucket, { recursive: true });
+const probeText = "探".repeat(150);
+writeFileSync(join(sessBucket, "s1.jsonl"), [
+	JSON.stringify({ type: "session", id: "sess-p", timestamp: iso(NOW2 - 2 * HOUR) }),
+	JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: `根据workflow进行工作${PTASK}\n做事` }] } }),
+	JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "error", content: [{ type: "text", text: probeText }] } }),
+].join("\n"), "utf8");
+// f_tab：repoF 表头漂移仓里的普通 working
+// g_tab：repoE 超大仓里的普通 working（用新 dispatch，无 state → dispatched 可见）
+d2("f_tab", repoF, NOW2 - 60_000, "F1");
+d2("g_tab", repoE, NOW2 - 60_000, "G1");
+
+const byId = (snapX: { details: { runId: string }[] }, id: string): any =>
+	(snapX.details as any[]).find((d) => d.runId === id);
+
+// A. rank 置顶序（纯函数单测，含 unconfirmed）
+const R = (o: object): number => rankDetail({ needsHuman: false, phase: "working", resultMissing: true, terminal: false, staleOver: false, overdue: false, ...o });
+assert.ok(R({ needsHuman: true }) < R({ phase: "unconfirmed" }), "等人工 > unconfirmed");
+assert.ok(R({ phase: "unconfirmed" }) < R({ resultMissing: true, terminal: true }), "unconfirmed > resultMissing&&terminal");
+assert.ok(R({ resultMissing: true, terminal: true }) < R({ staleOver: true }), "终态无 result > 无进展超阈值");
+assert.ok(R({ staleOver: true }) < R({ overdue: true }), "无进展 > overdue timer");
+assert.ok(R({ overdue: true }) < R({}), "overdue > 其余");
+
+// B. 明细列 + 降级
+const snapA = collect2({ agentDir: agent2, now: NOW2, gitProbe });
+const stale = byId(snapA, "w_stale");
+assert.equal(stale.phase, "working");
+assert.equal(stale.taskId, "C1");
+assert.ok(stale.staleOver, "无进展 60min > 45min 阈值");
+assert.equal(stale.stop, "stop");
+assert.equal(stale.summary.length, 120, "摘要截断 120 字");
+assert.equal(stale.gate, "awaiting");
+assert.equal(stale.needsHuman, true, "awaitingInput|gate awaiting → 等人工");
+assert.equal(stale.openIssues, null, "缺 result.openIssues → unknown(null)，不当 0");
+assert.equal(stale.artifact, "-", "无 result → 产物 -");
+const wait = byId(snapA, "w_wait");
+assert.equal(wait.needsHuman, true, "waiting→awaitingInput→等人工（gate unknown 照样成立）");
+assert.equal(wait.gate, "unknown", "缺 recentwork → unknown");
+assert.equal(wait.staleOver, false, "5min 无进展未超阈值");
+const probe = byId(snapA, "p_probe");
+assert.equal(probe.stop, "error", "tail 探活补 stop");
+assert.equal(probe.summary.length, 120, "探活摘要同样截断 120");
+const ftab = byId(snapA, "f_tab");
+assert.equal(ftab.gate, "unknown", "表头漂移 → unknown");
+assert.equal(ftab.stale, "unknown", "无 state.lastActivityAt → unknown（不拿 mtime 冒充）");
+assert.equal(ftab.taskId, "F1");
+const gtab = byId(snapA, "g_tab");
+assert.equal(gtab.gate, "unknown", "超 64KB → unknown");
+assert.ok(snapA.warnings.some((w) => w.includes("64KB")), "超大记 warnings");
+// 跨仓缺失不污染他仓行
+assert.equal(byId(snapA, "w_stale").gate, "awaiting", "repoD 缺失不污染 repoC");
+// 行置顶：repoC（等人工）在无异常仓 repoE 之前
+const order = snapA.rows.map((r) => r.repoPath);
+assert.ok(order.indexOf(repoC) !== -1 && order.indexOf(repoE) !== -1 && order.indexOf(repoC) < order.indexOf(repoE), `等人工置顶：${order.join(",")}`);
+// hygiene 单行：字段齐 + 未确认来源留 unknown
+assert.match(snapA.hygiene, /zombiePid:\d+ otherMail:\d+ unmappedTimer:\d+/, "hygiene 计数器");
+assert.match(snapA.hygiene, /wt:unknown port:unknown daemon:unknown/, "未确认来源留 unknown");
+// 头三件套
+const textA = format2(snapA);
+assert.match(textA, /src=S\(state\)\+R\(result\)\+P\(probe:tail40\)\+G\(gate:recentwork\)\+D\(diff:last\.json\)/, "五源缩写自解释");
+assert.match(textA, /cmd=global-view/, "生成命令回显");
+assert.match(textA, /asof=/, "as-of");
+assert.ok(textA.split("\n").length <= 30, "phase2 输出仍≤30 行");
+
+// C. collector 纯只读：collect 不写基线
+assert.ok(!existsSync(join(agent2, "global-view", "last.json")), "collector 纯只读，不写 last.json");
+
+// D. 差分：首次 → +/~/-（经 globalViewLogic 写基线）
+const first = logic2({ page: 1 }, { agentDir: agent2, now: NOW2, gitProbe });
+assert.match(first.text, /diff:none\(baseline saved\)/, "首次无基线");
+assert.ok(existsSync(join(agent2, "global-view", "last.json")), "调用层 best-effort 落基线");
+assert.ok((first.details.diff as { note: string }).note === "none(baseline saved)");
+// 变更：w_stale 落 result（→hidden，即 removed）；w_wait 改 phase（→changed）；新增 n_new（→added）
+write(join(agent2, "tab-runs", "w_stale.result.json"), { id: "w_stale", taskId: "C1", status: "completed", finishedAt: iso(NOW2) });
+s2("w_wait", "working", false, NOW2 - 5 * 60_000, { lastStopReason: "stop" });
+d2("n_new", repoD, NOW2 - 60_000, "D9");
+const second = logic2({ page: 1 }, { agentDir: agent2, now: NOW2 + 60_000, gitProbe });
+const diff2 = second.details.diff as { added: string[]; changed: string[]; removed: string[]; note: string };
+assert.ok(diff2.removed.includes("w_stale"), `removed 含 w_stale：${JSON.stringify(diff2)}`);
+assert.ok(diff2.changed.some((c) => c.startsWith("w_wait:")), `changed 含 w_wait：${JSON.stringify(diff2)}`);
+assert.ok(diff2.added.includes("n_new"), `added 含 n_new：${JSON.stringify(diff2)}`);
+assert.match(second.text, /\+n_new/, "渲染 + 标记");
+assert.match(second.text, /~w_wait:/, "渲染 ~ 标记");
+assert.match(second.text, /-w_stale/, "渲染 - 标记");
+
+// E. 坏基线 → 当作无基线（行为同首次运行）+ warn
+writeFileSync(join(agent2, "global-view", "last.json"), "{broken", "utf8");
+const snapE = collect2({ agentDir: agent2, now: NOW2, gitProbe });
+assert.equal(snapE.diff.note, "none(baseline saved)", "坏基线按首次运行");
+assert.ok(snapE.warnings.some((w) => w.includes("基线损坏")), "坏基线记 warn");
+assert.ok(snapE.details.length > 0, "坏基线全表仍出");
+
+// F. readGateStatus 直测：缺文件/坏解析一律 unknown 且不抛
+assert.equal(readGateStatus(join(tmpdir(), "gv2-nope-xyz"), []), "unknown");
+
+console.log(`global-view phase2 OK: details=${snapA.details.length} humans=${snapA.details.filter((d: any) => d.needsHuman).length} diff2=${JSON.stringify(diff2)}`);
+
+// ── G. M1：满页 30 行截断不得吞尾行（plans/0923_global_view_depth_review.md §11）──
+import type { GlobalViewSnapshot as SnapT, RepoRow as RowT, TabDetail as DetailT } from "./runtime/global-view.ts";
+const gRow = (n: string): RowT => ({
+	repoPath: `/r/${n}`, display: `repo${n}`, local: "alive(1m)", branch: "main", dirty: "clean",
+	tabText: `w:${n}`, tabActive: 1, attention: 0, timer: 0, overdue: 0, mail: "p0/c0", mailPending: 0,
+	plans: "0", plansCount: 0, lastMs: 0, lastText: "2m",
+});
+const gHome: RowT = { ...gRow("H"), repoPath: "__HOME__", display: "HOME", local: "global(2m)", branch: "-", dirty: "-", tabText: "-", tabActive: 0, timer: 1, mail: "p3/c1", mailPending: 3, plans: "-", plansCount: null };
+const gDetail = (i: number, over: boolean, human: boolean): DetailT => ({
+	runId: `run_${i}`, repoPath: `/r/r${i}`, phase: "working", taskId: `T${i}`, age: "1h", stale: over ? "60m" : "5m",
+	staleOver: over, stop: "stop", artifact: "-", artifactMtime: "-", resultMissing: false, terminal: false,
+	openIssues: null, summary: `sum${i}`, needsHuman: human, gate: human ? "awaiting" : "ok", overdue: 0, pidAlive: null,
+});
+const gBase = {
+	owner: "global-sess-1", generation: "4", cutover: "on", asof: "2026-09-23T00:00:00.000Z",
+	tabsActive: 7, timersPending: 1, inboxPending: 3, inboxClaimed: 1,
+	home: gHome, totals: { orphaned: 120, terminal: 1, noResult: 2, attention: 3, gitUnknown: 1, otherMail: 0 },
+	cursor: { page: 1, pageSize: 20, totalPages: 1 }, history: [], historyTotal: 0,
+	hygiene: "hygiene: zombiePid:0 otherMail:0 unmappedTimer:1 wt:unknown port:unknown daemon:unknown",
+	command: "global-view", baselinePayload: { savedAt: "2026-09-23T00:00:00.000Z", tabs: {}, repos: {} },
+};
+const gAllRows = Array.from({ length: 21 }, (_, i) => gRow(`r${String(i + 1).padStart(2, "0")}`));
+// 满页：21 仓（page1 显示 20 → 溢出提示）+ 6 个 staleOver tab + 1 needs-human + warn×2 + partial
+const fullSnap: SnapT = {
+	...gBase, reposTotal: 21, shown: 20, rows: gAllRows.slice(0, 20),
+	details: [gDetail(0, false, true), ...Array.from({ length: 6 }, (_, i) => gDetail(i + 1, true, false))],
+	warnings: ["坏 dispatch 跳过: broken.json", "基线损坏，按首次运行处理"], partial: true,
+	diff: { added: ["n_new"], changed: ["w_wait:working"], removed: ["w_stale"], note: "" },
+} as SnapT;
+const fullLines = formatGlobalView(fullSnap).split("\n");
+assert.equal(fullLines.length, 30, `满页输出恰 30 行（不超上限），实得 ${fullLines.length}`);
+const tailIdx = fullLines.findIndex((l) => l.startsWith("src="));
+assert.ok(tailIdx > 0, "sources 行在");
+assert.ok(fullLines.some((l) => l.startsWith("needs-human: ")), "①' sources 后 needs-human 行在");
+assert.ok(fullLines.some((l) => l.startsWith("hygiene: ")), "① hygiene 行在（修复前被吞）");
+assert.ok(fullLines.some((l) => l.startsWith("diff: ")), "② diff 行在（修复前被吞）");
+assert.ok(fullLines.some((l) => l.startsWith("warn: ")), "③ warn 行在（修复前被吞）");
+assert.ok(fullLines.some((l) => l.startsWith("partial: ")), "④ partial 行在（修复前被吞）");
+assert.ok(fullLines.some((l) => l === "! +2 more actionable (见 tool details)"), "actionable 溢出提示在");
+for (const key of ["hygiene: ", "diff: ", "warn: ", "partial: "]) {
+	assert.ok(fullLines.findIndex((l) => l.startsWith(key)) > tailIdx, `${key.trim()} 必须出现在尾部区`);
+}
+// ⑤ 被挤掉的只有表格明细行，且截断/翻页提示如实
+const cutLine = fullLines.find((l) => l.includes("行截断（30 行上限）"));
+assert.ok(cutLine, "表格截断提示在（不静默）");
+assert.ok(cutLine!.includes("还有 +1 repos; /global-view --page 2"), `翻页提示如实：${cutLine}`);
+assert.equal(fullLines.filter((l) => l.startsWith("repor")).length, 12, "明细行被裁到 12 行（含截断提示占 1 行）");
+// ⑥ 小规模场景与修复前逐字节一致（golden 取自修复前实现的输出）
+const smallSnap: SnapT = {
+	...gBase, reposTotal: 3, shown: 3, rows: gAllRows.slice(0, 3),
+	details: [gDetail(0, false, true), gDetail(1, true, false)],
+	warnings: ["坏 dispatch 跳过: broken.json"], partial: true,
+	diff: { added: [], changed: [], removed: [], note: "" },
+} as SnapT;
+const SMALL_GOLDEN = [
+	"Global | owner=global-sess-1 gen=4 cutover=on | repos=3 shown=3 | tabs=7 timer=1 inbox=p3/c1 | asof=2026-09-23T00:00:00.000Z",
+	"scope                 | local       | branch dirty     | tab                          | timer   | mail  | plans | last",
+	"HOME                  | global(2m)  | - -               | -                            | 1       | p3/c1 | -     | 2m",
+	"repor01               | alive(1m)   | main clean        | w:r01                        | 0       | p0/c0 | 0     | 2m",
+	"repor02               | alive(1m)   | main clean        | w:r02                        | 0       | p0/c0 | 0     | 2m",
+	"repor03               | alive(1m)   | main clean        | w:r03                        | 0       | p0/c0 | 0     | 2m",
+	"hidden=orphaned:120,terminal:1,noResult:2; attention=3; unknown=git:1; /global-view --history /global-view inbox",
+	"src=S(state)+R(result)+P(probe:tail40)+G(gate:recentwork)+D(diff:last.json) | cmd=global-view",
+	"needs-human: run_0",
+	"! run_0 working age:1h stale:5m stop:stop art:-@- issues:unknown human:Y sum0",
+	"! run_1 working age:1h stale:60m stop:stop art:-@- issues:unknown human:- sum1",
+	"hygiene: zombiePid:0 otherMail:0 unmappedTimer:1 wt:unknown port:unknown daemon:unknown",
+	"diff: clean",
+	"warn: 坏 dispatch 跳过: broken.json",
+	"partial: 扫描超预算，计数可能不完整",
+].join("\n");
+assert.equal(formatGlobalView(smallSnap), SMALL_GOLDEN, "⑥ 小规模输出与修复前逐字节一致");
+
+console.log(`global-view M1 OK: full=${fullLines.length} lines rows_shown=12 tail=${fullLines.length - tailIdx} small=byte-identical`);
