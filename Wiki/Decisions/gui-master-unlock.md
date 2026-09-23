@@ -39,6 +39,13 @@ source_paths:
 - M3：审计 0600 + ~1MB 轮转（留两代）+ `denied` 行（无正文/密钥），server 层为唯一落盘点。
 - 独立 L4 复核进行中，结论未定。
 
+## 注入门判据（实测澄清，2026-09-24）
+
+- **`masterAlive` 读的是 tick 级 session heartbeat**（`<timersDir>/<sessionId>.json` 的 `lastActiveAt`，`timers.ts::sessionAlive`，grace 15s）——**会话进程活着就持续刷新，空闲也算"活"**。
+- **不是** `state/master-liveness.json`（该文件只在 `agent_end` 写，用于压力/续任语义）；把两者混为一谈会得出"空闲 master 收不到消息"的**错误结论**。
+- **实测**（2026-09-24 00:06）：master 空闲时经 GUI 窄路径注入（cookie `sw_gui_token` + Origin 同端口 + 目标 = 当前 owner）→ HTTP 200 `accepted`，随后回执 `receipts/outbox_*.json` 的 `by = outbox-bridge:<master sessionId>` ⇒ **master 自己的桥把消息消费并注入成 followUp**（空闲会话被拉起来处理）。
+- ⇒ 剩下的缺口只有一种：**没有任何进程持有该会话（TUI 关闭）** ⇒ 需 G1（无头 worker 续写同一 session 文件），仍未实现。
+
 ## Key Symbols
 
 - `bootstrapStore` — `extensions/runtime-host/server.ts`，OTT 进程内存签发/核销。
