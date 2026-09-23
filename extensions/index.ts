@@ -79,7 +79,7 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { durableSessionIdentity, getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
@@ -2455,8 +2455,32 @@ export default function (pi: ExtensionAPI) {
 
 			if (p.action === "status") {
 				const runs = listAsyncRuns();
-				const target = p.runId ? runs.find((r) => r.id === p.runId) : runs[0];
-				if (!target) return { content: [{ type: "text", text: p.runId ? `Run ${p.runId} not found` : "No async runs yet" }] };
+				// L3 status 默认会话隔离（2026-09-23）：无参只返回本会话派发的 run（按时间最新的一个）；
+				// 跨会话查看须显式带 runId（全局查找不变）。归属判定复用 async-result-watcher 范式：
+				// links 首个可信 async 记录的 sessionId 与 sessionScopeKey()/getCurrentSessionId() 任一相等即放行。
+				let target: AsyncRunRecord | undefined;
+				if (p.runId) {
+					target = runs.find((r) => r.id === p.runId);
+					if (!target) return { content: [{ type: "text", text: `Run ${p.runId} not found` }] };
+				} else {
+					const myIds = new Set(
+						[sessionScopeKey(), getCurrentSessionId()].filter((v): v is string => !!v),
+					);
+					let links: ReturnType<typeof listLinks> = [];
+					try { links = listLinks(); } catch { links = []; }
+					const dispatcherOf = (runId: string): string | undefined => {
+						for (const link of links) {
+							if (link.kind !== "async" || link.targetId !== runId) continue;
+							if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+						}
+						return undefined;
+					};
+					target = runs.filter((r) => {
+						const d = dispatcherOf(r.id);
+						return d !== undefined && myIds.has(d);
+					})[0];
+					if (!target) return { content: [{ type: "text", text: "No async runs for this session yet" }] };
+				}
 				return {
 					content: [{ type: "text", text: [
 						`Run: ${target.id}`,
