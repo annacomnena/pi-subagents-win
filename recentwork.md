@@ -18,10 +18,23 @@
 |---|---|---|---|---|
 | 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
+| 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 14 - 微信扫码连接页 v1（绑定/解绑/状态）
+
+- **日期**：2026-09-23
+- **一句话**：GUI 设置里新增「微信连接」页 + daemon 侧 5 个端点，实现 iLink 扫码绑定/解绑/状态；v1 不含消息收发。
+- **涉及模块**：`extensions/runtime-host/wechat-bind.ts`（新）、`extensions/runtime-host/server.ts`、`gui/src/pages/ChannelsPage.tsx`（新）、`gui/src/pages/RuntimeOverlay.tsx`、`gui/src/store.ts`、`gui/src/api/{client,types}.ts`
+- **产物**：本地 `plans/0923_wechat_gui_bind_plan.md`（设计）、`plans/0923_wechat_gui_bind_impl.md`、`plans/0923_wechat_gui_bind_review.md`（tab 内独立 L4，条件通过）
+- **Wiki**：[[微信 iLink 通道]]（协议契约 + 已实现边界）
+- **Priority**：P1
+- **Status**：complete（代码级验收通过；真网 7 项待测）
+- **Commit**：`8ee843d`
+- **Verification**：`npm run smoke:extension-load` OK；`npx tsx extensions/_test_wechat_bind.ts` 11 组断言全过；`gui` tsc --noEmit + vite build 成功。L4 已修两项实问题（QR 代理跨源 SSRF、轮询故障热循环）。**待用户扫码**做真网测量。
 
 ### Item 13 - Local Master 可得性修复（工具/命令可设 local + status 可见）
 
