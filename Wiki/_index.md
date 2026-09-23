@@ -28,6 +28,7 @@ source_paths:
 - [[Runtime Daemon 架构]] — 三层结构、写侧迁移顺序、G0/G1 闸口（`status: draft`）
 - [[统一审批门架构]] — 三端共用一门、TOCTOU、超时（`status: proposed`）
 - [[微信 iLink 通道]] — Client Plane 通道定位、七项待测未知项（`status: proposed`）
+- [[主动性套件（Autonomy Suite）]] — 主动权 v1 纯函数层（未接线）（`status: draft`）
 
 ## Links Out
 
@@ -39,6 +40,7 @@ source_paths:
 - [[Runtime Daemon 架构]]
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
+- [[主动性套件（Autonomy Suite）]]
 
 ## Backlinks
 
@@ -50,6 +52,7 @@ source_paths:
 - [[Runtime Daemon 架构]]
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
+- [[主动性套件（Autonomy Suite）]]
 
 ## Open Questions
 

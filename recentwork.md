@@ -19,10 +19,23 @@
 | 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
 | 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
+| 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 15 - global master 主动性套件 v1（纯函数层，未接线）
+
+- **日期**：2026-09-23
+- **一句话**：按 1335 行规格切出 v1 最小切片并实现（配置/ kill-switch / frontier / wake-gate / watchdog / collect），**只新建、零既有文件改动**，但**尚未接线**到 master 工具与唤醒路径。
+- **涉及模块**：`extensions/runtime/autonomy/{config,kill-switch,frontier,wake-gate,watchdog,collect}.ts`（新）、`extensions/_test_runtime_autonomy.ts`（新）
+- **产物**：本地 `plans/0923_autonomy_suite_v1_{plan,impl,review}.md`、`plans/0923_autonomy_L1{A,B}_*_research.md`；规格 `plans/0923_global_master_autonomy_suite_v0.2.md`
+- **Wiki**：[[主动性套件（Autonomy Suite）]]（`status: draft`，含未接线清单）
+- **Priority**：P2
+- **Status**：v1 complete（待 v2 接线）
+- **Commit**：`3922ef4`
+- **Verification**：`npx tsx extensions/_test_runtime_autonomy.ts` 55 项断言全绿 + `npm run smoke:extension-load` OK；tab 内独立 L4 PASS（must-fix 0）；回滚 = 删两个新路径。
 
 ### Item 14 - 微信扫码连接页 v1（绑定/解绑/状态）
 
