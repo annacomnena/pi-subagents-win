@@ -414,6 +414,7 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
+- **Web Console (dev form)** — `gui/` + `npm run gui:dev` (vite dev server proxying `/v1` to the runtime-host). Opt-in auto-start: `/gui on` (writes `config.json: "gui": {"autoStart": true}` + starts host/vite detached if not already running) · `/gui off` · `/gui status` · `/gui open` (opens `http://localhost:5173` in your browser). `vite` is a **development server** — static `dist` hosting is a later milestone.
 - **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/sub-presets` (save/load named subagent-model snapshots across 5 slots, e.g. night-time cheap models or local-only fallback), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/runs`, `/tabs`, `/timers`, `/links`, `/agents`.
 
 ---
