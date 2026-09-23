@@ -39,6 +39,7 @@ import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
 import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
+import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -1750,6 +1751,16 @@ export default function (pi: ExtensionAPI) {
 				`recent: ${recentScopesLine()}`,
 			];
 			ctx.ui.notify(`Master status:\n${lines.join("\n")}`, "info");
+		},
+	});
+	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。
+	pi.registerCommand("global-view", {
+		description: "全局工作视野（只读）：/global-view [--history] [--page N] | /global-view inbox",
+		handler: async (args, ctx) => {
+			const parsed = parseGlobalViewArgs(args ?? "");
+			if (!parsed.ok) { ctx.ui.notify(parsed.text, "warning"); return; }
+			const out = globalViewLogic(parsed.inbox ? { section: "inbox", page: parsed.page } : { history: parsed.history, page: parsed.page });
+			ctx.ui.notify(out.text, "info");
 		},
 	});
 	pi.registerCommand("master-attach", {

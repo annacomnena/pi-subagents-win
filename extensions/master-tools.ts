@@ -26,6 +26,7 @@ import {
 	setMasterCutover,
 } from "./runtime/master-control.ts";
 import { readAttachment, type MasterAttachment } from "./runtime/registry.ts";
+import { globalViewLogic } from "./runtime/global-view.ts";
 import { masterAddress } from "./runtime/address.ts";
 import {
 	confirmTransferAttach,
@@ -554,6 +555,34 @@ export function registerMasterTools(
 			}
 			const text = `master-dispatch 已启动：${res.title} runId=${res.runId}（用 tab-status / reclaim-tabs 回收）`;
 			return { content: [{ type: "text", text }], details: { runId: res.runId, title: res.title, taskId: (params.taskId ?? "").trim(), mode, text } };
+		},
+	});
+
+	// global-view（0923 首阶段：只读聚合；与 /global-view 同 globalViewLogic；section=inbox 只读计数）。
+	pi.registerTool({
+		name: "global-view",
+		label: "Global View",
+		description: `全局工作视野（只读聚合：tab/timer/mailbox/plans/last，不消费不归档）。参数：history（默认 false，列 hidden 明细）、page、section（仅 "inbox" 只读计数）。${USER_DIRECTIVE}`,
+		parameters: Type.Object({
+			history: Type.Optional(Type.Boolean({ description: "列 hidden 明细分页（默认 false）" })),
+			page: Type.Optional(Type.Number({ description: "页码（默认 1，每页 20）" })),
+			section: Type.Optional(Type.String({ description: "仅 inbox（只读计数）" })),
+		}),
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("global-view"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as { history?: boolean; page?: number; section?: string };
+			if (params.page !== undefined && (!Number.isFinite(params.page) || params.page < 1)) {
+				return textResult({ text: "用法：global-view {history?: boolean, page?: number>=1, section?: \"inbox\"}", isError: true });
+			}
+			const outcome = globalViewLogic({ history: params.history, page: params.page, section: params.section });
+			const isError = (outcome.details as { isError?: boolean } | undefined)?.isError === true;
+			return textResult({ ...outcome, details: { ...(outcome.details as Record<string, unknown>), text: outcome.text }, ...(isError ? { isError: true } : {}) });
 		},
 	});
 }
