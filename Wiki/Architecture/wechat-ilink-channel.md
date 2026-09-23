@@ -59,6 +59,24 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 - **401 提示**：页内明示"请先在 TUI 执行 `/gui open` 后再刷新"（凭据 cookie 只能由 bootstrap exchange 种下）。
 - **待补**：TUI 对等命令 `/wechat on|off|status`（可复用 `setWechatEnabled`）。**token 永不进浏览器/日志/WS/argv**；凭据拟落 `<runtimeDir>/wechat/credentials.json`（0600）；二维码由 daemon 代理取图转 data URL（**已实现**，限与 iLink base URL 同 origin 且 ≤200KB/10s，失败安全回退 URL 文本）。进程放置已裁定（D14）：登录/绑定 = daemon 内**有界异步任务**（取码 1 次 + ≤120s 轮询 + AbortController 超时 + 结束即释放）；**长驻长轮询通道仍走受监督 worker**。（v1 只做绑定/解绑/状态，未实现）
 
+## W2 准入：微信文本注入 master（决策 D15，**用户 2026-09-24 明确批准**）
+
+**允许**把微信**私聊文本**按「本人远程输入」注入当前 master owner 会话——**六个条件必须同时成立**（任一不成立即 fail-closed，不注入、只持久化 + Attention）：
+
+1. 显式 opt-in（`channels.wechat.input`，缺省 false ⇒ 关掉即零行为变化，见 D7）
+2. 发送者 openid 命中**服务端 allowlist**（昵称 / 正文 / 请求体**不得**决定权限，D1）
+3. **仅私聊**；群消息一律拒
+4. master **进程活着**——判据是 **tick 级 session heartbeat**（`extensions/timers.ts::sessionAlive`，`<timersDir>/<sessionId>.json` 的 `lastActiveAt`，grace 15s；空闲也算活）。**不是** `state/master-liveness.json`（该文件 `agent_end` 写、用于压力/续任）。见 [[GUI 解锁 Master]] 的「注入门判据（实测澄清，2026-09-24）」
+5. 目标 == **当前 owner** 且 **generation 一致**（沿用 GUI 窄路径同一 fence）
+6. **脱敏审计** + 单条一次批（复用 D1 的 `ask` 档）
+
+**边界**：既有 `session.message → master` 的 **403 语义不被绕过**——这是**新开的显式窄通道**，不是放宽旧规则。
+**G1 不是 W2 的前提**：G1 只解决「没有任何进程持有该会话（TUI 关闭）」；master 开着（含空闲）时注入路径已实测可用（`Wiki/Decisions/gui-master-unlock.md`）。
+
+### 交互期口径（D16）
+
+远程消息到达而用户正在 master 交互时：缺省**直接插入**（远程通道本分），TUI 给醒目提示；「排队到本轮结束」留作后续可选开关。
+
 ## Evidence
 
 - `scripts/wechat-ilink-probe.mjs`（commit `658306e`）— 头部用法注释与六命令实现。
