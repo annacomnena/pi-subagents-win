@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { isMainSession } from "./identity.ts";
 import { classifyHost, readHostInfo, type HostInfo } from "./runtime-host/discovery.ts";
 import { startRuntimeHost } from "./runtime-host/server.ts";
+import { traceSpawn } from "./spawn-trace.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const GUI_DIR = join(REPO_ROOT, "gui");
@@ -151,15 +152,26 @@ export function probeViteAlive(port: number, opts: { timeoutMs?: number } = {}):
 	});
 }
 
-/** detached spawn vite dev server（cwd gui/，stdio ignore；GUI_HOST_TOKEN 经 env 交 vite proxy 上游注入）。 */
+/** vite dev server 派生（隐藏控制台 + stdio ignore；GUI_HOST_TOKEN 经 env 交 vite proxy 上游注入）。
+ *
+ * 2026-09-22 空壳 WT 根因修复：此前用 `detached: true`（DETACHED_PROCESS → 子进程无控制台）。
+ * vite 启动期会派生短命子进程（esbuild --ping、`node -p process.report` 环境探测等），它们**继承不到
+ * 控制台**，只能各自分配新控制台；在「默认终端应用 = Windows Terminal」的机器上，新控制台被委派
+ * 给 WT → 弹出一个空壳窗口（短命子进程先退出，WT 承接时已无 tab）。
+ * 改为 `windowsHide: true`（CREATE_NO_WINDOW → vite 拥有一个**隐藏**控制台）：子树全部继承该隐藏
+ * 控制台，不再分配新控制台 → 不再弹窗。`unref()` 保留：pi 退出不连带杀 vite（隐藏控制台属于
+ * vite 自身，关 pi 的终端页签不影响它）。
+ * 注意：不要把 `detached: true` 加回来与 windowsHide 叠加——Win32 会忽略与 DETACHED_PROCESS
+ * 同用的 CREATE_NO_WINDOW，那就又回到无控制台老路。 */
 function defaultSpawnVite(o: { port: number; token: string | null; guiDir: string; viteBin: string }): {
 	spawned: boolean;
 	pid?: number;
 	error?: string;
 } {
 	try {
+		traceSpawn("console-child", `vite pid-less spawn cwd=${o.guiDir} port=${o.port} exec=${process.execPath}`);
 		const child = spawn(process.execPath, [o.viteBin, "--port", String(o.port), "--strictPort"], {
-			detached: true,
+			windowsHide: true,
 			stdio: "ignore",
 			cwd: o.guiDir,
 			env: { ...process.env, ...(o.token ? { GUI_HOST_TOKEN: o.token } : {}) },
@@ -176,6 +188,7 @@ export function openInBrowser(url: string): { ok: boolean; error?: string } {
 	try {
 		const bin = process.platform === "win32" ? "cmd.exe" : process.platform === "darwin" ? "open" : "xdg-open";
 		const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+		traceSpawn("browser", `${bin} ${args.join(" ")}`);
 		const child = spawn(bin, args, { detached: true, stdio: "ignore" });
 		child.unref();
 		return { ok: true };

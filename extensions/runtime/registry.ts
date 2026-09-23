@@ -16,6 +16,12 @@
  *     已前进而失败——删除竞态无关紧要）。
  *
  * 纯库、无接线、无 Pi API 依赖。
+ *
+ * 注意（0923 home 守卫）：本库无 Pi/cwd 语义，不知道调用会话的工作目录；
+ * 全局 Master 的 home 位置守卫在控制层（runtime/master-control.ts::
+ * attachCurrentSession）与插件入口（slash/tool）执行。直接调用本库
+ * attachMaster()/attachMasterWithAudit() 会绕过该策略——生产 global 调用
+ * 必须走受守卫的控制入口，不可对外直接使用底层原语。
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";

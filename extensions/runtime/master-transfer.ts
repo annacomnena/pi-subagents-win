@@ -117,7 +117,35 @@ export function buildSuccessorPrompt(input: {
 		`交接包：${input.handoffPath}（先读它恢复上下文）。`,
 		`handoff token：${input.token}（仅你可用）。transfer id：${input.transferId}，from generation ${input.fromGeneration}。`,
 		"步骤：①读交接包；②调 master-attach 工具并传入 token 接管；③调 master-status 确认 generation+1 且 owner 是你；④调 master-transfer-confirm 并传入 transferId（标记交接完成）。",
+		"只在 home 会话接 global；仓库任务走 local Master。",
 	].join("\n");
+}
+
+/**
+ * 后继会话标题：`master-MMDD-HHmm-<slug>`（用户可读方向）。
+ * slug 取自 reason：仅保留中英文/数字，下划线与空白转 `-`，非法字符清洗，
+ * 合并连续 `-` 并去首尾，截断 ≤24 字符（按码点，不切散代理对/emoji）。
+ * reason 为空或 slug 为空时回退 `gen<N>`。transferId 不进标题
+ * （record/token 链保留，可追溯）。时间取本地时区，与用户时钟一致。
+ * @param generation 后继 generation（调用方传 att.generation + 1）。
+ */
+export function buildMasterSuccessorTitle(
+	transferId: string,
+	generation: number,
+	reason?: string,
+	now?: Date,
+): string {
+	void transferId;
+	const d = now ?? new Date();
+	const p = (x: number): string => String(x).padStart(2, "0");
+	const ts = `${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+	let slug = (reason ?? "").replace(/[\s_]+/g, "-").replace(/[^A-Za-z0-9\u4e00-\u9fff-]/g, "");
+	slug = slug.replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+	if (slug.length > 0) {
+		slug = Array.from(slug).slice(0, 24).join("").replace(/-+$/g, "");
+	}
+	if (!slug) return `master-${ts}-gen${generation}`;
+	return `master-${ts}-${slug}`;
 }
 
 export type TransferResult =
@@ -163,7 +191,7 @@ export function transferMaster(
 	try {
 		const spawned = input.spawn({
 			transferId: record.transferId,
-			title: `successor ${record.transferId.slice(3, 9)} (gen ${att.generation + 1})`,
+			title: buildMasterSuccessorTitle(record.transferId, att.generation + 1, record.reason),
 			prompt,
 			sessionId: input.sessionId,
 		});

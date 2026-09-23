@@ -38,12 +38,16 @@ import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trac
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
+import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
+import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
+import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
+import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
 import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
@@ -78,7 +82,7 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { durableSessionIdentity, getTabRunId, isMainSession, isSubagent, registerIdentityFlag } from "./identity.ts";
+import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
@@ -1403,6 +1407,8 @@ function collectMainSessionUsage(day: DayBounds, sessionsRoot = DEFAULT_SESSIONS
 interface AsyncRunRecord {
 	id: string;
 	agent?: string;
+	/** L3：dispatch 时解析的 effective model（override ?? agent default），供 status 的 Model: 行展示。 */
+	model?: string;
 	task: string;
 	status: "running" | "completed" | "failed";
 	result?: SubagentResult;
@@ -1721,6 +1727,18 @@ export default function (pi: ExtensionAPI) {
 	}));
 
 	// ── /master-* 命令（Phase 4d，A5 F9/F11）──
+	// master 原生感知：最近活跃仓库/scope（一行摘要）。三账本只读归并（recent-scopes.ts），
+	// 任一账本不可读只降级为 "(unknown)"，永不打断 status。
+	function recentScopesLine(): string {
+		try {
+			const items = listRecentScopes();
+			// P0 返修：空结果须区分“窗口内无活动”与“三账本全缺席（无证据）”
+			if (items.length === 0 && !anyLedgerPresent()) return "(unknown)";
+			return formatRecentScopes(items);
+		} catch {
+			return "(unknown)";
+		}
+	}
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
 		handler: async (_args, ctx) => {
@@ -1730,8 +1748,19 @@ export default function (pi: ExtensionAPI) {
 				`cutover: ${cut ? (cut.enabled ? `ON by=${cut.enabledBy.slice(0, 12)} at=${cut.enabledAt.slice(0, 19)}` : "OFF") : "(never set)"}`,
 				`resolver: ${snap ? `${snap.sessionId.slice(0, 12)} gen=${snap.generation}` : "(null)"}`,
 				`mailbox: ${backlog.map((b) => `${b.recipient}=p${b.pending}/c${b.claimed}`).join(" ") || "(empty)"}`,
+				`recent: ${recentScopesLine()}`,
 			];
 			ctx.ui.notify(`Master status:\n${lines.join("\n")}`, "info");
+		},
+	});
+	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。
+	pi.registerCommand("global-view", {
+		description: "全局工作视野（只读）：/global-view [--history] [--page N] | /global-view inbox",
+		handler: async (args, ctx) => {
+			const parsed = parseGlobalViewArgs(args ?? "");
+			if (!parsed.ok) { ctx.ui.notify(parsed.text, "warning"); return; }
+			const out = globalViewLogic(parsed.inbox ? { section: "inbox", page: parsed.page } : { history: parsed.history, page: parsed.page });
+			ctx.ui.notify(out.text, "info");
 		},
 	});
 	pi.registerCommand("master-attach", {
@@ -1747,8 +1776,16 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("master-attach: --force-stale 须与 --confirm 同用（二次人工确认），拒绝", "warning");
 				return;
 			}
-			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined });
-			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
+			// home 守卫（0923）：会话实际 cwd 取自可信 Pi ctx；启动快照按同 UUID 读取（缺失 fail closed）。
+			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined, cwd: ctx.cwd, initialCwd: readSessionStartCwd(sid) });
+			if (!r.ok) {
+				if (r.reason === "not-home-dir") {
+					ctx.ui.notify(formatNotHomeDirMessage(homedir(), { hasToken: Boolean(token) }), "warning");
+					return;
+				}
+				ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning");
+				return;
+			}
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
 			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
 			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
@@ -1805,7 +1842,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.registerCommand("master-detach", {
-		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]）",
+		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]；接班者在 home 新会话接管）",
 		handler: async (args, ctx) => {
 			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
 			if (!sid || sid === "unknown") { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
@@ -2002,7 +2039,9 @@ export default function (pi: ExtensionAPI) {
 		const piCli = findPiCli();
 		const runId = newTabRunId();
 		const taskId = `transfer-${transferId.slice(3, 9)}`;
-		const cwd = process.cwd();
+		// home 守卫配套（0923）：global successor 一律在 home 启动，否则后继 attach 必被拒绝。
+		const cwd = homedir();
+		if (!cwd) throw new Error("master-transfer: 无法确定 home 目录，拒绝 spawn 后继（旧主仍是 owner）");
 		const runsDir = defaultTabRunsDir();
 		const dispatch: TabDispatchRecord = {
 			id: runId, version: 1, taskId, mode: "execute", title, cwd,
@@ -2264,11 +2303,11 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"这是无头 subagent 工具，不会打开 Windows Terminal 标签页；sync/parallel/async 都仍是 subagent，不是 tab。需要可见独立标签页时，只有主会话才能调用 launch-tabs。",
 			"单 agent: { agent, task, model?, cwd? }",
-			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency? }",
-			"异步: { agent, task, model?, cwd?, async: true }（仍是无头 subagent）",
+			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency?, async? }（缺省异步：立返 runId 列表，靠 action=status 收割；显式 async:false 才阻塞等待全部结果；concurrency 仅同步路径有效，异步 fan-out 忽略不限流）",
+			"异步: { agent, task, model?, cwd? }（**缺省就是异步**，仍是无头 subagent；本轮就要结果才显式 async: false 走同步）",
 			"查状态: { action: \"status\", runId? }（async subagent 的 runId 只能用这里查询）",
 			"不要对 async subagent 使用 tab-status、reclaim-tabs、tab-finish 或 set-timer。",
-			"【async 决策准则】结果马上要用 → 同步/并行 subagent；结果本回合不需要 → async subagent，然后只用 subagent-win action=status 查询。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
+			"【async 决策准则】缺省即异步（非阻塞，返回 runId，产物落盘 plans/，靠完成事件/async-result-watcher/status 收割）；只有结果本轮马上要用（下一步依赖、L4 复核）才显式 async: false 同步等待；同批独立任务用 tasks: [...] 并行（并行缺省同样异步，显式 async:false 才阻塞）。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
 			"外部 CLI 后端（仅当某 agent 的 config 默认/fallback 已设为该后端时才走，勿主动用其 override 未配置的 agent）：model=\"cli:claude\" | \"cli:codex\" | \"cli:agy\" | \"cli:atomcode\" | \"cli:zcode\"（各 CLI 默认模型，不支持覆盖）。cwd 可指定项目 worktree。",
 			"consultant（咨询/评估顾问）：当用户点名某个模型来做评估/咨询/看截图（如「请glm来评估一下」「请gpt5.6看看截图仿照设计」）时，用 agent=\"consultant\" 并把用户点名的模型作为 model override（短名自动展开）；截图路径写进 task。",
@@ -2288,8 +2327,8 @@ export default function (pi: ExtensionAPI) {
 				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
 				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
 			}))),
-			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3）" })),
-			async: Type.Optional(Type.Boolean({ description: "异步执行" })),
+			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3；仅 async:false 同步路径有效，异步 fan-out 忽略）" })),
+			async: Type.Optional(Type.Boolean({ description: "异步执行（单发与并行 tasks 均适用）；**缺省 true（非阻塞，返回 runId 后靠完成事件/status 收割）**，只有本轮就要结果时才显式传 false 走同步等待" })),
 			action: Type.Optional(Type.String({ description: "status" })),
 			runId: Type.Optional(Type.String({ description: "异步 run id" })),
 			systemPrompt: Type.Optional(Type.String()),
@@ -2441,12 +2480,37 @@ export default function (pi: ExtensionAPI) {
 
 			if (p.action === "status") {
 				const runs = listAsyncRuns();
-				const target = p.runId ? runs.find((r) => r.id === p.runId) : runs[0];
-				if (!target) return { content: [{ type: "text", text: p.runId ? `Run ${p.runId} not found` : "No async runs yet" }] };
+				// L3 status 默认会话隔离（2026-09-23）：无参只返回本会话派发的 run（按时间最新的一个）；
+				// 跨会话查看须显式带 runId（全局查找不变）。归属判定复用 async-result-watcher 范式：
+				// links 首个可信 async 记录的 sessionId 与 sessionScopeKey()/getCurrentSessionId() 任一相等即放行。
+				let target: AsyncRunRecord | undefined;
+				if (p.runId) {
+					target = runs.find((r) => r.id === p.runId);
+					if (!target) return { content: [{ type: "text", text: `Run ${p.runId} not found` }] };
+				} else {
+					const myIds = new Set(
+						[sessionScopeKey(), getCurrentSessionId()].filter((v): v is string => !!v),
+					);
+					let links: ReturnType<typeof listLinks> = [];
+					try { links = listLinks(); } catch { links = []; }
+					const dispatcherOf = (runId: string): string | undefined => {
+						for (const link of links) {
+							if (link.kind !== "async" || link.targetId !== runId) continue;
+							if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+						}
+						return undefined;
+					};
+					target = runs.filter((r) => {
+						const d = dispatcherOf(r.id);
+						return d !== undefined && myIds.has(d);
+					})[0];
+					if (!target) return { content: [{ type: "text", text: "No async runs for this session yet" }] };
+				}
 				return {
 					content: [{ type: "text", text: [
 						`Run: ${target.id}`,
 						`Agent: ${target.agent ?? "(none)"}`,
+						(target.result?.requestedModel ?? target.result?.model ?? target.model) ? `Model: ${target.result?.requestedModel ?? target.result?.model ?? target.model}` : null,
 						`Task: ${target.task}`,
 						target.cwd ? `CWD: ${target.cwd}` : null,
 						`Status: ${target.status}`,
@@ -2456,7 +2520,48 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (p.tasks && Array.isArray(p.tasks)) {
+			// L3 parallel 缺省异步（2026-09-23）：p.async !== false（缺省/true）时每个 subtask 走与单发
+			// 完全同构的异步派发——写 RUNS_DIR 记录（status running + startedAt + resolveSubagentCwd）+
+			// recordLink（kind async + sessionIdentity）+ 刷新 panel，然后 .then 回写终态；立返 runId 列表。
+			// concurrency 在异步 fan-out 下无限流语义，忽略（见 description）。显式 async:false 才走下面的阻塞分支。
+			if (p.tasks && Array.isArray(p.tasks) && p.async !== false) {
+				const tasks = p.tasks as TaskInput[];
+				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
+				const asyncSid = sessionIdentity(_ctx as never);
+				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
+				const asyncRunIds: string[] = [];
+				const asyncLines: string[] = [];
+				tasks.forEach((t, idx) => {
+					const agentDef = t.agent ? agents.find((a) => a.name === t.agent) ?? null : null;
+					const label = agentDef?.name ?? t.agent ?? `task-${idx + 1}`;
+					const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}${idx.toString(36)}`;
+					asyncRunIds.push(runId);
+					const effModel = t.model ?? agentDefaultModel(agentDef);
+					if (t.agent && !agentDef) {
+						const record: AsyncRunRecord = { id: runId, agent: t.agent, task: t.task ?? "", model: effModel, status: "failed", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined,
+							result: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId, error: `unknown agent: ${t.agent}`, agent: t.agent } };
+						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+						recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${t.agent} unknown` });
+						asyncLines.push(`${runId} [${label}] failed: unknown agent: ${t.agent}`);
+						return;
+					}
+					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined };
+					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
+					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, undefined, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools }).then((result) => {
+						record.status = result.status; record.result = result;
+						recordUsage(agentDef?.name, result);
+						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+						refreshAsyncPanel();
+						notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: t.task ?? "", status: result.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
+					});
+					asyncLines.push(`${runId} [${label}] running`);
+				});
+				refreshAsyncPanel();
+				return { content: [{ type: "text", text: `Async parallel started: ${asyncRunIds.length} task(s)\n${asyncLines.map((l) => `  ${l}`).join("\n")}\nCheck with: subagent-win({ action: "status", runId: "<runId>" })` }] };
+			}
+
+			if (p.tasks && Array.isArray(p.tasks) && p.async === false) {
 				const tasks = p.tasks as TaskInput[];
 				const results = await runParallel(tasks, p.concurrency ?? 3, agents, signal,
 					onUpdate ? (msg, _d) => onUpdate({ content: [{ type: "text", text: msg }] }) : undefined,
@@ -2468,7 +2573,8 @@ export default function (pi: ExtensionAPI) {
 						r.status === "completed"
 							? (r.text || "(no output)")
 							: formatFailureForMainAgent(r, r.triedModels);
-					return "### " + icon + " " + (r.agent || "task-" + (i + 1)) + " (" + r.status + ")\n\n" + body;
+					var effModel = r.requestedModel ?? r.model ?? "(default)";
+					return "### " + icon + " " + (r.agent || "task-" + (i + 1)) + "/" + effModel + " (" + r.status + ")\n\n" + body;
 				});
 				var okCount = results.filter(function(r) { return r.status === "completed"; }).length;
 				var failed = results.filter(function(r) { return r.status === "failed"; });
@@ -2490,7 +2596,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (p.async) {
+			// 默认异步（用户 2026-09-22 指令）：只认「显式 false」为同步，其余（缺省/true）一律非阻塞。
+			// 动机：把「默认非阻塞」落到工具实现，而不是只靠提示词约束调用方（模型漏传 async 时旧实现会静默阻塞）。
+			if (p.async !== false) {
 				const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
@@ -2503,6 +2611,8 @@ export default function (pi: ExtensionAPI) {
 					detail: `agent=${p.agent ?? "subagent"} ${String(p.task ?? "").slice(0, 60)}`,
 				});
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
+				// L3 Model 披露（纯加法）：dispatch 时把 effective model 写入记录，供 status 的 Model: 行展示。
+				if (!record.model) { try { record.model = resolveCallModel(p.model, agentDef) ?? undefined; } catch { /* 保持无 model */ } writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record)); }
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
@@ -2539,13 +2649,18 @@ export default function (pi: ExtensionAPI) {
 					? `⚠ Requested model failed and a fallback was used: ${fallbackChainText(result)}\n`
 					: "";
 				const modelLine = (modelBits || fallbackHint) ? `[subagent ${modelBits}]\n\n${fallbackHint}` : "";
+				// L3 模型披露（纯加法）：Agent:/Model: 头——Model 取实际跑起来的 requestedModel（含 default 回退链）。
+				let headerResolve: string | undefined;
+				try { headerResolve = resolveCallModel(p.model, agentDef); } catch { headerResolve = undefined; }
+				const effectiveModel = result.requestedModel ?? result.model ?? headerResolve ?? "(default)";
+				const identityHeader = `Agent: ${agentDef?.name ?? p.agent ?? "(none)"}\nModel: ${effectiveModel}\n\n`;
 				// Timeout may still leave partial text; surface it instead of empty "(no output)".
 				if (result.status === "completed") {
-					return { content: [{ type: "text", text: modelLine + (result.text || "(no output)") }], details: { result } };
+					return { content: [{ type: "text", text: identityHeader + modelLine + (result.text || "(no output)") }], details: { result } };
 				}
 				// Failed: structured error for main agent (usage cap → switch higher-tier model).
 				const body = formatFailureForMainAgent(result, result.triedModels);
-				return { content: [{ type: "text", text: modelLine + body }], isError: true, details: { result } };
+				return { content: [{ type: "text", text: identityHeader + modelLine + body }], isError: true, details: { result } };
 			}
 
 			return { content: [{ type: "text", text: "Invalid params" }], isError: true };

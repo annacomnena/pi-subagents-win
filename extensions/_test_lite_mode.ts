@@ -65,9 +65,8 @@ const onLines = litePromptLines(onCfg);
 assert("on → 4 行", onLines.length === 4);
 assert("on 首行声明", onLines[0].includes("Lite workflow mode: ON"));
 assert("链段含 general", onLines[1].includes('agent="general"'));
-assert("链段投影 small=searcher 模型", onLines[1].includes("agens/agnes-3.0-flash"));
-assert("链段投影 medium=implementer 模型", onLines[1].includes("opencodego/omen-alpha"));
-assert("链段投影 large=consultant 模型", onLines[1].includes("openai-codex/gpt-5.6-terra"));
+assert("链段不写死模型（编排自选）", !onLines[1].includes("agens/agnes-3.0-flash") && !onLines[1].includes("opencodego/omen-alpha") && !onLines[1].includes("openai-codex/gpt-5.6-terra"));
+assert("链段声明编排自选", onLines[1].includes("自行选择") && onLines[1].includes("禁止写死模型"));
 assert("纪律段含 async-default", onLines[2].includes("默认派 async 非阻塞"));
 assert("纪律段含落盘交接", onLines[2].includes(">30 行"));
 assert("纪律段含独立审查", onLines[2].includes("交 git diff"));
@@ -81,9 +80,9 @@ assert("auto 首行声明", autoLines[0].includes("Lite workflow mode: AUTO"));
 assert("auto 含判据段", autoLines[1].includes("[lite 判据]"));
 assert("auto 含同款纪律", autoLines[2] === onLines[1] && autoLines[3] === onLines[2]);
 
-// 缺模型降级
+// 缺模型也不影响链段（链段不再引用具体模型；liteTiers 只供 /lite 展示）
 const missing = litePromptLines({ liteMode: "on", models: { planner: "Zhipu/glm-5.3" } });
-assert("缺 searcher/implementer/consultant → 占位提示", missing[1].includes("(未配置 models.searcher)") && missing[1].includes("(未配置 models.implementer)") && missing[1].includes("(未配置 models.consultant)"));
+assert("缺模型链段仍完整", missing[1].includes('agent="general"') && missing[1].includes("自行选择"));
 
 // liteTiers / normalizeLiteMode 直接导出
 assert("liteTiers 投影", liteTiers(BASE_CFG.models as any).medium === "opencodego/omen-alpha");

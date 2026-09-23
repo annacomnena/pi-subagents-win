@@ -17,10 +17,120 @@
  * profile 提交落地）。
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { traceSpawn } from "./spawn-trace.ts";
+
+/**
+ * WT 启动器解析 + 别名失效回退（2026-09-23 空壳 tab 根因修复）。
+ *
+ * 背景：`%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe` 在本机是普通 EXE 副本而非
+ * App Execution Alias（reparse tag 应为 0x8000001b）；断电硬崩后它静默 exit 1
+ * （连 `--help` 都零输出），导致 spawnPiTab“返回 OK 但 tab 从未建成”。
+ * 实测：直调包内 `WindowsTerminal.exe -w 0 new-tab ...` 可在现有窗口建成 tab
+ * （PROBE3_OK），故别名失效时回退到直调，不再依赖别名注册状态。
+ *
+ * 策略（进程级缓存，首个 spawn 最多慢 ~2.5s）：别名先行（受支持路径）→
+ * 别名探针失败则直调包内 exe → 都失败则 fail closed（返回 error 进
+ * launch_failed 账本，不谎报 OK）。直调路径每次动态解析（Store 更新会换
+ * 版本目录），不写死版本号。
+ */
+
+/** 健康探针：`--help` 是文档化无副作用元命令（`--version` 不是，不用它判活）。
+ *  pass 条件放宽为 exit==0 即可——实测直调 exe exit 0 但零输出（转交运行实例），
+ *  要求输出文本会误杀可用的直调路径；坏别名的指纹是 exit 1 + 双流全空。 */
+export function probeWtHelp(exePath: string, timeoutMs = 2500): boolean {
+	try {
+		// stdio 必须 ignore：WindowsTerminal.exe 是 GUI 程序，pipe 会导致其初始化挂起；
+		// 只看退出码（坏别名 exit 1，可用直调 exit 0），不读输出。
+		const r = spawnSync(exePath, ["--help"], {
+			timeout: timeoutMs,
+			windowsHide: true,
+			stdio: "ignore",
+		});
+		return r.status === 0 && !r.error;
+	} catch {
+		return false;
+	}
+}
+
+/** 包内直调路径：扫 WindowsApps 取最高版本（读目录即可，无需 powershell）。
+ * 测试注入：`PI_WT_APPS_DIR` 非空则改扫该目录（fail-closed 回归测试用）。 */
+export function resolveDirectTerminalExe(): string | null {
+	try {
+		const dir = process.env.PI_WT_APPS_DIR || "C:/Program Files/WindowsApps";
+		try {
+			const entries = readdirSync(dir);
+		let best: { ver: number[]; path: string } | null = null;
+		for (const e of entries) {
+			const m = /^Microsoft\.WindowsTerminal_([0-9.]+)_x64__8wekyb3d8bbwe$/.exec(e);
+			if (!m) continue;
+			const ver = m[1]!.split(".").map((x) => parseInt(x, 10) || 0);
+			const p = join(dir, e, "WindowsTerminal.exe");
+			if (!existsSync(p)) continue;
+			if (!best || compareVer(ver, best.ver) > 0) best = { ver, path: p };
+		}
+		if (best) return best.path;
+		} catch {
+			/* 目录不可读（WindowsApps ACL 常见）→ 走 powershell 包注册 */
+		}
+		// 回退：Get-AppxPackage 不受目录 ACL 影响（实测本机可用）
+		try {
+			const loc = execFileSync(
+				"powershell.exe",
+				["-NoProfile", "-NonInteractive", "-Command", "(Get-AppxPackage -Name Microsoft.WindowsTerminal).InstallLocation"],
+				{ encoding: "utf8", timeout: 8000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+			).trim();
+			if (loc) {
+				const p = join(loc, "WindowsTerminal.exe");
+				if (existsSync(p)) return p;
+			}
+		} catch {
+			/* powershell 也失败 → 无直调 */
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+function compareVer(a: number[], b: number[]): number {
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const d = (a[i] ?? 0) - (b[i] ?? 0);
+		if (d !== 0) return d;
+	}
+	return 0;
+}
+
+let cachedLauncher: { exe: string; kind: "alias" | "direct" } | null = null;
+
+/** 解析可用启动器（缓存）。返回 null = 别名与直调均不可用，调用方 fail closed。
+ *
+ * 非对称探针策略（实测依据）：别名必须过 `--help` 探针（坏别名 exit 1 零输出，
+ * 健康别名毫秒级返回）；直调路径**不探**——它来自 Get-AppxPackage 包注册表
+ * （系统真相源）+ existsSync 双重确认，而 WindowsTerminal.exe 是 GUI 程序，
+ * `--help` 不同步退出（转交运行实例后 lingering），同步探针必超时误杀。
+ * 直调的真实可用性已由端到端实测背书（PROBE3_OK audit）。 */
+export function healthyLauncher(wtPath: string): { exe: string; kind: "alias" | "direct" } | null {
+	if (cachedLauncher) return cachedLauncher;
+	if (existsSync(wtPath) && probeWtHelp(wtPath)) {
+		cachedLauncher = { exe: wtPath, kind: "alias" };
+		return cachedLauncher;
+	}
+	const direct = resolveDirectTerminalExe();
+	if (direct) {
+		cachedLauncher = { exe: direct, kind: "direct" };
+		return cachedLauncher;
+	}
+	return null;
+}
+
+/** 测试重置启动器缓存。 */
+export function _resetLauncherCache(): void {
+	cachedLauncher = null;
+}
 
 export interface PiLaunchArgsOptions {
 	cwd: string;
@@ -162,6 +272,11 @@ export interface TabLaunchOptions {
 	traceLane?: string;
 	/** 工具排除名单（trace worker §17：隔离 launch/timer/wiki 写工具）；仅显式传入才发射。 */
 	excludeTools?: string[];
+	/**
+	 * node 可执行文件路径（wt new-tab 后启动 pi 用）。缺省回退 process.execPath；
+	 * 早期调用点不传该字段，故必须可选（否则 preflight 拿到 undefined 直接拒发）。
+	 */
+	execPath?: string;
 	/** 异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
 	onSpawnError?: (err: Error) => void;
 }
@@ -189,14 +304,28 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 	if (!existsSync(wtPath)) return { title, prompt, model, error: `preflight: wt not found: ${wtPath}` };
 	if (!existsSync(piCli)) return { title, prompt, model, error: `preflight: pi CLI not found: ${piCli}` };
 	if (!existsSync(cwd)) return { title, prompt, model, error: `preflight: cwd not found: ${cwd}` };
-	if (!existsSync(options.execPath)) {
-		return { title, prompt, model, error: `preflight: node exec not found: ${options.execPath}` };
+	const nodeExecPath = options.execPath ?? process.execPath;
+	if (!existsSync(nodeExecPath)) {
+		return { title, prompt, model, error: `preflight: node exec not found: ${nodeExecPath}` };
+	}
+	// 取证：wt.exe 派生是「空壳 WT 窗口」的第一嫌疑人（见 spawn-trace.ts 头注；PI_SPAWN_TRACE=0 关）
+	traceSpawn("wt", `title=${title} cwd=${cwd} runId=${tabRunId ?? "-"} wt=${wtPath}`);
+	// 2026-09-23 别名失效回退：先探活别名，不行则直调包内 exe（动态解析版本目录）；
+	// 都不可用直接 fail closed（进 launch_failed），不再谎报 OK。
+	const launcher = healthyLauncher(wtPath);
+	if (!launcher) {
+		const err = `wt launcher unhealthy: alias(${wtPath}) --help failed and no direct WindowsTerminal.exe resolvable`;
+		onSpawnError?.(new Error(err));
+		return { title, prompt, model, error: err };
+	}
+	if (launcher.kind === "direct") {
+		traceSpawn("wt", `title=${title} alias-unhealthy, fallback direct=${launcher.exe}`);
 	}
 	try {
-		const child = spawn(wtPath, buildWindowsTerminalArgs(title, wtPromptArg(prompt, tabRunId), {
+		const child = spawn(launcher.exe, buildWindowsTerminalArgs(title, wtPromptArg(prompt, tabRunId), {
 			cwd,
 			piCli,
-			execPath: process.execPath,
+			execPath: nodeExecPath,
 			model,
 			skills,
 			tabRunId,

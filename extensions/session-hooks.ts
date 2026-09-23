@@ -14,6 +14,7 @@ import { isTraceWorker } from "./capabilities.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
+import { clearSessionStartCwd, recordSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { writeLiveness, writeScopeLiveness } from "./runtime/liveness.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
@@ -58,6 +59,17 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 	// trace-fusion 追赶收集：主会话启动时，扫「三路已终态但未出报告」的 running run
 	// 补后台收集（覆盖「三路全部在无主会话时完成」——重启后 watcher 把既有 result 标 seen，
 	// onTabFinished 不再触发，只能靠这里）。§24.1：磁盘是真相源，watch 只是加速器。
+	// home 守卫启动快照（0923）：最早按持久 session UUID 记录 initialCwd（首写优先，
+	// 永不从后来变化的 cwd 回填；缺快照的会话 attach 时 fail closed）。无条件记录（含 tab）。
+	pi.on("session_start", (_event, ctx) => {
+		try {
+			const sid = durableSessionIdentity(ctx as never);
+			if (!sid || sid === "unknown") return;
+			const cwd = (ctx as unknown as { cwd?: unknown }).cwd;
+			recordSessionStartCwd(sid, typeof cwd === "string" && cwd ? cwd : process.cwd());
+		} catch { /* gauge 永不打断主流程 */ }
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		if (!isMainSession()) return;
 		const catches = catchUpAutoCollect();
@@ -71,7 +83,11 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 		void ctx;
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
+		try {
+			const sid = durableSessionIdentity(ctx as never);
+			if (sid && sid !== "unknown") clearSessionStartCwd(sid);
+		} catch { /* ignore */ }
 		for (const cleanup of deps.cleanups) {
 			try { cleanup(); } catch { /* ignore */ }
 		}

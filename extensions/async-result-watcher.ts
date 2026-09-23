@@ -18,7 +18,7 @@
  *     ② claimNotified（.notified 文件 wx 原子，跨实例/跨 reload）
  *     ③ preInject/postInject（injection-gate 互斥）
  *   - 10s tick 兜底：全量扫描（Windows 丢事件 + 进程重启窗口）
- *   - 注册：session_start；shouldRegisterWatcher()（主会话/owner watch，子 agent 恒不 watch）
+ *   - 注册：session_start；shouldRegisterAsyncResultWatcher()（主会话/任意 tab/有身份会话 watch，子 agent 恒不 watch）
  *   - 注入内容：只含 runId/agent/终态/产物路径，不含全文
  *     （用 subagent-win({action:"status",runId}) 取全文）
  */
@@ -30,8 +30,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { refreshAsyncPanel } from "./async-panel.ts";
-import { claimNotified, shouldRegisterWatcher } from "./event-bus.ts";
-import { getCurrentSessionId, setCurrentSessionId } from "./identity.ts";
+import { claimNotified } from "./event-bus.ts";
+import { getCurrentSessionId, isMainSession, isSubagent, isTabSession, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
+import { defaultLinksPath, listLinks } from "./links.ts";
 import { preInject, postInject, injectFollowUpQuietly, type InjectionContext } from "./injection-gate.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
@@ -67,6 +68,8 @@ export interface AsyncResultWatcherOptions {
 	sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => void;
 	/** 供测试注入的钩子：run 终态时回调（返回 true 表示已消费，跳过默认注入）。 */
 	onRunFinished?: (runId: string) => void;
+	/** 派发溯源账本路径（缺省 defaultLinksPath()；测试注入隔离文件）。 */
+	linksPath?: string;
 }
 
 // ── 模块级状态 ─────────────────────────────────────────────────────────
@@ -124,6 +127,30 @@ function readRunRecord(runsDir: string, runId: string): RunRecord | null {
 	}
 }
 
+// ── 投递路由 ───────────────────────────────────────────────────────────
+
+/**
+ * 定位 async run 的派发者（0923 误投修复，只读路由）。
+ *
+ * 在 links.jsonl（at 倒序）中找首个 `kind === "async" && targetId === runId`
+ * 且 sessionId 可信（非空、非 "unknown"）的记录；损坏行由 listLinks 跳过。
+ * 找不到 → undefined（调用方 fail closed，绝不先到先得）。
+ * never-throw：listLinks 异常也收敛为 undefined。
+ */
+function asyncDispatcherFor(runId: string, linksPath: string): string | undefined {
+	let links;
+	try {
+		links = listLinks(linksPath);
+	} catch {
+		return undefined;
+	}
+	for (const link of links) {
+		if (link.kind !== "async" || link.targetId !== runId) continue;
+		if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+	}
+	return undefined;
+}
+
 // ── 核心处理 ───────────────────────────────────────────────────────────
 
 /**
@@ -167,17 +194,45 @@ export function onRunFile(
 	// 只处理终态（status !== "running" 覆盖全部终态值，含类型外溢 cancelled/aborted/timeout）
 	if (record.status === "running") return false;
 
+	// 投递路由（0923 误投修复）：async 完成只属于派发者。必须在 markSeen、claimNotified、
+	// preInject、toast、panel、hook、注入之前挡住非接收者——零副作用（不标 seen、不认领、
+	// 不 toast、不注入；不标 seen 保证派发者恢复后仍可补投）。双域校验复用 event-bus
+	// onTabResultFile 范式：派发时身份（tab runId 优先）与恢复后 UUID 任一匹配即放行。
+	let dispatcher: string | undefined;
+	try {
+		dispatcher = asyncDispatcherFor(runId, opts.linksPath ?? defaultLinksPath());
+	} catch {
+		dispatcher = undefined;
+	}
+	if (!dispatcher) {
+		// fail closed：无派发记录 / 身份不可信 → 不消费，留待人工处理（绝不先到先得）。
+		try { console.error(`[async-result-watcher] no async dispatch link for ${runId}, skip (fail closed, awaiting manual handling)`); } catch { /* ignore */ }
+		return false;
+	}
+	if (dispatcher !== sessionScopeKey() && dispatcher !== getCurrentSessionId()) {
+		return false; // 非接收者：静默早退（event-bus foreign-recipient 同范式）
+	}
+
 	markRunSeen(runId);
 
 	// 去重层 ②：跨实例 wx 原子认领（.notified 文件）
 	if (!claimNotified(runsDir, runId)) return false;
 
-	// 去重层 ③：injection-gate 互斥
-	const sessionId = getCurrentSessionId();
+	// 去重层 ③：injection-gate 互斥。派发者已在上游确认 → 置 dispatcherWake（复用
+	// event-bus Phase 4d 范式）：cutover 下跳过 master owner 压制但保留 claimInjection
+	// 互斥；legacy（未切换/无 registry）行为逐字节不变。
+	const sessionId = getCurrentSessionId() ?? sessionScopeKey();
 	const key = `async-result-${runId}-${record.status}`;
-	const gateCtx: InjectionContext = { key, sessionId, path: "legacy-eventbus" };
+	const gateCtx: InjectionContext = { key, sessionId, path: "legacy-eventbus", dispatcherWake: true };
 	const gate = preInject(gateCtx);
-	if (!gate.inject) return false;
+	if (!gate.inject) {
+		// 未实际发送，不得留下永久已投递标记：释放本次 .notified 认领（本调用刚创建）
+		// + 内存 seen，供派发者下 tick 重试（沿用 busy 释放语义；不碰 injection claim——
+		// 本路径未持有，holder 门禁防误放他人认领）。
+		try { unlinkSync(join(runsDir, `${runId}.notified`)); } catch { /* best-effort */ }
+		seenRunIds.delete(runId);
+		return false;
+	}
 
 	// 自定义 hook（返回 true 表示已消费，跳过默认注入）
 	if (opts.onRunFinished) {
@@ -262,12 +317,32 @@ export function pollUnnotified(
 // ── 注册 ──────────────────────────────────────────────────────────────
 
 /**
+ * async 专用注册谓词（0923 返修：非 owner tab 派发者注册缺口）。
+ *
+ * 不复用 event-bus shouldRegisterWatcher()——后者在 legacy 下只放行主会话、
+ * cutover 下只放行 attachment owner，会把合法的非 owner tab 派发者挡在门外
+ * （该会话派发的 async 终态留置但无人补投）。
+ *
+ * 放宽注册面安全，理由：
+ *   - 路由校验在消费前：onRunFile 先由 asyncDispatcherFor + 身份双域判定，
+ *     非接收者零副作用早退（不标 seen、不认领、不注入），fail closed；
+ *   - 多 watcher 共存安全：claimNotified（wx 原子）+ injection-gate 互斥保证
+ *     exactly-once，多实例同时 watch 同一 run 至多投递一次。
+ * 故注册面可放宽（凡可能是派发者的会话都 watch），消费面保持 fail closed。
+ */
+export function shouldRegisterAsyncResultWatcher(): boolean {
+	if (isSubagent()) return false; // 子 agent 恒不 watch
+	if (isMainSession()) return true;
+	if (isTabSession()) return true; // 任意 tab（含非 owner 派发者）
+	return getCurrentSessionId() !== undefined; // 兜底：有会话身份即 watch
+}
+
+/**
  * 注册 async run 终态 watcher。返回清理函数（测试用）。
  *
- * 注册条件（同 event-bus）：shouldRegisterWatcher()
+ * 注册条件（async 专用，不复用 event-bus shouldRegisterWatcher）：
  *   - 子 agent 恒不 watch
- *   - 主会话（无 tab-run-id、非 subagent）→ watch
- *   - cutover + attachment → 仅 owner watch
+ *   - 主会话 / 任意 tab（含非 owner 派发者）/ 有会话身份 → watch
  *
  * 延迟到 session_start 再判定身份（CLI flag 在扩展加载完成后才就绪）。
  */
@@ -286,7 +361,7 @@ export function registerAsyncResultWatcher(
 	};
 
 	const begin = (): void => {
-		if (!shouldRegisterWatcher()) return;
+		if (!shouldRegisterAsyncResultWatcher()) return;
 		closeWatcher();
 		clearTick();
 		const gen = ++watcherGen;
