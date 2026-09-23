@@ -43,11 +43,12 @@ import { traceSpawn } from "./spawn-trace.ts";
  *  要求输出文本会误杀可用的直调路径；坏别名的指纹是 exit 1 + 双流全空。 */
 export function probeWtHelp(exePath: string, timeoutMs = 2500): boolean {
 	try {
+		// stdio 必须 ignore：WindowsTerminal.exe 是 GUI 程序，pipe 会导致其初始化挂起；
+		// 只看退出码（坏别名 exit 1，可用直调 exit 0），不读输出。
 		const r = spawnSync(exePath, ["--help"], {
-			encoding: "utf8",
 			timeout: timeoutMs,
 			windowsHide: true,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: "ignore",
 		});
 		return r.status === 0 && !r.error;
 	} catch {
@@ -105,7 +106,13 @@ function compareVer(a: number[], b: number[]): number {
 
 let cachedLauncher: { exe: string; kind: "alias" | "direct" } | null = null;
 
-/** 解析可用启动器（缓存）。返回 null = 别名与直调均不可用，调用方 fail closed。 */
+/** 解析可用启动器（缓存）。返回 null = 别名与直调均不可用，调用方 fail closed。
+ *
+ * 非对称探针策略（实测依据）：别名必须过 `--help` 探针（坏别名 exit 1 零输出，
+ * 健康别名毫秒级返回）；直调路径**不探**——它来自 Get-AppxPackage 包注册表
+ * （系统真相源）+ existsSync 双重确认，而 WindowsTerminal.exe 是 GUI 程序，
+ * `--help` 不同步退出（转交运行实例后 lingering），同步探针必超时误杀。
+ * 直调的真实可用性已由端到端实测背书（PROBE3_OK audit）。 */
 export function healthyLauncher(wtPath: string): { exe: string; kind: "alias" | "direct" } | null {
 	if (cachedLauncher) return cachedLauncher;
 	if (existsSync(wtPath) && probeWtHelp(wtPath)) {
@@ -113,7 +120,7 @@ export function healthyLauncher(wtPath: string): { exe: string; kind: "alias" | 
 		return cachedLauncher;
 	}
 	const direct = resolveDirectTerminalExe();
-	if (direct && probeWtHelp(direct)) {
+	if (direct) {
 		cachedLauncher = { exe: direct, kind: "direct" };
 		return cachedLauncher;
 	}
