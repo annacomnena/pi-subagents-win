@@ -38,7 +38,7 @@ import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trac
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
-import { formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
+import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -1726,7 +1726,10 @@ export default function (pi: ExtensionAPI) {
 	// 任一账本不可读只降级为 "(unknown)"，永不打断 status。
 	function recentScopesLine(): string {
 		try {
-			return formatRecentScopes(listRecentScopes());
+			const items = listRecentScopes();
+			// P0 返修：空结果须区分“窗口内无活动”与“三账本全缺席（无证据）”
+			if (items.length === 0 && !anyLedgerPresent()) return "(unknown)";
+			return formatRecentScopes(items);
 		} catch {
 			return "(unknown)";
 		}
