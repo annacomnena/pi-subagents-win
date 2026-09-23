@@ -15,5 +15,5 @@ errors:
     status: open
     phenomenon: "subagent 派发全部失败：约 1.7s / 0 轮 / exit 1 / 空输出，换模型与换供应商均无效。"
     root_cause: "子进程启动需加载本仓 extensions/**；在飞实现轮把 extensions 文件写到瞬态不完整状态（例：函数声明后函数体未落盘，master-injection.ts:71），于是一切新起的 pi 子进程加载即死。症状看起来像模型/供应商故障，极易误判。"
-    constraint: "遇到该指纹先跑 `npm run smoke:extension-load` 判定，不要在模型/供应商层反复重试；确认是加载错时，先停派发并等写入方收敛，必要时由主会话直接修（不可派 subagent，因为派发已死）；修复后必须重跑 smoke 才恢复派发。实现轮验收必须包含 `smoke:extension-load`。"
+    constraint: "遇到该指纹先跑 `npm run smoke:extension-load` 判定，不要在模型/供应商层反复重试；确认是加载错时，先停派发并等写入方收敛，必要时由主会话直接修（不可派 subagent，因为派发已死）；修复后必须重跑 smoke 才恢复派发。实现轮验收必须包含 `smoke:extension-load`。 另：**reload 插件前必须先确认 smoke OK**——用户侧 reload 若撞上在飞编辑窗口，表现同样是「插件没加载」（2026-09-23 三次复发）；主会话应在任何在飞实现轮结束、且 smoke OK 后再通知用户 reload。"
     verification: "`npm run smoke:extension-load` 输出 OK/FAIL + 报错 file:line；修复后复跑 smoke 与 `test:gui-master-unlock`。"
