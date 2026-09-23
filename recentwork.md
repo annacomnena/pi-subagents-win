@@ -28,10 +28,23 @@
 | 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
 | 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ C1 Broker 开工 | none | C1（新包 `pi-packages/computer-use`）→ C2 pi 工具 → C3 skill |
 | 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 |
+| 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 24 - 微信连接页 opt-in UX 修复（入口不可发现/不可启用）
+
+- **日期**：2026-09-23
+- **一句话**：用户实测"GUI 里找不到微信连接"——根因是入口仅在 opt-in 开启后才渲染、而全仓无任何 `/wechat` 命令可开；改为入口常显 + 页内启用按钮 + 补 `POST /v1/wechat/enable|disable`（走既有 token 鉴权、原子写、保留其它字段）。
+- **涉及模块**：`extensions/runtime-host/{server.ts,wechat-bind.ts}`、`extensions/_test_wechat_bind.ts`、`gui/src/pages/{ChannelsPage,RuntimeOverlay}.tsx`、`gui/src/api/{client,types}.ts`、`gui/src/store.ts`
+- **产物**：本地 `plans/0923_wechat_optin_ux_fix.md`
+- **Wiki**：[[微信 iLink 通道]]（新增"开关路径"节）
+- **Priority**：P1
+- **Status**：complete（TUI 对等命令 `/wechat` 待补）
+- **Commit**：`5bfd258`
+- **Verification**：smoke OK；`_test_wechat_bind.ts` 12 组断言（新增 T12：无 token 401／开关幂等／写盘保留其它字段／status 403↔200／写失败 500）；gui tsc + vite build 成功。
 
 ### Item 23 - 主动性套件 v2 接线（可观察/可开关/可审计，不自动动手）
 
