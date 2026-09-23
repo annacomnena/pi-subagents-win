@@ -117,6 +117,7 @@ export function buildSuccessorPrompt(input: {
 		`交接包：${input.handoffPath}（先读它恢复上下文）。`,
 		`handoff token：${input.token}（仅你可用）。transfer id：${input.transferId}，from generation ${input.fromGeneration}。`,
 		"步骤：①读交接包；②调 master-attach 工具并传入 token 接管；③调 master-status 确认 generation+1 且 owner 是你；④调 master-transfer-confirm 并传入 transferId（标记交接完成）。",
+		"只在 home 会话接 global；仓库任务走 local Master。",
 	].join("\n");
 }
 

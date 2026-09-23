@@ -79,6 +79,7 @@
     "test:runtime-consumer": "node --experimental-strip-types ./extensions/_test_runtime_consumer.ts",
     "test:runtime-cutover": "node --experimental-strip-types ./extensions/_test_runtime_cutover.ts",
     "test:runtime-master-control": "node --experimental-strip-types ./extensions/_test_runtime_master_control.ts",
+    "test:master-home-guard": "node --experimental-strip-types ./extensions/_test_master_home_guard.ts",
     "test:runtime-master-transfer": "node --experimental-strip-types ./extensions/_test_runtime_master_transfer.ts",
     "test:runtime-master-pressure": "node --experimental-strip-types ./extensions/_test_runtime_master_pressure.ts",
     "test:runtime-master-succession": "node --experimental-strip-types ./extensions/_test_runtime_master_succession.ts",

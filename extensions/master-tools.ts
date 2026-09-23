@@ -12,7 +12,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { homedir } from "node:os";
 import { sessionIdentity } from "./links.ts";
+import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
+import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { durableSessionIdentity, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import { triggerOwnershipRecheck } from "./event-bus.ts";
 import {
@@ -65,12 +68,30 @@ function autoHandoffLine(cfg: MasterSuccessionConfig): string {
 export function masterAttachLogic(
 	sessionId: string,
 	input: { token?: string; forceStale?: boolean; confirm?: boolean } = {},
+	gate: { cwd: string; initialCwd: string | null; env?: { home: string; platform: NodeJS.Platform } },
 ): ToolOutcome {
 	if (input.forceStale && !input.confirm) {
 		return { text: "master-attach: --force-stale 须与 confirm 同用（二次人工确认），拒绝", isError: true };
 	}
-	const r = attachCurrentSession({ sessionId, token: input.token, forceStale: input.forceStale || undefined });
-	if (!r.ok) return { text: `master-attach 失败：${r.reason}`, isError: true };
+	const home = gate.env?.home ?? homedir();
+	const r = attachCurrentSession({
+		sessionId,
+		token: input.token,
+		forceStale: input.forceStale || undefined,
+		cwd: gate.cwd,
+		initialCwd: gate.initialCwd,
+		...(gate.env ? { env: gate.env } : {}),
+	});
+	if (!r.ok) {
+		if (r.reason === "not-home-dir") {
+			return {
+				text: formatNotHomeDirMessage(home, { hasToken: Boolean(input.token) }),
+				isError: true,
+				details: { reason: r.reason },
+			};
+		}
+		return { text: `master-attach 失败：${r.reason}`, isError: true };
+	}
 	return {
 		text: `master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sessionId.slice(0, 12)}`,
 		details: { generation: r.attachment.generation, genesis: r.genesis },
@@ -303,7 +324,7 @@ export function registerMasterTools(
 	pi.registerTool({
 		name: "master-attach",
 		label: "Master Attach",
-		description: `显式接管逻辑 Master（genesis / token 交接 / forceStale 强接需 confirm 双确认）。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		description: `显式接管逻辑 Master（genesis / token 交接 / forceStale 强接需 confirm 双确认）。全局 Master 只能在用户 home 根目录会话执行，仓库会话请持对应 local Master。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
 		parameters: Type.Object({
 			token: Type.Optional(Type.String({ description: "handoff token（接班时用）" })),
 			forceStale: Type.Optional(Type.Boolean({ description: "owner 失联时强接（必须与 confirm 同用）" })),
@@ -321,7 +342,10 @@ export function registerMasterTools(
 			const sid = toolSession(ctx);
 			if (!sid || sid === "unknown") return textResult({ text: "master-attach: 无法确定当前会话身份，拒绝", isError: true });
 			const params = rawParams as { token?: string; forceStale?: boolean; confirm?: boolean };
-			const outcome = masterAttachLogic(sid, params);
+			// 会话实际 cwd 来自调用上下文，不取 tool 参数；启动快照按同 UUID 读取（缺失 fail closed）。
+			const ctxCwd = (ctx as unknown as { cwd?: unknown }).cwd;
+			const cwd = typeof ctxCwd === "string" && ctxCwd ? ctxCwd : process.cwd();
+			const outcome = masterAttachLogic(sid, params, { cwd, initialCwd: readSessionStartCwd(sid) });
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（succession 后继 tab 在
 			// session_start 之后才成 owner，一次性 session_start 判定漏注册；best-effort，失败不影响接管）。
 			if (!outcome.isError) {
@@ -334,7 +358,7 @@ export function registerMasterTools(
 	pi.registerTool({
 		name: "master-detach",
 		label: "Master Detach",
-		description: `交出逻辑 Master 并颁发 handoff token（仅 owner 可调）。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
+		description: `交出逻辑 Master 并颁发 handoff token（仅 owner 可调）。接班者请在 home 新会话接管，仓库会话只持 local。子 agent 不可调。${USER_DIRECTIVE} ${NO_COMPOSE}`,
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ description: "交接原因" })),
 		}),

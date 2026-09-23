@@ -45,6 +45,8 @@ import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime
 import { registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
+import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
+import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
 import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
@@ -1763,8 +1765,16 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("master-attach: --force-stale 须与 --confirm 同用（二次人工确认），拒绝", "warning");
 				return;
 			}
-			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined });
-			if (!r.ok) { ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning"); return; }
+			// home 守卫（0923）：会话实际 cwd 取自可信 Pi ctx；启动快照按同 UUID 读取（缺失 fail closed）。
+			const r = attachCurrentSession({ sessionId: sid, token, forceStale: force || undefined, cwd: ctx.cwd, initialCwd: readSessionStartCwd(sid) });
+			if (!r.ok) {
+				if (r.reason === "not-home-dir") {
+					ctx.ui.notify(formatNotHomeDirMessage(homedir(), { hasToken: Boolean(token) }), "warning");
+					return;
+				}
+				ctx.ui.notify(`master-attach 失败：${r.reason}`, "warning");
+				return;
+			}
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
 			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
 			ctx.ui.notify(`master-attach 成功：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
@@ -1821,7 +1831,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.registerCommand("master-detach", {
-		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]）",
+		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]；接班者在 home 新会话接管）",
 		handler: async (args, ctx) => {
 			const sid = durableSessionIdentity(ctx as never); // 持久 UUID 域
 			if (!sid || sid === "unknown") { ctx.ui.notify("master-detach: 无法确定当前会话身份，拒绝", "warning"); return; }
@@ -2018,7 +2028,9 @@ export default function (pi: ExtensionAPI) {
 		const piCli = findPiCli();
 		const runId = newTabRunId();
 		const taskId = `transfer-${transferId.slice(3, 9)}`;
-		const cwd = process.cwd();
+		// home 守卫配套（0923）：global successor 一律在 home 启动，否则后继 attach 必被拒绝。
+		const cwd = homedir();
+		if (!cwd) throw new Error("master-transfer: 无法确定 home 目录，拒绝 spawn 后继（旧主仍是 owner）");
 		const runsDir = defaultTabRunsDir();
 		const dispatch: TabDispatchRecord = {
 			id: runId, version: 1, taskId, mode: "execute", title, cwd,
