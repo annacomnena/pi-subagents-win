@@ -4,7 +4,7 @@ kind: concept
 status: current
 updated: 2026-09-23
 schema_version: 1
-revision: 2
+revision: 4
 ---
 
 ## async-delivery-ownership
@@ -71,8 +71,8 @@ revision: 2
 
 - 标题：统一审批门策略与架构（三份参考实现对照已收尾）
 - 适用范围：审批门策略判定、待审队列接口形状拟定；边界与入口抄 openclaw，准入后动作分级抄 Hermes，队列形状抄 opencode（三处保守化改造）
-- 入口：Wiki/Decisions/approval-gate-policy.md
-- 入口：Wiki/Architecture/approval-gate.md
+- Wiki：Wiki/Decisions/approval-gate-policy.md
+- Wiki：Wiki/Architecture/approval-gate.md
 - 证据：plans/0923_hermes_approval_recon.md
 - 证据：plans/0923_opencode_permission_recon.md
 - 证据：plans/0923_openclaw_security_recon.md
@@ -84,10 +84,33 @@ revision: 2
 
 - 标题：本机服务默认 loopback，对外暴露显式 opt-in + 认证（拟）
 - 适用范围：daemon / eventual wechat bridge 的 bind 面与暴露审批；配置改动不热切换
-- 入口：Wiki/Decisions/host-exposure-hardening.md
-- 入口：extensions/runtime-host/server.ts
+- Wiki：Wiki/Decisions/host-exposure-hardening.md
+- 入口：extensions/runtime-host/server.ts::startRuntimeHost
 - 证据：plans/0923_opencode_permission_recon.md#3.2
 - 证据：plans/0923_openclaw_security_recon.md#4
 - 证据：extensions/runtime-host/server.ts
 - 内容更新：2026-09-23T00:00:00.000Z
 - 引用验证：2026-09-23T00:00:00.000Z
+
+## wechat-ilink-login
+
+- 标题：微信 iLink 登录/绑定协议契约与绑定切片
+- 适用范围：扫码取码/状态轮询协议事实与 GUI 绑定切片边界（v1 只做绑定/解绑/状态）
+- Wiki：Wiki/Architecture/wechat-ilink-channel.md → 登录/绑定协议契约（源码已验证）
+- 入口：scripts/wechat-ilink-probe.mjs::cmdLogin
+- 证据：plans/0923_wechat_gui_bind_plan.md
+- 内容更新：2026-09-23T09:30:16.232Z
+- 引用验证：2026-09-23T09:30:16.232Z
+
+## gui-master-inject-trust
+
+- 标题：本机 GUI 注入 master 信任通道（含 B 案与 must-fix）
+- 适用范围：bootstrap OTT 窄通道、B 案凭据作用域化（未实现）、M1–M3 修复（待 L4）
+- Wiki：Wiki/Decisions/gui-master-unlock.md
+- 入口：extensions/runtime/master-injection.ts::checkTrustedLocalChannel
+- 入口：extensions/runtime-host/server.ts::createRuntimeHostServer
+- 证据：plans/0923_gui_master_unlock_review.md
+- 证据：plans/0923_gui_master_unlock_fix.md
+- 内容更新：2026-09-23T09:30:16.232Z
+- 引用验证：2026-09-23T09:30:16.232Z
+

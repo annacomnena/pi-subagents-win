@@ -16,9 +16,21 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 12 | P2 | global-view phase 2 探测深度增强（设计已定，实现中） | none | 按 `plans/0923_global_view_depth_plan.md` 实现并提交 |
+| 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 12 - global-view phase 2 探测深度增强
+
+- **日期**：2026-09-23
+- **一句话**：为“一次探测看不够深”补内容层/异常聚合/差分/跨仓闸口读取；实现 + 独立 L4 复核 + M1 修复均已落地。
+- **产物**：本地 `plans/0923_global_view_depth_plan.md`（设计）、`plans/0923_global_view_depth_impl.md`（实现）、`plans/0923_global_view_depth_review.md`（L4 复核 PASS-WITH-MUST-FIX）、`plans/0923_global_view_tail_lines_fix.md`（M1 修复）
+- **Wiki**：无（工具增强，暂无需耐久页）
+- **Priority**：P2
+- **Status**：complete（待提交后随分支推送）
+- **Commit**：`70c8aa3`
 
 ### Item 10 - GUI 扫码连接微信切片（v1 绑定/解绑/状态）
 
@@ -29,7 +41,7 @@
 - **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
 - **Priority**：P1
 - **Status**：planning/active（尚未实现）
-- **Commit**：<!--COMMIT_HASH-->
+- **Commit**：`c54c378`（协议契约 + 切片设计）
 
 ### Item 6 - 本机 GUI 解锁 master 切片
 
@@ -40,7 +52,7 @@
 - **Wiki**：[[GUI 解锁 Master]]（`status: draft`）
 - **Priority**：P1
 - **Status**：active
-- **Verification**：待补（占用锁、审计行、`master-offline` 文案的端到端验收）
+- **Verification**：待补（占用锁、审计行、`master-offline` 文案的端到端验收）。当前真实状态：B 案（浏览器凭据作用域化，`sw_gui_token`）**已决策、未实现**；must-fix（M1–M3）**已实现、独立 L4 复核进行中结论未定**；通道代码仍仅在未提交工作树。
 
 ### Item 5 - 微信 iLink 探针
 
@@ -66,6 +78,16 @@
 
 ## Archived Tasks
 
+### Item 11 - 仓库记忆层建立
+
+- **日期**：2026-09-23
+- **一句话**：建立“耐久+时序”双层记忆：`Wiki/` 8 页（Decisions/Architecture）+ `recentwork.md` 时间线 + hotspot 路由缓存；含 hotspot frontmatter 契约冲突修复。
+- **Commit**：`cb9c3b5`（hotspot 兼容）、`49d5fd0`（记忆层）、`e473804`（参考对照 + L4 修正）
+- **Wiki**：[[Wiki 索引]]
+- **Priority**：P2
+- **Status**：complete
+- **Verification**：`check_repo_wiki.py` OK + `wiki-nav rebuild`；独立 L4 复核本地 `plans/0923_memory_layer_review.md`（PASS-WITH-MUST-FIX，5 项已修）
+
 ### Item 9 - Hermes 审批机制侦察
 
 - **日期**：2026-09-23
@@ -74,7 +96,7 @@
 - **Wiki**：[[审批门策略]]（参考实现对照）、[[统一审批门架构]]（待审队列接口形状拟定背景）
 - **Priority**：P2
 - **Status**：complete
-- **Commit**：<!--COMMIT_HASH-->
+- **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
 ### Item 8 - openclaw 安全模型侦察
 
@@ -84,7 +106,7 @@
 - **Wiki**：[[审批门策略]]（参考实现对照）、[[Host 暴露面加固]]（新建，`status: proposed`）
 - **Priority**：P2
 - **Status**：complete
-- **Commit**：<!--COMMIT_HASH-->
+- **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
 ### Item 7 - opencode 权限/服务信任侦察
 
@@ -94,7 +116,7 @@
 - **Wiki**：[[审批门策略]]（参考实现对照）、[[统一审批门架构]]（待审队列接口形状拟定）、[[Host 暴露面加固]]（新建，`status: proposed`）
 - **Priority**：P2
 - **Status**：complete
-- **Commit**：<!--COMMIT_HASH-->
+- **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
 ### Item 3 - runtime 卫生三连
 

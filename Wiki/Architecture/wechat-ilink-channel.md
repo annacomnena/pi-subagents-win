@@ -50,7 +50,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 ## 绑定切片边界（拟，未实现）
 
-- v1 只做绑定/解绑/状态（拟，未实现），默认 OFF：未启用时 `/v1/wechat/*` 全 403 + GUI 无入口。**token 永不进浏览器/日志/WS/argv**；凭据拟落 `<runtimeDir>/wechat/credentials.json`（0600）；二维码由 daemon 代理取图转 data URL（拟，未实现）。进程放置裁定（拟）：登录=daemon 内有界异步任务，**长驻轮询通道仍走受监督 worker**。
+- v1 只做绑定/解绑/状态（拟，未实现），默认 OFF：未启用时 `/v1/wechat/*` 全 403 + GUI 无入口。**token 永不进浏览器/日志/WS/argv**；凭据拟落 `<runtimeDir>/wechat/credentials.json`（0600）；二维码由 daemon 代理取图转 data URL（拟，未实现）。进程放置已裁定（D14）：登录/绑定 = daemon 内**有界异步任务**（取码 1 次 + ≤120s 轮询 + AbortController 超时 + 结束即释放）；**长驻长轮询通道仍走受监督 worker**。（v1 只做绑定/解绑/状态，未实现）
 
 ## Evidence
 
