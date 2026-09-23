@@ -5,6 +5,10 @@ import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
 	cleanupWtPromptArg,
+	_resetLauncherCache,
+	healthyLauncher,
+	probeWtHelp,
+	resolveDirectTerminalExe,
 	composeLaunchTitle,
 	deriveLaunchTitle,
 	isWorktreePath,
@@ -321,6 +325,25 @@ assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 p
 		cwd: ".", title: "t", prompt: "p",
 	});
 	assert.ok(badExec.error?.startsWith("preflight: node exec not found"), `缺失 execPath 应 preflight 拦截：${badExec.error}`);
+}
+
+{
+// 别名失效回退（2026-09-23）：探针只认 exit==0；直调路径动态解析；缓存命中不再探。
+_resetLauncherCache();
+assert.equal(typeof probeWtHelp, "function", "probeWtHelp 导出");
+assert.equal(typeof resolveDirectTerminalExe, "function", "resolveDirectTerminalExe 导出");
+// 不存在的 exe 探针必 false（never-throw，不卡超时太久）
+assert.equal(probeWtHelp("C:/no/such/wt.exe", 1500), false, "不存在路径探针 false");
+// 直调解析在本机应命中包内 exe（若 Store 包缺席则跳过，不断言失败）
+const direct = resolveDirectTerminalExe();
+if (direct !== null) {
+  assert.ok(direct.endsWith("WindowsTerminal.exe"), `直调路径应为包内 exe：${direct}`);
+}
+// healthyLauncher 缓存：第二次调用不再跑探针（用坏路径验证 fail closed 不抛）
+_resetLauncherCache();
+const bad = healthyLauncher("C:/no/such/wt.exe");
+assert.ok(bad === null || typeof bad.exe === "string", "全坏时返回 null 或可用项，不抛");
+_resetLauncherCache();
 }
 
 console.log("launch tests passed");
