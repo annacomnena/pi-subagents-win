@@ -24,10 +24,23 @@
 | 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） |
 | 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） |
 | 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
+| 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 20 - hotspot 工具 pending 队列误写仓库根 state/（待修）
+
+- **日期**：2026-09-23
+- **一句话**：`hotspot` 工具把待办队列写到 **CWD 的 `state/hotspot-pending.jsonl`**（应在 agentDir），在仓库里留下 `state/` 目录并污染工作树。
+- **涉及模块**：`extensions/hotspot/**`（路径推导处）
+- **产物**：无（现场证据：`state/hotspot-pending.jsonl`，已临时加入 `.gitignore` 止血）
+- **Wiki**：无
+- **Priority**：P3
+- **Status**：active（待修）
+- **Commit**：—
+- **Verification**：修后断言 pending 队列落在 agentDir（`~/.pi/agent/...`）；仓库根不再出现 `state/`。
 
 ### Item 19 - set-timer 的 target 参数 schema 恒拒修复
 
@@ -38,7 +51,7 @@
 - **Wiki**：无（Wiki 无 timers 主题页；契约记入工具 description 与代码注释）
 - **Priority**：P2
 - **Status**：complete
-- **Commit**：`<!--COMMIT_HASH-->`
+- **Commit**：`9960ed9`
 - **Verification**：`npx tsx extensions/_test_timers_target_compat.ts` 通过 + `npm run smoke:extension-load` OK。
 
 ### Item 18 - outbox 事件唤醒（消息入会话延迟 5s → 9ms/≤200ms）
