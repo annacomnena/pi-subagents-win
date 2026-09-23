@@ -15,10 +15,13 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-control-env-"));
+
+/** home 守卫迁移（0923）：控制层必填 cwd/initialCwd；存量用例以真实 home 通过门（仅作比较，不写 home）。 */
+const HOME = homedir();
 
 import {
 	attachCurrentSession,
@@ -61,10 +64,10 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 
 // ③ attach
 {
-	const a1 = attachCurrentSession({ sessionId: "sess_owner_1" });
+	const a1 = attachCurrentSession({ sessionId: "sess_owner_1", cwd: HOME, initialCwd: HOME });
 	assert.equal(a1.ok, true);
 	if (a1.ok) assert.equal(a1.attachment.generation, 1);
-	const a2 = attachCurrentSession({ sessionId: "sess_other" });
+	const a2 = attachCurrentSession({ sessionId: "sess_other", cwd: HOME, initialCwd: HOME });
 	assert.equal(a2.ok, false);
 	const r3 = setMasterCutover({ enabled: true, by: "sess_owner_1" });
 	assert.equal(r3.ok, true);
@@ -98,7 +101,7 @@ const ok = (name: string) => { n++; console.log(`ok ${n} - ${name}`); };
 {
 	const s = masterStatusLogic();
 	assert.match(s.text, /attachment: /);
-	const cf = masterAttachLogic("sess_x", { forceStale: true });
+	const cf = masterAttachLogic("sess_x", { forceStale: true }, { cwd: HOME, initialCwd: HOME });
 	assert.equal(cf.isError, true);
 	const co = masterCutoverLogic("sess_owner_1", { enabled: false });
 	assert.equal(co.isError, undefined);

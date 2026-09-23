@@ -15,10 +15,13 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-dispatch-env-"));
+
+/** home 守卫迁移（0923）：控制层必填 cwd/initialCwd；存量用例以真实 home 通过门（仅作比较，不写 home）。 */
+const HOME = homedir();
 
 import { masterDispatchGate, masterDispatchRejectText, registerMasterTools } from "./master-tools.ts";
 import { attachCurrentSession, issueMasterHandoffToken } from "./runtime/master-control.ts";
@@ -62,7 +65,7 @@ const OWNER = "sess_owner_md";
 
 // A1 owner 放行
 {
-	const a = attachCurrentSession({ sessionId: OWNER });
+	const a = attachCurrentSession({ sessionId: OWNER, cwd: HOME, initialCwd: HOME });
 	assert.equal(a.ok, true);
 	const g = masterDispatchGate({
 		sessionId: OWNER, isSub: false, isTab: false, isMain: false,
@@ -95,7 +98,7 @@ const OWNER = "sess_owner_md";
 	assert.equal(fresh.ok, true);
 	if (!fresh.ok || !("token" in fresh) || !fresh.token) throw new Error("unreachable");
 	const NEW = "sess_new_owner_md";
-	const a2 = attachCurrentSession({ sessionId: NEW, token: fresh.token });
+	const a2 = attachCurrentSession({ sessionId: NEW, token: fresh.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a2.ok, true);
 	assert.equal(a2.attachment?.generation, 2);
 	confirmTransferAttach({ transferId: t.ok ? t.transferId : "", sessionId: NEW });
