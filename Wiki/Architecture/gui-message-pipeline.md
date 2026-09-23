@@ -45,7 +45,7 @@ source_paths:
 - `gui/src/useEventStream.ts`（`onOpen` 回调）、`gui/src/store.ts`（`chatJournalHead` 指针、`resyncChatSession`、journal/interactions 帧路由、seq 防御）、`gui/src/api/client.ts`（`after=` 增量）。
 - `extensions/runtime-host/ws.ts` 的 `journal`/`interactions` 主题支持。
 - 独立 L4 复核：本地 `plans/0923_gui_ux_fix_review.md`；计划 `plans/0923_gui_ux_fix_plan.md`；实现 `plans/0923_gui_ux_fix_impl.md`（含 27 例 XSS/兼容实测）。
-- 提交：`6d4ba67`。
+- 提交：`6d4ba67`（管道修复）、`911c397`（markdown 测试入库 + 围栏收紧）。
 
 ## Links Out
 
@@ -59,4 +59,4 @@ source_paths:
 
 - 是否推动 pi 侧提供流式 delta（`row.delta` op 生产者）以实现打字机效果；若推动，投影侧需定义 delta 合并与终态对齐规则。
 - outbox-bridge 10s tick 是否缩短或事件化（影响用户消息入会话延迟）。
-- 自研 markdown 渲染器**尚无入库回归测试**（27 例 XSS/兼容验证是临时脚本，跑完即删）；围栏闭合识别偏宽（`startsWith(marker)`）属已知兼容性缺口。
+- ~~自研 markdown 渲染器尚无入库回归测试；围栏闭合识别偏宽~~ **已关闭（`911c397`）**：新增 `gui/tests/markdown.test.mjs`（node 直跑、零新增依赖、33 项断言含 XSS/元素清单/流式容错/围栏正反例/golden），并把围栏闭合收紧到 CommonMark 口径（`isClosingFence`：同种字符 + run 长度≥开启长度 + ≤3 空格缩进 + 独占一行）。

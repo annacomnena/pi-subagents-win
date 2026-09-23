@@ -21,10 +21,23 @@
 | 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
 | 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 |
 | 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 |
+| 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 17 - markdown 渲染器回归测试入库 + 围栏闭合收紧
+
+- **日期**：2026-09-23
+- **一句话**：把上一批"临时脚本验证"落成入库测试（33 项断言，`node` 直跑、零新增依赖），并修掉 L4 指出的围栏闭合偏宽（收紧到 CommonMark 口径）。
+- **涉及模块**：`gui/tests/markdown.test.mjs`（新）、`gui/src/ui/Markdown.tsx`（+16/-1）
+- **产物**：本地 `plans/0923_markdown_test_{impl,review}.md`
+- **Wiki**：[[GUI 消息管道与延迟贡献项]]（Open Questions 两条已关闭）
+- **Priority**：P2
+- **Status**：complete
+- **Commit**：`911c397`
+- **Verification**：`node gui/tests/markdown.test.mjs` 33/33；`cd gui && npx tsc --noEmit` 0 错误 + `vite build` 成功；反例验证（故意破坏链接协议白名单 → 测试必红 → 改回）。
 
 ### Item 16 - GUI 三毛病修复（设置层遮挡 / markdown 渲染 / 消息不及时）
 
