@@ -24,3 +24,8 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+
+# Wiki 派生索引（由 wiki-nav rebuild 从 Wiki/*.md 生成，不入库）
+Wiki/_navigation.json
+Wiki/_search.json
+Wiki/_keywords.json

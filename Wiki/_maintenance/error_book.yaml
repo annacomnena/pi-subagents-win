@@ -1,0 +1,7 @@
+errors:
+  - id: EB-001
+    status: open
+    phenomenon: "把尚未验证的方案内容写成 status: current。"
+    root_cause: "计划文档读起来像已实现，落笔时未对照代码与实测输出做状态判定。"
+    constraint: "已实现且验证过才 current；方案/未实现写 proposed；半成品写 draft；G0 10/10 这类待实测项必须在 Open Questions 写明。"
+    verification: "对照 extensions/** 与 scripts/** 源码及实测输出复核每个 current 断言。"
