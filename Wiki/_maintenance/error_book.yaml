@@ -5,3 +5,9 @@ errors:
     root_cause: "计划文档读起来像已实现，落笔时未对照代码与实测输出做状态判定。"
     constraint: "已实现且验证过才 current；方案/未实现写 proposed；半成品写 draft；G0 10/10 这类待实测项必须在 Open Questions 写明。"
     verification: "对照 extensions/** 与 scripts/** 源码及实测输出复核每个 current 断言。"
+  - id: EB-002
+    status: open
+    phenomenon: "给机器托管文件 Wiki/_hotspot.md 补 Wiki frontmatter 导致 hotspot 工具解析失败、自动写入停止。"
+    root_cause: "把通用 Wiki 页规范套用到工具托管文件，未先确认该工具解析器契约。"
+    constraint: "给任何工具托管文件加 frontmatter 前先确认该工具解析器契约。"
+    verification: "对照 extensions/hotspot/store.ts 解析逻辑复核；修复提交 cb9c3b5。"

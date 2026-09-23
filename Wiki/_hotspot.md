@@ -4,7 +4,7 @@ kind: concept
 status: current
 updated: 2026-09-23
 schema_version: 1
-revision: 1
+revision: 2
 ---
 
 ## async-delivery-ownership
@@ -43,15 +43,12 @@ revision: 1
 
 ## hidden-console-spawn
 
-- 标题：Windows 后台派生必须给隐藏控制台（勿用 detached）
-- 适用范围：vite/runtime-host 等常驻进程的派生；`detached: true` 无控制台→子进程各自开新控制台→默认终端 WT 弹窗；改 `windowsHide: true` 让子树继承隐藏控制台
-- 入口：extensions/gui-autostart.ts::defaultSpawnVite
-- 入口：extensions/runtime-host/server.ts::startRuntimeHost
-- 证据：plans/0922_empty_wt_window_diagnosis.md
-- 证据：plans/0922_empty_wt_evidence.md
-- 证据：plans/0922_empty_wt_gpt_verdict.md
-- 内容更新：2026-09-23T01:04:44.000Z
-- 引用验证：2026-09-23T01:04:44.000Z
+- 标题：daemon 派生形状以 Runtime Daemon 存活机制为准（detached 为主路径）
+- 适用范围：常驻进程派生形状争议；本条目旧结论（windowsHide-only、勿用 detached）已被切片一切片推翻，不再作为路由依据
+- 入口：extensions/runtime-host/daemon-lifecycle.ts::defaultSpawnDaemon
+- 证据：Wiki/Decisions/runtime-daemon-lifetime.md
+- 内容更新：2026-09-23T00:00:00.000Z
+- 引用验证：2026-09-23T00:00:00.000Z
 
 ## default-async-dispatch
 
@@ -69,3 +66,28 @@ revision: 1
 - 入口：extensions/spawn-trace.ts::traceSpawn
 - 内容更新：2026-09-23T01:04:44.000Z
 - 引用验证：2026-09-23T01:04:44.000Z
+
+## approval-gate
+
+- 标题：统一审批门策略与架构（三份参考实现对照已收尾）
+- 适用范围：审批门策略判定、待审队列接口形状拟定；边界与入口抄 openclaw，准入后动作分级抄 Hermes，队列形状抄 opencode（三处保守化改造）
+- 入口：Wiki/Decisions/approval-gate-policy.md
+- 入口：Wiki/Architecture/approval-gate.md
+- 证据：plans/0923_hermes_approval_recon.md
+- 证据：plans/0923_opencode_permission_recon.md
+- 证据：plans/0923_openclaw_security_recon.md
+- 证据：Wiki/Architecture/approval-gate.md#待审队列接口形状（拟）
+- 内容更新：2026-09-23T00:00:00.000Z
+- 引用验证：2026-09-23T00:00:00.000Z
+
+## host-exposure-hardening
+
+- 标题：本机服务默认 loopback，对外暴露显式 opt-in + 认证（拟）
+- 适用范围：daemon / eventual wechat bridge 的 bind 面与暴露审批；配置改动不热切换
+- 入口：Wiki/Decisions/host-exposure-hardening.md
+- 入口：extensions/runtime-host/server.ts
+- 证据：plans/0923_opencode_permission_recon.md#3.2
+- 证据：plans/0923_openclaw_security_recon.md#4
+- 证据：extensions/runtime-host/server.ts
+- 内容更新：2026-09-23T00:00:00.000Z
+- 引用验证：2026-09-23T00:00:00.000Z

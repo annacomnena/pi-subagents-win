@@ -8,7 +8,7 @@ source_paths:
   - extensions/runtime-host/server.ts#L365
   - extensions/runtime-host/server.ts#L465-L475
   - extensions/runtime-host/discovery.ts#L34-L44
-  - extensions/runtime-host/discovery.ts#L210-L214
+  - extensions/runtime-host/discovery.ts#L215-L218
   - scripts/verify-runtime-g0.ps1
 ---
 
@@ -32,13 +32,13 @@ source_paths:
 - `defaultSpawnDaemon` — `extensions/runtime-host/daemon-lifecycle.ts` 派生形状。
 - `startRuntimeHost` — `extensions/runtime-host/server.ts`，bind `127.0.0.1:0`，实际端口写盘发现。
 - `classifyHost` — `extensions/runtime-host/discovery.ts`，host 四态 `missing/alive/stale/dead` 判定。
-- `answerChallenge` / `verifyChallengeFlow` — `extensions/runtime-host/identity.ts`，nonce 挑战。
+- `answerChallenge` / `verifyChallengeResponse` / `runLocalChallenge` — `extensions/runtime-host/identity.ts`（L103 / L118 / L146），nonce 挑战。
 
 ## Evidence
 
 - `extensions/runtime-host/daemon-lifecycle.ts#L15-L16`、`#L149-L163` — 派生形状与 Win32 约束注释。
-- `extensions/runtime-host/server.ts#L365` — bind `127.0.0.1:0`；`#L465-L475` — 身份元组与 host token 落盘。
-- `extensions/runtime-host/discovery.ts#L34-L44` — host.json 内容契约；`#L210-L214` — stale 判定（探活失败）。
+- `extensions/runtime-host/server.ts#L885` — 真实 `server.listen(0, "127.0.0.1")`（`#L365` 仅是该行为的注释行）；`#L465-L475` — 身份元组与 host token 落盘。
+- `extensions/runtime-host/discovery.ts#L34-L44` — host.json 内容契约；`#L215-L218` — `classifyHost` 的 stale 判定（探活失败）。
 - `scripts/verify-runtime-g0.ps1` — G0 存活/身份验证脚本（save/check 两阶段；挑战未接线前显式返回 INCONCLUSIVE，不用匿名 health 冒充通过）。
 - commit `bdb6674`（daemon 切片一）、本地 `plans/0923_runtime_daemon_slice1_impl.md`、本地 `plans/0923_decisions.md` D5–D7。
 - 实测结论：切片一后关闭发起 tab，daemon 仍存活（D5 台账记录）。

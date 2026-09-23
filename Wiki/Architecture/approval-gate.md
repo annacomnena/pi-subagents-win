@@ -6,6 +6,8 @@ updated: 2026-09-23
 source_paths:
   - plans/0923_unified_approval_gate_plan.md
   - plans/0923_approval_hermes_delta.md
+  - plans/0923_opencode_permission_recon.md
+  - plans/0923_openclaw_security_recon.md
   - plans/0923_hermes_approval_recon.md
 ---
 
@@ -35,6 +37,18 @@ source_paths:
 - 本地 `plans/0923_hermes_approval_recon.md`（Hermes 参考实现侦察：网关阻塞队列约 L99、ACP 桥约 L100、fail-open 点约 L135）。
 - 策略拍板见 [[审批门策略]]；本地 `plans/0923_decisions.md` D1–D4、D11–D13。
 
+## 待审队列接口形状（拟）
+
+抄 opencode 形状（`plans/0923_opencode_permission_recon.md` §2.2），daemon 侧拟定如下。**纯方案，未实现。**
+
+- `create` — 评估并在需审批时建待审请求（对 `POST /api/session/:sid/permission`）。
+- `list` — 按会话列待审（对 `GET /api/session/:sid/permission`）。
+- `get` — 取单个待审详情（对 `GET /api/session/:sid/permission/:rid`）。
+- `reply` — 对待审做决定（对 `POST /api/session/:sid/permission/:rid/reply`），三选项 `once|always|reject`。
+- 事件 — `approval.asked`（新建待审推送）/ `approval.replied`（决定后移除，客户端按 session+request 去重），对 opencode `permission.asked/replied`。
+- 改造点：`always` = 作用域+TTL+可撤销租约（不是 opencode 的 project 级永久 saved；且"always 是否精确等于写 saved 行"未确认，见 opencode 报告未确认清单 §2）；微信端 `always` 降级为 once。
+- 超时/无 UI 默认拒绝由我们自己定（opencode 超时语义未确认，见 opencode 报告未确认清单 §1）：TUI 60s / GUI 120s / ACP 60s，超时按 deny。
+
 ## Links Out
 
 - [[审批门策略]]
@@ -47,4 +61,4 @@ source_paths:
 
 ## Open Questions
 
-- 私有 IPC 形态、fence 实现、持久账 schema 均未定；等 Hermes/opencode/openclaw 侦察收尾后再定第一切片。
+- 私有 IPC 形态、fence 实现、持久账 schema 均未定；三份参考实现侦察已收尾，对照结论见 [[审批门策略]] 的参考实现对照节；第一切片待定。

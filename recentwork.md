@@ -23,9 +23,9 @@
 ### Item 6 - 本机 GUI 解锁 master 切片
 
 - **日期**：2026-09-23
-- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已落地（bootstrap OTT + 护栏），端到端验收待补，进行中。
-- **涉及模块**：`extensions/runtime-host/server.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`
-- **Commit**：通道代码随切片一及 GUI 相关提交落地（`c3f69c5`、`c3003d5`）；本切片验收未合。
+- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已实现，但**仅在未提交工作树**（bootstrap OTT + 护栏），端到端验收待补，进行中。
+- **涉及模块**：`extensions/runtime/master-injection.ts`（新增）、`extensions/runtime/command-executor.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`
+- **Commit**：通道代码（bootstrap OTT、`master-injection.ts`、`master-offline:409` 映射）仅在未提交工作树，尚未合入任何提交；`c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为同域历史提交，**不含**本通道代码；本切片验收未合。
 - **Wiki**：[[GUI 解锁 Master]]（`status: draft`）
 - **Priority**：P1
 - **Status**：active
@@ -54,6 +54,36 @@
 - **Verification**：`scripts/verify-runtime-g0.ps1` save/check + 人工窗口/进程树核对；已验证部分见 Wiki Evidence
 
 ## Archived Tasks
+
+### Item 9 - Hermes 审批机制侦察
+
+- **日期**：2026-09-23
+- **一句话**：Hermes 审批四层判定（floor-before-yolo）+ 网关阻塞队列 + once/session/always + 超时即 BLOCKED 结论已提取，准入后动作分级可抄、headless fail-open 与 smart 代批不抄。
+- **产物**：`plans/0923_hermes_approval_recon.md`（本地 gitignored）
+- **Wiki**：[[审批门策略]]（参考实现对照）、[[统一审批门架构]]（待审队列接口形状拟定背景）
+- **Priority**：P2
+- **Status**：complete
+- **Commit**：<!--COMMIT_HASH-->
+
+### Item 8 - openclaw 安全模型侦察
+
+- **日期**：2026-09-23
+- **一句话**：openclaw 入站信任（pairing/allowlist/owner）+ exec policy + exposure-runbook 五档结论已提取，边界与入口可抄、远端代批需改造。
+- **产物**：`plans/0923_openclaw_security_recon.md`（本地 gitignored）
+- **Wiki**：[[审批门策略]]（参考实现对照）、[[Host 暴露面加固]]（新建，`status: proposed`）
+- **Priority**：P2
+- **Status**：complete
+- **Commit**：<!--COMMIT_HASH-->
+
+### Item 7 - opencode 权限/服务信任侦察
+
+- **日期**：2026-09-23
+- **一句话**：opencode 权限三态（deny > ask > allow）+ action×resource 粒度 + session 待审队列 + 默认 loopback 服务边界结论已提取，队列形状可抄、默认集与 yolo 开关需改造/不引入。
+- **产物**：`plans/0923_opencode_permission_recon.md`（本地 gitignored）
+- **Wiki**：[[审批门策略]]（参考实现对照）、[[统一审批门架构]]（待审队列接口形状拟定）、[[Host 暴露面加固]]（新建，`status: proposed`）
+- **Priority**：P2
+- **Status**：complete
+- **Commit**：<!--COMMIT_HASH-->
 
 ### Item 3 - runtime 卫生三连
 

@@ -25,7 +25,7 @@ source_paths:
 ## Key Symbols
 
 - `startRuntimeHost` / `stopRuntimeHost` — `extensions/runtime-host/server.ts`。
-- `ensureDaemon` / `defaultSpawnDaemon` — `extensions/runtime-host/daemon-lifecycle.ts`。
+- `ensureRuntimeDaemon` / `defaultSpawnDaemon` — `extensions/runtime-host/daemon-lifecycle.ts`。
 - `classifyHost` — `extensions/runtime-host/discovery.ts`。
 
 ## Evidence

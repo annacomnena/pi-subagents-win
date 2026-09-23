@@ -18,6 +18,7 @@ source_paths:
 ### 决策（Decisions）
 
 - [[审批门策略]] — D1–D4、D11–D13（`status: proposed`，未实现）
+- [[Host 暴露面加固]] — loopback 默认 + opt-in 暴露 + 不热切换（`status: proposed`，未实现）
 - [[Runtime Daemon 存活机制]] — 切片一已验证的存活/身份机制（`status: current`）
 - [[GUI 解锁 Master]] — 本机受信 GUI 注入 master 的边界（`status: draft`）
 
@@ -30,6 +31,7 @@ source_paths:
 ## Links Out
 
 - [[审批门策略]]
+- [[Host 暴露面加固]]
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
 - [[Runtime Daemon 架构]]
@@ -39,6 +41,7 @@ source_paths:
 ## Backlinks
 
 - [[审批门策略]]
+- [[Host 暴露面加固]]
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
 - [[Runtime Daemon 架构]]

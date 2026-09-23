@@ -6,7 +6,8 @@ updated: 2026-09-23
 source_paths:
   - extensions/runtime-host/server.ts#L625-L664
   - extensions/runtime-host/commands.ts#L66-L72
-  - extensions/gui-autostart.ts#L298
+  - extensions/gui-autostart.ts#L300
+  - extensions/runtime/master-injection.ts
   - plans/0923_decisions.md
 ---
 
@@ -14,7 +15,7 @@ source_paths:
 
 ## Summary
 
-决策（D9）：提前切片只解锁"本机受信 GUI → 活着的 master 进程"这一条注入路径。通道侧代码（bootstrap OTT + 护栏映射）已落地，但端到端注入验收未补，故本页为 `draft`。
+决策（D9）：提前切片只解锁"本机受信 GUI → 活着的 master 进程"这一条注入路径。通道侧代码（bootstrap OTT + 护栏映射）**仅在未提交工作树**（`server.ts` bootstrap 段、新文件 `master-injection.ts`、`commands.ts` 的 `master-offline:409` 增补均未提交；基线 `49d5fd0` 时尚不存在），端到端注入验收未补，故本页为 `draft`。
 
 ## Current Contract
 
@@ -28,16 +29,18 @@ source_paths:
 
 - `bootstrapStore` — `extensions/runtime-host/server.ts`，OTT 进程内存签发/核销。
 - `loopbackSocket` / `readGuiEnabled` — bootstrap 准入条件。
-- `reasonToStatus` — `extensions/runtime-host/commands.ts`，拒绝 reason → HTTP status 映射。
-- `/gui open` — `extensions/gui-autostart.ts`，换 OTT 并拉起浏览器走 exchange。
+- `REJECT_HTTP_STATUS` — `extensions/runtime-host/commands.ts`，拒绝 reason → HTTP status 映射。
+- `handleGuiCommand` / `mintGuiBootstrap` — `extensions/gui-autostart.ts`，`/gui open` 换 OTT 并拉起浏览器走 exchange。
+- `checkTrustedLocalChannel` / `readGuiEnabled` — `extensions/runtime/master-injection.ts`，窄口三证据与 opt-in 开关。
 
 ## Evidence
 
-- `extensions/runtime-host/server.ts#L625-L664` — bootstrap OTT 签发/核销与 loopback + gui-enabled 门禁。
-- `extensions/runtime-host/commands.ts#L66-L72` — `master-session-protected: 403`、`master-offline: 409`。
-- `extensions/gui-autostart.ts#L298`、`#L464-L465` — `/gui open` 换 OTT 流程。
+- `extensions/runtime-host/server.ts#L625-L664` — bootstrap OTT 签发/核销与 loopback + gui-enabled 门禁（未提交工作树；基线 `49d5fd0` 时尚不存在）。
+- `extensions/runtime-host/commands.ts#L66-L72` — `master-session-protected: 403`、`master-offline: 409`（未提交工作树；基线 `49d5fd0` 时尚不存在）。
+- `extensions/gui-autostart.ts#L300`、`#L464-L465` — `/gui open` 换 OTT 流程（未提交工作树；基线 `49d5fd0` 时尚不存在）。
+- `extensions/runtime/master-injection.ts` — 窄口三证据、OTT 签发/核销、审计（**未跟踪新文件**，尚未合入任何提交）。
 - 本地 `plans/0923_decisions.md` D8–D10。
-- commit `c3f69c5`（GUI autostart opt-in）、`c3003d5`（detached 无控制台子进程继承修复）为同通道相关提交。
+- 历史提交 `c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为**同域**提交，**不含**本通道代码。
 
 ## Links Out
 
