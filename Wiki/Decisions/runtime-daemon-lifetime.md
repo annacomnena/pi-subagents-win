@@ -34,6 +34,21 @@ source_paths:
 - `classifyHost` — `extensions/runtime-host/discovery.ts`，host 四态 `missing/alive/stale/dead` 判定。
 - `answerChallenge` / `verifyChallengeResponse` / `runLocalChallenge` — `extensions/runtime-host/identity.ts`（L103 / L118 / L146），nonce 挑战。
 
+## dead 僵尸 / 孤儿锁重建契约（2026-09-23，`e262eb8`）
+
+- **dead host.json（pid 已死）→ 持锁重建**：不再是 `uncertain`。此前 `tryReuse` 对任何
+  `state !== "alive"` 都 fail-closed，使文件头声明的"dead pid/坏文件才在确已持锁后重建"分支
+  在主路径上**不可达**。
+- **孤儿锁（锁 holder 也已死）→ 允许清抢后重建**：取锁失败时，仅当**可证持有人已死**（重读复核
+  instanceId 仍一致且仍死）才 `stealStaleLock`；**活锁永不强删**、绝不 kill 任何 pid。这是对
+  "取锁失败必须 fail-closed"的唯一收窄（理由：该情形锁并非被活方持有）。
+- **仍然 fail-closed（未放松）**：`stale`（pid 活但探活超时）、`runtimeId` 不符、身份挑战失败、
+  legacy 弱确权失败、**活锁占用**、**交接等待**（活方持有）——一律不 spawn、不 kill、不删锁、不覆盖。
+- **典型症状与恢复**：重启电脑后 daemon 死、host.json 与锁变僵尸 ⇒ 以前 `/gui on` 永远报
+  `未确权（dead）… GUI 地址未知`（只能手工删文件）；现在应自动"检测到僵尸，已接管（持锁重建）"。
+- **残余**：坏锁（不可解析 ⇒ 无法证死）仍 fail-closed（需人工删锁 / `stop --force`）；清抢存在
+  微秒级 TOCTOU（daemon 启动侧二次抢锁串行化）；同进程 own-pid 锁重入仍 fail-closed。
+
 ## Evidence
 
 - `extensions/runtime-host/daemon-lifecycle.ts#L15-L16`、`#L149-L163` — 派生形状与 Win32 约束注释。
@@ -42,6 +57,7 @@ source_paths:
 - `scripts/verify-runtime-g0.ps1` — G0 存活/身份验证脚本（save/check 两阶段；挑战未接线前显式返回 INCONCLUSIVE，不用匿名 health 冒充通过）。
 - commit `bdb6674`（daemon 切片一）、本地 `plans/0923_runtime_daemon_slice1_impl.md`、本地 `plans/0923_decisions.md` D5–D7。
 - 实测结论：切片一后关闭发起 tab，daemon 仍存活（D5 台账记录）。
+- `e262eb8`：dead 僵尸 / 孤儿锁 → 持锁重建（见上节契约）；测试 `extensions/_test_ensure_dead_rebuild.ts`（①①b②③④ 五夹具）。
 
 ## Links Out
 

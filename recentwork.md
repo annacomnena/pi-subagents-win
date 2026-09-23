@@ -25,10 +25,23 @@
 | 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） |
 | 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
 | 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
+| 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 21 - dead 僵尸 host.json / 孤儿锁重建（修「重启后 GUI 永远起不来」）
+
+- **日期**：2026-09-23
+- **一句话**：`ensureRuntimeDaemon` 此前对 dead host.json 直接 fail-closed，且 daemon 崩溃遗留的**孤儿锁**使取锁失败（`stealStaleLock` 定义了却从未接线）⇒ 重启电脑后 `/gui on` 永远拿不到 GUI 地址，只能手工删文件。
+- **涉及模块**：`extensions/runtime-host/daemon-lifecycle.ts`、`extensions/_test_ensure_dead_rebuild.ts`（新）
+- **产物**：本地 `plans/0923_daemon_dead_rebuild_fix.md`（+ L4 复核 `plans/0923_daemon_dead_rebuild_review.md` 并发中）
+- **Wiki**：[[Runtime Daemon 存活机制]]（新增"dead 僵尸 / 孤儿锁重建契约"节）
+- **Priority**：P1
+- **Status**：complete（L4 复核并发中；若有 must-fix 另起提交）
+- **Commit**：`e262eb8`
+- **Verification**：`npx tsx extensions/_test_ensure_dead_rebuild.ts` 五夹具全过（dead 无锁→重建、dead+孤儿锁→重建、stale→uncertain spawn=0、runtimeId 不符→uncertain spawn=0、dead+活锁→fail-closed 且锁/host.json 未动）；smoke OK；daemon-lifecycle/gui-autostart/runtime-host-server 相邻测试全过。
 
 ### Item 20 - hotspot 工具 pending 队列误写仓库根 state/（待修）
 
