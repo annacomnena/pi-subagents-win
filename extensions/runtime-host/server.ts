@@ -55,7 +55,6 @@
  * **禁** Pi API / extensions/index.ts。
  */
 
-import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, dirname, resolve } from "node:path";
@@ -68,10 +67,8 @@ import {
 	fetchHostHealth,
 	generateHostToken,
 	hostInfoPath,
-	isProcessAlive,
 	newInstanceId,
 	readHostInfo,
-	removeHostInfo,
 	writeHostInfo,
 	type HostInfo,
 	type HostState,
@@ -101,9 +98,26 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
-import { traceSpawn } from "../spawn-trace.ts";
 import { executeCommand } from "../runtime/command-executor.ts";
 import { attachEventStream, WS_PATH, parseCookieToken, tokenMatches } from "./ws.ts";
+import { resolveDistDir, serveStatic } from "./static.ts";
+import {
+	RUNTIME_SCHEMA_VERSION,
+	answerChallenge,
+	captureProcessStartIdentity,
+	computeReleaseId,
+	runtimeIdForDir,
+	type ChallengeMeta,
+} from "./identity.ts";
+import {
+	acquireRuntimeLock,
+	ensureRuntimeDaemon,
+	lockPathFor,
+	lockHolderAlive,
+	readRuntimeLock,
+	releaseRuntimeLock,
+	stopRuntimeDaemon,
+} from "./daemon-lifecycle.ts";
 
 // ── 视图装配（纯读、never-throw；可注入路径/now 供测试隔离）────────
 
@@ -143,6 +157,11 @@ export interface HostSelfInfo {
 	pid: number;
 	port: number;
 	startedAt: string;
+	/** 第一切片新增（§2.2 身份；匿名 health 可见的非敏感字段，token 永不进响应）。 */
+	runtimeId?: string;
+	releaseId?: string;
+	schemaVersion?: number;
+	processStartIdentity?: string;
 }
 
 export interface HealthOptions {
@@ -368,6 +387,10 @@ export interface RuntimeHostServerOptions {
 	tailMs?: number;
 	/** G6-P1：WS ping 间隔 ms（缺省 30000）。 */
 	pingMs?: number;
+	/** 第一切片：静态托管的 gui/dist 目录（缺省 resolveDistDir()；测试注入隔离）。 */
+	distDir?: string;
+	/** 第一切片：启动时等待交接锁释放的最长 ms（缺省 15000；测试用空闲锁，零等待）。 */
+	lockWaitMs?: number;
 }
 
 export interface RuntimeHostHandle {
@@ -377,14 +400,71 @@ export interface RuntimeHostHandle {
 	close(): Promise<void>;
 }
 
+/**
+ * daemon 单实例锁获取（§2.2：先取锁再绑定端口；listen 前调用）。
+ *   - 无锁/坏锁/僵尸持有人（pid 已死）→ 获取并持有；
+ *   - 活 daemon 持有人 → throw（本进程退出，绝不双跑）；
+ *   - 活 handoff 持有人 → 直接接管（rm + exclusive-create）：handoff 的唯一合法后继
+ *     就是被它 spawn 的 daemon 子进程（父 ensure 持 handoff 等 host.json，子若再等父释锁
+ *     则死锁）。并发双 child 时 wx 原子决出唯一胜者，败者下一轮看到活 daemon 即退出。
+ */
+async function acquireDaemonLockOrThrow(
+	hostPath: string,
+	entry: { instanceId: string; runtimeId: string; acquiredAt: string },
+	waitMs: number,
+): Promise<string> {
+	const lockPath = lockPathFor(hostPath);
+	const full = { kind: "daemon" as const, pid: process.pid, ...entry };
+	const t0 = Date.now();
+	for (;;) {
+		const existing = readRuntimeLock(lockPath);
+		if (!existing || !lockHolderAlive(existing)) {
+			// 空闲/僵尸/坏文件 → 获取（僵尸先删再取，原子 exclusive-create；
+			// 竞争窗口输了则落到循环尾重读决策）。注：同进程重复启动也视为双跑，拒绝。
+			try {
+				rmSync(lockPath, { force: true });
+			} catch {
+				/* ignore */
+			}
+			const ac = acquireRuntimeLock(lockPath, full);
+			if (ac.acquired) return lockPath;
+		} else if (existing.kind === "daemon") {
+			throw new Error(`单实例锁被活 daemon 持有（pid=${existing.pid} instance=${existing.instanceId}）：拒绝双跑`);
+		} else {
+			// 活 handoff → daemon 直接接管（见函数注释；父的释锁是 instanceId 条件匹配，
+			// 接管后父释锁为 no-op，不影响）
+			try {
+				rmSync(lockPath, { force: true });
+			} catch {
+				/* ignore */
+			}
+			const ac = acquireRuntimeLock(lockPath, full);
+			if (ac.acquired) return lockPath;
+			// 被并发 child 抢先 → 下一轮看到活 daemon 即 throw
+		}
+		if (Date.now() - t0 > waitMs) {
+			throw new Error("单实例锁竞争超时：拒绝启动");
+		}
+		await new Promise((r) => setTimeout(r, 150));
+	}
+}
+
 export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Promise<RuntimeHostHandle> {
 	const instanceId = opts.instanceId ?? newInstanceId();
 	const startedAt = new Date().toISOString();
-	const self: HostSelfInfo = { instanceId, pid: process.pid, port: 0, startedAt };
 	const hostPath = opts.hostPath ?? hostInfoPath();
-	// G6-P1：本机 token 启动即生成，落 host.json（同机进程可读）；仅 WS 升级面校验，
-	// 绝不出现在 /v1/* HTTP 响应（HostSelfInfo 不含 token）。
+	const distDir = resolveDistDir(opts.distDir);
+	// 第一切片身份（§2.2）：runtimeId ← host.json 所在目录规范化；releaseId ← repo 版本 +
+	// dist 内容 hash（dist 与 daemon 不可变 release 同步发布）；processStartIdentity 固定 ISO。
+	const runtimeId = runtimeIdForDir(dirname(hostPath));
+	const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+	const releaseId = computeReleaseId(repoRoot, distDir);
+	const processStartIdentity = captureProcessStartIdentity(startedAt);
+	const self: HostSelfInfo = { instanceId, pid: process.pid, port: 0, startedAt, runtimeId, releaseId, schemaVersion: RUNTIME_SCHEMA_VERSION, processStartIdentity };
+	// G6-P1：本机 token 启动即生成，落 host.json（同机进程可读）；仅 WS 升级面 + challenge
+	// HMAC 秘钥用，绝不出现在任何 /v1/* HTTP 响应（匿名 health 只报非敏感就绪信息）。
 	const hostToken = generateHostToken();
+	const challengeMeta: ChallengeMeta = { instanceId, runtimeId, protocolVersion: PROTOCOL_VERSION, releaseId, schemaVersion: RUNTIME_SCHEMA_VERSION, processStartIdentity };
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -468,11 +548,62 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		});
 	};
 
+	// 第一切片：POST /v1/challenge——本地受保护通道 nonce 挑战（§2.2）。
+	// 服务端用实例秘钥（host.json token）对 client nonce 做 HMAC，回显 nonce + 身份元组；
+	// token 本身永不外发；无 token（不应发生，token 启动即生成）→ 503 fail-closed。
+	const CHALLENGE_BODY_LIMIT_BYTES = 4096;
+	const handlePostChallenge = (req: IncomingMessage, res: ServerResponse): void => {
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let responded = false;
+		req.on("data", (c: Buffer) => {
+			if (responded) return;
+			size += c.length;
+			if (size > CHALLENGE_BODY_LIMIT_BYTES) {
+				responded = true;
+				respondJson(res, 413, { error: "payload-too-large" });
+				try { req.destroy(); } catch { /* ignore */ }
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("error", () => {
+			if (!responded) {
+				responded = true;
+				respondJson(res, 400, { error: "request-error" });
+			}
+		});
+		req.on("end", () => {
+			if (responded) return;
+			responded = true;
+			try {
+				const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { nonce?: unknown };
+				const ans = answerChallenge(hostToken, typeof parsed.nonce === "string" ? parsed.nonce : "", challengeMeta);
+				if (!ans) {
+					respondJson(res, 400, { error: "bad-challenge", hint: "body 需 {nonce: 8..256 字符随机串}；服务端无秘钥时 503" });
+					return;
+				}
+				respondJson(res, 200, ans);
+			} catch {
+				respondJson(res, 400, { error: "bad-challenge", hint: "body 需 JSON {nonce}" });
+			}
+		});
+	};
+
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
 		try {
 			const u = new URL(req.url ?? "/", "http://127.0.0.1");
+			// 第一切片：同源静态托管（GET / + /assets/*；/v1/* 在此返回 false → 走 API 路由，永不 SPA fallback）
+			if (serveStatic(req, res, { distDir })) return;
+			if (u.pathname === "/v1/challenge") {
+				if (req.method === "POST") {
+					handlePostChallenge(req, res);
+					return;
+				}
+				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/challenge 仅接受 POST {nonce}（本地身份挑战）" });
+			}
 			if (u.pathname === "/v1/commands") {
 				// 唯一写端点：仅 POST；GET /v1/commands → 405（读投影不含命令）
 				if (req.method === "POST") {
@@ -593,7 +724,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
-						throw new HttpError(404, { error: "not-found", hint: `端点：GET /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）` });
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）` });
 					}
 					const sessionId = decodeURIComponent(mt[1]);
 					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
@@ -631,7 +762,16 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	};
 
 	return new Promise((resolvePromise, reject) => {
-		const server = createServer(onReq);
+		// §2.2：先取跨进程独占锁，再绑定端口/写账。活 daemon 已持锁 → 本进程直接拒绝启动
+		// （防双跑）；交接期 handoff 锁 → 等待后获取。锁失败 = 启动失败（fail-closed）。
+		const lockWaitMs = opts.lockWaitMs ?? 15000;
+		void acquireDaemonLockOrThrow(hostPath, { instanceId, runtimeId, acquiredAt: startedAt }, lockWaitMs).then((lockPath) => {
+			startListening(lockPath);
+		}).catch((e) => {
+			reject(e instanceof Error ? e : new Error(String(e)));
+		});
+		const startListening = (lockPath: string): void => {
+			const server = createServer(onReq);
 		// G6-P1：唯一 WS 升级路径 /v1/events/stream（幂等挂载；HTTP 路由零变化）
 		// G6-P3：stateDir/mailboxDir 透传——interactions 主题与 GET 端点同源（测试注入隔离一致）
 		attachEventStream(server, {
@@ -644,13 +784,16 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			pingMs: opts.pingMs,
 		});
 		server.on("error", (e: NodeJS.ErrnoException) => {
-			// fail-fast 报端口（risk8：不静默换端口）——:0 下正常不会 EADDRINUSE
+			// 锁已持有但端口绑定失败 → 释锁后拒绝（不留僵尸锁；:0 下正常不会 EADDRINUSE）
+			releaseRuntimeLock(lockPath, instanceId);
 			reject(new Error(`runtime-host listen failed: ${e.message}${e.code ? ` (code=${e.code})` : ""}`));
 		});
 		server.listen(0, "127.0.0.1", () => {
 			const addr = server.address();
 			const port = typeof addr === "object" && addr ? addr.port : 0;
-			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION, token: hostToken };
+			// §2.2/§9：host.json 原子发布含 {runtimeId,instanceId,pid,processStartIdentity,
+			// releaseId,protocolVersion,schemaVersion,port,token}（仅当前用户可读，0600）。
+			const info: HostInfo = { instanceId, pid: process.pid, port, startedAt, protocolVersion: PROTOCOL_VERSION, token: hostToken, runtimeId, releaseId, schemaVersion: RUNTIME_SCHEMA_VERSION, processStartIdentity };
 			self.port = port;
 			writeHostInfo(info, hostPath); // 原子写（tmp+rename）；失败不炸（易失投影）
 			// G6-P2 L4 必修 2：host 启动扫 pending outbox → TTL 转 expired + journal 回执。
@@ -684,9 +827,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					} catch {
 						/* ignore */
 					}
+					// 释 daemon 单实例锁（条件匹配 instanceId，防误删接管后的新锁，§2.3）
+					releaseRuntimeLock(lockPath, instanceId);
 				},
 			});
 		});
+		};
 	});
 }
 
@@ -701,20 +847,20 @@ export interface HostStartResult {
 	started: boolean;
 	/** 已在跑（回显现有）= true。 */
 	already?: boolean;
-	/** 僵尸接管（原 host.json 为 stale/dead，已覆盖启动）时的回显说明。 */
+	/** 僵尸接管（原 host.json 为 dead，已覆盖启动）时的回显说明。 */
 	note?: string;
+	/** fail-closed：pid 活但超时/身份不符/锁占用 → uncertain，不复用、不重建、不 kill。 */
+	uncertain?: boolean;
 	info: HostInfo | null;
 	error?: string;
 }
 
 /**
- * 派生独立 `node --experimental-strip-types server.ts` 进程（detached + unref，pi 退出
- * 不连带杀 host——Mode A 回退语义）。等待 host.json 出现且 pid 存活（最多 waitMs，缺省 8s）。
- *
- * host.json 已存在时走**完整三态探活**（classifyHost：pid 存活只是必要条件，health 探活是
- * 权威——PID 重用/进程卡死时 pid 活但探活失败，必判 stale，L4 必修项）：
- *   - `alive`（pid 活 + 探活成功）→ 回显现有（不重起，already:true）
- *   - `stale` / `dead`（僵尸）→ 直接覆盖启动（新 pid/port/host.json），note 回显「检测到僵尸，已接管」
+ * 第一切片：委托 daemon-lifecycle.ensureRuntimeDaemon（§2 单实例/接管契约）。
+ * 语义变化（相对旧三态覆盖）：`stale`（pid 活但探活失败）不再直接覆盖启动，
+ * 改走 uncertain fail-closed（防 pid 复用误杀/覆盖活锁；恢复路径见 daemon-lifecycle
+ * stopRuntimeDaemon force 分支）；`dead`/坏文件仍在确已持锁后重建并注记。
+ * spawn 形状 §2.1：detached:true + stdio:ignore + windowsHide:false + unref。
  */
 export async function startRuntimeHost(opts?: {
 	/** 缺省 = 本文件旁 server.ts（同目录）。 */
@@ -722,97 +868,45 @@ export async function startRuntimeHost(opts?: {
 	waitMs?: number;
 	hostPath?: string;
 }): Promise<HostStartResult> {
-	const hostPath = opts?.hostPath ?? hostInfoPath();
-	const waitMs = opts?.waitMs ?? 8000;
-	const serverPath = opts?.serverPath ?? join(dirname(fileURLToPath(import.meta.url)), "server.ts");
-
-	const existing = readHostInfo(hostPath);
-	let zombie: { info: HostInfo; state: HostState } | null = null;
-	if (existing) {
-		const state = await classifyHost(existing);
-		if (state === "alive") {
-			return { started: false, already: true, info: existing };
-		}
-		zombie = { info: existing, state };
-	}
-	// zombie（stale：pid 在但探活失败；dead：僵尸文件）或无文件 → 直接 spawn，新实例 listen 成功后
-	// 原子覆盖 host.json（僵尸覆盖不先 kill 旧 pid——旧实例若仍活着，其退出清理按 instanceId 匹配，
-	// 不会误删新文件；新文件带新 startedAt，poll 按时间戳区分新旧）
-
-	return new Promise((resolvePromise) => {
-		let child: ReturnType<typeof spawn>;
-		try {
-			// 2026-09-22 空壳 WT 根因修复（同 gui-autostart defaultSpawnVite）：不用 `detached: true`
-			//（DETACHED_PROCESS → 无控制台 → 任何子进程只能分配新控制台 → 默认终端 WT 弹窗）。
-			// 改用 `windowsHide: true`（CREATE_NO_WINDOW → host 拥有隐藏控制台，子树继承，不再分配
-			// 新控制台）。`unref()` 保留：pi 退出不连带杀 host（隐藏控制台属于 host 自身）。
-			traceSpawn("console-child", `runtime-host spawn exec=${process.execPath} server=${serverPath}`);
-			child = spawn(
-			process.execPath,
-			["--experimental-strip-types", serverPath],
-			{
-				windowsHide: true,
-				stdio: "ignore",
-				cwd: dirname(serverPath),
-				// 钉子进程的 runtime 目录 = hostPath 所在目录（默认场景下与现状一致；测试注入隔离时
-				// 子进程写盘位置与本函数读盘位置严格一致）
-				env: { ...process.env, PI_RUNTIME_DIR: dirname(hostPath) },
-			},
-		);
-		} catch (e) {
-			resolvePromise({ started: false, info: null, error: `spawn failed: ${e instanceof Error ? e.message : String(e)}` });
-			return;
-		}
-		child.unref();
-		const startedAt0 = new Date().toISOString();
-		const t0 = Date.now();
-		const poll = setInterval(() => {
-			const info = readHostInfo(hostPath);
-			if (info && info.startedAt >= startedAt0 && isProcessAlive(info.pid)) {
-				clearInterval(poll);
-				resolvePromise({
-					started: true,
-					info,
-					...(zombie ? { note: `检测到僵尸，已接管（原 pid=${zombie.info.pid} ${zombie.state}，已覆盖启动）` } : {}),
-				});
-				return;
-			}
-			if (Date.now() - t0 > waitMs) {
-				clearInterval(poll);
-				try {
-					child.kill();
-				} catch {
-					/* ignore */
-				}
-				resolvePromise({ started: false, info: null, error: `timeout ${waitMs}ms：host.json 未就绪（server 可能启动失败）` });
-			}
-		}, 100);
-		// 注：poll 不 unref——start 期间必须保持 event loop 存活（裸 node 测试/短命宿主进程下
-		// unref 会让进程在等待中直接退出）；命令上下文下 host.json 出现即 resolve（~1s），无悬挂。
+	const r = await ensureRuntimeDaemon({
+		...(opts?.hostPath !== undefined ? { hostPath: opts.hostPath } : {}),
+		...(opts?.serverPath !== undefined ? { serverPath: opts.serverPath } : {}),
+		...(opts?.waitMs !== undefined ? { waitMs: opts.waitMs } : {}),
 	});
+	return {
+		started: r.ok && !r.already,
+		...(r.already ? { already: true as const } : {}),
+		...(r.note !== undefined ? { note: r.note } : {}),
+		...(r.uncertain ? { uncertain: true as const } : {}),
+		info: r.info,
+		...(r.error !== undefined ? { error: r.error } : {}),
+	};
 }
 
 export interface HostStopResult {
 	stopped: boolean;
+	/** fail-closed：未确权停机，不 kill 不删（见 reason；force 可走 legacy 分支）。 */
+	uncertain?: boolean;
 	info: HostInfo | null;
 	reason?: string;
 }
 
 /**
- * 停止 host：kill(pid)（Windows 下 SIGTERM → 立即退出；unix 走 server 的 SIGTERM 优雅路径）
- * + 删 host.json（含僵尸文件清理，risk4）。
+ * 第一切片：委托 daemon-lifecycle.stopRuntimeDaemon（§2.3/§2.4）。
+ * 旧裸 kill 语义替换为 fail-closed：alive → kill + 条件删；dead → 只清文件不 kill；
+ * stale/锁被陌生持有人占用 → uncertain（不 kill 不删）。`force:true` 保留 legacy
+ * 裸 kill 分支（wedged 实例人工恢复用）。
  */
-export function stopRuntimeHost(opts?: { hostPath?: string }): Promise<HostStopResult> {
-	const hostPath = opts?.hostPath ?? hostInfoPath();
-	const info = readHostInfo(hostPath);
-	if (!info) return Promise.resolve({ stopped: false, info: null, reason: "未启动（无 host.json 或不可解析）" });
-	try {
-		process.kill(info.pid);
-	} catch {
-		/* pid 可能已退出（僵尸）——继续清理文件 */
-	}
-	removeHostInfo(hostPath);
-	return Promise.resolve({ stopped: true, info });
+export function stopRuntimeHost(opts?: { hostPath?: string; force?: boolean }): Promise<HostStopResult> {
+	return stopRuntimeDaemon({
+		...(opts?.hostPath !== undefined ? { hostPath: opts.hostPath } : {}),
+		...(opts?.force === true ? { force: true as const } : {}),
+	}).then((r) => ({
+		stopped: r.stopped,
+		...(r.uncertain ? { uncertain: true as const } : {}),
+		info: r.info,
+		...(r.reason !== undefined ? { reason: r.reason } : {}),
+	}));
 }
 
 /** status 回显：host.json 内容 + 探活结果（alive/stale/dead/missing）。 */

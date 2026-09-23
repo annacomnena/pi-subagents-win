@@ -93,6 +93,7 @@
     "test:gui-store": "node --experimental-strip-types ./extensions/_test_gui_store_pagination.ts",
     "test:gui-chat-guard": "node --experimental-strip-types ./extensions/_test_gui_chat_guard.ts",
     "test:gui-autostart": "node --experimental-strip-types ./extensions/_test_gui_autostart.ts",
+    "test:gui-daemon-lifecycle": "node --experimental-strip-types ./extensions/_test_gui_daemon_lifecycle.ts",
     "test:runtime-host-server": "node --experimental-strip-types ./extensions/_test_runtime_host_server.ts",
     "test:runtime-host-ws": "node --experimental-strip-types ./extensions/_test_runtime_host_ws.ts",
     "test:runtime-stream-gen": "node --experimental-strip-types ./extensions/_test_runtime_stream_gen.ts",

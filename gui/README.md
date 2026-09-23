@@ -16,6 +16,17 @@ npm run gui:dev    # 根目录：探活 host（不活则代启）→ 起 vite �
 npm run gui:build  # tsc --noEmit && vite build
 ```
 
+## 生产部署（第一切片：daemon 自托管 dist，禁 vite）
+
+生产 GUI = Runtime Daemon 同源静态托管 `gui/dist`（`GET /` + `/assets/*`，`/v1/*`
+永不 fallback），随 daemon 不可变 release 同步发布（`npm run gui:build` 产物）。
+
+- **生产永不跑 vite**：`gui/vite.config.ts` 在 `PI_RUNTIME_PROFILE=prod` 下拒绝 dev
+  server；`gui/package.json#predev` 同守。浏览器打开 `http://127.0.0.1:<daemon-port>/`
+  （`/gui open` 自动 ensure daemon 并打开此地址）。
+- **dev profile 隔离**：`npm run gui:dev` 缺省 `PI_RUNTIME_PROFILE=dev`，未显式设
+  `PI_RUNTIME_DIR` 时用独立 `~/.pi/agent/runtime-dev`（不碰生产 host.json/host.lock）。
+
 - 端口发现：`GUI_HOST_TARGET` env > `GUI_HOST_PORT` env > `host.json`（`PI_RUNTIME_DIR` 感知）> 兜底 `http://127.0.0.1:4317`。
 - **vite 启动时只读一次 host.json**：host 重启换了端口需重启 vite（gui:dev 会自动代启新 host，实际影响窗口极小）。
 - `/runtime-host start` 行为零变化（不会自动开浏览器）；host 由 gui:dev 代启时是 detached 进程，Ctrl+C 只清 vite，host 存活（用 `/runtime-host stop` 管理）。

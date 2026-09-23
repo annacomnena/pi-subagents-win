@@ -1,22 +1,25 @@
 /**
  * gui-autostart — GUI 自动拉起（opt-in，G6 L3；锚 plans/0920_g6_webconsole_plan.md §5）
  *
+ * 第一切片（plans/0923_runtime_daemon_final_plan.md §9）：`/gui on|open` 改为 ensure
+ * Runtime Daemon（daemon-lifecycle.ensureRuntimeDaemon：detached 单实例 + 身份挑战）+
+ * 打开 daemon 同源静态 URL（`http://127.0.0.1:<port>/`，自托管 gui/dist，生产禁 vite）。
+ *
  * 语义红线：
- *   - `/runtime-host start` 零行为变化（本模块只调用 server.ts::startRuntimeHost，不改它）；
- *   - 默认 OFF 零动作（config.json 无 gui 段 / autoStart≠true → session_start 纯只读后返回）；
- *   - vite 属 **dev 服务**：gui/ 是开发形态（vite dev server + proxy），dist 托管属后续版本；
+ *   - 默认 OFF 零动作（config.json 无 gui 段 / autoStart≠true → session_start 纯只读后返回；
+ *     不得隐式建目录/锁/探测/spawn/定时器）；
+ *   - vite 属 **dev 服务**：仅 `npm run gui:dev`（独立 dev profile/runtimeDir）可用；
+ *     `/gui on|open` 生产路径永不 spawn vite（ensureGuiRuntime 保留作 legacy 导出，不再被命令面调用）；
  *   - 自动拉起（session_start）绝不自动开浏览器；`/gui open` 才开。
  *
  * 行为：
  *   - `/gui on`  → 写 config.json gui 段 {autoStart:true}（read-modify-write 保留其余字段 +
- *                  tmp+rename 原子写，同 index.ts::writeConfig 模式）+ 立即 ensure；
- *   - `/gui off` → 写 false（**不杀已起的** host/vite）；
- *   - `/gui status` → config 态 + host 探活（discovery 四态）+ vite 5173 探针；
- *   - `/gui open`   → ensure + 系统默认浏览器打开 http://localhost:5173。
+ *                  tmp+rename 原子写，同 index.ts::writeConfig 模式）+ 立即 ensure daemon；
+ *   - `/gui off` → 写 false（**不杀已起的** daemon；也不等于 /runtime stop）；
+ *   - `/gui status` → config 态 + daemon 探活（discovery 四态）+ 同源静态 GUI URL；
+ *   - `/gui open`   → ensure daemon + 系统默认浏览器打开同源静态 URL。
  *   - session_start 自动拉起（仅 gui.autoStart=true）：主会话非 subagent 非 tab
- *     （identity::isMainSession，与 S3/succession 无关）→ host 探活不活则 detached 代启
- *     server.ts（复用 startRuntimeHost，同 gui-dev 形状）→ vite 探活（GET / 探针）不活则
- *     detached spawn vite（cwd gui/，stdio ignore，GUI_HOST_TOKEN 经 env 传 vite proxy）。
+ *     （identity::isMainSession，与 S3/succession 无关）→ ensure daemon（内部幂等复用）。
  *     全程 never-throw + 30s 节流防抖。
  *
  * 子 agent / 子进程零动作：index.ts 主路径早退（isSubagent 分支不接线本模块）+
@@ -35,6 +38,7 @@ import { fileURLToPath } from "node:url";
 import { isMainSession } from "./identity.ts";
 import { classifyHost, readHostInfo, type HostInfo } from "./runtime-host/discovery.ts";
 import { startRuntimeHost } from "./runtime-host/server.ts";
+import { daemonUrlFor, ensureRuntimeDaemon, type DaemonEnsureResult } from "./runtime-host/daemon-lifecycle.ts";
 import { traceSpawn } from "./spawn-trace.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -205,7 +209,9 @@ export interface HostStartLike {
 }
 
 export interface GuiEnsureDeps {
-	/** host ensure（缺省 = startRuntimeHost：内部已做探活+复用+detached 代启，幂等）。 */
+	/** daemon ensure（缺省 = ensureRuntimeDaemon：detached 单实例 + 身份挑战，幂等）。 */
+	ensureDaemon?: () => Promise<DaemonEnsureResult>;
+	/** host ensure（legacy：仅 ensureGuiRuntime 用；命令面已改走 ensureDaemon）。 */
 	startHost?: () => Promise<HostStartLike>;
 	/** vite 探针（缺省 probeViteAlive）。 */
 	probeVite?: (port: number) => Promise<boolean>;
@@ -227,6 +233,8 @@ export interface GuiEnsureResult {
 
 /**
  * ensure host + vite（幂等：活则不重 spawn；never-throw）。
+ * @deprecated legacy dev 路径（第一切片起 `/gui on|open`/自动拉起改走 ensureGuiDaemon +
+ * 同源静态；本函数保留仅供既有测试与外部兼容，不再被命令面调用，生产永不 spawn vite）。
  * 顺序：host 先行（vite proxy 启动期读一次 host.json，host 就绪后再拉 vite 才能拿到正确端口/token）。
  */
 export async function ensureGuiRuntime(deps: GuiEnsureDeps = {}): Promise<GuiEnsureResult> {
@@ -283,16 +291,37 @@ export interface GuiAutoStartDeps extends GuiEnsureDeps {
 	throttleMs?: number;
 }
 
-/** session_start tick：主会话 + autoStart=true + 过节流 → 后台 ensure（fire-and-forget，不开浏览器）。 */
+/** daemon ensure（第一切片生产路径；never-throw：异常收敛为 ok:false）。 */
+export async function ensureGuiDaemon(deps: GuiAutoStartDeps = {}): Promise<DaemonEnsureResult> {
+	try {
+		return await (deps.ensureDaemon ?? (() => ensureRuntimeDaemon()))();
+	} catch (e) {
+		return { ok: false, info: null, url: null, pid: null, port: null, error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+function guiDaemonSummary(r: DaemonEnsureResult): string {
+	const daemonLine = r.ok
+		? r.already
+			? `复用已跑实例 pid=${r.pid} port=${r.port}`
+			: `已启动 pid=${r.pid} port=${r.port}`
+		: r.uncertain
+			? `未确权（uncertain，fail-closed）：${r.error ?? "未知"}`
+			: `未就绪：${r.error ?? "未知错误"}`;
+	const guiLine = r.url ? `同源静态 GUI：${r.url}（daemon 自托管 gui/dist，无 vite）` : "GUI 地址未知（daemon 未就绪）";
+	return `daemon: ${daemonLine}${r.note ? `\n注：${r.note}` : ""}\n${guiLine}`;
+}
+
+/** session_start tick：主会话 + autoStart=true + 过节流 → 后台 ensure daemon（fire-and-forget，不开浏览器）。 */
 export function guiAutoStartTick(deps: GuiAutoStartDeps = {}): void {
 	try {
 		if (!isMainSession()) return; // 子 agent / tab → 零动作
 		const readAutoStart = deps.readAutoStart ?? ((): boolean => readGuiAutoStart(deps.configPath));
-		if (readAutoStart() !== true) return; // 默认 OFF → 零动作
+		if (readAutoStart() !== true) return; // 默认 OFF → 零动作（不建目录/锁/探测/spawn/定时器）
 		const now = (deps.now ?? Date.now)();
 		if (now - guiAutoStartState.lastAt < (deps.throttleMs ?? GUI_AUTOSTART_THROTTLE_MS)) return; // 30s 节流
 		guiAutoStartState.lastAt = now;
-		void ensureGuiRuntime(deps).catch(() => {
+		void ensureGuiDaemon(deps).catch(() => {
 			/* 自动拉起 never-throw */
 		});
 	} catch {
@@ -347,7 +376,7 @@ export function registerGuiAutoStart(pi: GuiExtensionApi, deps: GuiAutoStartDeps
 	try {
 		pi.registerCommand("gui", {
 			description:
-				"Web Console（dev 形态，vite 开发服务器；dist 托管属后续）：/gui on|off|status|open",
+				"Runtime GUI（daemon 同源静态托管 gui/dist；dev 用 npm run gui:dev）：/gui on|off|status|open",
 			handler: async (args, ctx) => {
 				const notify = (body: string, level: "info" | "warning" = "info"): void => {
 					ctx.ui.notify(body, level);
@@ -360,15 +389,15 @@ export function registerGuiAutoStart(pi: GuiExtensionApi, deps: GuiAutoStartDeps
 						notify(`gui.autoStart 写入失败：${w.error}`, "warning");
 						return;
 					}
-					const r = await ensureGuiRuntime(deps);
-					notify(`gui.autoStart=true 已写入\n${guiEnsureSummary(r)}`, r.host.ok ? "info" : "warning");
+					const r = await ensureGuiDaemon(deps);
+					notify(`gui.autoStart=true 已写入\n${guiDaemonSummary(r)}`, r.ok ? "info" : "warning");
 					return;
 				}
 				if (cmd === "off") {
 					const w = setGuiAutoStart(false, cfgPath);
 					notify(
 						w.ok
-							? "gui.autoStart=false 已写入（自动拉起关闭；已运行的 host/vite 不停止）"
+							? "gui.autoStart=false 已写入（自动拉起关闭；已运行的 daemon 不停止——不等于 /runtime stop）"
 							: `gui.autoStart 写入失败：${w.error}`,
 						w.ok ? "info" : "warning",
 					);
@@ -378,29 +407,34 @@ export function registerGuiAutoStart(pi: GuiExtensionApi, deps: GuiAutoStartDeps
 					const auto = readGuiAutoStart(cfgPath);
 					const info = readHostInfo();
 					const state = info ? await classifyHost(info) : "missing";
-					const port = deps.vitePort ?? vitePortFromEnv();
-					const viteAlive = await (deps.probeVite ?? probeViteAlive)(port);
-					const hostLine = !info
+					const daemonLine = !info
 						? "未启动（无 host.json）"
-						: `${state} pid=${info.pid} port=${info.port}`;
+						: `${state} pid=${info.pid} port=${info.port}` +
+							(info.instanceId ? ` instance=${info.instanceId}` : "") +
+							(info.releaseId ? ` release=${info.releaseId}` : "");
+					const guiLine = info && state === "alive" ? `同源静态 GUI：${daemonUrlFor(info.port)}` : "GUI 未就绪（daemon 未确权前无地址）";
 					notify(
 						`gui.autoStart=${auto ? "on" : "off"}（config.json gui 段）\n` +
-							`host: ${hostLine}\n` +
-							`vite: ${viteAlive ? `alive（http://localhost:${port}）` : "down"}\n` +
-							`注：gui/ 为 dev 形态（vite 开发服务器），dist 托管属后续版本`,
+							`daemon: ${daemonLine}\n` +
+							`${guiLine}\n` +
+							`注：生产 GUI 由 daemon 自托管 gui/dist（无 vite）；dev 用 npm run gui:dev（独立 profile）`,
 						state === "stale" || state === "dead" ? "warning" : "info",
 					);
 					return;
 				}
 				if (cmd === "open") {
-					const r = await ensureGuiRuntime(deps);
-					const url = `http://localhost:${deps.vitePort ?? vitePortFromEnv()}`;
+					const r = await ensureGuiDaemon(deps);
+					const url = r.url ?? (r.port !== null ? daemonUrlFor(r.port) : "");
+					if (!url) {
+						notify(`daemon 未就绪，无法打开 GUI：${r.error ?? "未知错误"}`, "warning");
+						return;
+					}
 					const ob = (deps.openBrowser ?? openInBrowser)(url);
 					notify(
 						ob.ok
-							? `${url} 已交系统默认浏览器（ensure：\n${guiEnsureSummary(r)}）`
+							? `${url} 已交系统默认浏览器（同源静态，ensure：\n${guiDaemonSummary(r)}）`
 							: `浏览器打开失败：${ob.error}（手动访问 ${url}）`,
-						ob.ok && r.host.ok ? "info" : "warning",
+						ob.ok && r.ok ? "info" : "warning",
 					);
 					return;
 				}

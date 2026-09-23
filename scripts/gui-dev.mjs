@@ -11,6 +11,11 @@
  * 用法（根 package.json）：`npm run gui:dev`。
  * env：PI_RUNTIME_DIR（host.json 定位，同 runtime/journal.ts）；GUI_VITE_PORT（vite 端口，
  * 缺省 5173）。
+ *
+ * 第一切片 dev profile 隔离（plans/0923_runtime_daemon_final_plan.md §9）：缺省
+ * PI_RUNTIME_PROFILE=dev；未显式设 PI_RUNTIME_DIR 时 dev 用独立 runtime-dev 目录，
+ * 不碰生产 host.json/host.lock。生产 GUI 由 daemon 自托管 gui/dist，永不跑 vite
+ *（gui/vite.config.ts 在 prod profile 下拒绝 dev server）。
  */
 
 import { spawn } from "node:child_process";
@@ -28,9 +33,13 @@ const VITE_BIN = join(GUI_DIR, "node_modules", "vite", "bin", "vite.js");
 const HEALTH_PROBE_TIMEOUT_MS = 1500;
 const HOST_START_WAIT_MS = 8000;
 
+// dev profile 缺省（显式传入优先）；隔离默认 runtimeDir（生产目录不动）。
+if (!process.env.PI_RUNTIME_PROFILE) process.env.PI_RUNTIME_PROFILE = "dev";
+
 function runtimeDir() {
 	const override = process.env.PI_RUNTIME_DIR;
-	return override && override.trim() ? override.trim() : join(homedir(), ".pi", "agent", "runtime");
+	if (override && override.trim()) return override.trim();
+	return join(homedir(), ".pi", "agent", "runtime-dev");
 }
 
 function readHostInfo() {
@@ -133,6 +142,7 @@ function spawnHost() {
 }
 
 async function main() {
+	console.log(`[gui:dev] dev profile（PI_RUNTIME_PROFILE=${process.env.PI_RUNTIME_PROFILE}，runtimeDir=${runtimeDir()}；生产目录隔离，不碰线上 host.json）`);
 	if (!existsSync(VITE_BIN)) {
 		console.error("[gui:dev] gui/node_modules 缺失——先在 gui/ 下 `npm install`（或根目录 `npm install --prefix gui`）");
 		process.exit(1);

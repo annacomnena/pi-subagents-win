@@ -49,8 +49,26 @@ function resolveProxyTarget(): string {
 	return FALLBACK_TARGET;
 }
 
+// 第一切片生产禁 vite（plans/0923_runtime_daemon_final_plan.md §9）：
+// PI_RUNTIME_PROFILE=prod 时 dev server 拒绝启动（configureServer 抛错）；
+// `vite build`（dist 构建）不受影响——生产 GUI = daemon 自托管 gui/dist。
+// 开发一律 `npm run gui:dev`（dev profile + 独立 runtimeDir，见 scripts/gui-dev.mjs）。
+const prodGuardPlugin =
+	(process.env.PI_RUNTIME_PROFILE ?? "").trim().toLowerCase() === "prod"
+		? [
+				{
+					name: "prod-no-vite-dev-server",
+					configureServer(): void {
+						throw new Error(
+							"[gui] vite dev server 在生产 profile 下被禁止：生产 GUI 由 Runtime Daemon 自托管 gui/dist；开发用 npm run gui:dev",
+						);
+					},
+				},
+			]
+		: [];
+
 export default defineConfig({
-	plugins: [react(), tailwindcss()],
+	plugins: [...prodGuardPlugin, react(), tailwindcss()],
 	server: {
 		proxy: {
 			"/v1": {

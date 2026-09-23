@@ -67,6 +67,7 @@ import { newEnvelopeId } from "./runtime/ids.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { appendRuntimeEnvelope } from "./runtime/journal.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
+import { RUNTIME_SCHEMA_VERSION, verifyChallengeResponse } from "./runtime-host/identity.ts";
 import { newOutboxItem, writeOutboxItem } from "./runtime/message-outbox.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
@@ -484,7 +485,8 @@ try {
 		}
 	}
 
-	// ── T13 stale 接管（L4 必修回归）：pid 活但探活失败 ≠ “已在跑” ────────────
+	// ── T13 stale 不覆盖（第一切片 fail-closed 回归，替代旧 L4 覆盖语义）：
+	// pid 活但探活失败（PID 重用/陌生进程形状）→ uncertain，不复用、不重建、不 kill ───
 
 	{
 		const D = mkdtempDir("runtime-host-t13-");
@@ -496,27 +498,34 @@ try {
 		writeHostInfo(stale, hp);
 		assert.equal(await classifyHost(stale, { timeoutMs: 500 }), "stale", "前置：pid 活、探活失败 → stale");
 
-		// start 必须覆盖启动（不能回显“已在跑”）
-		const r = await startRuntimeHost({ hostPath: hp, waitMs: 15000 });
-		try {
-			assert.equal(r.error, undefined, `start 无错：${r.error ?? ""}`);
-			assert.equal(r.started, true, "stale host → 覆盖启动（非回显）");
-			assert.equal(r.already, undefined, "不得判 already");
-			assert.ok(r.note && r.note.includes("检测到僵尸，已接管"), `回显接管提示：${r.note ?? "无"}`);
-			assert.notEqual(r.info?.instanceId, stale.instanceId, "新 instanceId（覆盖语义）");
-			assert.notEqual(r.info?.pid, stale.pid, "新 pid（未被旧 pid 形状误导）");
-			assert.ok(isProcessAlive(r.info!.pid), "新进程存活");
-			const health = await getJson(`http://127.0.0.1:${r.info!.port}`, "/v1/health");
-			assert.equal(health.status, 200, "新实例 health 可达");
-			assert.equal((health.body.host as any).instanceId, r.info!.instanceId, "health 回显 = 新实例");
+		// start 必须 fail-closed（不能回显“已在跑”，也不能覆盖活锁）
+		const r = await startRuntimeHost({ hostPath: hp, waitMs: 5000 });
+		assert.equal(r.started, false, "stale host → 不启动");
+		assert.equal(r.already, undefined, "不得判 already");
+		assert.equal(r.uncertain, true, "stale host → uncertain fail-closed");
+		assert.ok(r.error && r.error.includes("fail-closed"), `回显 fail-closed 原因：${r.error ?? "无"}`);
+		assert.equal(readHostInfo(hp)?.instanceId, stale.instanceId, "host.json 未被覆盖（活锁保护）");
+		assert.ok(isProcessAlive(process.pid), "stale pid 未被 kill（不误杀）");
 
-			// 覆盖后重复 start → 回显现有（fresh 不重起）
-			const r2 = await startRuntimeHost({ hostPath: hp });
-			assert.equal(r2.started, false);
-			assert.equal(r2.already, true, "fresh host 重复 start → 回显现有（不重起）");
-			assert.equal(r2.info?.pid, r.info!.pid, "同 pid（未重新 spawn）");
+		// dead 僵尸仍可持锁重建（与 T12 同语义）：覆盖 stale 文件为 dead pid 后 start → 接管
+		const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+		await new Promise<void>((r2) => {
+			child.on("exit", () => r2());
+			setTimeout(() => r2(), 5000);
+		});
+		writeHostInfo(mkHostInfo({ pid: child.pid, port: 1 }), hp);
+		const r3 = await startRuntimeHost({ hostPath: hp, waitMs: 15000 });
+		try {
+			assert.equal(r3.started, true, "dead host → 持锁重建");
+			assert.ok(r3.note && r3.note.includes("检测到僵尸，已接管"), `回显接管提示：${r3.note ?? "无"}`);
+			assert.notEqual(r3.info?.instanceId, stale.instanceId, "新 instanceId（覆盖语义）");
+			// 重建后重复 start → 回显现有（fresh 不重起）
+			const r4 = await startRuntimeHost({ hostPath: hp });
+			assert.equal(r4.started, false);
+			assert.equal(r4.already, true, "fresh host 重复 start → 回显现有（不重起）");
+			assert.equal(r4.info?.pid, r3.info!.pid, "同 pid（未重新 spawn）");
 		} finally {
-			if (r.info && isProcessAlive(r.info.pid)) {
+			if (r3.info && isProcessAlive(r3.info.pid)) {
 				await stopRuntimeHost({ hostPath: hp }).catch(() => undefined);
 			}
 		}
@@ -620,6 +629,88 @@ try {
 			}
 		} finally {
 			await h.close().catch(() => undefined);
+		}
+	}
+	// ── T15 第一切片：身份发布 + 挑战 + 静态托管 + 穿越拒绝 + 单实例锁 ───
+
+	{
+		const D = mkdtempDir("runtime-host-t15-");
+		DIRS.push(D);
+		const dist = join(D, "dist");
+		mkdirSync(join(dist, "assets"), { recursive: true });
+		writeFileSync(join(dist, "index.html"), "<!doctype html><html><body>t15-home</body></html>");
+		writeFileSync(join(dist, "assets", "a.js"), "t15-asset-ok");
+		writeFileSync(join(D, "secret.txt"), "t15-outside-secret");
+		const hp = join(D, "host.json");
+		const h = await createRuntimeHostServer({
+			hostPath: hp,
+			timersDir: join(D, "t"),
+			mailboxDir: join(D, "m"),
+			stateDir: join(D, "s"),
+			journalPath: join(D, "e.jsonl"),
+			distDir: dist,
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			// 身份三件套随 host.json 原子发布
+			assert.ok(h.info.runtimeId && h.info.releaseId && h.info.processStartIdentity, "T15① 身份字段发布");
+			assert.equal(h.info.schemaVersion, RUNTIME_SCHEMA_VERSION, "T15② schemaVersion=1");
+			assert.ok(h.info.token && h.info.token.length > 0, "T15③ token 落盘（同用户可读）");
+			// 静态托管同源可用
+			const pageRes = await fetch(`${base}/`);
+			assert.equal(pageRes.status, 200, "T15④ GET / 200");
+			assert.ok((await pageRes.text()).includes("t15-home"), "T15⑤ 首页为 dist 内容");
+			const aRes = await fetch(`${base}/assets/a.js`);
+			assert.equal(aRes.status, 200, "T15⑥ /assets/* 200");
+			assert.ok((await aRes.text()).includes("t15-asset-ok"), "T15⑦ asset 内容正确");
+			// /v1/* 永不 SPA fallback
+			const nRes = await fetch(`${base}/v1/nope-t15`);
+			assert.equal(nRes.status, 404, "T15⑧ 未知 /v1/* 404");
+			assert.ok((nRes.headers.get("content-type") ?? "").includes("application/json"), "T15⑨ 404 为 JSON");
+			assert.ok(!(await nRes.text()).includes("<html"), "T15⑩ 无 HTML 泄漏");
+			// 匿名 health 无 token
+			const hh = await getJson(base, "/v1/health");
+			assert.equal((hh.body.host as any).token, undefined, "T15⑪ health 无 token");
+			assert.equal(hh.body.host.runtimeId, h.info.runtimeId, "T15⑫ health runtimeId");
+			// 穿越拒绝且无越界泄漏
+			for (const p of ["/assets/%2e%2e/secret.txt", "/assets/%252e%252e/x"]) {
+				const er = await fetch(`${base}${p}`);
+				assert.ok([400, 403, 404].includes(er.status), `T15⑬ ${p} → ${er.status}`);
+				assert.ok(!(await er.text()).includes("t15-outside-secret"), `T15⑭ ${p} 无泄漏`);
+			}
+			// 身份挑战往返
+			const nonce = "t15-nonce-0123456789abcdef";
+			const chRes = await fetch(`${base}/v1/challenge`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ nonce }),
+			});
+			assert.equal(chRes.status, 200, "T15⑮ challenge 200");
+			const chBody = (await chRes.json()) as Record<string, unknown>;
+			const meta = {
+				instanceId: h.info.instanceId,
+				runtimeId: h.info.runtimeId!,
+				protocolVersion: PROTOCOL_VERSION,
+				releaseId: h.info.releaseId!,
+				schemaVersion: RUNTIME_SCHEMA_VERSION,
+				processStartIdentity: h.info.processStartIdentity!,
+			};
+			assert.equal(verifyChallengeResponse(h.info.token, nonce, chBody, meta), true, "T15⑯ HMAC 本地可验");
+			assert.equal((chBody as any).token, undefined, "T15⑰ 挑战回显不含 token");
+			const badRes = await fetch(`${base}/v1/challenge`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ nonce: "x" }),
+			});
+			assert.equal(badRes.status, 400, "T15⑱ 坏 nonce 400");
+			// 单实例锁：同 hostPath 再起 → 拒绝（不双跑）
+			await assert.rejects(
+				createRuntimeHostServer({ hostPath: hp, timersDir: join(D, "t2") }),
+				/单实例锁/,
+				"T15⑲ 同 hostPath 双跑被拒绝",
+			);
+		} finally {
+			await h.close();
 		}
 	}
 } finally {

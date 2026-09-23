@@ -209,11 +209,11 @@ try {
 	{
 		let ensureCount = 0;
 		const deps = {
-			startHost: (): Promise<HostStartLike> => {
+			// 第一切片：tick 走 ensureDaemon（daemon 单实例），不再经 startHost/vite
+			ensureDaemon: (): Promise<import("./runtime-host/daemon-lifecycle.ts").DaemonEnsureResult> => {
 				ensureCount++;
-				return Promise.resolve(okHost());
+				return Promise.resolve({ ok: true, already: true, info: null, url: "http://127.0.0.1:4317/", pid: 1, port: 4317 });
 			},
-			probeVite: () => Promise.resolve(true),
 			readAutoStart: (): boolean => true,
 			now: (): number => 1_000_000,
 		};
@@ -260,21 +260,19 @@ try {
 		guiAutoStartState.lastAt = 0;
 	}
 
-	// ── T5 /gui 命令面 ──────────────────────────────────────────────
+	// ── T5 /gui 命令面（第一切片：on|open 走 ensureDaemon + 同源静态 URL；生产不碰 vite）
 	{
 		const cfg = join(TMP, "t5-config.json");
 		writeFileSync(cfg, JSON.stringify({ models: {}, notifications: true }, null, 2) + "\n");
-		let hostCalls = 0;
+		let daemonCalls = 0;
 		let openCalls = 0;
 		let openedUrl = "";
 		const deps = {
 			configPath: cfg,
-			startHost: (): Promise<HostStartLike> => {
-				hostCalls++;
-				return Promise.resolve(okHost({ token: "t5" }));
+			ensureDaemon: (): Promise<import("./runtime-host/daemon-lifecycle.ts").DaemonEnsureResult> => {
+				daemonCalls++;
+				return Promise.resolve({ ok: true, already: true, info: null, url: "http://127.0.0.1:4317/", pid: 11, port: 4317 });
 			},
-			probeVite: () => Promise.resolve(true),
-			vitePort: 5173,
 			openBrowser: (url: string): { ok: boolean } => {
 				openCalls++;
 				openedUrl = url;
@@ -293,15 +291,16 @@ try {
 		calls.length = 0;
 		await gui.handler("on", fakeCtx(calls));
 		assert.equal(readGuiAutoStart(cfg), true, "T5③ /gui on 写入 true");
-		assert.equal(hostCalls, 1, "T5④ /gui on 立即 ensure");
-		assert.ok((calls[0]?.body ?? "").includes("host:"), "T5⑤ on 回显 host/vite");
-		assert.ok((calls[0]?.body ?? "").includes("复用"), "T5⑥ ensure 复用（活则不重 spawn）");
+		assert.equal(daemonCalls, 1, "T5④ /gui on 立即 ensure daemon");
+		assert.ok((calls[0]?.body ?? "").includes("daemon:"), "T5⑤ on 回显 daemon");
+		assert.ok((calls[0]?.body ?? "").includes("http://127.0.0.1:4317/"), "T5⑥ on 回显同源静态 URL（无 vite）");
+		assert.ok((calls[0]?.body ?? "").includes("复用"), "T5⑥b ensure 复用（活则不重 spawn）");
 
 		calls.length = 0;
 		await gui.handler("off", fakeCtx(calls));
 		assert.equal(readGuiAutoStart(cfg), false, "T5⑦ /gui off 写入 false");
-		assert.ok((calls[0]?.body ?? "").includes("不停止"), "T5⑧ off 明示不杀已起服务");
-		assert.equal(hostCalls, 1, "T5⑨ off 不触发 ensure");
+		assert.ok((calls[0]?.body ?? "").includes("不停止"), "T5⑧ off 明示不杀已起 daemon");
+		assert.equal(daemonCalls, 1, "T5⑨ off 不触发 ensure");
 
 		// status：config + host（真实 classify：活 pid + 死端口 → stale）+ vite 探针（注入 alive）
 		writeHostInfo(
@@ -319,17 +318,17 @@ try {
 		await gui.handler("status", fakeCtx(calls));
 		const status = calls[0]?.body ?? "";
 		assert.ok(status.includes("autoStart=off"), "T5⑩ status 含 config 态");
-		assert.ok(/host: (missing|stale|alive|dead)/.test(status), "T5⑪ status 含 host 四态");
-		assert.ok(status.includes("vite: alive"), "T5⑫ status 含 vite 探针结果");
-		assert.ok(status.includes("dev"), "T5⑬ status 注明 dev 形态");
+		assert.ok(/daemon: (missing|stale|alive|dead)/.test(status), "T5⑪ status 含 daemon 四态");
+		assert.ok(!status.includes("vite:"), "T5⑫ status 不再走 vite 探针（生产禁 vite）");
+		assert.ok(status.includes("npm run gui:dev"), "T5⑬ status 注明 dev 走 gui:dev");
 
-		// open：先 ensure + 浏览器恰一次 + URL 正确（probeVite=true → 不重 spawn）
+		// open：先 ensure daemon + 浏览器恰一次 + 同源静态 URL 正确
 		calls.length = 0;
 		await gui.handler("open", fakeCtx(calls));
 		assert.equal(openCalls, 1, "T5⑭ open 恰开一次浏览器");
-		assert.equal(openedUrl, "http://localhost:5173", "T5⑮ open URL 正确");
-		assert.equal(hostCalls, 2, "T5⑯ open 先 ensure");
-		assert.ok((calls[0]?.body ?? "").includes("localhost:5173"), "T5⑰ open 回显 URL");
+		assert.equal(openedUrl, "http://127.0.0.1:4317/", "T5⑮ open URL 为 daemon 同源静态地址");
+		assert.equal(daemonCalls, 2, "T5⑯ open 先 ensure daemon");
+		assert.ok((calls[0]?.body ?? "").includes("127.0.0.1:4317"), "T5⑰ open 回显 URL");
 
 		// 写失败路径：configPath 指向目录 → warning
 		calls.length = 0;

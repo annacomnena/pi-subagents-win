@@ -31,7 +31,12 @@ export { isProcessAlive };
 /** 协议版本（首版冻结；G5 GUI 对接时按此分叉）。 */
 export const PROTOCOL_VERSION = 1;
 
-/** host.json 内容契约（总计划 §25；端口动态——127.0.0.1:0 启动，实际端口写盘做发现）。 */
+/** host.json 内容契约（总计划 §25；端口动态——127.0.0.1:0 启动，实际端口写盘做发现）。
+ *
+ * 第一切片新增（plans/0923_runtime_daemon_final_plan.md §2.2/§9，原子发布；全部可选字段——
+ * 旧文件/测试夹具缺省仍可解析 = legacy 分支兼容）：runtimeId / releaseId / schemaVersion /
+ * processStartIdentity。host.json 是发现提示，不是锁/凭据公开页；token 仅同用户可读
+ * （0600），绝不进任何 HTTP 响应。 */
 export interface HostInfo {
 	/** 本实例 id（`host_<base36>_<rand>`）；清理时按此匹配，防误删僵尸覆盖后的新文件。 */
 	instanceId: string;
@@ -41,6 +46,14 @@ export interface HostInfo {
 	/** ISO 时间。 */
 	startedAt: string;
 	protocolVersion: number;
+	/** 规范化 runtimeDir → 稳定 id（identity.runtimeIdForDir；§2.2 单实例）。 */
+	runtimeId?: string;
+	/** 不可变 release 标识（identity.computeReleaseId；dist 与 daemon 同步发布）。 */
+	releaseId?: string;
+	/** 契约版本（identity.RUNTIME_SCHEMA_VERSION，首版 1）。 */
+	schemaVersion?: number;
+	/** 进程启动身份 `<pid>@<ISO>`（G0 核对 OS 创建时间用，固定 ISO 格式）。 */
+	processStartIdentity?: string;
 	/** G6-P1：本机认证 token（host 启动生成；同机进程可读；仅 WS 升级面校验，
 	 *  绝不出现在任何 HTTP 响应里）。旧文件/测试夹具可缺省（可选字段）。 */
 	token?: string;
@@ -96,6 +109,11 @@ export function readHostInfo(path: string = hostInfoPath()): HostInfo | null {
 			startedAt: v.startedAt,
 			protocolVersion: v.protocolVersion,
 			...(typeof v.token === "string" && v.token.length > 0 ? { token: v.token } : {}),
+			// 第一切片新增字段：合法才收录（坏值丢弃≠整文件判坏，legacy 兼容）
+			...(typeof v.runtimeId === "string" && v.runtimeId.length > 0 ? { runtimeId: v.runtimeId } : {}),
+			...(typeof v.releaseId === "string" && v.releaseId.length > 0 ? { releaseId: v.releaseId } : {}),
+			...(typeof v.schemaVersion === "number" && Number.isInteger(v.schemaVersion) ? { schemaVersion: v.schemaVersion } : {}),
+			...(typeof v.processStartIdentity === "string" && v.processStartIdentity.length > 0 ? { processStartIdentity: v.processStartIdentity } : {}),
 		};
 	} catch {
 		return null;

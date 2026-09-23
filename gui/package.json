@@ -5,6 +5,7 @@
   "type": "module",
   "description": "G5 GUI v0: browser runtime workbench (vite+react+ts+tailwind v4+zustand). talks to runtime-host via vite dev proxy /v1 -> host.",
   "scripts": {
+    "predev": "node -e \"if(process.env.PI_RUNTIME_PROFILE==='prod'){console.error('[gui] refused: vite dev forbidden in prod profile');process.exit(1)}\"",
     "dev": "vite",
     "build": "tsc --noEmit && vite build"
   },
