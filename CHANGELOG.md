@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0] — 2026-09-23 (session isolation + parallel async + master governance + global view)
+
+- **async 终态只投派发者**：onRunFile link 路由 fail-closed（外会话零副作用、可补投）；async 专用注册谓词（任意 tab 派发者都 watch）。
+- **status 默认会话隔离**：无参只返本会话最新 run，显式 runId 保持跨会话可查。
+- **parallel 缺省异步**：tasks 不带 async:false 即 fan-out 立返 runId（async:false 保留阻塞）；单发/并行/status 全带 Model: 行。
+- **master 治理**：global 只能在 home 会话持有（token/forceStale/genesis 一律不放行、initialCwd 防 cd 绕过、后继 home 启动）；后继标题 `master-MMDD-HHmm-<工作>`。
+- **global-view 首阶段**：只读跨仓聚合（一屏 ≤30 行，orphaned 默认隐藏计数）；GC/mailbox 执行链未进本版。
+- **launch  robustness**：wt.exe 别名断裂直连回退、Get-AppxPackage 兜底、traceSpawn 探针、preflight。
+- **recent 原生感知**：master-status `recent:` 行（三账本归并）；lite 档位不规定模型（编排自选）。
+- **修复备注**：09-23 10:32 三处 pi 安装 dist+依赖被掏空致宿主崩溃，已按 0.87.1 shrinkwrap 逐包恢复；停用直接调底层 attachMaster 绕守卫。
+
 ## [0.5.3] — 2026-09-22 (rail trio + hotspot graph + async overhaul + launch preflight)
 
 - **会话 rail 三件套**：master 置顶区 + scope master 组内置顶（`isMaster/isScopeMaster`，session-pin + /v1/sessions additive）；每仓库最多 6 个（overflow 展开持久化）；全 tab 组默认折叠。
