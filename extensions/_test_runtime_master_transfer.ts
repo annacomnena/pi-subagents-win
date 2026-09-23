@@ -13,16 +13,20 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-master-transfer-env-"));
+
+/** home 守卫迁移（0923）：控制层必填 cwd/initialCwd；存量用例以真实 home 通过门（仅作比较，不写 home）。 */
+const HOME = homedir();
 
 import {
 	attachCurrentSession,
 	issueMasterHandoffToken,
 } from "./runtime/master-control.ts";
 import {
+	buildMasterSuccessorTitle,
 	buildSuccessorPrompt,
 	confirmTransferAttach,
 	readTransferRecord,
@@ -48,7 +52,7 @@ const OWNER = "sess_owner_m3";
 let transferId = "";
 let token = "";
 {
-	const a = attachCurrentSession({ sessionId: OWNER });
+	const a = attachCurrentSession({ sessionId: OWNER, cwd: HOME, initialCwd: HOME });
 	assert.equal(a.ok, true);
 	const r = transferMaster({ sessionId: OWNER, reason: "m3-test", spawn: fakeSpawn("run_succ_1") });
 	assert.equal(r.ok, true);
@@ -91,7 +95,7 @@ let token = "";
 	const fresh = issueMasterHandoffToken({ sessionId: OWNER, reason: "succession" });
 	assert.equal(fresh.ok, true);
 	if (!fresh.ok || !("token" in fresh) || !fresh.token) throw new Error("unreachable");
-	const a = attachCurrentSession({ sessionId: "sess_succ_1", token: fresh.token });
+	const a = attachCurrentSession({ sessionId: "sess_succ_1", token: fresh.token, cwd: HOME, initialCwd: HOME });
 	assert.equal(a.ok, true);
 	if (a.ok) assert.equal(a.attachment.generation, 2);
 	const c = confirmTransferAttach({ transferId, sessionId: "sess_succ_1" });
@@ -120,6 +124,63 @@ let token = "";
 	const c = confirmTransferAttach({ transferId: r.transferId, sessionId: "sess_succ_1" });
 	assert.equal(c.ok, false);
 	ok("confirm 未接管即确认 → generation-mismatch");
+}
+
+// ⑧ buildMasterSuccessorTitle：master-时间-主要工作
+{
+	const at = new Date(2026, 8, 23, 14, 30); // 本地时间注入
+	assert.equal(
+		buildMasterSuccessorTitle("tr_abc123", 5, "影像tile缓存", at),
+		"master-0923-1430-影像tile缓存",
+	);
+	assert.equal(
+		buildMasterSuccessorTitle("tr_abc123", 5, "影像 tile 缓存", at),
+		"master-0923-1430-影像-tile-缓存",
+	);
+	ok("中文 reason slug");
+}
+{
+	const at = new Date(2026, 8, 23, 14, 30);
+	const t = buildMasterSuccessorTitle("tr_x", 5, "fix: bug#123!!", at);
+	assert.equal(t, "master-0923-1430-fix-bug123");
+	ok("非法字符清洗");
+}
+{
+	const at = new Date(2026, 8, 23, 14, 30);
+	assert.equal(buildMasterSuccessorTitle("tr_x", 5, undefined, at), "master-0923-1430-gen5");
+	assert.equal(buildMasterSuccessorTitle("tr_x", 5, "", at), "master-0923-1430-gen5");
+	assert.equal(buildMasterSuccessorTitle("tr_x", 5, "!!!///", at), "master-0923-1430-gen5");
+	ok("无 reason 回退 gen<N>");
+}
+{
+	const at = new Date(2026, 8, 23, 14, 30);
+	const t = buildMasterSuccessorTitle("tr_x", 5, "ab" + "😀".repeat(30) + "影像缓存测试超长截断", at);
+	const slug = t.slice("master-0923-1430-".length);
+	assert.ok(Array.from(slug).length <= 24, `slug 超长: ${slug}`);
+	assert.ok(slug.isWellFormed(), "slug 切散代理对");
+	assert.ok(!/--+/.test(slug) && !/^-|-$/.test(slug), `slug 规范: ${slug}`);
+	ok("超长截断（按码点，不切散 emoji）");
+}
+{
+	const a = buildMasterSuccessorTitle("tr_x", 5, "r", new Date(2026, 8, 23, 14, 30));
+	const b = buildMasterSuccessorTitle("tr_x", 5, "r", new Date(2026, 11, 1, 8, 5));
+	assert.ok(a.startsWith("master-0923-1430-"), a);
+	assert.ok(b.startsWith("master-1201-0805-"), b);
+	assert.ok(!a.includes("tr_x") && !b.includes("tr_x"), "transferId 不进标题");
+	ok("now 注入决定时间部分");
+}
+
+// ⑨ transferMaster 传递可读标题给 spawn
+{
+	let title = "";
+	const r = transferMaster({
+		sessionId: "sess_succ_1",
+		reason: "影像 tile 缓存",
+		spawn: (args) => { title = args.title; return { successorRunId: "run_title_1" }; },
+	});
+	assert.equal(r.ok, true);
+	assert.match(title, /^master-\d{4}-\d{4}-影像-tile-缓存$/);
+	ok("transferMaster 用可读标题 spawn 后继");
 }
 
 console.log(`\n# pass ${n}`);
