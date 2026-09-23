@@ -408,23 +408,25 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 **设计动机**：完整链的 tab 生命周期（launch/reclaim/event-bus/timer）+ 六角色交接仪式对中小任务过重；且角色制的本质就是按阶段配模型档位——lite 把它显式化为「按阶段选档」，用既有机制（general 角色卡 + per-call model override + 文件交接）零新代码路径实现。
 
-### 档位映射（从 config.models 实时投影，/sub-models 改了自动同步）
+### 档位（相对大小，不规定模型）
 
-| 档位 | 用途 | 模型来源 |
+| 档位 | 用途 | 模型怎么定 |
 |------|------|----------|
-| small | 检索代码 / 更新文档 / 读文档找证据 | `models.searcher` |
-| medium | 实现 / 常规计划 | `models.implementer` |
-| large | 咨询 / 修订计划 / 独立审查 | `models.consultant` |
+| small | 检索代码 / 更新文档 / 读文档找证据 | 编排方自选（轻量、上下文大者优先） |
+| medium | 实现 / 常规计划 | 编排方自选（主力实现模型） |
+| large | 咨询 / 修订计划 / 独立审查 | 编排方自选（最强推理模型） |
 
-派发示例：`subagent-win({ agent: "general", model: "<small 档模型>", task: "阶段：检索。…" })`。档位传入是 lite 的既定机制，不触发「不得随意 override model」规则。
+选型原则：看任务需要的上下文窗口与能力，从当前 sub_models（`/sub-models`）里挑；默认走各 agent 配置的 default，只在默认明显不合适时才用 `model=` 覆盖。**禁止写死模型 ID**（模型会更新）。`/lite` 命令显示的档位映射仅供参考，不构成规定。
+
+派发示例：`subagent-win({ agent: "general", model: "<编排方按阶段自选>", task: "阶段：检索。…" })`。按阶段自选是 lite 的既定机制，不触发「不得随意 override model」规则。
 
 ### 链路 L1–L5
 
-1. **L1 检索（small）**：1–2 个 general，Wiki 第一站 → source_paths 直达 → 主动维护主题页；事实带代码位置 + Wiki 章节引用
-2. **L2 计划（medium；高风险修订用 large）**：基于 L1 事实写 `plans/<月日_主题>.md`
-3. **L3 实现（medium）**：按计划改代码、跑验证
-4. **L4 独立审查（large）**：独立 general 进程，交 `git diff` + 计划路径核对，直接修复；**不可省、不可自己审自己**
-5. **L5 文档收尾（small）**：只更新功能/主题正式页，可结论「Wiki 更新：无」；改过 wiki 调 `wiki-nav rebuild`
+1. **L1 检索（small 档，编排自选轻量模型）**：1–2 个 general，Wiki 第一站 → source_paths 直达 → 主动维护主题页；事实带代码位置 + Wiki 章节引用
+2. **L2 计划（medium 档；高风险修订用 large 档）**：基于 L1 事实写 `plans/<月日_主题>.md`
+3. **L3 实现（medium 档）**：按计划改代码、跑验证
+4. **L4 独立审查（large 档）**：独立 general 进程，交 `git diff` + 计划路径核对，直接修复；**不可省、不可自己审自己**
+5. **L5 文档收尾（small 档）**：只更新功能/主题正式页，可结论「Wiki 更新：无」；改过 wiki 调 `wiki-nav rebuild`
 
 ### 上下文纪律（lite 成败关键）
 
