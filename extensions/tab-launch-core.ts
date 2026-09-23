@@ -17,7 +17,7 @@
  * profile 提交落地）。
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -60,7 +60,8 @@ export function probeWtHelp(exePath: string, timeoutMs = 2500): boolean {
 export function resolveDirectTerminalExe(): string | null {
 	try {
 		const dir = process.env.PI_WT_APPS_DIR || "C:/Program Files/WindowsApps";
-		const entries = readdirSync(dir);
+		try {
+			const entries = readdirSync(dir);
 		let best: { ver: number[]; path: string } | null = null;
 		for (const e of entries) {
 			const m = /^Microsoft\.WindowsTerminal_([0-9.]+)_x64__8wekyb3d8bbwe$/.exec(e);
@@ -70,7 +71,25 @@ export function resolveDirectTerminalExe(): string | null {
 			if (!existsSync(p)) continue;
 			if (!best || compareVer(ver, best.ver) > 0) best = { ver, path: p };
 		}
-		return best?.path ?? null;
+		if (best) return best.path;
+		} catch {
+			/* 目录不可读（WindowsApps ACL 常见）→ 走 powershell 包注册 */
+		}
+		// 回退：Get-AppxPackage 不受目录 ACL 影响（实测本机可用）
+		try {
+			const loc = execFileSync(
+				"powershell.exe",
+				["-NoProfile", "-NonInteractive", "-Command", "(Get-AppxPackage -Name Microsoft.WindowsTerminal).InstallLocation"],
+				{ encoding: "utf8", timeout: 8000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+			).trim();
+			if (loc) {
+				const p = join(loc, "WindowsTerminal.exe");
+				if (existsSync(p)) return p;
+			}
+		} catch {
+			/* powershell 也失败 → 无直调 */
+		}
+		return null;
 	} catch {
 		return null;
 	}
