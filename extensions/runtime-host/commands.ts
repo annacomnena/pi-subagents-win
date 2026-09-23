@@ -63,12 +63,13 @@ export function parseCommandRequest(rawBody: string): CommandFrame {
 	return candidate as unknown as CommandFrame;
 }
 
-/** 拒绝 reason → HTTP status（§1 词表映射；G6-P2 additive：403 master-session-protected / 404 no-session）。 */
+/** 拒绝 reason → HTTP status（§1 词表映射；G6-P2 additive：403 master-session-protected / 404 no-session；L3 additive：409 master-offline）。 */
 const REJECT_HTTP_STATUS: Record<string, number> = {
 	"invalid-payload": 400,
 	"unknown-command": 400,
 	"not-implemented": 400,
 	"master-session-protected": 403,
+	"master-offline": 409,
 	"no-workstream": 404,
 	"no-proposal": 404,
 	"no-session": 404,

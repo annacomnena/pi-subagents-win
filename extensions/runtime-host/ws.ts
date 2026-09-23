@@ -39,7 +39,11 @@
  * 保活：30s ping/pong（两拍无 pong 判死断开，防僵尸连接堆积）。
  *
  * 认证（G6-P1 fail-closed）：token 由 host 启动生成落 host.json（同机进程可读）；WS 握手凭
- *   `?token=` 或 `Cookie: sw_host_token=`；无/错 token → 401（101 前拒绝）；`?token=` 握手成功
+ *   `?token=<hostToken>` 或 `Cookie: sw_host_token=<hostToken>`（旧兼容）或
+ *   `Cookie: sw_gui_token=<派生值>`（B 案浏览器作用域化凭据，仅当 `/gui on` 生效——
+ *   gui off 时该分支 401 fail-closed，`?token=`/旧本体 cookie 的 dev 路径不受影响）；
+ *   无/错 token → 401（101 前拒绝）；
+ *   `?token=` 位置只认 host token 本体（派生值当 query 用 → 401）；`?token=` 握手成功
  *   回 Set-Cookie（HttpOnly + SameSite=Strict + Path=/）。HTTP 端点零变化（P1 仅 WS 面校验）。
  *
  * 手写最小 RFC6455（零新依赖，~百行）：文本帧 + ping/pong + 关闭握手；二进制/分片/RSV →
@@ -72,6 +76,7 @@ import {
 	type TranscriptOp,
 } from "../runtime/transcript.ts";
 import { defaultJournalPath } from "../runtime/journal.ts";
+import { defaultPkgConfigPath, deriveGuiToken, GUI_COOKIE_NAME, readGuiEnabled } from "../runtime/master-injection.ts";
 
 export const WS_PATH = "/v1/events/stream";
 export const WS_COOKIE_NAME = "sw_host_token";
@@ -328,12 +333,16 @@ export function tokenMatches(presented: string | null, expected: string | null):
 }
 
 export function parseCookieToken(cookieHeader: string | undefined): string | null {
+	return parseNamedCookie(cookieHeader, WS_COOKIE_NAME);
+}
+
+/** 按名取 cookie（B 案 server 侧取 sw_gui_token 用；与上同规则）。 */
+export function parseNamedCookie(cookieHeader: string | undefined, name: string): string | null {
 	if (cookieHeader === undefined) return null;
 	for (const part of cookieHeader.split(";")) {
 		const eq = part.indexOf("=");
 		if (eq < 0) continue;
-		const name = part.slice(0, eq).trim();
-		if (name === WS_COOKIE_NAME) {
+		if (part.slice(0, eq).trim() === name) {
 			const value = part.slice(eq + 1).trim();
 			return value.length > 0 ? value : null;
 		}
@@ -443,6 +452,8 @@ export interface EventStreamOptions {
 	tailMs?: number;
 	/** 服务端 ping 间隔 ms（缺省 30000；两拍无 pong 断开）。 */
 	pingMs?: number;
+	/** config.json 路径（gui 门用；缺省包根 config.json，与 server 侧同一取法）。 */
+	configPath?: string;
 }
 
 /**
@@ -473,14 +484,27 @@ function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, opts:
 			return;
 		}
 
-		// ── 认证（101 之前，fail-closed）──
+		// ── 认证（101 之前，fail-closed；B 案作用域化）──
+		// query 位置只认 host token 本体（?token=<派生值> → 401）；cookie 位置另接受
+		// sw_gui_token=<deriveGuiToken(hostToken)>（浏览器作用域化凭据，只解锁 WS 流）。
 		const queryToken = u.searchParams.get("token");
-		const cookieToken = parseCookieToken(req.headers.cookie);
-		const presented = queryToken ?? cookieToken;
-		if (!tokenMatches(presented, opts.token)) {
+		let authed = false;
+		if (queryToken !== null) {
+			authed = tokenMatches(queryToken, opts.token);
+		} else {
+			const hostCookie = parseCookieToken(req.headers.cookie);
+			const guiCookie = parseNamedCookie(req.headers.cookie, GUI_COOKIE_NAME);
+			const guiExpected = typeof opts.token === "string" && opts.token.length > 0 ? deriveGuiToken(opts.token) : "";
+			// B 案 kill-switch：仅派生 cookie 分支受 `/gui on` 门（gui off → 401 fail-closed）；
+			// ?token= 与旧 sw_host_token 本体的既有 dev 路径行为不变。
+			const guiOk = guiCookie !== null && guiExpected.length > 0 && tokenMatches(guiCookie, guiExpected) &&
+				readGuiEnabled(opts.configPath ?? defaultPkgConfigPath());
+			authed = tokenMatches(hostCookie, opts.token) || guiOk;
+		}
+		if (!authed) {
 			rawHttpResponse(socket, 401, "Unauthorized", {
 				error: "unauthorized",
-				hint: "WS 需本机 token：?token= 或 Cookie sw_host_token（token 见 runtime 目录 host.json）",
+				hint: "WS 需本机 token：?token=<hostToken> 或 Cookie sw_host_token / sw_gui_token（token 见 runtime 目录 host.json）",
 			});
 			return;
 		}

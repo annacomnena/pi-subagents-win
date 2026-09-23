@@ -461,6 +461,20 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 
 ---
 
+## 安全边界：不要把 runtime 暴露到公网
+
+runtime-host / daemon 是**本机**控制面，不是网络服务。以下红线不接受例外：
+
+- daemon 只 bind `127.0.0.1`（动态端口，`host.json` 做发现）。不要改绑 `0.0.0.0`。
+- `host.json` 里的 host token 是**本机信任**：同机任何能读该文件（0600，当前用户）的进程都可连。拿到 token = 拿到全部读投影 + 唯一写端点 `POST /v1/commands`。
+- 禁止把端口带到公网：SSH `-L/-R` 端口转发、nginx/Caddy 等反向代理、公网域名、容器 `-p` 端口映射、云主机安全组放行，一律不做。跨站坏 `Origin` 会被服务端拒绝，但这只是纵深，不是暴露的理由。
+- 需要远程访问时走既定通道（微信网关、VPN/内网穿透到**你的人**而不是到端口），而不是暴露 HTTP。
+- token 泄漏等于把 runtime 交给对方：轮换 = 删 `host.json` + 重启 daemon（新 token），并检查 `master-injections.jsonl` 与 journal 有无异常注入。
+- 公网暴露会同时暴露两样东西：全部会话内容（转写/事件/注意力投影）与工具执行能力（命令入口直达工作流状态与会话注入）。
+- 残余风险（已接受，`/gui on` 即显式接受）：本机 GUI 经受信通道可注入 master 会话——浏览器上下文一旦被注入内容（如转写里的恶意文本诱导复制/点击），等于直接驱动 master；审批门尚在建设中。缓解：GUI 缺省 OFF（`/gui on` 显式启用才存在该通道）、一次性 OTT 换 `HttpOnly; SameSite=Strict` 派生凭据 cookie（`sw_gui_token = HMAC-SHA256(key="pi:gui-cookie:v1", msg=hostToken)`，浏览器不持 host token 本体）、每次 master 注入记 `state/master-injections.jsonl` 审计行（无正文）。诚实说明：该 cookie 是作用域化凭据（只解锁命令面 + WS 流；`Max-Age=43200`/12h；`/v1/bootstrap` 不认它故无自续期，12h 为真上限；`/gui off` 后浏览器下一次请求即 403 并被清除；重启轮换 host token 即失效；被盗=12h 窗口命令面能力；纯 http 下无 `Secure` 可用；本机持 token 进程用 `curl -b sw_host_token=` 以 cookie 呈现过门属预期行为，不是漏洞）。**该 cookie 不按端口隔离**：cookie 按 host 而非端口回传，`127.0.0.1` 上**任意端口**的本机服务都可能收到它（这正是把本体换成派生凭据的动机——本体泄漏=全权，派生泄漏=12h 窗口命令面）；`/gui off` 同样切断 WS 面（派生 cookie 握手 fail-closed 401）。
+
+---
+
 ## 10. Knowledge Management (project document system)
 
 The workflow ships a full documentation system for long-lived repos. **Five separate document families — don't confuse them:**

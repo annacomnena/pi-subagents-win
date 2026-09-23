@@ -18,6 +18,9 @@
  *   T7 帧卫生：坏 JSON / 未知 topic / 非 subscribe → error 帧且连接不断；服务端 ping 到达
  *   T8 outbox 主题（G6-P2）：journal 过滤投影 + 续传 + 过滤正确性 + gen 判代 + WS 只读红线
  *   T9 双 client 异 base（G6-P3 多端附着 v1）：各自独立 base 续传互不干扰 + live fan-out 隔离
+ *   T10 B 案作用域化：派生值≠本体、?token=只认本体、派生 cookie 101、错值 401
+ *   T11 L4 必修：①预言机回归（/v1/challenge nonce=域常量 的 mac 当派生 cookie → 401）
+ *      ②/gui off 切断派生 cookie 通道（401）；?token= 与旧本体 cookie 不受 gui 门影响
  *
  * 运行：npm run test:runtime-host-ws
  */
@@ -31,6 +34,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "host-ws-env-"));
 process.env.PI_SESSIONS_DIR = mkdtempSync(join(tmpdir(), "host-ws-sessions-"));
 
 import { createRuntimeHostServer, type RuntimeHostHandle } from "./runtime-host/server.ts";
+import { deriveGuiToken, GUI_COOKIE_NAME } from "./runtime/master-injection.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { appendRuntimeEnvelope } from "./runtime/journal.ts";
@@ -107,7 +111,11 @@ try {
 	const journalPath = join(ENV_DIR, "events.jsonl");
 	const sessionsDir = process.env.PI_SESSIONS_DIR!;
 
-	handle = await createRuntimeHostServer({ journalPath, sessionsDir, tailMs: 30, pingMs: 200 });
+	// gui 门测试用隔离 config（不依赖包根 config.json：其 gui.autoStart 缺省 false）
+	const guiCfg = join(ENV_DIR, "gui-config.json");
+	writeFileSync(guiCfg, JSON.stringify({ gui: { autoStart: true } }), "utf8");
+
+	handle = await createRuntimeHostServer({ journalPath, sessionsDir, tailMs: 30, pingMs: 200, configPath: guiCfg });
 	const token = handle.info.token;
 	assert.ok(typeof token === "string" && token.length > 0, "host 启动即生成 token 落 info");
 	const base = `http://127.0.0.1:${handle.info.port}`;
@@ -134,6 +142,56 @@ try {
 		const cookieOnly = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: sw_host_token=${token}`]);
 		assert.equal(cookieOnly.ok, true, "仅 cookie → 101");
 		cookieOnly.ws!.destroy();
+	}
+
+	// ── T10 B 案浏览器凭据作用域化（WS 握手面）───────────────────────────
+	{
+		const gui = deriveGuiToken(token!);
+		assert.ok(gui.length === 64 && gui !== token, "T10 派生值≠本体先决");
+		// ?token=<派生值> → 401（派生值不得当 query 用）
+		const qGui = await wsHandshake(handle.info.port, wsPath(gui));
+		assert.equal(qGui.ok, false, "?token=派生值 → 拒绝");
+		assert.ok(qGui.statusLine.includes(" 401"), `状态行含 401：${qGui.statusLine}`);
+		// Cookie sw_gui_token=<派生值> → 101（只解锁 WS 流）
+		const cGui = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: ${GUI_COOKIE_NAME}=${gui}`]);
+		assert.equal(cGui.ok, true, "派生 cookie → 101");
+		cGui.ws!.destroy();
+		// 错派生 cookie → 401
+		const cBad = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: ${GUI_COOKIE_NAME}=nope`]);
+		assert.equal(cBad.ok, false, "错派生 cookie → 拒绝");
+		assert.ok(cBad.statusLine.includes(" 401"));
+	}
+
+	// ── T11 B 案 L4 必修：①预言机回归 ②/gui off 切断派生 cookie 通道 ────
+	{
+		// ① 无认证 /v1/challenge 取 nonce=域常量 的 mac ≠ 派生值，且不能过 WS 握手
+		const ch = await fetch(`${base}/v1/challenge`, {
+			method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ nonce: "pi:gui-cookie:v1" }),
+		});
+		assert.equal(ch.status, 200, "T11 挑战端点 200（协议形状不变）");
+		const mac = ((await ch.json()) as { mac?: string }).mac ?? "";
+		assert.equal(mac.length, 64, "T11 预言机 mac 为 64 hex");
+		assert.notEqual(mac, deriveGuiToken(token!), "T11 预言机 nonce=域常量 ≠ 派生值（key/msg 已互换，洞已堵）");
+		const forged = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: ${GUI_COOKIE_NAME}=${mac}`]);
+		assert.equal(forged.ok, false, "T11 预言机 mac 当派生 cookie → 握手拒绝");
+		assert.ok(forged.statusLine.includes(" 401"), `T11 状态行含 401：${forged.statusLine}`);
+
+		// ② gui off：派生 cookie → 401（fail-closed）；?token=/旧本体 cookie 不受影响；gui on 恢复 101
+		writeFileSync(guiCfg, JSON.stringify({ gui: { autoStart: false } }), "utf8");
+		const off = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: ${GUI_COOKIE_NAME}=${deriveGuiToken(token!)}`]);
+		assert.equal(off.ok, false, "T11 gui off + 派生 cookie → 拒绝");
+		assert.ok(off.statusLine.includes(" 401"), `T11 gui off 状态行含 401：${off.statusLine}`);
+		const q = await wsHandshake(handle.info.port, wsPath(token!));
+		assert.equal(q.ok, true, "T11 gui off 不误伤 ?token= 本体（仍 101）");
+		q.ws!.destroy();
+		const legacy = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: sw_host_token=${token}`]);
+		assert.equal(legacy.ok, true, "T11 gui off 不误伤旧本体 cookie（仍 101）");
+		legacy.ws!.destroy();
+		writeFileSync(guiCfg, JSON.stringify({ gui: { autoStart: true } }), "utf8");
+		const on = await wsHandshake(handle.info.port, "/v1/events/stream", [`Cookie: ${GUI_COOKIE_NAME}=${deriveGuiToken(token!)}`]);
+		assert.equal(on.ok, true, "T11 gui on 后派生 cookie 恢复 101");
+		on.ws!.destroy();
 	}
 
 	// ── T2 HTTP 端点零变化 ───────────────────────────────────────────

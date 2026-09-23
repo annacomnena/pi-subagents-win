@@ -32,6 +32,11 @@
  *     token 认证（X-Command-Token header / Cookie sw_host_token，同 P1 token 面；无/错 → 401）。
  *   - `GET /v1/sessions` + `GET /v1/sessions/:id/transcript?after=`（G6-P1）：pi 会话列表 +
  *     转写投影行快照/增量分页（与 WS 同一投影函数）。
+ *   - B 案浏览器凭据作用域化：exchange 签发的不再是 host token 本体，而是派生凭据
+ *     `sw_gui_token=<HMAC-SHA256(key:"pi:gui-cookie:v1", msg:hostToken)>`（12h 真上限，见
+ *     master-injection.deriveGuiToken；重启轮换 hostToken 即失效）。命令面与 WS 流接受
+ *     该 cookie；`/v1/bootstrap` 只认 host token 本体（堵自续期）；header/query 位置
+ *     永远不认派生值。
  *   - `WS /v1/events/stream`（G6-P1，唯一升级路径）：journal + transcript 两路 JSON 帧多路复用，
  *     subscribe(base:{seq,logEpoch}) 断线续传 + 30s ping/pong + 本机 token→HttpOnly cookie
  *     fail-closed（token 落 host.json；无/错 token 握手 401；HTTP 端点零变化）。实现全在
@@ -98,8 +103,21 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
-import { executeCommand } from "../runtime/command-executor.ts";
-import { attachEventStream, WS_PATH, parseCookieToken, tokenMatches } from "./ws.ts";
+import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
+import { piSessionAddress } from "../runtime/address.ts";
+import {
+	BOOTSTRAP_OTT_TTL_MS,
+	auditMasterInjection,
+	checkTrustedLocalChannel,
+	createBootstrapStore,
+	defaultPkgConfigPath,
+	deriveGuiToken,
+	GUI_COOKIE_MAX_AGE_SECONDS,
+	GUI_COOKIE_NAME,
+	isLoopbackHostname,
+	readGuiEnabled,
+} from "../runtime/master-injection.ts";
+import { attachEventStream, WS_PATH, parseCookieToken, parseNamedCookie, tokenMatches } from "./ws.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
 import {
 	RUNTIME_SCHEMA_VERSION,
@@ -465,6 +483,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	// HMAC 秘钥用，绝不出现在任何 /v1/* HTTP 响应（匿名 health 只报非敏感就绪信息）。
 	const hostToken = generateHostToken();
 	const challengeMeta: ChallengeMeta = { instanceId, runtimeId, protocolVersion: PROTOCOL_VERSION, releaseId, schemaVersion: RUNTIME_SCHEMA_VERSION, processStartIdentity };
+	// L3：Bootstrap OTT 进程内存签发/核销（单实例 daemon 持有；gui 未启用时只 403，零落盘）
+	const bootstrapStore = createBootstrapStore();
+	const configPath = opts.configPath ?? defaultPkgConfigPath();
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -481,20 +502,64 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 
 	// G4：POST /v1/commands——唯一命令入口（body 异步读取后同步执行、同步回执；never-throw）
 	// G6-P2：认证补强（fail-closed，同 P1 token）：X-Command-Token header（curl/测试等价通道）
-	// 或 Cookie sw_host_token（同源 UI 无感）；无/错 token → 401，不读 body。只覆盖本写端点，
+	// 或 Cookie sw_host_token（同源 UI 无感，旧兼容）或 Cookie sw_gui_token=<派生值>
+	// （B 案浏览器作用域化凭据）；无/错 token → 401，不读 body。只覆盖本写端点，
 	// GET 读投影维持 P1 现状（本机 loopback 只读面）。
-	const authorizeCommand = (req: IncomingMessage): boolean => {
+	// B 案位置语义：header 只认 hostToken 本体（派生值当 header 用 → tokenMatches 为假 → 401）；
+	// cookie 位置认 hostToken 本体或派生值。/v1/bootstrap 另用 authorizeHostOnly（只认本体，堵自续期）。
+	const headerTokenOf = (req: IncomingMessage): string | null => {
 		const h = req.headers["x-command-token"];
-		const headerToken = typeof h === "string" && h.length > 0 ? h : (Array.isArray(h) ? (h[0] ?? null) : null);
-		const presented = headerToken ?? parseCookieToken(req.headers.cookie);
-		return tokenMatches(presented, hostToken);
+		if (typeof h === "string" && h.length > 0) return h;
+		if (Array.isArray(h) && h.length > 0 && typeof h[0] === "string" && h[0].length > 0) return h[0];
+		return null;
+	};
+	/** B 案派生凭据期望值（hostToken 轮换即变；hostToken 为空时 ""= 无派生凭据可接受）。 */
+	const guiExpected = (): string => deriveGuiToken(hostToken);
+	/** POST /v1/commands 授权：header=hostToken 本体；cookie=本体或派生值。派生值当 header 用恒 401。 */
+	const authorizeCommand = (req: IncomingMessage): boolean => {
+		const ht = headerTokenOf(req);
+		if (ht !== null) return tokenMatches(ht, hostToken);
+		if (tokenMatches(parseCookieToken(req.headers.cookie), hostToken)) return true;
+		const g = parseNamedCookie(req.headers.cookie, GUI_COOKIE_NAME);
+		const exp = guiExpected();
+		return g !== null && exp.length > 0 && tokenMatches(g, exp);
+	};
+	/** 浏览器是否以派生 cookie 呈现（机会式清除与 403 判定用；值对错由 authorizeCommand 定）。 */
+	const presentsGuiCookie = (req: IncomingMessage): boolean =>
+		parseNamedCookie(req.headers.cookie, GUI_COOKIE_NAME) !== null;
+	/** POST /v1/bootstrap 授权（B 案堵自续期）：只认 hostToken 本体（header 或旧 cookie 名位置）；
+	 *  sw_gui_token 在任何位置一律不认（派生值≠本体，tokenMatches 恒假 → 401）。 */
+	const authorizeHostOnly = (req: IncomingMessage): boolean => {
+		const ht = headerTokenOf(req);
+		if (ht !== null) return tokenMatches(ht, hostToken);
+		return tokenMatches(parseCookieToken(req.headers.cookie), hostToken);
+	};
+	/** B 案机会式清除：HttpOnly cookie 前端无法自清；`/gui off` 后浏览器下一次请求即被清除。
+	 *  触发条件 = 请求携带 sw_gui_token 且 readGuiEnabled 为 false → 403 + 清除 cookie。 */
+	const GUI_CLEAR_COOKIE = `${GUI_COOKIE_NAME}=; Max-Age=0; Path=/`;
+	const respondGuiOffClear = (res: ServerResponse): void => {
+		try {
+			res.writeHead(403, {
+				"content-type": "application/json",
+				"set-cookie": GUI_CLEAR_COOKIE,
+			});
+			res.end(JSON.stringify({ error: "gui-disabled", hint: "GUI 已关闭（/gui off 后浏览器下一次请求即清除凭据 cookie）；重开请走 /gui open" }));
+		} catch {
+			try { res.destroy(); } catch { /* ignore */ }
+		}
 	};
 	const handlePostCommand = (req: IncomingMessage, res: ServerResponse): void => {
 		if (!authorizeCommand(req)) {
 			respondJson(res, 401, {
 				error: "unauthorized",
-				hint: "POST /v1/commands 需本机 token：X-Command-Token header 或 Cookie sw_host_token（token 见 runtime 目录 host.json）",
+				hint: "POST /v1/commands 需本机 token：X-Command-Token header（host token 本体）或 Cookie sw_host_token / sw_gui_token（token 见 runtime 目录 host.json）",
 			});
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		// B 案机会式清除：带派生 cookie 但通道已关 → 403 + 清 cookie（HttpOnly 前端无法自清）。
+		if (presentsGuiCookie(req) && !readGuiEnabled(configPath)) {
+			respondGuiOffClear(res);
 			try { req.destroy(); } catch { /* ignore */ }
 			return;
 		}
@@ -524,13 +589,66 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			let status = 200;
 			let body: unknown;
 			try {
-				const frame = parseCommandRequest(Buffer.concat(chunks).toString("utf8"));
+				const raw = Buffer.concat(chunks).toString("utf8");
+				// L3 窄路径策略（peek 容错解析；失败→undefined=旧行为，parseCommandRequest 照常 400）：
+				// 仅 session.message→当前 master owner 才计算三证据并显式传入 executor。
+				let trustedMasterInjection: TrustedMasterInjectionPolicy | undefined;
+				try {
+					const peek = JSON.parse(raw) as { type?: unknown; to?: unknown };
+					const att = getMasterStatus().attachment;
+					if (peek?.type === "session.message" && att && peek.to === piSessionAddress(att.sessionId)) {
+						const timersDir = opts.timersDir ?? defaultTimersDir();
+						const tl = checkTrustedLocalChannel(req, hostToken, self.port);
+						trustedMasterInjection = {
+							trustedLocal: tl.ok,
+							guiEnabled: readGuiEnabled(configPath),
+							masterAlive: sessionAlive(timersDir, att.sessionId, new Date(), SESSION_HEARTBEAT_GRACE_MS),
+							source: `${req.socket.remoteAddress ?? "?"} host=${req.headers.host ?? "?"} origin=${req.headers.origin ?? "-"} via=${tl.via ?? "none"}${tl.ok ? "" : ` deny=${tl.reason ?? "?"}`}`,
+						};
+					}
+				} catch {
+					trustedMasterInjection = undefined;
+				}
+				const frame = parseCommandRequest(raw);
 				const outcome = executeCommand(frame, {
 					stateDir: opts.stateDir,
 					journalPath: opts.journalPath,
-					configPath: opts.configPath,
-					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）
+					configPath,
+					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）。
+					// R1 注：TOCTOU（预检活→执行时死）落 post-claim 旧护栏 409 会占 key，同 key 重试重放 409，需换 key（fail-closed；claim 顺序不动）。
+					...(trustedMasterInjection !== undefined ? { trustedMasterInjection } : {}),
 				});
+				// M3：窄路径被拒补 denied 审计行（字段同 accepted，无正文；best-effort 不影响回执）。
+				// 唯一 denied 落盘点在 server 层：executor 预检/护栏保持零副作用（M2），
+				// 此处只记“peek 命中 master 目标且策略已计算”的两类窄路径拒绝
+				// （master-session-protected：gui-off/坏 policy；master-offline）。
+				if (trustedMasterInjection !== undefined && outcome.status === "rejected" &&
+					(outcome.reason === "master-session-protected" || outcome.reason === "master-offline")) {
+					try {
+						let deniedSid = "?";
+						let deniedKey = "?";
+						try {
+							const dp = JSON.parse(raw) as { to?: unknown; commandKey?: unknown };
+							if (typeof dp.to === "string") {
+								const m = /^pi:\/\/(.+)$/.exec(dp.to);
+								if (m) deniedSid = m[1];
+							}
+							if (typeof dp.commandKey === "string" && dp.commandKey.length > 0) deniedKey = dp.commandKey;
+						} catch {
+							/* 解析失败就用占位符，审计不断 */
+						}
+						auditMasterInjection(outboxStateDirFor(opts), {
+							at: new Date().toISOString(),
+							by: String(frame.issuedBy),
+							targetSessionId: deniedSid,
+							source: trustedMasterInjection.source,
+							result: "denied",
+							commandKey: deniedKey,
+						});
+					} catch {
+						/* 审计 best-effort：失败绝不影响回执 */
+					}
+				}
 				const http = commandOutcomeHttpResponse(outcome);
 				status = http.status;
 				body = http.body;
@@ -590,6 +708,101 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		});
 	};
 
+	// L3 bootstrap（B 案作用域化后）：POST /v1/bootstrap 用 host token 本体（本机持 host.json 的进程，
+	// 如 `/gui open`）换一次性短时 OTT（60s，单用）；GET /v1/bootstrap/exchange?ott=
+	// 用 OTT 换**派生凭据** HttpOnly; SameSite=Strict 同源 cookie（sw_gui_token，12h 真上限；
+	// 长 token 与 host token 本体永不进 URL/HTML/JS/cookie）。gui 未启用 → 403 gui-disabled
+	// （通道不存在，零落盘）。`/v1/bootstrap` 只认本体（authorizeHostOnly），派生凭据换 OTT
+	// 被拒 ⇒ 无自续期，12h 为真上限。
+	const BOOTSTRAP_BODY_LIMIT_BYTES = 1024;
+	const loopbackSocket = (req: IncomingMessage): boolean => {
+		const r = req.socket?.remoteAddress ?? "";
+		return r === "127.0.0.1" || r === "::1" || r === "::ffff:127.0.0.1";
+	};
+	/** M1：bootstrap 面与 commands 窄路径复用同一 Host 精确白名单（master-injection.isLoopbackHostname），关 DNS rebinding 缺口。 */
+	const loopbackHost = (req: IncomingMessage): boolean => {
+		const h = req.headers.host;
+		return typeof h === "string" && isLoopbackHostname(h);
+	};
+	const handlePostBootstrap = (req: IncomingMessage, res: ServerResponse): void => {
+		// B 案堵自续期：只认 host token 本体；sw_gui_token（cookie 或 header 任何位置）一律 401。
+		if (!authorizeHostOnly(req)) {
+			respondJson(res, 401, { error: "unauthorized", hint: "bootstrap 换 OTT 只认 host token 本体（X-Command-Token header 或 Cookie sw_host_token）；派生凭据 sw_gui_token 不可自续期" });
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		// body 丢弃但真实限 1KB（OTT 签发不需要参数；超限 413 防堆积——注释与实现一致）。
+		// 溢出后不 destroy（避免 RST 客户端）：只计数不存，end 时统一回执，本机回环面可接受。
+		let bootSize = 0;
+		let bootOverflow = false;
+		let bootResponded = false;
+		req.on("data", (c: Buffer) => {
+			if (bootResponded) return;
+			bootSize += c.length;
+			if (bootSize > BOOTSTRAP_BODY_LIMIT_BYTES) bootOverflow = true;
+		});
+		req.on("end", () => {
+			if (bootResponded) return;
+			bootResponded = true;
+			if (bootOverflow) {
+				respondJson(res, 413, { error: "payload-too-large", hint: `body 限 ${BOOTSTRAP_BODY_LIMIT_BYTES} 字节（OTT 签发不需要参数）` });
+				return;
+			}
+			if (!loopbackSocket(req)) {
+				respondJson(res, 403, { error: "non-loopback", hint: "bootstrap 只接受本机回环连接" });
+				return;
+			}
+			if (!loopbackHost(req)) {
+				respondJson(res, 403, { error: "non-loopback-host", hint: "bootstrap Host 必须为本机回环名（与 /v1/commands 窄路径同一白名单）" });
+				return;
+			}
+			if (!readGuiEnabled(configPath)) {
+				respondJson(res, 403, { error: "gui-disabled", hint: "GUI 未显式启用：先 /gui on（含本机受信通道与风险提示）" });
+				return;
+			}
+			const { ott, expiresAt } = bootstrapStore.mint(BOOTSTRAP_OTT_TTL_MS);
+			respondJson(res, 200, { ott, expiresAt, expiresInSec: BOOTSTRAP_OTT_TTL_MS / 1000 });
+		});
+		req.on("error", () => {
+			if (!bootResponded) {
+				bootResponded = true;
+				respondJson(res, 400, { error: "request-error" });
+			}
+		});
+	};
+	const handleBootstrapExchange = (req: IncomingMessage, res: ServerResponse, u: URL): void => {
+		// M1：先验 socket+Host（Host 失败不核销 OTT，短路在 consume 之前），再验 gui+OTT。
+		// B 案机会式清除：gui-off 时浏览器下一次请求（此处为 exchange）即被清除 cookie。
+		if (!loopbackSocket(req) || !loopbackHost(req)) {
+			respondJson(res, 403, { error: "non-loopback", hint: "bootstrap 只接受本机回环连接与回环 Host（与 /v1/commands 窄路径同一白名单）" });
+			return;
+		}
+		if (!readGuiEnabled(configPath)) {
+			if (presentsGuiCookie(req)) {
+				respondGuiOffClear(res);
+				return;
+			}
+			respondJson(res, 403, { error: "bad-bootstrap", hint: "GUI 未启用；重走 /gui open" });
+			return;
+		}
+		if (!bootstrapStore.consume(u.searchParams.get("ott"))) {
+			respondJson(res, 403, { error: "bad-bootstrap", hint: "OTT 无效/过期/已用；重走 /gui open" });
+			return;
+		}
+		// B 案：签发派生凭据 cookie（值 = HMAC-SHA256(key:"pi:gui-cookie:v1", msg:hostToken)，hex；
+		// host token 本体不再进任何 cookie；重启轮换 hostToken ⇒ 派生值变 ⇒ 旧 cookie 自动失效）。
+		try {
+			res.writeHead(302, {
+				"location": "/",
+				"set-cookie": `${GUI_COOKIE_NAME}=${deriveGuiToken(hostToken)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${GUI_COOKIE_MAX_AGE_SECONDS}`,
+				"content-type": "text/plain",
+			});
+			res.end("bootstrap ok, redirecting to /");
+		} catch {
+			try { res.destroy(); } catch { /* ignore */ }
+		}
+	};
+
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
@@ -603,6 +816,20 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					return;
 				}
 				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/challenge 仅接受 POST {nonce}（本地身份挑战）" });
+			}
+			if (u.pathname === "/v1/bootstrap") {
+				if (req.method === "POST") {
+					handlePostBootstrap(req, res);
+					return;
+				}
+				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/bootstrap 仅接受 POST（本机 token 换一次性 OTT）" });
+			}
+			if (u.pathname === "/v1/bootstrap/exchange") {
+				if (req.method === "GET") {
+					handleBootstrapExchange(req, res, u);
+					return;
+				}
+				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/bootstrap/exchange 仅接受 GET ?ott=（换 HttpOnly 同源 cookie）" });
 			}
 			if (u.pathname === "/v1/commands") {
 				// 唯一写端点：仅 POST；GET /v1/commands → 405（读投影不含命令）
@@ -724,7 +951,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
-						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）` });
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）` });
 					}
 					const sessionId = decodeURIComponent(mt[1]);
 					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);
@@ -782,6 +1009,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			mailboxDir: opts.mailboxDir,
 			tailMs: opts.tailMs,
 			pingMs: opts.pingMs,
+			configPath, // WS 派生 cookie 分支的 gui 门用（与 server 侧同一 configPath）
 		});
 		server.on("error", (e: NodeJS.ErrnoException) => {
 			// 锁已持有但端口绑定失败 → 释锁后拒绝（不留僵尸锁；:0 下正常不会 EADDRINUSE）

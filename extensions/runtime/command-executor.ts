@@ -57,6 +57,7 @@ import {
 } from "./message-outbox.ts";
 import { decideProposal, maybePropose, readProposal } from "./master-succession.ts";
 import { readAttachment } from "./registry.ts";
+import { auditMasterInjection } from "./master-injection.ts";
 import { defaultSessionsDir, findSessionFile } from "./transcript.ts";
 import { validateCommandFrame, type CommandFrame } from "./protocol.ts";
 import { readWorkstream, updateWorkstream } from "./workstreams.ts";
@@ -84,7 +85,7 @@ const MASTER_ONLY_TYPES: readonly string[] = [
 
 /** 拒绝 reason 词表（HTTP 映射：400 invalid-payload·unknown-command·not-implemented /
  *  403 master-session-protected（G6-P2：Master 会话拒收远程输入，executor 层护栏） /
- *  404 no-workstream·no-proposal·no-session / 409 bad-state·not-owner·not-attached·replay-unknown-outcome）。 */
+ *  404 no-workstream·no-proposal·no-session / 409 bad-state·not-owner·not-attached·replay-unknown-outcome·master-offline）。 */
 export type CommandRejectReason =
 	| "invalid-payload"
 	| "unknown-command"
@@ -96,6 +97,7 @@ export type CommandRejectReason =
 	| "not-owner"
 	| "not-attached"
 	| "master-session-protected"
+	| "master-offline"
 	| "replay-unknown-outcome";
 
 export type CommandOutcome =
@@ -117,7 +119,23 @@ export interface ExecuteCommandOptions {
 	commandsDir?: string;
 	/** G6-P2：pi sessions 根目录（session.message 存在性校验用；缺省 defaultSessionsDir()）。 */
 	sessionsDir?: string;
+	/** L3 窄路径：本机受信 GUI→当前 master owner 会话的唯一例外。缺省（undefined）=
+	 *  通道不存在，master owner 目标一律 403 master-session-protected（旧行为）。 */
+	trustedMasterInjection?: TrustedMasterInjectionPolicy;
 	now?: Date;
+}
+
+/**
+ * L3 窄路径策略（daemon 侧计算、显式传入；executor 只认布尔，不重算证据）。
+ * 合取：trustedLocal（cookie+loopback+源校验）&& guiEnabled（`/gui on`）&&
+ * masterAlive（timers 心跳判活）。任一 false → 旧 403；alive=false → master-offline。
+ */
+export interface TrustedMasterInjectionPolicy {
+	trustedLocal: boolean;
+	guiEnabled: boolean;
+	masterAlive: boolean;
+	/** 审计来源（IP/Host/Origin，不含正文）。 */
+	source: string;
 }
 
 function stateRoot(opts: ExecuteCommandOptions): string {
@@ -168,6 +186,31 @@ function executeCommandInner(frame: CommandFrame, opts: ExecuteCommandOptions): 
 	}
 	// payload 白名单：多余/非法字段一律拒绝（封闭字段集）
 	if (!commandPayloadOk(frame)) return reject("invalid-payload");
+
+	// M2(a)：master-offline 预检（claim 之前）：目标 == 当前 owner 且策略已就绪
+	// (trustedLocal && guiEnabled) 但 masterAlive=false → 直接 409，不占幂等键。
+	// 纯读判定（readAttachment 与 runSessionMessage 同源；attachment+policy 此时均已同步可得），
+	// 除回执本身外零副作用：不 claim、不写 outcome/journal、不写 outbox、不记审计——
+	// 同一 commandKey 在 master 上线后重发可真正执行（非重放 409）。非 master 目标原样穿过。
+	if (frame.type === "session.message" && opts.trustedMasterInjection?.trustedLocal === true && opts.trustedMasterInjection?.guiEnabled === true && opts.trustedMasterInjection?.masterAlive !== true) {
+		const preTo = parseObjectAddress(frame.to);
+		if (preTo && preTo.scheme === "pi") {
+			let ownerSid: string | null = null;
+			try {
+				ownerSid = readAttachment(masterAddress())?.sessionId ?? null;
+			} catch {
+				ownerSid = null;
+			}
+			if (ownerSid !== null && preTo.value === ownerSid) {
+				return {
+					status: "rejected",
+					reason: "master-offline",
+					detail: "Master 会话离线：请在电脑端打开 master 会话（其心跳落盘后重试）",
+					replayed: false,
+				};
+			}
+		}
+	}
 
 	// commandKey 幂等 claim（wx 排他；同键重放/并发双请求只有赢家执行）
 	const dedupeKey = `${frame.type}:${frame.commandKey}`;
@@ -477,9 +520,25 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 	if (!parsed || parsed.scheme !== "pi" || parsed.value.length === 0) return reject("invalid-payload");
 	const sessionId = parsed.value;
 
-	// 护栏二：当前 master owner 会话拒收（attachment 缺失 = 未 attach，不拦截）
+	// 护栏二：当前 master owner 会话拒收（attachment 缺失 = 未 attach，不拦截）。
+	// L3 窄路径唯一例外：目标 == 当前 owner 且 trustedLocal && guiEnabled && masterAlive
+	// 时放行进正常 outbox 排队（仍走两段式，桥在 master 会话内注入）；alive=false →
+	// master-offline（409，「请在电脑端打开 master 会话」）；其余一律旧 403。
 	const att = readAttachment(masterAddress());
-	if (att && att.sessionId === sessionId) return reject("master-session-protected");
+	let masterTrusted = false;
+	if (att && att.sessionId === sessionId) {
+		const pol = opts.trustedMasterInjection;
+		if (pol?.trustedLocal !== true || pol?.guiEnabled !== true) return reject("master-session-protected");
+		if (pol.masterAlive !== true) {
+			return {
+				status: "rejected",
+				reason: "master-offline",
+				detail: "Master 会话离线：请在电脑端打开 master 会话（其心跳落盘后重试）",
+				replayed: false,
+			};
+		}
+		masterTrusted = true;
+	}
 
 	// 目标存在性校验（post-claim，与 no-workstream 同口径：读盘面后的业务拒绝可重放）
 	const sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
@@ -506,6 +565,17 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 		writeOutboxItem(dir, item);
 	} catch (e) {
 		return { status: "failed", reason: "io-error", error: `write outbox: ${msg(e)}`, replayed: false };
+	}
+	// L3 窄路径审计（仅 trusted 放行 accepted 时记；无正文字段；best-effort 不影响回执）
+	if (masterTrusted) {
+		auditMasterInjection(stateRoot(opts), {
+			at: (opts.now ?? new Date()).toISOString(),
+			by: frame.issuedBy,
+			targetSessionId: sessionId,
+			source: opts.trustedMasterInjection?.source ?? "unknown",
+			result: "accepted",
+			commandKey: frame.commandKey,
+		});
 	}
 
 	// journal message.queued（safe wrapper：写失败不影响回执；正文不进 journal，§15 大内容不进信封）

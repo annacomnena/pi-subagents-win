@@ -353,11 +353,12 @@ export function ChatPage() {
 		if (el !== null) el.scrollTop = el.scrollHeight;
 	};
 
-	const canSend = activeId !== null && draft.trim().length > 0 && !isMasterSession;
+	// L3 窄路径：master 会话经本机受信通道可注入（服务端三证据门；离线回 409 master-offline）。
+	const canSend = activeId !== null && draft.trim().length > 0;
 
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
-		if (text.length === 0 || activeId === null || isMasterSession) return;
+		if (text.length === 0 || activeId === null) return;
 		setDraft("");
 		await useGui.getState().sendChatMessage(activeId, text);
 	};
@@ -448,7 +449,7 @@ export function ChatPage() {
 											? "输入消息发往该会话（Enter 发送，Shift+Enter 换行）"
 											: "先选择会话"
 									}
-									disabled={activeId === null || isMasterSession}
+									disabled={activeId === null}
 									className="max-h-32 w-full resize-none bg-transparent text-ui-base text-foreground outline-none placeholder:text-foreground-subtlest disabled:cursor-not-allowed disabled:opacity-50"
 								/>
 								{/* 工具栏行（ChatPromptEditor.tsx#L388-393）：左动作组 + 右主按钮组 */}
@@ -470,11 +471,11 @@ export function ChatPage() {
 											<ConnBadge conn={conn} />
 										</div>
 									</div>
-									{isMasterSession ? (
-										// masterProtected 禁输入文案保留、换 token 色（拍板 5）
-										<p className="text-ui-sm text-destructive">Master 会话拒绝远程输入（executor 层 403 护栏）</p>
-									) : (
 										<div className="flex shrink-0 items-center gap-2">
+											{isMasterSession && (
+												// L3 窄路径：master 不再灰显；Master 会话拒绝远程输入（旧 403）已放宽为本机受信注入。
+												<p className="text-ui-sm text-destructive">Master 会话拒绝远程输入已放宽：经本机受信通道注入（浏览器上下文被注入内容时等于驱动 master）</p>
+											)}
 											{/* Stop 钮灰显占位（无 interrupt 命令；zcode 口径 variant=secondary + Square fill-current） */}
 											<Tooltip>
 												<TooltipTrigger asChild>
@@ -499,7 +500,6 @@ export function ChatPage() {
 												<ArrowUp className="size-4" />
 											</Button>
 										</div>
-									)}
 								</div>
 							</div>
 						</div>

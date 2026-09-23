@@ -407,6 +407,16 @@ export const useGui = create<GuiState>((set, get) => ({
 		if (!r.ok) {
 			// 真实 403 回执驱动（G6-P2 L4 必修 4）：executor 护栏拒绝即权威终态，不靠 health 猜测
 			const rej = (typeof r.body === "object" && r.body !== null ? (r.body as { status?: unknown; reason?: unknown }) : null);
+			// L3 窄路径：master 离线 → 明确提示（请在电脑端打开 master 会话），不静默失败
+			if (r.status === 409 && rej?.status === "rejected" && rej.reason === "master-offline") {
+				set({
+					chatOutbox: {
+						...get().chatOutbox,
+						[commandKey]: { ...cur, status: "rejected", detail: "Master 会话离线：请在电脑端打开 master 会话（其心跳落盘后重试；若仍 409 请重发（新 commandKey））", at: new Date().toISOString() },
+					},
+				});
+				return;
+			}
 			if (r.status === 403 && rej?.status === "rejected" && rej.reason === "master-session-protected") {
 				set({
 					chatOutbox: {

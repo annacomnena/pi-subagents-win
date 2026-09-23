@@ -287,8 +287,40 @@ export interface GuiAutoStartDeps extends GuiEnsureDeps {
 	/** autoStart 读函数（缺省 readGuiAutoStart(configPath)）。 */
 	readAutoStart?: () => boolean;
 	openBrowser?: (url: string) => { ok: boolean; error?: string };
+	/** OTT 签发（缺省 localhost 调 daemon；测试注入桩，防打真实端口）。 */
+	mintBootstrap?: (port: number, token: string) => Promise<{ ok: true; ott: string } | { ok: false; error: string }>;
 	now?: () => number;
 	throttleMs?: number;
+}
+
+/**
+ * 本机 OTT 签发（`/gui open` 用：持 host.json token 向 daemon 换一次性 OTT，
+ * 浏览器走 exchange 换 HttpOnly 同源 cookie；长 token 永不进 URL）。never-throw。
+ */
+export async function mintGuiBootstrap(
+	port: number,
+	token: string,
+	timeoutMs = 3000,
+): Promise<{ ok: true; ott: string } | { ok: false; error: string }> {
+	try {
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+		try {
+			const res = await fetch(`http://127.0.0.1:${port}/v1/bootstrap`, {
+				method: "POST",
+				headers: { "x-command-token": token },
+				signal: ctrl.signal,
+			});
+			if (!res.ok) return { ok: false, error: `bootstrap refused (${res.status})` };
+			const body = (await res.json()) as { ott?: unknown };
+			if (typeof body.ott !== "string" || body.ott.length < 16) return { ok: false, error: "bad ott" };
+			return { ok: true, ott: body.ott };
+		} finally {
+			clearTimeout(timer);
+		}
+	} catch (e) {
+		return { ok: false, error: msg(e) };
+	}
 }
 
 /** daemon ensure（第一切片生产路径；never-throw：异常收敛为 ok:false）。 */
@@ -424,15 +456,36 @@ export function registerGuiAutoStart(pi: GuiExtensionApi, deps: GuiAutoStartDeps
 				}
 				if (cmd === "open") {
 					const r = await ensureGuiDaemon(deps);
-					const url = r.url ?? (r.port !== null ? daemonUrlFor(r.port) : "");
-					if (!url) {
+					const base = r.url ?? (r.port !== null ? daemonUrlFor(r.port) : "");
+					if (!base) {
 						notify(`daemon 未就绪，无法打开 GUI：${r.error ?? "未知错误"}`, "warning");
 						return;
+					}
+					// L3 bootstrap：gui 已显式启用 + 持 daemon token 时换 OTT，浏览器经 exchange
+					// 拿 HttpOnly 同源 cookie（长 token 永不进 URL）；未启用/无 token/签发失败 →
+					// 回退直开（旧行为：读投影 401，写端点保持拒绝，零回归）。
+					let url = base;
+					let bootNote = "";
+					const token = r.info?.token ?? null;
+					if (readGuiAutoStart(cfgPath) && typeof r.port === "number" && token) {
+						try {
+							const m = await (deps.mintBootstrap ?? mintGuiBootstrap)(r.port, token);
+							if (m.ok) {
+								url = `http://127.0.0.1:${r.port}/v1/bootstrap/exchange?ott=${m.ott}`;
+								bootNote = "（已附一次性登录 OTT，浏览器自动换 HttpOnly 同源 cookie）";
+							} else {
+								bootNote = `（OTT 签发失败：${m.error}，回退直开）`;
+							}
+						} catch (e) {
+							bootNote = `（OTT 签发异常：${msg(e)}，回退直开）`;
+						}
+					} else if (!readGuiAutoStart(cfgPath)) {
+						bootNote = "（GUI 未显式启用：先 /gui on；写端点保持拒绝）";
 					}
 					const ob = (deps.openBrowser ?? openInBrowser)(url);
 					notify(
 						ob.ok
-							? `${url} 已交系统默认浏览器（同源静态，ensure：\n${guiDaemonSummary(r)}）`
+							? `${url} 已交系统默认浏览器${bootNote}（同源静态，ensure：\n${guiDaemonSummary(r)}）`
 							: `浏览器打开失败：${ob.error}（手动访问 ${url}）`,
 						ob.ok && r.ok ? "info" : "warning",
 					);
