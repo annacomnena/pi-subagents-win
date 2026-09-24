@@ -41,6 +41,7 @@ import { getPendingReminder } from "./runtime/master-succession.ts";
 import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
+import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { localAgentFromCwd, masterStatusLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
@@ -2144,7 +2145,7 @@ export default function (pi: ExtensionAPI) {
 	// start 派生独立 node 进程（bind 127.0.0.1:0，实际端口写 host.json 做发现）；stop 杀进程 +
 	// 清 host.json（含僵尸文件）；status 回显 host.json + 探活（alive/stale/dead/missing）。
 	pi.registerCommand("runtime-host", {
-		description: "Runtime Host（G2 只读观察服务）：/runtime-host start|stop|status",
+		description: "Runtime Host（G2 只读观察服务）：/runtime-host start|stop|restart [--force]|status",
 		handler: async (args, ctx) => {
 			const cmd = (args ?? "").trim().toLowerCase();
 			if (cmd === "start") {
@@ -2169,6 +2170,11 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`runtime-host 已停止：pid=${r.info?.pid ?? "?"}（host.json 已清理）`, "info");
 				return;
 			}
+			if (cmd === "restart" || cmd === "restart --force") {
+				const r = await restartRuntimeDaemon({ force: cmd === "restart --force" });
+				ctx.ui.notify(r.message, r.ok ? "info" : "warning");
+				return;
+			}
 			if (cmd === "status") {
 				const s = await runtimeHostStatus();
 				if (s.state === "missing" || !s.info) {
@@ -2185,7 +2191,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			ctx.ui.notify("用法：/runtime-host start|stop|status", "warning");
+			ctx.ui.notify("用法：/runtime-host start|stop|restart [--force]|status", "warning");
 		},
 	});
 

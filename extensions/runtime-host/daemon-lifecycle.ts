@@ -496,3 +496,48 @@ export async function stopRuntimeDaemon(opts: DaemonStopOptions = {}): Promise<D
 	// stale：pid 活但服务面不可用 → 可能是陌生进程 → fail-closed（提示 force 恢复路径）
 	return { stopped: false, uncertain: true, info, reason: `host 超时（pid=${info.pid} 存活但探活失败）：fail-closed，未 kill；确认归属后用 force 重试` };
 }
+
+export interface DaemonRestartOptions extends DaemonStopOptions, DaemonEnsureOptions {
+	waitForLockMs?: number;
+	pollMs?: number;
+	stop?: (opts: DaemonStopOptions) => Promise<DaemonStopResult>;
+	ensure?: (opts: DaemonEnsureOptions) => Promise<DaemonEnsureResult>;
+	readLock?: (path: string) => RuntimeLock | null;
+	isLockAlive?: (lock: RuntimeLock | null) => boolean;
+	sleep?: (ms: number) => Promise<void>;
+}
+
+export interface DaemonRestartResult {
+	ok: boolean;
+	message: string;
+	oldPid: number | null;
+	result?: DaemonEnsureResult;
+}
+
+/** Fail-closed stop → lock release → ensure orchestration. */
+export async function restartRuntimeDaemon(opts: DaemonRestartOptions = {}): Promise<DaemonRestartResult> {
+	const hostPath = opts.hostPath ?? join(resolve(opts.runtimeDir ?? defaultRuntimeDir()), "host.json");
+	const stop = await (opts.stop ?? stopRuntimeDaemon)({ hostPath, ...(opts.force === true ? { force: true } : {}) });
+	const oldPid = stop.info?.pid ?? null;
+	if (!stop.stopped) {
+		const forceHint = stop.uncertain ? "；确认实例归属后可显式使用 --force（会裸 kill，有风险）" : "";
+		return { ok: false, oldPid, message: `runtime-host restart 中止：${stop.reason ?? "stop 失败"}${forceHint}` };
+	}
+	const lockPath = lockPathFor(hostPath);
+	const waitMs = Math.min(10_000, Math.max(0, opts.waitForLockMs ?? 10_000));
+	const started = Date.now();
+	const readLock = opts.readLock ?? readRuntimeLock;
+	const alive = opts.isLockAlive ?? lockHolderAlive;
+	const pause = opts.sleep ?? sleep;
+	while (readLock(lockPath) && alive(readLock(lockPath))) {
+		const elapsed = Date.now() - started;
+		if (elapsed >= waitMs) return { ok: false, oldPid, message: `runtime-host restart 中止：等待锁释放超时（${waitMs}ms），未调用 ensure` };
+		await pause(Math.min(opts.pollMs ?? 100, waitMs - elapsed));
+	}
+	const result = await (opts.ensure ?? ensureRuntimeDaemon)(opts);
+	if (!result.ok || !result.info) return { ok: false, oldPid, result, message: `runtime-host restart 起动失败：${result.error ?? "ensure 未返回 host 信息"}` };
+	// L4 m2：ensure 返回 already:true = 等待窗口内被其他调用抢先起好并复用（pid/port 真实）——
+	// 不得笼统报"已重启"，必须区分“新起”与“复用现有实例”，否则误导用户以为换了进程。
+	const reuseNote = result.already === true ? "（复用现有实例：等待窗口内已由其他调用起好）" : "";
+	return { ok: true, oldPid, result, message: `runtime-host 已重启${reuseNote}：旧 pid=${oldPid ?? "?"} → 新 pid=${result.info.pid} port=${result.info.port}。⚠️ GUI cookie 已失效（新 host token），需 /gui open。微信 worker 将由新 daemon 的 supervisor 重新 spawn（若 receive.enabled=true）。` };
+}
