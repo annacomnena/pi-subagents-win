@@ -1077,7 +1077,11 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			try { const raw = readFileSync(join(wechatStore.dir, "quarantine.jsonl"), "utf8"); entries = raw.split("\n").filter(Boolean).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } }).slice(-limit).reverse(); } catch {}
 			const rejected = wechatStore.readInbox(0).filter(x => x.state === "rejected").map(x => ({ msgId: x.msgId.slice(0,8), reason: x.rejectedReason === "write-failed" ? "写入失败（结果不确定，未自动重试）" : x.rejectedReason === "not-allowlisted" ? "白名单外（拒绝）" : "拒绝", at: x.receivedAt }));
 			const visible = [...rejected, ...entries].slice(0, limit);
-			respondJson(res, 200, { count: visible.length, entries: visible }); return;
+			// L4-S6：诊断面补**命令审计行数**（state/wechat-command-audit.jsonl）——consumed 记录不
+			// 落上面的 rejected 列表，命令通道的活动只能从审计文件看（只记掩码+首 token，无正文/token）。
+			let commandAuditLines = 0;
+			try { commandAuditLines = readFileSync(join(wechatRuntimeDir, "state", "wechat-command-audit.jsonl"), "utf8").split("\n").filter((l) => l.trim() !== "").length; } catch { /* 无审计文件 = 0 行 */ }
+			respondJson(res, 200, { count: visible.length, entries: visible, commandAuditLines }); return;
 		}
 		if (p === "/v1/wechat/inbox" && req.method === "GET") {
 			const qRaw = u.searchParams.get("limit");

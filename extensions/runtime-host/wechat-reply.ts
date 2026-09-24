@@ -30,13 +30,18 @@ export function startWechatReplyWatcher(opts: WechatReplyWatcherOptions): () => 
   if (busy || stopped) return; busy = true;
   try {
    const cfg = readConfig(configPath);
-   if (!cfg.enabled) return; // disabled: no consume, preserve pending
+   // 旧行为：reply.enabled=false → 整轮不消费、intent 保留 pending（reply/broadcast 红线不变）。
+   // L4-S2 例外：**命令回执（kind="command"）豁免此门**——否则远程 `/wechat reply off` 的回执
+   // （以及之后所有命令回执）会被这道门自己关在 pending，直到 reply 重新开启才发出（陈旧回执）。
+   const replyEnabled = cfg.enabled === true;
    // 接收 worker 在线状态（每轮 run 新建实例读——readState 实例内缓存，复用会陈旧；recon⑥/计划 §5）。
    // 懒读：仅当本轮遇到 pending broadcast intent 时读一次；reply-only 路径零额外 IO。
    let receiveStatus: string | null = null;
    for (const item of listReplyIntents(intentDir)) {
     if (stopped) break;
     if (item.status !== "pending") continue;
+    // S2：reply.enabled=false 时只放行命令回执；reply/broadcast 仍 preserve pending（旧行为红线）。
+    if (!replyEnabled && item.kind !== "command") continue;
     // M1（L4 必须修）：mode 已回滚到 reply-only → broadcast intent 整轮跳过（保留 pending、
     // 零审计，与 enabled=false 同形态；TTL 窗口照走，翻回 broadcast 后过期即 failed、未过期续发）。
     // reply intent（无 kind）不进此分支——旧路径红线不变。

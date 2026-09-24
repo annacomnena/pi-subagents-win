@@ -14,7 +14,9 @@
  *   host 注入器对 inbox 的 fs.watch 有 **200ms debounce**（wechat-input.ts startWechatInput），
  *   本消费端在同一 FS 事件上**同步立即**扫描（无 debounce）⇒ 正常路径先于 host 拿下记录
  *   （余量 ≈200ms）。残余：本会话 watch 建立失败/会话晚起时退化为 tick 兜底，可能输掉竞态
- *   → 记录被 host 按今天行为注入（回退，非安全问题）；报告「残余/未决」章节有说明。
+ *   → **L4-M2 后不再回退成文本注入**：host 注入器在能力开启时先 classify，命令形态记录
+ *   `return {injected:false,reason:"command-shaped"}`（不改终态，留待本消费端下一轮拿下）；
+ *   普通文本则按今天行为注入。见 runtime-host/wechat-input.ts 的 M2 门。
  *
  * 授权双轴（用户裁定⑥）：
  *   轴一 = openid 白名单 `channels.wechat.input.allowFrom`（与 wechat-input.ts#L35 同口径：
@@ -31,8 +33,12 @@
  * 幂等（at-least-once 兜底）：`runtime/receipts.ts` 收据 first-wins，键前缀 **`wcmd:`**
  * （命名空间避开 outbox:`outbox:` / `run-` / `msg:` / `cmd:`），key = `wcmd:<sha256(msgId)>`。
  * 顺序 = 标终态 → claim → 执行 → 落回执 → defer 副作用（回执先落盘再 reload，研究 Q1.3）。
- *   崩溃窗口（诚实）：标终态后 / claim 后中断 → 该条命令**丢失不重放**（at-most-once，
- *   宁可丢一条 /reload 也不重复执行敏感操作）。
+ *   崩溃窗口（诚实，**两个方向**）：
+ *     a) 标终态后 / claim 后中断 → 该条命令**丢失不重放**（at-most-once，宁可丢一条 /reload
+ *        也不重复执行敏感操作）；
+ *     b) **反向窗口（L4-S5）**：回执已落盘（措辞「已请求执行 /reload…」）而 `defer()` 还没跑
+ *        就中断 → 用户被告知已执行、实际没执行，且 `wcmd:` 收据已消耗 → **永不重试**。
+ *        本模块选择不改写已落盘回执（改写同样有窗口），只在此与实现报告中如实记录。
  */
 
 import { createHash } from "node:crypto";
@@ -289,6 +295,11 @@ export function scanWechatRemoteCommands(opts: WechatCommandScanOptions): Wechat
 			const path = inboxRecordPath(runtimeDir, rec.msgId);
 			const raw = readInboxRaw(path);
 			if (!raw) continue; // 读不到原记录 → 不 claim，留待下轮
+			// S1（L4 建议修）TOCTOU 复核：host 注入器可能已在「scan 读 pending」与「本函数读
+			// 原文件」之间把记录置为 injected（窄窗口）。此时若照写 consumed，会把带 outboxId
+			// 的 injected 覆盖掉（丢 outboxId → wechat-reply-hook 回执归属断链），且同一条命令
+			// 既进 LLM 又被执行 → 让位（不 claim、不改终态、不执行）。
+			if (raw.state !== "pending") continue;
 			// 终态先落（consumed）→ 注入路从此看不见它；claim 决定「谁执行」
 			try {
 				writeInboxConsumed(path, raw, now());
@@ -379,13 +390,25 @@ export function scanWechatRemoteCommands(opts: WechatCommandScanOptions): Wechat
  *    { expandPromptTemplates: true })`——pi 正规扩展命令派发（agent-session.js#L1218：
  *    handler 命中即 return，**不构造 messages、不跑模型、不落转写**）。
  *    绝不用用户原文调用 sendUserMessage（那是注入路 = 转写污染，本通道禁用）。
+ *
+ * `opts.registered`（L4-S3）：内部命令注册成功才置 true；未注册（registerCommand 抛错被吞）
+ * 时 dispatch **no-op**——否则 pi 找不到 `/wechat-remote-run` 会把派发文本当**普通用户消息**
+ * 落进会话（转写污染 + 触发 turn，broadcast 模式下还会 stashWechatBroadcast → 可能广播）。
+ * 直接调用本函数而未提供 registered 的调用方（单测/自接线）按已注册对待（缺省放行）。
+ *
+ * 运行时版本前提（L4-S4）：`expandPromptTemplates` 选项是**运行时 pi ≥ ~0.87** 才支持的
+ * （本机 0.87.1 agent-session.js#L1570 支持；0.80.6 的实现硬编码 `expandPromptTemplates:false`
+ * 且 .d.ts 无该属性）——低于该版本的运行时会把内部命令文本当字面 prompt 注入。已写入
+ * README §2「Runtime requirement」：本包微信远程命令通道要求运行时 pi ≥ 0.87。
  */
 export function defaultRemoteCommandDeps(
 	pi: ExtensionAPI,
-	opts: { configPath?: string; runtimeDir?: string } = {},
+	opts: { configPath?: string; runtimeDir?: string; registered?: { current: boolean } } = {},
 ): RemoteCommandDeps {
 	const configPath = () => opts.configPath ?? readWechatConfigPath();
 	const dispatch = (action: string): void => {
+		// S3：内部命令未注册 → no-op（不把内部命令文本跌落成普通 user 消息）
+		if (opts.registered && !opts.registered.current) return;
 		try {
 			const r = pi.sendUserMessage(`/${WECHAT_REMOTE_RUN_COMMAND} ${action}`, { expandPromptTemplates: true }) as unknown;
 			if (r && typeof (r as { then?: unknown }).then === "function") {
@@ -473,12 +496,16 @@ export function registerWechatRemoteCommands(
 	opts: RegisterWechatRemoteCommandsOptions = {},
 ): () => void {
 	const runtimeDir = opts.runtimeDir ?? defaultRuntimeDir();
-	const deps = opts.deps ?? defaultRemoteCommandDeps(pi, { ...(opts.configPath ? { configPath: opts.configPath } : {}), runtimeDir });
+	// S3：注册状态旗标（与 deps 共享）——registerRemoteRunCommand 成功才置 true
+	const registered = { current: false };
+	const deps = opts.deps ?? defaultRemoteCommandDeps(pi, { ...(opts.configPath ? { configPath: opts.configPath } : {}), runtimeDir, registered });
 	const scanOpts: WechatCommandScanOptions = { ...opts, runtimeDir, deps };
 	try {
 		registerRemoteRunCommand(pi);
+		registered.current = true;
 	} catch {
-		/* 注册失败不阻断扩展加载 */
+		// 注册失败仍不阻断扩展加载，但 registered 保持 false → deps.dispatch no-op（S3：
+		// 不再静默吞掉后照发派发、把内部命令文本跌落成普通 user 消息）
 	}
 	const receiveDir = join(runtimeDir, "wechat", "receive");
 	const inboxDir = join(receiveDir, "inbox");

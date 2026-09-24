@@ -178,6 +178,29 @@ try {
 			assert.ok(!JSON.stringify(projection).includes("private"));
 			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
 		}
+		// L4-S6：诊断端 /v1/wechat/quarantine 补 command 审计行数
+		// （state/wechat-command-audit.jsonl；consumed 记录不落 rejected 列表，只能从审计看）。
+		// receive.enabled=true 但**无凭据** → channel-supervisor 不 spawn worker（零副作用）。
+		{
+			const auth = { "X-Command-Token": h.info.token! };
+			const off = await fetch(`${base}/v1/wechat/quarantine`, { headers: auth });
+			assert.equal(off.status, 403, "receive.enabled 缺省 false → 403（既有门不变）");
+			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true, channels: { wechat: { enabled: true, receive: { enabled: true } } } }));
+			const auditPath = join(ROOT, "state", "wechat-command-audit.jsonl");
+			mkdirSync(dirname(auditPath), { recursive: true });
+			writeFileSync(auditPath, [
+				JSON.stringify({ at: "2020-01-01T00:00:00.000Z", decision: "command-accepted", tier: "safe", cmd: "/wechat" }),
+				JSON.stringify({ at: "2020-01-01T00:00:01.000Z", decision: "command-denied", tier: "danger", cmd: "!rm" }),
+				"",
+			].join("\n"));
+			const res = await fetch(`${base}/v1/wechat/quarantine`, { headers: auth });
+			assert.equal(res.status, 200);
+			const body = await res.json() as { count: number; entries: unknown[]; commandAuditLines?: number };
+			assert.equal(body.commandAuditLines, 2, "S6：诊断端带 command 审计行数");
+			assert.ok(!JSON.stringify(body).includes("bot-token"), "诊断面无 token");
+			rmSync(auditPath, { force: true });
+			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
+		}
 		// T1 无 attachment：master 段全空态
 		{
 			const r = await getJson(base, "/v1/health");

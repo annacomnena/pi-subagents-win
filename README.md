@@ -68,6 +68,8 @@ pi install /path/to/pi-subagents-win
 
 The package is a pi extension (`pi.extensions` → `./extensions/index.ts`) with a bundled skill (`pi.skills` → `./skills`).
 
+**Runtime requirement:** the WeChat remote-command channel (`/wechat …`, `/reload`, `/model` … sent from WeChat) dispatches its internal `/wechat-remote-run` command via `sendUserMessage(…, { expandPromptTemplates: true })`, which requires a **runtime `pi` ≥ 0.87**. Older runtimes (e.g. the 0.80.x line) hard-code that option to `false`, so the internal command text would fall into the conversation instead of being dispatched. Unit tests are unaffected (they use fakes).
+
 1. Copy `config.example.json` → `config.json` and set models per agent (or run `/sub-models`).
 2. Reload pi (`/reload`) or restart.
 
