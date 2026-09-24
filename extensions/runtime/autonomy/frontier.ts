@@ -196,6 +196,8 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	const baseline = prev === null;
 
 	// ⑤ 载体：消费快照的「分页前全量投影」（不得读 rows/home——⑤ 触发集合不得是显示排序的函数）
+	// 该投影只含 attention>0 仓的条目：**缺项 = 该仓 attention 为 0**；不得把「键存在」当作「仓存在」
+	// （仓是否存在由 details/tabsByRepo 决定，与此 map 无关）。
 	const attentionByRepo = snapshot.attentionByRepo;
 
 	// 可见 tab 按归一化 repo 分组

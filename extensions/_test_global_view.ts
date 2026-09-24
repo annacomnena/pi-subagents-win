@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collectGlobalView, formatGlobalView, globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
+import { collectGlobalView, collectGlobalView as collect3, formatGlobalView, globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 
 const NOW = Date.now();
 const HOUR = 60 * 60 * 1000;
@@ -401,3 +401,36 @@ const SMALL_GOLDEN = [
 assert.equal(formatGlobalView(smallSnap), SMALL_GOLDEN, "⑥ 小规模输出与修复前逐字节一致");
 
 console.log(`global-view M1 OK: full=${fullLines.length} lines rows_shown=12 tail=${fullLines.length - tailIdx} small=byte-identical`);
+
+// ── G-A L4 建议修 1 / 遗漏 3：Σ 不变量独立断言（多计数 + 空/失败路径）──
+// 之前只在「21 仓每仓=1」的 P0 fixture 上间接测过；这里补同仓多计数与空/catch 路径。
+const sumAttn = (m: Record<string, number>): number => Object.values(m).reduce((a, b) => a + b, 0);
+{
+	// ① 同仓多个 attention：一个仓 3 条待审（completed 终态无 result）→ attention=3，键仍只 1 个
+	const agent3 = mkAgent();
+	const repoG = mkdtempSync(join(tmpdir(), "gv3-repoG-"));
+	mkdirSync(join(repoG, ".git"), { recursive: true });
+	for (let i = 0; i < 3; i++) {
+		dispatch(agent3, `multi_${i}`, repoG, NOW - 3 * HOUR, `M${i}`);
+		state(agent3, `multi_${i}`, "completed", true, NOW - 10 * 60_000); // 终态无 result → attention
+	}
+	const s3 = collect3({ agentDir: agent3, now: NOW, gitProbe });
+	assert.equal(s3.totals.attention, 3, "同仓 3 条待审 → totals.attention=3");
+	assert.ok(s3.rows.some((r) => r.repoPath === repoG), "repoG 入行");
+	assert.equal(Object.keys(s3.attentionByRepo).length, 1, "同仓多 attention 仍只 1 个键");
+	assert.equal(Object.values(s3.attentionByRepo)[0], 3, "该键值 = 3（同仓计数，非布尔）");
+	assert.equal(sumAttn(s3.attentionByRepo), s3.totals.attention, "Σ attentionByRepo === totals.attention（多计数）");
+	// ② 受控空输入：空 agentDir → 主路径空投影，Σ=0=totals.attention
+	const sEmpty = collect3({ agentDir: mkAgent(), now: NOW, gitProbe });
+	assert.deepEqual(sEmpty.attentionByRepo, {}, "空输入 → 空投影");
+	assert.equal(sEmpty.totals.attention, 0);
+	assert.equal(sumAttn(sEmpty.attentionByRepo), sEmpty.totals.attention, "Σ 0 === 0（空输入）");
+	// ③ never-throw catch 路径：受控抛错（agentDir getter）→ catch 返回空投影，Σ=0=totals.attention
+	const throwing = Object.defineProperty({}, "agentDir", { get() { throw new Error("boom"); } });
+	const sCatch = collect3(throwing as { agentDir: string });
+	assert.deepEqual(sCatch.attentionByRepo, {}, "catch 返回空投影");
+	assert.equal(sCatch.totals.attention, 0);
+	assert.equal(sumAttn(sCatch.attentionByRepo), sCatch.totals.attention, "Σ 0 === 0（catch 路径）");
+	assert.ok(sCatch.warnings.some((w) => w.includes("collect 失败")), "catch 记 warnings");
+}
+console.log("global-view Σ OK: 多计数/空输入/catch 三路径 Σ===totals.attention");

@@ -15,6 +15,8 @@
  *   3) 规模覆盖：19/20/21/40 仓四档，打印 attention>0 数 / 首页容纳 / 页外漏检 / 假边沿条数。
  *   另含 N1-N4（§12 机器验收口径）：排名无关性、surviving 仓 attention 边沿序列、冷启动零触发、
  *   n≤20 新旧口径等价性 harness（n=21 差异恰为 1 仓 false→true + 1 条 ⑤）。
+ *   L4 补强：M1（旧 prev 一次性补报）/ M2（legacy↔new 双向反复切换：每仓 ⑤≤1、同口径连续帧 0、
+ *   稳定帧 msv 不变、非预测字段不漂移）/ M3（新语义连续三帧 msv 不变）/ K1（normalizer 键一致性 tripwire）。
  *
  * 隔离：临时 PI_RUNTIME_DIR/PI_TAB_RUNS_DIR（照 `_test_runtime_autonomy.ts` A11 先例），
  * 固定 now（不依赖真实时钟），绝不碰真实 ~/.pi/agent。
@@ -110,6 +112,12 @@ const needsUserOf = (f: FrontierSnapshot, key: string): boolean => f.projects.fi
 const needsUserTriggers = (d: { triggers: { rule: string; project: string }[] }, key?: string): number =>
 	d.triggers.filter((t) => t.rule === "needs_user" && (key === undefined || t.project === key)).length;
 const attnSum = (m: Record<string, number>): number => Object.values(m).reduce((a, b) => a + b, 0);
+/** legacy = 旧窗口口径：attentionByRepo 仅由分页后 rows 派生（模拟修复前 frontier ⑤ 的载体）。 */
+const legacyOf = (s: GlobalViewSnapshot): GlobalViewSnapshot => {
+	const m: Record<string, number> = {};
+	for (const r of s.rows) if (r.attention > 0) m[normalizeExactPath(r.repoPath)] = r.attention;
+	return { ...s, attentionByRepo: m };
+};
 
 const worlds: World[] = [];
 const makeTracked = (tag: string, n: number): World => { const w = makeWorld(tag, n); worlds.push(w); return w; };
@@ -282,12 +290,7 @@ check("N3 冷启动（prev=null）不产 ⑤：baseline=true 且 triggers 为空
 	console.log(`       baseline=${g.next.baseline} triggers=${g.diff.triggers.length} needsUser=${g.next.projects.filter((p) => p.needsUser).length}/21`);
 });
 check("N4 n≤20 新旧口径全等；n=21 差异恰为 1 仓 needsUser false→true + 恰 1 条 ⑤", () => {
-	// legacy = 旧窗口口径：attentionByRepo 仅由分页后 rows 派生
-	const legacyOf = (s: GlobalViewSnapshot): GlobalViewSnapshot => {
-		const m: Record<string, number> = {};
-		for (const r of s.rows) if (r.attention > 0) m[normalizeExactPath(r.repoPath)] = r.attention;
-		return { ...s, attentionByRepo: m };
-	};
+	// legacy = 旧窗口口径（模块级 legacyOf）
 	// n≤20：首页即全量 → 新旧口径逐键相等，同 prev 下 next/diff JSON 全等
 	for (const n of [19, 20]) {
 		const w = makeTracked(`n4eq${n}`, n);
@@ -331,6 +334,113 @@ check("N4 n≤20 新旧口径全等；n=21 差异恰为 1 仓 needsUser false→
 	}
 	assert.deepEqual(diffRepos, [offKey], `差异仓应恰为页外仓，实际 ${JSON.stringify(diffRepos)}`);
 	console.log(`       n≤20 全等=✔；n=21 差异仓=${diffRepos.length}（${diffRepos[0]?.slice(-3)}）⑤=${needsUserTriggers(rNew.diff)}`);
+});
+
+// ════════════════ M1-M3：L2 §6 迁移测试（必须修）+ Σ 键一致性 tripwire ════════════════
+console.log("\nM) 迁移（L2 §6）：旧 prev 一次性补报 / 双向反复切换 / 新语义连续帧 msv");
+check("M1 旧 prev（页外仓 needsUser=false）→ 新语义首帧恰 1 条 ⑤（该仓），同输入下一帧 0 条", () => {
+	const w = makeTracked("m1", 21);
+	const snap = prodView(w);
+	const legacy = legacyOf(snap);
+	const offKey = keyOf(w, 20);
+	const prev = build(legacy, null).next; // 旧口径基线：页外仓 needsUser=false
+	assert.equal(needsUserOf(prev, offKey), false, "旧口径基线页外仓 needsUser=false");
+	const f1 = build(snap, prev);
+	assert.equal(needsUserTriggers(f1.diff, offKey), 1, "首帧新语义恰 1 条页外仓 ⑤");
+	assert.equal(needsUserTriggers(f1.diff), 1, "首帧总 ⑤ 恰 1 条（仅该仓一次性迁移）");
+	const f2 = build(snap, f1.next);
+	assert.equal(needsUserTriggers(f2.diff), 0, "同输入下一帧 0 条 ⑤（不重复补报）");
+	console.log(`       旧 prev 页外仓 needsUser=${needsUserOf(prev, offKey)} → 首帧 ⑤=${needsUserTriggers(f1.diff, offKey)} → 次帧 ⑤=${needsUserTriggers(f2.diff)}`);
+});
+check("M2 双向/反复切换 legacy↔new（同一 21 仓 fixture、同一 prev 链）：每仓 ⑤ ≤1、同口径连续帧 0、稳定帧 msv 不变、非预测字段不漂移", () => {
+	const w = makeTracked("m2", 21);
+	const snap = prodView(w);
+	const legacy = legacyOf(snap);
+	const offKey = keyOf(w, 20);
+	// 同一 prev 链：以 legacy 基线（页外仓 needsUser=false）起始，逐帧把 prev 传下去；覆盖 legacy→new→legacy→new
+	const seq: ("legacy" | "new")[] = ["legacy", "new", "new", "legacy", "legacy", "new", "new"];
+	let prev = build(legacy, null).next;
+	const frames: { kind: "legacy" | "new"; next: FrontierSnapshot; diff: ReturnType<typeof build>["diff"] }[] = [];
+	for (const kind of seq) {
+		const g = build(kind === "legacy" ? legacy : snap, prev);
+		frames.push({ kind, next: g.next, diff: g.diff });
+		prev = g.next;
+	}
+	// (a) 逐帧：每仓 needs_user 至多一次
+	for (let i = 0; i < frames.length; i++) {
+		const counts = new Map<string, number>();
+		for (const t of frames[i]!.diff.triggers) if (t.rule === "needs_user") counts.set(t.project, (counts.get(t.project) ?? 0) + 1);
+		for (const [k, c] of counts) assert.ok(c <= 1, `帧${i} 仓 ${k} needs_user 必须 ≤1，实际 ${c}`);
+	}
+	// (b) 同口径连续两帧：后一帧 0 触发（无振荡）
+	for (let i = 1; i < frames.length; i++) {
+		if (frames[i]!.kind !== frames[i - 1]!.kind) continue;
+		assert.equal(frames[i]!.diff.triggers.length, 0, `同口径连续帧 ${i - 1}→${i}（${frames[i]!.kind}）必须 0 触发`);
+	}
+	// (c) 稳定帧（同口径连续对的后一帧）msv 全不变
+	const msvOf = (f: FrontierSnapshot, k: string): number => f.projects.find((p) => p.project === k)?.meaningfulStateVersion ?? -1;
+	for (let i = 1; i < frames.length; i++) {
+		if (frames[i]!.kind !== frames[i - 1]!.kind) continue;
+		for (const p of frames[i]!.next.projects) assert.equal(msvOf(frames[i]!.next, p.project), msvOf(frames[i - 1]!.next, p.project), `稳定帧 ${i} 仓 ${p.project} msv 必须不变`);
+	}
+	// (d) 方向性 + 字段不漂移：切换帧差异恰为页外仓 needsUser（+ msv，仅 legacy→new），其余 project 字段全等
+	const FIELDS = ["state", "variant", "gate", "runs", "resultMissing", "stagnation", "overdue"] as const;
+	for (let i = 1; i < frames.length; i++) {
+		if (frames[i]!.kind === frames[i - 1]!.kind) continue; // 只看切换帧
+		const a = frames[i - 1]!.next;
+		const b = frames[i]!.next;
+		assert.equal(a.projects.length, b.projects.length, "切换帧项目数一致");
+		const drifted: string[] = [];
+		for (let j = 0; j < a.projects.length; j++) {
+			const pa = a.projects[j]!;
+			const pb = b.projects[j]!;
+			assert.equal(pa.project, pb.project, "切换帧项目顺序必须一致");
+			for (const f of FIELDS) assert.equal(JSON.stringify(pa[f]), JSON.stringify(pb[f]), `切换帧 ${pa.project} 字段 ${f} 不应漂移`);
+			if (pa.needsUser !== pb.needsUser || pa.meaningfulStateVersion !== pb.meaningfulStateVersion) drifted.push(pa.project);
+		}
+		assert.deepEqual(drifted, [offKey], `切换帧差异仓必须恰为页外仓，实际 ${JSON.stringify(drifted)}`);
+		const expected = frames[i]!.kind === "new" ? 1 : 0;
+		assert.equal(needsUserTriggers(frames[i]!.diff, offKey), expected, `${frames[i - 1]!.kind}→${frames[i]!.kind} 页外仓 ⑤ 应为 ${expected}`);
+	}
+	console.log(`       seq=${seq.join("→")}；⑤ 逐帧=${frames.map((f) => f.diff.triggers.length).join(",")}（仅 legacy→new 切换帧 =1，无振荡）`);
+});
+check("M3 新语义连续三帧同输入：0 触发、msv 不变（显式 msv 断言）", () => {
+	const w = makeTracked("m3", 21);
+	const snap = prodView(w);
+	const offKey = keyOf(w, 20);
+	const f1 = build(snap, null); // 基线
+	const f2 = build(snap, f1.next);
+	const f3 = build(snap, f2.next);
+	assert.equal(f2.diff.triggers.length, 0, "帧2 必须 0 触发");
+	assert.equal(f3.diff.triggers.length, 0, "帧3 必须 0 触发");
+	const msv2 = new Map(f2.next.projects.map((p) => [p.project, p.meaningfulStateVersion]));
+	for (const p of f3.next.projects) assert.equal(p.meaningfulStateVersion, msv2.get(p.project), `仓 ${p.project} msv 必须不变`);
+	assert.equal(needsUserOf(f3.next, offKey), true, "页外仓仍 needsUser=true");
+	console.log(`       帧1(基线)→帧2→帧3：⑤=${f2.diff.triggers.length},${f3.diff.triggers.length}，msv 全不变=✔`);
+});
+
+// ⚠ tripwire：两份 exact-path normalizer 是双写——`global-view.ts` 用 `recent-scopes.ts` 的
+// `normalizeExactPath`，`frontier.ts` 用本地副本（为保持依赖图零 node:fs）。**单侧改动**会让
+// global-view 的 attentionByRepo 键与 frontier 的 detail 键错配，静默表现为 attention=0（⑤ 漏检）。
+// 本测试用大小写/分隔符变体路径把「键一致」钉死；任一侧 normalizer 漂移 → 本 check 变红。
+check("K1 键一致性 tripwire：大小写/分隔符变体路径下 global-view map 键 == frontier detail 键", () => {
+	const w = makeTracked("k1", 3);
+	// 变体：反斜杠→正斜杠 + 整体大写 + 尾部分隔符（normalizeExactPath 必须把它们折回同一键）
+	const variants = w.repos.map((rp) => `${rp.replace(/\\/g, "/").toUpperCase()}/`);
+	for (let i = 0; i < variants.length; i++) writeTab(w.runsDir, i, variants[i]!, NOW - i * MIN);
+	const s = prodView(w);
+	assert.ok(s.details.some((d) => d.repoPath !== normalizeExactPath(d.repoPath)), "fixture 必须含未归一化 repoPath（否则 tripwire 无效）");
+	const f = build(s, null);
+	assert.equal(f.next.projects.length, 3, "3 仓");
+	assert.equal(Object.keys(s.attentionByRepo).length, 3, "全量投影 3 键");
+	for (const p of f.next.projects) {
+		assert.equal(s.attentionByRepo[p.project], 1, `frontier 键 ${p.project} 必须在 global-view map 内（单侧 normalizer 漂移 → 静默 attention=0）`);
+		assert.equal(needsUserOf(f.next, p.project), true, `仓 ${p.project} 必须 needsUser=true`);
+	}
+	const mapKeys = Object.keys(s.attentionByRepo).sort();
+	const detailKeys = [...new Set(f.next.projects.map((p) => p.project))].sort();
+	assert.deepEqual(mapKeys, detailKeys, "两 map 键集合必须逐字相等");
+	console.log(`       变体样本=${variants[0]?.slice(-24)} → 键一致=${JSON.stringify(mapKeys) === JSON.stringify(detailKeys)}`);
 });
 
 // ── 清理 + 汇总 ─────────────────────────────────────────────────────
