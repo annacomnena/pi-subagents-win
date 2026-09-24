@@ -277,9 +277,6 @@ export function registerHotspotTool(pi: ExtensionAPI): void {
 				if (shapeProblems.length) {
 					return err(`结构校验失败:\n${shapeProblems.map((p) => `- [${p.field}] ${p.message}`).join("\n")}`);
 				}
-				if (read.exists && read.file && read.file.entries.length >= ENTRY_LIMITS.topics && !read.file.entries.some((e) => e.topicId === entry.topicId)) {
-					return err(`主题数已达上限 ${ENTRY_LIMITS.topics}；请先 remove 冷却主题`);
-				}
 				// ② 手写边存在性 gate：rel.topic_id 须指向现有条目（或本条目自身）
 				const knownTopics = new Set<string>((read.exists && read.file ? read.file.entries : []).map((e) => e.topicId));
 				knownTopics.add(entry.topicId);

@@ -42,7 +42,9 @@ import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtim
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
-import { readWechatConfigPath } from "./runtime-host/wechat-bind.ts";
+import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
+import { defaultRuntimeDir } from "./runtime/journal.ts";
+import { WechatStore } from "./channel-wechat/store.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -2038,6 +2040,29 @@ export default function (pi: ExtensionAPI) {
 				body = "autonomy status: (状态不可读)";
 			}
 			ctx.ui.notify(body, "info");
+		},
+	});
+	pi.registerCommand("wechat", {
+		description: "微信通道开关与状态：/wechat on|off|status",
+		handler: async (args, ctx) => {
+			const sub = (args ?? "").trim().toLowerCase() || "status";
+			if (sub === "on" || sub === "off") {
+				if (isSubagent()) { ctx.ui.notify("wechat: 子 agent 会话不可切换通道（手动运维命令）", "warning"); return; }
+				const result = setWechatEnabled(sub === "on", readWechatConfigPath());
+				if (result.ok) appendAuditEvent("gating", sub === "on" ? "enable" : "disable", `wechat by=user:${durableSessionIdentity(ctx as never)?.slice(0, 12) ?? "cli"}`);
+				ctx.ui.notify(result.ok ? `wechat enabled=${sub}` : `wechat config write failed: ${result.error}`, result.ok ? "info" : "warning");
+				return;
+			}
+			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status", "warning"); return; }
+			const configPath = readWechatConfigPath();
+			let worker = "(状态不可读)";
+			try {
+				const stats = new WechatStore(join(defaultRuntimeDir(), "wechat", "receive")).stats();
+				worker = `status=${stats.status} polls=${stats.counts.polls} received=${stats.counts.received}`;
+			} catch { /* tolerant status */ }
+			const creds = readWechatCreds(wechatCredsPath(defaultRuntimeDir()));
+			const botId = creds?.botId;
+			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。

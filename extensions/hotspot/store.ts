@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { dirname, join, sep } from "node:path";
 import {
+	ENTRY_LIMITS,
 	FIELD_LABELS,
 	HOTSPOT_FILENAME,
 	HOTSPOT_TRASH_FILENAME,
@@ -332,6 +333,10 @@ export async function commitHotspot(path: string, input: CommitInput): Promise<C
 			return { ok: false, kind: "io", message: `变更被拒绝: ${e instanceof Error ? e.message : String(e)}` };
 		}
 		if (!mutated) return { ok: true, revision: curRev, skipped: true };
+		const priorIds = new Set((latest.file?.entries ?? []).map((e) => e.topicId));
+		if ((latest.file?.entries.length ?? 0) >= ENTRY_LIMITS.topics && mutated.next.entries.some((e) => !priorIds.has(e.topicId))) {
+			return { ok: false, kind: "io", message: `主题数已达上限 ${ENTRY_LIMITS.topics}；请先 remove 冷却主题` };
+		}
 		const next: HotspotFile = { ...mutated.next, revision: curRev + 1 };
 		const raw = serializeHotspot(next);
 		const tmp = `${path}.tmp-${process.pid}`;
