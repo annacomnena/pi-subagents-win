@@ -102,6 +102,27 @@ export interface AutonomyInputs {
 }
 
 /**
+ * graph-only 装配：**在 graph 分支内**派生 `agentDir`（`defaultAgentDir()` 归属 graph 路），
+ * 并显式传三路径——避免 `readGraphSnapshot` 缺省走 `PI_TAB_RUNS_DIR`/`defaultTabRunsDir()` 与 v2
+ * 的 `join(agentDir,"tab-runs")` 分叉（`graph/collect.ts#L58-L62`）。`journalPath` 不传（生产默认）。
+ * v2 分支**不得**复用本 helper：`collectGlobalView({ agentDir: opts?.agentDir, now })` 保持原调用形状，
+ * 使 `defaultAgentDir()` 仍在 `collectGlobalView` 自己的 `try` 内（异常边界逐字节不变）。
+ */
+function graphFrontierSnapshot(opts: { agentDir?: string; stateDir?: string; now: number }): FrontierSourceSnapshot {
+	const agentDir = opts.agentDir ?? defaultAgentDir();
+	return toFrontierInput(
+		readGraphSnapshot({
+			stateDir: opts.stateDir,
+			now: opts.now,
+			tabRunsDir: join(agentDir, "tab-runs"),
+			sessionsRoot: join(agentDir, "sessions"),
+			timersDir: join(agentDir, "timers"),
+		}),
+		{ now: opts.now },
+	);
+}
+
+/**
  * 只读聚合 + 写自有 namespace（never-throw：任何异常收敛为默认返回）。
  *
  * - gating = normalize(autonomy 配置) × kill 文件（kill 优先）；gating 短路每次产审计行（红线条款 2）。
@@ -121,19 +142,10 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 		const gating = evaluateAutonomyGating(cfg, kill);
 		if (!gating.active) appendAuditLine(`gating no-wake reason=${gating.reason}`, { stateDir }); // 红线条款 2：每次 gate 短路产审计行
 
-		const agentDir = opts?.agentDir ?? defaultAgentDir();
 		const snapshot: FrontierSourceSnapshot =
 			process.env.PI_AUTONOMY_FRONTIER_SOURCE?.trim() === "graph"
-				? toFrontierInput(
-						readGraphSnapshot({
-							stateDir, now,
-							tabRunsDir: join(agentDir, "tab-runs"),
-							sessionsRoot: join(agentDir, "sessions"),
-							timersDir: join(agentDir, "timers"),
-						}),
-						{ now },
-					)
-				: collectGlobalView({ agentDir, now });
+				? graphFrontierSnapshot({ agentDir: opts?.agentDir, stateDir, now })
+				: collectGlobalView({ agentDir: opts?.agentDir, now });
 		const backlog = mailboxBacklog();
 		const masterKey = masterAddress().replace(/[^A-Za-z0-9._-]/g, "_"); // mailboxDirFor 同款映射
 		const masterPending = backlog.filter((b) => b.recipient === masterKey).reduce((s, b) => s + b.pending, 0);

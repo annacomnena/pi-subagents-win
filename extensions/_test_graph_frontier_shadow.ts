@@ -35,7 +35,8 @@
 
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
+import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // 测试隔离（照 `_test_graph_frontier_input.ts#L23-L25` 先例）：任何 defaultRuntimeDir() 落 temp；
@@ -800,6 +801,9 @@ check("S17 O-B 硬门：unexplained=0 且 explained=0；rows 非空跑；shadow.
 
 const E23_CONFIG = join(ENV_TMP, "e23-config.json");
 writeFileSync(E23_CONFIG, JSON.stringify({}), "utf8");
+/** S23：gating.active=true 需要 `autonomy.enabled===true`（否则 watchdog 全 unknown，run_state_mismatch 不可观测）。 */
+const E23_ENABLED_CONFIG = join(ENV_TMP, "e23-enabled-config.json");
+writeFileSync(E23_ENABLED_CONFIG, JSON.stringify({ autonomy: { enabled: true } }), "utf8");
 
 /** graph 分支不传 journalPath → 生产 journal = defaultRuntimeDir()/events.jsonl（把 world journal 放此并隔离 PI_RUNTIME_DIR）。 */
 function wireProductionEnv(w: World): void {
@@ -807,7 +811,7 @@ function wireProductionEnv(w: World): void {
 	writeFileSync(join(w.envDir, "events.jsonl"), readFileSync(w.journalPath, "utf8"), "utf8");
 }
 
-interface E23Fixture { w: World; v2Next: FrontierSnapshot; v2Diff: FrontierDiff; v2Order: string[] }
+interface E23Fixture { w: World; v2Next: FrontierSnapshot; v2Diff: FrontierDiff; v2Order: string[]; v2Raw: string; v2Watchdog: ReturnType<typeof collectAutonomyInputs>["watchdog"] }
 let E23: E23Fixture | null = null;
 
 /** 共享 fixture：同仓两 run，`runId` 字典序（a,b）与 `rankDetail` 序（stale 的 b 先）相反 → S19② 指纹可判别。 */
@@ -836,7 +840,13 @@ check("S18 缺省=v2：collectAutonomyInputs 与直接 v2 装配 canonical 逐�
 	assert.equal(r.frontier!.next.asof, NOW, "S18: now 单源（asof===NOW）");
 	const order = Object.keys(r.frontier!.next.projects[0]!.runs);
 	assert.deepEqual(order, ["run_b", "run_a"], "S18: v2 序 = rankDetail（stale run_b 先）");
-	E23 = { w, v2Next: r.frontier!.next, v2Diff: r.frontier!.diff, v2Order: order };
+	// 建议修 1：不只比较 canonical——额外比较**写出的 frontier.json 原始文本**与 watchdog/audit 可观测结果。
+	const v2Raw = readFileSync(join(w.root, "s18-state", "autonomy", "frontier.json"), "utf8");
+	assert.equal(v2Raw, `${JSON.stringify(ref.next, null, 2)}\n`, "S18: frontier.json 原始文本（非 canonical）逐字节等于独立参照");
+	const v2Audit = readFileSync(join(w.root, "s18-state", "autonomy", "audit.jsonl"), "utf8");
+	assert.ok(v2Audit.includes("frontier baseline="), "S18: 审计含 frontier baseline 行（可观测）");
+	assert.ok(v2Audit.split("\n").includes(r.watchdog.auditLine), "S18: 审计含 watchdog 行（可观测）");
+	E23 = { w, v2Next: r.frontier!.next, v2Diff: r.frontier!.diff, v2Order: order, v2Raw, v2Watchdog: r.watchdog };
 });
 
 check("S19 PI_AUTONOMY_FRONTIER_SOURCE=graph = graph 路：canonical 全等 + 指纹证明切换有效（非死代码）", () => {
@@ -851,6 +861,16 @@ check("S19 PI_AUTONOMY_FRONTIER_SOURCE=graph = graph 路：canonical 全等 + �
 		const order = Object.keys(r.frontier!.next.projects[0]!.runs);
 		assert.deepEqual(order, ["run_a", "run_b"], "S19: graph 序 = runId 升序（run_a 先）");
 		assert.notDeepEqual(order, E23!.v2Order, "S19: 指纹与 v2 序不同 → flag 确实切换、非死代码");
+		// 建议修 1：比较 graph 路**写出的 frontier.json 原始文本**（非 canonical）+ watchdog 可观测结果。
+		// 已知：两路 `runs` 键序不同（v2=rankDetail / graph=runId）——原始文本因此不全等，但差异**仅限键序**。
+		const gRaw = readFileSync(join(E23!.w.root, "s19-state", "autonomy", "frontier.json"), "utf8");
+		assert.equal(gRaw, `${JSON.stringify(r.frontier!.next, null, 2)}\n`, "S19: graph frontier.json 原始文本 == 返回快照（写盘即产物，无二次序列化）");
+		const gParsed = JSON.parse(gRaw) as FrontierSnapshot;
+		const v2Parsed = JSON.parse(E23!.v2Raw) as FrontierSnapshot;
+		assert.deepEqual(Object.keys(gParsed.projects[0]!.runs), ["run_a", "run_b"], "S19: graph 原始 runs 键序 = runId 升序");
+		assert.deepEqual(Object.keys(v2Parsed.projects[0]!.runs), ["run_b", "run_a"], "S19: v2 原始 runs 键序 = rankDetail");
+		assert.equal(canonicalJson(gParsed), canonicalJson(v2Parsed), "S19: 原始文本解析后 canonical 相等（差异仅键序）");
+		assert.deepEqual(r.watchdog, E23!.v2Watchdog, "S19: graph watchdog 报告 == v2（可观测等价）");
 	} finally {
 		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
 	}
@@ -860,6 +880,7 @@ check("S20 decoy PI_TAB_RUNS_DIR：显式 tabRunsDir 生效，graph 路不受 en
 	assert.ok(E23 !== null);
 	const decoy = track(makeWorld("e23-decoy", [{ name: "decoy" }], [{ id: "t_decoy", repo: "decoy", phase: "working" }]));
 	const decoyKey = normalizeExactPath(decoy.repoPaths.get("decoy")!);
+	const prevTabRuns = process.env.PI_TAB_RUNS_DIR; // 建议修 2：保存进入前值，finally 恢复（不写死）
 	process.env.PI_TAB_RUNS_DIR = decoy.runsDir; // 故意设错（若不显式传即为默认值）
 	process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
 	try {
@@ -871,6 +892,7 @@ check("S20 decoy PI_TAB_RUNS_DIR：显式 tabRunsDir 生效，graph 路不受 en
 		console.log(`  S20 decoy proof: 默认 tabRunsDir(=${decoy.runsDir}) → projects=${JSON.stringify(naiveProjects)}（含 decoy）`);
 		// 生产装配：显式 tabRunsDir=agentDir/tab-runs → 结果等于 S18 v2，且 decoy 身份零出现。
 		const r = collectAutonomyInputs({ agentDir: E23!.w.agentDir, stateDir: join(E23!.w.root, "s20-state"), now: NOW, configPath: E23_CONFIG });
+		assert.ok(r.frontier !== null, "S20: frontier 非 null"); // 建议修 3：读取前显式断言
 		assert.equal(canonicalJson(r.frontier!.next), canonicalJson(E23!.v2Next), "S20: 结果 canonical == S18 v2");
 		assert.deepEqual(Object.keys(r.frontier!.next.projects[0]!.runs), ["run_a", "run_b"], "S20: graph 路序 = runId 升序（确认是 graph 分支且读 agentDir/tab-runs）");
 		const projKeys = r.frontier!.next.projects.map((p) => p.project);
@@ -879,7 +901,8 @@ check("S20 decoy PI_TAB_RUNS_DIR：显式 tabRunsDir 生效，graph 路不受 en
 		assert.equal(allRuns.includes("t_decoy"), false, "S20: decoy run 身份 t_decoy 未出现");
 	} finally {
 		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
-		process.env.PI_TAB_RUNS_DIR = join(ENV_TMP, "tab-runs");
+		if (prevTabRuns === undefined) delete process.env.PI_TAB_RUNS_DIR;
+		else process.env.PI_TAB_RUNS_DIR = prevTabRuns;
 	}
 });
 
@@ -910,6 +933,69 @@ check("S21b enabled=false 零行为：flag=graph 下门首行旁路，state/auto
 	} finally {
 		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
 	}
+});
+
+// S22（L4 必须修 / 遗漏 1）：`opts.agentDir === undefined` 时的**调用形状 + 异常边界**。
+// 必须修后：v2 分支保留 `collectGlobalView({ agentDir: opts?.agentDir, now })` 字面量（不提前解析），
+// `defaultAgentDir()` 仍归 `collectGlobalView` 自己的 try；graph 分支在 graph-only helper 内派生。
+check("S22 agentDir 未传：v2 分支保留原调用形状 + 异常边界归 collectGlobalView（不提前解析）", () => {
+	// ① 源码形状断言（静态读取 collect.ts 源码，非 shell grep）：v2 分支字面量 + graph-only helper + 无外层预解析。
+	const src = readFileSync(new URL("./runtime/autonomy/collect.ts", import.meta.url), "utf8");
+	assert.ok(src.includes("collectGlobalView({ agentDir: opts?.agentDir, now })"), "S22: v2 分支保留原调用形状字面量");
+	assert.ok(src.includes("graphFrontierSnapshot({ agentDir: opts?.agentDir, stateDir, now })"), "S22: graph 分支经 graph-only helper 派生 agentDir");
+	assert.equal(/const agentDir = opts\?\.agentDir \?\? defaultAgentDir\(\);\s*\n\s*const snapshot/.test(src), false, "S22: 外层不再预解析 agentDir（旧缺陷形状已消除）");
+
+	// ② 异常边界：令 `defaultAgentDir()`（= os.homedir）抛错 → v2 分支仍返回 collectGlobalView 的空/警告快照。
+	const w = track(makeE23World());
+	wireProductionEnv(w);
+	delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+	const origHomedir = os.homedir;
+	os.homedir = () => { throw new Error("s22-homedir-unavailable"); };
+	syncBuiltinESMExports();
+	try {
+		const r = collectAutonomyInputs({ agentDir: undefined, stateDir: join(w.root, "s22-v2-state"), now: NOW, configPath: E23_CONFIG });
+		assert.ok(r.frontier !== null, "S22: v2 分支异常边界 → frontier 非 null（collectGlobalView 警告快照）");
+		assert.notEqual(r.gating.reason, "collect-failed", "S22: v2 分支不收敛为 collect-failed");
+		assert.equal(r.frontier!.next.baseline, true, "S22: 警告快照 → baseline=true");
+		assert.deepEqual(r.frontier!.next.projects, [], "S22: 警告快照 → projects=[]（未读到任何仓）");
+
+		// 对照（有意不对称）：graph 分支在 graph-only helper 内派生 agentDir → 归外层 catch → collect-failed。
+		process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+		const rg = collectAutonomyInputs({ agentDir: undefined, stateDir: join(w.root, "s22-graph-state"), now: NOW, configPath: E23_CONFIG });
+		assert.equal(rg.frontier, null, "S22: graph 分支异常边界 → frontier=null（agentDir 派生在 graph 分支/外层 try）");
+		assert.equal(rg.gating.reason, "collect-failed", "S22: graph 分支异常收敛为 collect-failed（与 v2 有意不同）");
+	} finally {
+		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+		os.homedir = origHomedir;
+		syncBuiltinESMExports();
+	}
+});
+
+// S23（L4 遗漏 3）：graph flag 下 `pidAlive=false` 的 watchdog `runStateMismatch` 端到端断言。
+check("S23 graph flag pidAlive=false：runStateMismatch 端到端（v2 与 graph 同判 true）", () => {
+	const w = track(makeWorld("e23-zombie", [{ name: "alpha" }], [
+		{ id: "run_z", repo: "alpha", phase: "working", pid: 999_999_999 }, // 死 pid → reduceTabCarrier pidAlive=false
+	]));
+	wireProductionEnv(w);
+	const run = (flag: boolean): ReturnType<typeof collectAutonomyInputs> => {
+		if (flag) process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+		else delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+		try {
+			return collectAutonomyInputs({ agentDir: w.agentDir, stateDir: join(w.root, flag ? "s23-graph" : "s23-v2"), now: NOW, configPath: E23_ENABLED_CONFIG });
+		} finally {
+			delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+		}
+	};
+	const v2 = run(false);
+	const g = run(true);
+	for (const [side, r] of [["v2", v2], ["graph", g]] as const) {
+		assert.equal(r.gating.active, true, `S23 ${side}: gating active（enabled=true）`);
+		assert.equal(r.watchdog.checks.run_state_mismatch?.status, "true", `S23 ${side}: run_state_mismatch=true`);
+		assert.ok(r.watchdog.checks.run_state_mismatch?.reason.includes("run_z"), `S23 ${side}: mismatch 含 run_z`);
+		assert.equal(r.watchdog.wakeRecommended, true, `S23 ${side}: wakeRecommended=true`);
+	}
+	assert.ok(v2.frontier !== null && g.frontier !== null, "S23: 两路 frontier 非 null");
+	assert.equal(canonicalJson(g.frontier!.next), canonicalJson(v2.frontier!.next), "S23: graph next canonical == v2");
 });
 
 // ═══════════════════════ 可选反向自检（E22_REVERSE_SELFTEST=1）═══════════════════════
