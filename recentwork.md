@@ -30,7 +30,8 @@
 | 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 |
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
-| 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见；**未提交**） | Item 14 | L4 收敛 PASS → 显式路径提交 → 派 W2（注入 master，D15 六条件） |
+| 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
@@ -56,10 +57,11 @@
 - **产物**：`plans/0924_wechat_receive_w1_spec.md`（规格：九条不变量 + 6 组断言 + 诚实延期清单）、`plans/0924_wechat_w1_impl_report.md`、`plans/0924_wechat_w1_l4_review.md`（**FAIL**，2 must-fix）、`plans/0924_wechat_w1_l4_convergence.md`（收敛轮）
 - **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md`（W1 状态 + 延期项）
 - **Priority**：P1
-- **Status**：**未提交**（等 L4 收敛）；L4 首轮抓到 **MF1 数据丢失级缺陷**（dedupe 先写墓碑再写 inbox，putInbox 失败则重放被去重吞掉 → 游标照样推进 → 消息永久丢失）与 **MF2**（两个只读端点漏守 `receive.enabled`）。修复轮（agent）改完代码但**超时死掉无报告**，主会话接手收尾并实跑验证 7 组断言全绿。
-- **Commit**：—（待 L4 收敛 PASS 后提交）
-- **Verification**：`npx tsx extensions/_test_wechat_receive.ts` 7 组断言全绿（3.5s，含 180s 硬看门狗）；smoke OK；5 个既有测试 + GUI 构建全绿。
-- **教训（EB-004）**：agent 超时失败时工作树可能停在**中间态**（半写代码），此时跑会 spawn 子进程的测试会挂死——本次实测挂 **6 小时**（两棵进程树未退出）。
+- **Status**：已实现（L3）→ L4 首轮 **FAIL**（抓到 MF1 数据丢失级 + MF2 opt-in 闸）→ 修复轮（agent 超时死掉无报告，主会话接手收尾）→ L4 收敛 **PASS-with-must-fix**（MF2/MF3 真修；MF1 反向重复计数仍存）→ 主会话修计数语义（`putInbox` 返回是否新建，计数只来自真实写入）→ 窄范围 L4 确认：**计数修复四条路径均被独立确认有效**，quarantine 重放重复**裁定为明确接受的残余**（不丢消息，W2 必须按 msgId 幂等）。
+- **Commit**：`00b5f32`
+- **Verification**：`npx tsx extensions/_test_wechat_receive.ts` 7 组断言全绿（~3.5s，含 180s 看门狗）；smoke OK；`_test_gui_master_unlock`/`_test_injection_gate`/`_test_runtime_commands`/`_test_runtime_host_server` 全绿；GUI `tsc --noEmit` + `vite build` 通过。
+- **教训（EB-004）**：agent 超时失败时工作树可能停在**中间态**（半写代码），此时跑会 spawn 子进程的测试会挂死——本次实测挂 **6 小时**（两棵进程树未退出）；已给该测试加 180s 硬看门狗。
+- **旁发现（Item 27）**：L4 实跑时 `_test_message_outbox.ts` 的“恰一个 CAS 赢家”断言失败 1 次（两进程均 claimed）；主会话连跑 3 次均过 ⇒ 竞争敏感，待判真竞态/测试抖动。
 
 ### Item 24 - 微信连接页 opt-in UX 修复（入口不可发现/不可启用）
 

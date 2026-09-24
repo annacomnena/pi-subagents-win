@@ -59,6 +59,28 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 - **401 提示**：页内明示"请先在 TUI 执行 `/gui open` 后再刷新"（凭据 cookie 只能由 bootstrap exchange 种下）。
 - **待补**：TUI 对等命令 `/wechat on|off|status`（可复用 `setWechatEnabled`）。**token 永不进浏览器/日志/WS/argv**；凭据拟落 `<runtimeDir>/wechat/credentials.json`（0600）；二维码由 daemon 代理取图转 data URL（**已实现**，限与 iLink base URL 同 origin 且 ≤200KB/10s，失败安全回退 URL 文本）。进程放置已裁定（D14）：登录/绑定 = daemon 内**有界异步任务**（取码 1 次 + ≤120s 轮询 + AbortController 超时 + 结束即释放）；**长驻长轮询通道仍走受监督 worker**。（v1 只做绑定/解绑/状态，未实现）
 
+## W1 接收切片（**已实现**：长轮询 worker + 游标/去重/私有 inbox + 只读可见）
+
+**边界**：只收不投——把微信**私聊文本**收下来、持久化、在 GUI 可见；**不注入任何 pi 会话**（注入是 [[#W2 准入]]，用户已批准但属下一片）。
+
+**新增**：`extensions/channel-wechat/{client,parser,store,worker,index}.ts`、`extensions/runtime-host/channel-supervisor.ts`、`extensions/_test_wechat_receive.ts`；**最小 hunk**：`extensions/runtime-host/server.ts`（只读端点 + receive 闸）、`wechat-bind.ts`、`gui/src/pages/ChannelsPage.tsx`；`extensions/index.ts` **零改动**。
+
+**开关**：`channels.wechat.receive.enabled`（**缺省 false**，D7 零行为变化：不 spawn、不开长轮询、不写 inbox；两个只读端点在 `receive.enabled=false` 时 403 `wechat-receive-disabled`）。
+
+**不变量（实现层）**：①顺序 = `getUpdates → parseBatch → 逐条 claim(去重先落盘) → putInbox/quarantine → 全部落盘后才 commitBatch(游标)`；②去重前置（重复 msgId 不重复落盘/计数）；③`auth`(401/403) → `auth_required` 停 poll（不风暴）；④空批也推进游标；⑤坏格式 → quarantine（可查，不静默丢）；⑥凭据/`context_token` 永不进日志/错误/argv/URL/GUI 响应；⑦只读端点零副作用；⑧不新增监听端口（worker 只发出站 HTTPS）；⑨daemon 停机收掉 worker（显式 kill + pid 文件识别 + 父死亡看门狗）。
+
+**计数语义（L4 收敛后钉死）**：`received` **只来自"是否真的新建 inbox 文件"**（`putInbox` 返回 `!existed`），**不得**由 `claim.materialized` 推断——`isMaterialized` 在读失败/坏 JSON/去重容量裁剪后会偏 false，据此计数会重复计。
+
+**验收**：`npx tsx extensions/_test_wechat_receive.ts` → 7 组断言全绿（R1 协议分支 / R2 崩溃重放 / R2b putInbox 故障重放 + 裁剪后不重复计数 / R3 游标顺序 / R4 秘密卫生 / R5 opt-in OFF 零行为 + receive 闸 403 / R6 停机回收），含 **180s 硬看门狗**（EB-004）。
+
+**已知残余（诚实清单，不得当成已解决）**：
+- **quarantine 重放会重复追加行/重复计 `quarantined`**：有 msgId 的在去重裁剪或行不可读时会重复；**无 msgId 的必然重复**。影响面 = 记录/统计膨胀，**不丢正常 inbox 消息**；**W2 处理附件类 quarantine 必须按 msgId 幂等**。
+- WAL 强事务（`batch.accepted` + commit marker 重放）**未做**——用"先落盘后提交游标"的顺序约束替代（不等价）。
+- 多 worker fence（`daemonEpoch`/`workerAttempt` 晚 ACK 拒绝）**未强制**；supervisor 维持**单 worker**（`existsSync → 原子写` 在多 worker 下有竞态，不得声称多 worker 安全）。
+- Windows **Job Object 整树回收**未做（用显式 kill + pid 文件 + 看门狗替代）。
+- 附件/媒体/解密/Artifact Plane、ReplySink/出站/typing/限流聚合（W3）未做。
+- 真网 7 项未测（见本页 Open Questions）。
+
 ## W2 准入：微信文本注入 master（决策 D15，**用户 2026-09-24 明确批准**）
 
 **允许**把微信**私聊文本**按「本人远程输入」注入当前 master owner 会话——**六个条件必须同时成立**（任一不成立即 fail-closed，不注入、只持久化 + Attention）：
