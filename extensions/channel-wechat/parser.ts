@@ -53,6 +53,35 @@ function str(v: unknown, max: number): string | null {
 	return v.length > max ? v.slice(0, max) : v;
 }
 
+/**
+ * 脱敏形状签名（真网适配用）：只输出**键名 + 类型**，**绝不输出任何值**（正文/token/URL 均不入）。
+ * 真机 `msgs[]` 条目形状未知（指南不可信）——未知结构 quarantine 时附上签名，便于一次性对齐真字段。
+ */
+function shapeSig(v: unknown, maxKeys = 12): string {
+	if (!isObj(v)) return Array.isArray(v) ? `array(${v.length})` : typeof v;
+	const parts: string[] = [];
+	for (const k of Object.keys(v).slice(0, maxKeys)) {
+		const val = (v as Record<string, unknown>)[k];
+		const t = val === null ? "null" : Array.isArray(val) ? `array(${val.length})` : typeof val;
+		parts.push(`${k.slice(0, 24)}:${t}`);
+	}
+	return `{${parts.join(",")}}`;
+}
+
+/** 宽容取 msgId：真机字段名未测，接受 id/msgId/msg_id/msg.id。 */
+function pickMsgId(entry: Record<string, unknown>): string | null {
+	for (const cand of [entry.id, entry.msgId, entry.msg_id]) {
+		if (typeof cand === "string" && cand.length > 0) return cand;
+	}
+	const m = entry.msg;
+	if (isObj(m)) {
+		for (const cand of [m.id, m.msgId, m.msg_id]) {
+			if (typeof cand === "string" && cand.length > 0) return cand;
+		}
+	}
+	return null;
+}
+
 /** 剥离 Unicode 控制符（Cc，除 \t\n\r——保留换行语义）+ 截断标注。 */
 export function sanitizeInboundText(raw: string): string {
 	// eslint-disable-next-line no-control-regex
@@ -76,32 +105,49 @@ const NON_TEXT_TYPES = new Set([
 export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchResult {
 	const items: InboundText[] = [];
 	const quarantined: QuarantineEntry[] = [];
+	/** L4 MF1：批内已见 msgId——重复必须 quarantine（fail-visible），不得让 worker 静默去重吞消息。 */
+	const seenMsgIds = new Set<string>();
 	for (const entry of rawItems) {
 		if (!isObj(entry)) {
 			quarantined.push({ msgId: null, reason: "条目不是对象", at: receivedAt });
 			continue;
 		}
-		const msgId = typeof entry.id === "string" && entry.id.length > 0 ? entry.id : null;
+		const msgId = pickMsgId(entry);
 		if (msgId === null) {
-			quarantined.push({ msgId: null, reason: "缺消息 id（不伪造 id，不推进重复处理）", at: receivedAt });
+			quarantined.push({ msgId: null, reason: `缺消息 id（不伪造 id，不推进重复处理）；shape=${shapeSig(entry)}`, at: receivedAt });
 			continue;
 		}
-		const msg = isObj(entry.msg) ? entry.msg : null;
-		if (msg === null) {
-			quarantined.push({ msgId, reason: "缺 msg 结构", at: receivedAt });
+		// L4 MF3：msgId 未设界会造成记录膨胀（实测 2MB id → 2MB dedupe 行 + 等大 inbox）。与 from.id 同口径限长。
+		if (msgId.length > 128) {
+			quarantined.push({ msgId: null, reason: `msgId 超长（len=${msgId.length} > 128）；不记原值；shape=${shapeSig(entry)}`, at: receivedAt });
 			continue;
 		}
-		// context_token 故意不读（秘密，W1 无出站面；读到也不落地）
+		// L4 MF1：批内 msgId 重复必须 fail-visible（否则第二条被 worker 去重静默吞掉、无痕迹）。
+		if (seenMsgIds.has(msgId)) {
+			quarantined.push({ msgId, reason: `批内 msgId 重复（entry.id 疑非消息级唯一）；shape=${shapeSig(entry)}`, at: receivedAt });
+			continue;
+		}
+		seenMsgIds.add(msgId);
+		// 真机条目可能**没有** msg 包装（指南写有）——无包装时把条目自身当消息，宽容处理。
+		const hasWrapper = isObj(entry.msg);
+		const msg = hasWrapper ? (entry.msg as Record<string, unknown>) : entry;
 		const from = isObj(msg.from) ? msg.from : {};
-		const fromId = str(from.id, 128);
-		const fromNickname = str(from.nickname, 128);
+		const fromId = str(from.id, 128) ?? str(from.openid, 128) ?? str(from.user_id, 128);
+		const fromNickname = str(from.nickname, 128) ?? str(from.nick_name, 128);
 		if (fromId === null) {
-			quarantined.push({ msgId, reason: "缺发送者 from.id", at: receivedAt });
+			quarantined.push({ msgId, reason: `缺发送者 from.id；shape=${shapeSig(entry)}`, at: receivedAt });
 			continue;
 		}
-		const inner = Array.isArray(msg.item_list) ? msg.item_list : [];
+		// 内容项：真机未测；接受 item_list / items / content_list。
+		const inner = Array.isArray(msg.item_list)
+			? msg.item_list
+			: Array.isArray(msg.items)
+				? msg.items
+				: Array.isArray(msg.content_list)
+					? msg.content_list
+					: [];
 		if (inner.length === 0) {
-			quarantined.push({ msgId, reason: "msg.item_list 为空（无内容项）", at: receivedAt });
+			quarantined.push({ msgId, reason: `无内容项（item_list/items/content_list 均无）；shape=${shapeSig(entry)}`, at: receivedAt });
 			continue;
 		}
 		// 内层内容项：取**第一条可识别文本**（v1：一条消息一条文本；多内容项其余 quarantine 记录）
@@ -113,7 +159,14 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 			}
 			const typeRaw = typeof c.type === "string" ? c.type : typeof c.content_type === "string" ? c.content_type : "";
 			const type = typeRaw.trim().toLowerCase();
-			const body = typeof c.text === "string" ? c.text : typeof c.content === "string" ? c.content : null;
+			const textLike = typeof c.text === "string" ? c.text : null;
+			const contentLike = typeof c.content === "string" ? c.content : null;
+			// L4 MF2：**无 msg 包装**（真机未知路径）时收紧——只认 `text` 字段，或显式文本类 type；
+			// 否则未分类的 `content` 字符串会把控制帧/回执（如 {content:"delivered ok"}）误落 inbox。
+			// 指南形状（有 msg 包装）保持原行为，零回归。
+			const body = hasWrapper
+				? (textLike ?? contentLike)
+				: (textLike ?? (type === "text" || type === "msg_text" ? contentLike : null));
 			if (body !== null && body.length > 0 && !NON_TEXT_TYPES.has(type)) {
 				if (!textTaken) {
 					items.push({ msgId, fromId, fromNickname, text: sanitizeInboundText(body), receivedAt });
@@ -134,7 +187,7 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 				});
 				continue;
 			}
-			quarantined.push({ msgId, reason: "未知消息结构（无文本字段、无类型名）", at: receivedAt });
+			quarantined.push({ msgId, reason: `未知消息结构（无文本字段、无类型名）；shape=${shapeSig(c)}`, at: receivedAt });
 		}
 	}
 	return { items, quarantined };

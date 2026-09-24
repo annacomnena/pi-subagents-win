@@ -8,8 +8,9 @@
  *     Authorization: Bearer <bot_token>、X-WECHAT-UIN: base64(String(randomUint32))
  *     （1..4294967295，**不得为 0**；每次请求随机生成）
  *   - body：{"base_info":{"channel_version":"2.0.0"},"get_updates_buf":"<上次 buf | 首次空串>"}
- *   - 响应：{"ret":0,"buf":"<next cursor>","item_list":[...]}；长轮询 60~90s → 客户端
- *     超时留余量（95s 硬上限缺省 + 外部 AbortController）。
+ *   - 响应（**真机实测 2026-09-24**）：`{"msgs":[],"sync_buf":"…","get_updates_buf":"…"}`
+ *     —— **没有** 指南写的 `ret`/`buf`/`item_list`；长轮询实测 **约 18s** 返回（非指南的 60~90s）。
+ *     本客户端**两种形状都接受**（真机优先），字段取先命中者；游标只用 `get_updates_buf`/`sync_buf`/`buf`。
  *
  * 错误分类（W1 规格 §2）：auth(401/403——「确认失效码」真网未测，v1 只认 HTTP 401/403) /
  * transient(5xx/超时/网络) / rate_limited(429，honor Retry-After) / protocol(坏 JSON/ret≠0/缺 buf)。
@@ -143,11 +144,21 @@ export async function getUpdates(req: GetUpdatesReq, fetchImpl: WechatFetch = gl
 			// 「确认失效码」真网未测（W1 诚实延期）：v1 ret≠0 一律 protocol（退避重试），不臆测 auth 码
 			throw new WechatIlinkError("protocol", `getupdates 业务失败 ret=${ret}${typeof p.errmsg === "string" && p.errmsg ? `（${p.errmsg.slice(0, 120)}）` : ""}`, { ret });
 		}
-		if (typeof p.buf !== "string" || p.buf.length === 0) {
-			throw new WechatIlinkError("protocol", "getupdates 响应缺 buf 游标（不推进游标）");
+		// 游标：真机 = get_updates_buf（长）/ sync_buf（短）；指南形状 = buf。取先命中者，全无 → protocol。
+		const cursor =
+			typeof p.get_updates_buf === "string" && p.get_updates_buf.length > 0
+				? p.get_updates_buf
+				: typeof p.sync_buf === "string" && p.sync_buf.length > 0
+					? p.sync_buf
+					: typeof p.buf === "string" && p.buf.length > 0
+						? p.buf
+						: null;
+		if (cursor === null) {
+			throw new WechatIlinkError("protocol", "getupdates 响应缺游标（get_updates_buf/sync_buf/buf 均无；不推进游标）");
 		}
-		const items = Array.isArray(p.item_list) ? p.item_list : [];
-		return { buf: p.buf, items };
+		// 消息列表：真机 = msgs；指南形状 = item_list。
+		const items = Array.isArray(p.msgs) ? p.msgs : Array.isArray(p.item_list) ? p.item_list : [];
+		return { buf: cursor, items };
 	} catch (e) {
 		if (e instanceof WechatIlinkError) throw e;
 		// 外部取消（worker 停机）→ 透传 abort 语义；其余（含超时 abort、网络错）按分类面归一

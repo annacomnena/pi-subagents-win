@@ -99,6 +99,23 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 远程消息到达而用户正在 master 交互时：缺省**直接插入**（远程通道本分），TUI 给醒目提示；「排队到本轮结束」留作后续可选开关。
 
+## 真机协议实测（2026-09-24，**指南不可信**）
+
+**结论：指南 §3 描述的响应形状与真机不符，实现必须按真机校准。**
+
+| 项 | 指南写的 | **真机实测** |
+|---|---|---|
+| 响应字段 | `{ret, buf, item_list}` | **`{msgs, sync_buf, get_updates_buf}`**（**无** `ret`/`buf`/`item_list`） |
+| 游标字段 | `buf` | **`get_updates_buf`**（长，96 字符 base64）+ `sync_buf`（短，12 字符） |
+| 消息列表 | `item_list` | **`msgs`** |
+| 长轮询时长 | 60~90s | **约 18s** 返回（差 3~5 倍） |
+| 请求头 | `AuthorizationType` + `Authorization: Bearer` + `X-WECHAT-UIN` | ✅ 均被接受（HTTP 200） |
+| 空批 | 未说明 | `msgs:[]` + **仍带新游标**（可推进，W1 空批推进语义成立） |
+
+**影响与修法**：W1 原按指南实现 ⇒ 游标取不到（`protocolErrors` 累积、游标永不推进）⇒ **一条消息也收不到**。修法 = `client.ts` 接受真机字段（游标 `get_updates_buf`→`sync_buf`→`buf`；列表 `msgs`→`item_list`），**两种形状都兼容**；`parser.ts` 宽容取 msgId（`id`/`msgId`/`msg_id`/`msg.id`）、无 `msg` 包装时按条目自身解析、内容项接受 `item_list`/`items`/`content_list`，并新增**脱敏形状签名**（未知结构 quarantine 时记 `shape={key:type}`，**只记键名与类型**）——用于一次性对齐真机字段。
+
+**教训（可复用）**：第三方协议文档**必须用真机响应校准**后才能作为实现依据；"真网未测"清单里的项要尽早打真机，否则整个通道可能只是"看起来实现了"。
+
 ## W2 实现切片（**已落地** `168fed1`：微信私聊文本 → 当前 master owner）
 
 **边界**：只做「判定 + 注入通路」；**界面开关属 W2b**（D17：开关必须界面可达）。
@@ -135,4 +152,5 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 ## Open Questions
 
-- 七项待真网测量：①bot_token 何时失效 ②context_token 过期行为 ③同 buf 是否重放 ④空批是否推进 buf ⑤固定 client_id 重发是否去重 ⑥同 token 并发 poll+send 是否限流 ⑦附件 URL 主机/大小限制。测完回填本页。
+- 真网待测（7 项，已测 1 项）：①bot_token 何时失效（**未测**）②context_token 过期行为（**未测**；真机消息形状未确认，该字段是否存在未知）③同 buf 是否重放（**未测**）④空批是否推进 buf —— **已测：会带新游标，可推进**（见上节）⑤固定 client_id 重发是否去重（**未测**）⑥同 token 并发 poll+send 是否限流（**未测**；注意同一 bot **只能一个长轮询**，多消费者会互相抢消息）⑦附件 URL 主机/大小限制（**未测**）。
+- **真机消息条目形状仍未确认**（`msgs[]` 内每条结构）——已加脱敏形状签名机制：收到首条真实消息后从 quarantine 的 `shape=` 或 inbox 记录对齐，再回填本页。
