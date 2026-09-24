@@ -1,79 +1,57 @@
 /**
- * hotspot/log — 效果记录（v2 §10 首版：仅必要指标，不记会话正文）
+ * hotspot/log — 效果日志（v4 §15 指标；计划 §A）
  *
- * 事件写入 ~/.pi/agent/hotspot-logs/<repo-key>.jsonl：kind=inject|tool|used，
- * 只含主题、版本、动作、结果、时间。试点对照分析用，供人工抽查。
- * used：独立外部工具调用命中热点条目路径/符号时记一条（held-out 门控见 usage.ts）；
- * used 只进热度不进存储（零存储零腐烂）。
+ * <agentDir>/hotspot/<wsid>/log.jsonl：只记 `kind=inject` 门控决策（含拒绝原因）
+ * 与 `kind=lookup`（视图/limit）。不记会话正文；失败静默（日志不得阻断主流程）。
  */
 
-import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname } from "node:path";
+import { nowIso } from "./types.ts";
+
+export type HotspotLogKind = "inject" | "lookup";
 
 export interface HotspotLogEvent {
 	at: string;
-	kind: "inject" | "tool" | "used";
-	topics?: string[];
-	topic?: string | null;
-	action?: string;
-	revision?: number;
+	kind: HotspotLogKind;
+	/** inject：是否注入 / lookup：恒 true */
 	ok?: boolean;
+	gate?: "task" | "path";
+	files?: number;
+	/** 拒绝原因 / lookup 回退标注 */
 	reason?: string;
+	view?: string;
+	limit?: number;
 }
 
-function logDir(): string {
-	return join(homedir(), ".pi", "agent", "hotspot-logs");
-}
-
-function repoKey(root: string): string {
-	return createHash("sha1").update(root.replace(/[\\/]+/g, "/")).digest("hex").slice(0, 12);
-}
-
-/** 追加事件；失败静默（日志不得阻断主流程）。 */
-export function logEvent(root: string, event: Omit<HotspotLogEvent, "at">): void {
+/** 追加事件；失败静默。 */
+export function logHotspotEvent(logPath: string, event: Omit<HotspotLogEvent, "at">): void {
 	try {
-		const dir = logDir();
-		mkdirSync(dir, { recursive: true });
-		const line: HotspotLogEvent = { at: new Date().toISOString(), ...event };
-		writeFileSync(join(dir, `${repoKey(root)}.jsonl`), `${JSON.stringify(line)}\n`, { flag: "a" });
+		mkdirSync(dirname(logPath), { recursive: true });
+		writeFileSync(logPath, `${JSON.stringify({ at: nowIso(), ...event })}\n`, { flag: "a" });
 	} catch {
 		/* 静默 */
 	}
 }
 
-export function logPath(root: string): string {
-	return join(logDir(), `${repoKey(root)}.jsonl`);
-}
-
-const DAY_MS = 86_400_000;
-
-/** 近 14 天 `kind=used` 计数：topicId → 次数（只含 >0 的主题）。
- *  读失败/无文件 → 空 Map（使用率缺信号，不阻断热度计算）。 */
-export function usedCount14d(root: string, now = Date.now()): Map<string, number> {
-	const out = new Map<string, number>();
-	const p = logPath(root);
+/** 读日志（坏行跳过）；测试/审计用。 */
+export function readHotspotLog(logPath: string): HotspotLogEvent[] {
 	let raw: string;
 	try {
-		raw = readFileSync(p, "utf8");
+		raw = readFileSync(logPath, "utf8");
 	} catch {
-		return out;
+		return [];
 	}
-	const cutoff = now - 14 * DAY_MS;
-	for (const line of raw.split(/\r?\n/)) {
+	const out: HotspotLogEvent[] = [];
+	for (const line of raw.split("\n")) {
 		const t = line.trim();
 		if (!t) continue;
-		let ev: HotspotLogEvent;
 		try {
-			ev = JSON.parse(t) as HotspotLogEvent;
+			const ev = JSON.parse(t) as HotspotLogEvent;
+			if (ev && (ev.kind === "inject" || ev.kind === "lookup")) out.push(ev);
 		} catch {
-			continue; // 坏行跳过（日志只增不改，损坏行不影响其余计数）
+			continue;
 		}
-		if (ev.kind !== "used" || typeof ev.topic !== "string" || !ev.topic) continue;
-		const at = Date.parse(ev.at);
-		if (!Number.isFinite(at) || at < cutoff) continue;
-		out.set(ev.topic, (out.get(ev.topic) ?? 0) + 1);
 	}
 	return out;
 }

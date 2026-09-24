@@ -1,50 +1,25 @@
 /**
- * hotspot/store — 热点文件的读写、严格解析、乐观锁与跨进程安全写入
+ * hotspot/store — v4 存储层：分片追加写、snapshot 原子写、TTL 清理、坏行容忍读
  *
- * v2 §6.3 写入六步：获取跨进程锁 → 重读磁盘 → 检查 expected_revision 与指纹 →
- * 验证候选内容（调用方）→ 临时文件安全替换 → 返回新版本。
- * 工具外编辑通过指纹发现；文件无法解析时停止自动写入、保留用户内容。
+ * plans/0924_hotspot_v4_impl_plan.md §B.3/§C.2/§C.5。目录布局：
+ *   <agentDir = PI_CODING_AGENT_DIR ?? ~/.pi/agent>/hotspot/<wsid>/
+ *     meta.json          # {schema, workspaceRoot, createdAt} 首次建分片时 best-effort 写
+ *     events/<pid>-<startTs>-<rand4>.jsonl   # 每进程独占追加（无锁；单文件单写者）
+ *     snapshot.json      # 派生缓存（tmp+rename 原子写；唯一写者=主会话）
+ *     log.jsonl          # 效果日志（log.ts）
+ * - wsid = sha1(normalizeExactPath(findRepoRoot(cwd))).slice(0,16)：worktree 各自 .git → 各自 wsid
+ * - snapshot 的 tmp+rename 模式沿用 v2 store.ts commitHotspot；单写者无需跨进程锁（拍板 #4）
+ * - 不读写 Wiki/_hotspot.md（v2 已退役，拍板 #9）
  */
 
-import { createHash } from "node:crypto";
-import {
-	closeSync,
-	existsSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
-import {
-	ENTRY_LIMITS,
-	FIELD_LABELS,
-	HOTSPOT_FILENAME,
-	HOTSPOT_TRASH_FILENAME,
-	MULTI_FIELD_LABELS,
-	SCHEMA_VERSION,
-	type HotspotEntry,
-	type HotspotFile,
-	type ParseResult,
-	type Rel,
-	type SymbolRef,
-	type WikiRef,
-} from "./types.ts";
+import { normalizeExactPath } from "../runtime/recent-scopes.ts";
+import { HARD_TTL_MS, SCHEMA_VERSION, type HotEvent, type HotspotSnapshot } from "./types.ts";
 
-export interface ReadResult {
-	/** 文件不存在 → exists=false（file/parseError 均为空） */
-	exists: boolean;
-	file: HotspotFile | null;
-	/** sha1(raw)；exists=false 时为 null */
-	fingerprint: string | null;
-	/** 解析失败原因（exists=true 且 parse 失败时） */
-	parseError: string | null;
-}
-
-/** 仓库根：向上找 .git（目录或文件，worktree 的 .git 是文件）；找不到用 cwd（非 Git 项目的显式热点根）。 */
+/** 仓库根：向上找 .git（目录或文件，worktree 的 .git 是文件）；找不到用 cwd。 */
 export function findRepoRoot(cwd: string): string {
 	const parts = cwd.split(/[\\/]/);
 	for (let i = parts.length; i > 0; i--) {
@@ -54,316 +29,215 @@ export function findRepoRoot(cwd: string): string {
 	return cwd;
 }
 
-export function hotspotPath(root: string): string {
-	return join(root, "Wiki", HOTSPOT_FILENAME);
+/** agentDir：存储走 PI_CODING_AGENT_DIR ?? ~/.pi/agent（身份读 runtime state 另走 PI_RUNTIME_DIR，见 collect.ts）。 */
+export function defaultAgentDir(): string {
+	const override = process.env.PI_CODING_AGENT_DIR;
+	if (override && override.trim()) return override.trim();
+	return join(homedir(), ".pi", "agent");
 }
 
-export function trashPath(root: string): string {
-	return join(root, "Wiki", HOTSPOT_TRASH_FILENAME);
+/** 路径归一为仓库相对（正斜杠）；root 外绝对路径 / 空 → null。（吸收自 v2 usage.ts） */
+export function toRepoRelative(p: string, root: string): string | null {
+	const norm = p.replace(/\\/g, "/").trim();
+	if (!norm) return null;
+	const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
+	let rel: string | null = null;
+	if (norm.toLowerCase().startsWith(`${rootNorm.toLowerCase()}/`)) rel = norm.slice(rootNorm.length + 1);
+	else if (!norm.startsWith("/") && !/^[A-Za-z]:/.test(norm)) rel = norm; // 相对 token → 视作仓库相对（调用方存在性过滤）
+	if (!rel) return null;
+	rel = rel.replace(/^\.\//, "");
+	return rel || null;
 }
 
-export function fingerprintOf(raw: string): string {
-	return createHash("sha1").update(raw, "utf8").digest("hex");
+export interface WsPaths {
+	wsDir: string;
+	eventsDir: string;
+	snapshotPath: string;
+	logPath: string;
+	metaPath: string;
 }
 
-export function readHotspot(path: string): ReadResult {
-	if (!existsSync(path)) return { exists: false, file: null, fingerprint: null, parseError: null };
-	let raw: string;
-	try {
-		raw = readFileSync(path, "utf8");
-	} catch (e) {
-		return { exists: true, file: null, fingerprint: null, parseError: `读取失败: ${String(e)}` };
-	}
-	const parsed = parseHotspot(raw);
+/** wsid = sha1(normalizeExactPath(root)).slice(0,16)。 */
+export function workspaceIdOf(root: string): string {
+	return createHash("sha1").update(normalizeExactPath(root)).digest("hex").slice(0, 16);
+}
+
+export function wsPaths(agentDir: string, wsid: string): WsPaths {
+	const wsDir = join(agentDir, "hotspot", wsid);
 	return {
-		exists: true,
-		file: parsed.ok ? parsed.file : null,
-		fingerprint: fingerprintOf(raw),
-		parseError: parsed.ok ? null : parsed.error,
+		wsDir,
+		eventsDir: join(wsDir, "events"),
+		snapshotPath: join(wsDir, "snapshot.json"),
+		logPath: join(wsDir, "log.jsonl"),
+		metaPath: join(wsDir, "meta.json"),
 	};
 }
 
-// ── 解析（白名单校验 + frontmatter 未知字段容忍保留：已知字段仍严格校验；
-// 未知 frontmatter 字段原样收入 file.frontmatterExtra，写回逐字保留。
-// 条目未知字段/重复单值字段/坏时间戳仍整体失败；YAML 语法错误、schema_version
-// 不支持、revision 非法仍拒绝——fail-closed 保护语义不变）──────────────
-
-const WIKI_RE = /^(.+?)(?:\s+→\s+(.+))?$/u; // path 或 path → section（懒惰匹配：第一个 " → " 分隔）
-
-/** 手写边行格式：`topic_id → kind（note?）`——topic_id 严格（TOPIC_ID 字符集），
- *  → 分隔，末尾全角括号可选为 note。 */
-const REL_RE = /^([a-z0-9][a-z0-9-]{0,63})\s+→\s+(.+?)(?:\s*（([^）]*)）)?\s*$/u;
-
-export function parseHotspot(raw: string): ParseResult {
-	const lines = raw.split(/\r?\n/);
-	let i = 0;
-	let schemaVersion = 0;
-	let revision = -1;
-	const frontmatterExtra: Array<{ key: string; value: string }> = [];
-
-	// frontmatter（可选前导空行；--- 开始）
-	while (i < lines.length && lines[i]!.trim() === "") i++;
-	if (i < lines.length && lines[i]!.trim() === "---") {
-		i++;
-		while (i < lines.length && lines[i]!.trim() !== "---") {
-			const m = /^([A-Za-z_]+):\s*(.*)$/.exec(lines[i]!.trim());
-			if (!m) return { ok: false, error: `frontmatter 行无法解析: ${lines[i]}` };
-			if (m[1] === "schema_version") schemaVersion = Number(m[2]);
-			else if (m[1] === "revision") revision = Number(m[2]);
-			else frontmatterExtra.push({ key: m[1], value: m[2] }); // 未知字段容忍：原样保留
-			i++;
+/** 首次建分片时 best-effort 写 meta.json（幂等：已存在即跳过；失败静默）。 */
+export function ensureWorkspace(agentDir: string, wsid: string, workspaceRoot: string): void {
+	try {
+		const p = wsPaths(agentDir, wsid);
+		mkdirSync(p.eventsDir, { recursive: true });
+		if (!existsSync(p.metaPath)) {
+			writeFileSync(p.metaPath, `${JSON.stringify({ schema: SCHEMA_VERSION, workspaceRoot, createdAt: new Date().toISOString() }, null, "\t")}\n`);
 		}
-		if (i >= lines.length) return { ok: false, error: "frontmatter 未闭合（缺 ---）" };
-		i++;
+	} catch {
+		/* 静默：存储不可用绝不打断主流程 */
 	}
-	if (schemaVersion !== SCHEMA_VERSION) return { ok: false, error: `schema_version ${schemaVersion} != ${SCHEMA_VERSION}` };
-	if (!Number.isInteger(revision) || revision < 0) return { ok: false, error: `revision 非法: ${revision}` };
+}
 
-	const entries: HotspotEntry[] = [];
-	let cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[]; rel?: Rel[] } | null = null;
-	const seenTopics = new Set<string>();
-	const fail = (msg: string): ParseResult => ({ ok: false, error: `${msg}（行 ${i + 1}）` });
+const PROCESS_START_TS = Date.now();
 
-	for (; i < lines.length; i++) {
-		const line = lines[i]!;
-		const trimmed = line.trim();
-		if (trimmed === "") continue;
-		const topic = /^##\s+(\S+)\s*$/.exec(trimmed);
-		if (topic) {
-			if (cur && cur.topicId) {
-				const done = finalizeEntry(cur);
-				if (!done.ok) return done;
-				entries.push(done.entry);
-			}
-			if (seenTopics.has(topic[1]!)) return { ok: false, error: `主题重复: ${topic[1]}` };
-			seenTopics.add(topic[1]!);
-			cur = { topicId: topic[1]!, wiki: [], symbols: [], evidence: [], rel: [] };
+/** 分片文件名：每进程独占（pid+启动时间+随机后缀），交错追加互不覆盖。 */
+export function newShardName(): string {
+	return `${process.pid}-${PROCESS_START_TS}-${randomBytes(2).toString("hex")}.jsonl`;
+}
+
+let appendedCount = 0;
+
+/** 本进程自加载以来成功追加的事件条数（snapshot 写入条件之一：本会话追过分片）。 */
+export function appendedSinceLoad(): number {
+	return appendedCount;
+}
+
+/** 非法事件路径字符：真实尖括号（可在注入块伪造闭合标签）与控制字符（\u0000-\u001f 含换行/制表、\u007f，可伪造行）。 */
+const ILLEGAL_EVENT_PATH_RE = /[<>\u0000-\u001f\u007f]/;
+
+/**
+ * 事件路径合法性（写入侧拒绝，L4 must-fix 1a）：非法字符静默丢弃，与其他采集失败同口径；
+ * 同时保持落盘 path 必须已是 repo 相对形态（拒绝绝对路径/盘符/`..` 越界段/空）。
+ */
+export function isLegalEventPath(path: unknown): path is string {
+	return (
+		typeof path === "string" &&
+		path !== "" &&
+		!ILLEGAL_EVENT_PATH_RE.test(path) &&
+		!path.startsWith("/") &&
+		!/^[A-Za-z]:/.test(path) &&
+		!path.split("/").includes("..")
+	);
+}
+
+/** 追加一条事件（单文件单写者，无锁）；非法路径（isLegalEventPath）与 IO 失败同口径：静默丢弃、返回 false。 */
+export function appendEvent(eventsDir: string, shard: string, ev: HotEvent): boolean {
+	if (!isLegalEventPath(ev?.path)) return false; // 注入块字段写入侧拒绝（不计数、不落盘）
+	try {
+		writeFileSync(join(eventsDir, shard), `${JSON.stringify(ev)}\n`, { flag: "a" });
+		appendedCount++;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** 读全部分片：坏行/半行（崩溃残骸）跳过、v!==4 行跳过、坏时间戳跳过。 */
+export function readEvents(eventsDir: string): HotEvent[] {
+	let files: string[];
+	try {
+		files = readdirSync(eventsDir);
+	} catch {
+		return [];
+	}
+	const out: HotEvent[] = [];
+	for (const f of files) {
+		if (!f.endsWith(".jsonl")) continue;
+		let raw: string;
+		try {
+			raw = readFileSync(join(eventsDir, f), "utf8");
+		} catch {
 			continue;
 		}
-		const field = /^-\s+([^：]+)：(.*)$/u.exec(trimmed);
-		if (!field || !cur) return fail("无法识别的行（既非 '## topic' 也非 '- 键：值'）");
-		const [, label, value] = field as unknown as [string, string, string];
-		const v = value.trim();
-		switch (label) {
-			case FIELD_LABELS.title:
-				if (cur.title) return fail("标题 重复");
-				cur.title = v;
-				break;
-			case FIELD_LABELS.scope:
-				if (cur.scope) return fail("适用范围 重复");
-				cur.scope = v;
-				break;
-			case FIELD_LABELS.updatedAt:
-				if (cur.updatedAt) return fail("内容更新 重复");
-				if (Number.isNaN(Date.parse(v))) return fail(`内容更新 非法时间: ${v}`);
-				cur.updatedAt = v;
-				break;
-			case FIELD_LABELS.verifiedAt:
-				if (cur.verifiedAt) return fail("引用验证 重复");
-				if (Number.isNaN(Date.parse(v))) return fail(`引用验证 非法时间: ${v}`);
-				cur.verifiedAt = v;
-				break;
-			case MULTI_FIELD_LABELS.wiki: {
-				const m = WIKI_RE.exec(v);
-				if (!m) return fail(`Wiki 引用无法解析: ${v}`);
-				cur.wiki!.push({ path: m[1]!, ...(m[2] ? { section: m[2] } : {}) });
-				break;
+		for (const line of raw.split("\n")) {
+			const t = line.trim();
+			if (!t) continue;
+			try {
+				const ev = JSON.parse(t) as HotEvent;
+				if (
+					ev &&
+					ev.v === 4 &&
+					(ev.kind === "write" || ev.kind === "read" || ev.kind === "test") &&
+					typeof ev.at === "string" &&
+					Number.isFinite(Date.parse(ev.at)) &&
+					typeof ev.path === "string" &&
+					ev.path
+				) {
+					out.push(ev);
+				}
+			} catch {
+				continue;
 			}
-			case MULTI_FIELD_LABELS.evidence: {
-				const m = WIKI_RE.exec(v);
-				if (!m) return fail(`证据引用无法解析: ${v}`);
-				cur.evidence!.push({ path: m[1]!, ...(m[2] ? { section: m[2] } : {}) });
-				break;
-			}
-			case MULTI_FIELD_LABELS.symbols: {
-				const idx = v.lastIndexOf("::");
-				if (idx <= 0) return fail(`入口格式应为 path::Symbol: ${v}`);
-				cur.symbols!.push({ path: v.slice(0, idx), name: v.slice(idx + 2) });
-				break;
-			}
-			case MULTI_FIELD_LABELS.rel: {
-				const m = REL_RE.exec(v);
-				if (!m) return fail(`关联格式应为 topic_id → kind（note?）: ${v}`);
-				cur.rel!.push({ topic_id: m[1]!, kind: m[2]!, ...(m[3] !== undefined ? { note: m[3] } : {}) });
-				break;
-			}
-			default:
-				return fail(`未知字段: ${label}`);
 		}
 	}
-	if (cur && cur.topicId) {
-		const done = finalizeEntry(cur);
-		if (!done.ok) return done;
-		entries.push(done.entry);
-	}
-	return { ok: true, file: { schemaVersion, revision, entries, frontmatterExtra } };
+	return out;
 }
 
-function finalizeEntry(
-	cur: Partial<HotspotEntry> & { wiki?: WikiRef[]; symbols?: SymbolRef[]; evidence?: WikiRef[]; rel?: Rel[] },
-): { ok: true; entry: HotspotEntry } | { ok: false; error: string } {
-	const missing: string[] = [];
-	if (!cur.title) missing.push(FIELD_LABELS.title);
-	if (!cur.updatedAt) missing.push(FIELD_LABELS.updatedAt);
-	if (!cur.verifiedAt) missing.push(FIELD_LABELS.verifiedAt);
-	if (missing.length) return { ok: false, error: `主题 ${cur.topicId} 缺少必填字段: ${missing.join("、")}` };
-	return {
-		ok: true,
-		entry: {
-			topicId: cur.topicId!,
-			title: cur.title!,
-			scope: cur.scope,
-			wiki: cur.wiki ?? [],
-			symbols: cur.symbols ?? [],
-			evidence: cur.evidence ?? [],
-			updatedAt: cur.updatedAt!,
-			verifiedAt: cur.verifiedAt!,
-			rel: cur.rel ?? [],
-		},
-	};
-}
-
-// ── 序列化（与解析对称；工具生成的唯一合法格式）──────────────────────────
-
-export function serializeHotspot(file: HotspotFile): string {
-	// 未知字段逐字保留：按解析时顺序写在已知字段之前（顺序稳定，不丢弃外部工具加的 frontmatter）
-	const extra = (file.frontmatterExtra ?? []).map((f) => `${f.key}: ${f.value}`);
-	const out: string[] = ["---", ...extra, `schema_version: ${file.schemaVersion}`, `revision: ${file.revision}`, "---", ""];
-	for (const e of file.entries) {
-		out.push(`## ${e.topicId}`, "", `- ${FIELD_LABELS.title}：${e.title}`);
-		if (e.scope) out.push(`- ${FIELD_LABELS.scope}：${e.scope}`);
-		for (const w of e.wiki) out.push(`- ${MULTI_FIELD_LABELS.wiki}：${w.path}${w.section ? ` → ${w.section}` : ""}`);
-		for (const s of e.symbols) out.push(`- ${MULTI_FIELD_LABELS.symbols}：${s.path}::${s.name}`);
-		for (const ev of e.evidence) out.push(`- ${MULTI_FIELD_LABELS.evidence}：${ev.path}${ev.section ? ` → ${ev.section}` : ""}`);
-		for (const r of e.rel ?? []) out.push(`- ${MULTI_FIELD_LABELS.rel}：${r.topic_id} → ${r.kind}${r.note ? `（${r.note}）` : ""}`);
-		out.push(`- ${FIELD_LABELS.updatedAt}：${e.updatedAt}`, `- ${FIELD_LABELS.verifiedAt}：${e.verifiedAt}`, "");
-	}
-	return out.join("\n") + "\n";
-}
-
-// ── 跨进程锁 + 安全提交 ─────────────────────────────────────────────
-
-const LOCK_STALE_MS = 30_000;
-const LOCK_RETRIES = 40;
-const LOCK_RETRY_DELAY_MS = 50;
-
-function tryAcquireLock(lockPath: string): boolean {
-	const now = Date.now();
+/**
+ * snapshot tmp+rename 原子写（单写者=主会话，无跨进程锁；失败清理 tmp）。
+ * tmp 名 = pid + 随机后缀：同进程同刻并发也不会互写同一 tmp（L4 残余修复）。
+ */
+export function writeSnapshotAtomic(snapshotPath: string, snapshot: HotspotSnapshot): boolean {
+	const tmp = `${snapshotPath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
 	try {
-		const fd = openSync(lockPath, "wx");
-		writeFileSync(fd, `${process.pid}\n${now}\n`, "utf8");
-		closeSync(fd);
+		mkdirSync(dirname(snapshotPath), { recursive: true });
+		writeFileSync(tmp, `${JSON.stringify(snapshot, null, "\t")}\n`);
+		renameSync(tmp, snapshotPath);
 		return true;
-	} catch (e: unknown) {
-		const code = (e as { code?: string }).code;
-		if (code !== "EEXIST") return false; // 权限等错误：视为拿不到锁
-		// 陈旧锁：写入时间超过 LOCK_STALE_MS → 抢占
+	} catch {
 		try {
-			const raw = readFileSync(lockPath, "utf8").trim().split("\n");
-			const ts = Number(raw[1]);
-			if (Number.isFinite(ts) && now - ts > LOCK_STALE_MS) {
-				unlinkSync(lockPath);
-				return tryAcquireLock(lockPath);
-			}
+			if (existsSync(tmp)) rmSync(tmp);
 		} catch {
-			/* 读失败继续重试 */
+			/* ignore */
 		}
 		return false;
 	}
 }
 
-export async function withHotspotLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-	const lockPath = `${path}.lock`;
+/** 容忍读 snapshot；缺失/坏 JSON → null。 */
+export function readSnapshot(snapshotPath: string): HotspotSnapshot | null {
 	try {
-		mkdirSync(dirname(path), { recursive: true }); // 锁文件所在目录可能尚不存在（首次写入）
-	} catch {
-		/* 目录创建失败会在拿锁时暴露 */
-	}
-	let acquired = false;
-	for (let i = 0; i < LOCK_RETRIES && !acquired; i++) {
-		acquired = tryAcquireLock(lockPath);
-		if (!acquired) await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
-	}
-	if (!acquired) throw new Error("热点文件写入锁获取超时（另一进程持有且未释放）");
-	try {
-		return await fn();
-	} finally {
-		try {
-			unlinkSync(lockPath);
-		} catch {
-			/* 已被抢占时忽略 */
-		}
-	}
-}
-
-export interface CommitInput {
-	/** 乐观锁：调用者读到的 revision；新建文件传 0 */
-	expectedRevision: number;
-	/** 指纹校验（与 expectedRevision 二选一必过）。调用者读到的指纹；新建文件传 null */
-	expectedFingerprint: string | null;
-	/** 在锁内对最新文件做变更；返回 null 表示放弃（如相同内容不写入） */
-	mutate: (latest: HotspotFile | null) => { next: HotspotFile; skipped?: boolean } | null;
-}
-
-export type CommitResult =
-	| { ok: true; revision: number; skipped: boolean }
-	| { ok: false; kind: "parse_error" | "conflict" | "busy" | "io"; message: string; currentRevision?: number; currentFingerprint?: string };
-
-/** 六步安全写入。锁内重读磁盘并对 revision+指纹双重校验，任何不一致 → conflict（不自动覆盖）。 */
-export async function commitHotspot(path: string, input: CommitInput): Promise<CommitResult> {
-	return withHotspotLock(path, async () => {
-		const latest = readHotspot(path);
-		if (latest.exists && latest.parseError) {
-			return { ok: false, kind: "parse_error", message: `热点文件无法解析，停止自动写入以保留内容: ${latest.parseError}` };
-		}
-		const curRev = latest.exists && latest.file ? latest.file.revision : 0;
-		if (curRev !== input.expectedRevision || latest.fingerprint !== input.expectedFingerprint) {
-			return {
-				ok: false,
-				kind: "conflict",
-				message: `版本冲突：磁盘 revision=${curRev}，期望 revision=${input.expectedRevision}（请 read 后重试）`,
-				currentRevision: curRev,
-				currentFingerprint: latest.fingerprint ?? undefined,
-			};
-		}
-		let mutated: { next: HotspotFile; skipped?: boolean } | null;
-		try {
-			mutated = input.mutate(latest.exists ? latest.file : null);
-		} catch (e) {
-			return { ok: false, kind: "io", message: `变更被拒绝: ${e instanceof Error ? e.message : String(e)}` };
-		}
-		if (!mutated) return { ok: true, revision: curRev, skipped: true };
-		const priorIds = new Set((latest.file?.entries ?? []).map((e) => e.topicId));
-		if ((latest.file?.entries.length ?? 0) >= ENTRY_LIMITS.topics && mutated.next.entries.some((e) => !priorIds.has(e.topicId))) {
-			return { ok: false, kind: "io", message: `主题数已达上限 ${ENTRY_LIMITS.topics}；请先 remove 冷却主题` };
-		}
-		const next: HotspotFile = { ...mutated.next, revision: curRev + 1 };
-		const raw = serializeHotspot(next);
-		const tmp = `${path}.tmp-${process.pid}`;
-		try {
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(tmp, raw, "utf8");
-			renameSync(tmp, path);
-		} catch (e) {
-			try {
-				if (existsSync(tmp)) rmSync(tmp);
-			} catch {
-				/* ignore */
-			}
-			return { ok: false, kind: "io", message: `写入失败: ${String(e)}` };
-		}
-		return { ok: true, revision: next.revision, skipped: Boolean(mutated.skipped) };
-	}).catch((e: unknown) => ({ ok: false, kind: "busy", message: String(e) }) as CommitResult);
-}
-
-/** remove 的受限恢复副本：追加 JSONL（含被删条目全文、原因与删除时 revision）。 */
-export function appendTrash(root: string, record: unknown): string | null {
-	const p = trashPath(root);
-	try {
-		mkdirSync(dirname(p), { recursive: true });
-		writeFileSync(p, `${JSON.stringify(record)}\n`, { flag: "a" });
-		return p;
+		const snap = JSON.parse(readFileSync(snapshotPath, "utf8")) as HotspotSnapshot;
+		if (snap && snap.schema === 4 && Array.isArray(snap.entries)) return snap;
+		return null;
 	} catch {
 		return null;
 	}
+}
+
+/** 上次 snapshot 时间（ms）：generatedAt 优先，退 mtime，缺失 → 0。 */
+export function lastSnapshotAtMs(snapshotPath: string): number {
+	const snap = readSnapshot(snapshotPath);
+	if (snap) {
+		const t = Date.parse(snap.generatedAt);
+		if (Number.isFinite(t)) return t;
+	}
+	try {
+		return statSync(snapshotPath).mtimeMs;
+	} catch {
+		return 0;
+	}
+}
+
+/** TTL 清理：删除 events/ 中 mtime < now-HARD_TTL-24h 的分片文件（幂等、静默）。返回删除数。 */
+export function cleanupStaleShards(eventsDir: string, now: number): number {
+	const cutoff = now - HARD_TTL_MS - 24 * 3600_000;
+	let files: string[];
+	try {
+		files = readdirSync(eventsDir);
+	} catch {
+		return 0;
+	}
+	let n = 0;
+	for (const f of files) {
+		if (!f.endsWith(".jsonl")) continue;
+		try {
+			const p = join(eventsDir, f);
+			if (statSync(p).mtimeMs < cutoff) {
+				unlinkSync(p);
+				n++;
+			}
+		} catch {
+			/* 静默 */
+		}
+	}
+	return n;
 }

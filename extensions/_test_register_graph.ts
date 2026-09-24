@@ -163,11 +163,14 @@ assert.deepEqual(commandNames, [
 ]);
 
 // 事件快照（按名排序；2026-08-19 冻结）。同一事件可被多处注册：
-// agent_end x1（session-hooks 自动 master 交接）、
+// agent_end x2（session-hooks 自动 master 交接 + hotspot v4 snapshot 写入）、
 // session_start x5（timers/async-panel/event-bus/report/tab 遥测）、
 // session_shutdown x2（tab 遥测 + index.ts 清理钩子）、
-// tool_execution_end x2 与 tool_execution_start x2（index.ts 通知钩子 +
-// tab 遥测 tracking）。
+// input x1（hotspot v4 保守注入）与 agent_start x3（session-hooks + tab 遥测 +
+// hotspot v4 run-cap 重置）；tool_execution_start x3 / tool_execution_end x3
+// （index.ts 通知钩子 + tab 遥测 tracking + hotspot v4 采集）。
+// 2026-09-24 hotspot v4：旧 detect/usage 退役、collect 接管采集；
+// session_before_compact 随 v2 inject 退役移除（它曾是全仓唯一挂点）。
 assert.deepEqual(eventNames, [
 	"agent_end",
 	"agent_settled",
@@ -177,7 +180,6 @@ assert.deepEqual(eventNames, [
 	"input",
 	"message_end",
 	"resources_discover",
-	"session_before_compact",
 	"session_shutdown",
 	"session_start",
 	"tool_execution_end",

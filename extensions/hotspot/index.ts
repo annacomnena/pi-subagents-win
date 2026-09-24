@@ -1,31 +1,81 @@
 /**
- * hotspot — 热点路由缓存模块入口
+ * hotspot — 短期热点工作集模块入口（v4）
  *
- * 设计文档：plans/20260915_plan_hotspot_memory_layer.md（v2，已批准首版实施）
- * 结构约束（v2 §11）：主 extensions/index.ts 只 import 本入口并调用 registerHotspot(pi)。
+ * 设计：plans/0924_hotspot_v4_ephemeral_working_set.md；
+ * 实现计划：plans/0924_hotspot_v4_impl_plan.md §A.1（注册矩阵）。
+ * Hotspot = 可丢失、可重建、非权威的短期工作集 projection（task/workstream →
+ * 最近读写文件）。旧 v2 路由缓存（Wiki/_hotspot.md 托管）已整体退役。
  *
- * 首版范围：首轮 <system-reminder> 注入、hotspot 工具（read/upsert/remove）、
- * 引用验证+预算+乐观锁+跨进程锁、/hotspot 诊断、热度排序与效果记录。
- * 0922 组合：+ 使用度量（④ held-out）、③ 拒收回显（tool.ts）、② 手写边（rel）、
- * ① 动态投影（graph.ts）、P0 自动探测（detect.ts）。
- * 不含：curator、知识晋升、自动删除、daemon、向子代理复制热点块。
+ * 注册矩阵：
+ * | 能力              | 主会话 | Tab | 子 agent |
+ * | collect（采集分片）| ✓     | ✓  | ✓（只追加，workspace 级，不伪造 task_id）|
+ * | hotspot lookup 工具| ✓     | ✓  | ✓（只读，无害）|
+ * | /hotspot 命令      | ✓     | ✓  | ✗ |
+ * | inject             | ✓(路径门)| ✓(task/路径门) | ✗ |
+ * | snapshot 写+TTL 清理| ✓(唯一写者) | ✗ | ✗ |
+ * | 总开关关           | 全部不注册 | 同 | 同 |
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isMainSession, isSubagent } from "../identity.ts";
+import { registerHotspotCollect } from "./collect.ts";
 import { registerHotspotCommand } from "./command.ts";
-import { registerHotspotDetection } from "./detect.ts";
 import { registerInject } from "./inject.ts";
 import { registerHotspotTool } from "./tool.ts";
-import { registerUsage } from "./usage.ts";
+import {
+	appendedSinceLoad,
+	cleanupStaleShards,
+	defaultAgentDir,
+	findRepoRoot,
+	lastSnapshotAtMs,
+	workspaceIdOf,
+	writeSnapshotAtomic,
+	wsPaths,
+} from "./store.ts";
+import { buildWorkset } from "./workset.ts";
+import { HALF_LIFE_MS, SCHEMA_VERSION, SNAPSHOT_MIN_INTERVAL_MS, hotspotEnabled, nowIso } from "./types.ts";
+
+/**
+ * snapshot 写入（§C.5，主会话 agent_end 时）：距上次写 ≥ 节流间隔且本会话追过分片 →
+ * TTL 清理旧分片 → tmp+rename 写 snapshot（派生缓存；缺失/过期一律容忍）。
+ * 导出供测试。
+ */
+export function writeSnapshotIfDue(agentDir: string, root: string, now: number): { written: boolean; reason?: string } {
+	try {
+		if (appendedSinceLoad() === 0) return { written: false, reason: "no_events" };
+		const wsid = workspaceIdOf(root);
+		const p = wsPaths(agentDir, wsid);
+		if (now - lastSnapshotAtMs(p.snapshotPath) < SNAPSHOT_MIN_INTERVAL_MS) return { written: false, reason: "throttled" };
+		cleanupStaleShards(p.eventsDir, now);
+		const ws = buildWorkset(agentDir, wsid, { now });
+		const ok = writeSnapshotAtomic(p.snapshotPath, {
+			schema: SCHEMA_VERSION,
+			wsid,
+			generatedAt: nowIso(now),
+			halfLifeMs: HALF_LIFE_MS,
+			entries: ws.entries,
+		});
+		return ok ? { written: true } : { written: false, reason: "io_error" };
+	} catch (e) {
+		return { written: false, reason: `error:${String(e)}` };
+	}
+}
 
 export function registerHotspot(pi: ExtensionAPI): void {
-	// 子 agent 进程（PI_SUBAGENT=1）：注入/工具/命令内部自 gate 早退——
-	// 不注入（任务 prompt 由主会话组装时自行携带路由）、不暴露写入工具、无诊断命令。
-	// 0922 组合：+ 使用度量（④ held-out 门控，子 agent 的外部工具调用也算真实使用）
-	// + P0 自动探测（③，主会话行为；detect 内部自 gate 子 agent）。
-	registerInject(pi);
-	registerHotspotTool(pi);
-	registerHotspotCommand(pi);
-	registerUsage(pi);
-	registerHotspotDetection(pi);
+	if (!hotspotEnabled()) return; // §J.2 总开关：采集/注入/工具/命令全部不注册
+	registerHotspotCollect(pi); // 主/Tab/子 agent：分片采集
+	registerHotspotTool(pi); // 主/Tab/子 agent：只读 lookup
+	if (isSubagent()) return;
+	registerHotspotCommand(pi); // 主/Tab
+	registerInject(pi); // 主(路径门)/Tab(task/路径门)；内部自 gate
+	if (!isMainSession()) return;
+	pi.on("agent_end", (_event, ctx) => {
+		// gauge 永不打断主流程：任何异常静默
+		try {
+			const root = findRepoRoot((ctx as { cwd?: string })?.cwd ?? process.cwd());
+			writeSnapshotIfDue(defaultAgentDir(), root, Date.now());
+		} catch {
+			/* 静默 */
+		}
+	});
 }

@@ -1,114 +1,98 @@
 /**
- * hotspot/types — 热点路由缓存的数据模型与常量
+ * hotspot/types — Hotspot v4 数据模型与常量（短期工作集 projection）
  *
- * 设计文档：plans/20260915_plan_hotspot_memory_layer.md（v2）
- * - 热点是纯路由层：主题 → Wiki 章节切片 + 符号入口 + 证据指针
- * - 文件格式由工具生成/解析，代理不手工拼接 Markdown
- * - revision 与时间戳由工具管理
+ * 设计：plans/0924_hotspot_v4_ephemeral_working_set.md（v4）；
+ * 实现：plans/0924_hotspot_v4_impl_plan.md §B。
+ * - Hotspot = 可丢失、可重建、非权威的短期工作集缓存（task/workstream → 最近读写文件）
+ * - 旧 v2 路由缓存（upsert/remove/rel/graph/pending，托管 Wiki/_hotspot.md）已整体退役，
+ *   本文件不再定义其数据模型；不读写 Wiki/_hotspot.md（拍板 #9）
+ * - 存储目录：<agentDir>/hotspot/<wsid>/（见 store.ts）
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 4;
 
-/** 注入预算（字符）：固定说明预留后按完整条目选择，超预算整条省略。
- *  token 估算方法 = 字符数 ÷ 3.5（中英混合保守估计），4000 chars ≈ 1.1k token。
- *  这是试点参数，不是严格等价换算。 */
-export const FIXED_PREAMBLE_CHARS = 900; // 含“最近活动”小节（任务 3 行 + 函数 5 项，现算零存储）
-export const DEFAULT_INJECT_CHAR_BUDGET = 4000;
+/** 半衰期 12h：score 每 12h 减半。 */
+export const HALF_LIFE_MS = 12 * 3600_000;
+/** soft TTL 48h：soft 后条目不再参与注入，lookup/诊断仍可见。 */
+export const SOFT_TTL_MS = 48 * 3600_000;
+/** hard TTL 72h：hard 后条目从投影剪除（读侧窗口 = now - HARD_TTL_MS）。 */
+export const HARD_TTL_MS = 72 * 3600_000;
 
-/** 存储上限（字符）：与注入预算分别限制；超限拒写并要求显式整理。 */
-export const DEFAULT_STORE_CHAR_LIMIT = 12000;
+/** 事件权重（v4 §7 初值）：write=3 / read=1 / test=2。 */
+export const WEIGHTS = { write: 3, read: 1, test: 2 } as const;
 
-export const HOTSPOT_FILENAME = "_hotspot.md";
-export const HOTSPOT_TRASH_FILENAME = "_hotspot.trash.jsonl";
+/** 每 run（agent_start→agent_end）每文件每 kind 最多落盘的事件条数（拍板 #5）。 */
+export const RUN_CAP = { read: 4, write: 3, test: 2 } as const;
+
+/** 投影/snapshot 条目上限。 */
+export const WORKSET_TOP_N = 50;
+
+/** 注入预算：≤5 条、≥2 条才注入；字符预算 ≈160 token ×3.5 chars/token（沿用 v2 估算口径），超预算整条省略不截断。 */
+export const INJECT_MAX_FILES = 5;
+export const INJECT_MIN_FILES = 2;
+export const INJECT_CHAR_BUDGET = 560;
+
+/** 沿用 v2 旧值：语义仍是"已注入"，老会话里的旧标记也能挡重复注入。 */
 export const INJECT_CUSTOM_TYPE = "hotspot-injected";
-export const TOPIC_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
-export interface WikiRef {
-	/** 仓库相对路径（正斜杠分隔） */
+/** snapshot 节流间隔（主会话 agent_end 时）。 */
+export const SNAPSHOT_MIN_INTERVAL_MS = 5 * 60_000;
+
+export type HotKind = "write" | "read" | "test";
+export type HotScope = "tab" | "main" | "subagent";
+
+/** 事件（分片行，JSONL；taskId/wsId 可空 = workspace 级）。 */
+export interface HotEvent {
+	v: 4;
+	/** ISO-8601 */
+	at: string;
+	kind: HotKind;
+	/** 仓库相对路径（正斜杠；从不存目录路径） */
 	path: string;
-	/** 章节标题（可选；空表示整页） */
-	section?: string;
+	scope: HotScope;
+	taskId?: string;
+	wsId?: string;
 }
 
-export interface SymbolRef {
-	/** 仓库相对路径 */
+/** 投影/snapshot 条目（hard TTL 外已剪除，故 ttl 只有 fresh/soft）。 */
+export interface HotEntry {
 	path: string;
-	/** 符号名（CodeGraph 可解析） */
-	name: string;
+	score: number;
+	lastSeen: string;
+	lastSeenMs: number;
+	kinds: HotKind[];
+	/** 窗口内计数 */
+	counts: { write: number; read: number; test: number };
+	lastTestAt?: string;
+	taskId?: string;
+	wsId?: string;
+	ttl: "fresh" | "soft";
 }
 
-/** 手写边（0922 组合计划 ②/§14.2“存判断算事实”）：codegraph 不可推导的
- * 关系（范式复用/业务线/协作）由人手写，真相源是人的判断；调用/依赖类关系
- * 不手写（①动态投影自动给）。upsert 时校验 topic_id 存在性 gate。 */
-export interface Rel {
-	/** 指向的已存在主题 ID（upsert 时存在性 gate；read 时失效标 [失效]） */
-	topic_id: string;
-	/** 关系种类（业务线/范式复用/协作…，≤20 字） */
-	kind: string;
-	/** 一句话说明（可选，≤80 字） */
-	note?: string;
+/** 派生缓存：可删可重建；读取方（tool/inject/command）直接读分片，snapshot 仅供诊断/未来 GUI。 */
+export interface HotspotSnapshot {
+	schema: 4;
+	wsid: string;
+	generatedAt: string;
+	halfLifeMs: number;
+	entries: HotEntry[];
 }
 
-export interface HotspotEntry {
-	topicId: string;
-	title: string;
-	/** 适用范围一句话 */
-	scope?: string;
-	wiki: WikiRef[];
-	symbols: SymbolRef[];
-	evidence: WikiRef[];
-	/** 内容更新时间（ISO），由工具写入 */
-	updatedAt: string;
-	/** 最近引用验证时间（ISO）：只说明指针经过检查，不代表业务结论被验证 */
-	verifiedAt: string;
-	/** 手写边（可选，缺省 []；不 bump SCHEMA_VERSION，向后兼容旧文件） */
-	rel?: Rel[];
+export function nowIso(ms?: number): string {
+	return new Date(ms ?? Date.now()).toISOString();
 }
 
-/** frontmatter 未知字段（Wiki 校验器等外部工具加的 title/kind/status/updated）：原样保留、写回逐字保留 */
-export interface FrontmatterField {
-	key: string;
-	value: string;
+/** 总开关（§J.2 回退）：PI_HOTSPOT_ENABLED=0 → 采集/注入/工具/命令全部不注册。缺省开。 */
+export function hotspotEnabled(): boolean {
+	const v = process.env.PI_HOTSPOT_ENABLED;
+	return !(v !== undefined && (v === "0" || v === "false"));
 }
 
-export interface HotspotFile {
-	schemaVersion: number;
-	revision: number;
-	entries: HotspotEntry[];
-	/** 未知 frontmatter 字段（按文件中出现顺序）；缺省/空 = 无 */
-	frontmatterExtra?: FrontmatterField[];
+/**
+ * 渲染侧字段转义（L4 must-fix 1b；MF-2 共享化）：控制字符（含换行/回车/制表/C0/DEL，
+ * 防伪造行）→ 空格，`<`/`>` → 全角（防伪造标签）。inject/command/tool 渲染存储或
+ * 外部身份来源的字符串字段时统一走此单一实现，禁止各自复制漂移。
+ */
+export function esc(s: string): string {
+	return s.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/</g, "＜").replace(/>/g, "＞");
 }
-
-export type ParseResult =
-	| { ok: true; file: HotspotFile }
-	| { ok: false; error: string };
-
-/** 单值字段在文件中的中文名（与 v2 文档 §4.3 示例一致） */
-export const FIELD_LABELS = {
-	title: "标题",
-	scope: "适用范围",
-	updatedAt: "内容更新",
-	verifiedAt: "引用验证",
-} as const;
-
-export const MULTI_FIELD_LABELS = {
-	wiki: "Wiki",
-	symbols: "入口",
-	evidence: "证据",
-	rel: "关联",
-} as const;
-
-export function nowIso(): string {
-	return new Date().toISOString();
-}
-
-/** 条目字段数量/长度上限（写入校验用） */
-export const ENTRY_LIMITS = {
-	title: 40,
-	scope: 80,
-	refs: 5,
-	topics: 8,
-	rel: 5,
-	relKind: 20,
-	relNote: 80,
-} as const;

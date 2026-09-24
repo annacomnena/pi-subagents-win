@@ -1,88 +1,74 @@
 /**
- * hotspot/inject — 首轮用户消息附加 <system-reminder> 热点块
+ * hotspot/inject — 首条用户消息保守注入（v4 §9.2；计划 §D）
  *
- * v2 §5：新会话首次用户提交时附加一次；恢复已有会话/重试不重复；压缩后保留指针
- * 提示、需要时经工具重读；不修改全局 system prompt；模板安全编码字段防提前闭合。
- * 这是本模块唯一的自动行为（2026-09-17 裁决：不加工具调用提醒）。
+ * 走 `input` 通道（有现成幂等双保险，沿用 v2 inject 模式）；不用 before_agent_start
+ * （无内建幂等）。门控两级：task 门（taskId/wsId 精确命中 + 任务未终态 + fresh ≥2）
+ * → 路径门（用户文本路径 token 精确 ∈ workspace 工作集 + top-up）。两级皆无 → 不注入
+ * （新任务/身份不明/全局热 ≠ 证据）。预算内整条省略、剩 <2 放弃；单块一次/会话；
+ * 先 appendCustomEntry 落档再 transform；决策全量进效果日志。
+ * 不保留 v2 的 session_before_compact 压缩保留提示（返回字段与声明不符；压缩丢块可
+ * 接受——lookup 工具可重取）。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { isSubagent } from "../identity.ts";
-import { computeHeat, recentActivitySummary, type RecentActivity } from "./heat.ts";
-import { logEvent } from "./log.ts";
-import { findRepoRoot, hotspotPath, readHotspot } from "./store.ts";
+import { defaultRuntimeDir } from "../runtime/journal.ts";
+import { listTasks } from "../runtime/workstreams.ts";
+import { sessionHotIdentity, type HotIdentity } from "./collect.ts";
+import { logHotspotEvent } from "./log.ts";
+import { defaultAgentDir, findRepoRoot, toRepoRelative, workspaceIdOf, wsPaths } from "./store.ts";
+import { buildWorkset } from "./workset.ts";
 import {
-	DEFAULT_INJECT_CHAR_BUDGET,
-	FIXED_PREAMBLE_CHARS,
+	INJECT_CHAR_BUDGET,
 	INJECT_CUSTOM_TYPE,
-	type HotspotEntry,
+	INJECT_MAX_FILES,
+	INJECT_MIN_FILES,
+	esc,
+	hotspotEnabled,
+	type HotEntry,
 } from "./types.ts";
 
-/** 防 `</system-reminder>` 提前闭合：字段值中的 `<` 替换为全角。 */
-function esc(s: string): string {
-	return s.replace(/</g, "＜");
+/** 注入拒绝原因（效果日志 reason 字段）。 */
+export type InjectRejectReason =
+	| "disabled"
+	| "task_terminal"
+	| "no_evidence"
+	| "already_in_context"
+	| "budget_exhausted";
+
+export interface InjectGate {
+	kind: "task" | "path";
+	entries: HotEntry[];
+	taskId?: string;
+	wsId?: string;
 }
 
-export interface InjectionPlan {
-	selected: HotspotEntry[];
-	omitted: HotspotEntry[];
-	budgetChars: number;
-	usedChars: number;
-	degraded: string[];
-}
-
-/** 预算选择：固定说明预留后按完整条目选，超预算整条省略、不截断条目。 */
-export function planInjection(root: string, entries: HotspotEntry[], budget = DEFAULT_INJECT_CHAR_BUDGET): InjectionPlan {
-	const heat = computeHeat(root, entries);
-	const selected: HotspotEntry[] = [];
-	const omitted: HotspotEntry[] = [];
-	const fixed = FIXED_PREAMBLE_CHARS;
-	let used = fixed;
-	for (const { entry } of heat.scored) {
-		const size = renderEntry(entry).length;
-		if (used + size > budget) {
-			omitted.push(entry);
-			continue;
-		}
-		used += size;
-		selected.push(entry);
-	}
-	return { selected, omitted, budgetChars: budget, usedChars: used, degraded: heat.degraded };
-}
-
-function renderEntry(e: HotspotEntry): string {
-	const lines: string[] = [`主题：${esc(e.title)}${e.scope ? `（${esc(e.scope)}）` : ""}`];
-	for (const w of e.wiki) lines.push(`- Wiki：${esc(w.path)}${w.section ? ` → ${esc(w.section)}` : ""}`);
-	for (const s of e.symbols) lines.push(`- 入口：${esc(s.path)}::${esc(s.name)}`);
-	for (const ev of e.evidence) lines.push(`- 证据：${esc(ev.path)}${ev.section ? ` → ${esc(ev.section)}` : ""}`);
-	return lines.join("\n");
-}
-
-export function renderReminder(root: string, revision: number, plan: InjectionPlan, activity?: RecentActivity): string {
-	const body = plan.selected.map((e) => renderEntry(e)).join("\n\n");
-	const actLines: string[] = [];
-	if (activity?.tasks.length) actLines.push(`最近任务: ${activity.tasks.map(esc).join(" | ")}`);
-	if (activity?.funcs.length) actLines.push(`最近改动: ${activity.funcs.map(esc).join(" | ")}`);
-	return [
-		"<system-reminder>",
-		"以下是本仓库的热点路由缓存，仅用于定位；事实以源文件为准。",
-		`仓库：${root}`,
-		`热点文件：${hotspotPath(root)}`,
-		`版本：${revision}`,
-		...(actLines.length ? ["", ...actLines] : []),
-		"",
-		body,
-		"",
-		"优先使用精确入口；入口失效时扩大搜索，并遵守仓库的 CodeGraph 规则。",
-		"</system-reminder>",
-	].join("\n");
+export interface InjectDeps {
+	root: string;
+	agentDir: string;
+	now: number;
+	identity: HotIdentity;
+	/** 任务终态查询（测试可注入 stub）；缺省读 runtime state */
+	taskTerminal?: (taskId: string, wsId?: string) => boolean;
 }
 
 interface SessionEntryLike {
 	type?: string;
 	message?: { role?: string };
 	customType?: string;
+	data?: { gate?: string; paths?: string[] };
 }
+
+export interface InjectCtxLike {
+	cwd?: string;
+	sessionManager?: {
+		getEntries?: () => unknown[];
+		appendCustomEntry?: (customType: string, data: unknown) => void;
+	};
+}
+
+export type InputVerdict = { action: "continue" } | { action: "transform"; text: string } | { action: "handled" };
 
 function hasUserMessage(entries: SessionEntryLike[]): boolean {
 	return entries.some((e) => e.type === "message" && e.message?.role === "user");
@@ -92,61 +78,175 @@ function hasInjectMark(entries: SessionEntryLike[]): boolean {
 	return entries.some((e) => e.type === "custom" && e.customType === INJECT_CUSTOM_TYPE);
 }
 
+/** 任务终态判定（§C.3(b)）：externalTaskId 或内部 id 命中且 status ∈ {completed,cancelled,failed}。 */
+export function isTaskTerminal(taskId: string, stateDir?: string): boolean {
+	try {
+		const dir = stateDir ?? join(defaultRuntimeDir(), "state");
+		const t = listTasks(undefined, dir).find((x) => x.externalTaskId === taskId || x.id === taskId);
+		return Boolean(t && (t.status === "completed" || t.status === "cancelled" || t.status === "failed"));
+	} catch {
+		return false;
+	}
+}
+
+/** 段内再切：全角括号/标点与 ASCII 括号（中文文本常无空格紧贴路径，如 "src/a.ts（不用读）"）；不含 `.`/`,`，避免拆坏扩展名。 */
+const SEGMENT_SPLIT_RE = /[\s"'`（「【《()\[\]{}<>）」】》，。；：？！·]+/;
+const LEADING_TRIM_RE = /^[\s"'`,;:!?]+/;
+const TRAILING_TRIM_RE = /[\s"'`.,;:!?]+$/;
+
+/** 用户文本中的路径 token：空白切分 → 全角/括号再切 → ASCII 标点去边 → toRepoRelative 归一。 */
+export function extractPathTokens(text: string, root: string): string[] {
+	const out: string[] = [];
+	for (const piece of text.split(/\s+/)) {
+		for (const seg of piece.split(SEGMENT_SPLIT_RE)) {
+			const t = seg.replace(LEADING_TRIM_RE, "").replace(TRAILING_TRIM_RE, "");
+			if (!t) continue;
+			const rel = toRepoRelative(t, root);
+			if (rel) out.push(rel);
+		}
+	}
+	return out;
+}
+
+/** 两级门控（纯函数；文本 + 工作集 → gate 或拒绝原因）。 */
+export function planGate(deps: InjectDeps, text: string): { gate: InjectGate | null; reason: InjectRejectReason } {
+	const wsid = workspaceIdOf(deps.root);
+	const tid = deps.identity.taskId;
+	const wid = deps.identity.wsId;
+	if (tid || wid) {
+		const terminal = deps.taskTerminal ?? isTaskTerminal;
+		if (tid && terminal(tid, wid)) return { gate: null, reason: "task_terminal" };
+		const ws = buildWorkset(deps.agentDir, wsid, { now: deps.now, taskId: tid, wsId: wid });
+		const fresh = ws.entries.filter((e) => e.ttl === "fresh");
+		if (fresh.length >= INJECT_MIN_FILES) {
+			return {
+				gate: { kind: "task", entries: fresh.slice(0, INJECT_MAX_FILES), ...(tid ? { taskId: tid } : {}), ...(wid ? { wsId: wid } : {}) },
+				reason: "no_evidence",
+			};
+		}
+	}
+	// 路径门（主会话兜底，两种身份都可用）
+	const full = buildWorkset(deps.agentDir, wsid, { now: deps.now });
+	const tokens = new Set(extractPathTokens(text, deps.root));
+	const hits = full.entries.filter((e) => e.ttl === "fresh" && tokens.has(e.path));
+	if (hits.length >= 1) {
+		const chosen = [...hits];
+		for (const e of full.entries) {
+			if (chosen.length >= INJECT_MAX_FILES) break;
+			if (e.ttl === "fresh" && !chosen.includes(e)) chosen.push(e); // 同 task/近邻 top-up
+		}
+		return { gate: { kind: "path", entries: chosen }, reason: "no_evidence" };
+	}
+	return { gate: null, reason: "no_evidence" };
+}
+
+/** 相对时间（18m / 2h / 3d）。 */
+export function relTime(ms: number, now: number): string {
+	const s = Math.max(0, Math.round((now - ms) / 1000));
+	if (s < 60) return `${s}s`;
+	const m = Math.round(s / 60);
+	if (m < 60) return `${m}m`;
+	const h = Math.round(m / 60);
+	if (h < 48) return `${h}h`;
+	return `${Math.round(h / 24)}d`;
+}
+
+function kindsLabel(e: HotEntry): string {
+	return (["write", "read", "test"] as const)
+		.filter((k) => e.counts[k] > 0)
+		.map((k) => `${k}×${e.counts[k]}`)
+		.join(" ");
+}
+
+/** 单块 <recent-working-set>：任务标识（若有）+ ≤5 行 path+lastSeen+kinds + 最近验证入口 + 免责声明。所有存储来源字段（taskId/wsId/path）经共享 esc（types.ts）转义，块内不可能出现真实闭合标签。 */
+export function renderWorkingSetBlock(gate: InjectGate, now: number): string {
+	const lines: string[] = ["<recent-working-set>"];
+	if (gate.taskId || gate.wsId) {
+		lines.push(`当前任务 ${esc(gate.taskId ?? "")}${gate.wsId ? `（workstream ${esc(gate.wsId)}）` : ""} 最近集中在：`);
+	} else {
+		lines.push("按你提到的路径定位的近期工作位置：");
+	}
+	for (const e of gate.entries) {
+		lines.push(`- ${esc(e.path)} · ${kindsLabel(e)} · ${relTime(e.lastSeenMs, now)}`);
+	}
+	const tested = gate.entries
+		.filter((e) => e.lastTestAt)
+		.sort((a, b) => (Date.parse(a.lastTestAt!) < Date.parse(b.lastTestAt!) ? 1 : -1))[0];
+	if (tested) lines.push(`最近验证入口: ${esc(tested.path)}（${relTime(Date.parse(tested.lastTestAt!), now)}）`);
+	lines.push("以上仅表示近期工作位置，不代表当前代码仍已验证。", "</recent-working-set>");
+	return lines.join("\n");
+}
+
+/** 预算选择：按 score 序逐条尝试，超预算整条省略（不截断）；剩 < INJECT_MIN_FILES → null。 */
+export function selectWithinBudget(gate: InjectGate, now: number): { kept: HotEntry[]; block: string } | null {
+	let kept: HotEntry[] = [];
+	for (const e of gate.entries.slice(0, INJECT_MAX_FILES)) {
+		const cand = [...kept, e];
+		if (renderWorkingSetBlock({ ...gate, entries: cand }, now).length > INJECT_CHAR_BUDGET) continue; // 整条省略
+		kept = cand;
+	}
+	if (kept.length < INJECT_MIN_FILES) return null;
+	return { kept, block: renderWorkingSetBlock({ ...gate, entries: kept }, now) };
+}
+
 /**
- * 注册注入钩子。仅主会话/标签页会话注册；子 agent 进程不注入
- * （v2 暂不包含“向子代理重复复制完整热点块”）。
+ * input 事件核心（测试可直接调）。门控 + 幂等双保险 + 预算 + 落档 + 日志。
  */
+export async function handleInput(
+	event: { text?: string; source?: string },
+	ctx: InjectCtxLike,
+	deps: InjectDeps,
+): Promise<InputVerdict> {
+	if (event.source === "extension") return { action: "continue" };
+	const text = event.text ?? "";
+	if (!text.trim() || text.trimStart().startsWith("/")) return { action: "continue" };
+	const p = wsPaths(deps.agentDir, workspaceIdOf(deps.root));
+	const reject = (reason: InjectRejectReason): InputVerdict => {
+		logHotspotEvent(p.logPath, { kind: "inject", ok: false, reason });
+		return { action: "continue" };
+	};
+	if (!hotspotEnabled()) return reject("disabled");
+	// 幂等双保险（v2 模式）：已有 user 消息（恢复会话）或已注入标记 → 不注入
+	try {
+		const entries = (ctx.sessionManager?.getEntries?.() ?? []) as SessionEntryLike[];
+		if (hasUserMessage(entries) || hasInjectMark(entries)) return { action: "continue" };
+	} catch {
+		return { action: "continue" }; // 会话状态不可读时不注入（安全侧）
+	}
+	const { gate, reason } = planGate(deps, text);
+	if (!gate) return reject(reason);
+	// 工作集已在上下文（廉价启发）：用户文本已提及候选路径 ≥2 → 不注入
+	const tokens = new Set(extractPathTokens(text, deps.root));
+	if (gate.entries.filter((e) => tokens.has(e.path)).length >= 2) return reject("already_in_context");
+	const sel = selectWithinBudget(gate, deps.now);
+	if (!sel) return reject("budget_exhausted");
+	try {
+		ctx.sessionManager?.appendCustomEntry?.(INJECT_CUSTOM_TYPE, {
+			gate: gate.kind,
+			paths: sel.kept.map((e) => e.path),
+			at: deps.now,
+		});
+	} catch {
+		/* 持久标识失败时 entries 检查仍兜底（用户消息即将入档） */
+	}
+	logHotspotEvent(p.logPath, { kind: "inject", ok: true, gate: gate.kind, files: sel.kept.length });
+	return { action: "transform", text: `${text}\n\n${sel.block}` };
+}
+
+/** 注册注入钩子（主/Tab 会话；子 agent 不注入）。 */
 export function registerInject(pi: ExtensionAPI): void {
 	if (isSubagent()) return;
-
-	pi.on("session_start", async () => {
-		// 热点内容缓存与热度信号缓存分离：每次会话启动失效，注入前现读现算。
-	});
-
 	pi.on("input", async (event, ctx) => {
-		if (event.source === "extension") return { action: "continue" } as const;
-		const text = event.text ?? "";
-		if (!text.trim() || text.trimStart().startsWith("/")) return { action: "continue" } as const;
 		try {
-			const entries = ctx.sessionManager.getEntries() as SessionEntryLike[];
-			if (hasUserMessage(entries) || hasInjectMark(entries)) return { action: "continue" } as const;
-		} catch {
-			return { action: "continue" } as const; // 会话状态不可读时不注入（安全侧）
-		}
-		const root = findRepoRoot(ctx.cwd);
-		const path = hotspotPath(root);
-		const read = readHotspot(path);
-		if (!read.exists || !read.file || read.file.entries.length === 0) return { action: "continue" } as const;
-		const plan = planInjection(root, read.file.entries);
-		if (plan.selected.length === 0) return { action: "continue" } as const;
-		const activity = recentActivitySummary(root);
-		const reminder = renderReminder(root, read.file.revision, plan, activity);
-		try {
-			ctx.sessionManager.appendCustomEntry(INJECT_CUSTOM_TYPE, {
-				revision: read.file.revision,
-				topicIds: plan.selected.map((e) => e.topicId),
-				at: Date.now(),
+			const root = findRepoRoot((ctx as InjectCtxLike)?.cwd ?? process.cwd());
+			return await handleInput(event, ctx as InjectCtxLike, {
+				root,
+				agentDir: defaultAgentDir(),
+				now: Date.now(),
+				identity: sessionHotIdentity(),
 			});
 		} catch {
-			/* 持久标识失败时 entries 检查仍兜底（用户消息即将入档） */
+			return { action: "continue" } as const;
 		}
-		// 0922 ④：kind=inject 埋点（现类型有、调用无，research P0-3；给 P1 校准注入覆盖率/命中率）
-		logEvent(root, { kind: "inject", topics: plan.selected.map((e) => e.topicId), revision: read.file.revision, ok: true });
-		return { action: "transform", text: `${text}\n\n${reminder}` } as const;
-	});
-
-	// 压缩后：保留指针提示（不自动恢复全文；需要时 hotspot read 重读）。
-	pi.on("session_before_compact", async (_event, ctx) => {
-		try {
-			const entries = ctx.sessionManager.getEntries() as SessionEntryLike[];
-			if (!hasInjectMark(entries)) return;
-		} catch {
-			return;
-		}
-		const root = findRepoRoot(ctx.cwd);
-		return {
-			customInstructions:
-				`压缩摘要请保留提示：本仓库存在热点路由缓存（${hotspotPath(root)}），需要定位活跃模块时用 hotspot 工具重新读取。`,
-		};
 	});
 }
