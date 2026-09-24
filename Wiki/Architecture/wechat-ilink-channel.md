@@ -99,6 +99,28 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 远程消息到达而用户正在 master 交互时：缺省**直接插入**（远程通道本分），TUI 给醒目提示；「排队到本轮结束」留作后续可选开关。
 
+### 真机消息条目形状（**已实测**，2026-09-24）
+
+由 quarantine 的脱敏形状签名抓到（`msgs[]` 内每条 = **消息信封**）：
+
+```
+{ seq:number, message_id:number, from_user_id:string, to_user_id:string, client_id:string,
+  create_time_ms:number, update_time_ms:number, delete_time_ms:number,
+  session_id:string, group_id:string, message_type:number, message_state:number, item_list:[...] }
+```
+
+与指南/ZCode 的差异（**我们原先全部踩中**）：
+| 项 | 指南/我们的旧假设 | **真机** |
+|---|---|---|
+| 消息 id | `entry.id`（字符串） | **`message_id`（数字）** ⇒ 旧 `pickMsgId` 只收字符串 → 判"缺 id" → **全部 quarantine** |
+| 发送者 | `msg.from.id` | **`from_user_id`**（顶层） |
+| 文本 | `c.text` / `c.content` | **`c.text_item.text`**（对象） |
+| 群标识 | 无 | **`group_id`**（非空 = 群消息 ⇒ D15 仅私聊拒收） |
+
+**这解释了"消息收不到"的最后一段**：协议修复后消息**一直在到**（`quarantined` 计数增长），但 parser 读不懂字段 ⇒ 全部进 quarantine ⇒ **GUI「收到的消息」读的是 inbox，因此界面显示为空**，用户以为完全没收到。
+
+**教训（两条）**：① 未知形状的解析必须把**脱敏形状签名**写进 quarantine reason（本次正是靠它一次定位）；② **quarantine 必须可见**（当前 GUI 只读 inbox ⇒ 用户看不到被拒记录，这是真实的 UX 盲区，已列为后续项）。
+
 ## W2b 界面开关切片（**已落地** `18ba74d`，D17）
 
 **动机**：D17「任何 opt-in 开关必须界面可达」——W2 的注入开关原先只能手改 `config.json`。

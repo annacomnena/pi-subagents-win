@@ -57,7 +57,7 @@ function str(v: unknown, max: number): string | null {
  * 脱敏形状签名（真网适配用）：只输出**键名 + 类型**，**绝不输出任何值**（正文/token/URL 均不入）。
  * 真机 `msgs[]` 条目形状未知（指南不可信）——未知结构 quarantine 时附上签名，便于一次性对齐真字段。
  */
-function shapeSig(v: unknown, maxKeys = 12): string {
+function shapeSig(v: unknown, maxKeys = 24): string {
 	if (!isObj(v)) return Array.isArray(v) ? `array(${v.length})` : typeof v;
 	const parts: string[] = [];
 	for (const k of Object.keys(v).slice(0, maxKeys)) {
@@ -68,15 +68,15 @@ function shapeSig(v: unknown, maxKeys = 12): string {
 	return `{${parts.join(",")}}`;
 }
 
-/** 宽容取 msgId：真机字段名未测，接受 id/msgId/msg_id/msg.id。 */
+/** 宽容取 msgId（**真机实测 2026-09-24**：`msgs[]` 条目为 `{seq, message_id:number, from_user_id, ...}`）。
+ *  接受数字 `message_id`（转字符串，id 远小于 2^53 无精度风险）、`id`/`msgId`/`msg_id`、`msg.*` 同名字段。
+ *  缺 id 时**不伪造**（`seq` 不回退为 id：seq 可能重置，会与去重语义冲突）→ 调用方 quarantine。 */
 function pickMsgId(entry: Record<string, unknown>): string | null {
-	for (const cand of [entry.id, entry.msgId, entry.msg_id]) {
-		if (typeof cand === "string" && cand.length > 0) return cand;
-	}
-	const m = entry.msg;
-	if (isObj(m)) {
-		for (const cand of [m.id, m.msgId, m.msg_id]) {
+	const m = isObj(entry.msg) ? entry.msg : null;
+	for (const src of m ? [entry, m] : [entry]) {
+		for (const cand of [src.message_id, src.id, src.msgId, src.msg_id]) {
 			if (typeof cand === "string" && cand.length > 0) return cand;
+			if (typeof cand === "number" && Number.isFinite(cand)) return String(cand);
 		}
 	}
 	return null;
@@ -131,8 +131,20 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 		// 真机条目可能**没有** msg 包装（指南写有）——无包装时把条目自身当消息，宽容处理。
 		const hasWrapper = isObj(entry.msg);
 		const msg = hasWrapper ? (entry.msg as Record<string, unknown>) : entry;
+		// D15「仅私聊」：真机有 `group_id`（群消息非空）——群消息直接 quarantine（不入 inbox）。
+		const groupId = str(entry.group_id, 128) ?? str(msg.group_id, 128);
+		if (groupId !== null) {
+			quarantined.push({ msgId, reason: `群消息（group_id 非空）：D15 仅私聊，拒收；shape=${shapeSig(entry)}`, at: receivedAt });
+			continue;
+		}
 		const from = isObj(msg.from) ? msg.from : {};
-		const fromId = str(from.id, 128) ?? str(from.openid, 128) ?? str(from.user_id, 128);
+		// 发送者：真机 = `from_user_id`（顶层）；兼容 from.id/openid/user_id。
+		const fromId =
+			str(from.id, 128) ??
+			str(from.openid, 128) ??
+			str(from.user_id, 128) ??
+			str(entry.from_user_id, 128) ??
+			str(msg.from_user_id, 128);
 		const fromNickname = str(from.nickname, 128) ?? str(from.nick_name, 128);
 		if (fromId === null) {
 			quarantined.push({ msgId, reason: `缺发送者 from.id；shape=${shapeSig(entry)}`, at: receivedAt });
@@ -157,16 +169,18 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 				quarantined.push({ msgId, reason: "内容项不是对象", at: receivedAt });
 				continue;
 			}
-			const typeRaw = typeof c.type === "string" ? c.type : typeof c.content_type === "string" ? c.content_type : "";
+			const typeRaw = typeof c.type === "string" ? c.type : typeof c.content_type === "string" ? c.content_type : typeof c.type === "number" ? String(c.type) : "";
 			const type = typeRaw.trim().toLowerCase();
-			const textLike = typeof c.text === "string" ? c.text : null;
+			const textItem = isObj(c.text_item) ? c.text_item : null;
+			// 文本位置：真机 = `item_list[].text_item.text`（对象）；兼容 c.text / c.content。
+			const textLike = typeof c.text === "string" ? c.text : textItem && typeof textItem.text === "string" ? textItem.text : null;
 			const contentLike = typeof c.content === "string" ? c.content : null;
-			// L4 MF2：**无 msg 包装**（真机未知路径）时收紧——只认 `text` 字段，或显式文本类 type；
+			// L4 MF2：**无 msg 包装**（真机未知路径）时收紧——只认 `text` 字段或 text_item，或显式文本类 type；
 			// 否则未分类的 `content` 字符串会把控制帧/回执（如 {content:"delivered ok"}）误落 inbox。
 			// 指南形状（有 msg 包装）保持原行为，零回归。
 			const body = hasWrapper
 				? (textLike ?? contentLike)
-				: (textLike ?? (type === "text" || type === "msg_text" ? contentLike : null));
+				: (textLike ?? (type === "text" || type === "msg_text" || typeRaw === "1" ? contentLike : null));
 			if (body !== null && body.length > 0 && !NON_TEXT_TYPES.has(type)) {
 				if (!textTaken) {
 					items.push({ msgId, fromId, fromNickname, text: sanitizeInboundText(body), receivedAt });

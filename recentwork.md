@@ -31,6 +31,7 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 33 | P0 | **微信接收真正打通**：真机消息形状对齐（message_id 数字/from_user_id/text_item.text/group_id） | none | quarantine 在 GUI 可见（当前盲区） |
 | 32 | P1 | autonomy 开关界面可达（D17）+ **前置修 R4**（ws-mail 到信成为 frontier 触发，已实现 `3d8409f`） | none | A4 `/wechat on|off|status`；audit 轮转（R5） |
 | 31 | P1 | 修 daemon 弹终端窗口（spawn 形状 windowsHide:false → true，含 worker 连带修） | none | —（已完成） |
 | 30 | P2 | `/runtime-host restart [--force]`（用户提出；已实现 `1743061`） | none | worker-only restart（可选，SKIP） |
@@ -41,6 +42,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 33 - 微信接收真正打通：真机消息形状对齐
+
+- **日期**：2026-09-24
+- **一句话**：用户"重绑+重启后仍收不到"——真相是**消息一直在到**（`quarantined` 从 0 涨到 4，含用户刚发的那条），但 `parser.ts` 读不懂真机字段 ⇒ 全部 quarantine ⇒ GUI 读 inbox 显示为空。修后真机形状解析正确。
+- **真机形状**（quarantine 的脱敏签名抓到）：`{seq:number, message_id:number, from_user_id, to_user_id, client_id, create_time_ms, …, session_id, group_id, message_type, message_state, item_list:[{type:1,text_item:{text}}]}`。
+- **涉及模块**：`extensions/channel-wechat/parser.ts`（`pickMsgId` 接受数字 `message_id`；发送者取 `from_user_id`；文本取 `text_item.text`；`group_id` 非空 ⇒ 群消息拒收（D15 仅私聊）；`shapeSig` 上限 12→24 便于一次看清未知形状）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` → 「真机消息条目形状（已实测）」
+- **Priority**：P0（"微信能不能通"的最后一段）
+- **Status**：done
+- **Verification**：用真机形状构造用例实测（文本→正确解析 / 群消息→拒收 / 图片→quarantine 不误当文本）；smoke + W1 7 组 + W2 13 组回归全绿。
+- **教训**：① 未知形状解析必须把**脱敏形状签名**写进 quarantine（本次靠它一次定位）；② **quarantine 必须可见**——GUI 只读 inbox ⇒ 用户看不到被拒记录，是真实 UX 盲区（已列后续项）。
 
 ### Item 32 - autonomy 开关界面可达（D17）+ 前置修 R4
 
