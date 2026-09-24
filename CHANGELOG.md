@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (local Master 自动交接：`b0ff266`)
+
+- **local Master 自动交接**：`master-transfer` 支持 `--local`（仓库会话持 local 也能自动交接）；后继 prompt 携带 scope（`master-attach({token, local:true})` + 同一 local 地址）；home→local fail-closed；local transfer 不碰 global succession；四要素回报（旧/新 sid12+gen、token 消费时刻）；transfer-window marker 抑制 reclaim/takeover。
+- **安全修**：`registry.ts` token attach 一律不得走 genesis（`!existing && input.token → bad-token`，零写）——修前 local token 可在空 global attachment 上认领 global owner。
+- 新增 `extensions/_test_local_master_transfer.ts`（T1–T13）。L4 链：首轮 FAIL（7 条）→ 修复 → 窄确认 PASS；global 既有 12 项回归保持绿。
+
 ## [Unreleased] — 2026-09-24 (微信出站回复 W3a–W3d：`a282848`/`d4b3ebf`/`b9b6726`/`aab6bf6`)
 
 - **微信出站回复只读状态**：新增 `GET /v1/wechat/reply/status`，鉴权后受 `wechat.enabled` 闸保护，投影回复意图计数/最近时间/安全错误摘要；GUI Channels 页新增始终可见的只读卡（401/403 也可见），关闭开关引导 TUI `/wechat reply off`，GUI 不提供写操作。

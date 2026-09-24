@@ -17,6 +17,7 @@
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
 | 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
+| 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） |
 | 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
 | 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
@@ -45,6 +46,20 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 37 - local Master 自动交接（`master-transfer --local`）
+
+- **日期**：2026-09-24
+- **一句话**：让仓库会话（持 local Master）也能自动交接——`master-transfer` 支持 `--local`（此前只面向 global，仓库会话调用被拒）；L4 首轮 **FAIL**（7 条 must-fix，含安全级跨 scope token 绕过）→ 修复轮全落地 → 窄 L4 确认 **PASS**。
+- **涉及模块**：`extensions/runtime/{master-transfer,master-control,registry}.ts`、`extensions/master-tools.ts`、`extensions/index.ts`、`extensions/_test_local_master_transfer.ts`（新，~470 行 T1–T13）
+- **产物**：`plans/0924_local_master_auto_transfer_{report,l4_review,fix_report,fix_l4_confirm}.md`
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`b0ff266`
+- **Verification**：`npx tsx extensions/_test_local_master_transfer.ts` 13/13；`_test_runtime_master_transfer.ts`（global 既有）12/12；`npm run smoke:extension-load`、`_test_local_master`、`_test_master_home_guard`、`_test_runtime_commands`、`_test_register_graph`（本体直跑）、`gui tsc --noEmit` 全绿。
+- **安全修（最关键）**：`registry.ts` token attach **一律不得走 genesis**（`!existing && input.token → bad-token`，零写）——修前 local token 可在空 global attachment 上认领 global owner。窄确认用自建对抗探针验四种跨 scope 组合（local→空global / global→空local / global→非空local / local→非空global）全部 `bad-token` 且全 runtime 树字节零差异。
+- **其它 must-fix**：local 后继 prompt 带 `local:true`+同地址；home→local fail-closed（与 `master-attach --local` 不冲突）；local transfer 不碰 global succession（字节不变）；四要素回报（旧/新 sid12+gen、token 消费时刻）；transfer-window marker 抑制 reclaim/takeover（humanCancel 越过）。
+- **残余**：窗口 marker TTL 24h；多 daemon 并发假设（当前为单 daemon 迁移）；global 路径行为有源码变化（签名/record/spawn cwd）但 12 项回归绿。
 
 ### Item 36 - 微信出站回复 W3a–W3d
 
