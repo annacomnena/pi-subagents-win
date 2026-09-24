@@ -144,6 +144,7 @@ import {
 	type WechatFetch,
 } from "./wechat-bind.ts";
 import { ChannelSupervisor } from "./channel-supervisor.ts";
+import { startWechatInput } from "./wechat-input.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
 import {
@@ -536,6 +537,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const wechatRuntimeDir = opts.wechatRuntimeDir !== undefined ? opts.wechatRuntimeDir : defaultRuntimeDir();
 	const wechatStore = new WechatStore(WechatStore.resolveDir(wechatRuntimeDir));
 	const channelSupervisor = new ChannelSupervisor({ runtimeDir: wechatRuntimeDir, configPath });
+	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -1264,6 +1266,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				server,
 				info,
 				close: async () => {
+					stopWechatInput();
 					// 0923 wechat：停有界绑定流程（不动磁盘——bound 凭据跨重启保留）
 					try {
 						wechat.dispose();

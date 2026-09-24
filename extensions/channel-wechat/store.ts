@@ -135,7 +135,7 @@ function atomicWrite0600(path: string, body: string): void {
 }
 
 /** msgId → 安全文件名（防路径穿越/非法字符；djb2 短哈希防脱敏碰撞）。 */
-function inboxFileName(msgId: string): string {
+export function inboxFileName(msgId: string): string {
 	const safe = msgId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
 	let h = 5381;
 	for (let i = 0; i < msgId.length; i++) {

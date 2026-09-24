@@ -185,6 +185,24 @@ export const readWechatConfigPath = defaultPkgConfigPath;
 /** `channels.wechat.receive.enabled === true`？缺省 false（W1 规格 §3 D7：opt-in 零行为
  *  变化——不 spawn worker、不开长轮询、不写 inbox）。缺段/不可读/坏 JSON → false
  *  （never-throw，与 readWechatEnabled 同口径）。只管接收 worker；不影响绑定面 enabled。 */
+export interface WechatInputConfig { enabled: boolean; allowFrom: string[] }
+
+/** W2 input opt-in; never-throw and fail-closed. */
+export function readWechatInputConfig(configPath: string): WechatInputConfig {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+			channels?: { wechat?: { input?: { enabled?: unknown; allowFrom?: unknown } } };
+		};
+		const input = raw?.channels?.wechat?.input;
+		return {
+			enabled: input?.enabled === true,
+			allowFrom: Array.isArray(input?.allowFrom) ? input.allowFrom.filter((x): x is string => typeof x === "string") : [],
+		};
+	} catch {
+		return { enabled: false, allowFrom: [] };
+	}
+}
+
 export function readWechatReceiveEnabled(configPath: string): boolean {
 	try {
 		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {

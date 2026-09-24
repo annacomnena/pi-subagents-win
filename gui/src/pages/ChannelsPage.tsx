@@ -193,7 +193,7 @@ function ReceiveBlock() {
 
 	if (failed && worker === null) {
 		return (
-			<Card title={<Term zh="收到的消息" en="inbox" hint="W1 只读投影；加载失败时重试" />}>
+			<Card title={<Term zh="收到的消息" en="inbox" hint="W1 接收；W2 注入需 channels.wechat.input.enabled" />}>
 				<EmptyState>暂无法加载收到的消息（daemon 可能未在线）。</EmptyState>
 			</Card>
 		);
@@ -236,9 +236,9 @@ function ReceiveBlock() {
 									<span>{m.nickname ?? m.from}</span>
 									<RelTime at={m.receivedAt} />
 									{m.state === "pending" ? (
-										<Badge tone="yellow" title="W1 只持久化，不向任何 pi 会话注入；注入是 W2 且需六条件显式 opt-in">尚未注入（W2 未启用）</Badge>
+										<Badge tone="yellow" title="注入需 channels.wechat.input.enabled 且满足准入条件">尚未注入</Badge>
 									) : (
-										<Badge tone="green">{m.state}</Badge>
+										<Badge tone="green">{m.state === "injected" ? "已注入" : m.state}</Badge>
 									)}
 									{m.artifactPending === true && <Badge tone="gray">附件待处理</Badge>}
 								</div>
