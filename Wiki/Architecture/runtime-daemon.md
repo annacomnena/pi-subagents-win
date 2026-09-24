@@ -44,6 +44,29 @@ source_paths:
 
 **未做**：worker-only restart（可选，SKIP）；`restart --force extra`/`-f` 落到用法提示（fail-closed，无误触发）。
 
+## 派生形状更正：`windowsHide` 必须 true（2026-09-24 真机对照实测）
+
+**用户现象**：daemon 每次启动都**必定弹一个终端窗口**（Win11 把新控制台交给 Windows Terminal，表现为一个标题为 `C:
+vm4w
+odejs
+ode.exe` 的 WT 窗口）。
+
+**旧结论（已被推翻）**：`daemon-lifecycle.ts` 原注释称"DETACHED_PROCESS 与 CREATE_NO_WINDOW 不可叠用，故 windowsHide 必须 false"。该结论**对 daemon 这种单进程派生是错的**。
+
+**实测方法**：`EnumWindows` 枚举**可见窗口**（含类名/标题/pid）+ 子进程存活检查；四种形状各起一个 20s 的 node：
+
+| 变体 | 出现窗口 | 父进程退出后存活 |
+|---|---|---|
+| `detached:true + windowsHide:true` | **不出现** | **存活** ✅ |
+| `detached:true + windowsHide:false`（旧现状） | **出现**（= 用户看到的现象） | 存活 |
+| `detached:false + windowsHide:true` | 不出现 | **死亡**（不满足） |
+
+⇒ **修法**：daemon 用 `{detached:true, stdio:'ignore', windowsHide:true}`。
+**连带必修**：旧"孙进程各自 alloc 新控制台"风险的真实来源是 **daemon 的子进程** —— `channel-supervisor.ts` 的 worker spawn 也必须 `windowsHide:true`，否则 daemon 无控制台时 worker 会自己开一个窗口。
+**验证**：重启后可见控制台窗口数 **4 → 3**（daemon 窗口消失），daemon 存活（`/v1/health` 200）、worker 正常 spawn 且**无新增窗口**；worker 只有 1 个（`worker.json` pid 与 daemon 子进程一致）。
+
+**教训**：`windowsHide` 与 `detached` 的兼容性**必须按"本进程 + 它的子进程"两层分别实测**，不能靠一次探针或历史注释外推。
+
 ## Evidence
 
 - `extensions/runtime-host/server.ts#L1-L51` — 模块头注释（职责、fail-closed、不变量）。

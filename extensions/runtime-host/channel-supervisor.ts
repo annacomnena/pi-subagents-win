@@ -4,7 +4,7 @@
  * 规格：plans/0924_wechat_receive_w1_spec.md §2/§4。职责（D14：长驻长轮询走受监督 worker）：
  *   - 按配置 spawn/停止 worker 子进程：`channels.wechat.enabled` **且** `channels.wechat.receive.enabled`
  *     （缺省 false，D7 零行为变化）**且** 凭据存在 → spawn；任一不满足 → 收掉。
- *   - spawn 形状照抄 daemon-lifecycle.defaultSpawnDaemon（stdio:'ignore'、windowsHide:false、
+ *   - spawn 形状照抄 daemon-lifecycle.defaultSpawnDaemon（stdio:'ignore'、windowsHide:true、
  *     cwd=dirname(workerPath)、env:{...process.env, PI_RUNTIME_DIR}），但**不 detached、不 unref**：
  *     daemon 必须能收掉 worker（不变量 §4.7 第一层 = stop()/close 钩子 + 进程 exit 兜底 kill；
  *     第二层 = worker 自身父进程死亡看门狗，channel-wechat/index.ts）。
@@ -81,13 +81,15 @@ function defaultWorkerPath(): string {
 }
 
 function defaultSpawnWorker(o: { workerPath: string; runtimeDir: string; configPath: string }): WorkerSpawnHandle {
-	// 形状照抄 daemon-lifecycle.defaultSpawnDaemon（stdio ignore / windowsHide:false / cwd / env 覆写），
+	// 形状照抄 daemon-lifecycle.defaultSpawnDaemon（stdio ignore / windowsHide:**true** / cwd / env 覆写），
+	// windowsHide 必须 true（2026-09-24 实测）：daemon 本身以 detached+CREATE_NO_WINDOW 运行（无控制台），
+	// 若 worker 用 windowsHide:false，Windows 会为它 alloc 一个新控制台 → **用户看到一个终端窗口**。
 	// 差异仅两处（规格 §2）：不 detached（daemon 活着时 worker 随叫随收）、不 unref（持有 ChildProcess
 	// 句柄监听 exit 做退避重启）。env 只加 PI_RUNTIME_DIR + config 路径——**绝无凭据**。
 	traceSpawn("console-child", `channel-wechat worker spawn exec=${process.execPath} worker=${o.workerPath}`);
 	const child: ChildProcess = spawn(process.execPath, ["--experimental-strip-types", o.workerPath], {
 		stdio: "ignore",
-		windowsHide: false,
+		windowsHide: true,
 		cwd: dirname(o.workerPath),
 		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir, PI_CHANNEL_WECHAT_CONFIG: o.configPath },
 	});

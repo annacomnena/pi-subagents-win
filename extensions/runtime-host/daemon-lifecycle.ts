@@ -12,7 +12,8 @@
  *     身份不符/锁被活持有人占用 → `uncertain`，**禁止**按 host.json pid 盲目 kill
  *     或覆盖活锁。 wedged daemon 恢复路径：确认归属后 `stopRuntimeDaemon({force:true})`
  *    （legacy 裸 kill 分支，显式opt）再 ensure。
- *   - spawn 形状 §2.1：`{detached:true, stdio:'ignore', windowsHide:false}` + `unref()`
+ *   - spawn 形状：`{detached:true, stdio:'ignore', windowsHide:true}` + `unref()`（windowsHide
+ *     必须 true——见 `defaultSpawnDaemon` 的实测注释：false 会以 WT 窗口形式弹控制台）。
  *     （见 defaultSpawnDaemon 注释：DETACHED_PROCESS 与 CREATE_NO_WINDOW 不可叠用）。
  *
  * 本模块不碰任何共享写账本（mailbox/journal/receipts/timers/registry），只读写
@@ -146,17 +147,22 @@ export interface DaemonSpawnHandle {
 }
 
 function defaultSpawnDaemon(o: { serverPath: string; runtimeDir: string }): DaemonSpawnHandle {
-	// §2.1：detached:true（DETACHED_PROCESS）→ daemon 活过派生它的 WT 标签页/窗口关闭；
-	// windowsHide 必须 false：DETACHED_PROCESS 与 CREATE_NO_WINDOW（windowsHide:true）
-	// 在 Win32 不可叠用——同用时 CREATE_NO_WINDOW 被忽略，子进程又回到无控制台、
-	// 短命孙进程各自 alloc 新控制台的老路（此前 windowsHide:true 方案见 git 历史）。
-	// 空壳 WT 风险改由 G0 真机验证（关标签/关窗口 0 新增窗口，scripts/verify-runtime-g0.ps1）。
-	// unref：pi 退出不连带杀 daemon（隐藏与否属于 daemon 自身控制台）。
+	// §2.1：detached:true（DETACHED_PROCESS）→ daemon 活过派生它的 WT 标签页/窗口关闭。
+	// windowsHide 必须 **true**（CREATE_NO_WINDOW）——**2026-09-24 真机对照实测推翻旧注释**：
+	//   旧注释称“DETACHED_PROCESS 与 CREATE_NO_WINDOW 不可叠用”；实测（EnumWindows 枚举可见窗口）：
+	//     A `detached:true + windowsHide:true`  → **不出现窗口** + 父进程退出后 **存活**（两条件均满足）
+	//     B `detached:true + windowsHide:false` → **出现窗口**（Win11 把新控制台交给 Windows Terminal，
+	//       表现为一个标题为 node.exe 路径的 WT 窗口——用户实际看到的现象）
+	//     C `detached:false + windowsHide:true` → 不出现窗口但**随父进程死亡**（不满足存活）
+	// 旧“孙进程各 alloc 新控制台”风险的真实来源不是本进程，而是**daemon 的子进程**：因此
+	// `channel-supervisor.ts` 的 worker spawn 也必须 windowsHide:true（否则 daemon 无控制台时
+	// worker 会自己 alloc 一个窗口）。
+	// unref：pi 退出不连带杀 daemon。
 	traceSpawn("console-child", `runtime-daemon spawn exec=${process.execPath} server=${o.serverPath}`);
 	const child = spawn(process.execPath, ["--experimental-strip-types", o.serverPath], {
 		detached: true,
 		stdio: "ignore",
-		windowsHide: false,
+		windowsHide: true,
 		cwd: dirname(o.serverPath),
 		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir },
 	});
