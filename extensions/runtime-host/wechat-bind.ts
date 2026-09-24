@@ -3,7 +3,7 @@
  *
  * 计划：plans/0923_wechat_gui_bind_plan.md（阶段 2 切片）+ D14 进程放置（daemon 内有界异步任务，
  * 不进事件循环、不起独立 worker）：取码 1 次（10s 超时）+ ≤120s/2.5s 轮询 + 结束即释放；
- * AbortController 可取消。长驻长轮询通道仍走受监督 worker（后续切片）。
+ * 长驻长轮询通道走受监督 worker（runtime-host/channel-supervisor.ts + channel-wechat/，0924 W1）。
  *
  * 协议契约（源码已验证，见 Wiki/Architecture/wechat-ilink-channel.md#登录/绑定协议契约）：
  *   - 取码：GET {base}/ilink/bot/get_bot_qrcode?bot_type=3
@@ -181,6 +181,20 @@ export function readWechatEnabled(configPath: string): boolean {
 
 /** 缺省 config 路径（包根 config.json；与 readGuiEnabled 同源，独立 re-export 供 server 测试）。 */
 export const readWechatConfigPath = defaultPkgConfigPath;
+
+/** `channels.wechat.receive.enabled === true`？缺省 false（W1 规格 §3 D7：opt-in 零行为
+ *  变化——不 spawn worker、不开长轮询、不写 inbox）。缺段/不可读/坏 JSON → false
+ *  （never-throw，与 readWechatEnabled 同口径）。只管接收 worker；不影响绑定面 enabled。 */
+export function readWechatReceiveEnabled(configPath: string): boolean {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+			channels?: { wechat?: { receive?: { enabled?: unknown } } };
+		};
+		return raw?.channels?.wechat?.receive?.enabled === true;
+	} catch {
+		return false;
+	}
+}
 
 const cfgErrMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 

@@ -106,6 +106,155 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 	);
 }
 
+/** W1（0924）收到的消息：worker 状态 + inbox 只读投影（脱敏在 server 端点层完成）。 */
+interface WechatWorkerStatusBody {
+	enabled: boolean;
+	required: boolean;
+	running: boolean;
+	status: "disconnected" | "polling" | "connected" | "auth_required" | "uncertain";
+	lastPollAt: string | null;
+	backlog: number;
+	dedupeSize: number;
+	lastError: string | null;
+}
+
+interface WechatInboxBody {
+	version: number;
+	count: number;
+	messages: {
+		msgId: string;
+		from: string;
+		nickname: string | null;
+		text: string;
+		receivedAt: string;
+		state: "pending" | "injected" | "rejected";
+		artifactPending?: boolean;
+	}[];
+}
+
+const WORKER_STATUS_LABEL: Record<WechatWorkerStatusBody["status"], string> = {
+	disconnected: "未运行",
+	polling: "轮询中",
+	connected: "已连接",
+	auth_required: "需重新扫码",
+	uncertain: "状态不确定",
+};
+
+const WORKER_STATUS_TONE: Record<WechatWorkerStatusBody["status"], "gray" | "blue" | "green" | "red" | "yellow"> = {
+	disconnected: "gray",
+	polling: "blue",
+	connected: "green",
+	auth_required: "red",
+	uncertain: "yellow",
+};
+
+/** 同源只读拉取（never-throw；未进 api/client——W1 冻结路径纪律，只改本页）。 */
+async function fetchWechatReadonly<T>(path: string): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
+	const controller = new AbortController();
+	const timer = window.setTimeout(() => controller.abort(), 5000);
+	try {
+		const res = await fetch(path, { signal: controller.signal });
+		if (!res.ok) return { ok: false, status: res.status };
+		return { ok: true, data: (await res.json()) as T };
+	} catch {
+		return { ok: false, status: 0 };
+	} finally {
+		window.clearTimeout(timer);
+	}
+}
+
+/** 「收到的消息」只读区块（W1：只收不投——pending 一律标注「尚未注入（W2 未启用）」）。 */
+function ReceiveBlock() {
+	const [worker, setWorker] = useState<WechatWorkerStatusBody | null>(null);
+	const [inbox, setInbox] = useState<WechatInboxBody | null>(null);
+	const [failed, setFailed] = useState(false);
+
+	const refresh = useCallback(async (): Promise<void> => {
+		const [w, i] = await Promise.all([
+			fetchWechatReadonly<WechatWorkerStatusBody>("/v1/wechat/worker/status"),
+			fetchWechatReadonly<WechatInboxBody>("/v1/wechat/inbox?limit=20"),
+		]);
+		if (w.ok && i.ok) {
+			setWorker(w.data);
+			setInbox(i.data);
+			setFailed(false);
+		} else {
+			setFailed(true);
+		}
+	}, []);
+
+	useEffect(() => {
+		void refresh();
+		const t = window.setInterval(() => {
+			void refresh();
+		}, 5000);
+		return () => window.clearInterval(t);
+	}, [refresh]);
+
+	if (failed && worker === null) {
+		return (
+			<Card title={<Term zh="收到的消息" en="inbox" hint="W1 只读投影；加载失败时重试" />}>
+				<EmptyState>暂无法加载收到的消息（daemon 可能未在线）。</EmptyState>
+			</Card>
+		);
+	}
+	const st = worker?.status ?? "disconnected";
+	return (
+		<Card
+			title={<Term zh="收到的消息" en="inbox" hint="W1 只持久化+展示，不注入任何 pi 会话；token/完整发送者 ID 永不进浏览器" />}
+			right={<Badge tone={worker !== null && worker.enabled ? WORKER_STATUS_TONE[st] : "gray"}>{worker !== null && worker.enabled ? WORKER_STATUS_LABEL[st] : "接收未启用"}</Badge>}
+		>
+			<div className="space-y-2">
+				{worker !== null && !worker.enabled && (
+					<p className="text-xs text-foreground-subtle">
+						消息接收未启用（config <span className="font-mono">channels.wechat.receive.enabled</span> 缺省 false——显式 opt-in 后 daemon 才会拉取；本页为只读展示）。
+					</p>
+				)}
+				{worker?.status === "auth_required" && (
+					<p className="text-xs text-destructive">{worker.lastError ?? "bot_token 已失效"}：请解绑后重新扫码绑定（worker 已停止轮询，不会风暴重试）。</p>
+				)}
+				{worker?.status === "uncertain" && worker.lastError !== null && (
+					<p className="text-xs text-yellow-600">{worker.lastError}</p>
+				)}
+				{worker !== null && worker.enabled && (
+					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+						<dt className="text-foreground-subtle">轮询状态</dt>
+						<dd className="text-foreground">
+							{WORKER_STATUS_LABEL[worker.status]}；最近拉取 <RelTime at={worker.lastPollAt} />；待处理 {worker.backlog} 条
+						</dd>
+					</dl>
+				)}
+				{inbox !== null && inbox.messages.length === 0 && (
+					<EmptyState>暂无消息{worker !== null && worker.enabled ? "（长轮询静默期或无私聊文本）" : "（接收未启用）"}。</EmptyState>
+				)}
+				{inbox !== null && inbox.messages.length > 0 && (
+					<ul className="space-y-1.5">
+						{inbox.messages.map((m) => (
+							<li key={m.msgId} className="rounded border border-border bg-surface p-2">
+								<div className="flex flex-wrap items-center gap-2 text-[11px] text-foreground-subtle">
+									<span className="font-mono">{m.msgId}</span>
+									<span>{m.nickname ?? m.from}</span>
+									<RelTime at={m.receivedAt} />
+									{m.state === "pending" ? (
+										<Badge tone="yellow" title="W1 只持久化，不向任何 pi 会话注入；注入是 W2 且需六条件显式 opt-in">尚未注入（W2 未启用）</Badge>
+									) : (
+										<Badge tone="green">{m.state}</Badge>
+									)}
+									{m.artifactPending === true && <Badge tone="gray">附件待处理</Badge>}
+								</div>
+								<p className="mt-1 break-all text-xs text-foreground">{m.text}</p>
+							</li>
+						))}
+					</ul>
+				)}
+				<p className="text-[10px] leading-relaxed text-foreground-subtlest">
+					W1 只收不投：收到的消息仅持久化在本机私有 inbox 并在此只读展示（发送者 ID 前缀脱敏、正文截断）。
+				</p>
+			</div>
+		</Card>
+	);
+}
+
 export function ChannelsPage() {
 	const [status, setStatus] = useState<WechatBindStatusBody | null>(null);
 	const [disabled, setDisabled] = useState(false);
@@ -382,6 +531,9 @@ export function ChannelsPage() {
 					</div>
 				)}
 			</Card>
+
+			{/* W1（0924）：收到的消息只读区块（不注入；pending 明确标注 W2 未启用） */}
+			<ReceiveBlock />
 
 			{/* 7 项真网待测只读提示条（本切片只覆盖绑定链路；未知项不得当事实引用） */}
 			<Card title={<Term zh="真网待测" en="pending probes" hint="绑定链路之外的 7 个协议未知项，需真机微信测量" />}>

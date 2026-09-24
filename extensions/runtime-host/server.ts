@@ -136,10 +136,15 @@ import {
 	WechatBindManager,
 	WechatCancelledError,
 	WechatNoActiveSessionError,
+	readWechatCreds,
 	readWechatEnabled,
+	readWechatReceiveEnabled,
 	setWechatEnabled,
+	wechatCredsPath,
 	type WechatFetch,
 } from "./wechat-bind.ts";
+import { ChannelSupervisor } from "./channel-supervisor.ts";
+import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
 import {
 	RUNTIME_SCHEMA_VERSION,
@@ -525,6 +530,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		...(opts.wechatFetch !== undefined ? { fetchImpl: opts.wechatFetch } : {}),
 		...(opts.wechatPollIntervalMs !== undefined ? { pollIntervalMs: opts.wechatPollIntervalMs } : {}),
 	});
+	// 0924 W1：微信接收 worker 监督（D14：长驻长轮询走受监督 worker 子进程）。缺省零行为
+	// 变化（receive.enabled 缺省 false → 不 spawn）；仅读端点 /v1/wechat/{worker/status,inbox}
+	// 从私有 store 读投影（只读，不触发 poll/claim/注入）。token 永不进任何响应。
+	const wechatRuntimeDir = opts.wechatRuntimeDir !== undefined ? opts.wechatRuntimeDir : defaultRuntimeDir();
+	const wechatStore = new WechatStore(WechatStore.resolveDir(wechatRuntimeDir));
+	const channelSupervisor = new ChannelSupervisor({ runtimeDir: wechatRuntimeDir, configPath });
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -856,6 +867,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		error: "unauthorized",
 		hint: "/v1/wechat/* 需本机 token：X-Command-Token header（host token 本体）或 Cookie sw_host_token / sw_gui_token（token 见 runtime 目录 host.json）",
 	};
+	// MF2（0924 L4 复核）：receive opt-in 闸体——两个 W1 只读端点另检 channels.wechat.receive.enabled
+	//（缺省 false，D7 零侵入）；wechat.enabled=true 但 receive.enabled=false → 403（与既有 opt-in
+	// 403 同语义），且零副作用（闸在 stats/readInbox 之前，不触 sync、不读写 store）。
+	const WECHAT_RECEIVE_DISABLED_BODY: Record<string, unknown> = {
+		error: "wechat-receive-disabled",
+		hint: "微信消息接收未启用：设 config.json channels.wechat.receive.enabled=true（缺省 false，零行为变化）",
+	};
 	const drainWechatBody = (req: IncomingMessage): void => {
 		let size = 0;
 		req.on("data", (c: Buffer) => {
@@ -883,6 +901,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				respondJson(res, 500, { error: "config-write-failed", message: w.error ?? "config.json 写入失败", enabled: readWechatEnabled(configPath) });
 				return;
 			}
+			// W1 联动：enable/disable 后对账 worker（sync 幂等：应运行且未运行 → spawn；不应 → 收掉）
+			void channelSupervisor.sync();
 			respondJson(res, 200, { enabled: readWechatEnabled(configPath) });
 			return;
 		}
@@ -938,10 +958,60 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			// 解绑 = 取消在途 + unlink 凭据（不留空壳）→ 回 idle；removed = 是否删到了文件
 			drainWechatBody(req);
 			const removed = wechat.unbind();
+			// W1 联动：凭据已删 → supervisor 对账收掉 worker（不应运行）
+			void channelSupervisor.sync();
 			respondJson(res, 200, { ...wechat.getState(), removed });
 			return;
 		}
-		respondJson(res, 405, { error: "method-not-allowed", hint: "/v1/wechat/*：POST enable | disable | bind/start | bind/cancel | unbind；GET bind/status | bind/qr-image" });
+		// MF2（0924 L4 复核）：两个 W1 只读端点在鉴权 + wechat.enabled 闸之后另检
+		// channels.wechat.receive.enabled——false → 403，不谈 stats/readInbox（零副作用）。
+		// 仅拦 GET（非 GET 方法保持既有 405 语义）；绑定面端点行为不变。
+		if ((p === "/v1/wechat/worker/status" || p === "/v1/wechat/inbox") && req.method === "GET" && !readWechatReceiveEnabled(configPath)) {
+			respondJson(res, 403, WECHAT_RECEIVE_DISABLED_BODY);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		// W1 只读端点：worker 状态投影（脱敏：无 token/正文；不触发 poll/claim/注入，§4.8）
+		if (p === "/v1/wechat/worker/status" && req.method === "GET") {
+			const st = wechatStore.stats();
+			const sup = channelSupervisor.status();
+			respondJson(res, 200, {
+				version: 1,
+				enabled: readWechatEnabled(configPath) && readWechatReceiveEnabled(configPath),
+				required: readWechatEnabled(configPath) && readWechatReceiveEnabled(configPath) && readWechatCreds(wechatCredsPath(wechatRuntimeDir)) !== null,
+				running: sup.running,
+				status: st.status,
+				lastPollAt: st.lastPollAt,
+				backlog: st.backlog,
+				dedupeSize: st.dedupeSize,
+				lastError: st.lastError,
+			});
+			return;
+		}
+		// W1 只读端点：脱敏 inbox 列表（from 前缀脱敏 / text 截断；state=pending 即「尚未注入」）
+		if (p === "/v1/wechat/inbox" && req.method === "GET") {
+			const qRaw = u.searchParams.get("limit");
+			const qn = qRaw !== null ? Number(qRaw) : NaN;
+			const limit = Number.isInteger(qn) && qn > 0 ? Math.min(qn, 200) : 50;
+			const recs = wechatStore.readInbox(limit);
+			const maskFrom = (id: string): string => (id.length <= 6 ? `${id.slice(0, 1)}…` : `${id.slice(0, 4)}…`);
+			const trunc = (t: string): string => (t.length > 80 ? `${t.slice(0, 80)}…` : t);
+			respondJson(res, 200, {
+				version: 1,
+				count: recs.length,
+				messages: recs.map((r: InboundRecord) => ({
+					msgId: r.msgId,
+					from: maskFrom(r.fromId),
+					nickname: r.fromNickname,
+					text: trunc(r.text),
+					receivedAt: r.receivedAt,
+					state: r.state,
+					...(r.artifactPending === true ? { artifactPending: true } : {}),
+				})),
+			});
+			return;
+		}
+		respondJson(res, 405, { error: "method-not-allowed", hint: "/v1/wechat/*：POST enable | disable | bind/start | bind/cancel | unbind；GET bind/status | bind/qr-image | worker/status | inbox" });
 	};
 
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
@@ -1184,6 +1254,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			} catch {
 				/* 启动扫描失败不炸 host */
 			}
+			// 0924 W1：接收 worker 监督启动（初始 sync + 周期对账；receive.enabled 缺省 false → 零行为）
+			try {
+				channelSupervisor.start();
+			} catch {
+				/* 监督面 never-throw：启动失败不炸 host */
+			}
 			resolvePromise({
 				server,
 				info,
@@ -1194,6 +1270,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					} catch {
 						/* ignore */
 					}
+				// 0924 W1：先收掉接收 worker 子进程（不变量 §4.7：daemon 退出不留孤儿），再关 server
+				try {
+					await channelSupervisor.dispose();
+				} catch {
+					/* 监督面 never-throw */
+				}
 					await new Promise<void>((r) => {
 						try {
 							server.close(() => r());
