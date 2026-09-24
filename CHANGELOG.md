@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (G-A frontier ⑤ 语义修复：`93f8447`/`fae1aa2`)
+
+- **latent bug（P0，`cd061cc` 反例）**：frontier ⑤（`needs_user`）曾消费 `snapshot.home/rows`（GUI 分页后投影，生产实参 `page=1/pageSize=20`）→ **>20 仓时页外 attention 仓漏触发 `needs_user`**（21 仓漏 1、40 仓漏 20），且**仅改显示排名会产生假边沿**（出页→入页仓 ⑤ `0→1`）——⑤ 触发集合成了显示排序/页码的函数，而非工作状态的函数。
+- **修复**：`collectGlobalView` 暴露**分页前全量投影** `GlobalViewSnapshot.attentionByRepo`（必填 `Record<string, number>`，键=`normalizeExactPath(repoPath)`，仅含 `attention>0` 条目，**缺项=0**，`Σ===totals.attention`）；frontier ⑤ 改为直接消费该投影（`frontier.ts#L201`/`#L216`），⑤ 算法体（`needsUser` 判据 / false→true 边沿）一行未改。
+- **GUI 分页契约未变**：`rows`/`cursor`/`formatGlobalView`/`globalViewLogic` 的 tool `details` 逐字节不变（`test:global-view` M1 `small=byte-identical`）；新字段不进 details。
+- **迁移**：schema 未变，双向切换共用同一 `state/autonomy/frontier.json`，**不清空 prev**；旧 prev 页外仓首帧每仓**一次性** `needs_user` 补报（已批准，靠既有 wake-gate debounce/cooldown 合并）。
+- **机器证据出处**：反例 `plans/0924_attention_window_bug_evidence.md`（四档 19/20/21/40：页外漏检 `0/0/1/20`、假边沿 `0/0/1/1`）；修复后全部归零 `extensions/_test_frontier_attention_window.ts`（18 checks：P0 十条翻转 + N1-N4 + M1/M2/M3 + normalizer tripwire K1）；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**（1 必须修 M2 已闭环）；`_test_graph_carriers.ts` 5/5（T5 golden 仅加性新增 `attentionByRepo` 一个键）。
+- **文档**：Wiki `Wiki/Architecture/work-graph-read-only-projection.md`；Recent Work Item 41。
+
 ## [Unreleased] — 2026-09-24 (E2.0 Graph 载体对齐 + 共享 carrier 归约：`7672771`/`ed5278a`/`c7b977a`)
 
 - **E2.0 载体对齐**：`GraphRunRef` 增 `gate`/`needsHuman`/`staleOver`/`overdue`/`pidAlive`（缺→null 不猜）；`GraphSnapshot.history` 为**仅观测载体，不参与 frontier 输入**（E2.1 `toFrontierInput` 恒 emit `[]`，MF1）；`state/work-graph/<scope>.json` 只读缓存（唯一写者 `graph/collect.ts`，version + carrier/history 子结构校验，tmp 名含 pid+时间戳+计数器）。仍为影子运行（零生产接线）。

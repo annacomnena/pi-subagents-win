@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） |
 | 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） |
 | 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） |
 | 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） |
@@ -49,6 +50,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 41 - G-A：frontier ⑤ 语义修复（消费分页前全量 attention，修 GUI 分页耦合 latent bug）
+
+- **日期**：2026-09-24
+- **一句话**：修 frontier ⑤（`needs_user`）的 **latent bug**——⑤ 曾消费 `snapshot.home/rows`（GUI 分页后投影，生产 `page=1/pageSize=20`）→ >20 仓时页外 attention 仓**漏触发** `needs_user`（21 仓漏 1、40 仓漏 20），且仅改显示排名会产生**假边沿**（⑤ 触发集合成了显示排序/页码的函数）。修复 = `collectGlobalView` 暴露**分页前全量投影** `GlobalViewSnapshot.attentionByRepo`（必填、缺项=0、`Σ===totals.attention`），frontier ⑤ 直接消费；GUI 分页契约逐字节不变。P0 反例证据 `cd061cc`，生产修复 `93f8447`，L4 必须修/建议修补强 `fae1aa2`。
+- **涉及模块**：`extensions/runtime/global-view.ts`（`GlobalViewSnapshot.attentionByRepo` 字段 + `#L539-L541` 切片前聚合 + 主/catch return）、`extensions/runtime/autonomy/frontier.ts`（`#L201`/`#L216` 改消费全量投影 + 缺项=0 注释）、`extensions/_test_frontier_attention_window.ts`（P0 十条翻转 + N1-N4 + M1/M2/M3 + K1 tripwire）、`extensions/_test_global_view.ts`（Σ 不变量三路径）、`extensions/_test_runtime_autonomy.ts`（`makeSnapshot`/A3.4 改新字段）、`extensions/_test_graph_carriers.ts`（T5 golden 加性新增一个键）
+- **产物**：`plans/0924_attention_window_bug_evidence.md` / `plans/0924_attention_semantics_fix_recon.md` / `plans/0924_attention_semantics_fix_plan.md` / `plans/0924_attention_semantics_fix_impl_report.md` / `plans/0924_attention_semantics_fix_l4_review.md` / `plans/0924_attention_semantics_fix_wrapup_report.md`
+- **Wiki**：更新正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（Current Contract 新增「G-A：attention 载体语义修复」节 + Open Questions 的 attention 待办标为已修复 + source_paths 补真实行号）
+- **Priority**：P0（bug 修复）
+- **Status**：done
+- **Commit**：`cd061cc`（P0 反例测试，断言 buggy 行为）+ `93f8447`（生产修复）+ `fae1aa2`（L4 必须修/建议修：M2 双向切换 + msv/Σ 不变量 + normalizer tripwire + 缺项=0 注释）
+- **Verification**：P0 反例四档数字（19/20/21/40 仓：页外漏检 `0/0/1/20`、假边沿 `0/0/1/1`）→ 修复后全部归零（`_test_frontier_attention_window.ts` 18/18：P0 十条翻转 + N1-N4 + M1/M2/M3 + K1）；`test:global-view` M1 byte-identical + Σ 三路径；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_carriers.ts` 5/5（T5 golden 仅加性新增 `attentionByRepo` 一个键）；`_test_runtime_graph.ts` 13/13 + runtime-projector/workstream/snapshot/tab-runs/wake/local-master 全绿；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**（1 必须修 M2 已闭环）。
 
 ### Item 40 - E2.0 Graph 载体对齐 + 共享 carrier 归约抽取
 
