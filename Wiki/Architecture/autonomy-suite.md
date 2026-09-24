@@ -66,6 +66,27 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **enabled 模式预期语义（R4）**：frontier 不消费 ws-mail 到信（`backlog` 只透传）→ ws-mail 到信不构成 frontier 触发 → 启用后 wake-gate 常态 no-wake（`record-only`）会压制本会 fire 的 legacy ws 唤醒；恢复 legacy 的正道 = **移除 config.json 的 autonomy 键**（kill 是压制而非恢复；clear 后需 frontier 出现真触发才放行）。
 - **回滚**：v1 等式（删 `autonomy/**` + 测试两路径）已失效；v2 回滚 = `git revert <v2-wiring-commit>`（单 commit 纪律）。回滚后 `state/autonomy/` 数据成为惰性缓存/日志；kill engaged 时 legacy 唤醒不受影响（D-E），语义自洽。
 
+## 开关可达化（D17）+ **R4 已修**（`3d8409f`）
+
+**用户要求**：主动性套件也要能在设置里开（此前 `/autonomy` 只有 `status|kill|clear`，注释自述"启用需手改 config.json"；`config.json` 里也没有该段 ⇒ 界面上等于没有开关）。
+
+### A1（前置，必须先做）：R4 —— ws-mail 到信成为 frontier 触发
+计划风险表 R4：frontier v1 不消费 backlog ⇒ `enabled=true` 时 wake-gate 判 `no-meaningful-change` 而**压制**本来会 fire 的 legacy 唤醒（**打开开关反而更差**）。
+**修法**：`extensions/runtime/autonomy/frontier.ts` 对 `pending>0` 的 backlog 产生非近似 `ws_mail_backlog` trigger（**不消费/不 ack/不动 mailbox**，仍只影响"是否放行 legacy 唤醒"）。
+**L4 装配层实测**（自写 stub 走 `evaluateAutonomyWakeGate`）：到信 `t0+30s → proceed=true reason=ordinary`（真放行）；该信改 `claimed` 后 `proceed=false reason=record-only`（**不误触发**）；并把**改动前的实现并排 import** 做 6 组输入逐字节比对（6/6 相同 ⇒ 无到信时零回归）。
+
+### A2 开关（TUI + HTTP + GUI）
+- `extensions/runtime-host/autonomy-config.ts::setAutonomyEnabled`：原子 read-modify-write、保留其它字段、幂等、写失败如实报错
+- TUI `/autonomy on|off|status`（保留 `kill|clear`）；子 agent 会话拦截（与 kill/clear 对齐）+ 翻转留审计行
+- HTTP `GET /v1/autonomy/status`（**D17a 四要素**：enabled / kill / frontier 快照时间 / wake-gate 最近判定）+ `POST /v1/autonomy/set`（鉴权沿用 `authorizeCommand`，未认证 401）
+- GUI 设置区「主动性套件」卡片 + **诚实文案**："当前不执行任何自动动作"
+
+### A3 awayMode 空壳
+`autonomy.awayMode.enabled` 被解析但**无任何生产消费者** ⇒ 保留字段但 GUI 明确标注"未实现（保留字段）"，且**不提供开关**（不让界面出现按了没反应的按钮）。
+
+### L4 收口抓到的 D17 违背（值得记）
+`AutonomySettings` 原先**只在最终 return 渲染**，而 ChannelsPage 有 `disabled`(403)/`unauthorized`(401) 两个提前 return ⇒ **默认配置下开关完全不可见**（服务端端点本身没问题，是 GUI 挂载位置把它埋进 wechat 闸后）。已提到两个早退分支顶部。**教训**：D17 的验收必须覆盖"默认配置 + 各错误态"，只看正常态会漏。
+
 ## Evidence
 
 - v1：`extensions/_test_runtime_autonomy.ts` A1–A11 断言（含"测试不触真实 `~/.pi/agent/runtime`"隔离断言）；提交 `3922ef4`；L4 复核 `plans/0923_autonomy_suite_v1_review.md`（PASS，must-fix 0）。

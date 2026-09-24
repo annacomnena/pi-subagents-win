@@ -31,6 +31,7 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 32 | P1 | autonomy 开关界面可达（D17）+ **前置修 R4**（ws-mail 到信成为 frontier 触发，已实现 `3d8409f`） | none | A4 `/wechat on|off|status`；audit 轮转（R5） |
 | 31 | P1 | 修 daemon 弹终端窗口（spawn 形状 windowsHide:false → true，含 worker 连带修） | none | —（已完成） |
 | 30 | P2 | `/runtime-host restart [--force]`（用户提出；已实现 `1743061`） | none | worker-only restart（可选，SKIP） |
 | 29 | P1 | 微信输入 W2b：GUI 开关 + 白名单（hash id 可维护）+ 「为什么没进来」反馈（已实现 `18ba74d`） | Item 28 | 真机验证被**平台侧**阻塞（消息不进长轮询队列）→ 待用户核对推送/webhook 配置 |
@@ -40,6 +41,20 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 32 - autonomy 开关界面可达（D17）+ 前置修 R4
+
+- **日期**：2026-09-24
+- **一句话**：用户要求"主动话套件也要能在设置中开启"。**先修 R4**（否则开关一开反而压制唤醒），再给开关：`/autonomy on|off` + HTTP 端点 + GUI 卡片（含 D17a 四要素反馈与"当前不执行任何自动动作"的诚实文案）；`awayMode` 空壳明确标注"未实现"。
+- **涉及模块**：`extensions/runtime/autonomy/frontier.ts`（A1）、新增 `extensions/runtime-host/autonomy-config.ts`、`extensions/index.ts`（最小 hunk）、`extensions/runtime-host/server.ts`（端点）、`gui/src/pages/ChannelsPage.tsx`、三个测试文件
+- **产物**：`plans/0924_autonomy_switch_spec.md`、`plans/0924_autonomy_switch_impl_report.md`、`plans/0924_autonomy_switch_l4_review.md`（PASS-with-must-fix）
+- **Wiki**：`Wiki/Architecture/autonomy-suite.md` → 「开关可达化 + R4 已修」
+- **Priority**：P1
+- **Status**：done（`3d8409f`）
+- **Commit**：`3d8409f`
+- **Verification**：A1 由 L4 在**装配层**实测放行 + 改动前实现并排逐字节比对（6/6）；`_test_runtime_autonomy`(57)、`_test_autonomy_switch`（保留字段/幂等/写失败无半写）、`_test_runtime_host_server`（401/写入/status 四要素）、`_test_runtime_commands`、`_test_register_graph`、smoke、GUI tsc/build 全绿。
+- **L4 抓到的 D17 违背（已修）**：GUI 卡片原先只在最终 return 渲染 ⇒ 默认配置（wechat 403）与未授权（401）两个早退分支下**开关完全不可见**。教训：D17 验收必须覆盖"默认配置 + 各错误态"。
+- **残余**：R5 audit 无轮转（~1MB/天）；`enabled=true` 时长期 pending 到信是否导致 trigger 重复（L4 已列为观察项）；config 写入无锁（与 setWechatEnabled 同款先例）。
 
 ### Item 31 - 修 daemon 必定弹终端窗口（spawn 形状更正 + worker 连带修）
 
