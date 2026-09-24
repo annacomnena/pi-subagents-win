@@ -33,6 +33,7 @@ source_paths:
 - [[Hotspot 工作集]] — v4 短期工作集 projection：采集、衰减、注入门与 lookup（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
 - [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
+- [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff，零接线影子）（`status: current`）
 
 ## Links Out
 
@@ -48,6 +49,7 @@ source_paths:
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 - [[Wake 回信（round-trip 回执）]]
+- [[Work Graph 只读关系面]]
 
 ## Backlinks
 
@@ -63,6 +65,7 @@ source_paths:
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 - [[Wake 回信（round-trip 回执）]]
+- [[Work Graph 只读关系面]]
 
 ## Open Questions
 

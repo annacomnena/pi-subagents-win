@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） |
 | 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） |
 | 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
 | 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） |
@@ -47,6 +48,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 39 - E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线）
+
+- **日期**：2026-09-24
+- **一句话**：Work Graph 第一版（E1）落地为既有四对象（Master/Workstream/Task/Run）之上的**只读关系面**——journal + workstreams 显式库 + tab-runs 账本只读引用 → 纯投影 `projectGraph` + 引用式边（task→workstream / run→externalTaskId|subject / workstream→repoPath 弱载体）+ `diffGraph(since)`；边界裁定 (a)：是既有真相源的投影与求值器，**不替代** tab-runs 判态机 / recentwork；影子运行（零生产接线，单 commit 可 revert）。L4 独立审查 PASS（0 必须修 / 5 建议修）；L5 收尾落地建议修（去死参数、T13 恒等断言→手构快照、`isPathShapedRef` 补例）+ 文档收尾。
+- **涉及模块**：`extensions/runtime/graph/{types,project,edges,diff,collect,index}.ts`（新增 7 文件）、`extensions/_test_runtime_graph.ts`（13 组）
+- **产物**：`plans/0924_graph_E1_impl_plan.md` / `plans/0924_graph_E1_recon.md` / `plans/0924_graph_E1_l4_review.md` / `plans/0924_graph_E1_impl_report.md` / `plans/0924_graph_E1_wrapup_report.md`
+- **Wiki**：新建正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（`status: current`，只读关系面边界/契约/证据；`_index.md` 导航已收录）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`d54c09b`（E1 MVP）+ `97ef7e2`（L4 建议修）
+- **Verification**：`_test_runtime_graph.ts` 13/13 组绿（T9 10_000 事件 ~15ms / 预算 2000ms；含病态事件 Graph≡projector 等价断言）；回归 `test:runtime-projector` / `test:runtime-workstream` / `test:runtime-snapshot` / `test:tab-runs` 全绿 + `_test_runtime_autonomy.ts` 57 checks 绿；L4 审查 PASS。
 
 ### Item 38 - wake round-trip 回信（wake spawn prompt 带 deliverLetter RESULT 回信）
 

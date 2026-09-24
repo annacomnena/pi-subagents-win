@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (E1 Work Graph 只读关系面 MVP：`d54c09b`/`97ef7e2`)
+
+- **E1 只读关系面 MVP**：新增纯库 `extensions/runtime/graph/{types,project,edges,diff,collect,index}.ts` + `extensions/_test_runtime_graph.ts`（13 组）——既有四对象（Master/Workstream/Task/Run）之上的**只读关系面**：引用式边（`task→workstream` / `run→externalTaskId|subject` / `workstream→repoPath` 弱载体，**不做**声明式 `depends_on`）+ 纯投影 `projectGraph` + `diffGraph(since)`；`collect.ts` 唯一 IO，`graph/**` 零写路径。
+- **边界裁定 (a)**：Graph 是既有真相源的**投影与求值器，不是替代者**——不替代 tab-runs 判态机、不写 recentwork、不落盘（`state/work-graph` 归 E2）；影子运行（零生产接线，单 commit 可 revert；`RuntimeSnapshot v1`/`protocol.ts`/A10.1 allowlist 未变）。
+- **验收**：13 组测试绿（replay 等价 + 确定性 + 10k 事件 ~15ms）；回归 `test:runtime-projector`/`test:runtime-workstream`/`test:runtime-snapshot`/`test:tab-runs` + `_test_runtime_autonomy.ts`（57 checks）全绿；L4 独立审查 PASS。
+- **文档**：Wiki `Wiki/Architecture/work-graph-read-only-projection.md`；Recent Work Item 39；L4 建议修落地（去 `collect.ts` 死参数 `now`、T13 恒等断言→手构期望快照、`isPathShapedRef` 补「含 `/` 非绝对路径」用例）。
+
 ## [Unreleased] — 2026-09-24 (local Master 自动交接：`b0ff266`)
 
 - **local Master 自动交接**：`master-transfer` 支持 `--local`（仓库会话持 local 也能自动交接）；后继 prompt 携带 scope（`master-attach({token, local:true})` + 同一 local 地址）；home→local fail-closed；local transfer 不碰 global succession；四要素回报（旧/新 sid12+gen、token 消费时刻）；transfer-window marker 抑制 reclaim/takeover。
