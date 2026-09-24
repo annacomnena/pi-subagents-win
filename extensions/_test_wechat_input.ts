@@ -140,6 +140,7 @@ try {
 		const r1 = tryInjectPending(c.base);
 		assert.equal(r1.reason, "not-allowlisted");
 		assert.equal(c.store.readInbox(0).find((x: InboundRecord) => x.msgId === "m1")?.state, "rejected", "denied 记录标 rejected");
+		assert.equal(c.store.readInbox(0).find((x: InboundRecord) => x.msgId === "m1")?.rejectedReason, "not-allowlisted");
 		const n1 = c.auditLines().length;
 		const r2 = tryInjectPending(c.base);
 		assert.equal(r2.reason, "empty", "终态记录不再被选中");
@@ -286,8 +287,22 @@ try {
 		assert.equal(r.reason, "uncertain", "落盘失败必须报 uncertain");
 		assert.equal(r.injected, false);
 		assert.equal(c.store.readInbox(0)[0]?.state, "rejected", "失败记录标 rejected（不自动重试）");
+		assert.equal(c.store.readInbox(0)[0]?.rejectedReason, "write-failed");
+		assert.equal(c.store.reevaluateRejected([ALLOWED]), 0, "write-failed uncertain 不能复活");
 		const last = c.auditLines().at(-1) ?? "";
 		assert.ok(last.includes('"uncertain"'), `审计末行应为 uncertain：${last}`);
+	});
+
+	await check("T14 not-allowlisted 仍可复活；write-failed 和无原因拒绝不可复活", () => {
+		const c = ctx("reevaluation");
+		c.store.putInbox({ msgId: "denied", fromId: ALLOWED, fromNickname: null, text: "", receivedAt: "1", state: "rejected", rejectedReason: "not-allowlisted" });
+		c.store.putInbox({ msgId: "uncertain", fromId: ALLOWED, fromNickname: null, text: "", receivedAt: "2", state: "rejected", rejectedReason: "write-failed" });
+		c.store.putInbox({ msgId: "legacy", fromId: ALLOWED, fromNickname: null, text: "", receivedAt: "3", state: "rejected" });
+		assert.equal(c.store.reevaluateRejected([ALLOWED]), 1);
+		const states = new Map(c.store.readInbox(0).map((r) => [r.msgId, r.state]));
+		assert.equal(states.get("denied"), "pending");
+		assert.equal(states.get("uncertain"), "rejected");
+		assert.equal(states.get("legacy"), "rejected");
 	});
 
 	// 目录内容整体卫生：临时根下不得出现任何含 token 哨兵的文件
