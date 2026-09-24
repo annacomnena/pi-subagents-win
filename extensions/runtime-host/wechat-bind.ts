@@ -30,6 +30,7 @@
  */
 
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { defaultPkgConfigPath } from "../runtime/master-injection.ts";
@@ -186,6 +187,37 @@ export const readWechatConfigPath = defaultPkgConfigPath;
  *  变化——不 spawn worker、不开长轮询、不写 inbox）。缺段/不可读/坏 JSON → false
  *  （never-throw，与 readWechatEnabled 同口径）。只管接收 worker；不影响绑定面 enabled。 */
 export interface WechatInputConfig { enabled: boolean; allowFrom: string[] }
+
+export function wechatOpenIdHash(id: string): string { return createHash("sha256").update(id).digest("hex").slice(0, 12); }
+
+export function maskWechatOpenId(id: string): string {
+	return id.length > 10 ? `${id.slice(0, 6)}…${id.slice(-4)}` : `${id.slice(0, 2)}…${id.slice(-2)}`;
+}
+
+export function setWechatInputConfig(patch: { enabled?: boolean; allowFrom?: string[]; add?: string[]; remove?: string[] }, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {
+	let raw: Record<string, unknown>;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, error: "invalid config" };
+		raw = parsed as Record<string, unknown>;
+	} catch (e) { return { ok: false, error: `config read failed: ${cfgErrMsg(e)}` }; }
+	const channels = (raw.channels && typeof raw.channels === "object" && !Array.isArray(raw.channels) ? raw.channels : {}) as Record<string, unknown>;
+	const wechat = (channels.wechat && typeof channels.wechat === "object" && !Array.isArray(channels.wechat) ? channels.wechat : {}) as Record<string, unknown>;
+	const prior = (wechat.input && typeof wechat.input === "object" && !Array.isArray(wechat.input) ? wechat.input : {}) as Record<string, unknown>;
+	const input = { ...prior };
+	if (patch.enabled !== undefined) input.enabled = patch.enabled;
+	if (patch.allowFrom !== undefined) input.allowFrom = [...new Set(patch.allowFrom.filter(x => typeof x === "string").map(x => x.trim()).filter(Boolean))];
+	else if (patch.add !== undefined || patch.remove !== undefined) {
+		const ids = new Set(Array.isArray(input.allowFrom) ? input.allowFrom.filter((x): x is string => typeof x === "string") : []);
+		for (const id of patch.add ?? []) { const clean = id.trim(); if (clean) ids.add(clean); }
+		for (const hash of patch.remove ?? []) for (const id of ids) if (wechatOpenIdHash(id) === hash) ids.delete(id);
+		input.allowFrom = [...ids];
+	}
+	wechat.input = input; channels.wechat = wechat; raw.channels = channels;
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	try { writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n"); renameSync(tmp, path); return { ok: true }; }
+	catch (e) { try { unlinkSync(tmp); } catch {} return { ok: false, error: `config write failed: ${cfgErrMsg(e)}` }; }
+}
 
 /** W2 input opt-in; never-throw and fail-closed. */
 export function readWechatInputConfig(configPath: string): WechatInputConfig {

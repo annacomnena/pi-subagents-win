@@ -140,11 +140,17 @@ import {
 	readWechatEnabled,
 	readWechatReceiveEnabled,
 	setWechatEnabled,
+	setWechatInputConfig,
+	readWechatInputConfig,
+	maskWechatOpenId,
+	wechatOpenIdHash,
 	wechatCredsPath,
 	type WechatFetch,
 } from "./wechat-bind.ts";
 import { ChannelSupervisor } from "./channel-supervisor.ts";
 import { startWechatInput } from "./wechat-input.ts";
+import { readAttachment } from "../runtime/registry.ts";
+import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
 import {
@@ -908,9 +914,51 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			respondJson(res, 200, { enabled: readWechatEnabled(configPath) });
 			return;
 		}
+		// L4 MF-1（0924）：input/set **不得**置于 opt-in 闸之前——`wechat.enabled=false` 时必须与
+		// status/senders 同为 403（规格 §1）；此处无鸡生蛋问题（启用通道走 enable/disable）。
 		if (!readWechatEnabled(configPath)) {
 			respondJson(res, 403, WECHAT_DISABLED_BODY);
 			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if (p === "/v1/wechat/input/set" && req.method === "POST") {
+			let raw = "";
+			req.setEncoding("utf8");
+			req.on("data", (chunk: string) => { raw += chunk; });
+			req.on("end", () => {
+				try {
+					const body = JSON.parse(raw || "{}") as { enabled?: unknown; allowFrom?: unknown; add?: unknown; remove?: unknown };
+					if ((body.enabled !== undefined && typeof body.enabled !== "boolean") || (body.allowFrom !== undefined && (!Array.isArray(body.allowFrom) || body.allowFrom.some(x => typeof x !== "string"))) || (body.add !== undefined && (!Array.isArray(body.add) || body.add.some(x => typeof x !== "string"))) || (body.remove !== undefined && (!Array.isArray(body.remove) || body.remove.some(x => typeof x !== "string")))) { respondJson(res, 400, { error: "invalid-body" }); return; }
+					const result = setWechatInputConfig({ ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}), ...(Array.isArray(body.allowFrom) ? { allowFrom: body.allowFrom as string[] } : {}), ...(Array.isArray(body.add) ? { add: body.add as string[] } : {}), ...(Array.isArray(body.remove) ? { remove: body.remove as string[] } : {}) }, configPath);
+					// L4 MF-2（0924）：响应**不得**回显完整 openid（规格 §1：完整 openid 仅出现在
+					// /senders 与 GUI 内存）——改为与 status 同形的 {id, masked} 投影。
+					const cfg = readWechatInputConfig(configPath);
+					respondJson(res, result.ok ? 200 : 500, result.ok
+						? { enabled: cfg.enabled, allowFromCount: cfg.allowFrom.length, allowFrom: cfg.allowFrom.map((id) => ({ id: wechatOpenIdHash(id), masked: maskWechatOpenId(id) })) }
+						: { error: "config-write-failed" });
+				} catch { respondJson(res, 400, { error: "invalid-body" }); }
+			});
+			return;
+		}
+		if (!readWechatEnabled(configPath)) {
+			respondJson(res, 403, WECHAT_DISABLED_BODY);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if ((p === "/v1/wechat/input/status" || p === "/v1/wechat/senders") && req.method === "GET") {
+			const input = readWechatInputConfig(configPath);
+			if (p === "/v1/wechat/input/status") {
+				const att = readAttachment(masterAddress());
+				const timers = opts.timersDir ?? defaultTimersDir();
+				const alive = !!att && sessionAlive(timers, att.sessionId, new Date(), SESSION_HEARTBEAT_GRACE_MS);
+				let last: Record<string, unknown> = {};
+				try { const lines = readFileSync(join(wechatRuntimeDir, "state", "wechat-input-audit.jsonl"), "utf8").trim().split("\n"); last = JSON.parse(lines[lines.length - 1] || "{}"); } catch {}
+				respondJson(res, 200, { enabled: input.enabled, allowFrom: input.allowFrom.map(id => ({ id: wechatOpenIdHash(id), masked: maskWechatOpenId(id) })), allowFromCount: input.allowFrom.length, allowFromMasked: input.allowFrom.map(maskWechatOpenId), masterAlive: alive, ...(att ? { masterSid12: att.sessionId.slice(0, 12) } : {}), lastDecision: last.decision ?? null, lastReason: last.reason ?? null, lastAt: last.at ?? null });
+				return;
+			}
+			const grouped = new Map<string, { fromId: string; nickname: string | null; lastAt: string; msgCount: number }>();
+			for (const rec of wechatStore.readInbox(0)) { if (!rec.fromId) continue; const g = grouped.get(rec.fromId); if (!g) grouped.set(rec.fromId, { fromId: rec.fromId, nickname: rec.fromNickname, lastAt: rec.receivedAt, msgCount: 1 }); else { g.msgCount++; if (rec.receivedAt > g.lastAt) { g.lastAt = rec.receivedAt; g.nickname = rec.fromNickname; } } }
+			respondJson(res, 200, [...grouped.values()].sort((a,b) => b.lastAt.localeCompare(a.lastAt)).slice(0,20).map(x => ({ fromId: x.fromId, fromNicknameMasked: x.nickname, lastAt: x.lastAt, msgCount: x.msgCount, allowlisted: input.allowFrom.includes(x.fromId) })));
 			return;
 		}
 		if (p === "/v1/wechat/bind/start" && req.method === "POST") {

@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type FetchErr } from "../api/client";
 import type { WechatBindStatusBody, WechatQrImageBody } from "../api/types";
-import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term } from "../ui";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
 
 type UiState = "loading" | "idle" | "waiting" | "scanned" | "bound" | "expired" | "error";
 
@@ -253,6 +253,22 @@ function ReceiveBlock() {
 			</div>
 		</Card>
 	);
+}
+
+interface InputStatus { enabled: boolean; allowFrom: { id: string; masked: string }[]; masterAlive: boolean; masterSid12?: string; lastDecision: string | null; lastReason: string | null; lastAt: string | null }
+interface Sender { fromId: string; fromNicknameMasked: string | null; lastAt: string; msgCount: number; allowlisted: boolean }
+function InputBlock() {
+ const [status, setStatus] = useState<InputStatus | null>(null); const [senders, setSenders] = useState<Sender[]>([]);
+ const refresh = useCallback(async () => { const [s, a] = await Promise.all([fetchWechatReadonly<InputStatus>("/v1/wechat/input/status"), fetchWechatReadonly<Sender[]>("/v1/wechat/senders")]); if(s.ok) setStatus(s.data); if(a.ok) setSenders(a.data); }, []);
+ useEffect(() => { void refresh(); const t=window.setInterval(()=>void refresh(),5000); return ()=>window.clearInterval(t); },[refresh]);
+ const save = async (patch: {enabled?:boolean;allowFrom?:string[];add?:string[];remove?:string[]}) => { const r=await fetch("/v1/wechat/input/set",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(patch)}); if(r.ok) await refresh(); };
+ return <Card title="允许微信消息进入对话"><div className="space-y-3">
+ <p className="text-xs font-semibold text-destructive">开启后，白名单内的微信消息将作为你本人的输入进入当前 master 会话（单条一次批 + 脱敏审计）。</p>
+ <Toggle on={status?.enabled===true} onChange={v=>void save({enabled:v})} labels={["关闭","开启"]}/>
+ <div><p className="text-xs font-medium">白名单</p>{(status?.allowFrom.length??0)===0?<p className="text-xs text-destructive">未配置 = 拒绝所有（fail-closed）</p>:<ul>{status?.allowFrom.map(item=><li key={item.id}>{item.masked}<Button variant="ghost" onClick={()=>void save({remove:[item.id]})}>删除</Button></li>)}</ul>}</div>
+ <div><p className="text-xs font-medium">最近发送者</p>{senders.map(s=><div key={s.fromId} className="flex gap-2 text-xs"><span>{s.fromId.slice(0,6)}…{s.fromId.slice(-4)} {s.fromNicknameMasked??""} · {s.lastAt} · {s.msgCount} 条</span>{s.allowlisted?<Badge tone="green">已允许</Badge>:<Button variant="secondary" onClick={()=>void save({add:[s.fromId]})}>允许</Button>}</div>)}</div>
+ <p className="text-xs">为什么没进来：<span className={status?.masterAlive?"text-green-600":"text-destructive"}>{status?.masterAlive?"master 在线":"master 离线"}</span> · {status?.lastDecision??"暂无判定"} ({status?.lastReason??"—"}) · <RelTime at={status?.lastAt??null}/>{status?.masterAlive===false&&"；先 /gui open"}</p>
+ </div></Card>;
 }
 
 export function ChannelsPage() {
@@ -532,7 +548,8 @@ export function ChannelsPage() {
 				)}
 			</Card>
 
-			{/* W1（0924）：收到的消息只读区块（不注入；pending 明确标注 W2 未启用） */}
+			<InputBlock />
+			{/* W1（0924）：收到的消息只读区块 */}
 			<ReceiveBlock />
 
 			{/* 7 项真网待测只读提示条（本切片只覆盖绑定链路；未知项不得当事实引用） */}

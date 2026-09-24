@@ -1,0 +1,90 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readWechatInputConfig, setWechatInputConfig, maskWechatOpenId, wechatOpenIdHash } from "./runtime-host/wechat-bind.ts";
+import { createRuntimeHostServer } from "./runtime-host/server.ts";
+import { WechatStore } from "./channel-wechat/store.ts";
+import { touchSessionHeartbeat } from "./timers.ts";
+
+const dir = mkdtempSync(join(tmpdir(), "wechat-input-set-"));
+void (async () => { try {
+ const config = join(dir, "config.json");
+ const original = { models: { x: 1 }, channels: { wechat: { enabled: true, receive: { enabled: false }, input: { enabled: true, allowFrom: ["old"] } } } };
+ writeFileSync(config, JSON.stringify(original));
+ const unchangedFields = (value: any) => ({ models: value.models, enabled: value.channels.wechat.enabled, receive: value.channels.wechat.receive });
+ const beforeFields = unchangedFields(original);
+ const id1 = "wxid_secret_123456", id2 = "wxid_second_456789";
+ assert.equal(setWechatInputConfig({ allowFrom: [` ${id1} `, id1, "", "  ", id2] }, config).ok, true);
+ const afterFirst = JSON.parse(readFileSync(config, "utf8"));
+ assert.deepEqual(unchangedFields(afterFirst), beforeFields, "preserves models/channel/receive fields byte-equivalent as JSON values");
+ assert.deepEqual(readWechatInputConfig(config).allowFrom, [id1, id2], "trim, deduplicate and remove blanks");
+ const once = readFileSync(config, "utf8");
+ assert.equal(setWechatInputConfig({ allowFrom: [id1, id2] }, config).ok, true);
+ assert.deepEqual(readWechatInputConfig(config).allowFrom, [id1, id2]);
+ assert.equal(JSON.parse(readFileSync(config, "utf8")).channels.wechat.input.allowFrom.length, 2, "idempotent, no duplicates");
+ assert.equal(setWechatInputConfig({ add: [id2, " added "] , remove: [wechatOpenIdHash(id1)] }, config).ok, true);
+ assert.deepEqual(readWechatInputConfig(config).allowFrom, [id2, "added"], "add/remove hash composition");
+ assert.equal(maskWechatOpenId(id1), "wxid_s…3456");
+ assert.equal(wechatOpenIdHash(id1).length, 12);
+ assert.equal(JSON.stringify({ id: wechatOpenIdHash(id1), masked: maskWechatOpenId(id1) }).includes(id1), false);
+ // Endpoint-level tests use a real in-process HTTP server with only temporary paths.
+ const runtimeDir = join(dir, "runtime"); mkdirSync(runtimeDir, { recursive: true });
+ const timersDir = join(dir, "timers"); mkdirSync(timersDir, { recursive: true });
+ const host = await createRuntimeHostServer({ hostPath: join(dir, "host.json"), configPath: config, wechatRuntimeDir: runtimeDir, timersDir, stateDir: join(dir, "state"), journalPath: join(dir, "events.jsonl"), mailboxDir: join(dir, "mailbox"), sessionsDir: join(dir, "sessions"), distDir: join(dir, "dist") });
+ try {
+  const base = `http://127.0.0.1:${host.info.port}`; const token = host.info.token!;
+  const req = async (path: string, init: RequestInit = {}) => fetch(base + path, init);
+  const auth = { "X-Command-Token": token, "content-type": "application/json" };
+  const openid = "wxid_sentinel_complete_abcdef123456"; const tokenSentinel = "TOKEN_SENTINEL_NEVER_LOG";
+  writeFileSync(config, JSON.stringify({ models: { x: 1 }, channels: { wechat: { enabled: true, receive: { enabled: false } } } }));
+  assert.equal((await req("/v1/wechat/input/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) })).status, 401, "unauthenticated write is denied");
+  const post = async (body: unknown) => req("/v1/wechat/input/set", { method: "POST", headers: auth, body: JSON.stringify(body) });
+  assert.equal((await post({ enabled: true, allowFrom: [` ${openid} `, openid, "", "  "] })).status, 200);
+  assert.equal((await post({ add: [" second ", openid] })).status, 200);
+  assert.equal((await post({ remove: [wechatOpenIdHash("second")] })).status, 200);
+  assert.equal((await post({ allowFrom: [openid, " second "] })).status, 200);
+  const preserved = JSON.parse(readFileSync(config, "utf8")); assert.deepEqual(preserved.models, { x: 1 }); assert.equal(preserved.channels.wechat.enabled, true); assert.deepEqual(preserved.channels.wechat.receive, { enabled: false });
+  assert.deepEqual(preserved.channels.wechat.input.allowFrom, [openid, "second"]);
+  const onceHttp = JSON.stringify(preserved); const onceRes = await post({ allowFrom: [openid, "second"] }); assert.equal(JSON.stringify(JSON.parse(readFileSync(config, "utf8"))), onceHttp, "HTTP idempotence");
+  // L4 MF-2 锁：set 的成功响应**不得**回显完整 openid（只允许 {id, masked} 投影）
+  const onceBody = await onceRes.text(); assert.equal(onceBody.includes(openid), false, "MF-2: set 响应不得含完整 openid");
+  const onceJson = JSON.parse(onceBody); assert.deepEqual(Object.keys(onceJson.allowFrom[0]).sort(), ["id", "masked"]); assert.equal(onceJson.allowFromCount, 2);
+  const status0 = await req("/v1/wechat/input/status", { headers: { "X-Command-Token": token } }); assert.equal(status0.status, 200);
+  const statusBody = await status0.text(); assert.equal(statusBody.includes(openid), false); assert.equal(statusBody.includes(tokenSentinel), false);
+  const sj = JSON.parse(statusBody); assert.equal(sj.enabled, true); assert.deepEqual(Object.keys(sj.allowFrom[0]).sort(), ["id", "masked"]); assert.equal(sj.allowFrom[0].id, wechatOpenIdHash(openid));
+  const oldRuntime = process.env.PI_RUNTIME_DIR; process.env.PI_RUNTIME_DIR = runtimeDir;
+  const { attachMaster } = await import("./runtime/registry.ts");
+  assert.equal(attachMaster({ sessionId: "wechat-test-master" }).ok, true); touchSessionHeartbeat(timersDir, "wechat-test-master", new Date());
+  assert.equal((await (await req("/v1/wechat/input/status", { headers: { "X-Command-Token": token } })).json() as any).masterAlive, true);
+  touchSessionHeartbeat(timersDir, "wechat-test-master", new Date(Date.now() - 60000));
+  assert.equal((await (await req("/v1/wechat/input/status", { headers: { "X-Command-Token": token } })).json() as any).masterAlive, false);
+  mkdirSync(join(runtimeDir, "state"), { recursive: true }); writeFileSync(join(runtimeDir, "state", "wechat-input-audit.jsonl"), JSON.stringify({ at: "audit-time", decision: "denied", reason: "not-allowlisted" }) + "\n");
+  const sj2 = await (await req("/v1/wechat/input/status", { headers: { "X-Command-Token": token } })).json() as any; assert.equal(sj2.lastDecision, "denied"); assert.equal(sj2.lastReason, "not-allowlisted"); assert.equal(sj2.lastAt, "audit-time");
+  const store = new WechatStore(WechatStore.resolveDir(runtimeDir));
+  for (let i = 0; i < 25; i++) store.putInbox({ msgId: `m${i}`, fromId: i >= 23 ? "duplicate-sender" : `sender-${i}`, fromNickname: `nick-${i}`, text: "x", receivedAt: new Date(1700000000000 + i * 1000).toISOString(), state: "pending" });
+  const auditBefore = readFileSync(join(runtimeDir, "state", "wechat-input-audit.jsonl"), "utf8");
+  const sendersRes = await req("/v1/wechat/senders", { headers: { "X-Command-Token": token } }); const sendersText = await sendersRes.text(); const senders = JSON.parse(sendersText);
+  assert.equal(senders.length, 20); assert.equal(senders[0].fromId, "duplicate-sender"); assert.equal(senders.some((x: any) => x.fromId === "sender-0"), false); assert.equal(senders.find((x: any) => x.fromId === "duplicate-sender").msgCount, 2); assert.equal(sendersText.includes("sender-22"), true);
+  assert.equal(readFileSync(join(runtimeDir, "state", "wechat-input-audit.jsonl"), "utf8"), auditBefore, "senders reads do not audit");
+  assert.equal((await req("/v1/wechat/worker/status", { headers: { "X-Command-Token": token } })).status, 403, "W1 receive endpoint remains gated");
+  writeFileSync(config, JSON.stringify({ channels: { wechat: { enabled: false, receive: { enabled: true } } } })); assert.equal((await req("/v1/wechat/input/status", { headers: { "X-Command-Token": token } })).status, 403);
+  // L4 MF-1 锁：wechat.enabled=false 时 input/set 必须同为 403（不得绕过 opt-in 闸），且**不写盘**
+  const cfgBeforeSet = readFileSync(config, "utf8");
+  assert.equal((await req("/v1/wechat/input/set", { method: "POST", headers: auth, body: JSON.stringify({ enabled: true }) })).status, 403, "MF-1: input/set 在禁用时须 403");
+  assert.equal(readFileSync(config, "utf8"), cfgBeforeSet, "MF-1: 403 时不得写盘");
+ } finally { await host.close(); }
+ writeFileSync(config, JSON.stringify({ channels: { wechat: { enabled: true } } }));
+ assert.equal(readWechatInputConfig(config).enabled, false, "missing input defaults off");
+ assert.equal(setWechatInputConfig({ enabled: false }, config).ok, true);
+ assert.deepEqual(JSON.parse(readFileSync(config, "utf8")).channels.wechat.input, { enabled: false }, "disabled default creates no extra keys");
+ // Inject write failure using a same-name directory; the existing config remains untouched.
+ const failedPath = join(dir, "failure.json"); const untouched = "{\"marker\":\"unchanged\"}";
+ writeFileSync(failedPath, untouched);
+ const blocker = `${failedPath}.${process.pid}.block`; mkdirSync(blocker);
+ const failure = setWechatInputConfig({ enabled: true }, join(dir, "missing-parent", "config.json"));
+ assert.equal(failure.ok, false);
+ assert.equal(readFileSync(failedPath, "utf8"), untouched);
+ assert.equal(existsSync(join(dir, "missing-parent", "config.json")), false);
+ console.log("wechat input config tests passed: preserve/idempotence/add-remove/default/failure/masking");
+} finally { rmSync(dir, { recursive: true, force: true }); } })().catch((error) => { console.error(error); process.exitCode = 1; });
