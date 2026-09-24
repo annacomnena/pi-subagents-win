@@ -15,6 +15,9 @@ source_paths:
   - extensions/runtime/global-view.ts#L88-L90
   - extensions/runtime/global-view.ts#L539-L541
   - extensions/runtime/autonomy/frontier.ts#L197-L216
+  - extensions/runtime/graph/frontier-input.ts#L16-L76
+  - extensions/runtime/autonomy/frontier.ts#L103-L129
+  - extensions/_test_graph_frontier_input.ts#L263-L398
   - extensions/runtime/graph/index.ts#L7-L11
   - extensions/_test_runtime_graph.ts#L87-L358
   - extensions/_test_frontier_attention_window.ts#L1-L30
@@ -90,6 +93,21 @@ E2.0 把 frontier 消费的载体补齐到 Graph 只读投影，并把 carrier �
 
 **双 normalizer tripwire**：`global-view` 用 `recent-scopes.ts` 的 `normalizeExactPath`，`frontier` 用本地副本（为保持依赖图零 `node:fs`）；两份实现必须同口径——**单侧改动会静默表现为 attention=0**（键错配）。`_test_frontier_attention_window.ts` K1 用大小写/分隔符变体路径把「两 map 键集合逐字相等」钉死。
 
+### E2.1 契约：`toFrontierInput` 适配器（Graph → frontier 输入，零接线）
+
+E2.1 新增**纯函数** `toFrontierInput(snap, {now})`（`graph/frontier-input.ts#L55`）：把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`（`autonomy/frontier.ts#L116`，其 `FrontierSourceTab` `#L103`），为 E2.2 影子对照冻结输入契约。**零生产接线**：`frontier-input.ts` 不被任何生产文件 import，只被 `_test_graph_frontier_input.ts` 消费（`extensions/index.ts`/`graph/index.ts` 未加导出面）；`autonomy/frontier.ts` 仅做**类型放宽**（`FrontierInputs.snapshot` 改结构化接口 `#L124`，`buildFrontier` 算法体与 v2 调用点零改）。
+
+契约（`frontier-input.ts#L16-L76`）：
+
+- **纯度**：零 IO、零墙钟、零随机、确定性；两 `import` 均为 `import type`（零运行时依赖）。T8 以**源码读取守卫**（`readFileSync` 直读生产源码做 substring 断言，**非 shell grep**）把 `node:fs`/`Date.now`/`Math.random`/`writeFile`/`toLowerCase`/`toLocaleLowerCase`/`replace(`/`function|const|let|var normalize`/`normalize =`/两既有 normalizer 调用列入**零路径转换白名单**（`_test_graph_frontier_input.ts#L263`）。
+- **R4 单一口径**：直接把 `GraphProjectView.project`（已由 `normalizeRepoKey` 归一）写入 `attentionByRepo` 键与 `details[].repoPath`（`frontier-input.ts#L60`）——**不做任何转换、严禁自写第三份 normalizer**；`normalizeRepoKey` ≡ `normalizeExactPath` 逐字节同体，由 T4 机器钉死。
+- **`now` 来源**：`FrontierInputOptions.now` 必填（`#L16`），**不使用 `snap.asof`**（`collect.ts#L96` 缺省不发出 → 采用会得 `undefined`）；适配器自身不消费墙钟，`now` 由调用方以同一值透传 `buildFrontier`（T11 断言 `next.asof === opts.now`）。
+- **`history` 恒 `[]`**（MF1）：不读 `snap.history`（`#L75` 字面量）；填充会造出 v2 生产从不产的 ②③ hidden 触发（T6 双向反例）。
+- **attention 全量无裁剪**：仅 `attention > 0` 写键（缺项 = 0，`#L59-L60`），无窗口裁剪；键/值逐字等于 v2 `attentionByRepo`（G-A 全量口径）。
+- **details 成员过滤 + 确定性**：仅 carrier 存在（`gate`/`needsHuman`/`staleOver`/`overdue` 非 null）且 `project`/`phase` 非 null 的可见 tab 进 `details`（`#L27-L47`，缺 carrier 不猜、`pidAlive=null` 合法保留）；按 `runId` 升序，**重复 `runId` 时按 `repoPath` 升序 tie-break**（`#L70`，T15）。
+
+验证：T1–T15 全绿（`_test_graph_frontier_input.ts`，含 T9 双路径结构等价：同 fixture 帧0 `JSON.stringify` 严格全等、帧1 canonical 全等且含非 mailbox 边沿 `working_to_completed`/`stagnation`/`needs_user`；T9 端到端覆盖 `staleOver=true`/`needsHuman=true`/`pidAlive=false`）。
+
 ## Evidence
 
 - E1 测试 13 组（`extensions/_test_runtime_graph.ts#L87-L311`）：空输入 / 单对象 / 边三来源 / 孤儿引用 / dedupe 幂等 / 乱序 terminal / diff 边界 / 确定性+路径口径 tripwire / 10k 性能 / 未知事件 / workspaceRef 弱载体 / 坏行只读 / replay 等价 + collect 装配；T13 含病态事件（type 与 payload.status 矛盾）下 Graph ≡ projector 的等价断言。
@@ -98,6 +116,7 @@ E2.0 把 frontier 消费的载体补齐到 Graph 只读投影，并把 carrier �
 - L4 独立审查（`plans/0924_graph_E1_l4_review.md`）：**PASS**（必须修 0；建议修 5）。
 - E2.0 载体对齐 + 共享归约（`7672771`+`ed5278a`，L4 `plans/0924_graph_E2_0_l4_review.md` **PASS**）：`_test_graph_carriers.ts` 5 组（legacy oracle 双跑 + `collectGlobalView` 全量 golden 入库，路径归一化、固定 now）；`_test_runtime_graph.ts` 13/13（T13 快照形状零漂移）；`_test_runtime_autonomy.ts` 57 checks（A10.1 allowlist 仍恰好 3）；`test:global-view`（含 M1 golden）绿。行为保持由 pre/post golden 逐字节复现证明。
 - G-A 语义修复（`93f8447` + `fae1aa2`；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**，必须修 M2 已闭环）：`_test_frontier_attention_window.ts` 18 checks（P0 十条翻转 + N1-N4 + M1/M2/M3 + K1 tripwire）；规模 19/20/21/40 四档页外漏检=0、假边沿=0；`test:global-view` M1 byte-identical + Σ 不变量三路径；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_carriers.ts` 5/5（golden 仅加性新增 `attentionByRepo` 一个键）；其余 runtime 回归全绿。
+- E2.1 适配器契约（`b59ee68` + `513623c`；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**，2 必须修 + 3 建议修已闭环）：`_test_graph_frontier_input.ts` **15/15**（T1–T15：T8 源码读取守卫扩零路径转换白名单、T9 `FAR_PAST` 相对固定 `NOW` + 双路径双帧非 mailbox 边沿、T15 重复 runId tie-break）；`frontier-input.ts` 零生产接线（`rg -l frontier-input extensions --include=*.ts` 仅命中自身 + 测试）；回归 `_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）/ `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）/ `_test_frontier_attention_window.ts` 18 + `test:global-view` + 6×npm 全绿。
 
 ## Links Out
 
@@ -110,7 +129,7 @@ E2.0 把 frontier 消费的载体补齐到 Graph 只读投影，并把 carrier �
 ## Open Questions
 
 - **attention 当页窗口口径（MF2）**：~~E2.0 未动 v2 `frontier.ts` rows 当页 slice 口径；`attentionWindow` 参数零实现。E2.1/E2.3 翻转前的 attention 口径仍待用户裁定。~~ **已由 G-A 修复（`93f8447`）**：frontier ⑤ 改为消费分页前全量 `GlobalViewSnapshot.attentionByRepo`（见 Current Contract「G-A 语义修复契约」），`attentionWindow` 仍零实现但不再构成 latent bug；G-B `toFrontierInput` 须从 graph `projectAttention`（全量归约）填充该字段，**不得**引入窗口裁剪。
-- **`asof` 缺省不发出**：`collectGraphInput` 仅在显式提供 `opts.asof` 时透传；E2.1 必须决定 `toFrontierInput` 的 `now` 来源（`opts.now` vs `snap.asof`），否则 asof 载体空转。
+- **~~`asof` 缺省不发出~~ 已闭合（E2.1）**：`toFrontierInput` 取 `opts.now` 必填、**不使用 `snap.asof`**（`collectGraphInput` 仅在显式提供 `opts.asof` 时透传）；`now` 由调用方以同一值透传 `buildFrontier`（见 Current Contract「E2.1 契约」）。
 - **弱载体残余**：`isPathShapedRef` 对含 `/` 的自由字符串（如 `a/b` 标签）判为路径形 → 伪 project 节点（已测试固化，属 best-effort 已知残余）。
 - **`run_subject` 自环 / 无 changedEdges**：`diffGraph` 边只按键增删，evidence/match 标注变化不可见；E2 文档需显式声明。
-- **双 `findRepoRoot` 口径**：共享版用 `normalizeExactPath`，graph 本地版（`collect.ts`）用 `normalizeRepoKey`（case-insensitive）并存（E1 遗留）；E2.1 若以 graph project 键直接匹配 v2 `repoPath` 口径，Windows 大小写差异可能静默错配（L4 R4）。
+- **双 `findRepoRoot` 口径（E2.1 已定单一口径）**：共享版用 `normalizeExactPath`，graph 本地版（`collect.ts`）用 `normalizeRepoKey`（case-insensitive）并存（E1 遗留）；E2.1 裁定 = **R4 单一口径**——适配器直接把 graph `project` 键当规范键使用、**不新增第三份 normalizer**（T4/T8 机器钉死）；E2.3 翻转前仍需保证该键与 v2 `attentionByRepo` 键逐字同口径。

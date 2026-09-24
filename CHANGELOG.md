@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (E2.1 Graph → frontier 输入适配器 `toFrontierInput`：`b59ee68`/`513623c`)
+
+- **E2.1 适配器（零接线）**：新增纯函数 `toFrontierInput(snap, {now})`（`extensions/runtime/graph/frontier-input.ts`），把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`，冻结 E2.2 影子对照输入契约；`autonomy/frontier.ts` 仅类型放宽（`FrontierInputs.snapshot` 改结构化接口，`buildFrontier` 算法体与 v2 调用点零改）。**零生产接线**（`rg -l frontier-input extensions --include=*.ts` 仅命中自身 + 测试）。
+- **R4 单一口径勘误**：适配器**直接取 `GraphProjectView.project`**（零转换），**严禁自写第三份 normalizer**；`normalizeRepoKey` ≡ `normalizeExactPath` 逐字节同体（T4 钉死）。T8 源码读取守卫扩为**零路径转换白名单**（新禁 `replace(`/`toLocaleLowerCase`/`function|const|let|var normalize`/`normalize =`），抗改名绕过。
+- **三契约落地**：`now` 取自 `opts.now`（必填，不用 `snap.asof`）；`history` 恒 `[]`（MF1，填充会造出 v2 生产从不产的 ②③ hidden 触发）；`attentionByRepo` 只写 `>0` 项（缺项=0，全量无裁剪）。`details` 按 `runId` 升序、重复 `runId` 按 `repoPath` tie-break。
+- **T9 结构等价 v2 通过**：同 fixture 下 `buildFrontier(toFrontierInput)` ≡ `buildFrontier(collectGlobalView)`——帧0 `JSON.stringify` **严格全等**、帧1 canonical 全等且含非 mailbox 边沿（`working_to_completed`/`stagnation`/`needs_user`）；T9 fixture 端到端覆盖 `staleOver=true`/`needsHuman=true`/`pidAlive=false`，`FAR_PAST` 改相对固定 `NOW`（不偷读墙钟）。
+- **验收**：`_test_graph_frontier_input.ts` 15/15（T1–T15）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`_test_frontier_attention_window.ts` 18；`test:global-view` + 6×npm 回归全绿；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**（2 必须修 + 3 建议修已闭环）。`test:register-graph` 因外部依赖预备冲突（`CONFLICT @earendil-works/pi-coding-agent`）失败，非断言失败；直跑 `_test_register_graph.ts` 通过。
+- **文档**：Wiki `Wiki/Architecture/work-graph-read-only-projection.md`；Recent Work Item 42。
+
 ## [Unreleased] — 2026-09-24 (G-A frontier ⑤ 语义修复：`93f8447`/`fae1aa2`)
 
 - **latent bug（P0，`cd061cc` 反例）**：frontier ⑤（`needs_user`）曾消费 `snapshot.home/rows`（GUI 分页后投影，生产实参 `page=1/pageSize=20`）→ **>20 仓时页外 attention 仓漏触发 `needs_user`**（21 仓漏 1、40 仓漏 20），且**仅改显示排名会产生假边沿**（出页→入页仓 ⑤ `0→1`）——⑤ 触发集合成了显示排序/页码的函数，而非工作状态的函数。

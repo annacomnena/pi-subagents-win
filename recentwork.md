@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） |
 | 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） |
 | 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） |
 | 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） |
@@ -50,6 +51,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 42 - E2.1 Graph → frontier 输入适配器（`toFrontierInput`，零接线）
+
+- **日期**：2026-09-24
+- **一句话**：新增**纯函数** `toFrontierInput(snap, {now})`（`extensions/runtime/graph/frontier-input.ts`）把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`，为 E2.2 影子对照冻结输入契约。要点：零 IO / 零墙钟 / 确定性；**R4 单一口径**（键直接取 `GraphProjectView.project`，`normalizeRepoKey` ≡ `normalizeExactPath` 逐字节同体，严禁第三份 normalizer）；`now` 取自 `opts.now`（不用 `snap.asof`）；`history` 恒 `[]`（MF1，填充会造出 v2 生产从不产的 ②③）；`attentionByRepo` 只写 >0 项（缺项=0，全量无裁剪）；**零生产接线**（只被测试调用，`extensions/index.ts`/`graph/index.ts` 未动）。`autonomy/frontier.ts` 仅类型放宽（`FrontierInputs.snapshot` 改结构化接口，`buildFrontier` 体零改）。L4 独立审查 **PASS-with-fixes**（2 必须修 + 3 建议修已闭环）。
+- **涉及模块**：`extensions/runtime/graph/frontier-input.ts`（新，~76 行）、`extensions/runtime/autonomy/frontier.ts`（+类型放宽，算法体零改）、`extensions/_test_graph_frontier_input.ts`（新，T1–T15）、`extensions/_test_runtime_autonomy.ts`（A10.1 排除列表 +1 行）
+- **产物**：`plans/0924_graph_E2_1_recon.md` / `plans/0924_graph_E2_1_impl_plan.md` / `plans/0924_graph_E2_1_impl_report.md` / `plans/0924_graph_E2_1_l4_review.md` / `plans/0924_graph_E2_1_wrapup_report.md`
+- **Wiki**：更新正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（Current Contract 新增「E2.1 契约：`toFrontierInput` 适配器」节 + Open Questions 的 `asof`/双 normalizer 条目闭合 + source_paths 补真实行号）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`b59ee68`（E2.1 适配器，零接线，R4 单一口径 + attention 全量等价）+ `513623c`（L4 必须修/建议修：T9 固定时钟 + T8 零路径转换守卫扩白名单 + 重复 runId tie-break）
+- **Verification**：`_test_graph_frontier_input.ts` **15/15**（T1–T15；T9 双路径结构等价：帧0 `JSON.stringify` 严格全等、帧1 canonical 全等且含非 mailbox 边沿 `working_to_completed`/`stagnation`/`needs_user`，端到端覆盖 `staleOver=true`/`needsHuman=true`/`pidAlive=false`）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`_test_frontier_attention_window.ts` 18；`test:global-view` + `test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；`test:register-graph` 因外部依赖预备冲突失败（`CONFLICT @earendil-works/pi-coding-agent`，非断言失败），直跑 `_test_register_graph.ts` 通过；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**（2 必须修 + 3 建议修已闭环）。
 
 ### Item 41 - G-A：frontier ⑤ 语义修复（消费分页前全量 attention，修 GUI 分页耦合 latent bug）
 
