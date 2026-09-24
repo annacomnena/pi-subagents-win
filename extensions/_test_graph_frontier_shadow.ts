@@ -23,6 +23,14 @@
  *
  * 运行（EB-004 外部超时）：
  *   timeout 300 node --experimental-strip-types ./extensions/_test_graph_frontier_shadow.ts   → exit 0，打印 unexplained=0 explained=0
+ *
+ * 可选反向自检（判别力复验，缺省关闭）：
+ *   E22_REVERSE_SELFTEST=1 timeout 300 node --experimental-strip-types ./extensions/_test_graph_frontier_shadow.ts
+ *     → 额外跑 S-R：把 graph-only `attentionByRepo[首个正键]:=0`，断言 O-B 必报 `unexplained>0`；
+ *       判别力有效时该自检通过（进程仍 exit 0），失效则 FAIL。
+ *   L4 全 harness 级等价实验（照 0924_graph_E2_2_l4_review.md 原文，未改仓库）：在 frame() 的 graph 装配后注入
+ *     `const corruptKey = Object.keys(gIn.attentionByRepo)[0]; if (corruptKey) gIn.attentionByRepo[corruptKey] = 0;`
+ *     → 预期 exit=1、S2/S3/S4/S6/S11/S12/S13/S16/S17 失败、`unexplained=15 explained=0`。
  */
 
 import assert from "node:assert/strict";
@@ -184,6 +192,29 @@ const triggerValue = (t: { rule: string; project: string; evidence: string; appr
 });
 
 /**
+ * 按语义键分组为**数组**（不折叠重复项，L4 建议修 1）：同键多值以 canonical 序排列，
+ * 使 O-B 单行保留 multiplicity——原 `Map` 会把同键重复 trigger 静默折叠、丢根因信息。
+ */
+function groupByKey<T>(items: readonly T[], key: (t: T) => string, project: (t: T) => unknown): Map<string, unknown[]> {
+	const buckets = new Map<string, T[]>();
+	for (const it of items) {
+		const k = key(it);
+		const arr = buckets.get(k);
+		if (arr) arr.push(it);
+		else buckets.set(k, [it]);
+	}
+	const out = new Map<string, unknown[]>();
+	for (const [k, arr] of buckets) {
+		out.set(k, arr.map(project).sort((a, b) => {
+			const ja = canonicalJson(a);
+			const jb = canonicalJson(b);
+			return ja < jb ? -1 : ja > jb ? 1 : 0;
+		}));
+	}
+	return out;
+}
+
+/**
  * §3.2 纯函数：对同一帧的两路 (next,diff) + 输入 details 逐 source 展开 O-B 行。
  * 五源：snapshot(baseline/asof) / project(含 msv) / run(carrier 七字段) / trigger / recordOnly。
  * 不 IO、不改输入；`verdict` 机器判定（same/explained/unexplained），`reason` 仅白名单 id 或字段路径。
@@ -215,9 +246,9 @@ function shadowCompare(v2: ShadowSide, graph: ShadowSide, ctx: { at: number; sco
 	const gRuns = new Map((graph.details ?? []).map((d) => [runKey(d), carrier7(d)]));
 	for (const k of unionSorted(v2Runs.keys(), gRuns.keys())) add("run", k, v2Runs.get(k), gRuns.get(k));
 
-	// 源 4：trigger 行（语义键 `rule|project|evidence`）
-	const v2Triggers = new Map(v2.diff.triggers.map((t) => [triggerKey(t), triggerValue(t)]));
-	const gTriggers = new Map(graph.diff.triggers.map((t) => [triggerKey(t), triggerValue(t)]));
+	// 源 4：trigger 行（语义键 `rule|project|evidence`；数组保重复，不折叠 multiplicity）
+	const v2Triggers = groupByKey(v2.diff.triggers, triggerKey, triggerValue);
+	const gTriggers = groupByKey(graph.diff.triggers, triggerKey, triggerValue);
 	for (const k of unionSorted(v2Triggers.keys(), gTriggers.keys())) add("trigger", k, v2Triggers.get(k), gTriggers.get(k));
 
 	// 源 5：recordOnly 行（存在性）
@@ -555,8 +586,9 @@ check("S7 ⑦ overdue 0→正：两路同 deadline_urgency（approximate=true）
 // S8 ⑨ stagnation：resultMissing 分支 + staleOver 分支
 check("S8 ⑨ stagnation：resultMissing 分支（session probe error → unconfirmed）两路同 trigger", () => {
 	// 关键：state 文件不得含 unconfirmed（TabState.phase 无此值）；unconfirmed 只来自 session probe。
-	// dispatchedAt 取真实时钟近点，保证 `classifyDispatch` 的 ledger-only 分支不因 grace 收敛为 orphaned（可见）。
-	const dispatchedAtMs = Date.now() - 60_000;
+	// dispatchedAt 相对固定 NOW 派生（不依赖墙钟）：探活时间窗下界 = dispatchedAt-60s，
+	// 令 session header.timestamp === dispatchedAt 恒匹配，避开 classifyTabStatus 的 ledger-only grace 分支。
+	const dispatchedAtMs = NOW - 60_000;
 	const w = track(makeWorld("s8a", [{ name: "alpha" }], [{ id: "t_rm", repo: "alpha", phase: "working", dispatchedAtMs }]));
 	writeSessionProbe(w, "t_rm", w.repoPaths.get("alpha")!, dispatchedAtMs, "error");
 	const f1 = frame(w, null, "s8a@f1"); // state 存在 → phase=working（stagnation=false）
@@ -716,6 +748,20 @@ check("S16 R4 大小写变体：两路归一键唯一且相等；差异不得记
 	updateTab(w, "t_upper", { cwd: w.repoPaths.get("foo")!.replace(/\\/g, "/").toUpperCase() });
 	const key = normalizeExactPath(w.repoPaths.get("foo")!);
 	const f1 = frame(w, null, "s16@f1");
+	// 输入分叉显式化（R4 判别性）：两路消费的**原始**载体确实不同，非两份相同输入——
+	// graph 源 journal 的 dispatch cwd 保留 lower-case；v2 源账本 cwd 被改成大写/正斜杠变体。
+	const gProjects = f1.gSnap.projects.map((p) => p.project);
+	assert.deepEqual(gProjects, [key], "graph 原始 project 为 lower-case 单键（归一口径）");
+	assert.equal(gProjects[0], gProjects[0]!.toLowerCase(), "graph 原始 project 全小写");
+	const fold = (s: string): string => s.replace(/\\/g, "/").toLowerCase();
+	const upperCount = (s: string): number => (s.match(/[A-Z]/g) ?? []).length;
+	const v2Upper = w.tabs.find((t) => t.id === "t_upper")!.cwdAbs; // v2 原始 detail（账本 cwd）
+	const journalLower = (w.journal.find((e) => e.subject === tabRunAddress("t_upper"))!.payload as { cwd: string }).cwd;
+	assert.notEqual(v2Upper, journalLower, "v2 原始 detail 与 graph journal cwd 拼写不同（输入分叉）");
+	assert.equal(fold(v2Upper), fold(journalLower), "二者指向同一仓（仅大小写/分隔符不同）");
+	assert.ok(upperCount(v2Upper) > upperCount(journalLower), "v2 原始 detail 含 upper-case 变体，journal 为 lower-case");
+	assert.equal(normalizeExactPath(v2Upper), key, "大写变体归一到 key");
+	assert.equal(normalizeExactPath(journalLower), key, "journal lower-case 归一到同 key");
 	assert.deepEqual(Object.keys(f1.v2Snap.attentionByRepo), [key], "v2 归一键唯一");
 	assert.deepEqual(f1.gIn.attentionByRepo, f1.v2Snap.attentionByRepo, "graph 同键同值");
 	assert.equal(Object.values(f1.v2Snap.attentionByRepo)[0], 2, "两 tab 归并计数 = 2");
@@ -746,6 +792,28 @@ check("S17 O-B 硬门：unexplained=0 且 explained=0；rows 非空跑；shadow.
 	assert.equal(existsSync(join(shadowStateDir, "autonomy", "audit.jsonl")), false, "零行为：不写生产 state/autonomy/audit.jsonl");
 	console.log(`  E2.2 dump: frames=${FRAMES.length} rows=${all.length} same=${all.length - unexplained.length - explained.length} triggerRows=${all.filter((r) => r.itemKind === "trigger").length} unexplained=${unexplained.length} explained=${explained.length}`);
 });
+
+// ═══════════════════════ 可选反向自检（E22_REVERSE_SELFTEST=1）═══════════════════════
+// 受控 helper（L4 建议修 3）：把 L4 的 graph-only 0 化反向实验落成可复跑自检，缺省关闭、不影响正常跑。
+// 目的：未来改 canonical/verdict 时复验判别力——篡改 graph-only 输入必须被 O-B 报为 unexplained>0。
+if (process.env.E22_REVERSE_SELFTEST === "1") {
+	check("S-R 反向自检：篡改 graph-only attention → 必报 unexplained>0", () => {
+		const w = track(makeWorld("reverse-selftest", [{ name: "alpha" }], [{ id: "t_rev", repo: "alpha", phase: "attached" }]));
+		const f = frame(w, null, "reverse@f1");
+		const corruptKey = Object.keys(f.gIn.attentionByRepo).find((k) => (f.gIn.attentionByRepo[k] ?? 0) > 0);
+		assert.ok(corruptKey, "反向自检前置：需存在 attention>0 的键");
+		const tamperedIn: FrontierSourceSnapshot = { ...f.gIn, attentionByRepo: { ...f.gIn.attentionByRepo, [corruptKey!]: 0 } };
+		const tampered = buildFrontier({ snapshot: tamperedIn, backlog: mailboxBacklog(), prev: null, now: NOW });
+		const rows = shadowCompare(
+			{ ...f.v2, details: f.v2Snap.details },
+			{ ...tampered, details: tamperedIn.details },
+			{ at: NOW, scope: "reverse@tampered" },
+		);
+		const unexp = rows.filter((r) => r.verdict === "unexplained").length;
+		console.log(`  E22_REVERSE_SELFTEST: graph-only attention['${corruptKey}']:=0 → unexplained=${unexp}（期望 >0）`);
+		assert.ok(unexp > 0, "反向自检失败：篡改 graph-only 输入未被判为 unexplained>0（harness 判别力失效）");
+	});
+}
 
 // ═══════════════════════ 汇总 + 清理 ═══════════════════════
 const ALL_ROWS = FRAMES.flatMap((f) => f.rows);
