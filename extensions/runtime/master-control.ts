@@ -107,14 +107,17 @@ export type HandoffTokenIssue =
 export function issueMasterHandoffToken(input: {
 	sessionId: string;
 	reason?: string;
+	agent?: ObjectAddress;
 }): HandoffTokenIssue {
-	const att = readAttachment(masterAddress());
+	const agent = input.agent ?? masterAddress();
+	const att = readAttachment(agent);
 	if (!att || att.sessionId !== input.sessionId) {
 		return { ok: false, reason: "not-owner", precheck: true };
 	}
 	return detachMasterWithAudit({
 		sessionId: input.sessionId,
 		generation: att.generation,
+		agent,
 		reason: input.reason,
 	});
 }

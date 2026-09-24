@@ -11,13 +11,13 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { masterAddress } from "./address.ts";
+import { masterAddress, type ObjectAddress } from "./address.ts";
 import { newEventEnvelope } from "./envelope.ts";
 import { defaultJournalPath, defaultRuntimeDir, emitRuntimeEventOnce } from "./journal.ts";
 import { buildHandoff } from "./hydrate.ts";
 import { issueMasterHandoffToken } from "./master-control.ts";
 import { adoptTransfer, completeProposalForTransfer } from "./master-succession.ts";
-import { readAttachment } from "./registry.ts";
+import { clearTransferWindow, readAttachment, setTransferWindow } from "./registry.ts";
 
 export type TransferStatus = "initiated" | "spawned" | "attached" | "completed" | "failed";
 
@@ -26,6 +26,7 @@ export interface TransferRecord {
 	transferId: string;
 	fromSession: string;
 	fromGeneration: number;
+	agentAddress?: ObjectAddress;
 	token: string;
 	handoffPath: string;
 	successorRunId?: string;
@@ -34,6 +35,11 @@ export interface TransferRecord {
 	error?: string;
 	createdAt: string;
 	updatedAt: string;
+	// 0924 L3-fix（四要素）：新 owner 快照 + token 消费时刻（confirm 时 attach 成功才写；
+	// 旧 owner 快照即 fromSession/fromGeneration）。
+	toSession?: string;
+	toGeneration?: number;
+	tokenConsumedAt?: string;
 }
 
 /** spawn 后继的实现由调用方注入；抛错即 spawn 失败。 */
@@ -42,6 +48,7 @@ export type SpawnSuccessor = (args: {
 	title: string;
 	prompt: string;
 	sessionId: string;
+	cwd?: string;
 }) => { successorRunId: string };
 
 export interface TransferOptions {
@@ -95,6 +102,10 @@ function emitTransferEvent(
 				fromGeneration: record.fromGeneration,
 				status: record.status,
 			},
+			// 0924 L3-fix：事件主体随 transfer 记录的 agent 地址走（local transfer 不再固定
+			// 全局 master 地址，审计归属正确）。
+			source: record.agentAddress ?? masterAddress(),
+			subject: record.agentAddress ?? masterAddress(),
 			dedupeKey: `${type}:${record.transferId}`,
 		}),
 		journalPath ?? defaultJournalPath(),
@@ -105,13 +116,33 @@ function newTransferId(): string {
 	return `tr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** 后继首轮 prompt：handoff 路径 + token + generation + transferId（§5 step 5）。 */
+/**
+ * 后继首轮 prompt：handoff 路径 + token + generation + transferId（§5 step 5）。
+ * 0924 L3-fix：prompt 显式携带 scope（local + 目标地址）。local 后继必须被指示
+ * `master-attach({token, local:true})` 并写回**同一 local 地址**——否则后继默认按
+ * global attach，local 自动交接实际断裂（L4 实测 promptLocal:false）。
+ * global（缺省 local:false）文案逐字保持原样（回归零变化）。
+ */
 export function buildSuccessorPrompt(input: {
 	transferId: string;
 	token: string;
 	handoffPath: string;
 	fromGeneration: number;
+	/** local 交接（true 时目标为 input.agent 的 local 地址）。 */
+	local?: boolean;
+	/** local 交接目标地址（agent://master_local_<scope>）。 */
+	agent?: ObjectAddress;
 }): string {
+	if (input.local) {
+		const addr = input.agent ?? "";
+		return [
+			`你是新一代 local Master（接管 ${addr}，local handoff），不要 tab-finish，不要退出，常驻本仓库履职。`,
+			`交接包：${input.handoffPath}（先读它恢复上下文）。`,
+			`handoff token：${input.token}（仅你可用；它是 ${addr} 的 local 交接 token）。transfer id：${input.transferId}，from generation ${input.fromGeneration}。`,
+			`步骤：①读交接包；②调 master-attach 工具并传入 { token: "${input.token}", local: true } 接管——token 与 local:true 必须同用，目标是同一 local 地址 ${addr}，不要接 global；③调 master-status 确认 ${addr} 的 generation 为 ${input.fromGeneration + 1} 且 owner 是你；④调 master-transfer-confirm 并传入 transferId（标记交接完成）。`,
+			`仓库会话持 local（${addr}）；不要触碰全局 Master。`,
+		].join("\n");
+	}
 	return [
 		"你是新一代逻辑 Master（succession 接班），不要 tab-finish，不要退出，常驻履职。",
 		`交接包：${input.handoffPath}（先读它恢复上下文）。`,
@@ -149,20 +180,32 @@ export function buildMasterSuccessorTitle(
 }
 
 export type TransferResult =
-	| { ok: true; transferId: string; successorRunId: string; token: string; handoffPath: string; generation: number }
+	| {
+			ok: true;
+			transferId: string;
+			successorRunId: string;
+			token: string;
+			handoffPath: string;
+			generation: number;
+			/** 0924 L3-fix（四要素）：旧 owner 快照（发起时刻；新 owner 由 confirm 回报）。 */
+			from: { sessionId: string; generation: number };
+			agent: ObjectAddress;
+			local: boolean;
+	  }
 	| { ok: false; reason: "not-owner" | "spawn-failed"; error?: string; transferId?: string };
 
 export function transferMaster(
-	input: { sessionId: string; reason?: string; spawn: SpawnSuccessor },
+	input: { sessionId: string; reason?: string; spawn: SpawnSuccessor; agent?: ObjectAddress; repoRoot?: string },
 	opts: TransferOptions = {},
 ): TransferResult {
-	const master = masterAddress();
+	const master = input.agent ?? masterAddress();
+	const isGlobal = master === masterAddress();
 	const att = readAttachment(master);
 	if (!att || att.sessionId !== input.sessionId) {
 		return { ok: false, reason: "not-owner" };
 	}
-	const doc = buildHandoff({});
-	const tok = issueMasterHandoffToken({ sessionId: input.sessionId, reason: input.reason });
+	const doc = buildHandoff({ repoRoot: input.repoRoot });
+	const tok = issueMasterHandoffToken({ sessionId: input.sessionId, reason: input.reason, agent: master });
 	if (!tok.ok) return { ok: false, reason: "not-owner" };
 	const token = tok.token!;
 
@@ -172,6 +215,7 @@ export function transferMaster(
 		transferId: newTransferId(),
 		fromSession: input.sessionId,
 		fromGeneration: att.generation,
+		agentAddress: master,
 		token,
 		handoffPath: doc.path,
 		status: "initiated",
@@ -187,6 +231,8 @@ export function transferMaster(
 		token,
 		handoffPath: doc.path,
 		fromGeneration: att.generation,
+		local: !isGlobal,
+		agent: master,
 	});
 	try {
 		const spawned = input.spawn({
@@ -194,12 +240,15 @@ export function transferMaster(
 			title: buildMasterSuccessorTitle(record.transferId, att.generation + 1, record.reason),
 			prompt,
 			sessionId: input.sessionId,
+			...(input.repoRoot ? { cwd: input.repoRoot } : {}),
 		});
 		record.successorRunId = spawned.successorRunId;
 	} catch (e) {
 		record.status = "failed";
 		record.error = e instanceof Error ? e.message : String(e);
 		record.updatedAt = new Date().toISOString();
+		// 0924 L3-fix：spawn 失败路径同样清理窗口 marker（幂等；失败前未落则 no-op）。
+		clearTransferWindow(master);
 		writeRecordAtomic(recordPath(record.transferId, opts.stateDir), record);
 		emitTransferEvent("master.handoff.failed", record, opts.journalPath);
 		return { ok: false, reason: "spawn-failed", error: record.error, transferId: record.transferId };
@@ -208,7 +257,20 @@ export function transferMaster(
 	record.updatedAt = new Date().toISOString();
 	writeRecordAtomic(recordPath(record.transferId, opts.stateDir), record);
 	emitTransferEvent("master.handoff.spawned", record, opts.journalPath);
-	adoptTransfer({ transferId: record.transferId, fromGeneration: att.generation }, opts);
+	// 0924 L3-fix（交接窗口）：token 已发、后继 confirm 前落可查询的 transfer-in-progress
+	// marker；窗口内该 agent 的 forceStale / stale takeover 被 registry 抑制（防 zombie
+	// reclaim 抢代）。confirm 完成 / human cancel / TTL（24h，随 token 过期）清理。
+	setTransferWindow({
+		version: 1,
+		transferId: record.transferId,
+		agentAddress: master,
+		fromGeneration: att.generation,
+		createdAt: record.updatedAt,
+	});
+	// 0924 L3-fix：succession proposal 状态机是 global 专属（S2/S3 均为 global 压力流）；
+	// local transfer 不得读写 global succession state（L4：曾把 global proposal 记成
+	// transferring 污染归属）。local 分支纯 no-op。
+	if (isGlobal) adoptTransfer({ transferId: record.transferId, fromGeneration: att.generation }, opts);
 	return {
 		ok: true,
 		transferId: record.transferId,
@@ -216,11 +278,24 @@ export function transferMaster(
 		token,
 		handoffPath: doc.path,
 		generation: att.generation,
+		from: { sessionId: input.sessionId, generation: att.generation },
+		agent: master,
+		local: !isGlobal,
 	};
 }
 
 export type ConfirmResult =
-	| { ok: true; transferId: string; generation: number }
+	| {
+			ok: true;
+			transferId: string;
+			generation: number;
+			handoffPath: string;
+			agent: ObjectAddress;
+			/** 0924 L3-fix（四要素）：新旧 owner 快照 + token 消费时刻。 */
+			from: { sessionId: string; generation: number };
+			to: { sessionId: string; generation: number };
+			tokenConsumedAt: string;
+	  }
 	| { ok: false; reason: "no-transfer" | "bad-state" | "not-owner" | "generation-mismatch" };
 
 /** 后继 attach 成功后调用：校验 gen+1 与 owner，落 attached→completed。 */
@@ -231,19 +306,39 @@ export function confirmTransferAttach(
 	const record = readTransferRecord(input.transferId, opts.stateDir);
 	if (!record) return { ok: false, reason: "no-transfer" };
 	if (record.status !== "spawned") return { ok: false, reason: "bad-state" };
-	const att = readAttachment(masterAddress());
+	const master = record.agentAddress ?? masterAddress();
+	const att = readAttachment(master);
 	if (!att || att.generation !== record.fromGeneration + 1) {
 		return { ok: false, reason: "generation-mismatch" };
 	}
 	if (att.sessionId !== input.sessionId) return { ok: false, reason: "not-owner" };
+	const now = new Date().toISOString();
+	// 0924 L3-fix（四要素）：attach 已验证成功 → record 新 owner 快照 + token 消费时刻
+	//（token 本身的消费由 generation 检查天然保证——token 文件残留但 gen 已前进，
+	// 重放必败；这里只是把「已消费」落成可观测字段）。
+	record.toSession = att.sessionId;
+	record.toGeneration = att.generation;
+	record.tokenConsumedAt = now;
 	record.status = "attached";
-	record.updatedAt = new Date().toISOString();
+	record.updatedAt = now;
 	writeRecordAtomic(recordPath(record.transferId, opts.stateDir), record);
 	emitTransferEvent("master.handoff.attached", record, opts.journalPath);
 	record.status = "completed";
 	record.updatedAt = new Date().toISOString();
 	writeRecordAtomic(recordPath(record.transferId, opts.stateDir), record);
 	emitTransferEvent("master.handoff.completed", record, opts.journalPath);
-	completeProposalForTransfer(record.transferId, opts);
-	return { ok: true, transferId: record.transferId, generation: att.generation };
+	// 0924 L3-fix（交接窗口）：交接完成 → 清理该 agent 的 transfer-in-progress marker。
+	clearTransferWindow(master);
+	// 0924 L3-fix：proposal 状态机 global 专属；local transfer 不触碰 global succession。
+	if (master === masterAddress()) completeProposalForTransfer(record.transferId, opts);
+	return {
+		ok: true,
+		transferId: record.transferId,
+		generation: att.generation,
+		handoffPath: record.handoffPath,
+		agent: master,
+		from: { sessionId: record.fromSession, generation: record.fromGeneration },
+		to: { sessionId: att.sessionId, generation: att.generation },
+		tokenConsumedAt: now,
+	};
 }

@@ -48,7 +48,7 @@ import { WechatStore } from "./channel-wechat/store.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { localAgentFromCwd, masterStatusLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { localAgentFromCwd, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
@@ -2164,6 +2164,19 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`master 自动交接${want === "on" ? "已开启" : "已关闭"}（autoPercent=${cfg.masterSuccession.autoPercent}%，proposalPercent=${cfg.masterSuccession.proposalPercent}%）`, "info");
 		},
 	});
+	pi.registerCommand("master-transfer", {
+		description: "一键交接当前 Master：/master-transfer [--local] [reason]",
+		handler: async (args, ctx) => {
+			if (isSubagent()) { ctx.ui.notify("子 agent 不可发起交接", "warning"); return; }
+			const sid = durableSessionIdentity(ctx as never);
+			if (!sid || sid === "unknown") { ctx.ui.notify("master-transfer: 无法确定当前会话身份，拒绝", "warning"); return; }
+			const parts = (args ?? "").trim().split(/\\s+/).filter(Boolean);
+			const local = parts.includes("--local");
+			const reason = parts.filter((p) => p !== "--local").join(" ") || undefined;
+			const out = masterTransferLogic(sid, { local, cwd: ctx.cwd, reason, spawn: spawnSuccessor });
+			ctx.ui.notify(out.text, out.isError ? "warning" : "info");
+		},
+	});
 	pi.registerCommand("master-detach", {
 		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]；接班者在 home 新会话接管）",
 		handler: async (args, ctx) => {
@@ -2361,14 +2374,14 @@ export default function (pi: ExtensionAPI) {
 	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
 	// 后继 spawn 通道（wt.exe + spawnPiTab + 失败写 launch_failed）：master-transfer 工具与
 	// S3 自动交接共用同一闭包（M3 内联实现原样提取，零逻辑变化）
-	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId }) => {
+	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId, cwd: requestedCwd }) => {
 		const wtPath = findWindowsTerminal();
 		if (!wtPath) throw new Error("master-transfer: no wt.exe");
 		const piCli = findPiCli();
 		const runId = newTabRunId();
 		const taskId = `transfer-${transferId.slice(3, 9)}`;
 		// home 守卫配套（0923）：global successor 一律在 home 启动，否则后继 attach 必被拒绝。
-		const cwd = homedir();
+		const cwd = requestedCwd ?? homedir();
 		if (!cwd) throw new Error("master-transfer: 无法确定 home 目录，拒绝 spawn 后继（旧主仍是 owner）");
 		const runsDir = defaultTabRunsDir();
 		const dispatch: TabDispatchRecord = {

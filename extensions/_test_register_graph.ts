@@ -116,7 +116,7 @@ assert.deepEqual(toolNames, [
 // 2026-09-20 补 master slash（attach/cutover/detach/handoff/status/succession/auto-handoff——
 // Phase 5.5 S1/A1/总开关）+ /runtime-host（G2）+ /workstream* /task-*（Phase 5a A7 F18，旧漏项——此前被 tools 断言失败遮挡）：
 // 2026-09-22 补 /gui（G6 L3 GUI 自动拉起，gui-autostart.ts）：
-// 2026-09-24 补 /wechat（D17 opt-in 开关界面可达）；
+// 2026-09-24 补 /wechat（D17 opt-in 开关界面可达）与 /master-transfer（local 自动交接 D17）；
 // 2026-09-23 Task 2006 v2 autonomy 补 /autonomy（手动运维命令 status/kill/clear，D-I）；
 // 同批修复 commands 存量漂移（补 /global-view，index.ts 0923 首阶段注册，与 tools global-view 同批漂移）；
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
@@ -139,6 +139,7 @@ assert.deepEqual(commandNames, [
 	"master-handoff",
 	"master-status",
 	"master-succession",
+	"master-transfer",
 	"notify",
 	"runs",
 	"runtime-host",

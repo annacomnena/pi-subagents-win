@@ -14,7 +14,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { homedir } from "node:os";
 import { sessionIdentity } from "./links.ts";
-import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
+import { formatNotHomeDirMessage, isExactHomeCwd } from "./runtime/master-home-guard.ts";
 import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { durableSessionIdentity, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import { triggerOwnershipRecheck } from "./event-bus.ts";
@@ -301,20 +301,49 @@ function textResult(outcome: ToolOutcome): { content: { type: string; text: stri
 
 export function masterTransferLogic(
 	sessionId: string,
-	input: { reason?: string; spawn: SpawnSuccessor },
+	input: { reason?: string; local?: boolean; cwd?: string; spawn: SpawnSuccessor; env?: { home: string; platform: NodeJS.Platform } },
 ): ToolOutcome {
-	const r = transferMaster({ sessionId, reason: input.reason, spawn: input.spawn });
+	// 0924 L3-fix（home 调 local，L4 must-fix 3）：home 会话只持 global——`local: true` +
+	// exact-home cwd 在入口 fail-closed。slash（index.ts /master-transfer）与 tool 共用本纯逻辑层，
+	// 同一判定一处覆盖；不依赖 attach 侧的 global home 守卫（那只拦 global 认领、不拦 local 发起）。
+	if (input.local && input.cwd) {
+		const home = input.env?.home ?? homedir();
+		const platform = input.env?.platform ?? process.platform;
+		if (isExactHomeCwd(input.cwd, home, platform)) {
+			return {
+				text: "master-transfer --local 已拒绝：home 会话只持 global Master（交接请用不带 --local 的 /master-transfer；仓库会话才持 local 并用 --local 交接）",
+				isError: true,
+				details: { reason: "home-local" },
+			};
+		}
+	}
+	const agent = input.local && input.cwd ? localAgentFromCwd(input.cwd) : undefined;
+	const r = transferMaster({ sessionId, reason: input.reason, spawn: input.spawn, ...(agent ? { agent, repoRoot: input.cwd } : {}) });
 	if (!r.ok) {
 		return {
 			text: r.reason === "not-owner"
 				? "master-transfer: 你不是当前 owner，拒绝"
 				: `master-transfer 失败：spawn 未能启动（${r.error ?? "unknown"}），你仍是 owner（transfer=${r.transferId}）`,
 			isError: true,
+			details: { reason: r.reason, ...(r.transferId ? { transferId: r.transferId } : {}) },
 		};
 	}
+	// 0924 L3-fix（四要素回报）：scope/agent + 旧 owner 快照（sid12+gen）+ 预期 generation +
+	// 交接包路径 + token 状态。token 值只在 details（结构化），不出现在普通 UI text。
+	const scope = r.local ? `local ${r.agent}` : "global";
+	const oldOwner = `${r.from.sessionId.slice(0, 12)}/gen${r.from.generation}`;
 	return {
-		text: `master-transfer 已发起：transfer=${r.transferId} 后继=${r.successorRunId}（gen ${r.generation}→${r.generation + 1}，交接包=${r.handoffPath}）`,
-		details: { transferId: r.transferId, successorRunId: r.successorRunId, token: r.token, handoffPath: r.handoffPath },
+		text: `master-transfer 已发起（${scope}）：transfer=${r.transferId} 旧 owner=${oldOwner} → 预期 gen${r.from.generation + 1} 后继=${r.successorRunId} 交接包=${r.handoffPath}（token 已发放未消费，由后继 attach 时消费）`,
+		details: {
+			transferId: r.transferId,
+			successorRunId: r.successorRunId,
+			token: r.token,
+			handoffPath: r.handoffPath,
+			scope: r.local ? "local" : "global",
+			agent: r.agent,
+			from: { sessionId: r.from.sessionId.slice(0, 12), generation: r.from.generation },
+			tokenConsumed: false,
+		},
 	};
 }
 
@@ -323,8 +352,27 @@ export function masterTransferConfirmLogic(
 	input: { transferId: string },
 ): ToolOutcome {
 	const r = confirmTransferAttach({ transferId: input.transferId, sessionId });
-	if (!r.ok) return { text: `master-transfer-confirm 失败：${r.reason}`, isError: true };
-	return { text: `master-transfer 完成：transfer=${r.transferId} gen=${r.generation}`, details: { transferId: r.transferId, generation: r.generation } };
+	if (!r.ok) {
+		return { text: `master-transfer-confirm 失败：${r.reason}`, isError: true, details: { reason: r.reason } };
+	}
+	// 0924 L3-fix（四要素回报）：新旧 owner 快照（sid12+gen）+ token 消费时刻 + 交接包；
+	// token 值不出现在普通 UI text。
+	const scope = r.agent === masterAddress() ? "global" : `local ${r.agent}`;
+	const oldOwner = `${r.from.sessionId.slice(0, 12)}/gen${r.from.generation}`;
+	const newOwner = `${r.to.sessionId.slice(0, 12)}/gen${r.to.generation}`;
+	return {
+		text: `master-transfer 完成（${scope}）：transfer=${r.transferId} 旧 owner=${oldOwner} → 新 owner=${newOwner}；token 已消费（at=${r.tokenConsumedAt.slice(0, 19)}），交接包=${r.handoffPath}`,
+		details: {
+			transferId: r.transferId,
+			handoffPath: r.handoffPath,
+			scope: r.agent === masterAddress() ? "global" : "local",
+			agent: r.agent,
+			from: { sessionId: r.from.sessionId.slice(0, 12), generation: r.from.generation },
+			to: { sessionId: r.to.sessionId.slice(0, 12), generation: r.to.generation },
+			tokenConsumed: true,
+			tokenConsumedAt: r.tokenConsumedAt,
+		},
+	};
 }
 
 export function masterPressureLogic(usage: unknown): ToolOutcome {
@@ -480,6 +528,7 @@ export function registerMasterTools(
 		description: `一键交接事务：备 fresh 交接包→发 token→spawn 后继→后继凭 token 接管（gen+1）。仅 owner 可调；子 agent 不可调。仅在用户明确要求时调用；spawn 失败旧主仍是 owner，不重试。`,
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ description: "交接原因" })),
+			local: Type.Optional(Type.Boolean({ description: "true = 自动交接可信当前 cwd 对应的 local Master" })),
 		}),
 		renderCall(_args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("master-transfer"))}`, 0, 0);
@@ -493,8 +542,10 @@ export function registerMasterTools(
 			const sid = toolSession(ctx);
 			if (!sid || sid === "unknown") return textResult({ text: "master-transfer: 无法确定当前会话身份，拒绝", isError: true });
 			if (!opts.spawnSuccessor) return textResult({ text: "master-transfer: spawn 通道不可用，拒绝", isError: true });
-			const params = rawParams as { reason?: string };
-			const outcome = masterTransferLogic(sid, { reason: params.reason, spawn: opts.spawnSuccessor });
+			const params = rawParams as { reason?: string; local?: boolean };
+			const ctxCwd = (ctx as unknown as { cwd?: unknown }).cwd;
+			const cwd = typeof ctxCwd === "string" && ctxCwd ? ctxCwd : process.cwd();
+			const outcome = masterTransferLogic(sid, { reason: params.reason, local: params.local, cwd, spawn: opts.spawnSuccessor });
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
 		},
 	});

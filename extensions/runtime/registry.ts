@@ -101,13 +101,16 @@ export interface AttachInput {
 	forceStale?: boolean;
 	staleAfterMs?: number;
 	now?: Date;
+	/** 明确人工取消（0924 L3-fix）：交接窗口内的 forceStale/takeover 被抑制，
+	 *  仅显式 human cancel 可越过（人类是 tiebreaker，与 forceStale 同一语义）。 */
+	humanCancel?: boolean;
 	/** 自由字段：genesis 时写入（local master v1：toplevel 路径）；后续 bump/刷新保留既有值 */
 	detail?: string;
 }
 
 export type AttachResult =
 	| { ok: true; attachment: MasterAttachment; genesis: boolean }
-	| { ok: false; reason: "bad-session" | "owner-active" | "bad-token" | "token-expired" | "generation-mismatch" | "not-stale" | "lease-contended" };
+	| { ok: false; reason: "bad-session" | "owner-active" | "bad-token" | "token-expired" | "generation-mismatch" | "not-stale" | "lease-contended" | "transfer-in-progress" };
 
 /**
  * 显式 attach。genesis（无 owner）→ wx 原子创建 gen 1；已有 owner → 需 token
@@ -126,6 +129,12 @@ export function attachMaster(input: AttachInput): AttachResult {
 
 	const existing = readAttachment(agent);
 	if (!existing) {
+		// 0924 L3-fix（跨 scope token 绕过，L4 安全级 must-fix）：token attach 一律不得走
+		// genesis——否则其它 scope 的 handoff token（如 local token）可在空目标 attachment
+		// 上零验证被当作 genesis 认领 owner（L4 实测：local token 在空 global 上成功写入
+		// global owner）。此处直接拒绝、零写；已有 owner 路径继续按目标自己的 handoff 文件
+		// 校验（异 scope token 在目标文件不存在 → bad-token，同样零写）。
+		if (input.token) return { ok: false, reason: "bad-token" };
 		const genesis: MasterAttachment = {
 			agentAddress: agent,
 			sessionId: input.sessionId,
@@ -202,6 +211,10 @@ function attachWithOwnerLocked(
 	}
 
 	if (input.forceStale) {
+		// 0924 L3-fix（交接窗口）：transfer 在途（token 已发、后继未 confirm）期间 forceStale
+		// 不得 bump——zombie reclaim / stale succession 抑制；仅显式 human cancel 越过。
+		// token attach（后继本人）不受此门影响，它是窗口内唯一预期的换主路径。
+		if (isTransferInFlight(agent) && !input.humanCancel) return { ok: false, reason: "transfer-in-progress" };
 		const staleAfterMs = input.staleAfterMs ?? 10 * 60 * 1000;
 		const age = Date.parse(now) - Date.parse(current.lastHeartbeatAt);
 		if (!Number.isFinite(age) || age <= staleAfterMs) return { ok: false, reason: "not-stale" };
@@ -362,6 +375,8 @@ export interface TakeoverMasterInput {
 	expected: { sessionId: string; generation: number };
 	/** 断言的下一代（缺省 expected.generation+1；显式给出且不符 → generation-mismatch） */
 	generation?: number;
+	/** 明确人工取消（0924 L3-fix）：越过交接窗口抑制，并清理该 agent 的窗口 marker。 */
+	humanCancel?: boolean;
 	reason?: string;
 	/** 诊断证据（透传 journal payload；注册表不解释） */
 	evidence?: Record<string, unknown>;
@@ -370,7 +385,7 @@ export interface TakeoverMasterInput {
 
 export type TakeoverMasterResult =
 	| { ok: true; attachment: MasterAttachment; prevSessionId: string; prevGeneration: number }
-	| { ok: false; reason: "bad-session" | "generation-mismatch" | "lease-contended" };
+	| { ok: false; reason: "bad-session" | "generation-mismatch" | "lease-contended" | "transfer-in-progress" };
 
 /**
  * Stale 接管：acquireRegistryLease → lease 内重读比对 expected（CAS）→ 覆盖写 gen+1
@@ -384,6 +399,10 @@ export function takeoverMaster(input: TakeoverMasterInput): TakeoverMasterResult
 	const agent = input.agent ?? masterAddress();
 	const now = (input.now ?? new Date()).toISOString();
 	if (!input.sessionId || input.sessionId === "unknown") return { ok: false, reason: "bad-session" };
+	// 0924 L3-fix（交接窗口）：transfer 在途期间 stale 接管被抑制（防 zombie reclaim 抢代）；
+	// 明确 human cancel 越过并清理 marker（人工取消 = 该 transfer 视为作废）。
+	if (!input.humanCancel && isTransferInFlight(agent)) return { ok: false, reason: "transfer-in-progress" };
+	if (input.humanCancel) clearTransferWindow(agent);
 	const lease = acquireRegistryLease(`takeover:${input.sessionId}`);
 	if (!lease.won) return { ok: false, reason: "lease-contended" };
 	try {
@@ -410,6 +429,65 @@ export function takeoverMaster(input: TakeoverMasterInput): TakeoverMasterResult
 	} finally {
 		lease.release();
 	}
+}
+
+// ── transfer 窗口 marker（0924 L3-fix：交接在途 {agent, fromGeneration, transferId}）──────
+//
+// master-transfer spawn 成功后落 marker（token 已发出、后继 confirm 前的窗口）；confirm
+// （completed）/ transfer failed / human cancel 清理。TTL = 24h（与 handoff token 同寿命）：
+// 后继若永久死亡，窗口随 token 过期自然失效，不永久封死该 agent。窗口内 forceStale attach
+// 与 stale takeover 被抑制（仅显式 human cancel 越过）；token attach（后继本人）不受影响。
+// 文件放 registry/（本库自足、无模块环）；查询入口 readTransferWindow / isTransferInFlight。
+
+export interface TransferWindowMarker {
+	version: 1;
+	transferId: string;
+	agentAddress: ObjectAddress;
+	fromGeneration: number;
+	createdAt: string;
+}
+
+const TRANSFER_WINDOW_TTL_MS = 24 * 60 * 60 * 1000; // 与 handoff token 缺省 TTL 一致
+
+function transferWindowPathFor(agent: ObjectAddress): string {
+	return join(registryDir(), "transfer-window", `${agent.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+}
+
+/** 读 transfer 窗口 marker（缺失/损坏 → null）。 */
+export function readTransferWindow(agent: ObjectAddress = masterAddress()): TransferWindowMarker | null {
+	try {
+		const raw = JSON.parse(readFileSync(transferWindowPathFor(agent), "utf8")) as TransferWindowMarker;
+		if (raw?.version !== 1 || typeof raw.transferId !== "string" || typeof raw.fromGeneration !== "number") return null;
+		return raw;
+	} catch {
+		return null;
+	}
+}
+
+/** 落/覆盖 transfer 窗口 marker（同 agent 后一次 transfer 覆盖前一次，v1 单 transfer 假设）。 */
+export function setTransferWindow(marker: TransferWindowMarker): void {
+	const path = transferWindowPathFor(marker.agentAddress);
+	const dir = path.slice(0, Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")));
+	if (dir) mkdirSync(dir, { recursive: true });
+	writeJsonAtomic(path, marker);
+}
+
+/** 清理 transfer 窗口 marker（不存在 = 已清理，幂等）。 */
+export function clearTransferWindow(agent: ObjectAddress = masterAddress()): void {
+	try {
+		unlinkSync(transferWindowPathFor(agent));
+	} catch {
+		/* 不存在/无权限：按已清理处理（读侧 tolerant） */
+	}
+}
+
+/** 交接窗口是否活跃：marker 在场且 TTL 未超龄；超龄视同不存在（token 已过期，窗口无意义）。 */
+export function isTransferInFlight(agent: ObjectAddress = masterAddress(), now?: Date): boolean {
+	const m = readTransferWindow(agent);
+	if (!m) return false;
+	const age = (now ?? new Date()).getTime() - Date.parse(m.createdAt);
+	if (!Number.isFinite(age) || age < 0) return true; // 时钟回拨按在途处理（fail closed）
+	return age < TRANSFER_WINDOW_TTL_MS;
 }
 
 // ── heartbeat（条件刷新）────────────────────────────────────────────
