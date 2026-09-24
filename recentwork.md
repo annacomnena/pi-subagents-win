@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） |
 | 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） |
 | 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） |
 | 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） |
@@ -51,6 +52,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 43 - E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`）
+
+- **日期**：2026-09-24
+- **一句话**：新增**测试态** `extensions/_test_graph_frontier_shadow.ts`——G-B 核心验收件：同一 fixture、同一 `(backlog, prev, now)` 下逐项对照 v2 生产路径（`collectGlobalView`→`buildFrontier`）与 graph 路径（`readGraphSnapshot`→`toFrontierInput`→`buildFrontier`），产 O-B 行（五源 snapshot/project/run/trigger/recordOnly）；**双硬门 `unexplained=0 且 explained=0`（`WHITELIST=[]` 空集）+ DoD-3 canonical 全等**。实测 `frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`（21 checks，exit 0）→ **E2.3 翻转硬门证据**。**零生产接线、零行为**（只写临时 `state/work-graph/shadow.jsonl`）。L4 独立审查 **PASS-with-fixes**（1 必须修 + 3 建议修已闭环）；**篡改反向实验**证明非恒真假绿（graph-only attention 0 化 → exit 1 / `unexplained=15`）。
+- **涉及模块**：`extensions/_test_graph_frontier_shadow.ts`（新，~810 行，S1–S17 + S-R 反向自检）、`extensions/_test_runtime_autonomy.ts`（A10.1 排除列表 +1 行，ALLOW 仍恰 3）
+- **产物**：`plans/0924_graph_E2_2_recon.md` / `plans/0924_graph_E2_2_impl_plan.md` / `plans/0924_graph_E2_2_impl_report.md` / `plans/0924_graph_E2_2_l4_review.md` / `plans/0924_graph_E2_2_wrapup_report.md`
+- **Wiki**：更新正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（Current Contract 新增「E2.2 影子对照契约」节：O-B schema / 双硬门 / canonical 序 / E2.3 硬门证据 / 篡改反向实验 / 测试态零行为 + source_paths 补真实行号）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`de84baa`（E2.2 影子对照 harness：O-B schema + 两路装配 + S1–S17 + 双硬门）+ `154bf8d`（L4 必须修/建议修：S8a 固定时钟 + trigger `groupByKey` 不折叠 + S16 输入分叉断言 + `E22_REVERSE_SELFTEST` 反向自检）
+- **Verification**：`_test_graph_frontier_shadow.ts` **21 checks，exit 0，`frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`**（双硬门 + 全 33 帧 `next`/`diff` canonical 全等）；**篡改反向实验 exit 1 / `unexplained=15 explained=0`**（graph-only attention 0 化被 O-B + canonical 捕获 → 非恒真假绿）；`E22_REVERSE_SELFTEST=1` 自检报 `unexplained=1`（判别力有效）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_frontier_input.ts` 15/15；`_test_frontier_attention_window.ts` 18；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`test:global-view` + `test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_2_l4_review.md` **PASS-with-fixes**（1 必须修 + 3 建议修已闭环）。
 
 ### Item 42 - E2.1 Graph → frontier 输入适配器（`toFrontierInput`，零接线）
 

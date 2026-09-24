@@ -18,6 +18,9 @@ source_paths:
   - extensions/runtime/graph/frontier-input.ts#L16-L76
   - extensions/runtime/autonomy/frontier.ts#L103-L129
   - extensions/_test_graph_frontier_input.ts#L263-L398
+  - extensions/_test_graph_frontier_shadow.ts#L119-L243
+  - extensions/_test_graph_frontier_shadow.ts#L433-L452
+  - extensions/_test_graph_frontier_shadow.ts#L775-L815
   - extensions/runtime/graph/index.ts#L7-L11
   - extensions/_test_runtime_graph.ts#L87-L358
   - extensions/_test_frontier_attention_window.ts#L1-L30
@@ -108,6 +111,28 @@ E2.1 新增**纯函数** `toFrontierInput(snap, {now})`（`graph/frontier-input.
 
 验证：T1–T15 全绿（`_test_graph_frontier_input.ts`，含 T9 双路径结构等价：同 fixture 帧0 `JSON.stringify` 严格全等、帧1 canonical 全等且含非 mailbox 边沿 `working_to_completed`/`stagnation`/`needs_user`；T9 端到端覆盖 `staleOver=true`/`needsHuman=true`/`pidAlive=false`）。
 
+### E2.2 影子对照契约：`_test_graph_frontier_shadow.ts`（测试态，零行为；`de84baa` + `154bf8d`）
+
+E2.2 = **G-B 核心验收件**：在**测试态**逐项对照 v2 生产路径与 graph 路径，证明「Graph 派生输入 ≡ v2 生产输入」。**零生产接线、零行为**：不 import 进 `extensions/index.ts`/`protocol.ts`/`autonomy/collect.ts`；只写临时 `<tmp>/state/work-graph/shadow.jsonl`，不碰生产 `state/autonomy/audit.jsonl`（`_test_runtime_autonomy.ts` A10.1 排除列表 +1 行，ALLOW 仍恰 3）。
+
+**两路装配（唯一自变量 = snapshot 载体）**：同一 fixture、同一 `(backlog, prev, now)` 下——
+
+- v2：`collectGlobalView({agentDir, now, gitProbe})` → `buildFrontier`（**不传 `history`** → `history≡[]`，MF1）；
+- graph：`readGraphSnapshot({journalPath, stateDir, tabRunsDir, sessionsRoot, timersDir, now})` → `toFrontierInput(gSnap,{now})` → `buildFrontier`；
+- `backlog`（一次 `mailboxBacklog()`）/`prev`（同一对象）/`now`（同一标量）两路共享；每帧断言 `next.asof === NOW`（`#L433`）。
+
+**O-B 行 schema**（`shadowCompare`，`#L222`，纯函数、零 IO）：`{ at, scope, itemKind: "snapshot"|"project"|"run"|"trigger"|"recordOnly", nodeId, v2Value, graphValue, verdict: "same"|"explained"|"unexplained", reason? }`。五源：snapshot（baseline/asof）· project（`msv` 折入本行）· run（carrier 七字段根因定位）· trigger（语义键 `rule|project|evidence`，`groupByKey` **数组保重复不折叠**，`#L198`）· recordOnly（存在性）。
+
+**canonical 序**（`deepSort`，`#L134`）：对象键递归排序（消 `runs` 键序）；数组按**语义键**排序——`triggers` 按 `rule|project|evidence`、`details` 按 `runId|repoPath`（下标序不参与）。canonical 序只消序、不抹值。
+
+**双硬门（不可协商）**：`rows.filter(unexplained).length === 0` **且** `rows.filter(explained).length === 0`——`WHITELIST = []`（空集，`#L119`）：G-A 后 v2 已消费全量 attention，任何差异都是真差异；`explained>0` 即「有人往白名单塞未批准条目」→ 失败。另加 DoD-3 全等：`canonicalJson(v2.next) === canonicalJson(graph.next)` 且 `diff` 同理（全 33 帧）。
+
+**`unexplained=0 explained=0` 是 E2.3 翻转的硬门证据**（`0924_graph_E2_impl_plan.md#6`：翻转 commit 前必须附该机器输出原文）。实测：`frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`，21 checks，exit 0。
+
+**篡改反向实验证明 harness 非恒真假绿**：在 graph-only 输入注入 `attentionByRepo[首个正键]:=0` → 进程 **exit 1**、S2/S3/S4/S6/S11/S12×4/S13/S16/S17 失败、`unexplained=15 explained=0`（S17 打印 `unexplained=15 → s2@f2/project/…: needsUser …`）。该实验已落成**受控自检**（`E22_REVERSE_SELFTEST=1`，缺省关闭）：篡改 graph-only 输入 → 断言 O-B 必报 `unexplained>0`（判别力有效时自检通过、进程仍 exit 0），供未来改 canonical/verdict 时复验（`#L796-L815`）。
+
+**E2.2 L4 收尾（`154bf8d`）**：S8a 固定时钟（`dispatchedAtMs = NOW - 60_000`，去 `Date.now()`）；trigger Map 改 `groupByKey` 数组保 multiplicity；S16 显式断言输入分叉（graph 源 journal cwd lower-case vs v2 源账本 cwd upper-case 变体 → 归一键唯一，`#L742`）；反向自检 helper。
+
 ## Evidence
 
 - E1 测试 13 组（`extensions/_test_runtime_graph.ts#L87-L311`）：空输入 / 单对象 / 边三来源 / 孤儿引用 / dedupe 幂等 / 乱序 terminal / diff 边界 / 确定性+路径口径 tripwire / 10k 性能 / 未知事件 / workspaceRef 弱载体 / 坏行只读 / replay 等价 + collect 装配；T13 含病态事件（type 与 payload.status 矛盾）下 Graph ≡ projector 的等价断言。
@@ -117,6 +142,7 @@ E2.1 新增**纯函数** `toFrontierInput(snap, {now})`（`graph/frontier-input.
 - E2.0 载体对齐 + 共享归约（`7672771`+`ed5278a`，L4 `plans/0924_graph_E2_0_l4_review.md` **PASS**）：`_test_graph_carriers.ts` 5 组（legacy oracle 双跑 + `collectGlobalView` 全量 golden 入库，路径归一化、固定 now）；`_test_runtime_graph.ts` 13/13（T13 快照形状零漂移）；`_test_runtime_autonomy.ts` 57 checks（A10.1 allowlist 仍恰好 3）；`test:global-view`（含 M1 golden）绿。行为保持由 pre/post golden 逐字节复现证明。
 - G-A 语义修复（`93f8447` + `fae1aa2`；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**，必须修 M2 已闭环）：`_test_frontier_attention_window.ts` 18 checks（P0 十条翻转 + N1-N4 + M1/M2/M3 + K1 tripwire）；规模 19/20/21/40 四档页外漏检=0、假边沿=0；`test:global-view` M1 byte-identical + Σ 不变量三路径；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_carriers.ts` 5/5（golden 仅加性新增 `attentionByRepo` 一个键）；其余 runtime 回归全绿。
 - E2.1 适配器契约（`b59ee68` + `513623c`；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**，2 必须修 + 3 建议修已闭环）：`_test_graph_frontier_input.ts` **15/15**（T1–T15：T8 源码读取守卫扩零路径转换白名单、T9 `FAR_PAST` 相对固定 `NOW` + 双路径双帧非 mailbox 边沿、T15 重复 runId tie-break）；`frontier-input.ts` 零生产接线（`rg -l frontier-input extensions --include=*.ts` 仅命中自身 + 测试）；回归 `_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）/ `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）/ `_test_frontier_attention_window.ts` 18 + `test:global-view` + 6×npm 全绿。
+- E2.2 影子对照 harness（`de84baa` + `154bf8d`；L4 `plans/0924_graph_E2_2_l4_review.md` **PASS-with-fixes**，1 必须修 + 3 建议修已闭环）：`_test_graph_frontier_shadow.ts` **21 checks，exit 0，`frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`**（双硬门 + DoD-3 canonical 全等 33 帧）；篡改反向实验 **exit 1 / `unexplained=15`**（非恒真假绿）；`E22_REVERSE_SELFTEST=1` 自检报 `unexplained=1`；`_test_runtime_autonomy.ts` 57 checks（ALLOW 仍恰 3）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）+ `test:global-view`/`runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿。
 
 ## Links Out
 

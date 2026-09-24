@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (E2.2 影子对照 harness：`de84baa`/`154bf8d`)
+
+- **影子对照证明 Graph 派生输入与 v2 生产输入语义等价；硬门 `unexplained=0` 且 `explained=0`**：新增测试态 `extensions/_test_graph_frontier_shadow.ts`（G-B 核心验收件）——同一 fixture、同一 `(backlog, prev, now)` 下逐项对照 v2 生产路径（`collectGlobalView`→`buildFrontier`）与 graph 路径（`readGraphSnapshot`→`toFrontierInput`→`buildFrontier`），产 O-B 行（五源 snapshot/project/run/trigger/recordOnly）。实测 `frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`（21 checks，exit 0），全 33 帧 `next`/`diff` canonical 全等 → **E2.3 翻转硬门证据**。
+- **双硬门（不可协商）**：`unexplained=0` **且** `explained=0`（`WHITELIST=[]` 空集——G-A 后任何差异都是真差异，`explained>0` 即「白名单塞未批准条目」）；canonical 序只消序不抹值（对象键递归排序 + `triggers` 按 `rule|project|evidence`、`details` 按 `runId|repoPath`，下标序不参与）。
+- **篡改反向实验证明非恒真假绿**：graph-only 输入注入 `attentionByRepo[首个正键]:=0` → 进程 **exit 1**、`unexplained=15 explained=0`（S2/S3/S4/S6/S11/S12×4/S13/S16/S17 失败）。已落成受控自检 `E22_REVERSE_SELFTEST=1`（缺省关闭；篡改 graph-only 输入 → 断言必报 `unexplained>0`，判别力有效时 exit 0），供未来改 canonical/verdict 时复验。
+- **零行为**：测试态临时 `PI_RUNTIME_DIR`/`PI_TAB_RUNS_DIR` + 显式 `stateDir`；影子行只写 `<tmp>/state/work-graph/shadow.jsonl`，不写生产 `state/autonomy/audit.jsonl`；零生产接线（`index.ts`/`protocol.ts`/`autonomy/collect.ts`/`graph/**` 未动）；A10.1 排除列表 +1 行，ALLOW 仍恰 3。
+- **E2.2 L4 收尾（`154bf8d`）**：S8a 固定时钟（`dispatchedAtMs = NOW - 60_000`，去 `Date.now()`）；trigger Map 改 `groupByKey` 数组保 multiplicity；S16 显式断言输入分叉（graph 源 journal cwd lower-case vs v2 源账本 cwd upper-case 变体 → 归一键唯一）。
+- **验收**：`_test_graph_frontier_shadow.ts` 21 checks（`unexplained=0 explained=0`）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_frontier_input.ts` 15/15；`_test_frontier_attention_window.ts` 18；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`test:global-view` + `runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_2_l4_review.md` **PASS-with-fixes**（1 必须修 + 3 建议修已闭环）。
+- **文档**：Wiki `Wiki/Architecture/work-graph-read-only-projection.md`（「E2.2 影子对照契约」节）；Recent Work Item 43。
+
 ## [Unreleased] — 2026-09-24 (E2.1 Graph → frontier 输入适配器 `toFrontierInput`：`b59ee68`/`513623c`)
 
 - **E2.1 适配器（零接线）**：新增纯函数 `toFrontierInput(snap, {now})`（`extensions/runtime/graph/frontier-input.ts`），把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`，冻结 E2.2 影子对照输入契约；`autonomy/frontier.ts` 仅类型放宽（`FrontierInputs.snapshot` 改结构化接口，`buildFrontier` 算法体与 v2 调用点零改）。**零生产接线**（`rg -l frontier-input extensions --include=*.ts` 仅命中自身 + 测试）。
