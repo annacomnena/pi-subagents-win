@@ -2,7 +2,7 @@
 title: 微信 iLink 通道
 kind: concept
 status: current
-updated: 2026-09-24
+updated: 2026-09-25
 source_paths:
   - scripts/wechat-ilink-probe.mjs
   - plans/0923_wechat_ilink_probe_checklist.md
@@ -16,13 +16,17 @@ source_paths:
   - extensions/runtime/wechat-reply.ts
   - extensions/channel-wechat/store.ts
   - extensions/channel-wechat/parser.ts
+  - extensions/runtime/wechat-remote-command.ts
+  - extensions/wechat-command-consumer.ts
+  - extensions/runtime-host/wechat-input.ts
+  - extensions/index.ts
 ---
 
 # 微信 iLink 通道
 
 ## Summary
 
-iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复与**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）均已实现。广播契约见 [[#出站广播]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
+iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
 
 ## Current Contract
 
@@ -264,6 +268,90 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 - `npx tsx extensions/_test_wechat_broadcast.ts` → **18 组断言块全绿**（含 M1 回滚止发、S5 的 TTL 先于 connected 门序 + 真实 `readAttachment(masterAddress())` 缺省路径 + `currentSid=undefined`）；`_test_wechat_reply.ts` **22 组旧路径红线原样通过**；回归 `_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server` 全绿。L4 报告：本地 `plans/0924_wechat_broadcast_l4_review.md`（PASS-with-fixes，M1 + S1–S5 已闭环 `0337aac`）。
 
+## 远程斜杠命令（已实现 `488e942`，L4 修复 `ebb9e04`）
+
+**一句话**：微信私聊里的 `/xxx` 在 host 侧 `wechat-input` 写 outbox **之前**被会话消费端拿下（inbox 记录 → `state:"consumed"`）——**零 LLM、零 `sendUserMessage(用户原文)`、零 outbox 项、零转写污染**；回执 = `kind:"command"` 的 reply intent，由既有 watcher 发出。L4 独立复核 PASS-with-fixes（M1 归一化 + M2 注入点 fail-closed + S1–S6 已闭环 `ebb9e04`）。
+
+### 旁路机制与执行顺序
+
+- **消费端** `scanWechatRemoteCommands`（`extensions/wechat-command-consumer.ts#L250`）门序 = ① 能力门（`#L257`）→ ② 会话门：subagent 恒拒（`#L262`）、仅 **global master owner 会话**（`readAttachment(masterAddress()).sessionId === getCurrentSessionId()`，`#L266`）→ ③ 轴一 openid 白名单（`#L292`）→ ④ 分类 → ⑤ 标终态 `consumed`（`#L305`）→ ⑥ `wcmd:` claim（`#L309`）→ ⑦ 执行/拒绝 → ⑧ 写回执 intent（`#L342`）→ ⑨ 脱敏审计 → ⑩ `defer()`（`#L372`）。任何异常内部吞掉，消费端永不抛。
+- **形态与节拍**：`session_start` 起 **fs.watch 立即扫描（无 debounce）** + 启动即扫 + 5s tick 兜底（`registerWechatRemoteCommands`，`#L494`；接线 `extensions/index.ts#L1868`）；host 侧注入器的 fs.watch 有 **200ms debounce**（`wechat-input.ts::startWechatInput`）⇒ 正常路径先于 host 拿下记录。**残余竞态不再靠抢跑**（见下「注入点双防护」）。
+- **回执**：intent id `sha256("wechat-command:"+msgId)`（`extensions/runtime/wechat-reply.ts#L34`）、clientId `sha256("wechat-command-client:"+msgId+":"+toUserId)`（`extensions/channel-wechat/send.ts#L82`），`outboxId = intent id`（同 msgId 重写被 `linkSync` EEXIST 挡住）。watcher 三门（mode/TTL/connected）只对 `kind==="broadcast"` 生效 ⇒ command 与 reply 同待遇；另**豁免 `reply.enabled` 门**（S2：`extensions/runtime-host/wechat-reply.ts#L36`、`#L44`——否则远程 `/wechat reply off` 会吞掉自身回执），reply/broadcast 的门零改动。
+- **终态第三值**：`InboundRecord.state` 增 `"consumed"` 且读回透传（`extensions/channel-wechat/store.ts#L57`、`#L332`；**透传是承重改动**——不透传会被映回 `pending` → 注入路重复拿到）。`consumed` 记录不带 `outboxId`、不满足 `wechat-reply-hook` 的 `state==="injected"` 门 ⇒ **回执不可能被当成 marker 轮回执**。
+- **防环**：命令轮不产生 turn ⇒ 无 `agent_end`/`agent_settled` ⇒ 无广播暂存（`flushWechatBroadcast → no-stash`）。
+- **执行面**：配置类（`/wechat …`）直连 `wechat-bind` 同步写盘、如实回报 ok/error；会话类（`/reload` `/compact` `/model` `/thinking`）经 `pi.sendUserMessage("/wechat-remote-run …", {expandPromptTemplates:true})` 走 pi 正规扩展命令派发拿 `ExtensionCommandContext.reload()/compact()`（`defaultRemoteCommandDeps`，`#L404`；内部命令注册 `#L504`）。**S3**：内部命令未注册 → dispatch **no-op**（不把内部命令文本跌落成普通 user 消息）。**S4 运行时依赖**：`expandPromptTemplates` 需**运行时 pi ≥ 0.87**——仓库 devDep 的 pi 0.80.6 硬编码 `expandPromptTemplates:false`（`.d.ts` 无该属性），低于版本会把内部命令文本当字面 prompt 注入；已写入 `README.md` §2「Runtime requirement」。
+- **审计（独立文件）**：`state/wechat-command-audit.jsonl`（0600），行含 `decision=command-accepted|command-denied|command-failed` + `tier` + `reason`，**只记首 token**（`auditCmdToken`，参数不落盘）+ 掩码 msgId/openid；诊断面 `GET /v1/wechat/quarantine` 响应带 `commandAuditLines` 行数（`extensions/runtime-host/server.ts#L1082-L1084`，S6）。
+
+### 注入点双防护（M2 必须修后）
+
+- `wechat-input.ts::tryInjectPending` 在能力开启（`readWechatRemoteCommandConfig(configPath).enabled===true`）时**先 classify**（`extensions/runtime-host/wechat-input.ts#L39`）：`kind !== "not-command"` 的记录**按序跳过**（不选它、继续找下一条，避免一条滞留命令饿死其后的普通文本）；全部被跳过时 → `return {injected:false, reason:"command-shaped"}` + 输入审计 `skipped/command-shaped`（`#L50-L51`），**不改终态、不写 outbox**，留待消费端下一轮拿下。
+- 结构性 fail-closed：裁定③「未知 `/xxx` 绝不回落成文本注入」不再依赖「消费端比 host 快 200ms」——冷启动 5s tick 窗口、会话门失败（`not-owner`/`subagent`）、dedupe 重投窗口下，**即使消费端不在线，命令也不会被当普通文本注入**。
+- 轴一 not-allowlisted 判定位置保持今天口径（全被跳过时对**首条** pending 记录判白名单：未授权 → 既有 `not-allowlisted` rejected 终态 + 审计；授权 → `command-shaped`）。
+- 普通文本不受影响：`gate=false`（能力关）时逐字节今天行为；能力开时 `not-command` 记录照旧注入。
+
+### 归一化与绕过矩阵（M1 必须修后）
+
+**入口先归一化**（`normalizeForClassify`，`extensions/runtime/wechat-remote-command.ts#L118`，**只作用于分类副本**，不改写入库正文/回执展示）：① **NFKC 兼容分解**（全角 `／`→`/`、全角字母数字 `ｒｅｌｏａｄ`→ASCII、全角空格→半角；顺带 `！`→`!`、`；`→`;`，与既有 ASCII danger 口径一致，不新增判定面）→ ② **剔不可见字符**（ZWSP/ZWNJ/ZWJ/双向控制符/word joiner/BOM/软连字符，整串，含中缀插入）→ ③ **trimStart**（`SHELL_LIKE` `#L80` 与首 token 正则 `#L86` 都锚定第 0 列）。
+
+**判定分界**（归一化后）：`/` 单斜杠或斜杠后带空白（`/`、`/ ok`）→ `not-command`（聊天分隔符，L3 行为）；两段路径（`PATH_LIKE_RE` `#L92`，`/etc/passwd`、`/tmp/f.txt`）→ `not-command`；**其余以 `/` 开头却解析不出命令名**（`//x` `/_x` `/1x` `/-x` `/reload/`）→ **显式 deny(unknown)**，绝不落 `not-command`；不以 `/` 且不以 shell 运算符开头 → 散文/URL `not-command`。
+
+**15 条绕过形态全挡**（`_test_wechat_remote_command.ts` BYPASS_MATRIX，T14 分类 / T15 端到端 / T16 注入门，实测）：
+
+| 形态 | 例 | 分类（修后） |
+|---|---|---|
+| 前导空白 + 命令 | ` /nonexistent-cmd …`、`\t/x`、`\n/x`、`\r\n/reload` | deny/unknown 或 exec（归一后落第 0 列） |
+| 前导空白 + shell | ` !rm -rf /`、` ; id`、`\n!rm …` | deny/**danger** |
+| 首字符非 `[A-Za-z]` | `//reload`、`/_internal`、`/1cmd …`、`/-x` | deny/unknown |
+| 全角斜杠/字母 | `／reload`、`/ｒｅｌｏａｄ` | exec/sensitive |
+| 零宽字符插入 | `/​reload`（ZWSP） | exec/sensitive |
+| 尾斜杠 | `/reload/` | deny/unknown |
+
+- **15/15 `kind !== "not-command"`**；端到端 **15/15 → `consumed`、零 outbox、零用户原文 `sendUserMessage`**（exec 类的 `send=1` 只可能是内部命令 `/wechat-remote-run …`）；**M2 注入门下**（消费端会话门失败）连跑 3 轮 15/15 `injected=false reason=command-shaped`、state 仍 `pending`。
+- **8 条正常文本零误伤**（仍 `not-command`）：`hello 世界`、`/etc/passwd`、`/`、`/ ok`、`/tmp/f.txt`、`https://example.com/x`、`我明天 /食堂见`、`今天​很好`。
+- **误伤面（如实）**：以全角 `！`/`；` 开头的正常中文散文被判 danger 恒拒（与半角 `!`/`;` 同待遇，回执告知、不静默丢）；形如 `/tmp file.txt` 的首 token 命中命令形态 → `Unknown command` 拒而非注入（Hermes 同款取舍「去掉前导斜杠重发」）。
+
+### 分级白名单（裁定①②③，`classifyRemoteCommand` `#L227`）
+
+| 档 | 命令 | 说明 |
+|---|---|---|
+| **safe** | `/wechat status`（或 `/wechat`）、`/wechat reply mode broadcast\|reply-only`、`/wechat reply on\|off` | 只读或仅改出站偏好，免确认 |
+| **sensitive** | `/reload`、`/compact`、`/model <id>`（`MODEL_ID_RE` 校验）、`/thinking off\|minimal\|low\|medium\|high\|xhigh`（枚举）、`/wechat on\|off` | **免确认直接执行**（用户裁定②，无 nonce/确认弹窗），审计保留 `tier=sensitive` |
+| **danger（恒拒）** | shell 形态 `!` `;` `\|` `&` `$(` 反引号开头；`master-*` 前缀；`DANGER_EXACT`（`new/fork/clone/resume/quit/login/logout/trust/export/import/share/yolo/approve/deny/rm/sh/bash/exec/shell/sudo`）；**任何含 `:` 的名**（skill/prompt 模板展开面，**永不展开**） | 回执原文「**该命令不支持远程执行**」（`REMOTE_COMMAND_DANGER_TEXT`） |
+| **usage 拒** | 白名单命令但参数非法（`/reload now`、`/wechat reply mode foo`、`/model a;id`、`/thinking HIGH`） | 第三种文案 `用法：…`；仍属显式拒绝，绝不回落正文 |
+| **unknown** | 白名单外 `/xxx` | 回执 ``Unknown command `/xxx`…``（对齐 Hermes），**零 `sendUserMessage`、零 outbox** |
+
+- **解析纪律**：只认首 token 精确匹配 `^/([A-Za-z][\w:.-]*)(\s|$)` + 参数枚举校验；命令名 lower-case 归一（`/RELOAD` → exec、`/EXPORT` → danger，大小写无逃逸）；**参数永不进 shell**（新文件 grep `child_process|execSync|spawn|exec(` 零命中）。
+- **双轴授权（裁定⑥）**：轴一 = `channels.wechat.input.allowFrom` ∪ owner openid（**全等**比较，与 `wechat-input.ts` 同口径）；轴二 = 上表命令白名单。**会话门 = global master owner 会话**（= 注入路本会投递的目标会话），subagent 恒拒——避免 tab/subagent 抢执行。轴一未授权 → 消费端**不 claim**，交回注入路产生既有 `not-allowlisted` rejected 终态（今天行为不变）。
+
+### 配置门（裁定⑤ fail-closed）
+
+- `channels.wechat.remoteCommands.enabled === true` 才开（`extensions/runtime-host/wechat-bind.ts#L249-L257`）；缺段/坏 JSON/文件不存在/`enabled:"true"`/`enabled:1` → **false**。与 Hermes `slash_access.py` 的 fail-open（未配 admin 即全开）**刻意相反**。
+- **关闭（= 缺省态）时行为精确回退今天**：消费端 `scan.reason="disabled"` 零 IO 零副作用、记录留 `pending`；注入器 `gate=false` 不做 classify，逐字节旧路径。
+- **与 `input.enabled` 解耦**：能力门只看 `remoteCommands.enabled` + 轴一 allowFrom/owner——`input.enabled=false` 只关文本注入，不关命令通道。
+- **无二次确认开关**（裁定②明确否掉 nonce 挑战）；白名单覆盖留代码表（改动需发版），配置面只有 `enabled` 一个键。
+
+### 幂等与顺序
+
+- 收据 = `runtime/receipts.ts` first-wins，键 **`wcmd:<sha256(msgId)>`**（`wcmdReceiptKey`；命名空间避开 `outbox:`/`run-`/`msg:`/`cmd:`）；claim 输家只收敛终态、不重复执行（重放实测 `alreadyClaimed=1`、副作用=1、回执=1）。
+- 顺序 = **标终态 → claim → 执行 → 回执落盘 → `defer()`**（回执先落盘再 reload：`ctx.reload()` 后旧 ctx 即 stale）。
+- intent id 确定性 + `linkSync` EEXIST ⇒ 同 msgId 不重写不重发；TOCTOU 复核（S1：`raw.state !== "pending"` 即让位，`#L302`）⇒ host 已写下 `injected` 时不覆盖、不双动作。
+
+### 已知残余（诚实清单，不得当成已解决）
+
+1. **崩溃反向窗口（S5）**：回执已落盘（措辞「已请求执行 …」）而 `defer()` 未跑 → 用户被告知已执行、实际没执行，且 `wcmd:` 收据已耗 → **永不重试**；实现选择不改写已落盘回执（改写同样有窗口）。
+2. **崩溃正向窗口**：标终态/claim 后中断 → 该条命令**丢失不重放**（at-most-once：宁丢一条 `/reload` 也不重复执行敏感操作）。
+3. **消费端不在线/会话门失败**时：M2 保证命令**不被注入**，但记录滞留 `pending`（命令未执行、无回执）直到消费端下一轮拿下；能力关闭时整条回退今天行为（文本注入）。
+4. **未授权记录交回注入路** → 既有 `not-allowlisted` rejected 终态（事后加白名单不补投，与 W2 同口径）。
+5. **命令审计在独立文件** `state/wechat-command-audit.jsonl`（与 `wechat-input-audit.jsonl` 分离）；诊断端只回行数 `commandAuditLines`，`consumed` 明细不在 quarantine 列表内；GUI 面未做——`remoteCommands.enabled` 无界面开关（D17 后续切片）、inbox 徽章对 `state:"consumed"` 渲染为字面 `consumed`。
+6. **`/model <id>` 存在性校验只在本地**（registry 精确匹配），错误只在本机 `ctx.ui.notify` 可见；远程回执措辞保守「已请求执行 …」（研究 Q7-4 既定缓解）。**内部派发的真机会话行为未实跑**（只有静态依据 + fakePi 单测）。
+7. **测试面既有问题（非本通道引入，L4 独立复核已确认）**：`_test_message_outbox` 双进程 CAS 断言偶发红（父提交 50 跑 2 次）、`_test_tui_progress` pre-existing 红。
+
+### 验收
+
+- `npx tsx extensions/_test_wechat_remote_command.ts` → **22 组断言块全绿**（含 BYPASS_MATRIX 15 条的 T14 分类/T15 端到端/T16 注入门、T17 冷启动、S1→T18、S2→T19、S3→T20）；回归 10/10：`_test_wechat_reply` 22 组 / `_test_wechat_broadcast` 18 组 / `_test_wechat_input` 14 组 / `input_set` / `message_outbox` / `outbox_latency` / `_test_wechat_receive` 7 组 / `_test_wechat_bind` 12 组 / `_test_runtime_host_server` / `check-extension-load`。
+- **变异测试**：把 `classify` 还原成 `488e942` 版 → T14/T15/T16 FAIL；把 M2 `gate` 恒 false → T16/T17 FAIL（exit 1）——非恒绿假象。
+- L4 报告：本地 `plans/0924_wechat_remote_command_l4_review.md`（PASS-with-fixes，M1+M2+S1–S6 已闭环 `ebb9e04`）。
+
 ## Evidence
 
 - `scripts/wechat-ilink-probe.mjs`（commit `658306e`）— 头部用法注释与六命令实现。
@@ -273,6 +361,8 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 决策依据见 [[审批门策略]]；本地 `plans/0923_decisions.md` D1②、D2、D4。
 - 出站广播（commit `0a2b292`，L4 修复 `0337aac`）：`extensions/wechat-reply-hook.ts`（`stashWechatBroadcast`/`flushWechatBroadcast`/owner 资格门）、`extensions/runtime-host/wechat-reply.ts#L13-L61`（mode/TTL/connected 三门与顺序）、`extensions/runtime-host/wechat-bind.ts#L263-L278`（`{enabled, mode, sessionScope}` 与 fail-closed）、`extensions/runtime/wechat-reply.ts#L24-L27` + `extensions/channel-wechat/send.ts#L72-L74`（intent id / clientId 派生）、`extensions/channel-wechat/store.ts#L349-L358`（`knownChats()`）。
 - 广播验收：`extensions/_test_wechat_broadcast.ts`（18 组断言块，修复后实跑全绿）；L4 复核 `plans/0924_wechat_broadcast_l4_review.md`（本地 gitignored）。
+- 远程斜杠命令（commit `488e942`，L4 修复 `ebb9e04`）：`extensions/runtime/wechat-remote-command.ts`（`normalizeForClassify#L118`、`classifyRemoteCommand#L227`、`ENTRIES#L166`、`DANGER_EXACT#L130`）、`extensions/wechat-command-consumer.ts`（`scanWechatRemoteCommands#L250`、`registerWechatRemoteCommands#L494`、`defaultRemoteCommandDeps#L404`、`buildWechatStatusText#L170`）、`extensions/runtime-host/wechat-input.ts#L39-L51`（M2 注入点门）、`extensions/runtime-host/wechat-bind.ts#L249-L257`（能力门 fail-closed）、`extensions/channel-wechat/store.ts#L57`+`#L332`（`consumed` 终态与透传）、`extensions/runtime/wechat-reply.ts#L34` + `extensions/channel-wechat/send.ts#L82`（intent id / clientId 派生）、`extensions/runtime-host/wechat-reply.ts#L36`+`#L44`（command 豁免 `reply.enabled` 门）、`extensions/index.ts#L1868`（接线）、`README.md#L71`（运行时 pi ≥ 0.87）。
+- 命令通道验收：`extensions/_test_wechat_remote_command.ts`（22 组断言块 + 15 条绕过矩阵，修复后实跑全绿）；L4 复核 `plans/0924_wechat_remote_command_l4_review.md`（本地 gitignored）。
 
 ## Links Out
 
@@ -288,3 +378,4 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放未测；④空批推进游标已测；⑤相同 `client_id` 的服务端去重未定论（API 双发均成功，手机端条数待人工观察）；⑥并发 poll+send 限流/429 未测；⑦附件 URL 主机/大小限制未测。另：出站文本长度上限与 bot 回声行为未验证。
 - 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。
 - 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；③ 服务端 `client_id` 去重语义仍**未定论**（已用 per-recipient clientId 规避跨收件人互斥，同 id 双发是否只投一条未知，沿用⑤）；④ 出站文本长度上限未测（4000 为本地预算）。
+- 远程斜杠命令通道待实测/未决：① 真机会话内 `/wechat-remote-run` 派发（含 agent 忙时 defer 窗口）只有静态依据 + fakePi 单测，**未做真机会话验证**；② GUI 面未做——`remoteCommands.enabled` 界面开关（D17）与 inbox 对 `state:"consumed"` 的徽章渲染（当前显示字面 `consumed`）；③ 诊断面只给 `commandAuditLines` 行数，`consumed` 记录明细仍不可见（quarantine 列表只列 `rejected`）；④ 真机端到端被平台侧消息投递问题阻塞（见「判定实验」节）——通道目前只有本机断言与 fakePi 证据。

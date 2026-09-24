@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） |
 | 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
 | 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） |
 | 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） |
@@ -54,6 +55,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 46 - 微信远程斜杠命令旁路（`/xxx` → `consumed`，分级白名单 + 防绕过 + fail-closed）
+
+- **日期**：2026-09-25
+- **一句话**：微信私聊里的 `/xxx` 在 host 侧 `wechat-input` 写 outbox **之前**被会话消费端拿下（inbox → `state:"consumed"`）——零 LLM、零 `sendUserMessage(用户原文)`、零 outbox、零转写污染；回执 = `kind:"command"` reply intent 由既有 watcher 发出（不产生 turn ⇒ 不进广播环路）。**归一化（M1）**：NFKC + 剔零宽 + trimStart 后再分类，归一化后以 `/` 开头却解析不出命令名（`//x` `/_x` `/1x` `/-x` `/reload/`）→ 显式 deny 不落 `not-command`，**15 条绕过形态全挡、8 条正常文本零误伤**。**注入点双防护（M2）**：`wechat-input.ts::tryInjectPending` 能力开启时先 classify，`kind!=="not-command"` → 按序跳过 → `reason:"command-shaped"`（不改终态、不写 outbox）→ 结构性 fail-closed，不靠消费端抢跑 200ms。**分级白名单**：safe（`/wechat status`、`/wechat reply mode|on|off`）｜sensitive（`/reload` `/compact` `/model <id>` `/thinking <lvl>` `/wechat on|off`）免确认直接执行｜danger 恒拒（shell 形态 / `master-*` / 会话销毁与凭据导出面 / 含 `:` 的名）→「该命令不支持远程执行」；未知 `/xxx` → ``Unknown command `/xxx`…``，零派发零 outbox。**配置门**：`channels.wechat.remoteCommands.enabled` 缺省 false（fail-closed），关闭时回退今天；双轴 = `allowFrom` ∪ owner openid × 命令白名单，会话门 = global master owner、subagent 恒拒；幂等 = `wcmd:<sha256(msgId)>` first-wins，顺序 标终态→claim→执行→回执→`defer()`。
+- **涉及模块**：`extensions/runtime/wechat-remote-command.ts`（`normalizeForClassify`/`classifyRemoteCommand`/`ENTRIES`/`DANGER_EXACT`，纯函数零 IO）、`extensions/wechat-command-consumer.ts`（`scanWechatRemoteCommands`/`registerWechatRemoteCommands`/`defaultRemoteCommandDeps`/`buildWechatStatusText`/`wcmdReceiptKey`）、`extensions/runtime-host/wechat-input.ts`（M2 注入点门）、`extensions/runtime-host/wechat-bind.ts`（`readWechatRemoteCommandConfig` fail-closed）、`extensions/runtime-host/wechat-reply.ts`（S2 command 豁免 `reply.enabled` 门）、`extensions/channel-wechat/store.ts`（`consumed` 终态 + 读回透传）、`extensions/runtime/wechat-reply.ts` + `extensions/channel-wechat/send.ts`（intent id / clientId 派生）、`extensions/runtime-host/server.ts`（S6 `commandAuditLines`）、`extensions/index.ts`（接线 + `/wechat status` 抽公共函数）、`README.md`（S4 Runtime requirement）
+- **产物**：`plans/0924_wechat_remote_slash_command_research.md` / `plans/0924_wechat_remote_command_impl_report.md`（含 §10 L4 后修复 + 绕过矩阵三张表）/ `plans/0924_wechat_remote_command_l4_review.md` / `plans/0924_wechat_remote_command_wrapup_report.md`（本地 gitignored）
+- **Wiki**：更新 `Wiki/Architecture/wechat-ilink-channel.md`——新增「远程斜杠命令（已实现 488e942，L4 修复 ebb9e04）」节（旁路机制与执行顺序 / 注入点双防护 / 归一化与绕过矩阵 / 分级白名单 / 配置门 / 幂等 / 已知残余 / 验收）+ Summary 补指路 + Evidence 补代码位置与验收 + Open Questions 补通道待实测项 + frontmatter `updated`/`source_paths` 维护
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`488e942`（feat：旁路 + 白名单分级 + 未知命令显式拒绝，9 files）+ `ebb9e04`（fix：L4 必须修 M1 归一化防绕过 + M2 注入点 fail-closed + S1–S6，8 files）
+- **Verification**：`_test_wechat_remote_command.ts` **22 组断言块全绿**（BYPASS_MATRIX 15 条 T14 分类 / T15 端到端零原文派发零 outbox / T16 注入门 ×3 轮 + T17 冷启动 + T18 S1 / T19 S2 / T20 S3）；回归 10/10（`_test_wechat_reply` 22 / `_test_wechat_broadcast` 18 / `_test_wechat_input` 14 / `input_set` / `message_outbox` / `outbox_latency` / `_test_wechat_receive` 7 / `_test_wechat_bind` 12 / `_test_runtime_host_server` / `check-extension-load`）；变异测试（还原 M1、关 M2 门）→ exit 1；L4 `plans/0924_wechat_remote_command_l4_review.md` **PASS-with-fixes**（2 必须修 M1/M2 + 6 建议修 S1–S6 全部采纳闭环）。
 
 ### Item 45 - 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast）
 
