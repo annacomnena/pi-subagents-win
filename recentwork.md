@@ -31,11 +31,26 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 28 | P1 | 微信输入 W2（私聊文本注入 master，D15 六条件，已实现 `168fed1`） | Item 25 | W2b：GUI 开关 + 白名单（从最近发送者一键添加）+ 「为什么没进来」反馈 |
 | 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 28 - 微信输入 W2（私聊文本注入当前 master owner）
+
+- **日期**：2026-09-24
+- **一句话**：用户批准 W2（D15）后，把微信**私聊文本**按「本人远程输入」注入当前 master owner 会话——六条件按序短路（opt-in / openid 全等白名单 / 仅私聊 / tick 级心跳判活 / generation 二次确认 / 单条一次批 + 脱敏审计），幂等键 `msgId`，注入复用 GUI 窄路径同一条 outbox 通路，**worker 永不成为 Pi 的写者**，**不改**既有 `session.message → master` 403。
+- **涉及模块**：新增 `extensions/runtime-host/wechat-input.ts`、`extensions/_test_wechat_input.ts`；最小 hunk `extensions/runtime-host/server.ts`（3 行接线，透传 `timersDir` + `stateDir` 兜底统一）、`wechat-bind.ts`（`readWechatInputConfig`）、`gui/src/pages/ChannelsPage.tsx`、`extensions/channel-wechat/store.ts`（仅 `inboxFileName` 改 export，**主会话批准的一行级豁免**）。
+- **产物**：`plans/0924_wechat_input_w2_spec.md`（规格 + 豁免记录）、`plans/0924_wechat_input_w2_impl_report.md`、`plans/0924_wechat_input_w2_l4_review.md`（**FAIL**，4 must-fix）、`plans/0924_wechat_input_w2_fix_report.md`（补写）、`plans/0924_wechat_input_w2_l4_convergence.md`（**PASS**）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` → 「W2 实现切片」
+- **Priority**：P1
+- **Status**：done（`168fed1`）；W2b（界面开关）待做
+- **Commit**：`168fed1`
+- **Verification**：13 组断言全绿（116ms）；收敛 L4 **PASS**（并反向复现旧缺陷证明 T5 有效）；smoke + 既有 5 个测试 + GUI 构建全绿。
+- **L4 三轮轨迹**：首轮抓到 **MF1 非 BMP msgId 命名分歧 → 重复注入**（实跑证据）/ MF2 denied 无界重审（~17k 行/天）/ MF3 注入正文含不可信昵称 / MF4 `timersDir` 未透传 → **注入门静默失效**；修复轮 4 项代码全改对但改坏测试且未写报告；主会话重写测试后收敛 PASS。
+- **已知残余**：群消息无法独立识别（靠 openid 白名单兜住）；denied 终态 ⇒ 事后加白名单不补投旧消息；真网 7 项未测。
 
 ### Item 26 - 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底）
 

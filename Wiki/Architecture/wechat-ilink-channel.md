@@ -99,6 +99,23 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 远程消息到达而用户正在 master 交互时：缺省**直接插入**（远程通道本分），TUI 给醒目提示；「排队到本轮结束」留作后续可选开关。
 
+## W2 实现切片（**已落地** `168fed1`：微信私聊文本 → 当前 master owner）
+
+**边界**：只做「判定 + 注入通路」；**界面开关属 W2b**（D17：开关必须界面可达）。
+
+**开关**：`channels.wechat.input.enabled`（**缺省 false**）+ `allowFrom`（openid 数组，空 = 拒绝所有，fail-closed）。
+
+**六条件按序短路**（`extensions/runtime-host/wechat-input.ts`，daemon 进程内，**不经过 HTTP**）：① opt-in（false ⇒ 不读 registry/不建审计/不注入）② 发送者 openid 与 `allowFrom` **全等**（权限只由服务端白名单决定；昵称/正文/请求体不得决定权限）③ 仅私聊 ④ master 活着（**tick 级** `sessionAlive`，空闲也算活）⑤ generation 二次确认（变化即放弃）⑥ 单条一次批 + **脱敏审计**（`state/wechat-input-audit.jsonl` 0600：无正文/无 token/无完整 openid）。
+
+**注入通路**：复用 GUI 窄路径同一条——`newOutboxItem` + `writeOutboxItem` → 目标会话自己的桥注入 followUp；**worker 永不成为 Pi 的写者**；**不改**既有 `session.message → master` 403 规则（这是新开的显式窄通道）。
+**幂等键 = msgId**：成功后把 inbox 记录原子覆盖为 `state:"injected"`（**复用 store 的 `inboxFileName`**——L4 抓到重复实现导致非 BMP msgId 命名分歧 ⇒ 重复注入，故从根上共用同一函数）；写失败/结果不明 → 记录 `rejected` + 审计 `uncertain`，**不自动重试**。
+
+**验收**：`npx tsx extensions/_test_wechat_input.ts` → 13 组断言全绿（T1 缺省零行为 / T2 denied 终态 / T3 注入成功 / T4 幂等 / **T5 非 BMP msgId** / T6 master-offline / T7 generation 变化 / T8 单条一次批 / T9 正文精确等值 `[微信 <脱敏id>] <原文>` / **T10 真实 `sessionAlive` 反向验证** / T11–T12 秘密卫生 / T13 写失败 uncertain）。
+
+**L4 轨迹（三轮，每轮都有真发现）**：首轮 **FAIL**（MF1 非 BMP msgId 命名分歧→重复注入〔有实跑证据〕/ MF2 denied 无界重审 ~17k 行/天 / MF3 注入正文含不可信昵称 / MF4 `timersDir` 未透传致注入门**静默失效**）→ 修复轮（4 项代码全改对，但改坏测试且未写报告）→ 主会话重写测试 → 收敛 L4 **PASS**（并**反向复现旧缺陷**证明 T5 真能抓住该类缺陷）。
+
+**已知残余（不得当成已解决）**：① 群消息无法独立识别（W1 记录不含会话类型；实际由 openid 白名单兜住）② denied 记录**终态** ⇒ 事后加白名单**不补投**旧消息（运维取舍，如需补投要另做"重新评估 rejected"手段）③ 真网 7 项未测。
+
 ## Evidence
 
 - `scripts/wechat-ilink-probe.mjs`（commit `658306e`）— 头部用法注释与六命令实现。
