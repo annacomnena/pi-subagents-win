@@ -152,6 +152,7 @@ function makeSnapshot(tabs: TabDetail[], over: Partial<GlobalViewSnapshot> = {})
 			plans: "-", plansCount: null, lastMs: 0, lastText: "?",
 		},
 		rows: [],
+		attentionByRepo: {},
 		totals: { orphaned: 0, terminal: 0, noResult: 0, attention: 0, gitUnknown: 0, otherMail: 0 },
 		warnings: [],
 		cursor: { page: 1, pageSize: 20, totalPages: 1 },
@@ -357,11 +358,11 @@ check("A3.3 unconfirmed → resultMissing → stagnation 真（C5 裁定）", ()
 	assert.equal(p.resultMissing, true);
 	assert.equal(p.stagnation, true);
 });
-check("A3.4 仓 attention>0 喂 needs_user（terminal 无 result 可见待审）；无 row 时不猜", () => {
+check("A3.4 仓 attention>0 喂 needs_user（terminal 无 result 可见待审）；无 attention 时不猜", () => {
 	const tabs = [makeTab({ runId: "r1", repoPath: R1, phase: "unconfirmed", needsHuman: false })];
-	const { next } = buildFrontier({ snapshot: makeSnapshot(tabs, { rows: [makeRepoRow(R1, { attention: 1 })] }), backlog: [], prev: null, now: NOW });
+	const { next } = buildFrontier({ snapshot: makeSnapshot(tabs, { attentionByRepo: { [normalizeExactPath(R1)]: 1 } }), backlog: [], prev: null, now: NOW });
 	assert.equal(next.projects[0].needsUser, true);
-	const { next: n2 } = buildFrontier({ snapshot: makeSnapshot(tabs, { rows: [] }), backlog: [], prev: null, now: NOW });
+	const { next: n2 } = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: null, now: NOW });
 	assert.equal(n2.projects[0].needsUser, false);
 });
 check("A3.5 多 tab 变体严重度序（orphaned>resultMissing>waiting）+ 全 terminal 优先级 Failed>Cancelled>Completed", () => {

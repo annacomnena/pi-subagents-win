@@ -85,6 +85,9 @@ export interface GlobalViewSnapshot {
 	inboxClaimed: number;
 	home: RepoRow;
 	rows: RepoRow[];
+	/** 分页前全量 attention 投影：normalizeExactPath(repoPath) → 可见待审计数（仅 >0 条目；Σ === totals.attention）。
+	 *  与 rows[].attention 同源（同一 allRows 聚合的切片前形态），供 autonomy 推导层消费；GUI 分页仍走 rows。 */
+	attentionByRepo: Record<string, number>;
 	totals: { orphaned: number; terminal: number; noResult: number; attention: number; gitUnknown: number; otherMail: number };
 	warnings: string[];
 	cursor: { page: number; pageSize: number; totalPages: number };
@@ -533,6 +536,9 @@ export function collectGlobalView(opts: GlobalViewOptions = {}): GlobalViewSnaps
 				gitUnknown: git.branch === "?" || git.dirty === "?",
 			});
 		}
+		// 分页前全量 attention 投影（attention>0 仓；与 rows[].attention 同一聚合，仅不做分页）
+		const attentionByRepo: Record<string, number> = {};
+		for (const r of allRows) if (r.attention > 0) attentionByRepo[normalizeExactPath(r.repoPath)] = r.attention;
 		// phase2：回填各明细的 repo overdue；置顶序聚合；hygiene；差分（只读基线）
 		for (const d of details) {
 			const t = timerByRepo.get(normalizeExactPath(d.repoPath));
@@ -601,6 +607,7 @@ export function collectGlobalView(opts: GlobalViewOptions = {}): GlobalViewSnaps
 				lastText: globalAttach ? relText(toMs((globalAttach as { lastHeartbeatAt?: unknown }).lastHeartbeatAt) ?? 0, now) : "?",
 			},
 			rows,
+			attentionByRepo,
 			totals: { orphaned, terminal, noResult, attention: attentionTotal, gitUnknown, otherMail },
 			warnings,
 			cursor: { page: pg, pageSize, totalPages },
@@ -614,7 +621,7 @@ export function collectGlobalView(opts: GlobalViewOptions = {}): GlobalViewSnaps
 			owner: "none", generation: "-", cutover: "off", asof: new Date(opts.now ?? Date.now()).toISOString(),
 			reposTotal: 0, shown: 0, tabsActive: 0, timersPending: 0, inboxPending: 0, inboxClaimed: 0,
 			home: { repoPath: "__HOME__", display: "HOME", local: "unknown", branch: "-", dirty: "-", tabText: "-", tabActive: 0, attention: 0, timer: 0, overdue: 0, mail: "p0/c0", mailPending: 0, plans: "-", plansCount: null, lastMs: 0, lastText: "?" },
-			rows: [], totals: { orphaned: 0, terminal: 0, noResult: 0, attention: 0, gitUnknown: 0, otherMail: 0 },
+			rows: [], attentionByRepo: {}, totals: { orphaned: 0, terminal: 0, noResult: 0, attention: 0, gitUnknown: 0, otherMail: 0 },
 			warnings: [`collect 失败（never-throw）：${e instanceof Error ? e.message : String(e)}`],
 			cursor: { page: 1, pageSize: 20, totalPages: 1 }, history: [], historyTotal: 0, partial: true,
 			details: [], diff: { added: [], changed: [], removed: [], note: "none(baseline saved)" },

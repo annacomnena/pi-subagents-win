@@ -195,12 +195,8 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	const { snapshot, prev, now } = inputs;
 	const baseline = prev === null;
 
-	// 仓行 attention 索引（home 是 __HOME__ 伪仓，非真实 repo，跳过；rows 为当前页——attention 仓按置顶序在前页，见实现报告）
-	const attentionByRepo = new Map<string, number>();
-	for (const r of [snapshot.home, ...snapshot.rows]) {
-		if (r.repoPath === "__HOME__") continue;
-		attentionByRepo.set(normalizeExactPath(r.repoPath), r.attention);
-	}
+	// ⑤ 载体：消费快照的「分页前全量投影」（不得读 rows/home——⑤ 触发集合不得是显示排序的函数）
+	const attentionByRepo = snapshot.attentionByRepo;
 
 	// 可见 tab 按归一化 repo 分组
 	const tabsByRepo = new Map<string, TabDetail[]>();
@@ -215,7 +211,7 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	if (prev) for (const p of prev.projects) prevByRepo.set(p.project, p);
 
 	const nextCores = new Map<string, ProjectCore>();
-	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo.get(k) ?? 0));
+	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0));
 
 	const triggers: FrontierTrigger[] = [];
 	// R4：未消费到信（pending>0）是可唤醒的真实输入，不消费/ack 邮件。

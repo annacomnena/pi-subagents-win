@@ -1,23 +1,26 @@
 /**
- * _test_frontier_attention_window.ts — P0 反例：frontier ⑤ 依赖 GUI 显示分页
+ * _test_frontier_attention_window.ts — G-A 回归测试：frontier ⑤ 不得是显示分页/排名的函数
  *
- * 命题（plans/0924_graph_E2_impl_plan.md §12 MF2 裁定）：
- *   `buildFrontier` 的 ⑤ needs_user 规则消费的是 `snapshot.home + snapshot.rows` 的
- *   **分页后** attention（`global-view.ts` 排序键 #L570-L574 + `slice` #L577，生产实参
- *   page=1 / pageSize=20）→ ⑤ 触发集合是**显示排序的函数**，而非工作状态的函数。
+ * 命题（plans/0924_graph_E2_impl_plan.md §12 MF2 裁定；G-A 语义修复）：
+ *   `buildFrontier` 的 ⑤ needs_user 必须消费 `snapshot.attentionByRepo`（分页前全量 attention
+ *   投影：`global-view.ts` 在 allRows 切片之前聚合，与 `rows[].attention` 同源），**不得**消费
+ *   `snapshot.home/rows`（GUI 分页后投影，生产实参 page=1 / pageSize=20）→ ⑤ 触发集合必须是
+ *   工作状态的函数，而非显示排序/页码的函数。
  *
- * 本测试用机器可证的三件事把它钉死（零生产改动，只加本文件）：
- *   1) 页外漏检：21 个真实仓各有 attention>0，首页只容纳 20 → 第 21 仓 needsUser=false，
- *      跨三帧不产 ⑤（对照：同快照 page=2 时该仓 needsUser=true 且产 ⑤）。
- *   2) 仅换排名造成的假边沿：固定全部仓 attention/其它载体，只压低一个原本排前仓的活跃度
- *      （纯显示排序输入）→ 原页外 attention>0 仓挤进首页 → 新产 1 条 ⑤。
+ * 本测试用机器可证的三件事把它钉死：
+ *   1) 页外不漏检：21 个真实仓各有 attention>0，首页只容纳 20 → 第 21 仓 needsUser=true，
+ *      跨三帧不产 ⑤（基线帧已记录 true → 无边沿）；同一 prev 下 page=1 与 page=2 的 next/diff 全等。
+ *   2) 仅换排名不造假边沿：固定全部仓 attention/其它载体，只压低一个原本排前仓的活跃度
+ *      （纯显示排序输入）→ 零触发、next 逐字节不变。
  *   3) 规模覆盖：19/20/21/40 仓四档，打印 attention>0 数 / 首页容纳 / 页外漏检 / 假边沿条数。
+ *   另含 N1-N4（§12 机器验收口径）：排名无关性、surviving 仓 attention 边沿序列、冷启动零触发、
+ *   n≤20 新旧口径等价性 harness（n=21 差异恰为 1 仓 false→true + 1 条 ⑤）。
  *
  * 隔离：临时 PI_RUNTIME_DIR/PI_TAB_RUNS_DIR（照 `_test_runtime_autonomy.ts` A11 先例），
  * 固定 now（不依赖真实时钟），绝不碰真实 ~/.pi/agent。
  *
  * 运行（EB-004 外部超时）：timeout 300 node --experimental-strip-types ./extensions/_test_frontier_attention_window.ts
- * 计划：plans/0924_graph_E2_impl_plan.md §12（P0）。
+ * 计划：plans/0924_graph_E2_impl_plan.md §12（P0）+ plans/0924_attention_semantics_fix_plan.md §5。
  */
 
 import assert from "node:assert/strict";
@@ -32,9 +35,9 @@ process.env.PI_TAB_RUNS_DIR = join(ENV_TMP, "tab-runs");
 
 import { collectGlobalView, type GlobalViewSnapshot } from "./runtime/global-view.ts";
 // A10.1 字面量 tripwire（_test_runtime_autonomy.ts）：测试文件若含 "runtime"+"/autonomy" 连续字面量会成为
-// offender，除非改那个既有 tripwire 的排除表。本 P0 任务要求「零生产改动 + 只加这一个测试文件」，
-// 故此处拼接 specifier 规避字面量（动态 import 解析结果不变）。若后续更倾向显式排除，按计划 §7 SF2
-// 先例在 _test_runtime_autonomy.ts 加一行 `if (p === join(EXT_ROOT, "_test_frontier_attention_window.ts")) continue;`。
+// offender，除非改那个既有 tripwire 的排除表。本回归测试沿用拼接 specifier 规避字面量（动态 import
+// 解析结果不变）。若后续更倾向显式排除，按计划 §7 SF2 先例在 _test_runtime_autonomy.ts 加一行
+// `if (p === join(EXT_ROOT, "_test_frontier_attention_window.ts")) continue;`。
 const frontierMod = await import("./runtime/" + "autonomy/frontier.ts");
 const buildFrontier = frontierMod.buildFrontier;
 const normalizeExactPath = frontierMod.normalizeExactPath;
@@ -58,7 +61,7 @@ function check(name: string, fn: () => void): void {
 	}
 }
 
-// ── fixture：每个仓 1 个可见 attached tab（attention=1，needsHuman/gate 均未兜底）──
+// ── fixture：每个仓 1 个可见 tab（默认 attached → attention=1，needsHuman/gate 均未兜底）──
 interface World {
 	root: string;
 	agentDir: string;
@@ -66,7 +69,7 @@ interface World {
 	repos: string[];
 }
 
-function writeTab(runsDir: string, i: number, repoPath: string, lastActivityMs: number): void {
+function writeTab(runsDir: string, i: number, repoPath: string, lastActivityMs: number, phase = "attached"): void {
 	const id = `run_${String(i).padStart(2, "0")}`;
 	writeFileSync(
 		join(runsDir, `${id}.json`),
@@ -74,9 +77,10 @@ function writeTab(runsDir: string, i: number, repoPath: string, lastActivityMs: 
 	);
 	// attached：classifyDispatch → active=true, attention=true, hiddenKind=null（可见）
 	//            classifyForReclaim → "pending"（非 awaitingInput）；无 recentwork.md → gate=unknown
+	// working：classifyDispatch → active=true, attention=false, hiddenKind=null（可见但非待审）
 	writeFileSync(
 		join(runsDir, `${id}.state.json`),
-		JSON.stringify({ id, phase: "attached", turn: "working", terminal: false, lastActivityAt: iso(lastActivityMs) }),
+		JSON.stringify({ id, phase, turn: "working", terminal: false, lastActivityAt: iso(lastActivityMs) }),
 	);
 }
 
@@ -103,15 +107,16 @@ const prodView = (w: World): GlobalViewSnapshot => collectGlobalView({ agentDir:
 const build = (snapshot: GlobalViewSnapshot, prev: FrontierSnapshot | null) => buildFrontier({ snapshot, backlog: [], prev, now: NOW });
 const keyOf = (w: World, i: number): string => normalizeExactPath(w.repos[i]!);
 const needsUserOf = (f: FrontierSnapshot, key: string): boolean => f.projects.find((p) => p.project === key)?.needsUser ?? false;
-const needsUserTriggers = (d: { triggers: { rule: string; project: string }[] }, key: string): number =>
-	d.triggers.filter((t) => t.rule === "needs_user" && t.project === key).length;
+const needsUserTriggers = (d: { triggers: { rule: string; project: string }[] }, key?: string): number =>
+	d.triggers.filter((t) => t.rule === "needs_user" && (key === undefined || t.project === key)).length;
+const attnSum = (m: Record<string, number>): number => Object.values(m).reduce((a, b) => a + b, 0);
 
 const worlds: World[] = [];
 const makeTracked = (tag: string, n: number): World => { const w = makeWorld(tag, n); worlds.push(w); return w; };
 
-// ════════════════ 1) 页外漏检（21 仓，跨三帧）+ HOME 伪仓 ════════════════
-console.log("1) 页外漏检：21 仓各有 attention>0，首页只容纳 20");
-check("1.1 生产实参 page=1/pageSize=20：attention 总数 21、首页 20、第 21 仓在页外但 details 可见", () => {
+// ════════════════ 1) 页外不漏检（21 仓，跨三帧）+ HOME 伪仓 ════════════════
+console.log("1) 页外不漏检：21 仓各有 attention>0，首页只容纳 20（⑤ 消费分页前全量投影）");
+check("1.1 生产实参 page=1/pageSize=20：attention 总数 21、首页 20、第 21 仓在页外但全量投影/details 可见", () => {
 	const w = makeTracked("leak", 21);
 	const s = prodView(w);
 	assert.equal(s.cursor.page, 1, "cursor.page 必须为生产缺省 1");
@@ -122,55 +127,62 @@ check("1.1 生产实参 page=1/pageSize=20：attention 总数 21、首页 20、�
 	const offKey = keyOf(w, 20);
 	assert.ok(!s.rows.some((r) => normalizeExactPath(r.repoPath) === offKey), "第 21 仓必须落在页外");
 	assert.ok(s.details.some((d) => normalizeExactPath(d.repoPath) === offKey), "第 21 仓必须有可见 details（attention>0 的真实载体）");
-	console.log(`       attention>0=21 / 首页容纳=${s.rows.length} / 页外仓=${offKey.slice(-3)}（details 可见=${s.details.some((d) => normalizeExactPath(d.repoPath) === offKey)}）`);
+	// G-A 追加：分页前全量投影含页外仓，且与 totals.attention 同源（Σ 不变量）
+	assert.equal(attnSum(s.attentionByRepo), s.totals.attention, `Σ attentionByRepo 必须等于 totals.attention，实际 ${attnSum(s.attentionByRepo)}`);
+	assert.equal(s.attentionByRepo[offKey], 1, "页外仓键必须在全量 attention 投影内");
+	console.log(`       attention>0=21 / 首页容纳=${s.rows.length} / ΣattentionByRepo=${attnSum(s.attentionByRepo)} / 页外仓=${offKey.slice(-3)}（投影内=${s.attentionByRepo[offKey]}` + `）`);
 });
-check("1.2 HOME 是伪仓：repoPath=__HOME__、attention=0、不占 rows 名额", () => {
+check("1.2 HOME 是伪仓：repoPath=__HOME__、attention=0、不占 rows 名额、不进全量投影", () => {
 	const w = worlds[0]!;
 	const s = prodView(w);
 	assert.equal(s.home.repoPath, "__HOME__");
 	assert.equal(s.home.attention, 0);
 	assert.ok(!s.rows.some((r) => r.repoPath === "__HOME__"), "HOME 不在 rows 内（不消耗分页名额）");
-	console.log(`       home.repoPath=${s.home.repoPath} home.attention=${s.home.attention} homeInRows=${s.rows.some((r) => r.repoPath === "__HOME__")}`);
+	assert.equal(s.attentionByRepo["__HOME__"], undefined, "HOME 伪仓不得进 attentionByRepo");
+	console.log(`       home.repoPath=${s.home.repoPath} home.attention=${s.home.attention} homeInRows=${s.rows.some((r) => r.repoPath === "__HOME__")} homeInAttn=${s.attentionByRepo["__HOME__"]}`);
 });
-check("1.3 页外 attention>0 仓 needsUser=false（漏检），页内 20 仓 needsUser=true（对照）", () => {
+check("1.3 页外仓同样 needsUser=true（修复语义）：21 仓全 needsUser，不再因分页漏检", () => {
 	const w = worlds[0]!;
 	const f1 = build(prodView(w), null);
 	const offKey = keyOf(w, 20);
-	assert.equal(needsUserOf(f1.next, offKey), false, "页外 attention>0 仓不应 needsUser（这正是漏检）");
-	assert.equal(f1.next.projects.filter((p) => p.needsUser).length, 20, "页内 20 仓应 needsUser=true");
-	console.log(`       needsUser: 页内=${f1.next.projects.filter((p) => p.needsUser).length}/20 页外(${offKey.slice(-3)})=${needsUserOf(f1.next, offKey)}`);
+	assert.equal(needsUserOf(f1.next, offKey), true, "页外 attention>0 仓必须 needsUser=true");
+	assert.equal(f1.next.projects.filter((p) => p.needsUser).length, 21, "21 仓应全 needsUser=true");
+	console.log(`       needsUser: 总数=${f1.next.projects.filter((p) => p.needsUser).length}/21 页外(${offKey.slice(-3)})=${needsUserOf(f1.next, offKey)}`);
 });
-check("1.4 跨三帧：页外 attention>0 仓始终不产 ⑤（漏检持续）", () => {
+check("1.4 跨三帧：页外仓 needsUser 恒 true，但 ⑤=0（基线帧已记录 true → 无边沿）", () => {
 	const w = worlds[0]!;
 	const offKey = keyOf(w, 20);
-	const f1 = build(prodView(w), null); // 帧1 基线
+	const f1 = build(prodView(w), null); // 帧1 基线：needsUser 已 true
 	const f2 = build(prodView(w), f1.next); // 帧2
 	const f3 = build(prodView(w), f2.next); // 帧3
 	const t2 = needsUserTriggers(f2.diff, offKey);
 	const t3 = needsUserTriggers(f3.diff, offKey);
-	assert.equal(t2, 0, `帧2 不应产页外仓 ⑤，实际 ${t2}`);
-	assert.equal(t3, 0, `帧3 不应产页外仓 ⑤，实际 ${t3}`);
-	assert.equal(needsUserOf(f2.next, offKey), false);
-	assert.equal(needsUserOf(f3.next, offKey), false);
-	console.log(`       帧2 ⑤=${t2} 帧3 ⑤=${t3}（页外仓 needsUser 恒 false）`);
+	assert.equal(needsUserOf(f2.next, offKey), true);
+	assert.equal(needsUserOf(f3.next, offKey), true);
+	assert.equal(t2, 0, `帧2 不应产页外仓 ⑤（基线已 true），实际 ${t2}`);
+	assert.equal(t3, 0, `帧3 不应产页外仓 ⑤（基线已 true），实际 ${t3}`);
+	console.log(`       帧2 ⑤=${t2} 帧3 ⑤=${t3}（页外仓 needsUser 恒 true，无重复边沿）`);
 });
-check("1.5 对照（机器证明是分页而非工作状态）：同一快照内容 page=2 → 页外仓 needsUser=true 且产 1 条 ⑤", () => {
+check("1.5 分页无关：同一 prev 下 page=1 与 page=2 的 next/diff JSON 逐字节全等", () => {
 	const w = worlds[0]!;
 	const offKey = keyOf(w, 20);
 	const f1 = build(prodView(w), null);
+	const sPage1 = prodView(w);
 	const sPage2 = collectGlobalView({ agentDir: w.agentDir, now: NOW, page: 2 });
 	assert.equal(sPage2.rows.length, 1, "page=2 只含第 21 仓");
 	assert.equal(normalizeExactPath(sPage2.rows[0]!.repoPath), offKey);
 	assert.equal(sPage2.rows[0]!.attention, 1, "page=2 行 attention 仍为 1（载体未变）");
-	const fPage2 = build(sPage2, f1.next);
-	assert.equal(needsUserOf(fPage2.next, offKey), true, "page=2 时同仓 needsUser=true");
-	assert.equal(needsUserTriggers(fPage2.diff, offKey), 1, "page=2 时同仓产 1 条 ⑤");
-	console.log(`       page=2：${offKey.slice(-3)} attention=${sPage2.rows[0]!.attention} needsUser=${needsUserOf(fPage2.next, offKey)} ⑤=${needsUserTriggers(fPage2.diff, offKey)}`);
+	const gPage1 = build(sPage1, f1.next);
+	const gPage2 = build(sPage2, f1.next);
+	assert.equal(needsUserOf(gPage2.next, offKey), true, "page=2 时同仓 needsUser=true");
+	assert.equal(JSON.stringify(gPage1.next), JSON.stringify(gPage2.next), "next 必须与 page 无关");
+	assert.equal(JSON.stringify(gPage1.diff), JSON.stringify(gPage2.diff), "diff 必须与 page 无关");
+	console.log(`       page=1 vs page=2：next 全等=${JSON.stringify(gPage1.next) === JSON.stringify(gPage2.next)} diff 全等=${JSON.stringify(gPage1.diff) === JSON.stringify(gPage2.diff)}（page=2 行 attention=${sPage2.rows[0]!.attention}）`);
 });
 
-// ════════════════ 2) 仅换显示排名造成的假边沿 ════════════════
+// ════════════════ 2) 仅换显示排名不再造边沿 ════════════════
 console.log("2) 仅换显示排名：固定全部载体，只压低一个原本排前仓的活跃度");
-check("2.1 只改显示排序输入 → 原页外 attention>0 仓挤进首页 → 新产 1 条假 ⑤", () => {
+check("2.1 只改显示排序输入 → 零触发、next.projects 逐仓字段不变（无假边沿）", () => {
 	const w = makeTracked("edge", 21);
 	const offKey = keyOf(w, 20);
 	const demotedKey = keyOf(w, 19);
@@ -179,7 +191,7 @@ check("2.1 只改显示排序输入 → 原页外 attention>0 仓挤进首页 �
 	assert.ok(a1.rows.some((r) => normalizeExactPath(r.repoPath) === demotedKey), "帧1 repo_19 应在首页");
 	assert.ok(!a1.rows.some((r) => normalizeExactPath(r.repoPath) === offKey), "帧1 repo_20 应在页外");
 	const g1 = build(a1, null);
-	assert.equal(needsUserOf(g1.next, offKey), false);
+	assert.equal(needsUserOf(g1.next, offKey), true);
 	assert.equal(needsUserOf(g1.next, demotedKey), true);
 	// 帧2：唯一改动 = 把 repo_19 的 lastActivityAt 压低（纯显示排序输入/活跃度）
 	writeTab(w.runsDir, 19, w.repos[19]!, NOW - 1000 * MIN);
@@ -187,40 +199,139 @@ check("2.1 只改显示排序输入 → 原页外 attention>0 仓挤进首页 �
 	// 载体不变：attention 总数不变、repo_20 的 tab 仍 attached
 	assert.equal(a2.totals.attention, 21, `attention 总数必须不变，实际 ${a2.totals.attention}`);
 	assert.ok(a2.details.some((d) => normalizeExactPath(d.repoPath) === offKey && d.phase === "attached"), "repo_20 载体（attached）必须不变");
-	assert.ok(a2.rows.some((r) => normalizeExactPath(r.repoPath) === offKey), "repo_20 应挤进首页");
+	assert.ok(a2.rows.some((r) => normalizeExactPath(r.repoPath) === offKey), "repo_20 应挤进首页（显示排名变了）");
 	assert.ok(!a2.rows.some((r) => normalizeExactPath(r.repoPath) === demotedKey), "repo_19 应被挤出首页");
 	const g2 = build(a2, g1.next);
-	assert.equal(needsUserTriggers(g2.diff, offKey), 1, `仅换排名应新产 1 条 ⑤（repo_20），实际 ${needsUserTriggers(g2.diff, offKey)}`);
-	assert.equal(needsUserOf(g2.next, offKey), true);
-	console.log(`       仅改 repo_19 活跃度：attention 总数 21→${a2.totals.attention}，repo_20 入页 ⑤=+${needsUserTriggers(g2.diff, offKey)}`);
+	assert.equal(needsUserTriggers(g2.diff), 0, `仅换排名不应产任何 ⑤，实际 ${needsUserTriggers(g2.diff)}`);
+	assert.equal(g2.diff.triggers.length, 0, `仅换排名不应产任何触发，实际 ${g2.diff.triggers.length}`);
+	assert.equal(JSON.stringify(g2.next.projects), JSON.stringify(g1.next.projects), "next.projects 必须逐仓字段不变");
+	console.log(`       仅改 repo_19 活跃度：attention 总数 21→${a2.totals.attention}，⑤=+${needsUserTriggers(g2.diff)}，projects 不变=${JSON.stringify(g2.next.projects) === JSON.stringify(g1.next.projects)}`);
 });
 
 // ════════════════ 3) 规模覆盖 19/20/21/40 ════════════════
-console.log("3) 规模覆盖（19/20/21/40 仓）");
+console.log("3) 规模覆盖（19/20/21/40 仓）：修复后各档页外漏检=0、假边沿=0");
 const scaleRows: { n: number; attention: number; capacity: number; leak: number; fakeEdges: number }[] = [];
 for (const n of [19, 20, 21, 40]) {
-	check(`3.${n} ${n} 仓：attention>0=${n}，页外漏检=${Math.max(0, n - 20)}，假边沿=${n > 20 ? 1 : 0}`, () => {
+	check(`3.${n} ${n} 仓：attention>0=${n}，页外漏检=0，假边沿=0`, () => {
 		const w = makeTracked(`scale${n}`, n);
 		const s1 = prodView(w);
 		const f1 = build(s1, null);
 		assert.equal(s1.totals.attention, n, `attention>0 应为 ${n}`);
 		assert.equal(s1.rows.length, Math.min(n, 20), "首页容纳 = min(n,20)");
 		const leak = f1.next.projects.filter((p) => !p.needsUser).length; // 每仓 attention>0，false 即页外漏检
-		assert.equal(leak, Math.max(0, n - 20), `页外漏检应为 ${Math.max(0, n - 20)}，实际 ${leak}`);
+		assert.equal(leak, 0, `页外漏检应为 0（全量投影），实际 ${leak}`);
 		// 假边沿：压低最后一个首页仓的活跃度（仅显示排名），看是否有页外仓挤入并产 ⑤
 		const demoteIdx = Math.min(19, n - 1);
 		writeTab(w.runsDir, demoteIdx, w.repos[demoteIdx]!, NOW - 1000 * MIN);
 		const s2 = prodView(w);
 		const f2 = build(s2, f1.next);
-		const fakeEdges = f2.diff.triggers.filter((t) => t.rule === "needs_user").length;
+		const fakeEdges = needsUserTriggers(f2.diff);
 		assert.equal(s2.totals.attention, n, "attention 载体不变");
-		assert.equal(fakeEdges, n > 20 ? 1 : 0, `假边沿应为 ${n > 20 ? 1 : 0}，实际 ${fakeEdges}`);
+		assert.equal(fakeEdges, 0, `假边沿应为 0，实际 ${fakeEdges}`);
 		scaleRows.push({ n, attention: s1.totals.attention, capacity: s1.rows.length, leak, fakeEdges });
 	});
 }
 
 console.log("\n  规模 | attention>0 | 首页容纳 | 页外漏检 | 假边沿");
 for (const r of scaleRows) console.log(`  ${String(r.n).padStart(4)} | ${String(r.attention).padStart(11)} | ${String(r.capacity).padStart(8)} | ${String(r.leak).padStart(8)} | ${String(r.fakeEdges).padStart(6)}`);
+
+// ════════════════ N1-N4：§12 机器验收口径 ════════════════
+console.log("\nN) §12 验收口径（排名无关性 / surviving 边沿序列 / 冷启动 / n≤20 等价性）");
+check("N1 只改显示排名 → frontier 逐字节不变（三帧：基线→同输入→仅改排序输入）", () => {
+	const w = makeTracked("n1", 21);
+	const offKey = keyOf(w, 20);
+	const f1 = build(prodView(w), null);
+	const f2 = build(prodView(w), f1.next);
+	assert.equal(f2.diff.triggers.length, 0, "同输入帧不应产触发");
+	// 唯一改动：压低首页仓 repo_19 的 lastActivityAt（显示排序输入）；载体不变
+	writeTab(w.runsDir, 19, w.repos[19]!, NOW - 1000 * MIN);
+	const s3 = prodView(w);
+	assert.equal(s3.totals.attention, 21, "载体不变（totals.attention 恒定）");
+	assert.ok(s3.details.some((d) => normalizeExactPath(d.repoPath) === offKey && d.phase === "attached"), "页外仓 details 仍 attached");
+	const f3 = build(s3, f2.next);
+	assert.equal(JSON.stringify(f3.next), JSON.stringify(f2.next), "next 必须逐字节不变");
+	assert.equal(f3.diff.triggers.length, 0, "不应产任何触发");
+	console.log(`       f2→f3 仅改排序：next 全等=${JSON.stringify(f3.next) === JSON.stringify(f2.next)} triggers=${f3.diff.triggers.length}`);
+});
+check("N2 surviving 仓 attention 0→1→1→0→1 → ⑤ 计数 [1,0,0,1]，needsUser [false,true,true,false,true]", () => {
+	const w = makeTracked("n2", 1); // 单仓，多仓干扰清零
+	const k = keyOf(w, 0);
+	const phases = ["working", "attached", "attached", "working", "attached"];
+	let prev: FrontierSnapshot | null = null;
+	const counts: number[] = [];
+	const seq: boolean[] = [];
+	for (const ph of phases) {
+		writeTab(w.runsDir, 0, w.repos[0]!, NOW, ph);
+		const g = build(prodView(w), prev);
+		assert.ok(g.next.projects.some((p) => p.project === k), `surviving 项目必须在 next.projects 内（phase=${ph}）`);
+		seq.push(needsUserOf(g.next, k));
+		if (prev !== null) counts.push(needsUserTriggers(g.diff));
+		prev = g.next;
+	}
+	assert.deepEqual(counts, [1, 0, 0, 1], `⑤ 计数序列应为 [1,0,0,1]，实际 ${JSON.stringify(counts)}`);
+	assert.deepEqual(seq, [false, true, true, false, true], `needsUser 序列应为 [false,true,true,false,true]，实际 ${JSON.stringify(seq)}`);
+	console.log(`       attention 序列 ${phases.map((p) => (p === "attached" ? 1 : 0)).join("→")} → ⑤ ${counts.join(",")} / needsUser ${seq.join(",")}`);
+});
+check("N3 冷启动（prev=null）不产 ⑤：baseline=true 且 triggers 为空", () => {
+	const w = makeTracked("n3", 21);
+	const g = build(prodView(w), null);
+	assert.equal(g.next.baseline, true, "首帧必须 baseline=true");
+	assert.equal(g.diff.triggers.length, 0, "冷启动零触发");
+	assert.equal(needsUserTriggers(g.diff), 0, "冷启动无 ⑤");
+	assert.equal(g.next.projects.filter((p) => p.needsUser).length, 21, "基线帧已记录 21 仓 needsUser=true");
+	console.log(`       baseline=${g.next.baseline} triggers=${g.diff.triggers.length} needsUser=${g.next.projects.filter((p) => p.needsUser).length}/21`);
+});
+check("N4 n≤20 新旧口径全等；n=21 差异恰为 1 仓 needsUser false→true + 恰 1 条 ⑤", () => {
+	// legacy = 旧窗口口径：attentionByRepo 仅由分页后 rows 派生
+	const legacyOf = (s: GlobalViewSnapshot): GlobalViewSnapshot => {
+		const m: Record<string, number> = {};
+		for (const r of s.rows) if (r.attention > 0) m[normalizeExactPath(r.repoPath)] = r.attention;
+		return { ...s, attentionByRepo: m };
+	};
+	// n≤20：首页即全量 → 新旧口径逐键相等，同 prev 下 next/diff JSON 全等
+	for (const n of [19, 20]) {
+		const w = makeTracked(`n4eq${n}`, n);
+		const snap = prodView(w);
+		const legacy = legacyOf(snap);
+		assert.deepEqual(legacy.attentionByRepo, snap.attentionByRepo, `n=${n} 旧窗口口径应等于全量口径`);
+		const prev = build(snap, null).next;
+		const a = build(snap, prev);
+		const b = build(legacy, prev);
+		assert.equal(JSON.stringify(a.next), JSON.stringify(b.next), `n=${n} next 应全等`);
+		assert.equal(JSON.stringify(a.diff), JSON.stringify(b.diff), `n=${n} diff 应全等`);
+	}
+	// n=21：页外 1 仓差异
+	const w = makeTracked("n4diff", 21);
+	const snap = prodView(w);
+	const legacy = legacyOf(snap);
+	const offKey = keyOf(w, 20);
+	assert.equal(legacy.attentionByRepo[offKey], undefined, "旧窗口口径缺页外仓键");
+	assert.equal(snap.attentionByRepo[offKey], 1, "新语义含页外仓键");
+	const prev = build(legacy, null).next; // 旧口径基线：页外仓 needsUser=false
+	assert.equal(needsUserOf(prev, offKey), false);
+	const rLegacy = build(legacy, prev);
+	const rNew = build(snap, prev);
+	assert.equal(needsUserTriggers(rLegacy.diff), 0, "旧口径同输入零触发");
+	assert.equal(needsUserTriggers(rNew.diff), 1, "新语义恰 1 条 ⑤");
+	// 逐仓比对：恰 1 仓差异，且该仓仅 needsUser false→true + meaningfulStateVersion +1
+	const diffRepos: string[] = [];
+	for (let i = 0; i < rNew.next.projects.length; i++) {
+		const a = rLegacy.next.projects[i]!;
+		const b = rNew.next.projects[i]!;
+		assert.equal(a.project, b.project, "项目顺序必须一致");
+		for (const f of ["state", "variant", "gate", "runs", "resultMissing", "stagnation", "overdue"] as const) {
+			assert.equal(JSON.stringify(a[f]), JSON.stringify(b[f]), `${a.project} 字段 ${f} 不应漂移`);
+		}
+		if (a.needsUser !== b.needsUser || a.meaningfulStateVersion !== b.meaningfulStateVersion) {
+			assert.equal(a.needsUser, false);
+			assert.equal(b.needsUser, true);
+			assert.equal(b.meaningfulStateVersion, a.meaningfulStateVersion + 1, "msv 仅因该真触发 +1");
+			diffRepos.push(a.project);
+		}
+	}
+	assert.deepEqual(diffRepos, [offKey], `差异仓应恰为页外仓，实际 ${JSON.stringify(diffRepos)}`);
+	console.log(`       n≤20 全等=✔；n=21 差异仓=${diffRepos.length}（${diffRepos[0]?.slice(-3)}）⑤=${needsUserTriggers(rNew.diff)}`);
+});
 
 // ── 清理 + 汇总 ─────────────────────────────────────────────────────
 for (const w of worlds) rmSync(w.root, { recursive: true, force: true });
