@@ -153,6 +153,7 @@ import { readAutonomyConfig } from "../runtime/autonomy/config.ts";
 import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/collect.ts";
 import { readKillSwitch } from "../runtime/autonomy/kill-switch.ts";
 import { startWechatInput } from "./wechat-input.ts";
+import { startWechatReplyWatcher } from "./wechat-reply.ts";
 import { readAttachment } from "../runtime/registry.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
@@ -548,6 +549,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const wechatStore = new WechatStore(WechatStore.resolveDir(wechatRuntimeDir));
 	const channelSupervisor = new ChannelSupervisor({ runtimeDir: wechatRuntimeDir, configPath });
 	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
+	const stopWechatReply = startWechatReplyWatcher({ runtimeDir: wechatRuntimeDir, configPath, stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 
 	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
 		try {
@@ -1350,6 +1352,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				info,
 				close: async () => {
 					stopWechatInput();
+					stopWechatReply();
 					// 0923 wechat：停有界绑定流程（不动磁盘——bound 凭据跨重启保留）
 					try {
 						wechat.dispose();

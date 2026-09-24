@@ -69,6 +69,13 @@ const REPLY_TMP_MAX_AGE_MS = 5 * 60_000;
 function cleanupReplyTemps(dir: string): void {
  try { const now = Date.now(); for (const name of readdirSync(dir)) if (/^[0-9a-f]{64}\.json\.\d+\.[0-9a-f]+\.tmp$/.test(name)) { const file = join(dir, name); try { if (now - statSync(file).mtimeMs > REPLY_TMP_MAX_AGE_MS) unlinkSync(file); } catch {} } } catch {}
 }
+export function incrementReplyAttempts(dir: string, id: string, at = new Date().toISOString()): ReplyIntent | null {
+ return withIntentLock(dir, id, () => {
+  const cur = readReplyIntent(dir, id); if (!cur || cur.status !== "pending") return null;
+  const next = { ...cur, attempts: cur.attempts + 1, updatedAt: at };
+  try { atomic(pathFor(dir, id), next); return next; } catch { return null; }
+ });
+}
 export function markReplyIntent(dir: string, id: string, patch: { status: Exclude<ReplyIntentStatus,"pending">; at?: string; error?: string }): ReplyIntent | null {
  return withIntentLock(dir, id, () => {
   const cur = readReplyIntent(dir, id); if (!cur || cur.status !== "pending") return null;

@@ -28,6 +28,8 @@ import { Buffer } from "node:buffer";
 import { sendMessage, deriveReplyClientId, deriveReplyIntentId, type SendMessageReq } from "./channel-wechat/send.ts";
 import { WechatIlinkError } from "./channel-wechat/client.ts";
 import type { WechatFetch } from "./runtime-host/wechat-bind.ts";
+import { startWechatReplyWatcher } from "./runtime-host/wechat-reply.ts";
+import { incrementReplyAttempts } from "./runtime/wechat-reply.ts";
 
 const WATCHDOG_MS = 180_000;
 const watchdog = setTimeout(() => {
@@ -64,6 +66,8 @@ function jsonRes(body: unknown, status = 200, headers: Record<string, string> = 
 		headers: { "content-type": "application/json", ...headers },
 	});
 }
+
+function writeWechatTestCreds(runtimeDir: string): void { writeFileSync(join(runtimeDir,"wechat","credentials.json"),JSON.stringify({botToken:TOKEN,baseUrl:BASE,boundAt:"test"})); }
 
 function baseReq(over: Partial<SendMessageReq> = {}): SendMessageReq {
 	return { baseUrl: BASE, botToken: TOKEN, toUserId: TO, clientId: CID, text: BODY, ...over };
@@ -339,6 +343,36 @@ try {
 			assert.equal(createdItem?.created, true); assert.ok(!readdirSync(dir).includes(orphan.split(/[\\/]/).pop()!));
 			console.log(`    orphan tmp cleanup: removed=${!readdirSync(dir).includes(orphan.split(/[\\/]/).pop()!)}`);
 		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	// ── S5 daemon watcher 状态机 ─────────────────────────────────────
+	await check("S5 pending→sent；attempts 先落盘；disabled/no-creds 保留；重放转 unknown；秘密不进审计", async () => {
+	 const root = mkdtempSync(join(tmpdir(), "wechat-reply-s5-"));
+	 try {
+	  const runtimeDir=join(root,"runtime"), stateDir=join(root,"state"), cfg=join(root,"config.json"), dir=replyIntentDir(stateDir); mkdirSync(join(runtimeDir,"wechat"),{recursive:true});
+	  writeFileSync(cfg,JSON.stringify({channels:{wechat:{reply:{enabled:false}}}}));
+	  const mk=(id:string)=>newReplyIntent(dir,{id,msgId:"private-user-12345",outboxId:id,fromId:TO,clientId:"cid",text:"private body"})!.item;
+	  const disabled=mk("2".repeat(64)); let calls=0;
+	  let stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:15,fetchImpl:fakeFetch(()=>{calls++;return jsonRes({message_id:"ok"})})});
+	  await new Promise(r=>setTimeout(r,50)); stop(); assert.equal(readReplyIntent(dir,disabled.id)?.status,"pending"); assert.equal(calls,0); markReplyIntent(dir,disabled.id,{status:"failed"});
+	  writeFileSync(cfg,JSON.stringify({channels:{wechat:{reply:{enabled:true}}}}));
+	  writeWechatTestCreds(runtimeDir);
+	  const sent=mk("3".repeat(64));
+	  stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:15,fetchImpl:fakeFetch(()=>{calls++;return jsonRes({message_id:"ok"})})});
+	  await new Promise(r=>setTimeout(r,100)); stop(); assert.equal(readReplyIntent(dir,sent.id)?.status,"sent"); assert.equal(readReplyIntent(dir,sent.id)?.attempts,1);
+	  const exhausted=mk("4".repeat(64)); incrementReplyAttempts(dir,exhausted.id); // simulated crash after persisted pre-send attempt
+	  stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:15,fetchImpl:fakeFetch(()=>{calls++;return jsonRes({message_id:"unexpected"})})});
+	  await new Promise(r=>setTimeout(r,60)); stop(); assert.equal(readReplyIntent(dir,exhausted.id)?.status,"unknown");
+	  const absent=mk("5".repeat(64)); rmSync(join(runtimeDir,"wechat","credentials.json"),{force:true});
+	  stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:15}); await new Promise(r=>setTimeout(r,50)); stop(); assert.equal(readReplyIntent(dir,absent.id)?.status,"pending"); markReplyIntent(dir,absent.id,{status:"failed"});
+	  const failed=mk("6".repeat(64)), unknown=mk("7".repeat(64)); writeWechatTestCreds(runtimeDir);
+	  let n=0; stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:15,fetchImpl:fakeFetch(()=>++n===1?jsonRes({ret:9}):Promise.reject(new Error("offline")))});
+	  await new Promise(r=>setTimeout(r,100)); stop(); assert.equal(readReplyIntent(dir,failed.id)?.status,"failed"); assert.match(readReplyIntent(dir,failed.id)?.error??"",/^protocol::9$/); assert.equal(readReplyIntent(dir,unknown.id)?.status,"unknown");
+	  const gate=mk("8".repeat(64)); let release!: (r:Response)=>void, entered=0;
+	  stop=startWechatReplyWatcher({runtimeDir,stateDir,configPath:cfg,intervalMs:10,fetchImpl:((()=>{entered++; return new Promise<Response>(r=>{release=r;});}) as unknown) as WechatFetch});
+	  await new Promise(r=>setTimeout(r,60)); assert.equal(entered,1,"interval watcher re-entered during unresolved send"); release(jsonRes({message_id:"ok"})); await new Promise(r=>setTimeout(r,40)); stop(); assert.equal(readReplyIntent(dir,gate.id)?.status,"sent");
+	  const audit=readFileSync(join(stateDir,"wechat-reply-audit.jsonl"),"utf8"); assert.match(audit,/no-credentials/); assert.doesNotMatch(audit,/private body|bot-token-sentinel|openid-target-sentinel/); assert.doesNotMatch(readFileSync(join(dir,sent.id+".json"),"utf8"),/bot-token-sentinel/);
+	 } finally { rmSync(root,{recursive:true,force:true}); }
 	});
 
 	// ── S3 派生确定性 ────────────────────────────────────────────────
