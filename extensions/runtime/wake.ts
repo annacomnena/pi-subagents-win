@@ -20,7 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
-import { masterAddress, workstreamAddress } from "./address.ts";
+import { masterAddress, workstreamAddress, type ObjectAddress } from "./address.ts";
 import { readAttachment, readCutover } from "./registry.ts";
 import {
 	ackClaimedBy,
@@ -51,6 +51,12 @@ export interface WakeLetter {
 	subject?: string;
 	summary: string;
 	sentAt: string;
+	/** 原信发信方（message 帧 frame.from / command 帧 issuedBy）= 回信目标 */
+	from?: ObjectAddress;
+	/** 原信收件方（frame.to / to）= 回信的 from（本收件地址） */
+	to?: ObjectAddress;
+	/** 仅 message 帧有：requiresAck（kind !== "ACK"）；true → prompt 要求回 RESULT */
+	requiresAck?: boolean;
 }
 
 export interface WakeDecision {
@@ -206,14 +212,72 @@ export function auditWakeSpawnFailed(
 
 // ── Bounded prompt（调用方经 launch 纪律块包装）─────────────────────
 
+/**
+ * mailbox.ts 的绝对 file:// URL（与本模块同目录）——回信 recipe 的动态 import 目标，
+ * 加载时解析一次。本机 node v22 类型剥离下以 file:// URL 形式可被动态 import 接受
+ *（已实测）；Windows 裸反斜杠绝对路径会被 ESM loader 拒绝
+ *（"On Windows, absolute paths must be valid file:// URLs"）。
+ */
+export const MAILBOX_MODULE_URL = new URL("./mailbox.ts", import.meta.url).href;
+
+/**
+ * 回信 recipe（内嵌进 wake prompt；tab 无发信工具，用 bash + 临时脚本调 deliverLetter）。
+ * mailboxUrl = mailbox.ts 的绝对 file:// URL；尖括号占位符由执行方按当前那封信填值。
+ * 脚本体刻意不用模板字符串（避免与外层 TS 模板字面量转义冲突）。
+ */
+export function buildReplyRecipe(mailboxUrl: string): string {
+	return [
+		"【回信 recipe — 每封需回执的来信执行一次（你无发信工具，用 bash + 下面的脚本调 deliverLetter）】",
+		"1) 把下面脚本里的 <原信 to> / <原信 from> / <原信 messageId> / <回执摘要> 替换为当前这封信的值（原信 to = 你的收件地址，原信 from = 回信目标），写进一个临时 .mjs（路径自定，如 reply_<messageId>.mjs）：",
+		"```mjs",
+		`import { deliverLetter, mailboxDirFor } from "${mailboxUrl}";`,
+		"const REPLY = {",
+		'  frame: "message",',
+		'  id: "msg_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8),',
+		'  kind: "RESULT",',
+		'  from: "<原信 to>",',
+		'  to: "<原信 from>",',
+		'  inReplyTo: "<原信 messageId>",',
+		"  requiresAck: true,",
+		"  sentAt: new Date().toISOString(),",
+		'  body: { summary: "<回执摘要，≤512 字节>" },',
+		"};",
+		"const r = deliverLetter(REPLY);",
+		'console.log("DELIVERED created=" + r.created + " id=" + r.letter.frame.id);',
+		'console.log("recipientDir=" + mailboxDirFor(REPLY.to));',
+		"```",
+		"2) 运行：node <临时脚本.mjs>（本机 node v22 类型剥离默认可用，能直接 import 上面的 .ts；若报类型/解析错误改用 node --experimental-strip-types <脚本>；不要用 npx，它依赖网络）",
+		"3) 确认：ls <上一步打印的 recipientDir>（= mailboxDirFor(回信的 to)；目录名规则：非 [A-Za-z0-9._-] 的字符一律替换为 _），断言出现新的 msg_*.json",
+		"4) 删除临时脚本",
+	].join("\n");
+}
+
 export function buildWakePrompt(ws: WorkstreamRecord, letters: WakeLetter[]): string {
+	const shown = letters.slice(0, 10);
+	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
+	const replyBlock: string[] = [];
+	if (replies.length) {
+		replyBlock.push(
+			"回执（round-trip：处理完必须逐封回信给来信者）：",
+			...replies.map(
+				(l) => `- 回执：${l.messageId} → 用 deliverLetter 回 kind=RESULT 到 ${l.from}（from=${l.to}, inReplyTo=${l.messageId}）`,
+			),
+			buildReplyRecipe(MAILBOX_MODULE_URL),
+		);
+	}
 	const lines = [
 		`你是 workstream ${ws.id} 的 Sub-Master（runtime wake 层唤醒，有终态的一次执行）。`,
 		`mission=${ws.mission}`,
 		ws.successCriteria ? `criteria=${ws.successCriteria}` : null,
 		`待处理输入（${letters.length}）：`,
-		...letters.slice(0, 10).map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...shown.map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...replyBlock,
 		`规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经 wake 层；`,
+		...(replies.length
+			? [
+				"硬规则：处理完必须逐封用 deliverLetter 回 kind=RESULT 给来信者；禁止只依赖 tab-report（它是派发者归属通道，wake 场景的来信者收不到）；command 帧不要求回信。",
+			  ]
+			: []),
 		`无 actionable 输入时立即 tab-finish 报 no-op，不许挂等；`,
 		`workstream 暂停时你不会被唤醒（由 wake 层保证）。`,
 	].filter((l): l is string => l !== null);
@@ -261,9 +325,23 @@ function letterTime(letter: Letter): string {
 
 function describeLetter(letter: Letter): WakeLetter {
 	if (letter.frame.frame === "message") {
-		return { messageId: letter.frame.id, subject: letter.frame.subject, summary: letter.frame.body.summary, sentAt: letter.frame.sentAt };
+		return {
+			messageId: letter.frame.id,
+			subject: letter.frame.subject,
+			summary: letter.frame.body.summary,
+			sentAt: letter.frame.sentAt,
+			from: letter.frame.from,
+			to: letter.frame.to,
+			requiresAck: letter.frame.requiresAck,
+		};
 	}
-	return { messageId: `cmd:${letter.frame.commandKey}`, summary: `command ${letter.frame.type}`, sentAt: letter.frame.issuedAt };
+	return {
+		messageId: `cmd:${letter.frame.commandKey}`,
+		summary: `command ${letter.frame.type}`,
+		sentAt: letter.frame.issuedAt,
+		from: letter.frame.issuedBy,
+		to: letter.frame.to,
+	};
 }
 
 /**

@@ -32,6 +32,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]] — v1 纯函数层 + v2 唤醒总门 / 状态行 / /autonomy 命令已接线（`status: current`）
 - [[Hotspot 工作集]] — v4 短期工作集 projection：采集、衰减、注入门与 lookup（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
+- [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
 
 ## Links Out
 
@@ -46,6 +47,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]]
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
+- [[Wake 回信（round-trip 回执）]]
 
 ## Backlinks
 
@@ -60,6 +62,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]]
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
+- [[Wake 回信（round-trip 回执）]]
 
 ## Open Questions
 

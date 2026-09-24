@@ -955,6 +955,64 @@ const reEsc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	assert.match(stSkip.text, new RegExp(`${reEsc(localPrefix)} owner=sess-l3-st gen=1 liveness=skip:no-liveness`), stSkip.text);
 }
 
+// ════════════════════════════════════════════════════════════════════
+// RT — round-trip 回信（buildScopeWakePrompt / evaluateScopeWake 的 message 帧回执）
+// ════════════════════════════════════════════════════════════════════
+{
+	setCutover(true, "rt-test");
+	const repoRT = mkGitRepo("repoRT");
+	const scopeRT = localMasterScope(repoRT.cwd);
+	const addrRT = localMasterAddress(scopeRT);
+	silentScopeGenesis("sess-rt", repoRT.cwd);
+	assert.equal(readAttachment(addrRT)!.sessionId, "sess-rt", "RT scope owner 在位");
+
+	// buildScopeWakePrompt 直测：message 帧 + requiresAck → 回执行 + deliverLetter recipe
+	const pRT = buildScopeWakePrompt(scopeRT, [{
+		messageId: "msg_rt_scope_1",
+		subject: "task://RT1",
+		summary: "round-trip",
+		sentAt: new Date().toISOString(),
+		from: masterAddress(),
+		to: addrRT,
+		requiresAck: true,
+	}], gitToplevel(repoRT.cwd));
+	assert.ok(pRT.includes("deliverLetter"), "scope prompt 含 deliverLetter");
+	assert.ok(pRT.includes(`RESULT 到 ${masterAddress()}`), "scope prompt 含回信目标地址（原信 from）");
+	assert.ok(pRT.includes("RESULT"), "scope prompt 含 RESULT");
+	assert.ok(pRT.includes("inReplyTo"), "scope prompt 含 inReplyTo");
+	assert.ok(pRT.includes("确认"), "scope prompt 含确认步骤");
+	assert.ok(pRT.includes("mailboxDirFor"), "scope prompt recipe 含 mailboxDirFor");
+
+	// command 帧 / requiresAck=false → 无 recipe
+	const pRT2 = buildScopeWakePrompt(scopeRT, [
+		{ messageId: "cmd:rt", summary: "command agent.wake", sentAt: new Date().toISOString(), from: masterAddress(), to: addrRT },
+		{ messageId: "msg_ack_rt", summary: "ack", sentAt: new Date().toISOString(), from: masterAddress(), to: addrRT, requiresAck: false },
+	], gitToplevel(repoRT.cwd));
+	assert.ok(!pRT2.includes("deliverLetter"), "scope command/ACK 不要求回信，无 recipe");
+
+	// evaluateScopeWake 链路：非 REPORT message → fire + describeLetter 带 from/to + prompt 带回执
+	const rtMsg: MessageFrame = {
+		frame: "message",
+		id: newMessageId(),
+		kind: "ESCALATION",
+		from: masterAddress(),
+		to: addrRT,
+		subject: "task://RT-eval",
+		requiresAck: true,
+		sentAt: new Date().toISOString(),
+		body: { summary: "round-trip escalation" },
+	};
+	deliverLetter(rtMsg);
+	const dRT = evaluateScopeWake({ sessionId: "sess-rt", scope: scopeRT });
+	assert.equal(dRT.fire, true, "非 REPORT message 触发 scope wake");
+	assert.equal(dRT.letters[0].from, masterAddress(), "scope describeLetter：message 帧 from = 原信发信方");
+	assert.equal(dRT.letters[0].to, addrRT, "scope describeLetter：message 帧 to = 原信收件方");
+	assert.equal(dRT.letters[0].requiresAck, true, "scope describeLetter：ESCALATION requiresAck=true");
+	assert.ok(dRT.prompt!.includes("deliverLetter"), "scope wake prompt 含 deliverLetter recipe");
+	assert.ok(dRT.prompt!.includes(`RESULT 到 ${masterAddress()}`), "scope wake prompt 含回信目标地址");
+	assert.ok(dRT.prompt!.includes(`inReplyTo=${rtMsg.id}`), "scope wake prompt 含 inReplyTo=原信 messageId");
+}
+
 rmSync(tmpRoot, { recursive: true, force: true });
 rmSync(RUNTIME, { recursive: true, force: true });
 console.log("_test_local_master: all assertions passed (U1-U9 + E1-E5 + L1-L7)");

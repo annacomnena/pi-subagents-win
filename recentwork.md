@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，已实现待提交） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已实现，待提交） |
 | 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
 | 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） |
 | 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
@@ -46,6 +47,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 38 - wake round-trip 回信（wake spawn prompt 带 deliverLetter RESULT 回信）
+
+- **日期**：2026-09-24
+- **一句话**：bug #4（ESCALATION `msg_muf5tqq8_8mbtg4`）——wake-spawn 链路没把「回信给来信者」翻译成 `deliverLetter`，回程只走 tab-report（派发者归属，wake 场景来信者收不到）→ 修法 A：`buildWakePrompt`/`buildScopeWakePrompt` 为每封「message 且 requiresAck」来信加回执行（回 kind=RESULT 到原信 `from`，inReplyTo=原信 messageId）+ 可执行 recipe（bash + 临时 .mjs 调 deliverLetter，file:// URL 动态 import）+ 硬规则（禁只依赖 tab-report；command 帧不回信）。
+- **涉及模块**：`extensions/runtime/wake.ts`（`WakeLetter`+from/to/requiresAck、`MAILBOX_MODULE_URL`、`buildReplyRecipe`、`buildWakePrompt`、`describeLetter`）、`extensions/runtime/scope.ts`（同形）、`extensions/_test_runtime_wake.ts`、`extensions/_test_local_master.ts`
+- **产物**：`plans/20260924_wake_roundtrip_reply_impl.md`
+- **Wiki**：新建正式主题页 `Wiki/Architecture/wake-roundtrip-ack.md`（`status: current`，回信渠道事实：tab-report 派发者归属不可达来信者、回信走 deliverLetter、prompt 形状与 recipe 约束；`_index.md` 导航已收录）
+- **Priority**：P1
+- **Status**：done（已实现，待提交）
+- **Commit**：（待提交；基线 `ad72cd4`）
+- **Verification**：recipe 本机实测跑通（隔离 `PI_RUNTIME_DIR`、未污染真实 mailbox；回执信 `kind=RESULT / inReplyTo=原信 messageId / to=agent://master_default`）；`test:runtime-wake` / `test:local-master` / `test:runtime-mailbox` / `test:mailbox-command-consume` 全绿 + `test:scope-stale-takeover` 绿；`_test_autonomy_wiring` W2.3 为基线既有（`git stash` 后复现，与本改动无关）。
 
 ### Item 37 - local Master 自动交接（`master-transfer --local`）
 

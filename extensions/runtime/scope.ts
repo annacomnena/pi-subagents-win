@@ -41,7 +41,15 @@ import { ackClaimedBy, claimLetters, defaultMailboxDir, listLetters, mailboxDirF
 import { attachMasterWithAudit, takeoverMasterWithAudit } from "./adapters/session-lifecycle.ts";
 import { readAttachment, readCutover, type MasterAttachment } from "./registry.ts";
 import { isProcessAlive, readScopeLiveness, type ScopeLiveness } from "./liveness.ts";
-import { isInFlight, readWakeState, wakeHolder, writeWakeState, type WakeLetter } from "./wake.ts";
+import {
+	buildReplyRecipe,
+	isInFlight,
+	MAILBOX_MODULE_URL,
+	readWakeState,
+	wakeHolder,
+	writeWakeState,
+	type WakeLetter,
+} from "./wake.ts";
 
 // ── scope 键（S1 + L4 M1/M2/M3 返修，纯函数）──────────────────────────────────────────
 
@@ -239,9 +247,23 @@ export function isScopeWakeLetter(letter: Letter): boolean {
 /** 信描述（与 wake.ts describeLetter 同规则）。 */
 function describeLetter(letter: Letter): WakeLetter {
 	if (letter.frame.frame === "message") {
-		return { messageId: letter.frame.id, subject: letter.frame.subject, summary: letter.frame.body.summary, sentAt: letter.frame.sentAt };
+		return {
+			messageId: letter.frame.id,
+			subject: letter.frame.subject,
+			summary: letter.frame.body.summary,
+			sentAt: letter.frame.sentAt,
+			from: letter.frame.from,
+			to: letter.frame.to,
+			requiresAck: letter.frame.requiresAck,
+		};
 	}
-	return { messageId: `cmd:${letter.frame.commandKey}`, summary: `command ${letter.frame.type}`, sentAt: letter.frame.issuedAt };
+	return {
+		messageId: `cmd:${letter.frame.commandKey}`,
+		summary: `command ${letter.frame.type}`,
+		sentAt: letter.frame.issuedAt,
+		from: letter.frame.issuedBy,
+		to: letter.frame.to,
+	};
 }
 
 /**
@@ -376,12 +398,30 @@ export function auditScopeWakeSpawnFailed(scope: string, error: string, stateDir
 // ── Bounded prompt（调用方经 launch 纪律块包装）────────────────────
 
 export function buildScopeWakePrompt(scope: string, letters: WakeLetter[], repoCwd: string | null): string {
+	const shown = letters.slice(0, 10);
+	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
+	const replyBlock: string[] = [];
+	if (replies.length) {
+		replyBlock.push(
+			"回执（round-trip：处理完必须逐封回信给来信者）：",
+			...replies.map(
+				(l) => `- 回执：${l.messageId} → 用 deliverLetter 回 kind=RESULT 到 ${l.from}（from=${l.to}, inReplyTo=${l.messageId}）`,
+			),
+			buildReplyRecipe(MAILBOX_MODULE_URL),
+		);
+	}
 	const lines = [
 		`你是仓库 ${scope} 的本地 Sub-Master（local master v1 唤醒，有终态的一次执行）。`,
 		repoCwd ? `工作目录：${repoCwd}（本仓）` : null,
 		`待处理输入（${letters.length}）：`,
-		...letters.slice(0, 10).map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...shown.map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...replyBlock,
 		`规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经本地 wake 层；`,
+		...(replies.length
+			? [
+				"硬规则：处理完必须逐封用 deliverLetter 回 kind=RESULT 给来信者；禁止只依赖 tab-report（它是派发者归属通道，来信者收不到）；command 帧不要求回信。",
+			  ]
+			: []),
 		`无 actionable 输入时立即 tab-finish 报 no-op，不许挂等；`,
 		`你不是全局 Master：不得调用 master-attach/master-transfer/master-cutover，不处理 run 完成回收（run 归派发者）。`,
 	].filter((l): l is string => l !== null);

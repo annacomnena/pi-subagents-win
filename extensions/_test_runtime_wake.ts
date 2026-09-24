@@ -74,6 +74,15 @@ try {
 		const [d] = evaluateWakes({ ...S, mailboxDir: MAILBOX, runsDir: RUNS, sessionId: "sess-W", now: BASE });
 		assert.equal(d.fire, true);
 		assert.equal(d.letters.length, 1);
+		// describeLetter 新字段：message 帧带 from/to/requiresAck
+		assert.equal(d.letters[0]!.from, "agent://a", "message 帧 from = 原信发信方");
+		assert.equal(d.letters[0]!.to, workstreamAddress(ws.id), "message 帧 to = 原信收件方");
+		assert.equal(d.letters[0]!.requiresAck, true, "REPORT 帧 requiresAck=true");
+		// prompt 带回信目标地址 + deliverLetter + RESULT + inReplyTo + 确认步骤
+		assert.ok(d.prompt!.includes("deliverLetter"), "prompt 含 deliverLetter recipe");
+		assert.ok(d.prompt!.includes("RESULT 到 agent://a"), "prompt 含回信目标地址（原信 from）");
+		assert.ok(d.prompt!.includes("inReplyTo"), "prompt 含 inReplyTo");
+		assert.ok(d.prompt!.includes("确认"), "prompt 含确认步骤");
 		assert.ok(d.prompt!.includes(ws.id), "prompt 带 workstream 身份");
 		assert.ok(d.prompt!.includes("tab-finish"), "prompt 强制有终态");
 		assert.ok(d.prompt!.includes("timer"), "prompt 禁自续命");
@@ -173,17 +182,39 @@ try {
 		const mine = all.find((x) => x.workstreamId === ws4.id);
 		assert.ok(mine && mine.fire, "command 信触发 wake");
 		assert.ok(mine.letters[0]!.messageId.startsWith("cmd:"), "command 信标识");
+		// describeLetter command 帧：from=issuedBy、to=frame.to、无 requiresAck（不崩）
+		assert.equal(mine.letters[0]!.from, "agent://a", "command 帧 from = issuedBy");
+		assert.equal(mine.letters[0]!.to, workstreamAddress(ws4.id), "command 帧 to = frame.to");
+		assert.equal(mine.letters[0]!.requiresAck, undefined, "command 帧无 requiresAck");
+		assert.ok(!mine.prompt!.includes("deliverLetter"), "command 帧不要求回信，无 recipe");
 		confirmWakeSpawn(ws4.id, "tab_wake_cmd", { stateDir: STATE, mailboxDir: MAILBOX, sessionId: "sess-W", now: BASE + 601_000 });
 		assert.equal(wsInbox(ws4.id), 0, "command 信确认后 ack（ackClaimedBy，不依赖 frame.id）");
 	}
 
 	// ── 8. prompt 形状（buildWakePrompt 直测）───────────────────────
 	{
+		// message 帧 + requiresAck → 回执行 + deliverLetter recipe + RESULT + inReplyTo + 确认步骤
 		const p = buildWakePrompt(
 			{ id: "ws_x", mission: "m", status: "active" } as never,
-			[{ messageId: "a", subject: "run://tab/t", summary: "s", sentAt: iso(BASE) }],
+			[{ messageId: "msg_rt_wake_1", subject: "run://tab/t", summary: "s", sentAt: iso(BASE), from: "agent://master_default", to: "workstream://ws_x", requiresAck: true }],
 		);
 		assert.ok(p.includes("Sub-Master") && p.includes("no-op"), "边界写进 prompt");
+		assert.ok(p.includes("deliverLetter"), "含 deliverLetter");
+		assert.ok(p.includes("RESULT 到 agent://master_default"), "含回信目标地址");
+		assert.ok(p.includes("RESULT"), "含 RESULT");
+		assert.ok(p.includes("inReplyTo"), "含 inReplyTo");
+		assert.ok(p.includes("确认"), "含确认步骤");
+		assert.ok(p.includes("mailboxDirFor"), "recipe 含 mailboxDirFor 确认");
+
+		// command 帧 / requiresAck=false → 无回信 recipe
+		const p2 = buildWakePrompt(
+			{ id: "ws_x", mission: "m", status: "active" } as never,
+			[
+				{ messageId: "cmd:wake", summary: "command agent.wake", sentAt: iso(BASE), from: "agent://a", to: "workstream://ws_x" },
+				{ messageId: "msg_ack_w1", summary: "ack", sentAt: iso(BASE), from: "agent://a", to: "workstream://ws_x", requiresAck: false },
+			],
+		);
+		assert.ok(!p2.includes("deliverLetter"), "command 帧 / ACK 不要求回信，无 recipe");
 	}
 } finally {
 	rmSync(RUNTIME, { recursive: true, force: true });
