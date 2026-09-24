@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
 | 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
 | 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
@@ -43,6 +44,20 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 35 - 热点层 v4 重做（短期工作集 projection）
+
+- **日期**：2026-09-24
+- **一句话**：Hotspot 从 v2「Wiki 路由缓存」重做为可丢失、可重建、非权威的短期工作集；按 task/workstream 投影最近 read/write/test 文件，工具仅 lookup，`/hotspot` 只读诊断。
+- **涉及模块**：`extensions/hotspot/{types,store,collect,decay,workset,inject,tool,command,log,index}.ts`；删除 v2 detect/graph/heat/usage/validate 等实现；文档 `README.md`、`CHANGELOG.md`、`skills/workflow-orchestrator/SKILL.md`、`agents/searcher.md`、`Wiki/Architecture/hotspot-working-set.md`
+- **产物**：设计 `plans/0924_hotspot_v4_ephemeral_working_set.md`；实现 `plans/0924_hotspot_v4_impl_report.md`；L4 链 `plans/0924_hotspot_v4_{l4_review,fix_report,fix_l4_confirm,fix2_report,fix2_l4_confirm}.md`
+- **Wiki**：`Wiki/Architecture/hotspot-working-set.md`（current；源码逐项出处）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`8a9f09a`
+- **Verification**：实现报告记载 `npm run test:hotspot` 13/13、extension smoke、注册图测试本体、真机采集/注入/开关/lookup 四项通过；L4 两轮修复后终判 PASS。`npm run test:register-graph` 脚本前置依赖检查环境性失败，但底层测试直跑通过。文档收尾另实跑验证见本轮结果。
+- **L4 教训**：① 注入块字段必须在写入端拒绝非法路径，并在渲染端共享转义（控制字符压平、尖括号全角化），防存储/旧分片内容伪造标签或行；② 不能只审查主渲染函数，lookup 工具与 `/hotspot` 诊断是渲染旁路，必须使用同一 `esc()` 并对三条输出路径分别回归。
+- **退役边界**：`Wiki/_hotspot.md` 与 `_hotspot.trash.jsonl` 保留为 v2 唯一副本；v4 不读写删除。回退为 `git revert 8a9f09a`；确认不再回退后再按旧计划备份移出并清理 `.gitignore` 遗留规则。
 
 ### Item 34 - 交接状态（2026-09-24，compaction 不可用 → 自动交接新会话）
 

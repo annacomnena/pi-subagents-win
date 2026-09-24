@@ -293,7 +293,7 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
    - [ ] 已调 `wiki-nav rebuild` 重建索引，`_navigation.json` 反映本轮所有新增/合并/删除
    - [ ] 全文检索不应出现新建的 `task`/`itemNN`/`#NN` Wiki 文件
    - [ ] `recentwork.md`（如有）一行：改了哪些正式 Wiki 页，或「Wiki 更新：无」
-   - [ ] **热点路由检查（仓库有 `Wiki/_hotspot.md` 时）**：对照本任务验证过的路由变化（新入口/章节迁移/旧指针失效），有则经 `hotspot` 工具 upsert（先 read 取 revision；相同内容会自动跳过），无变化则不动——纯纪律，不机械每任务必写
+   - [ ] **近期工作集检查**：需要定位当前任务/工作流近期活跃文件时，用 `hotspot` 工具 `lookup`（或 `/hotspot` 诊断）查短期工作集（v4：只读投影，task/workstream → 最近读写文件）——热点层已无路由指针，收尾不再有 hotspot 写入动作（旧 upsert 纪律已随 v2 退役）
 
 5. **回报主会话（强制）**：上述全部收尾完成后，调用 `tab-finish`（status=completed + summary + 交付物 artifacts/reportPath）向主会话回报。只有 tab-finish 才是工作流终态信号——主会话靠它被 event-bus 唤醒去 reclaim 并编排下一批；**不调 tab-finish = 未完成，主会话会一直等你**。
 

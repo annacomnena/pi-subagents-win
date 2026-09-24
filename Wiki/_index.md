@@ -2,9 +2,10 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-09-23
+updated: 2026-09-24
 source_paths:
   - plans/0923_decisions.md
+  - extensions/hotspot/index.ts
 ---
 
 # Wiki 索引
@@ -29,6 +30,7 @@ source_paths:
 - [[统一审批门架构]] — 三端共用一门、TOCTOU、超时（`status: proposed`）
 - [[微信 iLink 通道]] — Client Plane 通道定位、七项待测未知项（`status: proposed`）
 - [[主动性套件（Autonomy Suite）]] — v1 纯函数层 + v2 唤醒总门 / 状态行 / /autonomy 命令已接线（`status: current`）
+- [[Hotspot 工作集]] — v4 短期工作集 projection：采集、衰减、注入门与 lookup（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
 
 ## Links Out
@@ -42,6 +44,7 @@ source_paths:
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
 - [[主动性套件（Autonomy Suite）]]
+- [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 
 ## Backlinks
@@ -55,6 +58,7 @@ source_paths:
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
 - [[主动性套件（Autonomy Suite）]]
+- [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 
 ## Open Questions

@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (hotspot v4: ephemeral working set)
+
+- **热点层 v4 重做（`8a9f09a`）**：Hotspot 从「Wiki 路由缓存（主题 → Wiki 切片/符号/证据，`hotspot` 工具 read/upsert/remove 托管 `Wiki/_hotspot.md`）」整体重做为「短期工作集 projection（task/workstream → 最近读/写/测试文件）」。定位：cache 不是 memory——可丢失/可重建/非权威/短 TTL（半衰 12h、soft 48h、hard 72h）/非阻塞（全静默失败，丢失不影响编码/Master/Timeline/Wiki）。
+- **新增**：`decay.ts`（`score(t)=score·2^(−Δt/12h)+w` 纯函数 + TTL 判定）；`collect.ts`（工具事件采集：edit/write 成功→3、read 成功→1、bash 保守单文件 test→2；失败/broad scan（grep/find/ls 白名单外）/hotspot 自身不计；同 run 每文件每 kind 上限 read4/write3/test2；tab 身份 = 派发账本 externalTaskId + enrichRunRefs 派生 workstream，主会话/子 agent 无 task_id 不伪造）；`workset.ts`（归并投影 buildWorkset/lookupWorkset，task 视图无命中回退 workspace 并标注）；`_test_hotspot_v4.ts`（13 组用例，含两轮 L4 对抗回归）。
+- **重写**：`types/store/inject/command/tool/log/index`。存储全部移到 `<agentDir>/hotspot/<wsid>/{meta.json,events/*.jsonl,snapshot.json,log.jsonl}`（repo 零运行状态、不动 `.gitignore`；wsid=sha1(repoRoot)[:16]，worktree 各自命名空间；分片 append-only 无锁单写者；snapshot tmp+随机后缀+rename 原子写、唯一写者=主会话、5min 节流 + TTL 清理）；首条用户消息两级保守注入（task/workstream 精确命中且非终态，或路径 token 精确命中工作集）+ 幂等双保险（已有 user 消息 / `hotspot-injected` 标记）+ 预算内整条省略（≤5 条、≥2 条、~560 字符）+ 工作集已在上下文去重；`hotspot` 工具只剩只读 lookup（limit 默认 10 上限 50）；`/hotspot` 只读诊断（buildHotspotReport）；决策全量进 `log.jsonl`。
+- **安全加固（两轮 L4 must-fix）**：写入侧 `isLegalEventPath` 拒绝非法 path（尖括号/控制字符/绝对路径/`..` 越界段）；渲染侧共享 `esc()`（types.ts 唯一实现：控制字符压平空格 + `<`/`>` 全角化）覆盖注入块（renderWorkingSetBlock）、`/hotspot` 报告与 lookup 工具文本——手工/旧分片的恶意字段无法伪造行或标签。
+- **删除（v2 专属，共 1874 行）**：`detect/graph/heat/usage/validate/_test_hotspot/_seed_greencad`（pending 自动探测、动态关系投影、路由热度与 used 度量、引用与 CodeGraph 符号校验）。`Wiki/_hotspot.md`/`_hotspot.trash.jsonl` 不删不改不读写（v2 唯一副本留作历史；回退 v2 = `git revert 8a9f09a`，确认不回退后再按 v3 计划 §12-4 备份移出并清理 `.gitignore` 遗留规则）。
+- **回退开关**：`PI_HOTSPOT_ENABLED=0`（缺省开）——采集/注入/工具/命令全部不注册，其余扩展功能不受影响。
+- **验收**：`npm run test:hotspot` 13/13 绿；`npm run smoke:extension-load` 绿；`_test_register_graph` 绿（注册面快照：事件表删 `session_before_compact`，工具/命令不变）；真机四项实测（采集落分片 / 首条消息路径注入且被模型消费 / 开关关闭 `agent/hotspot/` 零创建 / lookup 渲染）；两轮 L4 独立复核终判 PASS。
+- **报告**：设计 `plans/0924_hotspot_v4_ephemeral_working_set.md`；实现 `plans/0924_hotspot_v4_impl_report.md`；L4 链 `plans/0924_hotspot_v4_{l4_review,fix_report,fix_l4_confirm,fix2_report,fix2_l4_confirm}.md`；Wiki `Wiki/Architecture/hotspot-working-set.md`。
+
 ## [0.6.0] — 2026-09-23 (session isolation + parallel async + master governance + global view)
 
 - **async 终态只投派发者**：onRunFile link 路由 fail-closed（外会话零副作用、可补投）；async 专用注册谓词（任意 tab 派发者都 watch）。

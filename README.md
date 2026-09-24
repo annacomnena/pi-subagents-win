@@ -450,6 +450,7 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `links.jsonl` | provenance log (who spawned what) |
 | `trace-fusion-runs/<runId>/` | trace-fusion run artifacts (meta, lanes/{A,B,C}, collect, cross-test, logs) |
 | `trust.json` | pre-granted trusted paths (e.g. worktree root for implement mode) |
+| `hotspot/<wsid>/` | v4 ephemeral working set: `events/*.jsonl` shards, `snapshot.json`, `log.jsonl` (see §9.5) |
 
 ### Environment variables
 
@@ -458,6 +459,7 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `PI_TAB_RUN_ID` | set on launched tabs (reclaim identity); cleared for subagents |
 | `PI_TAB_RUNS_DIR` | tab ledger dir override |
 | `PI_SUBAGENT` | set on subagent processes (they never own tabs/timers, never open tabs) |
+| `PI_HOTSPOT_ENABLED` | `0`/`false` disables the hotspot working set entirely — collection/injection/tool/command all unregister (default on; see §9.5) |
 
 ---
 
@@ -482,7 +484,7 @@ The workflow ships a full documentation system for long-lived repos. **Five sepa
 | Family | Where | Purpose | Written by |
 |--------|-------|---------|------------|
 | **Wiki** | `Wiki/{Concepts,Modules,Architecture,Decisions,Workflows}/` | durable cross-task facts, `status: current`, `source_paths` + Evidence | searcher (proactively maintained) |
-| **Hotspot cache** | `Wiki/_hotspot.md` | routing snapshot of recently-active topics (Wiki section slices, symbol entry points, evidence pointers) | main session via `hotspot` tool |
+| **Hotspot working set** | `~/.pi/agent/hotspot/<wsid>/` (outside the repo) | v4 ephemeral projection: task/workstream → recently read/written/tested files (12h half-life, 48h/72h TTL; losable, rebuildable — see §9.5) | runtime collector (automatic) |
 | **Plans** | `plans/` | per-task implementation plans & research notes | planner; research mode |
 | **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log (`Item NN` entries) | implementer / reviewer |
 | **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (wiki-and-task templates) |
@@ -509,31 +511,41 @@ The workflow ships a full documentation system for long-lived repos. **Five sepa
 ```text
 search ──► Wiki verify/update (searcher)
    │          plans/ research notes (if oversized)
-   │          hotspot candidates in the reply (searcher returns, never writes)
    ▼
 plan ──► plans/<date_topic>.md (planner)
    ▼
 implement/review ──► recentwork.md row (progress)
+   │          hotspot: tool calls collected to the working set along the way (v4, automatic)
    ▼
 Wiki wrap-up (stage 5) ──► update the corresponding theme page; may be "none"
-                        ──► hotspot upsert if a routing pointer changed (idle if not)
+                        ──► no hotspot action here: the working set was collected live;
+                            the next session recovers it via inject gate / `hotspot` lookup (§9.5)
 ```
 
-### 9.5 Hotspot routing cache (`Wiki/_hotspot.md`)
+### 9.5 Hotspot working set (v4 — ephemeral projection)
 
-A routing-only working set for **new-session cold starts**. When a session's first user message is submitted, the extension appends one `<system-reminder>` block (once, idempotent — resume/retry never re-injects) containing:
+Hotspot answers one question: **"which files was this task/workstream touching just now?"** It is a *cache, not memory*: **losable** (deleting all hotspot data loses no knowledge), **rebuildable** (re-accumulates from fresh tool activity), **non-authoritative** (heat ≠ importance or correctness), **short-lived** (12h half-life, 48h/72h TTL), **non-blocking** (every failure path is silent; coding/Master/Timeline/Wiki run normally without it). "What happened" belongs to Timeline/recentwork, "what we know" belongs to Wiki — Hotspot holds neither. Design: `plans/0924_hotspot_v4_ephemeral_working_set.md`.
 
-- **Recent tasks** — latest 3 active `recentwork.md` rows (one pointer line each; status stays owned by recentwork)
-- **Recently modified functions** — top 5 method-level hunk contexts aggregated from the **uncommitted working tree** + last 30 commits (purely derived, recomputed each injection; needs `*.cs diff=csharp` funcname for C# quality, falls back to file level)
-- **Topic entries** — per topic: Wiki section slice, symbol entry points (`path::Symbol`, resolvable via CodeGraph), evidence pointers — sorted by heat and capped at ~1k tokens total
+**Storage** — all under `<agentDir = PI_CODING_AGENT_DIR ?? ~/.pi/agent>/hotspot/<wsid>/`, never inside the repo (no `.gitignore` edits, no runtime state in the worktree):
 
-Heat signals are **computed, never stored**: uncommitted `git diff HEAD` (×5 — git log can't see in-progress work), 14-day churn (×3), active recentwork rows. The file stores only what can't be computed: routing pointers, pitfalls, semantic links.
+```text
+meta.json          # {schema:4, workspaceRoot, createdAt}
+events/<pid>-<startTs>-<rand>.jsonl   # append-only shards, one per process (no locks)
+snapshot.json      # derived cache: tmp+rename atomic write, sole writer = main session
+log.jsonl          # inject/lookup decision log
+```
 
-- **`hotspot` tool** (`read` / `upsert` / `remove`) — the only write path. Strict parse, shape + path-boundary + CodeGraph-symbol validation, revision + fingerprint optimistic lock, cross-process `.lock`, atomic tmp-rename, identical-content no-op, removal keeps a `_hotspot.trash.jsonl` recovery copy. Subagent processes get none of it (candidates travel in replies; the main session commits).
-- **`/hotspot`** — read-only diagnostics: disk vs injected revision, per-topic heat score **with its reasoning**, budget estimate, degradation causes.
-- **Effect log** — `~/.pi/agent/hotspot-logs/<repo-key>.jsonl` (topic/version/action/time only); two weeks of this data decides the v3 candidates (dynamic CodeGraph relation projection, usage feedback into heat, curator).
+`wsid` = first 16 hex chars of sha1(repo root) — each worktree gets its own namespace.
 
-Design principles: *compute what you can, store only the rest*; *routing pointers, never explanatory knowledge* (that's Wiki's job); *no daemon, no timers* — everything lives inside pi session lifecycles. Underscore prefix keeps `_hotspot.md` out of `wiki-nav` indexes. Design doc: `plans/20260915_plan_hotspot_memory_layer.md`.
+**Collection & weights** — tool events only: successful `edit`/`write` → **write 3**, successful `read` → **read 1**, `bash` conservatively recognized as a targeted single-file test → **test 2**. Failures (`isError`), broad scans (grep/find/ls are outside the whitelist), and hotspot's own activity never count. A per-run cap per file per kind (read 4 / write 3 / test 2) stops loops from cooking scores. Score decays as `score(t) = score(t0)·2^(−Δt/12h) + weight`; entries turn **soft at 48h** (still visible in lookup, excluded from injection) and are **pruned at 72h**.
+
+**Conservative injection** — at most one `<recent-working-set>` block appended to a session's first user message, and only when a gate passes: (a) the current task/workstream exactly matches entries in the set (and the task is not terminal), or (b) the first message mentions exact repo paths that are fresh in the set. New tasks, unknown identity, "globally hot" files, and fuzzy text similarity never trigger injection. Budget: ≤5 entries (≥2 to inject at all), ~560 chars ≈ 80–160 tokens; over-budget entries are omitted whole, never truncated. Idempotent twice over: a resumed session (existing user messages) or a prior `hotspot-injected` custom entry suppresses re-injection.
+
+- **`hotspot` tool** — **lookup only** (read-only): task/workstream view, `limit` (default 10, max 50). The v2 `read`/`upsert`/`remove` routing-cache writes are gone.
+- **`/hotspot`** — read-only diagnostics: identity, parameters, entries with score/kind/age/TTL, injection switch state, storage summary.
+- **Kill switch** — `PI_HOTSPOT_ENABLED=0` (default on): collection/injection/tool/command all unregister; everything else keeps working.
+
+**v2 retirement** — `Wiki/_hotspot.md` + `Wiki/_hotspot.trash.jsonl` are the only remaining copies of the v2 routing cache; v4 never reads, writes, or deletes them (deliberately left untouched). Rolling back to v2 = `git revert 8a9f09a` (the old files are intact, so the revert restores the old behavior wholesale). Once rollback is off the table, retire them for good: back them up out of the repo and drop the now-dead `state/`/trash `.gitignore` rules (old-implementation exit strategy, v3 plan §12-4).
 
 ---
 
@@ -561,6 +573,7 @@ npm run test:trace-fusion-crosstest # cross-test matrix + diagnose skip report
 npm run test:trace-fusion-supervisor # auto-collect decision matrix + claim idempotency
 npm run test:trace-worker       # worker identity/profile/guard
 npm run test:register-graph     # tool/command registration snapshot
+npm run test:hotspot            # hotspot v4 working set (decay/collect/store/inject/lookup, incl. adversarial escaping)
 ```
 
 ### extensions/ file map
