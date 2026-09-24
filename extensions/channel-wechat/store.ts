@@ -52,6 +52,7 @@ export interface InboundRecord {
 	receivedAt: string;
 	/** W1 恒 pending（injected/rejected 留给 W2 注入门）。 */
 	state: "pending" | "injected" | "rejected";
+	rejectedReason?: "not-allowlisted" | "write-failed";
 	artifactPending?: boolean;
 }
 
@@ -323,6 +324,7 @@ export class WechatStore {
 					text: typeof v.text === "string" ? v.text : "",
 					receivedAt: typeof v.receivedAt === "string" ? v.receivedAt : "",
 					state: v.state === "injected" || v.state === "rejected" ? v.state : "pending",
+					...(v.rejectedReason === "not-allowlisted" || v.rejectedReason === "write-failed" ? { rejectedReason: v.rejectedReason } : {}),
 					...(v.artifactPending === true ? { artifactPending: true } : {}),
 				});
 			}
@@ -331,6 +333,19 @@ export class WechatStore {
 		}
 		out.sort((a, b) => (a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : a.msgId < b.msgId ? 1 : -1));
 		return Number.isInteger(limit) && limit > 0 ? out.slice(0, limit) : out;
+	}
+
+	/** Re-evaluate rejected inbox records only for explicitly allowed senders. Atomic, idempotent. */
+	reevaluateRejected(allowedSenders: string[]): number {
+		const allowed = new Set(allowedSenders.filter(Boolean));
+		if (!allowed.size) return 0;
+		let count = 0;
+		for (const rec of this.readInbox(0)) {
+			if (rec.state !== "rejected" || rec.rejectedReason !== "not-allowlisted" || !allowed.has(rec.fromId)) continue;
+			this.putInbox({ ...rec, state: "pending" });
+			count++;
+		}
+		return count;
 	}
 
 	/** inbox 总条数 / pending 积压（never-throw）。 */

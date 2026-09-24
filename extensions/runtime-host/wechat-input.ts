@@ -6,7 +6,7 @@ import { readAttachment } from "../runtime/registry.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { newOutboxItem, outboxDir, outboxItemId, writeOutboxItem } from "../runtime/message-outbox.ts";
 import { sessionAlive, defaultTimersDir } from "../timers.ts";
-import { readWechatInputConfig } from "./wechat-bind.ts";
+import { readWechatInputConfig, readWechatCreds, wechatCredsPath } from "./wechat-bind.ts";
 
 export interface WechatInputOptions {
  runtimeDir: string; configPath: string; now?: Date; timersDir?: string; stateDir?: string;
@@ -31,7 +31,8 @@ export function tryInjectPending(opts: WechatInputOptions): { injected: boolean;
  if(!record) return {injected:false,reason:"empty"};
  const at=(opts.now??new Date()).toISOString();
  const base={at,msgId:mask(record.msgId),from:mask(record.fromId),ownerSid:"",generation:0};
- if(!record.fromId || !config.allowFrom.includes(record.fromId)) { try { atomicRecord(WechatStore.resolveDir(opts.runtimeDir),{...record,state:"rejected"}); } catch {} audit(opts.runtimeDir,{...base,decision:"denied",reason:"not-allowlisted"}); return {injected:false,reason:"not-allowlisted"}; }
+ const ownerOpenId = readWechatCreds(wechatCredsPath(opts.runtimeDir))?.ownerOpenId;
+ if(!record.fromId || (record.fromId !== ownerOpenId && !config.allowFrom.includes(record.fromId))) { try { atomicRecord(WechatStore.resolveDir(opts.runtimeDir),{...record,state:"rejected",rejectedReason:"not-allowlisted"}); } catch {} audit(opts.runtimeDir,{...base,decision:"denied",reason:"not-allowlisted"}); return {injected:false,reason:"not-allowlisted"}; }
  // W1 parser only materializes direct-message text records; no group discriminator is retained.
  let owner=(opts.readOwner??readAttachment)(masterAddress());
  if(!owner || !(opts.alive??sessionAlive)(opts.timersDir??defaultTimersDir(),owner.sessionId,opts.now??new Date())) { audit(opts.runtimeDir,{...base,decision:"skipped",reason:"master-offline"}); return {injected:false,reason:"master-offline"}; }
@@ -48,7 +49,7 @@ export function tryInjectPending(opts: WechatInputOptions): { injected: boolean;
   atomicRecord(WechatStore.resolveDir(opts.runtimeDir),updated);
   audit(opts.runtimeDir,{...base,decision:"accepted",reason:"injected",ownerSid:owner.sessionId.slice(0,12),generation:owner.generation,outboxId:item.id});
   return {injected:true};
- } catch { try { atomicRecord(WechatStore.resolveDir(opts.runtimeDir),{...record,state:"rejected"}); } catch {} audit(opts.runtimeDir,{...base,decision:"uncertain",reason:"write-failed",ownerSid:before.sessionId.slice(0,12),generation:before.generation}); return {injected:false,reason:"uncertain"}; }
+ } catch { try { atomicRecord(WechatStore.resolveDir(opts.runtimeDir),{...record,state:"rejected",rejectedReason:"write-failed"}); } catch {} audit(opts.runtimeDir,{...base,decision:"uncertain",reason:"write-failed",ownerSid:before.sessionId.slice(0,12),generation:before.generation}); return {injected:false,reason:"uncertain"}; }
 }
 export function startWechatInput(opts: WechatInputOptions): ()=>void {
  const inbox=join(opts.runtimeDir,"wechat","receive","inbox"); let busy=false; let timer: ReturnType<typeof setTimeout>|null=null;

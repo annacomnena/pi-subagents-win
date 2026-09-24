@@ -72,7 +72,7 @@
  * **禁** Pi API / extensions/index.ts。
  */
 
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -937,6 +937,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// L4 MF-2（0924）：响应**不得**回显完整 openid（规格 §1：完整 openid 仅出现在
 					// /senders 与 GUI 内存）——改为与 status 同形的 {id, masked} 投影。
 					const cfg = readWechatInputConfig(configPath);
+					if (result.ok) { const n = wechatStore.reevaluateRejected([...cfg.allowFrom, readWechatCreds(wechatCredsPath(wechatRuntimeDir))?.ownerOpenId ?? ""]); if (n) { try { const stateDir = join(wechatRuntimeDir, "state"); mkdirSync(stateDir, { recursive: true }); const auditPath = join(stateDir, "wechat-input-audit.jsonl"); const fd = openSync(auditPath, "a", 0o600); try { appendFileSync(fd, JSON.stringify({ at: new Date().toISOString(), decision: "reevaluated", reason: "sender-now-allowed", count: n }) + "\n"); } finally { closeSync(fd); } try { chmodSync(auditPath, 0o600); } catch {} } catch {} } }
 					respondJson(res, result.ok ? 200 : 500, result.ok
 						? { enabled: cfg.enabled, allowFromCount: cfg.allowFrom.length, allowFrom: cfg.allowFrom.map((id) => ({ id: wechatOpenIdHash(id), masked: maskWechatOpenId(id) })) }
 						: { error: "config-write-failed" });
@@ -984,7 +985,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		}
 		if (p === "/v1/wechat/bind/status" && req.method === "GET") {
 			// 状态投影（pending/scanned/bound/expired/error/idle；token 永不出现，bot id 只报存在性）
-			respondJson(res, 200, wechat.getState());
+			const bindState = wechat.getState();
+			if (bindState.state === "bound") { const owner = readWechatCreds(wechatCredsPath(wechatRuntimeDir))?.ownerOpenId; if (owner) { const n = wechatStore.reevaluateRejected([owner]); if (n) { try { const stateDir = join(wechatRuntimeDir, "state"); mkdirSync(stateDir, { recursive: true }); const auditPath = join(stateDir, "wechat-input-audit.jsonl"); const fd = openSync(auditPath, "a", 0o600); try { appendFileSync(fd, JSON.stringify({ at: new Date().toISOString(), decision: "reevaluated", reason: "owner-now-allowed", count: n }) + "\n"); } finally { closeSync(fd); } try { chmodSync(auditPath, 0o600); } catch {} } catch {} } } }
+			respondJson(res, 200, bindState);
 			return;
 		}
 		if (p === "/v1/wechat/bind/qr-image" && req.method === "GET") {
@@ -1020,7 +1023,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		// MF2（0924 L4 复核）：两个 W1 只读端点在鉴权 + wechat.enabled 闸之后另检
 		// channels.wechat.receive.enabled——false → 403，不谈 stats/readInbox（零副作用）。
 		// 仅拦 GET（非 GET 方法保持既有 405 语义）；绑定面端点行为不变。
-		if ((p === "/v1/wechat/worker/status" || p === "/v1/wechat/inbox") && req.method === "GET" && !readWechatReceiveEnabled(configPath)) {
+		if ((p === "/v1/wechat/worker/status" || p === "/v1/wechat/inbox" || p === "/v1/wechat/quarantine") && req.method === "GET" && !readWechatReceiveEnabled(configPath)) {
 			respondJson(res, 403, WECHAT_RECEIVE_DISABLED_BODY);
 			try { req.destroy(); } catch { /* ignore */ }
 			return;
@@ -1043,6 +1046,14 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			return;
 		}
 		// W1 只读端点：脱敏 inbox 列表（from 前缀脱敏 / text 截断；state=pending 即「尚未注入」）
+		if (p === "/v1/wechat/quarantine" && req.method === "GET") {
+			const n = Number(u.searchParams.get("limit")); const limit = Number.isInteger(n) && n > 0 ? Math.min(n, 200) : 50;
+			let entries: { msgId: string | null; reason: string; at: string }[] = [];
+			try { const raw = readFileSync(join(wechatStore.dir, "quarantine.jsonl"), "utf8"); entries = raw.split("\n").filter(Boolean).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } }).slice(-limit).reverse(); } catch {}
+			const rejected = wechatStore.readInbox(0).filter(x => x.state === "rejected").map(x => ({ msgId: x.msgId.slice(0,8), reason: x.rejectedReason === "write-failed" ? "写入失败（结果不确定，未自动重试）" : x.rejectedReason === "not-allowlisted" ? "白名单外（拒绝）" : "拒绝", at: x.receivedAt }));
+			const visible = [...rejected, ...entries].slice(0, limit);
+			respondJson(res, 200, { count: visible.length, entries: visible }); return;
+		}
 		if (p === "/v1/wechat/inbox" && req.method === "GET") {
 			const qRaw = u.searchParams.get("limit");
 			const qn = qRaw !== null ? Number(qRaw) : NaN;

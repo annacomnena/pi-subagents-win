@@ -87,6 +87,7 @@ export interface WechatCreds {
 	botId?: string;
 	boundAt: string;
 	baseUrl: string;
+	ownerOpenId?: string;
 }
 
 export function wechatCredsPath(runtimeDir: string): string {
@@ -144,6 +145,7 @@ export function readWechatCreds(path: string): WechatCreds | null {
 			...(typeof raw.botId === "string" && raw.botId.length > 0 ? { botId: raw.botId } : {}),
 			boundAt: raw.boundAt,
 			baseUrl: raw.baseUrl,
+			...(typeof raw.ownerOpenId === "string" && raw.ownerOpenId.length > 0 ? { ownerOpenId: raw.ownerOpenId } : {}),
 		};
 	} catch {
 		return null;
@@ -403,6 +405,7 @@ export interface QrStatusParse {
 	botToken: string;
 	/** kind=confirmed 时 ilink_bot_id（别名 bot_id），可选。 */
 	botId?: string;
+	ilinkUserId?: string;
 }
 
 /** 状态映射（源码已验证）：数字 0/1/2 → pending/scanned/confirmed，3,4（及任何其他数字）→ expired
@@ -426,7 +429,8 @@ export function parseQrStatus(payload: Record<string, unknown> | null): QrStatus
 	if (kind !== "confirmed") return { kind, botToken: "" };
 	const botToken = str(p.bot_token) ?? str(p.token) ?? "";
 	const botId = str(p.ilink_bot_id) ?? str(p.bot_id);
-	return { kind, botToken, ...(botId !== undefined ? { botId } : {}) };
+	const ilinkUserId = str(p.ilink_user_id);
+	return { kind, botToken, ...(botId !== undefined ? { botId } : {}), ...(ilinkUserId ? { ilinkUserId } : {}) };
 }
 
 /** 轮询一次状态。null = api_error（HTTP 非 ok / 网络错误，退避继续，不抛——probe 同口径）；
@@ -791,6 +795,7 @@ export class WechatBindManager {
 							const creds: WechatCreds = {
 								botToken: st.botToken,
 								...(st.botId !== undefined ? { botId: st.botId } : {}),
+								...(st.ilinkUserId ? { ownerOpenId: st.ilinkUserId } : {}),
 								boundAt,
 								baseUrl: this.baseUrl,
 							};

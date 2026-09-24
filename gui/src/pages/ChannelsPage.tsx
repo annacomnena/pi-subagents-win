@@ -118,6 +118,8 @@ interface WechatWorkerStatusBody {
 	lastError: string | null;
 }
 
+interface WechatQuarantineBody { count: number; entries: { msgId: string | null; reason: string; at: string }[] }
+
 interface WechatInboxBody {
 	version: number;
 	count: number;
@@ -167,16 +169,19 @@ async function fetchWechatReadonly<T>(path: string): Promise<{ ok: true; data: T
 function ReceiveBlock() {
 	const [worker, setWorker] = useState<WechatWorkerStatusBody | null>(null);
 	const [inbox, setInbox] = useState<WechatInboxBody | null>(null);
+	const [quarantine, setQuarantine] = useState<WechatQuarantineBody | null>(null);
 	const [failed, setFailed] = useState(false);
 
 	const refresh = useCallback(async (): Promise<void> => {
-		const [w, i] = await Promise.all([
+		const [w, i, q] = await Promise.all([
 			fetchWechatReadonly<WechatWorkerStatusBody>("/v1/wechat/worker/status"),
 			fetchWechatReadonly<WechatInboxBody>("/v1/wechat/inbox?limit=20"),
+			fetchWechatReadonly<WechatQuarantineBody>("/v1/wechat/quarantine?limit=10"),
 		]);
 		if (w.ok && i.ok) {
 			setWorker(w.data);
 			setInbox(i.data);
+			if (q.ok) setQuarantine(q.data);
 			setFailed(false);
 		} else {
 			setFailed(true);
@@ -247,6 +252,7 @@ function ReceiveBlock() {
 						))}
 					</ul>
 				)}
+				{quarantine !== null && quarantine.count > 0 && <section className="border-t border-border pt-2"><h4 className="text-xs font-medium">被拒/未处理（{quarantine.count}）</h4><p className="text-[10px]">这些条目没有进入会话；加入白名单或绑定本人后会重新评估，不是永久终态。</p><ul>{quarantine.entries.map((e, i) => <li key={`${e.msgId}-${i}`} className="text-[11px]">{e.reason} · {e.at} · {e.msgId ?? "—"}</li>)}</ul></section>}
 				<p className="text-[10px] leading-relaxed text-foreground-subtlest">
 					W1 只收不投：收到的消息仅持久化在本机私有 inbox 并在此只读展示（发送者 ID 前缀脱敏、正文截断）。
 				</p>
