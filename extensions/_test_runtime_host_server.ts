@@ -69,6 +69,7 @@ import { appendRuntimeEnvelope } from "./runtime/journal.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 import { RUNTIME_SCHEMA_VERSION, verifyChallengeResponse } from "./runtime-host/identity.ts";
 import { listOutboxItems, newOutboxItem, outboxDir, writeOutboxItem } from "./runtime/message-outbox.ts";
+import { newReplyIntent, markReplyIntent, replyIntentDir } from "./runtime/wechat-reply.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, touchSessionHeartbeat } from "./timers.ts";
@@ -156,6 +157,25 @@ try {
 			const set = await fetch(`${base}/v1/autonomy/set`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
 			assert.equal(set.status, 200); assert.equal((await set.json() as { enabled: boolean }).enabled, true);
 			assert.equal(JSON.parse(readFileSync(autonomyConfigPath, "utf8")).autonomy.enabled, true);
+		}
+		// W3d read-only reply projection: authorize → wechat gate → aggregate only safe fields.
+		{
+			const noAuth = await fetch(`${base}/v1/wechat/reply/status`);
+			assert.equal(noAuth.status, 401);
+			const auth = { "X-Command-Token": h.info.token! };
+			const off = await fetch(`${base}/v1/wechat/reply/status`, { headers: auth });
+			assert.equal(off.status, 403);
+			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true, channels: { wechat: { enabled: true, reply: { enabled: false } } } }));
+			const dir = replyIntentDir(join(D, "state"));
+			const first = newReplyIntent(dir, { id: "a".repeat(64), msgId: "private-msg", outboxId: "b".repeat(64), fromId: "private-openid", clientId: "client", text: "private body" });
+			assert.ok(first?.created);
+			markReplyIntent(dir, first!.item.id, { status: "failed", error: "auth: bot_token sentinel" });
+			const res = await fetch(`${base}/v1/wechat/reply/status`, { headers: auth });
+			assert.equal(res.status, 200);
+			const projection = await res.json() as any;
+			assert.deepEqual(projection, { enabled: false, counts: { pending: 0, sent: 0, failed: 1, unknown: 0 }, lastAt: projection.lastAt, lastError: "auth" });
+			assert.ok(!JSON.stringify(projection).includes("private"));
+			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
 		}
 		// T1 无 attachment：master 段全空态
 		{

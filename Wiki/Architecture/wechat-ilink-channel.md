@@ -1,29 +1,39 @@
 ---
 title: 微信 iLink 通道
 kind: concept
-status: proposed
-updated: 2026-09-23
+status: current
+updated: 2026-09-24
 source_paths:
   - scripts/wechat-ilink-probe.mjs
   - plans/0923_wechat_ilink_probe_checklist.md
   - plans/0923_ilink_channel_adapter_plan.md
   - plans/0923_ilink_master_binding_delta.md
+  - extensions/channel-wechat/send.ts
+  - plans/0924_wechat_w3a_calibration.md
 ---
 
 # 微信 iLink 通道
 
 ## Summary
 
-iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地（commit `658306e`），七项协议未知项待真网测量；adapter 与 master 绑定均为方案（`proposed`）。
+iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入与文本出站回复均已实现。协议剩余未知项及校准状态见「Open Questions」与各契约节。
 
 ## Current Contract
 
 - 通道定位：iLink 是 Client Plane 的一端，只做状态呈现与一次审批（D1②、D2）；微信里发"确认"不构成第二因素（D4）。
 - 传输：长轮询（HTTP 超时默认 95000ms，必须 >90s），无公网 webhook。
-- Reply sink 与游标持久化：用持久化的最近入站 `context_token` 回复；`bot_token`/`context_token`/`aes_key` 永不打到 stdout 与 measure 日志，只记存在性与长度。
+- Reply sink：真机入站信封顶层无 `context_token`（已实测，至少 4 条）；回复按 `to_user_id` 直发，不依赖最近入站 context token。凭据与 token 不进入日志/GUI。
 - Token/QR 生命周期："无人开 UI 即失能"——以真网测量为准，失效以首次 401/403 时间戳判定。
 - 进程放置：受监督 worker，不进 daemon 事件循环。
 - 安全约束：仅访问 `https://ilinkai.weixin.qq.com` + allowlist 附件 CDN 主机；`send` 当前仅 text。
+
+## 出站协议契约（真机校准 2026-09-24）
+
+- **请求**：`POST {base}/ilink/bot/sendmessage`；鉴权头同 getupdates（`AuthorizationType: ilink_bot_token`、`Authorization: Bearer <bot_token>`、`X-WECHAT-UIN`，另有 JSON content-type）。出处：`extensions/channel-wechat/send.ts#L110-L113`；`plans/0924_wechat_w3a_calibration.md`。
+- **Body**：`base_info.channel_version="2.0.0"`；`msg` 含 `from_user_id:""`、`to_user_id`、`client_id`、`message_type:2`、`message_state:2`、`item_list:[{type:1,text_item:{text}}]`；**不带 `context_token`**。出处：`extensions/channel-wechat/send.ts#L121-L128`；校准依据：`plans/0924_wechat_w3a_calibration.md`。
+- **真机响应**：HTTP 200 + `{message_id}`；无 `ret`/`errcode`/`errmsg`。`send.ts` 将缺失业务码按 0 处理，因此该响应判为成功。出处：`extensions/channel-wechat/send.ts#L159-L170`；`plans/0924_wechat_w3a_calibration.md`。
+- **client_id 去重：未定论**：相同 ID 两次请求 API 均回 sent；服务端/客户端是否只投递一条，待人工观察微信端收件数。出处：`plans/0924_wechat_w3a_calibration.md`。
+- **未验证**：文本长度上限、429/并发 poll 限流、bot 自发回声行为。出处：`plans/0924_wechat_w3a_calibration.md`。
 
 ## Key Symbols
 
@@ -78,7 +88,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 - WAL 强事务（`batch.accepted` + commit marker 重放）**未做**——用"先落盘后提交游标"的顺序约束替代（不等价）。
 - 多 worker fence（`daemonEpoch`/`workerAttempt` 晚 ACK 拒绝）**未强制**；supervisor 维持**单 worker**（`existsSync → 原子写` 在多 worker 下有竞态，不得声称多 worker 安全）。
 - Windows **Job Object 整树回收**未做（用显式 kill + pid 文件 + 看门狗替代）。
-- 附件/媒体/解密/Artifact Plane、ReplySink/出站/typing/限流聚合（W3）未做。
+- W3 出站回复已实现（W3a 协议发送、W3b 意图触发、W3c daemon 发送/审计、W3d 只读状态投影）；typing、限流聚合、附件/媒体/解密/Artifact Plane 仍未做。
 - 真网 7 项未测（见本页 Open Questions）。
 
 ## W2 准入：微信文本注入 master（决策 D15，**用户 2026-09-24 明确批准**）
@@ -201,5 +211,5 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 ## Open Questions
 
-- 真网待测（7 项，已测 1 项）：①bot_token 何时失效（**未测**）②context_token 过期行为（**未测**；真机消息形状未确认，该字段是否存在未知）③同 buf 是否重放（**未测**）④空批是否推进 buf —— **已测：会带新游标，可推进**（见上节）⑤固定 client_id 重发是否去重（**未测**）⑥同 token 并发 poll+send 是否限流（**未测**；注意同一 bot **只能一个长轮询**，多消费者会互相抢消息）⑦附件 URL 主机/大小限制（**未测**）。
-- **真机消息条目形状仍未确认**（`msgs[]` 内每条结构）——已加脱敏形状签名机制：收到首条真实消息后从 quarantine 的 `shape=` 或 inbox 记录对齐，再回填本页。
+- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放未测；④空批推进游标已测；⑤相同 `client_id` 的服务端去重未定论（API 双发均成功，手机端条数待人工观察）；⑥并发 poll+send 限流/429 未测；⑦附件 URL 主机/大小限制未测。另：出站文本长度上限与 bot 回声行为未验证。
+- 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。

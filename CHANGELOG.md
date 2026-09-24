@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (微信出站回复 W3d)
+
+- **微信出站回复只读状态**：新增 `GET /v1/wechat/reply/status`，鉴权后受 `wechat.enabled` 闸保护，投影回复意图计数/最近时间/安全错误摘要；GUI Channels 页新增始终可见的只读卡（401/403 也可见），关闭开关引导 TUI `/wechat reply off`，GUI 不提供写操作。
+- **文档收尾**：README 记录回复开关、意图目录和脱敏审计文件；Wiki 补真机校准出站协议契约与未验证项；Recent Work 追加 Item 36。
+- **真机校准**：sendmessage 返回 HTTP 200 + `{message_id}`，无 `ret`/`errcode`/`errmsg`；`client_id` 去重尚未定论，长度上限/429/回声未验证。
+
 ## [Unreleased] — 2026-09-24 (hotspot v4: ephemeral working set)
 
 - **热点层 v4 重做（`8a9f09a`）**：Hotspot 从「Wiki 路由缓存（主题 → Wiki 切片/符号/证据，`hotspot` 工具 read/upsert/remove 托管 `Wiki/_hotspot.md`）」整体重做为「短期工作集 projection（task/workstream → 最近读/写/测试文件）」。定位：cache 不是 memory——可丢失/可重建/非权威/短 TTL（半衰 12h、soft 48h、hard 72h）/非阻塞（全静默失败，丢失不影响编码/Master/Timeline/Wiki）。

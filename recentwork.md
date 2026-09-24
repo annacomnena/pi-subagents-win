@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
 | 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
 | 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
 | 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
@@ -44,6 +45,16 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 36 - 微信出站回复 W3a–W3d
+
+- **日期**：2026-09-24
+- **一句话**：微信入站触发的 assistant 最终文本经 daemon 意图 watcher 发回发送者；提供受鉴权/通道开关闸保护的只读状态投影和 GUI 卡片，GUI 不写开关。
+- **涉及模块**：`extensions/channel-wechat/send.ts`、`extensions/runtime/wechat-reply.ts`、`extensions/runtime-host/wechat-reply.ts`、`extensions/runtime-host/server.ts`、`gui/src/pages/ChannelsPage.tsx`、`gui/src/api/types.ts`
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`a282848` / `d4b3ebf` / `b9b6726` / `<W3d commit 由主会话补>`
+- **Verification**：按 W3d 实跑记录执行回归；真机校准确认 HTTP 200 + `{message_id}`、无 `ret`/`errcode`/`errmsg`；client_id 去重未定论，文本长度上限/429/回声未验证；本轮未发送真机消息。
 
 ### Item 35 - 热点层 v4 重做（短期工作集 projection）
 

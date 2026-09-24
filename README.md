@@ -414,7 +414,7 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
-- **Web Console (dev form)** — `gui/` + `npm run gui:dev` (vite dev server proxying `/v1` to the runtime-host). Opt-in auto-start: `/gui on` (writes `config.json: "gui": {"autoStart": true}` + starts host/vite detached if not already running) · `/gui off` · `/gui status` · `/gui open` (opens `http://localhost:5173` in your browser). `vite` is a **development server** — static `dist` hosting is a later milestone.
+- **Web Console (dev form)** — `gui/` + `npm run gui:dev` (vite dev server proxying `/v1` to the runtime-host). Opt-in auto-start: `/gui on` (writes `config.json: "gui": {"autoStart": true}` + starts host/vite detached if not already running) · `/gui off` · `/gui status` · `/gui open` (opens `http://localhost:5173` in your browser). 微信回复状态为只读展示；关闭请在 TUI 执行 `/wechat reply off`（GUI 不写此开关）。`vite` 是**开发服务器**——静态 `dist` 托管后续再做。
 - **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/sub-presets` (save/load named subagent-model snapshots across 5 slots, e.g. night-time cheap models or local-only fallback), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/runs`, `/tabs`, `/timers`, `/links`, `/agents`.
 
 ---
@@ -451,6 +451,8 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `trace-fusion-runs/<runId>/` | trace-fusion run artifacts (meta, lanes/{A,B,C}, collect, cross-test, logs) |
 | `trust.json` | pre-granted trusted paths (e.g. worktree root for implement mode) |
 | `hotspot/<wsid>/` | v4 ephemeral working set: `events/*.jsonl` shards, `snapshot.json`, `log.jsonl` (see §9.5) |
+| `state/wechat-reply/<id>.json` | 微信出站回复意图及终态（pending/sent/failed/unknown；包含私有正文，仅本机状态目录） |
+| `state/wechat-reply-audit.jsonl` | 微信回复脱敏审计（无正文/token/完整 openid）；开关 `/wechat reply on|off`，GUI 仅只读计数 |
 
 ### Environment variables
 

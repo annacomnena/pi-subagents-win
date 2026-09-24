@@ -139,6 +139,7 @@ import {
 	readWechatCreds,
 	readWechatEnabled,
 	readWechatReceiveEnabled,
+	readWechatReplyConfig,
 	setWechatEnabled,
 	setWechatInputConfig,
 	readWechatInputConfig,
@@ -154,6 +155,7 @@ import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/col
 import { readKillSwitch } from "../runtime/autonomy/kill-switch.ts";
 import { startWechatInput } from "./wechat-input.ts";
 import { startWechatReplyWatcher } from "./wechat-reply.ts";
+import { listReplyIntents, replyIntentDir } from "../runtime/wechat-reply.ts";
 import { readAttachment } from "../runtime/registry.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
@@ -888,6 +890,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		error: "wechat-receive-disabled",
 		hint: "微信消息接收未启用：设 config.json channels.wechat.receive.enabled=true（缺省 false，零行为变化）",
 	};
+	const safeReplyError = (value: string | undefined): string | null => {
+		if (!value) return null;
+		// Only expose a short classifier summary; never return arbitrary persisted data.
+		const kind = /^(auth|rate_limited|protocol|transient|attempts-exhausted|send-result-unknown)/.exec(value)?.[1];
+		return kind ? kind : "send-error";
+	};
 	const drainWechatBody = (req: IncomingMessage): void => {
 		let size = 0;
 		req.on("data", (c: Buffer) => {
@@ -905,6 +913,20 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			return;
 		}
 		const p = u.pathname;
+		// W3d: read-only reply projection; authorize first, then the shared wechat opt-in gate.
+		if (p === "/v1/wechat/reply/status" && req.method === "GET") {
+			if (!readWechatEnabled(configPath)) { respondJson(res, 403, WECHAT_DISABLED_BODY); return; }
+			const items = listReplyIntents(replyIntentDir(outboxStateDirFor(opts)));
+			const counts = { pending: 0, sent: 0, failed: 0, unknown: 0 };
+			for (const item of items) counts[item.status]++;
+			let audits: { at?: string; event?: string; reason?: string; error?: string }[] = [];
+			try { audits = readFileSync(join(outboxStateDirFor(opts), "wechat-reply-audit.jsonl"), "utf8").split("\\n").filter(Boolean).slice(-500).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } }); } catch {}
+			const auditTimes = audits.map((a) => a.at).filter((at): at is string => typeof at === "string");
+			const lastAt = [...items.map((item) => item.updatedAt), ...auditTimes].sort().at(-1) ?? null;
+			const failed = [...items.filter((item) => item.error && item.status !== "sent").map((item) => ({ at: item.updatedAt, message: safeReplyError(item.error) })), ...audits.filter((a) => a.event === "failed" || a.event === "unknown" || (a.event === "skipped" && a.reason === "no-credentials")).map((a) => ({ at: a.at ?? "", message: safeReplyError(a.error) ?? (a.reason === "no-credentials" ? "no-credentials" : null) }))].filter((x) => x.message).sort((a, b) => b.at.localeCompare(a.at))[0];
+			respondJson(res, 200, { enabled: readWechatReplyConfig(configPath).enabled, counts, lastAt, lastError: failed?.message ?? null });
+			return;
+		}
 		// L3 UX 修复：enable/disable 置于 opt-in 闸**之前**（否则未启用时无法启用 = 鸡生蛋）。
 		// 写 config channels.wechat.enabled（read-modify-write 保留其余字段 + tmp+rename 原子写）；
 		// 幂等（同值重写）；回执 {enabled} = 写后当前态；写盘失败 → 500 如实报错，不谎称成功。

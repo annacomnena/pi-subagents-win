@@ -482,6 +482,14 @@ export interface WechatUnbindBody extends WechatBindStatusBody {
 	removed: boolean;
 }
 
+/** GET /v1/wechat/reply/status（只读投影；不含正文/token/完整 openid）。 */
+export interface WechatReplyStatusBody {
+	enabled: boolean;
+	counts: { pending: number; sent: number; failed: number; unknown: number };
+	lastAt: string | null;
+	lastError: string | null;
+}
+
 /** POST /v1/wechat/enable | disable（写 config channels.wechat.enabled；回执 = 写后当前 enabled，幂等；
  *  写盘失败 → 500 {error:"config-write-failed", message, enabled=写前读值}——如实报错不谎称成功）。 */
 export interface WechatToggleBody {

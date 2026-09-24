@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, type FetchErr } from "../api/client";
-import type { WechatBindStatusBody, WechatQrImageBody } from "../api/types";
+import type { WechatBindStatusBody, WechatQrImageBody, WechatReplyStatusBody } from "../api/types";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
 
 type UiState = "loading" | "idle" | "waiting" | "scanned" | "bound" | "expired" | "error";
@@ -132,6 +132,24 @@ interface WechatInboxBody {
 		state: "pending" | "injected" | "rejected";
 		artifactPending?: boolean;
 	}[];
+}
+
+function ReplyBlock() {
+	const [data, setData] = useState<WechatReplyStatusBody | null>(null);
+	const [httpStatus, setHttpStatus] = useState<number | null>(null);
+	const refresh = useCallback(async () => {
+		const r = await fetchWechatReadonly<WechatReplyStatusBody>("/v1/wechat/reply/status");
+		if (r.ok) { setData(r.data); setHttpStatus(null); } else setHttpStatus(r.status);
+	}, []);
+	useEffect(() => { void refresh(); const t = window.setInterval(() => void refresh(), 5000); return () => window.clearInterval(t); }, [refresh]);
+	return <Card title={<Term zh="回复微信（只读）" en="reply status" hint="意图状态计数；不展示消息正文、token 或完整 openid" />}>
+		<div className="space-y-2 text-xs">
+			<p>回复开关：{data ? (data.enabled ? "开启" : "关闭") : httpStatus === 403 ? "微信通道未启用" : httpStatus === 401 ? "未授权" : "暂不可用"}</p>
+			<p>意图：待处理 {data?.counts.pending ?? "—"} · 已发送 {data?.counts.sent ?? "—"} · 失败 {data?.counts.failed ?? "—"} · 未知 {data?.counts.unknown ?? "—"}</p>
+			<p>最近更新：<RelTime at={data?.lastAt ?? null} />{data?.lastError ? ` · 最近错误：${data.lastError}` : ""}</p>
+			<p className="text-foreground-subtle">只读状态；如需关闭，请在本机 TUI 执行 <code>/wechat reply off</code>。</p>
+		</div>
+	</Card>;
 }
 
 const WORKER_STATUS_LABEL: Record<WechatWorkerStatusBody["status"], string> = {
@@ -418,8 +436,9 @@ export function ChannelsPage() {
 	if (disabled) {
 		return (
 			<div className="space-y-3">
-				{/* L4 must-fix 1：autonomy 开关必须在**所有分支**可达（D17）——否则默认配置下走早退分支，开关形同虚设 */}
+				{/* D17：只读回复状态卡在所有配置/授权分支都可见。 */}
 				<AutonomySettings />
+				<ReplyBlock />
 				<PageIntro>微信连接</PageIntro>
 				<Card
 					title={
@@ -451,8 +470,9 @@ export function ChannelsPage() {
 	if (unauthorized) {
 		return (
 			<div className="space-y-3">
-				{/* L4 must-fix 1：同上——未授权分支也必须能到达 autonomy 开关（卡片自身会显示获取失败） */}
+				{/* D17：只读回复状态卡在所有配置/授权分支都可见。 */}
 				<AutonomySettings />
+				<ReplyBlock />
 				<PageIntro>微信连接</PageIntro>
 				<Card title={<Term zh="未获得本机凭据" en="401 unauthorized" />}>
 					<div className="space-y-3">
@@ -474,7 +494,8 @@ export function ChannelsPage() {
 	return (
 		<div className="space-y-3">
 			<AutonomySettings />
-			<PageIntro>扫码绑定微信（v1 只做绑定/解绑/状态；消息收发是后续切片）</PageIntro>
+			<ReplyBlock />
+			<PageIntro>微信连接与消息回复状态</PageIntro>
 
 			<Card
 				title={<Term zh="绑定状态" en="status" hint="状态由 daemon 的 /v1/wechat/bind/status 提供；token 永不进浏览器" />}
