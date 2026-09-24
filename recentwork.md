@@ -53,7 +53,7 @@
 - **涉及模块**：`extensions/channel-wechat/send.ts`、`extensions/runtime/wechat-reply.ts`、`extensions/runtime-host/wechat-reply.ts`、`extensions/runtime-host/server.ts`、`gui/src/pages/ChannelsPage.tsx`、`gui/src/api/types.ts`
 - **Priority**：P1
 - **Status**：done
-- **Commit**：`a282848` / `d4b3ebf` / `b9b6726` / `<W3d commit 由主会话补>`
+- **Commit**：`a282848`（W3a 协议底座） / `d4b3ebf`（W3b 触发与意图） / `b9b6726`（W3c daemon 发送与审计） / `aab6bf6`（W3d 只读端点 + GUI + Wiki/文档）
 - **Verification**：按 W3d 实跑记录执行回归；真机校准确认 HTTP 200 + `{message_id}`、无 `ret`/`errcode`/`errmsg`；client_id 去重未定论，文本长度上限/429/回声未验证；本轮未发送真机消息。
 
 ### Item 35 - 热点层 v4 重做（短期工作集 projection）

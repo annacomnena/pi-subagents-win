@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2026-09-24 (微信出站回复 W3d)
+## [Unreleased] — 2026-09-24 (微信出站回复 W3a–W3d：`a282848`/`d4b3ebf`/`b9b6726`/`aab6bf6`)
 
 - **微信出站回复只读状态**：新增 `GET /v1/wechat/reply/status`，鉴权后受 `wechat.enabled` 闸保护，投影回复意图计数/最近时间/安全错误摘要；GUI Channels 页新增始终可见的只读卡（401/403 也可见），关闭开关引导 TUI `/wechat reply off`，GUI 不提供写操作。
 - **文档收尾**：README 记录回复开关、意图目录和脱敏审计文件；Wiki 补真机校准出站协议契约与未验证项；Recent Work 追加 Item 36。
