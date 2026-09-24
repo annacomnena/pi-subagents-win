@@ -31,7 +31,6 @@ export interface CollectGraphOptions {
 	stateDir?: string;
 	/** tab-runs 账本目录；缺省 env `PI_TAB_RUNS_DIR`（测试隔离）否则 ~/.pi/agent/tab-runs。 */
 	tabRunsDir?: string;
-	now?: number;
 }
 
 const EMPTY_INPUT: GraphInput = { journal: [], workstreams: [], tasks: [] };

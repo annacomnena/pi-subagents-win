@@ -57,7 +57,8 @@ interface TerminalPayload {
 interface PendingTerminal {
 	subject: string;
 	type: string;
-	payloadStatus: string | null;
+	/** 终态状态：由事件 type 派生（与 projector.ts::applyTerminal 的 `payloadStatus` 参数同义，**非** envelope.payload.status）。 */
+	derivedStatus: string | null;
 }
 
 function asStr(v: unknown): string | null {
@@ -88,15 +89,19 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 	const unknownTypes = new Set<string>();
 	let headSeq = input.headSeq ?? 0;
 
-	const applyTerminal = (subject: string, seq: number, type: string, payloadStatus: string | null, payload: TerminalPayload): void => {
+	const applyTerminal = (subject: string, seq: number, type: string, derivedStatus: string | null, payload: TerminalPayload): void => {
 		const existing = runs.get(subject);
 		if (!existing) {
 			// 孤立终态：等 dispatched 配对（projector 同语义；Graph 不为孤立终态发明 run 节点）
-			pending.set(subject, { subject, type, payloadStatus });
+			pending.set(subject, { subject, type, derivedStatus });
 			return;
 		}
 		if (isTerminalStatus(existing.status)) return; // terminal 优先不回退
-		const status = payloadStatus as RuntimeRunStatus | null;
+		// 终态恒由事件 type 派生（run.launch_failed 已在调用侧显式映射为 failed）。
+		// 对齐 projector.ts：其 `payloadStatus` 是**函数参数**（仅 launch_failed 传 "failed"），并非 envelope.payload.status；
+		// 两投影都不读 payload.status。此处保持 type 派生——若改为 `payload.status ?? type 派生`，病态事件（type 与
+		// payload.status 矛盾）反而会制造 Graph ≠ projector 分歧（E2 影子 diff 假分歧源）。
+		const status = derivedStatus as RuntimeRunStatus | null;
 		if (!status || !isTerminalStatus(status)) return;
 		existing.status = status;
 		existing.externalTaskId = existing.externalTaskId ?? asStr(payload.externalTaskId);
@@ -136,7 +141,7 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 			const pend = pending.get(subject);
 			if (pend) {
 				pending.delete(subject);
-				applyTerminal(subject, entry.seq, pend.type, pend.payloadStatus, {});
+				applyTerminal(subject, entry.seq, pend.type, pend.derivedStatus, {});
 			}
 			continue;
 		}

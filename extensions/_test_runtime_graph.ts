@@ -207,7 +207,10 @@ try {
 		assert.equal(normalizeRepoKey("C:\\Repo\\Sub\\"), "c:/repo/sub");
 		assert.ok(isPathShapedRef("C:\\repo"));
 		assert.ok(isPathShapedRef("/home/x"));
+		assert.ok(isPathShapedRef("a/b")); // 含 `/` 的非绝对路径字符串也判为路径形（弱载体 best-effort，L4 遗漏 ⑤）
+		assert.ok(isPathShapedRef("foo\\bar"));
 		assert.ok(!isPathShapedRef("agent://x"));
+		assert.ok(!isPathShapedRef("agent://x/y")); // scheme:// 逻辑地址即使含 `/` 也不算路径
 		assert.ok(!isPathShapedRef(""));
 		assert.ok(!isPathShapedRef(undefined));
 	});
@@ -286,6 +289,23 @@ try {
 			}
 			assert.deepEqual(replayEquivalenceDiff(p), []);
 
+			// 病态事件（type 与 payload.status 矛盾）：Graph 与 projector 同口径——均取 type 派生，都不读 payload.status。
+			// 固化该等价性：E2 影子 diff 不会在病态事件上产生 Graph≠projector 假分歧。
+			const badSubject = tabRunAddress("tab_r_bad");
+			const badDispatch = dispatchEnv("tab_r_bad", 1);
+			const badTerminal = newEventEnvelope({
+				type: "run.completed",
+				source: masterAddress(),
+				subject: badSubject,
+				at: iso(2),
+				dedupeKey: `run.completed:${badSubject}`,
+				payload: { tabRunId: "tab_r_bad", status: "failed" },
+			});
+			const badGraphStatus = projectGraph({ journal: entriesOf([badDispatch, badTerminal]), workstreams: [], tasks: [] }).nodes.find((n) => n.kind === "run")!.status;
+			const badProjectorStatus = [...rebuildFromEnvelopes([badDispatch, badTerminal]).state.runs.values()][0].status;
+			assert.equal(badGraphStatus, "completed");
+			assert.equal(badGraphStatus, badProjectorStatus);
+
 			// collect IO 装配：journal + 显式库
 			const stateDir = join(dir, "state");
 			mkdirSync(stateDir, { recursive: true });
@@ -293,7 +313,30 @@ try {
 			const ci = collectGraphInput({ journalPath: p, stateDir, tabRunsDir: emptyTabs });
 			assert.equal(ci.headSeq, scan.head);
 			assert.equal(projectGraph(ci).nodes.find((n) => n.kind === "run")!.status, "completed");
-			assert.deepEqual(readGraphSnapshot({ journalPath: p, tabRunsDir: emptyTabs }), projectGraph(collectGraphInput({ journalPath: p, tabRunsDir: emptyTabs })));
+			// 手构期望快照（替换原恒等断言 readGraphSnapshot ≡ projectGraph∘collectGraphInput）：显式固化 collect→project 完整装配结果
+			const expectedSnapshot = {
+				version: 1,
+				headSeq: 2,
+				logEpoch: scan.logEpoch,
+				nodes: [
+					{ id: "master_default", kind: "master", label: "master_default", status: null, attrs: {}, firstSeq: 0, lastSeq: 0 },
+					{
+						id: tabRunAddress("tab_r"),
+						kind: "run",
+						label: tabRunAddress("tab_r"),
+						status: "completed",
+						attrs: { executionKind: "tab", externalTaskId: "9001", mode: "workflow", title: "t-tab_r", phase: null, project: null },
+						firstSeq: 1,
+						lastSeq: 2,
+					},
+				],
+				edges: [
+					{ kind: "run_subject", from: tabRunAddress("tab_r"), to: tabRunAddress("tab_r"), evidence: `envelope.subject=${tabRunAddress("tab_r")} (envelope.ts#L36)` },
+				],
+				projects: [],
+				skipped: { badLines: 0, unknownEventTypes: [] },
+			};
+			assert.deepEqual(readGraphSnapshot({ journalPath: p, stateDir, tabRunsDir: emptyTabs }), expectedSnapshot);
 
 			// collect 的 tab-runs 只读引用：phase 原样引用 + repoRoot 归一化
 			const repoDir = join(dir, "repo");
