@@ -2,7 +2,15 @@ import { appendFileSync, chmodSync, closeSync, mkdirSync, openSync, watch, type 
 import { join } from "node:path";
 import { listReplyIntents, incrementReplyAttempts, markReplyIntent, replyIntentDir } from "../runtime/wechat-reply.ts";
 import { sendMessage } from "../channel-wechat/send.ts";
+import { WechatStore } from "../channel-wechat/store.ts";
 import { readWechatCreds, readWechatReplyConfig, wechatCredsPath, readWechatConfigPath, maskWechatOpenId, type WechatFetch } from "./wechat-bind.ts";
+
+/**
+ * 广播意图 TTL（计划 §5，用户裁定④：10min 常量，不配置化）：createdAt 超过仍 pending →
+ * mark failed(broadcast-expired)，**先于 connected 门**判定——防通道长断恢复后陈旧回复倾泻。
+ * reply intent 不受 TTL 影响（旧行为红线）。
+ */
+export const BROADCAST_INTENT_TTL_MS = 10 * 60_000;
 
 export interface WechatReplyWatcherOptions {
  runtimeDir: string; stateDir?: string; configPath?: string; fetchImpl?: WechatFetch; intervalMs?: number;
@@ -22,6 +30,9 @@ export function startWechatReplyWatcher(opts: WechatReplyWatcherOptions): () => 
   if (busy || stopped) return; busy = true;
   try {
    if (!readConfig(configPath).enabled) return; // disabled: no consume, preserve pending
+   // 接收 worker 在线状态（每轮 run 新建实例读——readState 实例内缓存，复用会陈旧；recon⑥/计划 §5）。
+   // 懒读：仅当本轮遇到 pending broadcast intent 时读一次；reply-only 路径零额外 IO。
+   let receiveStatus: string | null = null;
    for (const item of listReplyIntents(intentDir)) {
     if (stopped) break;
     if (item.status !== "pending") continue;
@@ -31,6 +42,19 @@ export function startWechatReplyWatcher(opts: WechatReplyWatcherOptions): () => 
      if (updated) audit(stateDir, { ...base, event: "unknown", reason: "attempts-exhausted" });
      continue;
     }
+    if (item.kind === "broadcast") {
+     // ① TTL（先于 connected 门）：过期即终态 failed，不发。
+     const age = Date.now() - Date.parse(item.createdAt);
+     if (Number.isFinite(age) && age > BROADCAST_INTENT_TTL_MS) {
+      if (markReplyIntent(intentDir, item.id, { status: "failed", error: "broadcast-expired" })) audit(stateDir, { ...base, kind: "broadcast", event: "failed", reason: "broadcast-expired" });
+      continue;
+    }
+     // ② connected 门（用户裁定④：status==="connected" 才出站）；非 connected 保留 pending
+     //    排队顺延（下个 tick 状态转 connected 即续发），不 mark failed、不丢。
+     if (receiveStatus === null) { try { receiveStatus = new WechatStore(WechatStore.resolveDir(opts.runtimeDir)).readState().status; } catch { receiveStatus = "disconnected"; } }
+     if (receiveStatus !== "connected") { audit(stateDir, { ...base, kind: "broadcast", event: "skipped", reason: "channel-not-connected" }); continue; }
+    }
+    // reply intent（kind 缺省）不加 connected 门/TTL——旧行为红线，S5 原断言不动。
     const creds = readWechatCreds(wechatCredsPath(opts.runtimeDir));
     if (!creds) { audit(stateDir, { ...base, event: "skipped", reason: "no-credentials" }); continue; }
     // Persist the attempt before any network request: a crash thereafter is conservatively unknown.

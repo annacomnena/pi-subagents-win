@@ -340,6 +340,23 @@ export class WechatStore {
 		return Number.isInteger(limit) && limit > 0 ? out.slice(0, limit) : out;
 	}
 
+	/**
+	 * 已知 chat 集合（0924 广播收件人，计划 §1.2）：readInbox(0) 全量 → 过滤空 fromId 与
+	 * `@im.bot` 防环域 → fromId 去重取首见（readInbox 已按 receivedAt 降序 ⇒ 首见 = 最近
+	 * 一次入站优先的稳定顺序）。群消息天然不在（parser 已 quarantine，recon④）。
+	 * 纯 additive、never-throw；不引入跨轮缓存（调用方每轮现算，intent 文件冻结轮内快照）。
+	 */
+	knownChats(): { fromId: string; lastAt: string }[] {
+		const seen = new Set<string>();
+		const out: { fromId: string; lastAt: string }[] = [];
+		for (const rec of this.readInbox(0)) {
+			if (!rec.fromId || rec.fromId.endsWith("@im.bot") || seen.has(rec.fromId)) continue;
+			seen.add(rec.fromId);
+			out.push({ fromId: rec.fromId, lastAt: rec.receivedAt });
+		}
+		return out;
+	}
+
 	/** Re-evaluate rejected inbox records only for explicitly allowed senders. Atomic, idempotent. */
 	reevaluateRejected(allowedSenders: string[]): number {
 		const allowed = new Set(allowedSenders.filter(Boolean));

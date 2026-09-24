@@ -237,14 +237,52 @@ export function readWechatInputConfig(configPath: string): WechatInputConfig {
 	}
 }
 
-export function readWechatReplyConfig(configPath: string): { enabled: boolean } {
+export type WechatReplyMode = "reply-only" | "broadcast";
+export type WechatReplySessionScope = "owner" | "main" | "any";
+
+/** 非法 reply 配置值一次性 warn（同一键只告警一次；fail-closed 回退值由调用方给定）。 */
+const warnedReplyConfigKeys = new Set<string>();
+function replyConfigFallback(key: string, value: unknown, fallback: string): string {
+	if (!warnedReplyConfigKeys.has(key)) {
+		warnedReplyConfigKeys.add(key);
+		console.warn(`wechat reply 配置非法 ${key}=${JSON.stringify(value)} → fail-closed 到 "${fallback}"`);
+	}
+	return fallback;
+}
+
+/**
+ * reply 配置（0924 广播扩展）：
+ *   - enabled：语义不变（≠false ⇒ 缺省 true，坏文件也 true）——向后兼容红线，表达式逐字不动。
+ *   - mode：缺失 → "broadcast"（用户裁定②）；"reply-only"/"broadcast" 原样；其它非法值 →
+ *     fail-closed 到 "reply-only"（保守路径）+ 一次性 warn（计划 §2、验收 B9）。
+ *   - sessionScope：缺失 → "owner"（用户裁定①：只有 global master 会话广播）；合法值
+ *     owner|main|any；非法 → fail-closed 到 "owner"。
+ */
+export function readWechatReplyConfig(configPath: string): { enabled: boolean; mode: WechatReplyMode; sessionScope: WechatReplySessionScope } {
 	try {
-		const raw = JSON.parse(readFileSync(configPath, "utf8")) as { channels?: { wechat?: { reply?: { enabled?: unknown } } } };
-		return { enabled: raw?.channels?.wechat?.reply?.enabled !== false };
-	} catch { return { enabled: true }; }
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as { channels?: { wechat?: { reply?: { enabled?: unknown; mode?: unknown; sessionScope?: unknown } } } };
+		const reply = raw?.channels?.wechat?.reply;
+		const enabled = raw?.channels?.wechat?.reply?.enabled !== false;
+		const mode: WechatReplyMode = reply?.mode === undefined || reply?.mode === null ? "broadcast"
+			: reply.mode === "broadcast" || reply.mode === "reply-only" ? (reply.mode as WechatReplyMode)
+			: (replyConfigFallback("mode", reply.mode, "reply-only") as WechatReplyMode);
+		const sessionScope: WechatReplySessionScope = reply?.sessionScope === undefined || reply?.sessionScope === null ? "owner"
+			: reply.sessionScope === "owner" || reply.sessionScope === "main" || reply.sessionScope === "any" ? (reply.sessionScope as WechatReplySessionScope)
+			: (replyConfigFallback("sessionScope", reply.sessionScope, "owner") as WechatReplySessionScope);
+		return { enabled, mode, sessionScope };
+	} catch { return { enabled: true, mode: "broadcast", sessionScope: "owner" }; }
 }
 
 export function setWechatReplyConfig(enabled: boolean, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {
+	return writeWechatReplyPatch((reply) => { reply.enabled = enabled; }, path);
+}
+
+/** 写 `channels.wechat.reply.mode`（/wechat reply mode broadcast|reply-only）；read-modify-write 保留其余字段（含 enabled/sessionScope），原子写同 setWechatReplyConfig。 */
+export function setWechatReplyMode(mode: WechatReplyMode, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {
+	return writeWechatReplyPatch((reply) => { reply.mode = mode; }, path);
+}
+
+function writeWechatReplyPatch(patch: (reply: Record<string, unknown>) => void, path: string): { ok: boolean; error?: string } {
 	let raw: Record<string, unknown>;
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -254,7 +292,7 @@ export function setWechatReplyConfig(enabled: boolean, path: string = readWechat
 	const channels = (raw.channels && typeof raw.channels === "object" && !Array.isArray(raw.channels) ? raw.channels : {}) as Record<string, unknown>;
 	const wechat = (channels.wechat && typeof channels.wechat === "object" && !Array.isArray(channels.wechat) ? channels.wechat : {}) as Record<string, unknown>;
 	const reply = (wechat.reply && typeof wechat.reply === "object" && !Array.isArray(wechat.reply) ? wechat.reply : {}) as Record<string, unknown>;
-	reply.enabled = enabled; wechat.reply = reply; channels.wechat = wechat; raw.channels = channels;
+	patch(reply); wechat.reply = reply; channels.wechat = wechat; raw.channels = channels;
 	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
 	try { writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n"); for (let n = 0;; n++) { try { renameSync(tmp, path); return { ok: true }; } catch (e) { if ((e as NodeJS.ErrnoException).code === "EPERM" && n < 3) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); continue; } throw e; } } }
 	catch (e) { try { unlinkSync(tmp); } catch {} return { ok: false, error: `config write failed: ${cfgErrMsg(e)}` }; }

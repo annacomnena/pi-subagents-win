@@ -42,7 +42,7 @@ import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtim
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
-import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, readWechatReplyConfig, setWechatReplyConfig, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
+import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, readWechatReplyConfig, setWechatReplyConfig, setWechatReplyMode, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
 import { defaultRuntimeDir } from "./runtime/journal.ts";
 import { WechatStore } from "./channel-wechat/store.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
@@ -2045,12 +2045,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.registerCommand("wechat", {
-		description: "微信通道开关与状态：/wechat on|off|status|reply on|off",
+		description: "微信通道开关与状态：/wechat on|off|status|reply on|off|reply mode broadcast|reply-only",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase() || "status";
 			if (sub.startsWith("reply ")) {
 				const value = sub.slice(6).trim();
-				if (value !== "on" && value !== "off") { ctx.ui.notify("用法：/wechat reply on|off", "warning"); return; }
+				if (value.startsWith("mode ")) {
+					const mode = value.slice(5).trim();
+					if (mode !== "broadcast" && mode !== "reply-only") { ctx.ui.notify("用法：/wechat reply mode broadcast|reply-only", "warning"); return; }
+					if (isSubagent()) { ctx.ui.notify("wechat: 子 agent 会话不可切换通道", "warning"); return; }
+					const modeResult = setWechatReplyMode(mode, readWechatConfigPath());
+					ctx.ui.notify(modeResult.ok ? `wechat reply.mode=${mode}` : `wechat reply config write failed: ${modeResult.error}`, modeResult.ok ? "info" : "warning");
+					return;
+				}
+				if (value !== "on" && value !== "off") { ctx.ui.notify("用法：/wechat reply on|off | /wechat reply mode broadcast|reply-only", "warning"); return; }
 				if (isSubagent()) { ctx.ui.notify("wechat: 子 agent 会话不可切换通道", "warning"); return; }
 				const result = setWechatReplyConfig(value === "on", readWechatConfigPath());
 				ctx.ui.notify(result.ok ? `wechat reply.enabled=${value}` : `wechat reply config write failed: ${result.error}`, result.ok ? "info" : "warning");
@@ -2063,7 +2071,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(result.ok ? `wechat enabled=${sub}` : `wechat config write failed: ${result.error}`, result.ok ? "info" : "warning");
 				return;
 			}
-			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status|reply on|off", "warning"); return; }
+			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status|reply on|off|reply mode broadcast|reply-only", "warning"); return; }
 			const configPath = readWechatConfigPath();
 			let worker = "(状态不可读)";
 			try {
@@ -2072,7 +2080,8 @@ export default function (pi: ExtensionAPI) {
 			} catch { /* tolerant status */ }
 			const creds = readWechatCreds(wechatCredsPath(defaultRuntimeDir()));
 			const botId = creds?.botId;
-			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `reply.enabled=${readWechatReplyConfig(configPath).enabled}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
+			const replyCfg = readWechatReplyConfig(configPath);
+			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `reply.enabled=${replyCfg.enabled} mode=${replyCfg.mode} scope=${replyCfg.sessionScope}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。

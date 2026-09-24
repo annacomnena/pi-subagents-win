@@ -924,7 +924,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			const auditTimes = audits.map((a) => a.at).filter((at): at is string => typeof at === "string");
 			const lastAt = [...items.map((item) => item.updatedAt), ...auditTimes].sort().at(-1) ?? null;
 			const failed = [...items.filter((item) => item.error && item.status !== "sent").map((item) => ({ at: item.updatedAt, message: safeReplyError(item.error) })), ...audits.filter((a) => a.event === "failed" || a.event === "unknown" || (a.event === "skipped" && a.reason === "no-credentials")).map((a) => ({ at: a.at ?? "", message: safeReplyError(a.error) ?? (a.reason === "no-credentials" ? "no-credentials" : null) }))].filter((x) => x.message).sort((a, b) => b.at.localeCompare(a.at))[0];
-			respondJson(res, 200, { enabled: readWechatReplyConfig(configPath).enabled, counts, lastAt, lastError: failed?.message ?? null });
+			const replyCfg = readWechatReplyConfig(configPath);
+			respondJson(res, 200, { enabled: replyCfg.enabled, mode: replyCfg.mode, counts, lastAt, lastError: failed?.message ?? null });
 			return;
 		}
 		// L3 UX 修复：enable/disable 置于 opt-in 闸**之前**（否则未启用时无法启用 = 鸡生蛋）。

@@ -64,6 +64,16 @@ export function deriveReplyClientId(msgId: string, outboxId: string): string {
 }
 
 /**
+ * 广播出站 client_id（0924 广播，每收件人独立）：sha256("wechat-broadcast-client:"+roundId+":"+toUserId)。
+ * 依据（recon⑤ / W3a E-2）：服务端 client_id 去重语义未定论（同 id 双发均回 sent、是否只投一条
+ * 未知）——跨收件人复用同一 id 存在「按 id 全局去重丢件」风险；独立 id 在任何服务端语义下都
+ * 安全，且成为 per-recipient 幂等键。前缀与 intent id 派生前缀（wechat-broadcast:）不同源。
+ */
+export function deriveBroadcastClientId(roundId: string, toUserId: string): string {
+	return createHash("sha256").update(`wechat-broadcast-client:${roundId}:${toUserId}`, "utf8").digest("hex");
+}
+
+/**
  * 回复意图文件 id（W3b 消费）：sha256("wechat-reply:"+outboxId) 全 64hex，确定性
  * （同 outboxId 二次 agent_end → 同 id → 文件幂等，不覆盖）。
  */
