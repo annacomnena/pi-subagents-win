@@ -38,3 +38,6 @@ Wiki/_hotspot.trash.jsonl
 
 # 临时探针/实验文件（不入库）
 .tmp_*
+
+# codegraph 符号索引（本机工具产物，可重建，不入库）
+.codegraph/

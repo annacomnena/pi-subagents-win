@@ -4,7 +4,7 @@ kind: concept
 status: current
 updated: 2026-09-23
 schema_version: 1
-revision: 6
+revision: 8
 ---
 
 ## async-delivery-ownership
@@ -85,25 +85,30 @@ revision: 6
 
 ## wechat-ilink-login
 
-- 标题：微信 iLink 登录绑定 + 接收 W1
-- 适用范围：微信 iLink 通道：登录/绑定 v1（扫码/状态/解绑/开关）+ 接收 W1（长轮询 worker/游标/去重/私有 inbox，只收不投）
+- 标题：微信 iLink 绑定+接收 W1+W2
+- 适用范围：微信 iLink 通道：绑定 v1 + 接收 W1 + W2 注入 + W2b 界面开关（真机协议已校准）
 - Wiki：Wiki/Architecture/wechat-ilink-channel.md → 登录/绑定协议契约（源码已验证）
-- Wiki：Wiki/Architecture/wechat-ilink-channel.md → W1 接收切片（**已实现**：长轮询 worker + 游标/去重/私有 inbox + 只读可见）
+- Wiki：Wiki/Architecture/wechat-ilink-channel.md → 真机协议实测（2026-09-24，**指南不可信**）
+- Wiki：Wiki/Architecture/wechat-ilink-channel.md → W2b 界面开关切片（**已落地** `18ba74d`，D17）
+- 入口：extensions/runtime-host/wechat-bind.ts::setWechatEnabled
+- 入口：extensions/channel-wechat/worker.ts::startWechatWorker
+- 入口：extensions/runtime-host/channel-supervisor.ts::ChannelSupervisor
 - 证据：plans/0923_wechat_gui_bind_plan.md
 - 证据：extensions/_test_wechat_receive.ts
 - 证据：recentwork.md → Item 25 - 微信 iLink 接收 W1（只收不投：长轮询 + 游标/去重/私有 inbox + GUI 可见）
-- 内容更新：2026-09-24T00:37:26.486Z
-- 引用验证：2026-09-24T00:37:26.486Z
+- 内容更新：2026-09-24T02:52:53.388Z
+- 引用验证：2026-09-24T02:52:53.388Z
 
 ## gui-master-inject-trust
 
-- 标题：本机 GUI 注入 master 信任通道（含 B 案与 must-fix）
-- 适用范围：bootstrap OTT 窄通道、B 案凭据作用域化（未实现）、M1–M3 修复（待 L4）
-- Wiki：Wiki/Decisions/gui-master-unlock.md
+- 标题：本机 GUI 注入 master 信任通道
+- 适用范围：本机 GUI 注入 master 的信任通道（bootstrap OTT + 派生 cookie），四轮 L4 已收敛
+- Wiki：Wiki/Decisions/gui-master-unlock.md → 注入门判据（实测澄清，2026-09-24）
 - 入口：extensions/runtime/master-injection.ts::checkTrustedLocalChannel
 - 入口：extensions/runtime-host/server.ts::createRuntimeHostServer
 - 证据：plans/0923_gui_master_unlock_review.md
 - 证据：plans/0923_gui_master_unlock_fix.md
-- 内容更新：2026-09-23T09:30:16.232Z
-- 引用验证：2026-09-23T09:30:16.232Z
+- 证据：Wiki/Decisions/gui-master-unlock.md → 注入门判据（实测澄清，2026-09-24）
+- 内容更新：2026-09-24T02:53:07.301Z
+- 引用验证：2026-09-24T02:53:07.301Z
 
