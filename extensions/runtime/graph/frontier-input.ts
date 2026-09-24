@@ -47,7 +47,8 @@ function toTab(view: GraphProjectView, ref: GraphRunRef): FrontierSourceTab | nu
 /**
  * GraphSnapshot → FrontierSourceSnapshot（纯、零 IO、确定性）。
  * - `attentionByRepo`：仅 `project.attention > 0` 写键（缺项语义 = 0；不为 0 仓造键）。
- * - `details`：仅 carrier 存在（可见 tab）且 project/phase 非 null 的 run；按 `runId` 升序（确定性）。
+ * - `details`：仅 carrier 存在（可见 tab）且 project/phase 非 null 的 run；按 `runId` 升序（确定性）；
+ *   重复 `runId` 时按 `repoPath` 升序 tie-break（公开纯函数对重复 runId 输入亦给出确定序，不依赖 Array.sort 稳定性）。
  * - `history`：恒 `[]`（MF1，不读 `snap.history`）；不产 hidden 回填。
  * - 不读 `snap.asof`；`opts.now` 仅作输入契约（`now` 由调用方透传给 `buildFrontier` 的 `now` 参数）。
  */
@@ -65,6 +66,11 @@ export function toFrontierInput(snap: GraphSnapshot, opts: FrontierInputOptions)
 			if (tab) details.push(tab);
 		}
 	}
-	details.sort((a, b) => (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+	// 契约（T12/T15）：runId 升序；重复 runId 时 repoPath 升序 tie-break（不依赖 Array.sort 稳定性）。
+	details.sort((a, b) => {
+		if (a.runId !== b.runId) return a.runId < b.runId ? -1 : 1;
+		if (a.repoPath !== b.repoPath) return a.repoPath < b.repoPath ? -1 : 1;
+		return 0;
+	});
 	return { attentionByRepo, details, history: [] };
 }
