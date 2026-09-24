@@ -240,6 +240,7 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 	for (const acc of runs.values()) {
 		const project = projectOf(acc.subject);
 		if (!project) continue;
+		const carrier = input.runCarriers?.[acc.subject];
 		const ref: GraphRunRef = {
 			runId: runIdFromSubject(acc.subject),
 			subject: acc.subject,
@@ -247,6 +248,12 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 			phase: phaseOf(acc.subject),
 			externalTaskId: acc.externalTaskId ?? undefined,
 			project,
+			// E2.0：carrier 缺失 → null（不猜）
+			gate: carrier?.gate ?? null,
+			needsHuman: carrier?.needsHuman ?? null,
+			staleOver: carrier?.staleOver ?? null,
+			overdue: carrier?.overdue ?? null,
+			pidAlive: carrier?.pidAlive ?? null,
 		};
 		const arr = runsByProject.get(project);
 		if (arr) arr.push(ref);
@@ -267,5 +274,8 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 		projects: Object.freeze(projects) as GraphProjectView[],
 		skipped: { badLines: input.badLines ?? 0, unknownEventTypes: Object.freeze([...unknownTypes].sort(cmp)) as string[] },
 	};
+	// E2.0：history/asof 为观测载体，仅在输入提供时发出（保持 E1 快照形状向后兼容）。
+	if (input.history !== undefined) snapshot.history = Object.freeze([...input.history].sort((a, b) => cmp(a.id, b.id))) as { id: string; reason: string }[];
+	if (input.asof !== undefined) snapshot.asof = input.asof;
 	return Object.freeze(snapshot);
 }

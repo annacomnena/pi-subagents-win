@@ -10,6 +10,8 @@
 
 import type { JournalSeqEntry } from "../journal-seq.ts";
 import type { RuntimeRunStatus, TaskRecord, WorkstreamRecord } from "../objects.ts";
+// E2.0：carrier 闸口口径单一真相源（type-only，不引入运行时依赖，保持 types.ts 零 IO）。
+import type { GateStatus } from "../frontier-carriers.ts";
 
 // ── 节点 / 边 ──────────────────────────────────────────────────────
 
@@ -61,6 +63,22 @@ export interface GraphRunRef {
 	externalTaskId?: string;
 	/** 归一化 repoPath（tab-runs 账本引用）；无法归属 → null。 */
 	project: string | null;
+	/** E2.0 carrier（只读引用共享 `reduceTabCarrier` 结论；缺 → null，**不猜**）。 */
+	gate?: GateStatus | null;
+	needsHuman?: boolean | null;
+	staleOver?: boolean | null;
+	overdue?: number | null;
+	/** state.pid + process.kill 探活；无 state.pid → null。 */
+	pidAlive?: boolean | null;
+}
+
+/** E2.0：单 run 的 carrier 输入（collect 层用共享归约填充；缺 → GraphRunRef 对应字段 null）。 */
+export interface GraphRunCarrier {
+	gate: GateStatus;
+	needsHuman: boolean;
+	staleOver: boolean;
+	overdue: number;
+	pidAlive: boolean | null;
 }
 
 export interface GraphProjectView {
@@ -81,6 +99,13 @@ export interface GraphSnapshot {
 	edges: GraphEdge[];
 	/** 按 project 升序（E2 翻转输入）。 */
 	projects: GraphProjectView[];
+	/**
+	 * E2.0 观测载体（**不参与 frontier 输入**：E2.1 `toFrontierInput` 恒 emit []，MF1）。
+	 * hidden tab 的 id/reason，按 id 升序；缺省不发出（保持 E1 快照形状向后兼容）。
+	 */
+	history?: { id: string; reason: string }[];
+	/** E2.0 诊断时间戳（ms）；缺省不发出。 */
+	asof?: number;
 	skipped: { badLines: number; unknownEventTypes: string[] };
 }
 
@@ -112,6 +137,12 @@ export interface GraphInput {
 	runProjects?: Record<string, string>;
 	/** 归一化 repoPath → attention（只读引用，可选）。 */
 	projectAttention?: Record<string, number>;
+	/** subject（run://tab/<id>）→ carrier（只读引用共享归约，可选；缺 → 对应字段 null）。 */
+	runCarriers?: Record<string, GraphRunCarrier>;
+	/** hidden tab 观测载体的原始输入（project 层纯透传；**不参与 frontier 输入**）。 */
+	history?: { id: string; reason: string }[];
+	/** 诊断时间戳（ms）；缺省不发出。 */
+	asof?: number;
 }
 
 // ── 冻结常量 ───────────────────────────────────────────────────────
