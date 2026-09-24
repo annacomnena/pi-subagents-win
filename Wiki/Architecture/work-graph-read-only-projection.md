@@ -21,6 +21,9 @@ source_paths:
   - extensions/_test_graph_frontier_shadow.ts#L119-L243
   - extensions/_test_graph_frontier_shadow.ts#L433-L452
   - extensions/_test_graph_frontier_shadow.ts#L775-L815
+  - extensions/runtime/autonomy/collect.ts#L104-L124
+  - extensions/runtime/autonomy/collect.ts#L142-L148
+  - extensions/_test_graph_frontier_shadow.ts#L800-L1000
   - extensions/runtime/graph/index.ts#L7-L11
   - extensions/_test_runtime_graph.ts#L87-L358
   - extensions/_test_frontier_attention_window.ts#L1-L30
@@ -133,6 +136,16 @@ E2.2 = **G-B 核心验收件**：在**测试态**逐项对照 v2 生产路径与
 
 **E2.2 L4 收尾（`154bf8d`）**：S8a 固定时钟（`dispatchedAtMs = NOW - 60_000`，去 `Date.now()`）；trigger Map 改 `groupByKey` 数组保 multiplicity；S16 显式断言输入分叉（graph 源 journal cwd lower-case vs v2 源账本 cwd upper-case 变体 → 归一键唯一，`#L742`）；反向自检 helper。
 
+### E2.3 单点翻转契约：`PI_AUTONOMY_FRONTIER_SOURCE`（缺省 v2；`22e398a` + `f89abdb`）——**G-B 全部完成**
+
+E2.3 = G-B 最后一环：把 `autonomy/collect.ts` 的 frontier 数据源做成**单点二选一**（`collect.ts#L146-L148`）。落地后 **G-B（来源翻转）全部完成**：E2.1 适配器 + E2.2 影子双硬门 + E2.3 生产接线。
+
+- **单点开关（env-only opt-in 逃生舱）**：`process.env.PI_AUTONOMY_FRONTIER_SOURCE?.trim() === "graph"` **才**走 Graph（`readGraphSnapshot`→`toFrontierInput`）；**缺省/其它任何值（含 `""`/`"v2"`/`"graphx"`/`"GRAPH"`）= v2**（`collectGlobalView`）。**不写 `config.json`**、**不新增 `collectAutonomyInputs` opts**、`graph/**`/`autonomy/frontier.ts`/`protocol.ts`/`index.ts`/`package.json` 零改。**单 commit 可 revert**（`git revert 22e398a` 即回 v2，无状态迁移）。
+- **graph 路参数分叉防护**：graph 分支经 **graph-only helper `graphFrontierSnapshot`**（`collect.ts#L111`）派生 `agentDir = opts?.agentDir ?? defaultAgentDir()`，并**显式传 `tabRunsDir`/`sessionsRoot`/`timersDir`**（均从同一 `agentDir` 派生）。必须显式传：`readGraphSnapshot` 缺省 `tabRunsDir = PI_TAB_RUNS_DIR || defaultTabRunsDir()`（`graph/collect.ts#L58-L62`）会与 v2 的 `join(agentDir,"tab-runs")` 分叉（S20 decoy 断言钉死）；`journalPath` 不传（生产默认 `defaultRuntimeDir()/events.jsonl`）。
+- **v2 分支保留原调用形状**（L4 必须修，`f89abdb`）：v2 分支字面量为 `collectGlobalView({ agentDir: opts?.agentDir, now })`——**不在共同分支预先解析 `agentDir`**，使 `defaultAgentDir()` 仍归 `collectGlobalView` 自己的 `try`（异常边界与改造前逐字节等价；S22 源码形状 + 异常边界用例钉死）。graph 分支的 `defaultAgentDir()` 归外层 `collectAutonomyInputs` 的 try（opt-in 路，有意不对称）。
+- **等价基准**：缺省 v2 行为逐字节不变（S18 比较 canonical + **写出的 `frontier.json` 原始文本** + watchdog/audit 可观测）；`flag=graph` 与 v2 canonical 全等（S19；原始文本 `runs` 键序差异仅 `runId` vs `rankDetail`，不参与消费）；`enabled=false` 零行为（S21b）。**`frontier.json` 两版 schema 兼容**：同一个 `buildFrontier` 产 `FrontierSnapshot`，`readFrontierSnapshot` 仅校验 `asof/projects/triggers/baseline`；不清空 `prev`、双向切换共用同一文件。
+- **测试**：`_test_graph_frontier_shadow.ts` S18–S23（缺省=v2 / graph 等价+序指纹 / decoy `PI_TAB_RUNS_DIR` / 非 graph 值=v2 / enabled=false 零行为 / `agentDir` 未传形状与异常边界 / graph flag `pidAlive=false` 的 watchdog `runStateMismatch` 端到端），**28 checks**；`E22_REVERSE_SELFTEST=1` → 29 checks、`unexplained=1`。E2.2 影子双硬门仍 `unexplained=0 explained=0`（`frames=33 rows=623 same=623`）。
+
 ## Evidence
 
 - E1 测试 13 组（`extensions/_test_runtime_graph.ts#L87-L311`）：空输入 / 单对象 / 边三来源 / 孤儿引用 / dedupe 幂等 / 乱序 terminal / diff 边界 / 确定性+路径口径 tripwire / 10k 性能 / 未知事件 / workspaceRef 弱载体 / 坏行只读 / replay 等价 + collect 装配；T13 含病态事件（type 与 payload.status 矛盾）下 Graph ≡ projector 的等价断言。
@@ -143,6 +156,7 @@ E2.2 = **G-B 核心验收件**：在**测试态**逐项对照 v2 生产路径与
 - G-A 语义修复（`93f8447` + `fae1aa2`；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**，必须修 M2 已闭环）：`_test_frontier_attention_window.ts` 18 checks（P0 十条翻转 + N1-N4 + M1/M2/M3 + K1 tripwire）；规模 19/20/21/40 四档页外漏检=0、假边沿=0；`test:global-view` M1 byte-identical + Σ 不变量三路径；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_carriers.ts` 5/5（golden 仅加性新增 `attentionByRepo` 一个键）；其余 runtime 回归全绿。
 - E2.1 适配器契约（`b59ee68` + `513623c`；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**，2 必须修 + 3 建议修已闭环）：`_test_graph_frontier_input.ts` **15/15**（T1–T15：T8 源码读取守卫扩零路径转换白名单、T9 `FAR_PAST` 相对固定 `NOW` + 双路径双帧非 mailbox 边沿、T15 重复 runId tie-break）；`frontier-input.ts` 零生产接线（`rg -l frontier-input extensions --include=*.ts` 仅命中自身 + 测试）；回归 `_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）/ `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）/ `_test_frontier_attention_window.ts` 18 + `test:global-view` + 6×npm 全绿。
 - E2.2 影子对照 harness（`de84baa` + `154bf8d`；L4 `plans/0924_graph_E2_2_l4_review.md` **PASS-with-fixes**，1 必须修 + 3 建议修已闭环）：`_test_graph_frontier_shadow.ts` **21 checks，exit 0，`frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`**（双硬门 + DoD-3 canonical 全等 33 帧）；篡改反向实验 **exit 1 / `unexplained=15`**（非恒真假绿）；`E22_REVERSE_SELFTEST=1` 自检报 `unexplained=1`；`_test_runtime_autonomy.ts` 57 checks（ALLOW 仍恰 3）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）+ `test:global-view`/`runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿。
+- E2.3 单点翻转（`22e398a` + `f89abdb`；L4 `plans/0924_graph_E2_3_l4_review.md` **PASS-with-fixes**，1 必须修 + 建议修已闭环）：`_test_graph_frontier_shadow.ts` **28 checks，exit 0，`frames=33 rows=623 same=623 unexplained=0 explained=0`**（S18–S23：缺省=v2 等价 / graph 等价+序指纹 / decoy `PI_TAB_RUNS_DIR` / 非 graph 值=v2 / enabled=false 零行为 / `agentDir` 未传形状与异常边界 / graph flag `pidAlive=false` `runStateMismatch` 端到端）；`E22_REVERSE_SELFTEST=1` **29 checks**、`unexplained=1`（判别力有效）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3、A11.2 零新文件）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）+ `test:global-view`/`runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿。
 
 ## Links Out
 
@@ -158,4 +172,4 @@ E2.2 = **G-B 核心验收件**：在**测试态**逐项对照 v2 生产路径与
 - **~~`asof` 缺省不发出~~ 已闭合（E2.1）**：`toFrontierInput` 取 `opts.now` 必填、**不使用 `snap.asof`**（`collectGraphInput` 仅在显式提供 `opts.asof` 时透传）；`now` 由调用方以同一值透传 `buildFrontier`（见 Current Contract「E2.1 契约」）。
 - **弱载体残余**：`isPathShapedRef` 对含 `/` 的自由字符串（如 `a/b` 标签）判为路径形 → 伪 project 节点（已测试固化，属 best-effort 已知残余）。
 - **`run_subject` 自环 / 无 changedEdges**：`diffGraph` 边只按键增删，evidence/match 标注变化不可见；E2 文档需显式声明。
-- **双 `findRepoRoot` 口径（E2.1 已定单一口径）**：共享版用 `normalizeExactPath`，graph 本地版（`collect.ts`）用 `normalizeRepoKey`（case-insensitive）并存（E1 遗留）；E2.1 裁定 = **R4 单一口径**——适配器直接把 graph `project` 键当规范键使用、**不新增第三份 normalizer**（T4/T8 机器钉死）；E2.3 翻转前仍需保证该键与 v2 `attentionByRepo` 键逐字同口径。
+- **双 `findRepoRoot` 口径（E2.1 已定单一口径；E2.3 已闭合）**：共享版用 `normalizeExactPath`，graph 本地版（`collect.ts`）用 `normalizeRepoKey`（case-insensitive）并存（E1 遗留）；E2.1 裁定 = **R4 单一口径**——适配器直接把 graph `project` 键当规范键使用、**不新增第三份 normalizer**（T4/T8 机器钉死）；**E2.3 已闭合**：影子 S12/S13/S18/S19 断言两路 `attentionByRepo` 键/值逐字相等且 `next`/`diff` canonical 全等（S16 大小写变体归一键唯一）。

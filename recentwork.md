@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） |
 | 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） |
 | 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） |
 | 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） |
@@ -52,6 +53,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 44 - G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in）
+
+- **日期**：2026-09-24
+- **一句话**：E2.3 = G-B 最后一环——`autonomy/collect.ts` 的 frontier 数据源**单点二选一**：env `PI_AUTONOMY_FRONTIER_SOURCE.trim()==="graph"` 才走 Graph（`readGraphSnapshot`→`toFrontierInput`），**缺省/其它值（含 `""`/`"v2"`/`"graphx"`/`"GRAPH"`）= v2**（`collectGlobalView`）。**不写 `config.json`、不新增 opts、`graph/**`/`frontier.ts`/`protocol.ts`/`index.ts`/`package.json` 零改**；单 commit 可 revert；`frontier.json` 两版 schema 兼容（同一 `buildFrontier` 产物，不清 `prev`）。graph 路经 graph-only helper `graphFrontierSnapshot` 派生 `agentDir` 并**显式传 `tabRunsDir`/`sessionsRoot`/`timersDir`**（防 `PI_TAB_RUNS_DIR`/`defaultTabRunsDir()` 分叉）。L4 必须修（`f89abdb`）：v2 分支**保留原调用形状** `collectGlobalView({ agentDir: opts?.agentDir, now })`，`defaultAgentDir()` 仍归 `collectGlobalView` 自己的 `try` → 缺省生产行为与异常边界逐字节不变。**G-B 全部完成**（E2.1 适配器 + E2.2 影子双硬门 + E2.3 生产接线）。
+- **涉及模块**：`extensions/runtime/autonomy/collect.ts`（单点翻转 `#L146-L148` + graph-only helper `#L111`）、`extensions/_test_graph_frontier_shadow.ts`（S18–S23）
+- **产物**：`plans/0924_graph_E2_3_recon.md` / `plans/0924_graph_E2_3_impl_plan.md` / `plans/0924_graph_E2_3_l4_review.md` / `plans/0924_graph_E2_3_wrapup_report.md`
+- **Wiki**：更新正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（Current Contract 新增「E2.3 单点翻转契约」节：env-only 开关 / 缺省 v2 / 参数分叉防护 / v2 分支形状保持 / schema 兼容 / **G-B 完成**；Evidence 补 E2.3；source_paths 补 `collect.ts#L104-L124`/`#L142-L148` + shadow `#L800-L1000`；双 `findRepoRoot` Open Question 标闭合）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`22e398a`（E2.3 单点翻转：env `PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2，显式三路径）+ `f89abdb`（L4 必须修：v2 分支保留原调用形状，`agentDir` 仅在 graph 分支派生）
+- **Verification**：`_test_graph_frontier_shadow.ts` **28 checks，exit 0，`frames=33 rows=623 same=623 unexplained=0 explained=0`**（S18 缺省=v2 等价，含写出 `frontier.json` 原始文本 + watchdog/audit 可观测 / S19 graph 等价 + `runs` 序指纹 + 原始文本键序差异仅 `runId` vs `rankDetail` / S20 decoy `PI_TAB_RUNS_DIR` 防护 / S21a 非 graph 值=v2 / S21b enabled=false 零行为 / **S22 `agentDir` 未传：v2 源码形状 + 异常边界归 `collectGlobalView`** / **S23 graph flag `pidAlive=false` 的 `runStateMismatch` 端到端**）；`E22_REVERSE_SELFTEST=1` **29 checks**、`unexplained=1`（判别力有效）；**删 `tabRunsDir:` 行实验 → exit 1 / S19+S20+S23 FAIL**（漏传被有效捕获）；`_test_runtime_autonomy.ts` 57（A10.1 ALLOW 仍恰 3、A11.2 零新文件）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）+ `test:global-view`/`test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_3_l4_review.md` **PASS-with-fixes**（1 必须修 + 建议修已闭环）。
 
 ### Item 43 - E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`）
 

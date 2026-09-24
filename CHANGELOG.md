@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (E2.3 单点翻转落地：`22e398a`/`f89abdb`；**G-B 完成**)
+
+- **单点翻转落地、缺省仍 v2（opt-in 逃生舱）**：`autonomy/collect.ts` 的 frontier 数据源改为按 env `PI_AUTONOMY_FRONTIER_SOURCE` 单点二选一——`trim()==="graph"` 才走 Graph（`readGraphSnapshot`→`toFrontierInput`），**缺省/其它任何值 = v2**（`collectGlobalView`）。**不写 `config.json`**、不新增 `collectAutonomyInputs` opts、`graph/**`/`autonomy/frontier.ts`/`protocol.ts`/`index.ts`/`package.json` 零改；单 commit 可 revert（`git revert 22e398a` 即回 v2，无状态迁移）。
+- **参数分叉防护**：graph 路经 graph-only helper `graphFrontierSnapshot` 派生 `agentDir = opts?.agentDir ?? defaultAgentDir()`，并**显式传 `tabRunsDir`/`sessionsRoot`/`timersDir`**——否则 `readGraphSnapshot` 缺省 `PI_TAB_RUNS_DIR || defaultTabRunsDir()`（`graph/collect.ts#L58-L62`）会与 v2 的 `join(agentDir,"tab-runs")` 分叉；`journalPath` 不传（生产默认）。
+- **v2 分支形状保持（L4 必须修 `f89abdb`）**：v2 分支字面量为 `collectGlobalView({ agentDir: opts?.agentDir, now })`——**不在共同分支预先解析 `agentDir`**，使 `defaultAgentDir()` 仍归 `collectGlobalView` 自己的 `try`（缺省生产行为与异常边界逐字节不变；S22 源码形状 + 异常边界用例钉死）。graph 分支的 `defaultAgentDir()` 归外层 try（opt-in 路，有意不对称）。
+- **`frontier.json` 两版 schema 兼容**：两路都由同一个 `buildFrontier` 产 `FrontierSnapshot`，`readFrontierSnapshot` 仅校验 `asof/projects/triggers/baseline`；不清空 `prev`，双向切换共用同一文件。
+- **验收**：`_test_graph_frontier_shadow.ts` **28 checks，exit 0，`frames=33 rows=623 same=623 unexplained=0 explained=0`**（S18 缺省=v2 含写出 `frontier.json` 原始文本 + watchdog/audit / S19 graph 等价 + 序指纹 / S20 decoy `PI_TAB_RUNS_DIR` / S21a 非 graph 值=v2 / S21b enabled=false 零行为 / S22 `agentDir` 未传形状与异常边界 / S23 graph flag `pidAlive=false` `runStateMismatch` 端到端）；`E22_REVERSE_SELFTEST=1` **29 checks**、`unexplained=1`；删 `tabRunsDir:` 行实验 → exit 1（S19+S20+S23 FAIL）；`_test_runtime_autonomy.ts` 57（A10.1 ALLOW 仍恰 3）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5 + `test:global-view`/`runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_3_l4_review.md` **PASS-with-fixes**（1 必须修 + 建议修已闭环）。
+- **文档**：Wiki `Wiki/Architecture/work-graph-read-only-projection.md`（「E2.3 单点翻转契约」节，**G-B 完成**）；Recent Work Item 44。
+
 ## [Unreleased] — 2026-09-24 (E2.2 影子对照 harness：`de84baa`/`154bf8d`)
 
 - **影子对照证明 Graph 派生输入与 v2 生产输入语义等价；硬门 `unexplained=0` 且 `explained=0`**：新增测试态 `extensions/_test_graph_frontier_shadow.ts`（G-B 核心验收件）——同一 fixture、同一 `(backlog, prev, now)` 下逐项对照 v2 生产路径（`collectGlobalView`→`buildFrontier`）与 graph 路径（`readGraphSnapshot`→`toFrontierInput`→`buildFrontier`），产 O-B 行（五源 snapshot/project/run/trigger/recordOnly）。实测 `frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`（21 checks，exit 0），全 33 帧 `next`/`diff` canonical 全等 → **E2.3 翻转硬门证据**。
