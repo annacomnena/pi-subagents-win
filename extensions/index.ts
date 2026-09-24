@@ -42,7 +42,7 @@ import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtim
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
-import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
+import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, readWechatReplyConfig, setWechatReplyConfig, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
 import { defaultRuntimeDir } from "./runtime/journal.ts";
 import { WechatStore } from "./channel-wechat/store.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
@@ -66,6 +66,7 @@ import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
 import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
 import { registerOutboxBridge } from "./outbox-bridge.ts";
+import { registerWechatReplyHook } from "./wechat-reply-hook.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts"; // G6 L3：GUI 自动拉起（opt-in）
 import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import type { WakeDecision } from "./runtime/wake.ts";
@@ -1861,6 +1862,7 @@ export default function (pi: ExtensionAPI) {
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
+	collect(registerWechatReplyHook(pi));
 	// G6 L3：GUI 自动拉起（opt-in，gui.autoStart=true 才有动作；subagent 早退分支不达此处，tick 内 isMainSession 双保险）
 	collect(registerGuiAutoStart(pi));
 
@@ -2043,9 +2045,17 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 	pi.registerCommand("wechat", {
-		description: "微信通道开关与状态：/wechat on|off|status",
+		description: "微信通道开关与状态：/wechat on|off|status|reply on|off",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase() || "status";
+			if (sub.startsWith("reply ")) {
+				const value = sub.slice(6).trim();
+				if (value !== "on" && value !== "off") { ctx.ui.notify("用法：/wechat reply on|off", "warning"); return; }
+				if (isSubagent()) { ctx.ui.notify("wechat: 子 agent 会话不可切换通道", "warning"); return; }
+				const result = setWechatReplyConfig(value === "on", readWechatConfigPath());
+				ctx.ui.notify(result.ok ? `wechat reply.enabled=${value}` : `wechat reply config write failed: ${result.error}`, result.ok ? "info" : "warning");
+				return;
+			}
 			if (sub === "on" || sub === "off") {
 				if (isSubagent()) { ctx.ui.notify("wechat: 子 agent 会话不可切换通道（手动运维命令）", "warning"); return; }
 				const result = setWechatEnabled(sub === "on", readWechatConfigPath());
@@ -2053,7 +2063,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(result.ok ? `wechat enabled=${sub}` : `wechat config write failed: ${result.error}`, result.ok ? "info" : "warning");
 				return;
 			}
-			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status", "warning"); return; }
+			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status|reply on|off", "warning"); return; }
 			const configPath = readWechatConfigPath();
 			let worker = "(状态不可读)";
 			try {
@@ -2062,7 +2072,7 @@ export default function (pi: ExtensionAPI) {
 			} catch { /* tolerant status */ }
 			const creds = readWechatCreds(wechatCredsPath(defaultRuntimeDir()));
 			const botId = creds?.botId;
-			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
+			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `reply.enabled=${readWechatReplyConfig(configPath).enabled}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。

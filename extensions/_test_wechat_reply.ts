@@ -16,6 +16,13 @@
  * 跑法：`node --experimental-strip-types ./extensions/_test_wechat_reply.ts` 或 `npx tsx` 同文件。
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { extractWechatReply } from "./wechat-reply-hook.ts";
+import { markReplyIntent, newReplyIntent, readReplyIntent, replyIntentDir } from "./runtime/wechat-reply.ts";
+import { WechatStore } from "./channel-wechat/store.ts";
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { sendMessage, deriveReplyClientId, deriveReplyIntentId, type SendMessageReq } from "./channel-wechat/send.ts";
@@ -258,6 +265,82 @@ try {
 }
 
 try {
+	// ── S4 触发提取（所有文件均隔离在临时目录）──────────────────────
+	await check("S4 trigger: valid marker writes inbox-derived pending intent; forged body address ignored", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-s4-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({}));
+			const outboxId = "a".repeat(64), store = new WechatStore(join(runtimeDir, "wechat", "receive"));
+			store.putInbox({ msgId: "m-private-userid", fromId: "openid-authoritative@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const msgs = [{ role: "user", content: [{ type: "text", text: `dedupe:outbox:${outboxId}` }] }, { role: "assistant", content: [{ type: "text", text: "older" }] }, { role: "assistant", stopReason: "length", content: [{ type: "text", text: `last ${TO}` }] }];
+			assert.equal(extractWechatReply(msgs, { stateDir, runtimeDir, configPath }).written, true);
+			const id = deriveReplyIntentId(outboxId), intent = readReplyIntent(replyIntentDir(stateDir), id)!;
+			assert.equal(intent.fromId, "openid-authoritative@im.wechat"); assert.equal(intent.text, `last ${TO}`); assert.equal(intent.status, "pending"); assert.equal(intent.clientId, deriveReplyClientId("m-private-userid", outboxId));
+			assert.equal(extractWechatReply(msgs, { stateDir, runtimeDir, configPath }).written, false);
+			assert.ok(!readFileSync(join(stateDir, "wechat-reply-audit.jsonl"), "utf8").includes("last "));
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+	await check("S4 zero action for absent/non-first marker; pure tool skips; truncate and disabled gate", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-s4-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({}));
+			const outboxId = "b".repeat(64), store = new WechatStore(join(runtimeDir, "wechat", "receive"));
+			store.putInbox({ msgId: "m2", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			assert.equal(extractWechatReply([{ role: "user", content: "no" }], { stateDir, runtimeDir, configPath }).written, false);
+			assert.equal(extractWechatReply([{ role: "user", content: "no" }, { role: "user", content: `dedupe:outbox:${outboxId}` }], { stateDir, runtimeDir, configPath }).written, false);
+			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", content: [{ type: "toolCall" }] }], { stateDir, runtimeDir, configPath }).reason, "no-text");
+			assert.match(readFileSync(join(stateDir, "wechat-reply-audit.jsonl"), "utf8"), /no-text/);
+			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", stopReason: "length", content: [{ type: "text", text: "x".repeat(4001) }] }], { stateDir, runtimeDir, configPath }).written, true);
+			assert.equal(readReplyIntent(replyIntentDir(stateDir), deriveReplyIntentId(outboxId))!.text, "x".repeat(4000) + "…[截断]");
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { enabled: false } } } }));
+			const other = "c".repeat(64); store.putInbox({ msgId: "m3", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId: other });
+			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${other}` }, { role: "assistant", content: "reply" }], { stateDir, runtimeDir, configPath }).reason, "reply-disabled");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+	await check("S4 subagent skip and bot-domain anti-loop", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-s4-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json"); writeFileSync(configPath, JSON.stringify({}));
+			const outboxId = "d".repeat(64); new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "m4", fromId: "bot@im.bot", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const messages = [{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", content: "reply" }];
+			assert.equal(extractWechatReply(messages, { stateDir, runtimeDir, configPath, subagent: () => true }).written, false);
+			assert.equal(extractWechatReply(messages, { stateDir, runtimeDir, configPath }).reason, "bot-domain");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	await check("跨进程并发创建/终态 CAS + 陈旧锁恢复", async () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-race-")), dir = replyIntentDir(root), id = "e".repeat(64);
+		const worker = (op: string, arg: string, targetId = id) => new Promise<string>((resolve, reject) => {
+			const code = `import {newReplyIntent,markReplyIntent} from './extensions/runtime/wechat-reply.ts'; const [op,dir,id,arg]=process.argv.slice(1); const common={id,msgId:'m',outboxId:'o',fromId:'f',clientId:'c',text:arg}; console.log(JSON.stringify(op==='create'?newReplyIntent(dir,common):markReplyIntent(dir,id,{status:arg})));`;
+			const p = spawn(process.execPath, ["--experimental-strip-types", "-e", code, op, dir, targetId, arg], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+			let out = "", err = ""; p.stdout.setEncoding("utf8").on("data", x => out += x); p.stderr.setEncoding("utf8").on("data", x => err += x); p.on("error", reject); p.on("close", n => n === 0 ? resolve(out.trim()) : reject(new Error(err)));
+		});
+		try {
+			const created = await Promise.all([worker("create", "winner-A"), worker("create", "winner-B")]);
+			const stored = readReplyIntent(dir, id)!; assert.equal(stored.status, "pending"); assert.ok(["winner-A", "winner-B"].includes(stored.text));
+			assert.equal(created.map(x => JSON.parse(x).created).filter(Boolean).length, 1);
+			console.log(`    workers create: ${created.map(x => JSON.parse(x).item?.text).join(" | ")}; disk=${stored.text}`);
+			const moved = await Promise.all([worker("mark", "sent"), worker("mark", "failed")]);
+			const results = moved.map(x => JSON.parse(x)); assert.equal(results.filter(Boolean).length, 1); assert.equal(markReplyIntent(dir, id, { status: "unknown" }), null);
+			console.log(`    workers transition: ${results.map(x => x?.status ?? "null").join(" | ")}; disk=${readReplyIntent(dir, id)!.status}`);
+			const recoverId = "f".repeat(64); newReplyIntent(dir, { id: recoverId, msgId: "m2", outboxId: "o2", fromId: "f", clientId: "c", text: "recover" });
+			const lock = `${join(dir, recoverId + ".json")}.lock`; writeFileSync(lock, "stale"); utimesSync(lock, new Date(0), new Date(0));
+			assert.equal(markReplyIntent(dir, recoverId, { status: "unknown" })?.status, "unknown");
+			const contestedId = "9".repeat(64); newReplyIntent(dir, { id: contestedId, msgId: "m4", outboxId: "o4", fromId: "f", clientId: "c", text: "stale-race" });
+			const contestedLock = `${join(dir, contestedId + ".json")}.lock`; writeFileSync(contestedLock, "stale"); utimesSync(contestedLock, new Date(0), new Date(0));
+			const claims = await Promise.all([worker("mark", "sent", contestedId), worker("mark", "failed", contestedId)]);
+			assert.equal(claims.map(x => JSON.parse(x)).filter(Boolean).length, 1);
+			assert.equal(readReplyIntent(dir, contestedId)!.status === "sent" || readReplyIntent(dir, contestedId)!.status === "failed", true);
+			console.log(`    stale-lock contenders: successes=${claims.map(x => JSON.parse(x) ? 1 : 0).join(",")}; final=${readReplyIntent(dir, contestedId)!.status}`);
+			const orphan = join(dir, `${"a".repeat(64)}.json.999.deadbeef.tmp`); writeFileSync(orphan, "orphan"); utimesSync(orphan, new Date(0), new Date(0));
+			const createdItem = newReplyIntent(dir, { id: "1".repeat(64), msgId: "m3", outboxId: "o3", fromId: "f", clientId: "c", text: "cleanup" });
+			assert.equal(createdItem?.created, true); assert.ok(!readdirSync(dir).includes(orphan.split(/[\\/]/).pop()!));
+			console.log(`    orphan tmp cleanup: removed=${!readdirSync(dir).includes(orphan.split(/[\\/]/).pop()!)}`);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
 	// ── S3 派生确定性 ────────────────────────────────────────────────
 	await check("S3a deriveReplyClientId：确定性 + 64hex + 输入敏感 + 已知向量", () => {
 		const a = deriveReplyClientId("msg-1", "outbox-1");

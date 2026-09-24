@@ -54,6 +54,9 @@ export interface InboundRecord {
 	state: "pending" | "injected" | "rejected";
 	rejectedReason?: "not-allowlisted" | "write-failed";
 	artifactPending?: boolean;
+	/** W2 注入关联只读投影；旧记录无此键时为 undefined。 */
+	outboxId?: string;
+	injectedAt?: string;
 }
 
 export interface WechatReceiveCounts {
@@ -326,6 +329,8 @@ export class WechatStore {
 					state: v.state === "injected" || v.state === "rejected" ? v.state : "pending",
 					...(v.rejectedReason === "not-allowlisted" || v.rejectedReason === "write-failed" ? { rejectedReason: v.rejectedReason } : {}),
 					...(v.artifactPending === true ? { artifactPending: true } : {}),
+					...(typeof v.outboxId === "string" ? { outboxId: v.outboxId } : {}),
+					...(typeof v.injectedAt === "string" ? { injectedAt: v.injectedAt } : {}),
 				});
 			}
 		} catch {

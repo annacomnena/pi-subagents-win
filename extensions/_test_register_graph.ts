@@ -163,7 +163,7 @@ assert.deepEqual(commandNames, [
 ]);
 
 // 事件快照（按名排序；2026-08-19 冻结）。同一事件可被多处注册：
-// agent_end x2（session-hooks 自动 master 交接 + hotspot v4 snapshot 写入）、
+// agent_end x3（session-hooks 自动 master 交接 + hotspot v4 snapshot 写入 + 微信回复触发）、
 // session_start x5（timers/async-panel/event-bus/report/tab 遥测）、
 // session_shutdown x2（tab 遥测 + index.ts 清理钩子）、
 // input x1（hotspot v4 保守注入）与 agent_start x3（session-hooks + tab 遥测 +

@@ -237,6 +237,29 @@ export function readWechatInputConfig(configPath: string): WechatInputConfig {
 	}
 }
 
+export function readWechatReplyConfig(configPath: string): { enabled: boolean } {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as { channels?: { wechat?: { reply?: { enabled?: unknown } } } };
+		return { enabled: raw?.channels?.wechat?.reply?.enabled !== false };
+	} catch { return { enabled: true }; }
+}
+
+export function setWechatReplyConfig(enabled: boolean, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {
+	let raw: Record<string, unknown>;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, error: "invalid config" };
+		raw = parsed as Record<string, unknown>;
+	} catch (e) { return { ok: false, error: `config read failed: ${cfgErrMsg(e)}` }; }
+	const channels = (raw.channels && typeof raw.channels === "object" && !Array.isArray(raw.channels) ? raw.channels : {}) as Record<string, unknown>;
+	const wechat = (channels.wechat && typeof channels.wechat === "object" && !Array.isArray(channels.wechat) ? channels.wechat : {}) as Record<string, unknown>;
+	const reply = (wechat.reply && typeof wechat.reply === "object" && !Array.isArray(wechat.reply) ? wechat.reply : {}) as Record<string, unknown>;
+	reply.enabled = enabled; wechat.reply = reply; channels.wechat = wechat; raw.channels = channels;
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+	try { writeFileSync(tmp, JSON.stringify(raw, null, 2) + "\n"); for (let n = 0;; n++) { try { renameSync(tmp, path); return { ok: true }; } catch (e) { if ((e as NodeJS.ErrnoException).code === "EPERM" && n < 3) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); continue; } throw e; } } }
+	catch (e) { try { unlinkSync(tmp); } catch {} return { ok: false, error: `config write failed: ${cfgErrMsg(e)}` }; }
+}
+
 export function readWechatReceiveEnabled(configPath: string): boolean {
 	try {
 		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
