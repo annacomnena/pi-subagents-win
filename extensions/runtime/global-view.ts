@@ -11,20 +11,26 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { normalizeExactPath, isNoisePath } from "./recent-scopes.ts";
 import { localMasterAddress } from "./scope.ts";
+import { readTabResultFile, readTabState, validateTabDispatchRecord, type TabDispatchRecord, type TabResult, type TabState } from "../tab-runs.ts";
 import {
-	classifyTabStatus,
-	composeTabStatus,
-	probeSessionFile,
-	readTabResultFile,
-	readTabState,
-	sessionBucketForCwd,
-	validateTabDispatchRecord,
-	type SessionProbe,
-	type TabDispatchRecord,
-	type TabResult,
-	type TabState,
-} from "../tab-runs.ts";
-import { classifyForReclaim } from "../tab-runs-runtime.ts";
+	classifyDispatch,
+	collectTimerByRepo,
+	findRepoRoot,
+	readGateStatus,
+	readJson,
+	reduceTabCarrier,
+	relText,
+	toMs,
+	warn,
+	type GateStatus,
+	type TabDetail,
+} from "./frontier-carriers.ts";
+
+// E2.0：carrier 归约抽至 frontier-carriers.ts（共享，单一真相源）；
+// 下列符号保持原导出面不变（向后兼容 autonomy/frontier.ts 与既有测试）。
+export { MAX_GATE_BYTES, MAX_PROBE_TAIL_LINES, STALE_NO_PROGRESS_MS, SUMMARY_TRUNCATE_CHARS } from "./frontier-carriers.ts";
+export type { FrontierSourceTab, GateStatus, TabDetail } from "./frontier-carriers.ts";
+export { readGateStatus };
 import { mailboxDirFor, type ObjectAddress } from "./mailbox.ts";
 import { masterAddress } from "./address.ts";
 
@@ -99,49 +105,13 @@ const DEFAULT_PAGE_SIZE = 20;
 const MAX_SCAN_FILES = 5000;
 
 /**
- * 无进展阈值 45min（0923 phase2 裁定）：对齐 localText 既有 stale(30min)
- * 口径上浮，避免两处阈值打架。仅用于排序/标注，不改变任何字段语义。
- */
-export const STALE_NO_PROGRESS_MS = 45 * 60 * 1000;
-/** 最后 assistant 摘要截断 120 字（0923 phase2 裁定；state/probe 侧 2000 截断之上再截）。 */
-export const SUMMARY_TRUNCATE_CHARS = 120;
-/**
  * 差分基线相对路径 `<agentDir>/global-view/last.json`（0923 phase2 裁定）。
  * collector 保持纯只读（只读基线）；写基线只发生在调用层 globalViewLogic
  * 执行后的 best-effort 路径（原子写 tmp+rename，失败只记 warnings）。
  */
 export const GLOBAL_VIEW_BASELINE_REL = "global-view/last.json";
-/** 探活抽尾行数上限：lastStopReason/摘要只在 visible/active tab 上探，terminal 跳过。 */
-export const MAX_PROBE_TAIL_LINES = 40;
-/** 跨仓 recentwork.md 读取上限 64KB（超→该仓 gate=unknown）。 */
-export const MAX_GATE_BYTES = 64 * 1024;
 /** 五源缩写自解释（输出头三件套用）：S=state R=result P=probe(session JSONL 抽尾) G=gate(各仓 recentwork.md) D=diff(last.json 基线)。 */
 export const SOURCES_LEGEND = "src=S(state)+R(result)+P(probe:tail40)+G(gate:recentwork)+D(diff:last.json)";
-
-/** 跨仓闸口状态：awaiting=等人工动作 | ok=表中有行但无等人工 | unknown=缺文件/超限/表头漂移/解析异常 */
-export type GateStatus = "awaiting" | "ok" | "unknown";
-
-/** phase2 每 tab 明细行（纯增量列；读不到一律 unknown，绝不猜、绝不拿 mtime 冒充 lastActivityAt）。 */
-export interface TabDetail {
-	runId: string;
-	repoPath: string;
-	phase: string;
-	taskId: string;
-	age: string;
-	stale: string;
-	staleOver: boolean;
-	stop: string;
-	artifact: string;
-	artifactMtime: string;
-	resultMissing: boolean;
-	terminal: boolean;
-	openIssues: number | null;
-	summary: string;
-	needsHuman: boolean;
-	gate: GateStatus;
-	overdue: number;
-	pidAlive: boolean | null;
-}
 
 /** 差分输出（键=runId；仓库行用归一化 repoPath）。 */
 export interface ViewDiff { added: string[]; changed: string[]; removed: string[]; note: string }
@@ -154,35 +124,8 @@ export interface BaselinePayload {
 }
 
 export function defaultAgentDir(): string { return join(homedir(), ".pi", "agent"); }
-function warn(out: string[], msg: string): void { if (out.length < 20) out.push(msg); }
-function readJson(path: string): Record<string, unknown> | null {
-	try {
-		const v: unknown = JSON.parse(readFileSync(path, "utf8"));
-		return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-	} catch { return null; }
-}
-function toMs(v: unknown): number | null {
-	if (typeof v === "number" && Number.isFinite(v)) return v;
-	if (typeof v === "string" && v) { const t = Date.parse(v); return Number.isFinite(t) ? t : null; }
-	return null;
-}
-function relText(ms: number | null, now: number): string {
-	if (ms === null || ms <= 0) return "?";
-	const d = now - ms;
-	if (d < 0) return "0m";
-	const m = Math.floor(d / 60000);
-	if (m < 1) return "0m";
-	if (m < 60) return `${m}m`;
-	const h = Math.floor(m / 60);
-	if (h < 48) return `${h}h`;
-	return `${Math.floor(h / 24)}d`;
-}
 function sanitize(s: string): string {
 	return s.replace(/[\x00-\x1f\x7f]/g, "").replace(/\n/g, " ").slice(0, 120);
-}
-function truncateSummary(s: string): string {
-	const t = s.replace(/[\x00-\x1f\x7f]/g, "").replace(/\n/g, " ").trim();
-	return t ? t.slice(0, SUMMARY_TRUNCATE_CHARS) : "-";
 }
 
 /**
@@ -200,70 +143,6 @@ export function rankDetail(d: {
 	if (d.staleOver) return 3;
 	if (d.overdue) return 4;
 	return 5;
-}
-
-/**
- * 只读各仓 `<repo>/recentwork.md` 的 `## Active Tasks` → `### Task Index` 表
- * + `**Status**` 行，判定等人工动作证据。任一触发→该仓 gate=unknown：
- * 文件缺失 / 超 64KB / 表头漂移 / 解析异常。单仓异常由调用方记 warnings，
- * 不影响其它仓行。绝不写任何其它仓库。
- */
-export function readGateStatus(repoPath: string, warnings: string[]): GateStatus {
-	try {
-		const f = join(repoPath, "recentwork.md");
-		if (!existsSync(f)) return "unknown";
-		try {
-			if (statSync(f).size > MAX_GATE_BYTES) { warn(warnings, `gate 超 64KB 降级 unknown: ${basename(repoPath)}`); return "unknown"; }
-		} catch { return "unknown"; }
-		let text: string;
-		try { text = readFileSync(f, "utf8"); } catch { return "unknown"; }
-		let inActive = false; let sawIndex = false; let colsOk = false; let awaiting = false;
-		for (const line of text.split("\n")) {
-			if (/^##\s+Active Tasks/.test(line)) { inActive = true; continue; }
-			if (inActive && /^##\s+/.test(line)) break;
-			if (!inActive) continue;
-			if (/\*\*Status\*\*/.test(line) && /(waiting|等人工|awaiting|needs?-?human|需人工)/i.test(line)) awaiting = true;
-			if (/^###\s+Task Index/.test(line)) { sawIndex = true; continue; }
-			if (sawIndex && !colsOk && line.includes("|")) {
-				const h = line.toLowerCase();
-				if (h.includes("item") && h.includes("priority") && h.includes("summary")) colsOk = true;
-				else { warn(warnings, `gate 表头漂移降级 unknown: ${basename(repoPath)}`); return "unknown"; }
-				continue;
-			}
-		}
-		if (!sawIndex || !colsOk) return "unknown";
-		return awaiting ? "awaiting" : "ok";
-	} catch { return "unknown"; }
-}
-
-/**
- * 可见 tab 的 tail-capped 会话探活（复用 probeSessionFile；只读 bucket 内
- * .jsonl，匹配规则/时间窗消歧与 probeSessionsForDispatch 一致）。
- * 失败→null（调用方降级 unknown）。
- */
-function probeVisibleTab(rec: TabDispatchRecord, sessionsRoot: string): SessionProbe | null {
-	try {
-		const bucket = join(sessionsRoot, sessionBucketForCwd(rec.cwd));
-		if (!existsSync(bucket)) return null;
-		const dispatchedMs = Date.parse(rec.dispatchedAt);
-		for (const f of readdirSync(bucket)) {
-			if (!f.endsWith(".jsonl")) continue;
-			const full = join(bucket, f);
-			let probe: SessionProbe;
-			try { probe = probeSessionFile(full, rec.taskId, rec.mode, { maxTailLines: MAX_PROBE_TAIL_LINES }); }
-			catch { continue; }
-			if (!probe.matched) continue;
-			if (!Number.isNaN(dispatchedMs)) {
-				let sessionMs = probe.sessionTimestamp ? Date.parse(probe.sessionTimestamp) : NaN;
-				if (Number.isNaN(sessionMs)) {
-					try { sessionMs = statSync(full).mtimeMs; } catch { /* 保留候选 */ }
-				}
-				if (!Number.isNaN(sessionMs) && sessionMs < dispatchedMs - 60_000) continue;
-			}
-			return probe;
-		}
-		return null;
-	} catch { return null; }
 }
 
 /** 默认 git 探针：只读 HEAD + `git status --porcelain=v1 --untracked-files=normal`。失败/超时 → `?`。 */
@@ -299,61 +178,14 @@ export function defaultGitProbe(repoRoot: string): GitProbeResult {
 	} catch { return { branch: "?", dirty: "?" }; }
 }
 
-/** cwd 沿父目录向上找 .git（≤8 层，不过 profile/盘根）；无则回退 cwd 本身。 */
-function findRepoRoot(cwd: string, cache: Map<string, string>): string {
-	const norm = normalizeExactPath(cwd);
-	const hit = cache.get(norm);
-	if (hit) return hit;
-	try {
-		let cur = resolve(cwd);
-		for (let i = 0; i < 8; i++) {
-			try {
-				const g = join(cur, ".git");
-				if (existsSync(g)) { cache.set(norm, cur); return cur; }
-			} catch { break; }
-			const parent = dirname(cur);
-			if (parent === cur) break;
-			cur = parent;
-		}
-	} catch { /* fall through */ }
-	cache.set(norm, cwd);
-	return cwd;
-}
-
-interface TabNote { phase: string; active: boolean; attention: boolean; hiddenKind: "orphaned" | "terminal" | null; noResult: boolean; at: string }
-
-function classifyDispatch(rec: TabDispatchRecord, runsDir: string): TabNote {
-	const at = rec.dispatchedAt;
-	try {
-		const result = readTabResultFile(runsDir, rec.id);
-		if (result) {
-			const terminal = result.status === "completed" || result.status === "failed" || result.status === "cancelled";
-			if (terminal) return { phase: result.status, active: false, attention: false, hiddenKind: "terminal", noResult: false, at };
-			return { phase: "completed", active: false, attention: false, hiddenKind: "terminal", noResult: false, at };
-		}
-		const state = readTabState(runsDir, rec.id);
-		if (state) {
-			if (state.phase === "orphaned") return { phase: "orphaned", active: false, attention: false, hiddenKind: "orphaned", noResult: true, at: state.lastActivityAt ?? at };
-			if (state.terminal) {
-				// 终态但无 result → 待审（可见），绝不静默归 hidden
-				return { phase: state.phase, active: true, attention: true, hiddenKind: null, noResult: true, at: state.lastActivityAt ?? at };
-			}
-			const att = state.phase === "attached" || state.phase === "working" || state.phase === "waiting";
-			return { phase: state.phase, active: att, attention: state.phase === "working" || state.phase === "waiting" ? false : att, hiddenKind: null, noResult: true, at: state.lastActivityAt ?? at };
-		}
-		const st = classifyTabStatus(null, { dispatchedAt: rec.dispatchedAt });
-		if (st.phase === "orphaned") return { phase: "orphaned", active: false, attention: false, hiddenKind: "orphaned", noResult: true, at };
-		return { phase: st.phase, active: true, attention: st.phase === "unconfirmed", hiddenKind: null, noResult: true, at };
-	} catch {
-		return { phase: "unknown", active: false, attention: false, hiddenKind: null, noResult: true, at };
-	}
-}
-
 // ── phase2 明细 / 基线 IO（只读；写基线仅 writeGlobalViewBaseline，由调用层 best-effort 调用） ──
 
 /**
- * 构建单条可见 tab 明细。判态复用 composeTabStatus（result>state>probe 回退链）
- * + classifyForReclaim（awaitingInput 判定）；每列读不到→unknown，绝不猜。
+ * 构建单条可见 tab 明细。E2.0：归约体抽至共享 `reduceTabCarrier`（MF4）；
+ * 本函数只保留调用点职责——读 state/result、按 repo 缓存 gate（warnings 留在调用点）。
+ *
+ * 顺序依赖钉死：timers 聚合尚未完成时以 `repoOverdue=0` 调本函数（原 #L586），
+ * 聚合完成后由调用方回填 `d.overdue`（原 #L784）；共享归约不得假设该值为终值。
  */
 function buildTabDetail(
 	rec: TabDispatchRecord,
@@ -365,62 +197,14 @@ function buildTabDetail(
 	warnings: string[],
 	gateCache: Map<string, GateStatus>,
 ): TabDetail | null {
-	try {
-		let state: TabState | null = null;
-		let result: TabResult | null = null;
-		try { result = readTabResultFile(runsDir, rec.id); } catch { result = null; }
-		try { state = readTabState(runsDir, rec.id); } catch { state = null; }
-		// 探活成本控制：只在 state 缺 stop/摘要时探（terminal 已由 hidden 分流跳过）
-		let probe: SessionProbe | null = null;
-		if (!state?.lastStopReason || !state?.lastAssistantText) {
-			probe = probeVisibleTab(rec, sessionsRoot);
-		}
-		let phase: string = state?.phase ?? (result ? result.status : "unknown");
-		let terminal = state?.terminal ?? !!result;
-		let resultMissing = !result;
-		let reclaim: string = "pending";
-		try {
-			const view = composeTabStatus({ runId: rec.id, dispatch: rec, state, result, probe, dispatchedAt: rec.dispatchedAt });
-			phase = view.phase; terminal = view.terminal; resultMissing = view.resultMissing;
-			reclaim = classifyForReclaim(view);
-		} catch { /* 保持 state/result 直读值 */ }
-		const dispMs = toMs(rec.dispatchedAt);
-		const ageMs = dispMs && dispMs > 0 ? now - dispMs : null;
-		// stale 只认 TabState.lastActivityAt；无 state/无该字段→unknown，绝不拿 mtime 冒充
-		const actMs = toMs(state?.lastActivityAt);
-		const staleMs = actMs && actMs > 0 ? now - actMs : null;
-		const staleOver = staleMs !== null && staleMs > STALE_NO_PROGRESS_MS && (phase === "working" || phase === "waiting");
-		const stop = state?.lastStopReason ?? probe?.lastStopReason ?? "unknown";
-		let pidAlive: boolean | null = null;
-		if (typeof state?.pid === "number" && Number.isFinite(state.pid)) {
-			try { process.kill(state.pid, 0); pidAlive = true; } catch { pidAlive = false; }
-		}
-		let artifact = "-"; let artifactMtime = "?";
-		const cands = result?.reportPath ? [result.reportPath] : [...(result?.artifacts ?? [])];
-		const last = cands[cands.length - 1];
-		if (result && last) {
-			artifact = last;
-			try {
-				const p = existsSync(last) ? last : join(repoPath, last);
-				const m = statSync(p).mtimeMs;
-				artifactMtime = relText(m, now);
-			} catch { artifactMtime = "missing"; }
-		}
-		const gk = normalizeExactPath(repoPath);
-		let gate = gateCache.get(gk);
-		if (!gate) { gate = readGateStatus(repoPath, warnings); gateCache.set(gk, gate); }
-		return {
-			runId: rec.id, repoPath, phase, taskId: rec.taskId || "unknown",
-			age: ageMs !== null ? relText(now - ageMs, now) : "?",
-			stale: staleMs !== null ? relText(now - staleMs, now) : "unknown",
-			staleOver, stop,
-			artifact, artifactMtime, resultMissing, terminal,
-			openIssues: Array.isArray(result?.openIssues) ? result.openIssues.length : null,
-			summary: truncateSummary(probe?.lastAssistantText ?? state?.lastAssistantText ?? result?.finalText ?? result?.summary ?? ""),
-			needsHuman: reclaim === "awaitingInput" || gate === "awaiting",
-			gate, overdue: repoOverdue, pidAlive,
-		};
-	} catch { return null; }
+	let state: TabState | null = null;
+	let result: TabResult | null = null;
+	try { result = readTabResultFile(runsDir, rec.id); } catch { result = null; }
+	try { state = readTabState(runsDir, rec.id); } catch { state = null; }
+	const gk = normalizeExactPath(repoPath);
+	let gate = gateCache.get(gk);
+	if (!gate) { gate = readGateStatus(repoPath, warnings); gateCache.set(gk, gate); }
+	return reduceTabCarrier({ rec, sessionsRoot, repoPath, repoOverdue, now, gate, state, result });
 }
 
 /** 只读基线；缺失→{base:null}；损坏/不可解析→当作无基线 + warn（行为同首次运行）。 */
@@ -596,46 +380,12 @@ export function collectGlobalView(opts: GlobalViewOptions = {}): GlobalViewSnaps
 		} catch (e) { warn(warnings, `tab-runs 扫描失败: ${e instanceof Error ? e.message : String(e)}`); }
 
 		// timers：pending only；root 按 ownerCwd，mail 按 run→repo；未映射记 unmapped
-		const timerByRepo = new Map<string, { n: number; overdue: number }>();
-		let unmappedTimer = 0; let timersPending = 0;
-		const bumpTimer = (repoPath: string | null, dueAt: unknown): void => {
-			const due = toMs(dueAt) ?? 0;
-			const od = due > 0 && due < now ? 1 : 0;
-			if (!repoPath) { unmappedTimer++; return; }
-			const k = normalizeExactPath(repoPath);
-			const e = timerByRepo.get(k) ?? { n: 0, overdue: 0 };
-			e.n++; e.overdue += od; timerByRepo.set(k, e);
-		};
-		try {
-			if (existsSync(timersDir)) {
-				for (const f of readdirSync(timersDir)) {
-					if (!f.endsWith(".json") || f.endsWith(".tmp")) continue;
-					const full = join(timersDir, f);
-					try { if (statSync(full).isDirectory()) continue; } catch { continue; }
-					const r = readJson(full);
-					if (!r || r.status !== "pending") continue;
-					timersPending++;
-					const ownerCwd = typeof r.ownerCwd === "string" && r.ownerCwd ? r.ownerCwd : null;
-					bumpTimer(ownerCwd ? findRepoRoot(ownerCwd, repoCache) : null, r.dueAt);
-				}
-				const mailRoot = join(timersDir, "mail");
-				if (existsSync(mailRoot)) {
-					for (const run of readdirSync(mailRoot)) {
-						const dir = join(mailRoot, run);
-						let files: string[] = [];
-						try { files = readdirSync(dir); } catch { continue; }
-						for (const f of files) {
-							if (!f.endsWith(".json") || f.endsWith(".tmp")) continue;
-							const r = readJson(join(dir, f));
-							if (!r || r.status !== "pending") continue;
-							timersPending++;
-							const repo = runToRepo.get(run) ?? null;
-							bumpTimer(repo, r.dueAt);
-						}
-					}
-				}
-			}
-		} catch (e) { warn(warnings, `timers 扫描失败: ${e instanceof Error ? e.message : String(e)}`); }
+		// E2.0：聚合体抽至共享 collectTimerByRepo（MF4），本处仅解构 + warnings 记账。
+		const timerAgg = collectTimerByRepo(timersDir, now, runToRepo);
+		const timerByRepo = timerAgg.byRepo;
+		const timersPending = timerAgg.pending;
+		const unmappedTimer = timerAgg.unmapped;
+		if (timerAgg.error) warn(warnings, `timers 扫描失败: ${timerAgg.error}`);
 
 		// mailbox：pending/claimed 计数；global 进 HOME，其余按附件 detail 精确归仓，未解析记 other
 		const mailByRepo = new Map<string, { p: number; c: number }>();
