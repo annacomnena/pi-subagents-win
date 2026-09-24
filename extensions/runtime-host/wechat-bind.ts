@@ -254,7 +254,9 @@ function replyConfigFallback(key: string, value: unknown, fallback: string): str
  * reply 配置（0924 广播扩展）：
  *   - enabled：语义不变（≠false ⇒ 缺省 true，坏文件也 true）——向后兼容红线，表达式逐字不动。
  *   - mode：缺失 → "broadcast"（用户裁定②）；"reply-only"/"broadcast" 原样；其它非法值 →
- *     fail-closed 到 "reply-only"（保守路径）+ 一次性 warn（计划 §2、验收 B9）。
+ *     fail-closed 到 "reply-only"（保守路径）+ 一次性 warn（计划 §2、验收 B9）；
+ *     坏文件（JSON 解析抛/不可读）→ catch 同样 fail-closed "reply-only"（L4 S3：非法配置
+ *     两种松紧统一取保守者；enabled 坏文件仍 true 是既有红线不动）。
  *   - sessionScope：缺失 → "owner"（用户裁定①：只有 global master 会话广播）；合法值
  *     owner|main|any；非法 → fail-closed 到 "owner"。
  */
@@ -270,7 +272,11 @@ export function readWechatReplyConfig(configPath: string): { enabled: boolean; m
 			: reply.sessionScope === "owner" || reply.sessionScope === "main" || reply.sessionScope === "any" ? (reply.sessionScope as WechatReplySessionScope)
 			: (replyConfigFallback("sessionScope", reply.sessionScope, "owner") as WechatReplySessionScope);
 		return { enabled, mode, sessionScope };
-	} catch { return { enabled: true, mode: "broadcast", sessionScope: "owner" }; }
+	} catch {
+		// L4 S3：配置文件整体坏 = 非法配置 → mode fail-closed 到 reply-only（与 mode 取值非法同口径）；
+		// enabled:true 是向后兼容红线（坏文件也 true）保持不变。
+		return { enabled: true, mode: "reply-only", sessionScope: "owner" };
+	}
 }
 
 export function setWechatReplyConfig(enabled: boolean, path: string = readWechatConfigPath()): { ok: boolean; error?: string } {

@@ -24,6 +24,8 @@ import {
 	listReplyIntents, markReplyIntent, newReplyIntent, readReplyIntent, replyIntentDir,
 	deriveBroadcastIntentId, deriveReplyIntentId,
 } from "./runtime/wechat-reply.ts";
+import { attachmentPathFor } from "./runtime/registry.ts";
+import { masterAddress } from "./runtime/address.ts";
 import { WechatStore } from "./channel-wechat/store.ts";
 import { deriveBroadcastClientId, deriveReplyClientId } from "./channel-wechat/send.ts";
 import { readWechatReplyConfig, type WechatFetch } from "./runtime-host/wechat-bind.ts";
@@ -403,7 +405,7 @@ try {
 	});
 
 	// ── B9 配置兼容（enabled 缺省 / 全关 / mode 非法 / scope 非法） ────
-	await check("B9 {} → enabled:true+mode:broadcast+scope:owner；enabled:false 两模式全关；mode 非法 → reply-only fail-closed；scope 非法 → owner", async () => {
+	await check("B9 {} → enabled:true+mode:broadcast+scope:owner；enabled:false 两模式全关；mode/scope 非法 fail-closed；坏 JSON 文件 → reply-only", async () => {
 		resetWechatBroadcastStash();
 		// ① {}（无 reply 键）
 		const emptyCfg = mkEnv({});
@@ -454,11 +456,16 @@ try {
 			assert.equal(flushAfter(extractWechatReply(round("非法scope", 1758000009200, BODY), deps), deps).reason, "not-master-owner");
 			assert.equal(intentFiles(badScope.stateDir).length, 0, "非法 scope 未 fail-closed 到 owner");
 		} finally { rmSync(badScope.root, { recursive: true, force: true }); }
+		// ⑤ 配置文件整体坏（JSON 解析抛）→ mode fail-closed 到 reply-only（L4 S3：与 mode 取值非法同口径；enabled 仍 true 红线）
+		const brokenCfg = mkEnv({});
+		try {
+			writeFileSync(brokenCfg.configPath, "{ this is not json");
+			assert.deepEqual(readWechatReplyConfig(brokenCfg.configPath), { enabled: true, mode: "reply-only", sessionScope: "owner" });
+		} finally { rmSync(brokenCfg.root, { recursive: true, force: true }); }
 	});
 
 	// ── 补充：no-stash（settled 无暂存）与 no-known-chats ───────────────
-	await check("补充审计面：settled 无暂存 → no-stash；inbox 空 → no-known-chats（零动作）", () => {
-		resetWechatBroadcastStash();
+	await check("补充审计面：settled 无暂存 → no-stash；inbox 空 → no-known-chats（零动作）", () => {		resetWechatBroadcastStash();
 		const env = mkEnv(BROADCAST_CFG);
 		try {
 			const deps = envDeps(env);
@@ -471,6 +478,153 @@ try {
 			const r2 = flushWechatBroadcast(deps);
 			assert.equal(r2.reason, "no-known-chats");
 			assert.equal(intentFiles(env.stateDir).length, 0);
+		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── M1（L4 必须修）mode=reply-only 回滚：残留 pending 广播不发 ──────
+	await check("M1 reply-only 回滚：残留 pending broadcast 不出站（fetch=0、仍 pending）；reply intent（无 kind）照发", async () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv({ channels: { wechat: { reply: { mode: "reply-only" } } } });
+		try {
+			putChat(env, "m-a", A);
+			const dir = replyIntentDir(env.stateDir);
+			// 回滚前最后一轮已写出的 pending 广播 intent（L4 repro 同形态）
+			const roundId = deriveBroadcastRoundId(MASTER_SID, 1758000010500, "回滚前一轮");
+			const bcId = deriveBroadcastIntentId(roundId, A);
+			newReplyIntent(dir, { id: bcId, msgId: roundId, outboxId: roundId, fromId: A, clientId: deriveBroadcastClientId(roundId, A), text: BODY, kind: "broadcast" });
+			writeCreds(env); setWorkerStatus(env, "connected");
+			const log: { to: string; clientId: string }[] = [];
+			let stop = startWechatReplyWatcher({ runtimeDir: env.runtimeDir, stateDir: env.stateDir, configPath: env.configPath, intervalMs: 15, fetchImpl: senderFetch(log) });
+			await sleep(140); stop();
+			assert.equal(log.length, 0, "reply-only 回滚后残留广播仍被发出");
+			assert.equal(readReplyIntent(dir, bcId)?.status, "pending", "回滚应保留 pending（翻回 broadcast 可续发）");
+			assert.ok(!auditText(env.stateDir).includes("broadcast-expired"), "跳过轮不应写审计");
+			// reply intent（无 kind）不受 mode 门影响——旧路径红线
+			const rId = deriveReplyIntentId("9".repeat(64));
+			newReplyIntent(dir, { id: rId, msgId: "m-old", outboxId: "9".repeat(64), fromId: B, clientId: "cid-old", text: "旧回复" });
+			const log2: { to: string; clientId: string }[] = [];
+			stop = startWechatReplyWatcher({ runtimeDir: env.runtimeDir, stateDir: env.stateDir, configPath: env.configPath, intervalMs: 15, fetchImpl: senderFetch(log2) });
+			await sleep(140); stop();
+			assert.equal(log2.length, 1, "reply intent 应照发（mode 只门 broadcast）");
+			assert.equal(readReplyIntent(dir, rId)?.status, "sent");
+			assert.equal(readReplyIntent(dir, bcId)?.status, "pending", "广播 intent 不应被 reply 发送连带迁移");
+		} finally { rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── S5① 门序：TTL 先于 connected（status=polling 中过期 → failed） ──
+	await check("S5① status=polling + createdAt 11min → failed/broadcast-expired（TTL 门先于 connected 门，而非永久 pending）", async () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			writeCreds(env); setWorkerStatus(env, "polling"); // 非 connected：若 connected 门在前则会保留 pending
+			const dir = replyIntentDir(env.stateDir);
+			const roundId = deriveBroadcastRoundId(MASTER_SID, 1758000011500, "断连中过期");
+			const id = deriveBroadcastIntentId(roundId, A);
+			newReplyIntent(dir, { id, msgId: roundId, outboxId: roundId, fromId: A, clientId: deriveBroadcastClientId(roundId, A), text: BODY, kind: "broadcast", now: new Date(Date.now() - 11 * 60_000) });
+			const log: { to: string; clientId: string }[] = [];
+			const stop = startWechatReplyWatcher({ runtimeDir: env.runtimeDir, stateDir: env.stateDir, configPath: env.configPath, intervalMs: 15, fetchImpl: senderFetch(log) });
+			await sleep(140); stop();
+			assert.equal(log.length, 0, "过期意图不应出站");
+			assert.equal(readReplyIntent(dir, id)?.status, "failed", "polling 中过期应直接终态 failed（TTL 先于 connected）");
+			assert.equal(readReplyIntent(dir, id)?.error, "broadcast-expired");
+		} finally { rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── S5② sessionId undefined + ownerSid 存在 → not-master-owner ─────
+	await check("S5② ownerSid 存在但 sessionId:()=>undefined → not-master-owner（fail-closed）", () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			putChat(env, "m-a", A);
+			const deps = envDeps(env, { sessionId: () => undefined });
+			flushAfter(extractWechatReply(round("第八问", 1758000012600, BODY), deps), deps);
+			assert.equal(intentFiles(env.stateDir).length, 0, "undefined 会话不应写 intent");
+			assert.ok(auditRows(env.stateDir).some((r) => r.reason === "not-master-owner"), "缺 not-master-owner 审计");
+		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── S5③ 真实 masterSessionId 缺省路径（不注入该 dep → readAttachment(masterAddress())）──
+	await check("S5③ 不注入 masterSessionId：走真实 readAttachment(masterAddress())（无 attachment→fail-closed；写入 attachment→可广播）", () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
+		const attachRoot = mkdtempSync(join(tmpdir(), "wechat-broadcast-attach-"));
+		process.env.PI_RUNTIME_DIR = attachRoot; // defaultRuntimeDir() 现读 env → attachment 路径隔离
+		try {
+			putChat(env, "m-a", A);
+			// 刻意不注入 masterSessionId —— 只给 stateDir/runtimeDir/configPath/sessionId
+			const deps: ReplyHookDeps = { stateDir: env.stateDir, runtimeDir: env.runtimeDir, configPath: env.configPath, subagent: () => false, sessionId: () => MASTER_SID };
+			const msgs = round("缺省路径问", 1758000013700, BODY);
+			// ① 无 attachment → 默认路径 fail-closed（证明 ownerSid 来自真实 readAttachment，非注入）
+			flushAfter(extractWechatReply(msgs, deps), deps);
+			assert.equal(intentFiles(env.stateDir).length, 0, "无 attachment 不应写 intent");
+			assert.ok(auditRows(env.stateDir).some((r) => r.reason === "master-attachment-unavailable"), "默认路径未走 readAttachment（缺 master-attachment-unavailable 审计）");
+			// ② 写入真实 master attachment → 默认路径解析出 ownerSid → 正常广播
+			const p = attachmentPathFor(masterAddress());
+			mkdirSync(join(p, ".."), { recursive: true });
+			writeFileSync(p, JSON.stringify({ agentAddress: masterAddress(), sessionId: MASTER_SID, generation: 1, attachedAt: new Date().toISOString(), lastHeartbeatAt: new Date().toISOString(), attemptId: "att-test" }));
+			flushAfter(extractWechatReply(round("缺省路径问2", 1758000013800, BODY), deps), deps);
+			assert.equal(intentFiles(env.stateDir).length, 1, "attachment 存在时默认路径应解析 ownerSid 并写 intent");
+		} finally {
+			resetWechatBroadcastStash();
+			if (prevRuntimeDir === undefined) delete process.env.PI_RUNTIME_DIR; else process.env.PI_RUNTIME_DIR = prevRuntimeDir;
+			rmSync(attachRoot, { recursive: true, force: true });
+			rmSync(env.root, { recursive: true, force: true });
+		}
+	});
+
+	// ── S1 资格门失败且无暂存 → 静默（不写审计行） ───────────────────
+	await check("S1 资格门失败 + 无 stash → 静默返回（audit 零增长）；有 stash 才记审计", () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			const silent = envDeps(env, { sessionId: () => OTHER_SID }); // 非 owner，但从未暂存
+			assert.equal(flushWechatBroadcast(silent).reason, "not-master-owner");
+			assert.equal(auditText(env.stateDir), "", "无 stash 的资格门失败不应写审计（防单向增长）");
+			// 有 stash → 仍记一行（真正丢弃了内容）
+			flushAfter(extractWechatReply(round("第十一问", 1758000011100, BODY), silent), silent);
+			assert.ok(auditRows(env.stateDir).some((r) => r.reason === "not-master-owner"), "有 stash 时应记审计");
+		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── S2 TTL fail-closed：createdAt 不可解析 → 过期终态 ─────────────
+	await check("S2 createdAt 不可解析（Date.parse NaN）→ fail-closed failed/broadcast-expired（不落 connected 门）", async () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			writeCreds(env); setWorkerStatus(env, "connected");
+			const dir = replyIntentDir(env.stateDir);
+			const roundId = deriveBroadcastRoundId(MASTER_SID, 1758000012200, "坏 createdAt");
+			const id = deriveBroadcastIntentId(roundId, A);
+			newReplyIntent(dir, { id, msgId: roundId, outboxId: roundId, fromId: A, clientId: deriveBroadcastClientId(roundId, A), text: BODY, kind: "broadcast" });
+			// 手工改坏 createdAt（模拟损坏/手工编辑文件）
+			const p = join(dir, `${id}.json`);
+			const raw = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+			raw.createdAt = "not-a-date";
+			writeFileSync(p, JSON.stringify(raw));
+			const log: { to: string; clientId: string }[] = [];
+			const stop = startWechatReplyWatcher({ runtimeDir: env.runtimeDir, stateDir: env.stateDir, configPath: env.configPath, intervalMs: 15, fetchImpl: senderFetch(log) });
+			await sleep(140); stop();
+			assert.equal(log.length, 0, "坏 createdAt 不应出站（fail-open）");
+			assert.equal(readReplyIntent(dir, id)?.status, "failed");
+			assert.equal(readReplyIntent(dir, id)?.error, "broadcast-expired");
+		} finally { rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	// ── S4 flush 校验 stash.sessionId ≠ 当前会话 → 丢弃 + 审计 ───────
+	await check("S4 tab 暂存（sessionId=A）后 master settled（sessionId=B）→ 丢弃 + stash-session-mismatch 审计、零 intent", () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			putChat(env, "m-a", A);
+			const tabDeps = envDeps(env, { sessionId: () => OTHER_SID }); // tab 轮暂存
+			extractWechatReply(round("第十二问", 1758000012300, BODY), tabDeps);
+			const masterDeps = envDeps(env); // master settled（资格门过：sessionId === ownerSid）
+			const r = flushWechatBroadcast(masterDeps);
+			assert.equal(r.written, false);
+			assert.equal(r.reason, "stash-session-mismatch");
+			assert.equal(intentFiles(env.stateDir).length, 0, "跨会话暂存内容不应被广播");
+			assert.ok(auditRows(env.stateDir).some((x) => x.reason === "stash-session-mismatch"), "缺 stash-session-mismatch 审计");
 		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
 	});
 } catch (e) {

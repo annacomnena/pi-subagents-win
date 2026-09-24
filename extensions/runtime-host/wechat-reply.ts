@@ -29,13 +29,18 @@ export function startWechatReplyWatcher(opts: WechatReplyWatcherOptions): () => 
  const run = async (): Promise<void> => {
   if (busy || stopped) return; busy = true;
   try {
-   if (!readConfig(configPath).enabled) return; // disabled: no consume, preserve pending
+   const cfg = readConfig(configPath);
+   if (!cfg.enabled) return; // disabled: no consume, preserve pending
    // 接收 worker 在线状态（每轮 run 新建实例读——readState 实例内缓存，复用会陈旧；recon⑥/计划 §5）。
    // 懒读：仅当本轮遇到 pending broadcast intent 时读一次；reply-only 路径零额外 IO。
    let receiveStatus: string | null = null;
    for (const item of listReplyIntents(intentDir)) {
     if (stopped) break;
     if (item.status !== "pending") continue;
+    // M1（L4 必须修）：mode 已回滚到 reply-only → broadcast intent 整轮跳过（保留 pending、
+    // 零审计，与 enabled=false 同形态；TTL 窗口照走，翻回 broadcast 后过期即 failed、未过期续发）。
+    // reply intent（无 kind）不进此分支——旧路径红线不变。
+    if (item.kind === "broadcast" && cfg.mode !== "broadcast") continue;
     const base = { at: new Date().toISOString(), msgId: maskWechatOpenId(item.msgId), from: maskWechatOpenId(item.fromId) };
     if (item.attempts >= 1) {
      const updated = markReplyIntent(intentDir, item.id, { status: "unknown", error: "attempts-exhausted" });
@@ -45,7 +50,8 @@ export function startWechatReplyWatcher(opts: WechatReplyWatcherOptions): () => 
     if (item.kind === "broadcast") {
      // ① TTL（先于 connected 门）：过期即终态 failed，不发。
      const age = Date.now() - Date.parse(item.createdAt);
-     if (Number.isFinite(age) && age > BROADCAST_INTENT_TTL_MS) {
+     // S2：createdAt 不可解析（Date.parse → NaN）→ fail-closed 判过期（防倾泻方向），不落 connected 门。
+     if (!Number.isFinite(age) || age > BROADCAST_INTENT_TTL_MS) {
       if (markReplyIntent(intentDir, item.id, { status: "failed", error: "broadcast-expired" })) audit(stateDir, { ...base, kind: "broadcast", event: "failed", reason: "broadcast-expired" });
       continue;
     }

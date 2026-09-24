@@ -12,7 +12,8 @@ import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 
 export type ReplySkipReason = "no-text" | "reply-disabled" | "no-inbox-match" | "marker-not-first" | "bot-domain"
- | "no-stash" | "no-known-chats" | "not-main-session" | "not-master-owner" | "master-attachment-unavailable";
+ | "no-stash" | "no-known-chats" | "not-main-session" | "not-master-owner" | "master-attachment-unavailable"
+ | "stash-session-mismatch";
 export interface ReplyHookDeps {
  stateDir?: string; runtimeDir?: string; configPath?: string; subagent?: () => boolean;
  /** 当前会话 UUID（缺省 getCurrentSessionId()）——owner 资格门比对左值。 */
@@ -94,16 +95,26 @@ export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushRe
   // disabled / mode 已翻回 reply-only：丢弃暂存静默返回（不产生任何 reply 侧副作用）
   if (!cfg.enabled || cfg.mode !== "broadcast") { pendingBroadcast = null; return { written: false, count: 0 }; }
   const at = () => new Date().toISOString();
+  // S1（L4）：资格门失败但本会话无暂存 → 静默返回（audit jsonl 无轮转会单向增长，
+  // 不能让每个 tab settled 轮都落一行）；有 stash 才记审计（真正丢弃了内容才值得记）。
+  const hadStash = pendingBroadcast !== null;
   if (cfg.sessionScope === "owner") {
    const ownerSid = deps.masterSessionId ? deps.masterSessionId() : defaultMasterSessionId();
    const currentSid = deps.sessionId?.() ?? getCurrentSessionId();
-   if (!ownerSid) { pendingBroadcast = null; audit(stateDir, { at: at(), event: "skipped", reason: "master-attachment-unavailable", scope: "owner" }); return { written: false, count: 0, reason: "master-attachment-unavailable" }; }
-   if (!currentSid || currentSid !== ownerSid) { pendingBroadcast = null; audit(stateDir, { at: at(), event: "skipped", reason: "not-master-owner", scope: "owner" }); return { written: false, count: 0, reason: "not-master-owner" }; }
+   if (!ownerSid) { pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "master-attachment-unavailable", scope: "owner" }); return { written: false, count: 0, reason: "master-attachment-unavailable" }; }
+   if (!currentSid || currentSid !== ownerSid) { pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "not-master-owner", scope: "owner" }); return { written: false, count: 0, reason: "not-master-owner" }; }
   } else if (cfg.sessionScope === "main" && !(deps.mainSession ?? isMainSession)()) {
-   pendingBroadcast = null; audit(stateDir, { at: at(), event: "skipped", reason: "not-main-session", scope: "main" }); return { written: false, count: 0, reason: "not-main-session" };
+   pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "not-main-session", scope: "main" }); return { written: false, count: 0, reason: "not-main-session" };
   } // scope "any"：仅 subagent 门（上方）
   const stash = pendingBroadcast; pendingBroadcast = null;
   if (!stash) { audit(stateDir, { at: at(), event: "skipped", reason: "no-stash" }); return { written: false, count: 0, reason: "no-stash" }; }
+  // S4（L4）：暂存会话 ≠ 当前 settled 会话 → 丢弃 + 审计（防同进程内 tab 先暂存、
+  // master 隗后 settled 时把 tab 轮内容按 owner 资格广播出去）。口径与 stashWechat
+  // Broadcast 的 sessionId 记录一致（两端取不到时均为 "unknown"，视为同端）。
+  if (stash.sessionId !== ((deps.sessionId?.() ?? getCurrentSessionId()) ?? "unknown")) {
+   audit(stateDir, { at: at(), event: "skipped", reason: "stash-session-mismatch", scope: cfg.sessionScope });
+   return { written: false, count: 0, reason: "stash-session-mismatch" };
+  }
   if (!stash.text) { audit(stateDir, { at: at(), event: "skipped", reason: "no-text", msgId: maskWechatOpenId(stash.roundKey) }); return { written: false, count: 0, reason: "no-text" }; }
   const dir = replyIntentDir(stateDir);
   let chats: { fromId: string; lastAt: string }[] = [];
