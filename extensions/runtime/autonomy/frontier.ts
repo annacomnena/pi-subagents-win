@@ -43,7 +43,8 @@ export type FrontierRule =
 	| "risk_high" // ⑥ record-only（无 risk 载体）
 	| "deadline_urgency" // ⑦ approx：timer overdue 0→正（auto-push timer ≠ 真 deadline，明示近似）
 	| "expected_event_timeout" // ⑧ record-only（无 per-project 期望事件账本，L1A 未决 #2）
-	| "stagnation"; // ⑨ 实做
+	| "stagnation" // ⑨ 实做
+	| "ws_mail_backlog"; // 未消费 ws-mail 到信
 
 export interface FrontierTrigger {
 	rule: FrontierRule;
@@ -217,6 +218,13 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo.get(k) ?? 0));
 
 	const triggers: FrontierTrigger[] = [];
+	// R4：未消费到信（pending>0）是可唤醒的真实输入，不消费/ack 邮件。
+	// 以当前 backlog 状态产生 trigger；无到信时不改变任何既有输出。
+	for (const mail of inputs.backlog) {
+		if (mail.pending > 0) {
+			triggers.push({ rule: "ws_mail_backlog", project: `mailbox:${mail.recipient}`, evidence: `pending:${mail.pending}`, approximate: false });
+		}
+	}
 	if (!baseline) {
 		const prevKeys = [...prevByRepo.keys()].sort();
 		for (const key of prevKeys) {

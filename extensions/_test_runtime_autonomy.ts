@@ -510,6 +510,17 @@ check("A4.9 新出现项目（不在 prev）：不触发、version 起 1", () =>
 	assert.equal(diff.triggers.length, 0);
 	assert.equal(next.projects[0].meaningfulStateVersion, 1);
 });
+check("A4.10 R4 ws-mail 到信触发并放行；无到信输出逐字节不变", () => {
+	const snapshot = makeSnapshot([makeTab({ runId: "mail-test", repoPath: R1, phase: "working" })]);
+	const prev = makePrevSnap(NOW - 60_000, []);
+	const empty = buildFrontier({ snapshot, backlog: [], prev, now: NOW });
+	const withMail = buildFrontier({ snapshot, backlog: [{ recipient: "agent__master_default", pending: 1, claimed: 0 }], prev, now: NOW });
+	assert.deepEqual(empty, buildFrontier({ snapshot, backlog: [], prev, now: NOW }));
+	assert.deepEqual(withMail.diff.triggers.map(t => t.rule), ["ws_mail_backlog"]);
+	const decision = evaluateWakeGate({ gating: { active: true, reason: "active" }, diff: withMail.diff,
+		state: { lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: NOW - 5_000 }, cfg: DEFAULT_AUTONOMY.wakeGate, now: NOW });
+	assert.equal(decision.wake, true);
+});
 
 // ════════════════════════════ A5 首帧基线 ════════════════════════════
 console.log("A5 首帧基线");
@@ -523,8 +534,9 @@ check("A5 prev=null → baseline:true、零触发（全开标志也只建基线�
 		now: NOW,
 	});
 	assert.equal(next.baseline, true);
-	assert.deepEqual(next.triggers, []);
-	assert.deepEqual(diff.triggers, []);
+	assert.equal(next.triggers.length, 1); // R4：未消费 ws-mail 到信不被冷启动基线吞掉
+	assert.equal(next.triggers[0].rule, "ws_mail_backlog");
+	assert.deepEqual(diff.triggers, next.triggers);
 	const p = next.projects[0];
 	assert.equal(p.needsUser, true);
 	assert.equal(p.stagnation, true);
@@ -794,7 +806,7 @@ const EXT_ROOT = join(REPO_ROOT, "extensions");
 check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 allowlist（Task 2006）", () => {
 	// v2 接线后生产文件 import 合法化：零 import 不变量改为 allowlist 双向精确匹配
 	//（多一个 = 红线违规；少一个 = 接线被静默拆除）。相对路径与相对名 ALLOW 对齐（L2 审查要点 ①）。
-	const ALLOW = ["index.ts", "master-tools.ts"]; // 相对 EXT_ROOT（2026-09-23 v2 接线）
+	const ALLOW = ["index.ts", "master-tools.ts", "runtime-host/server.ts"]; // 相对 EXT_ROOT（2026-09-24 autonomy endpoint）
 	const offenders: string[] = [];
 	const walk = (dir: string): void => {
 		for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -806,7 +818,7 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// 本测试文件（v1 既有排除）+ v2 接线测试文件自身 import runtime/autonomy 字面量（不排除即假红，L2 审查要点 ②）
 				if (p === join(EXT_ROOT, "_test_runtime_autonomy.ts")) continue;
 				if (p === join(EXT_ROOT, "_test_autonomy_wiring.ts")) continue;
-				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p));
+				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
 	};

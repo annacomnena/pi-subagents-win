@@ -148,6 +148,10 @@ import {
 	type WechatFetch,
 } from "./wechat-bind.ts";
 import { ChannelSupervisor } from "./channel-supervisor.ts";
+import { setAutonomyEnabled } from "./autonomy-config.ts";
+import { readAutonomyConfig } from "../runtime/autonomy/config.ts";
+import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/collect.ts";
+import { readKillSwitch } from "../runtime/autonomy/kill-switch.ts";
 import { startWechatInput } from "./wechat-input.ts";
 import { readAttachment } from "../runtime/registry.ts";
 import { masterAddress } from "../runtime/address.ts";
@@ -1104,6 +1108,26 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			// authorizeCommand 链（无/错 → 401，同 /v1/commands 面）；opt-in OFF（enabled!==true）→
 			// 5 个绑定端点 403 wechat-disabled（enable/disable 不受闸限制；GUI「微信连接」入口始终渲染）。
 			// token 永不进任何响应。
+			if (u.pathname === "/v1/autonomy/set" || u.pathname === "/v1/autonomy/status") {
+				if (!authorizeCommand(req)) { respondJson(res, 401, { error: "unauthorized" }); try { req.destroy(); } catch {} return; }
+				if (u.pathname === "/v1/autonomy/set" && req.method === "POST") {
+					let raw = ""; req.setEncoding("utf8");
+					req.on("data", (chunk: string) => { raw += chunk; if (raw.length > 4096) { try { req.destroy(); } catch {} } });
+					req.on("end", () => {
+						let on: unknown; try { on = (JSON.parse(raw || "{}") as { enabled?: unknown }).enabled; } catch { on = undefined; }
+						if (typeof on !== "boolean") { respondJson(res, 400, { error: "invalid-body" }); return; }
+						const result = setAutonomyEnabled(on, configPath);
+						if (!result.ok) { respondJson(res, 500, { error: "config-write-failed", message: result.error }); return; }
+						respondJson(res, 200, { enabled: readAutonomyConfig({ configPath }).enabled });
+					}); return;
+				}
+				if (u.pathname === "/v1/autonomy/status" && req.method === "GET") {
+					const cfg = readAutonomyConfig({ configPath }); const kill = readKillSwitch({ stateDir: opts.stateDir });
+					const frontier = readFrontierSnapshot({ stateDir: opts.stateDir }); const gate = readWakeGateState({ stateDir: opts.stateDir });
+					respondJson(res, 200, { enabled: cfg.enabled, kill: kill ? `on (${kill.reason})` : "off", frontier: frontier ? new Date(frontier.asof).toISOString() : null, wakeGate: gate?.lastReason ? `${gate.lastReason} @ ${gate.lastDecisionAt}` : null }); return;
+				}
+				respondJson(res, 405, { error: "method-not-allowed" }); return;
+			}
 			if (u.pathname.startsWith("/v1/wechat/")) {
 				handleWechat(req, res, u);
 				return;

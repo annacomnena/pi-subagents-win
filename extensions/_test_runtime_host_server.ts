@@ -130,9 +130,12 @@ try {
 	const timersDir = join(D, "timers");
 	const mailboxDir = join(D, "mailbox");
 	const journalPath = join(D, "events.jsonl");
+	const autonomyConfigPath = join(D, "config.json");
+	writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
 	mkdirSync(join(timersDir, "sessions"), { recursive: true });
 
 	const h = await createRuntimeHostServer({
+		configPath: autonomyConfigPath,
 		hostPath,
 		timersDir,
 		stateDir: join(D, "state"),
@@ -141,6 +144,19 @@ try {
 	});
 	const base = `http://127.0.0.1:${h.info.port}`;
 	try {
+		// Autonomy 开关 API：未认证 401；认证后写入与 D17a 四要素状态。
+		{
+			const noAuth = await fetch(`${base}/v1/autonomy/status`);
+			assert.equal(noAuth.status, 401);
+			const auth = { "X-Command-Token": h.info.token! };
+			const status = await fetch(`${base}/v1/autonomy/status`, { headers: auth });
+			assert.equal(status.status, 200);
+			const data = await status.json() as Record<string, unknown>;
+			assert.deepEqual(Object.keys(data).sort(), ["enabled", "frontier", "kill", "wakeGate"].sort());
+			const set = await fetch(`${base}/v1/autonomy/set`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
+			assert.equal(set.status, 200); assert.equal((await set.json() as { enabled: boolean }).enabled, true);
+			assert.equal(JSON.parse(readFileSync(autonomyConfigPath, "utf8")).autonomy.enabled, true);
+		}
 		// T1 无 attachment：master 段全空态
 		{
 			const r = await getJson(base, "/v1/health");

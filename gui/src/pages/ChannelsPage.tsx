@@ -271,6 +271,15 @@ function InputBlock() {
  </div></Card>;
 }
 
+function AutonomySettings() {
+	const [state, setState] = useState<{ enabled: boolean; kill: string; frontier: string | null; wakeGate: string | null } | null>(null);
+	const [error, setError] = useState("");
+	const refresh = useCallback(async () => { try { const r = await fetch("/v1/autonomy/status"); if (r.ok) setState(await r.json()); else setError(`状态读取失败 HTTP ${r.status}`); } catch { setError("状态读取失败"); } }, []);
+	useEffect(() => { void refresh(); }, [refresh]);
+	const toggle = async (enabled: boolean) => { try { const r = await fetch("/v1/autonomy/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }); if (!r.ok) { setError(`写入失败 HTTP ${r.status}`); return; } setError(""); await refresh(); } catch { setError("写入失败"); } };
+	return <Card title="主动性套件"><div className="space-y-2 text-xs"><label className="flex gap-2"><input type="checkbox" checked={state?.enabled ?? false} disabled={!state} onChange={e => void toggle(e.target.checked)} />启用主动性套件</label><p>开启后启用总门（可压制唤醒）+ 写审计/快照；当前不执行任何自动动作（不自动派活、不自动重启 worker）。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
+}
+
 export function ChannelsPage() {
 	const [status, setStatus] = useState<WechatBindStatusBody | null>(null);
 	const [disabled, setDisabled] = useState(false);
@@ -403,6 +412,8 @@ export function ChannelsPage() {
 	if (disabled) {
 		return (
 			<div className="space-y-3">
+				{/* L4 must-fix 1：autonomy 开关必须在**所有分支**可达（D17）——否则默认配置下走早退分支，开关形同虚设 */}
+				<AutonomySettings />
 				<PageIntro>微信连接</PageIntro>
 				<Card
 					title={
@@ -434,6 +445,8 @@ export function ChannelsPage() {
 	if (unauthorized) {
 		return (
 			<div className="space-y-3">
+				{/* L4 must-fix 1：同上——未授权分支也必须能到达 autonomy 开关（卡片自身会显示获取失败） */}
+				<AutonomySettings />
 				<PageIntro>微信连接</PageIntro>
 				<Card title={<Term zh="未获得本机凭据" en="401 unauthorized" />}>
 					<div className="space-y-3">
@@ -454,6 +467,7 @@ export function ChannelsPage() {
 
 	return (
 		<div className="space-y-3">
+			<AutonomySettings />
 			<PageIntro>扫码绑定微信（v1 只做绑定/解绑/状态；消息收发是后续切片）</PageIntro>
 
 			<Card

@@ -41,6 +41,8 @@ import { getPendingReminder } from "./runtime/master-succession.ts";
 import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
+import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
+import { readWechatConfigPath } from "./runtime-host/wechat-bind.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -1965,14 +1967,27 @@ export default function (pi: ExtensionAPI) {
 	});
 	// ── /autonomy（Task 2006 L2，D-I）──
 	// 学术诚实定性：kill/clear 是用户在交互会话手动键入的运维命令（不新增 LLM 可调 tool，
-	// tool 快照与 dispatch 侧零变化）；启用 autonomy = 用户手动在 config.json 加
-	// "autonomy":{"enabled":true}（本命令不写 config——禁动约束）。全部状态读为容忍读 never-throw。
+	// tool 快照与 dispatch 侧零变化）；切换开关用 `/autonomy on|off` 或 GUI 设置区的
+	// 「主动性套件」卡片（setAutonomyEnabled 原子写 config，保留其它字段）。
+	// 全部状态读为容忍读 never-throw。
 	pi.registerCommand("autonomy", {
-		description: "autonomy 套件总门：/autonomy [status] | /autonomy kill [reason] | /autonomy clear（kill/clear 为手动运维命令；启用需手动在 config.json 加 autonomy.enabled=true）",
+		description: "autonomy 套件总门：/autonomy on|off|status|kill [reason]|clear（当前不执行自动动作）",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0] ?? "status";
 			const sid = durableSessionIdentity(ctx as never);
+			if (sub === "on" || sub === "off") {
+				// L4 should-fix 3：与 kill/clear 对齐——子 agent 会话不得翻转总门（手动运维面）。
+				if (isSubagent()) {
+					ctx.ui.notify("autonomy: 子 agent 会话不可切换总门（手动运维命令）", "warning");
+					return;
+				}
+				const result = setAutonomyEnabled(sub === "on", readWechatConfigPath());
+				// L4 should-fix 4：开关翻转也要留痕（与 kill/clear 同口径；best-effort，不影响回执）。
+				if (result.ok) appendAuditEvent("gating", sub === "on" ? "enable" : "disable", `by=user:${sid?.slice(0, 12) ?? "cli"}`);
+				ctx.ui.notify(result.ok ? `autonomy enabled=${sub}` : `autonomy config write failed: ${result.error}`, result.ok ? "info" : "warning");
+				return;
+			}
 			if (sub === "kill" || sub === "clear") {
 				// subagent 会话拦截 kill/clear（与 master 工具组 subBlocked 同款）
 				if (isSubagent()) {
@@ -1997,7 +2012,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub !== "status") {
-				ctx.ui.notify("用法：/autonomy [status] | /autonomy kill [reason] | /autonomy clear", "warning");
+				ctx.ui.notify("用法：/autonomy on|off|status|kill [reason]|clear", "warning");
 				return;
 			}
 			// status：全容忍读，never-throw（D-I 列表项逐行渲染）
@@ -2011,7 +2026,7 @@ export default function (pi: ExtensionAPI) {
 				const tail = readAuditTail({ limit: 5 });
 				const iso = (t: number): string => new Date(t).toISOString().slice(0, 19);
 				body = [
-					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（启用 = 手动在 config.json 加 "autonomy":{"enabled":true}；本命令不写 config）`,
+					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（切换：/autonomy on|off，或 GUI 设置区的「主动性套件」开关）`,
 					`kill-switch: ${kill ? `on (reason=${kill.reason} @${kill.at.slice(0, 19)} by=${kill.by})` : "off"}`,
 					`gating: ${gating.active ? "active" : `inactive (${gating.reason})`}`,
 					`frontier: ${frontier ? `asof=${iso(frontier.asof)} baseline=${frontier.baseline} projects=${frontier.projects.length} triggers(last)=${frontier.triggers.length}` : "(none)"}`,
