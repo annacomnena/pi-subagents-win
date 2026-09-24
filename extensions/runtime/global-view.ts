@@ -186,6 +186,11 @@ export function defaultGitProbe(repoRoot: string): GitProbeResult {
  *
  * 顺序依赖钉死：timers 聚合尚未完成时以 `repoOverdue=0` 调本函数（原 #L586），
  * 聚合完成后由调用方回填 `d.overdue`（原 #L784）；共享归约不得假设该值为终值。
+ *
+ * R2（已知差异，零行为风险）：gate 在本 wrapper 内、归约前计算（旧版在归约体末尾算）。
+ * 唯一可观测差异：病态 `result.artifacts` 非可迭代使归约抛错时，本版先经 readGateStatus
+ * 推入一条 gate warning 后仍返回 null（旧版不推）；details/rows 不受影响，仅 warnings[]
+ * 在病理输入下多一条。
  */
 function buildTabDetail(
 	rec: TabDispatchRecord,

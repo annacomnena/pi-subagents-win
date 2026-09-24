@@ -9,6 +9,10 @@
  * 填 projectAttention（F3）；O-C 只读缓存 `state/work-graph/<scope>.json`（**唯一写者 = 本文件**，
  * 纯函数层 types/project/edges/diff 仍零写）。
  *
+ * 缓存版本约定（R5）：`GRAPH_SNAPSHOT_VERSION` **必须随 schema 扩字段 bump**（含 carriers/history
+ * 等子结构）；否则旧缓存会被 E2.1 `toFrontierInput` 读出而 carrier 字段全缺 → watchdog 静默失活。
+ * 本文件 `readGraphSnapshotCache` 另做 carrier/history 子结构校验兜底（version 未 bump 时也拒绝旧形）。
+ *
  * 红线：不写 journal / tab-runs / workstreams / registry（Graph 是只读投影，业务态无 writer）；
  *      不 import autonomy 模块（A10.1 allowlist 不扩）；不触 RuntimeSnapshot/protocol/index。
  */
@@ -219,13 +223,17 @@ function scopeName(scope?: string): string {
 	return (scope ?? "global").replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
+/** 同进程并发写 tmp 名去重计数（R5/遗漏 4：pid+时间戳+计数器，杜绝同 ms 冲突）。 */
+let tmpSeq = 0;
+
 /** 原子写快照缓存（tmp+rename；best-effort，失败返回 false，绝不抛）。 */
 export function writeGraphSnapshotCache(snap: GraphSnapshot, opts?: { stateDir?: string; scope?: string }): boolean {
 	try {
 		const dir = workGraphDir(opts?.stateDir);
 		mkdirSync(dir, { recursive: true });
-		const file = join(dir, `${scopeName(opts?.scope)}.json`);
-		const tmp = join(dir, `${scopeName(opts?.scope)}.${process.pid}.tmp`);
+		const name = scopeName(opts?.scope);
+		const file = join(dir, `${name}.json`);
+		const tmp = join(dir, `${name}.${process.pid}.${Date.now()}.${tmpSeq++}.tmp`);
 		writeFileSync(tmp, JSON.stringify(snap), "utf8");
 		renameSync(tmp, file);
 		return true;
@@ -234,11 +242,44 @@ export function writeGraphSnapshotCache(snap: GraphSnapshot, opts?: { stateDir?:
 	}
 }
 
-/** 容忍读快照缓存：缺失/坏 JSON/版本不符 → null（行为同无缓存）。 */
+const CARRIER_KEYS = ["gate", "needsHuman", "staleOver", "overdue", "pidAlive"] as const;
+
+/**
+ * 缓存子结构校验（R5）：version/nodes/edges/projects 之外，校验 history 形状与每个 run 的
+ * carrier 五键**存在性**（E2.0 起 `projectGraph` 恒赋，缺→null）。E2.0 前旧缓存无这些键
+ * → 拒绝（防读出后 carrier 全 undefined 致 watchdog 检查 6 静默失活）。
+ */
+function isCurrentSnapshot(raw: unknown): raw is GraphSnapshot {
+	if (!raw || typeof raw !== "object") return false;
+	const s = raw as Record<string, unknown>;
+	if (s.version !== GRAPH_SNAPSHOT_VERSION) return false;
+	if (!Array.isArray(s.nodes) || !Array.isArray(s.edges) || !Array.isArray(s.projects)) return false;
+	if (s.history !== undefined) {
+		if (!Array.isArray(s.history)) return false;
+		for (const h of s.history) {
+			if (!h || typeof h !== "object") return false;
+			const e = h as Record<string, unknown>;
+			if (typeof e.id !== "string" || typeof e.reason !== "string") return false;
+		}
+	}
+	if (s.asof !== undefined && typeof s.asof !== "number") return false;
+	for (const p of s.projects) {
+		if (!p || typeof p !== "object") return false;
+		const runs = (p as Record<string, unknown>).runs;
+		if (!Array.isArray(runs)) return false;
+		for (const r of runs) {
+			if (!r || typeof r !== "object") return false;
+			for (const k of CARRIER_KEYS) if (!Object.hasOwn(r, k)) return false;
+		}
+	}
+	return true;
+}
+
+/** 容忍读快照缓存：缺失/坏 JSON/版本不符/子结构过期 → null（行为同无缓存）。 */
 export function readGraphSnapshotCache(opts?: { stateDir?: string; scope?: string }): GraphSnapshot | null {
 	try {
-		const raw = JSON.parse(readFileSync(join(workGraphDir(opts?.stateDir), `${scopeName(opts?.scope)}.json`), "utf8")) as GraphSnapshot;
-		if (!raw || raw.version !== GRAPH_SNAPSHOT_VERSION || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges) || !Array.isArray(raw.projects)) return null;
+		const raw: unknown = JSON.parse(readFileSync(join(workGraphDir(opts?.stateDir), `${scopeName(opts?.scope)}.json`), "utf8"));
+		if (!isCurrentSnapshot(raw)) return null;
 		return raw;
 	} catch {
 		return null;

@@ -222,6 +222,21 @@ function legacyCollectTimerByRepo(dir: string, now: number, runToRepo: ReadonlyM
 let passed = 0;
 function check(name: string, fn: () => void): void { fn(); passed += 1; console.log(`  ok ${name}`); }
 
+/** 归一化临时根路径（raw / 正斜杠 / 小写 / JSON 转义形态）→ `<ROOT>`，使 golden 跨机可复现。 */
+function scrub(s: string): string {
+	const variants = new Set<string>();
+	for (const v of [ROOT, ROOT.toLowerCase(), ROOT.replace(/\\/g, "/"), ROOT.toLowerCase().replace(/\\/g, "/")]) {
+		variants.add(v);
+		variants.add(JSON.stringify(v).slice(1, -1));
+	}
+	let out = s;
+	for (const v of variants) out = out.split(v).join("<ROOT>");
+	return out.split("\\\\").join("/"); // 统一 Windows 路径分隔符（JSON 转义双反斜杠 → 正斜杠）
+}
+
+/** E2.0 行为保持 golden（遗漏 1）：`collectGlobalView` 全量快照、路径已归一化、`now` 固定。 */
+const GOLDEN = `{"owner":"none","generation":"-","cutover":"off","asof":"2026-09-01T12:00:00.000Z","reposTotal":3,"shown":3,"tabsActive":4,"timersPending":6,"inboxPending":0,"inboxClaimed":0,"home":{"repoPath":"__HOME__","display":"HOME","local":"none","branch":"-","dirty":"-","tabText":"-","tabActive":0,"attention":0,"timer":2,"overdue":0,"mail":"p0/c0","mailPending":0,"plans":"-","plansCount":null,"lastMs":0,"lastText":"?"},"rows":[{"repoPath":"<ROOT>/repos/beta","display":"beta","local":"none","branch":"main","dirty":"clean","tabText":"working:1 waiting:1","tabActive":2,"attention":0,"timer":0,"overdue":0,"mail":"p0/c0","mailPending":0,"plans":"0","plansCount":0,"lastMs":1788263700000,"lastText":"5m","gitUnknown":false},{"repoPath":"<ROOT>/repos/alpha","display":"alpha","local":"none","branch":"main","dirty":"clean","tabText":"working:1","tabActive":1,"attention":0,"timer":2,"overdue":1,"mail":"p0/c0","mailPending":0,"plans":"0","plansCount":0,"lastMs":1788260400000,"lastText":"1h","gitUnknown":false},{"repoPath":"<ROOT>/repos/gamma","display":"gamma","local":"none","branch":"main","dirty":"clean","tabText":"completed:1","tabActive":1,"attention":1,"timer":0,"overdue":0,"mail":"p0/c0","mailPending":0,"plans":"0","plansCount":0,"lastMs":1788263400000,"lastText":"10m","gitUnknown":false}],"totals":{"orphaned":1,"terminal":1,"noResult":5,"attention":1,"gitUnknown":0,"otherMail":0},"warnings":[],"cursor":{"page":1,"pageSize":20,"totalPages":1},"history":[],"historyTotal":2,"partial":false,"details":[{"runId":"w_stale","repoPath":"<ROOT>/repos/alpha","phase":"working","taskId":"A1","age":"3h","stale":"1h","staleOver":true,"stop":"stop","artifact":"-","artifactMtime":"?","resultMissing":true,"terminal":false,"openIssues":null,"summary":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","needsHuman":true,"gate":"awaiting","overdue":1,"pidAlive":false},{"runId":"w_wait","repoPath":"<ROOT>/repos/beta","phase":"waiting","taskId":"B1","age":"3h","stale":"5m","staleOver":false,"stop":"stop","artifact":"-","artifactMtime":"?","resultMissing":true,"terminal":false,"openIssues":null,"summary":"-","needsHuman":true,"gate":"ok","overdue":0,"pidAlive":null},{"runId":"t_attn","repoPath":"<ROOT>/repos/gamma","phase":"completed","taskId":"C1","age":"3h","stale":"10m","staleOver":false,"stop":"unknown","artifact":"-","artifactMtime":"?","resultMissing":true,"terminal":true,"openIssues":null,"summary":"-","needsHuman":false,"gate":"unknown","overdue":0,"pidAlive":null},{"runId":"p_probe","repoPath":"<ROOT>/repos/beta","phase":"working","taskId":"PT1","age":"3h","stale":"5m","staleOver":false,"stop":"error","artifact":"-","artifactMtime":"?","resultMissing":true,"terminal":false,"openIssues":null,"summary":"探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探探","needsHuman":false,"gate":"ok","overdue":0,"pidAlive":null}],"diff":{"added":[],"changed":[],"removed":[],"note":"none(baseline saved)"},"hygiene":"hygiene: zombiePid:1 otherMail:0 unmappedTimer:2 wt:unknown port:unknown daemon:unknown","command":"global-view","baselinePayload":{"savedAt":"2026-09-01T12:00:00.000Z","tabs":{"w_stale":{"phase":"working","stop":"stop","missing":true,"human":true,"issues":"null"},"w_wait":{"phase":"waiting","stop":"stop","missing":true,"human":true,"issues":"null"},"t_attn":{"phase":"completed","stop":"unknown","missing":true,"human":false,"issues":"null"},"p_probe":{"phase":"working","stop":"error","missing":true,"human":false,"issues":"null"}},"repos":{"<ROOT>/repos/beta":"2/0/0/0/0","<ROOT>/repos/gamma":"1/1/0/0/0","<ROOT>/repos/alpha":"1/0/2/0/1"}}}`;
+
 try {
 	check("T1 reduceTabCarrier ≡ legacy buildTabDetail（逐字段，含 probe/pid/gate 三态）", () => {
 		const warnings: string[] = [];
@@ -307,8 +322,17 @@ try {
 		assert.equal(snap.details.length, visible);
 	});
 
-	assert.equal(passed, 4, `应跑满 4 组，实际 ${passed}`);
-	console.log(`_test_graph_carriers: ${passed}/4 组通过（legacy oracle 双跑比对）`);
+	check("T5 collectGlobalView 全量 golden（路径归一化 + 固定 now；E2.1 行为保持回归基线）", () => {
+		const opts = { agentDir, now: NOW, gitProbe: () => ({ branch: "main", dirty: "clean" }) } as const;
+		const a = scrub(JSON.stringify(collectGlobalView({ ...opts })));
+		const b = scrub(JSON.stringify(collectGlobalView({ ...opts })));
+		assert.equal(a, b, "确定性：同 fixture 两次快照须逐字节相等");
+		if (process.env.E2_GOLDEN_DUMP) { console.log(a); return; }
+		assert.equal(a, GOLDEN, "collectGlobalView golden 漂移（行为保持基线）");
+	});
+
+	assert.equal(passed, 5, `应跑满 5 组，实际 ${passed}`);
+	console.log(`_test_graph_carriers: ${passed}/5 组通过（legacy oracle 双跑比对 + golden）`);
 } finally {
 	rmSync(ROOT, { recursive: true, force: true });
 }
