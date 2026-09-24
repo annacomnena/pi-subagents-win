@@ -819,6 +819,8 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// 本测试文件（v1 既有排除）+ v2 接线测试文件自身 import runtime/autonomy 字面量（不排除即假红，L2 审查要点 ②）
 				if (p === join(EXT_ROOT, "_test_runtime_autonomy.ts")) continue;
 				if (p === join(EXT_ROOT, "_test_autonomy_wiring.ts")) continue;
+				// E2.1：新适配器测试 import runtime/autonomy（frontier.ts）字面量 → 排除（ALLOW 不动）
+				if (p === join(EXT_ROOT, "_test_graph_frontier_input.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}

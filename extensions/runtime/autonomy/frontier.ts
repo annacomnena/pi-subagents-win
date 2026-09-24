@@ -22,7 +22,7 @@
  * 快照是派生缓存（C4）：可删；删除/损坏后仅丢失一次 diff 基线，重建回到 baseline 模式自愈，不风暴。
  *   本层绝不反向写 recentwork Status，不是第二进度真相源。
  */
-import type { GateStatus, GlobalViewSnapshot, TabDetail } from "../global-view.ts";
+import type { GateStatus } from "../global-view.ts";
 
 // normalizeExactPath：recent-scopes.ts 的同函数本地副本（双写；_test 的 tripwire 防漂移——
 // 同 master-auto "proposalPercent 双写 tripwire" 先例）。本地副本目的：保持本模块依赖图零 node:fs
@@ -93,8 +93,36 @@ export interface FrontierDiff {
 	meaningfulChanges: number;
 }
 
+/**
+ * E2.1 结构化输入契约（plans/0924_graph_E2_1_impl_plan.md §3）：graph 派生源可赋值的**最小子集**。
+ * `GlobalViewSnapshot` 是它的结构化超集（`details: TabDetail[]` 含本接口全字段；
+ * `history: HiddenTabEntry[]` 含 `{id,reason}`）→ v2 调用点零改。
+ * 键口径 = `normalizeExactPath`（与 graph `normalizeRepoKey` 逐字节同体，R4 单一口径）；适配器直接
+ * 消费已归一 `GraphProjectView.project` 键，本层 `tabsByRepo` 再归一为幂等。
+ */
+export interface FrontierSourceTab {
+	runId: string;
+	/** exact-path 归一键（适配器直接用 GraphProjectView.project；buildFrontier 内部再归一幂等）。 */
+	repoPath: string;
+	phase: string;
+	needsHuman: boolean;
+	gate: GateStatus;
+	staleOver: boolean;
+	overdue: number;
+	/** MF3：watchdog 检查 6（autonomy/collect.ts#L153-L154）消费；无 state.pid → null。 */
+	pidAlive: boolean | null;
+}
+
+export interface FrontierSourceSnapshot {
+	/** 全量 attention 投影：归一键、仅 >0 项；缺项=0（G-A 口径，frontier.ts#L201/#L216）。 */
+	attentionByRepo: Record<string, number>;
+	details: readonly FrontierSourceTab[];
+	/** v2 生产恒空（MF1）；适配器恒 emit []。 */
+	history: readonly { id: string; reason: string }[];
+}
+
 export interface FrontierInputs {
-	snapshot: GlobalViewSnapshot;
+	snapshot: FrontierSourceSnapshot;
 	backlog: { recipient: string; pending: number; claimed: number }[];
 	prev: FrontierSnapshot | null;
 	now: number;
@@ -146,8 +174,8 @@ const VARIANT_RANK: Record<string, number> = { orphaned: 0, resultMissing: 1, wa
 
 type ProjectCore = Omit<ProjectFrontier, "meaningfulStateVersion">;
 
-/** 单 repo 聚合（纯）：只消费 TabDetail/RepoRow 结构化字段，不解析任何展示文本（约束 9）。 */
-function aggregateProject(project: string, tabs: TabDetail[], attention: number): ProjectCore {
+/** 单 repo 聚合（纯）：只消费 FrontierSourceTab 结构化字段，不解析任何展示文本（约束 9）。 */
+function aggregateProject(project: string, tabs: FrontierSourceTab[], attention: number): ProjectCore {
 	const nonTerm = tabs.filter((t) => !mapPhaseToProjectState(t.phase).terminal);
 	let state: ProjectState;
 	let variant: string | null;
@@ -201,7 +229,7 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	const attentionByRepo = snapshot.attentionByRepo;
 
 	// 可见 tab 按归一化 repo 分组
-	const tabsByRepo = new Map<string, TabDetail[]>();
+	const tabsByRepo = new Map<string, FrontierSourceTab[]>();
 	for (const d of snapshot.details) {
 		const k = normalizeExactPath(d.repoPath);
 		const arr = tabsByRepo.get(k);
