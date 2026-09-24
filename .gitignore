@@ -35,3 +35,6 @@ state/
 
 # hotspot 工具移除主题的恢复副本（派生/可重建，不入库）
 Wiki/_hotspot.trash.jsonl
+
+# 临时探针/实验文件（不入库）
+.tmp_*
