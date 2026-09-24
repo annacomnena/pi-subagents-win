@@ -31,6 +31,7 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 30 | P2 | `/runtime-host restart [--force]`（用户提出；已实现 `1743061`） | none | worker-only restart（可选，SKIP） |
 | 29 | P1 | 微信输入 W2b：GUI 开关 + 白名单（hash id 可维护）+ 「为什么没进来」反馈（已实现 `18ba74d`） | Item 28 | 真机验证被**平台侧**阻塞（消息不进长轮询队列）→ 待用户核对推送/webhook 配置 |
 | 28 | P1 | 微信输入 W2（私聊文本注入 master，D15 六条件，已实现 `168fed1`） | Item 25 | W2b：GUI 开关 + 白名单（从最近发送者一键添加）+ 「为什么没进来」反馈 |
 | 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） |
@@ -38,6 +39,19 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 30 - `/runtime-host restart [--force]`（用户提出）
+
+- **日期**：2026-09-24
+- **一句话**：把"反复手工杀 daemon 重启"变成一条命令：复用既有 `stopRuntimeDaemon`（身份核验 + fail-closed）+ `ensureRuntimeDaemon`，**有界等锁释放**，回报必含"GUI cookie 已失效需 `/gui open`"+worker 重新 spawn；`uncertain` 一律中止；`--force` 仅显式传入。
+- **涉及模块**：`extensions/runtime-host/daemon-lifecycle.ts`（新增 `restartRuntimeDaemon()`；既有语义未改）、`extensions/index.ts`（最小 hunk：命令分支 + 用法串/description 补 restart）、`extensions/_test_runtime_host_restart.ts`
+- **产物**：`plans/0924_runtime_host_restart_spec.md`、`plans/0924_runtime_host_restart_impl_report.md`、`plans/0924_runtime_host_restart_l4_review.md`（**PASS**，无 must-fix；5 条 minor 中 2 条已修：用法串可发现性 + `already:true` 不得谎称"新起"）
+- **Wiki**：`Wiki/Architecture/runtime-daemon.md` → 「重启命令」
+- **Priority**：P2
+- **Status**：done（`1743061`）
+- **Commit**：`1743061`
+- **Verification**：单测 5 组 PASS（第 6 组可选 worker-only restart 如实 SKIP）；smoke + 3 个回归测试全绿；**真实重启实测**：旧 pid=195936 port=53872 → 新 pid=254488 port=51984、`/v1/health` 200、回报含 cookie 失效提示。
+- **未做**：worker-only restart（可选）；`restart --force extra`/`-f` 落到用法提示（fail-closed）。
 
 ### Item 29 - 微信输入 W2b（界面开关 + 白名单 + 未生效反馈）+ 真机接收被平台侧阻塞
 
