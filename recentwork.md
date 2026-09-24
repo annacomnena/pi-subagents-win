@@ -16,7 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
-| 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，已实现待提交） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已实现，待提交） |
+| 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） |
 | 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
 | 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） |
 | 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
@@ -56,8 +56,8 @@
 - **产物**：`plans/20260924_wake_roundtrip_reply_impl.md`
 - **Wiki**：新建正式主题页 `Wiki/Architecture/wake-roundtrip-ack.md`（`status: current`，回信渠道事实：tab-report 派发者归属不可达来信者、回信走 deliverLetter、prompt 形状与 recipe 约束；`_index.md` 导航已收录）
 - **Priority**：P1
-- **Status**：done（已实现，待提交）
-- **Commit**：（待提交；基线 `ad72cd4`）
+- **Status**：done（`f299758`）
+- **Commit**：`f299758`（基线 `ad72cd4`）
 - **Verification**：recipe 本机实测跑通（隔离 `PI_RUNTIME_DIR`、未污染真实 mailbox；回执信 `kind=RESULT / inReplyTo=原信 messageId / to=agent://master_default`）；`test:runtime-wake` / `test:local-master` / `test:runtime-mailbox` / `test:mailbox-command-consume` 全绿 + `test:scope-stale-takeover` 绿；`_test_autonomy_wiring` W2.3 为基线既有（`git stash` 后复现，与本改动无关）。
 
 ### Item 37 - local Master 自动交接（`master-transfer --local`）
