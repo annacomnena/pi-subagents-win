@@ -61,7 +61,8 @@ import {
 	type FrontierSourceSnapshot,
 	type FrontierSourceTab,
 } from "./runtime/autonomy/frontier.ts";
-import { readFrontierSnapshot } from "./runtime/autonomy/collect.ts";
+import { collectAutonomyInputs, readFrontierSnapshot } from "./runtime/autonomy/collect.ts";
+import { evaluateAutonomyWakeGate } from "./runtime/autonomy/gate.ts";
 
 const NOW = Date.parse("2026-09-24T12:00:00.000Z");
 const MIN = 60_000;
@@ -791,6 +792,124 @@ check("S17 O-B 硬门：unexplained=0 且 explained=0；rows 非空跑；shadow.
 	assert.equal(lines.length, all.length, "shadow.jsonl 行数 == rows 数");
 	assert.equal(existsSync(join(shadowStateDir, "autonomy", "audit.jsonl")), false, "零行为：不写生产 state/autonomy/audit.jsonl");
 	console.log(`  E2.2 dump: frames=${FRAMES.length} rows=${all.length} same=${all.length - unexplained.length - explained.length} triggerRows=${all.filter((r) => r.itemKind === "trigger").length} unexplained=${unexplained.length} explained=${explained.length}`);
+});
+
+// ═══════════════════════ S18–S21 E2.3 单点翻转接线（生产入口 collectAutonomyInputs）═══════════════════════
+// 命题：`#L122` 单点二选一（env `PI_AUTONOMY_FRONTIER_SOURCE`，值 graph 才走 Graph，缺省 = v2）；
+// 显式传 `tabRunsDir=join(agentDir,"tab-runs")`（L1 §3 关键点：否则落到 env 默认/真实目录）。
+
+const E23_CONFIG = join(ENV_TMP, "e23-config.json");
+writeFileSync(E23_CONFIG, JSON.stringify({}), "utf8");
+
+/** graph 分支不传 journalPath → 生产 journal = defaultRuntimeDir()/events.jsonl（把 world journal 放此并隔离 PI_RUNTIME_DIR）。 */
+function wireProductionEnv(w: World): void {
+	process.env.PI_RUNTIME_DIR = w.envDir;
+	writeFileSync(join(w.envDir, "events.jsonl"), readFileSync(w.journalPath, "utf8"), "utf8");
+}
+
+interface E23Fixture { w: World; v2Next: FrontierSnapshot; v2Diff: FrontierDiff; v2Order: string[] }
+let E23: E23Fixture | null = null;
+
+/** 共享 fixture：同仓两 run，`runId` 字典序（a,b）与 `rankDetail` 序（stale 的 b 先）相反 → S19② 指纹可判别。 */
+function makeE23World(): World {
+	return track(makeWorld("e23-flip", [{ name: "alpha" }], [
+		{ id: "run_a", repo: "alpha", phase: "working", lastActivityMs: NOW - 5 * MIN },
+		{ id: "run_b", repo: "alpha", phase: "working", lastActivityMs: NOW - 60 * MIN },
+	]));
+}
+
+check("S18 缺省=v2：collectAutonomyInputs 与直接 v2 装配 canonical 逐字节等价（旧行为不变）", () => {
+	delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+	assert.equal(process.env.PI_AUTONOMY_FRONTIER_SOURCE, undefined, "flag 未设");
+	const w = makeE23World();
+	wireProductionEnv(w);
+	const r = collectAutonomyInputs({ agentDir: w.agentDir, stateDir: join(w.root, "s18-state"), now: NOW, configPath: E23_CONFIG });
+	assert.ok(r.frontier !== null, "frontier 非 null");
+	const ref = buildFrontier({
+		snapshot: collectGlobalView({ agentDir: w.agentDir, now: NOW, gitProbe: GIT_PROBE }),
+		backlog: mailboxBacklog(),
+		prev: null,
+		now: NOW,
+	});
+	assert.equal(canonicalJson(r.frontier!.next), canonicalJson(ref.next), "S18: next canonical 逐字节等价");
+	assert.equal(canonicalJson(r.frontier!.diff), canonicalJson(ref.diff), "S18: diff canonical 逐字节等价");
+	assert.equal(r.frontier!.next.asof, NOW, "S18: now 单源（asof===NOW）");
+	const order = Object.keys(r.frontier!.next.projects[0]!.runs);
+	assert.deepEqual(order, ["run_b", "run_a"], "S18: v2 序 = rankDetail（stale run_b 先）");
+	E23 = { w, v2Next: r.frontier!.next, v2Diff: r.frontier!.diff, v2Order: order };
+});
+
+check("S19 PI_AUTONOMY_FRONTIER_SOURCE=graph = graph 路：canonical 全等 + 指纹证明切换有效（非死代码）", () => {
+	assert.ok(E23 !== null, "S18 已建共享 fixture");
+	process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+	try {
+		const r = collectAutonomyInputs({ agentDir: E23!.w.agentDir, stateDir: join(E23!.w.root, "s19-state"), now: NOW, configPath: E23_CONFIG });
+		assert.ok(r.frontier !== null);
+		assert.equal(canonicalJson(r.frontier!.next), canonicalJson(E23!.v2Next), "S19: graph next canonical == v2");
+		assert.equal(canonicalJson(r.frontier!.diff), canonicalJson(E23!.v2Diff), "S19: graph diff canonical == v2");
+		assert.equal(r.frontier!.next.asof, NOW, "S19: now 单源（asof===NOW）");
+		const order = Object.keys(r.frontier!.next.projects[0]!.runs);
+		assert.deepEqual(order, ["run_a", "run_b"], "S19: graph 序 = runId 升序（run_a 先）");
+		assert.notDeepEqual(order, E23!.v2Order, "S19: 指纹与 v2 序不同 → flag 确实切换、非死代码");
+	} finally {
+		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+	}
+});
+
+check("S20 decoy PI_TAB_RUNS_DIR：显式 tabRunsDir 生效，graph 路不受 env 默认分叉影响", () => {
+	assert.ok(E23 !== null);
+	const decoy = track(makeWorld("e23-decoy", [{ name: "decoy" }], [{ id: "t_decoy", repo: "decoy", phase: "working" }]));
+	const decoyKey = normalizeExactPath(decoy.repoPaths.get("decoy")!);
+	process.env.PI_TAB_RUNS_DIR = decoy.runsDir; // 故意设错（若不显式传即为默认值）
+	process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+	try {
+		wireProductionEnv(E23!.w);
+		// 证伪对照（守卫非空跑）：默认 tabRunsDir（=env decoy）确实会吸入 decoy 项目。
+		const naive = readGraphSnapshot({ stateDir: join(E23!.w.root, "s20-naive-state"), now: NOW });
+		const naiveProjects = naive.projects.map((p) => p.project);
+		assert.ok(naiveProjects.includes(decoyKey), `S20 前置：默认 tabRunsDir 会读 decoy（实际=${JSON.stringify(naiveProjects)}）`);
+		console.log(`  S20 decoy proof: 默认 tabRunsDir(=${decoy.runsDir}) → projects=${JSON.stringify(naiveProjects)}（含 decoy）`);
+		// 生产装配：显式 tabRunsDir=agentDir/tab-runs → 结果等于 S18 v2，且 decoy 身份零出现。
+		const r = collectAutonomyInputs({ agentDir: E23!.w.agentDir, stateDir: join(E23!.w.root, "s20-state"), now: NOW, configPath: E23_CONFIG });
+		assert.equal(canonicalJson(r.frontier!.next), canonicalJson(E23!.v2Next), "S20: 结果 canonical == S18 v2");
+		assert.deepEqual(Object.keys(r.frontier!.next.projects[0]!.runs), ["run_a", "run_b"], "S20: graph 路序 = runId 升序（确认是 graph 分支且读 agentDir/tab-runs）");
+		const projKeys = r.frontier!.next.projects.map((p) => p.project);
+		assert.equal(projKeys.includes(decoyKey), false, `S20: decoy 项目未进入结果（实际=${JSON.stringify(projKeys)}）`);
+		const allRuns = r.frontier!.next.projects.flatMap((p) => Object.keys(p.runs));
+		assert.equal(allRuns.includes("t_decoy"), false, "S20: decoy run 身份 t_decoy 未出现");
+	} finally {
+		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+		process.env.PI_TAB_RUNS_DIR = join(ENV_TMP, "tab-runs");
+	}
+});
+
+check("S21a 非 graph 值 = v2：''/v2/graphx/GRAPH 均取 v2 序且 canonical 等于 S18", () => {
+	assert.ok(E23 !== null);
+	for (const v of ["", "v2", "graphx", "GRAPH"]) {
+		process.env.PI_AUTONOMY_FRONTIER_SOURCE = v;
+		try {
+			const r = collectAutonomyInputs({ agentDir: E23!.w.agentDir, stateDir: join(E23!.w.root, `s21-${v || "empty"}-state`), now: NOW, configPath: E23_CONFIG });
+			assert.equal(canonicalJson(r.frontier!.next), canonicalJson(E23!.v2Next), `S21a '${v}': canonical == v2`);
+			assert.deepEqual(Object.keys(r.frontier!.next.projects[0]!.runs), E23!.v2Order, `S21a '${v}': v2 序`);
+		} finally {
+			delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+		}
+	}
+});
+
+check("S21b enabled=false 零行为：flag=graph 下门首行旁路，state/autonomy/ 零新文件（A11.2 口径）", () => {
+	const w = track(makeWorld("e23-zero", [{ name: "alpha" }], [{ id: "t_g", repo: "alpha", phase: "working" }]));
+	const stateDir = join(w.root, "s21b-state"); // 故意不存在
+	process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+	try {
+		const d = evaluateAutonomyWakeGate({ stateDir, configPath: E23_CONFIG, agentDir: w.agentDir, now: NOW });
+		assert.equal(d.engaged, false, "enabled=false → 门旁路");
+		assert.equal(d.reason, "autonomy-disabled");
+		assert.equal(existsSync(stateDir), false, "S21b: stateDir 未被创建（不 reach collect）");
+		assert.equal(existsSync(join(stateDir, "autonomy")), false, "S21b: 零 state/autonomy/ 新文件");
+	} finally {
+		delete process.env.PI_AUTONOMY_FRONTIER_SOURCE;
+	}
 });
 
 // ═══════════════════════ 可选反向自检（E22_REVERSE_SELFTEST=1）═══════════════════════
