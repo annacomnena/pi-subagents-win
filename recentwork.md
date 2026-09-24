@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） |
 | 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） |
 | 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） |
 | 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
@@ -48,6 +49,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 40 - E2.0 Graph 载体对齐 + 共享 carrier 归约抽取
+
+- **日期**：2026-09-24
+- **一句话**：把 frontier 消费的载体补齐到 Graph 只读投影，并把 carrier 归约抽成单一真相源——① `GraphRunRef` 增 `gate/needsHuman/staleOver/overdue/pidAlive`（缺→null 不猜）；② `GraphSnapshot.history` 仅观测载体（E2.1 恒 emit `[]`，不参与 frontier 输入）；③ `state/work-graph/<scope>.json` 只读缓存（唯一写者 `graph/collect.ts`，版本+子结构校验）；④ 抽 `frontier-carriers.ts`（`reduceTabCarrier`/`collectTimerByRepo`/`classifyDispatch`）为唯一真相源，`global-view.ts` 与 `graph/collect.ts` 共用。仍为影子运行（零生产接线）。L4 独立审查 **PASS**（0 必须修 / 5 建议修 / 5 遗漏）；L5 收尾落地 4 条 E2.1 前必修 + 文档收尾。
+- **涉及模块**：`extensions/runtime/frontier-carriers.ts`（新，359 行）、`extensions/runtime/global-view.ts`（净删 288 行，re-export 保持导出面）、`extensions/runtime/graph/{types,project,collect}.ts`（+169/-26）、`extensions/_test_graph_carriers.ts`（新，含 legacy oracle 双跑 + 全量 golden）
+- **产物**：`plans/0924_graph_E2_impl_plan.md` / `plans/0924_graph_E2_plan_review.md` / `plans/0924_graph_E2_recon.md` / `plans/0924_graph_E2_0_impl_report.md` / `plans/0924_graph_E2_0_l4_review.md` / `plans/0924_graph_E2_0_wrapup_report.md`
+- **Wiki**：更新正式主题页 `Wiki/Architecture/work-graph-read-only-projection.md`（Current Contract 新增「E2.0 载体对齐与共享归约」节 + source_paths 补 `frontier-carriers.ts` 真实行号）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`7672771`（抽 frontier-carriers 共享归约，行为保持）+ `ed5278a`（Graph 载体对齐 + 只读缓存）+ `c7b977a`（L4 建议修：缓存版本校验 + tmp 防冲突 + warning 序注释 + golden 入库）
+- **Verification**：行为保持由 **pre/post golden 逐字节复现** + `_test_graph_carriers.ts` 5/5（legacy oracle 双跑 4 组 + 全量 golden 入库）证明；`_test_runtime_graph.ts` 13/13；`_test_runtime_autonomy.ts` 57 checks（A10.1 allowlist 仍恰好 3）；回归 6×npm（`test:global-view`/`runtime-projector`/`runtime-workstream`/`runtime-snapshot`/`tab-runs`/`runtime-wake` + `local-master`）全绿；L4 审查 PASS。
 
 ### Item 39 - E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线）
 

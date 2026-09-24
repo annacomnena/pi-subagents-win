@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (E2.0 Graph 载体对齐 + 共享 carrier 归约：`7672771`/`ed5278a`/`c7b977a`)
+
+- **E2.0 载体对齐**：`GraphRunRef` 增 `gate`/`needsHuman`/`staleOver`/`overdue`/`pidAlive`（缺→null 不猜）；`GraphSnapshot.history` 为**仅观测载体，不参与 frontier 输入**（E2.1 `toFrontierInput` 恒 emit `[]`，MF1）；`state/work-graph/<scope>.json` 只读缓存（唯一写者 `graph/collect.ts`，version + carrier/history 子结构校验，tmp 名含 pid+时间戳+计数器）。仍为影子运行（零生产接线）。
+- **共享归约单一真相源**：抽 `extensions/runtime/frontier-carriers.ts`（`reduceTabCarrier`/`collectTimerByRepo`/`classifyDispatch`），`global-view.ts` 与 `graph/collect.ts` **共用同一实现，禁止各写一份**（`global-view.ts` 以 re-export 保持原导出面）。
+- **行为保持由 golden 双跑证明**：pre/post `collectGlobalView` 快照逐字节相等；全量 golden 已随 `_test_graph_carriers.ts` 入库（路径归一化 + 固定 now），E2.1 之后仍可复现回归。
+- **E2.1 前的 4 条修复已落地**（L4 建议修/遗漏）：① 缓存 carrier/history 子结构校验 + `GRAPH_SNAPSHOT_VERSION` 扩字段必 bump 约定（R5）；② tmp 文件名加 pid+时间戳+计数器防同进程并发冲突（遗漏 4）；③ `buildTabDetail` 注释钉死 gate 前移导致的病态 warning 序差异（R2，选注释方案）；④ before/after golden 基线入库（遗漏 1）。
+- **验收**：`_test_graph_carriers.ts` 5/5（legacy oracle 双跑 4 组 + golden）；`_test_runtime_graph.ts` 13/13；`_test_runtime_autonomy.ts` 57 checks（A10.1 allowlist 仍恰好 3）；`test:global-view` + 6×npm 回归全绿；L4 独立审查 PASS（0 必须修）。Wiki `Wiki/Architecture/work-graph-read-only-projection.md`；Recent Work Item 40。
+
 ## [Unreleased] — 2026-09-24 (E1 Work Graph 只读关系面 MVP：`d54c09b`/`97ef7e2`)
 
 - **E1 只读关系面 MVP**：新增纯库 `extensions/runtime/graph/{types,project,edges,diff,collect,index}.ts` + `extensions/_test_runtime_graph.ts`（13 组）——既有四对象（Master/Workstream/Task/Run）之上的**只读关系面**：引用式边（`task→workstream` / `run→externalTaskId|subject` / `workstream→repoPath` 弱载体，**不做**声明式 `depends_on`）+ 纯投影 `projectGraph` + `diffGraph(since)`；`collect.ts` 唯一 IO，`graph/**` 零写路径。
