@@ -26,13 +26,40 @@
 | 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
 | 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
 | 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
-| 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ C1 Broker 开工 | none | C1（新包 `pi-packages/computer-use`）→ C2 pi 工具 → C3 skill |
+| 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ **C1 Broker 已完成** | none | C2 pi 工具 → C3 skill（C1 已入库 `0470527`） |
 | 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 |
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
+| 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
+| 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见；**未提交**） | Item 14 | L4 收敛 PASS → 显式路径提交 → 派 W2（注入 master，D15 六条件） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 26 - 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底）
+
+- **日期**：2026-09-24
+- **一句话**：master 会话里出现一条 U+FFFD 乱码消息——**根因是主会话一次诊断 `curl`（Windows/mingw curl 按 cp936 编码请求体）**，而 `POST /v1/commands` 旧实现用 `Buffer.toString("utf8")` 把非 UTF-8 字节静默烧成 U+FFFD 并照常落盘 outbox（事后不可恢复）。
+- **涉及模块**：`extensions/runtime-host/commands.ts`（新 `decodeCommandBody`）、`extensions/runtime-host/ws.ts`（文本帧严格 UTF-8 → 非法 close 1007）、`extensions/runtime-host/server.ts`（两处接线，最小 hunk）、两个测试文件。
+- **产物**：`plans/0924_remote_input_encoding_fix.md`、`plans/0924_remote_input_encoding_impl.md`、`plans/0924_remote_input_encoding_review.md`（独立 L4：PASS-WITH-FIXES，含 T16 补强）
+- **Wiki**：`Wiki/Architecture/gui-message-pipeline.md`（编码口径）
+- **Priority**：P1（阻塞 W2 的中文输入正确性）
+- **Status**：done（由用户开的 `l2-subagent-win` execute tab 完成；主会话按 hunk 精确暂存提交，未夹带同树 W1 半成品）
+- **Commit**：`88ba26a`
+- **Verification**：合法 UTF-8（含 BOM/emoji/原文 U+FFFD）逐字节等于旧行为；GBK 中文正确恢复；双非法 → 400 且 outbox 与 state/commands 零新增；runtime-commands / runtime-host-server / runtime-host-ws / message-outbox / gui-chat-guard / smoke 全 PASS。
+
+### Item 25 - 微信 iLink 接收 W1（只收不投：长轮询 + 游标/去重/私有 inbox + GUI 可见）
+
+- **日期**：2026-09-24
+- **一句话**：用户报“GUI 通了、微信还没通”——查明绑定早已成功（`credentials.json` 已存 bot_token），**缺的是接收侧**：v1 只做了绑定页，没有任何东西在跑 iLink 长轮询，所以微信发的消息从没进过 pi。W1 落地“收到并可见”（**不注入**，注入是 W2/D15）。
+- **涉及模块**：新增 `extensions/channel-wechat/{client,parser,store,worker,index}.ts`、`extensions/runtime-host/channel-supervisor.ts`、`extensions/_test_wechat_receive.ts`；最小 hunk：`extensions/runtime-host/server.ts`（2 只读端点 + receive 闸）、`wechat-bind.ts`、`gui/src/pages/ChannelsPage.tsx`；`extensions/index.ts` **零改动**。
+- **产物**：`plans/0924_wechat_receive_w1_spec.md`（规格：九条不变量 + 6 组断言 + 诚实延期清单）、`plans/0924_wechat_w1_impl_report.md`、`plans/0924_wechat_w1_l4_review.md`（**FAIL**，2 must-fix）、`plans/0924_wechat_w1_l4_convergence.md`（收敛轮）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md`（W1 状态 + 延期项）
+- **Priority**：P1
+- **Status**：**未提交**（等 L4 收敛）；L4 首轮抓到 **MF1 数据丢失级缺陷**（dedupe 先写墓碑再写 inbox，putInbox 失败则重放被去重吞掉 → 游标照样推进 → 消息永久丢失）与 **MF2**（两个只读端点漏守 `receive.enabled`）。修复轮（agent）改完代码但**超时死掉无报告**，主会话接手收尾并实跑验证 7 组断言全绿。
+- **Commit**：—（待 L4 收敛 PASS 后提交）
+- **Verification**：`npx tsx extensions/_test_wechat_receive.ts` 7 组断言全绿（3.5s，含 180s 硬看门狗）；smoke OK；5 个既有测试 + GUI 构建全绿。
+- **教训（EB-004）**：agent 超时失败时工作树可能停在**中间态**（半写代码），此时跑会 spawn 子进程的测试会挂死——本次实测挂 **6 小时**（两棵进程树未退出）。
 
 ### Item 24 - 微信连接页 opt-in UX 修复（入口不可发现/不可启用）
 
@@ -66,7 +93,9 @@
 - **产物**：本地 `plans/20260923_cua_c0_probe.md`（C0 结论 + 实测输出）、`plans/.cua-probe/`（探针脚本，已拷为新包 `probe-seed/`）
 - **Wiki**：无（新包自带 README/roadmap；本仓 Wiki 不承载其设计）
 - **Priority**：P1（新方向）
-- **Status**：C0 complete；C1 active（tab 3001）
+- **Status**：C0 complete；**C1 complete**（tab 3001，workflow 六阶段走齐 + 独立 code-reviewer L4 两轮；e2e 24 PASS/0 FAIL/1 WARN）；C2 待开工
+- **Commit**：新包 `0470527`（本仓仅此记录）
+- **Verification（C1 实测结论）**：`bin/cua-broker.ps1`（989 行）pwsh7 常驻 Broker + stdio JSON 行协议（ping/observe/act/capture/diff/lease）；三档动作焦点回执 **wm_settext=none（不抢）/ setvalue=steals（实测）/ invoke=may_steal（实测在本环境 steals）**；非幂等动作抛错即 `dispatched_unknown`（不自动重试）；常驻复用 walk 118.6→63.7ms、client_rt 161→67ms。未决：PS5.1 回退未实跑、单实例 Notepad 目标选择依附用户进程、其它控件类型 focus 未穷举。
 - **Commit**：—（新包未提交；本仓仅此记录）
 - **Verification（C0 实测结论）**：传输选型 = **PowerShell + System.Windows.Automation 常驻进程**（冷启动太贵⇒必须常驻；Python/node-ffi-napi 出局）；**`ValuePattern.SetValue` 被证伪会抢前台焦点**（干净基线、两窗口复现；`WM_SETTEXT` 已证不抢、`Invoke` 未决）；树 22–26 节点/62–122ms、扁平化 ≈600–750 tokens/窗；字段级 diff 可行但**主键须改用 RuntimeId**；截屏证实。⇒ 动作能力必须分三档 + 内建 FG 断言器。
 

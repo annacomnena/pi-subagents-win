@@ -17,3 +17,9 @@ errors:
     root_cause: "子进程启动需加载本仓 extensions/**；在飞实现轮把 extensions 文件写到瞬态不完整状态（例：函数声明后函数体未落盘，master-injection.ts:71），于是一切新起的 pi 子进程加载即死。症状看起来像模型/供应商故障，极易误判。"
     constraint: "遇到该指纹先跑 `npm run smoke:extension-load` 判定，不要在模型/供应商层反复重试；确认是加载错时，先停派发并等写入方收敛，必要时由主会话直接修（不可派 subagent，因为派发已死）；修复后必须重跑 smoke 才恢复派发。实现轮验收必须包含 `smoke:extension-load`。 另：**reload 插件前必须先确认 smoke OK**——用户侧 reload 若撞上在飞编辑窗口，表现同样是「插件没加载」（2026-09-23 三次复发）；主会话应在任何在飞实现轮结束、且 smoke OK 后再通知用户 reload。"
     verification: "`npm run smoke:extension-load` 输出 OK/FAIL + 报错 file:line；修复后复跑 smoke 与 `test:gui-master-unlock`。"
+  - id: EB-004
+    status: open
+    phenomenon: "派发的实现/修复轮超时失败后，跑会 spawn 子进程的测试会**挂死数小时**（实测 2026-09-24：两棵 `_test_wechat_receive` 进程树从 01:15/01:25 存活到 08:15，白占机器 6 小时）。"
+    root_cause: "agent 被超时中断时可能已写入部分改动（半写代码，含未完成的重试/循环逻辑）；而这类测试会 spawn worker/supervisor 子进程且缺少硬超时保护，于是无人回收、进程永不退出。"
+    constraint: "① agent 超时/失败后先看 `git status --short` 与文件 mtime 判断是否动过文件，**不要立刻跑长测试**，先读关键改动确认自洽；② 任何会 spawn 子进程的测试必须内建硬看门狗（`setTimeout(...).unref()` + 非零退出），禁止无超时跑；③ 人工跑测试一律带外部超时（后台启动 + sleep + 强杀），并在结束时清理残留子进程；④ 看到测试“跑了很久”不要等，先查进程树。"
+    verification: "`extensions/_test_wechat_receive.ts` 的 `WATCHDOG_MS=180000`；事故现场可用 `Get-CimInstance Win32_Process` 按 CommandLine 匹配 `_test_wechat_receive` 复查。"
