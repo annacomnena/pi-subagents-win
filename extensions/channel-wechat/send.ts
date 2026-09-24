@@ -74,6 +74,16 @@ export function deriveBroadcastClientId(roundId: string, toUserId: string): stri
 }
 
 /**
+ * 命令回执出站 client_id（0924 远程斜杠命令旁路）：sha256("wechat-command-client:"+msgId+":"+toUserId)。
+ * 每条命令独立（同 deriveBroadcastClientId 的 per-recipient 纪律：服务端 client_id 去重语义
+ * 未定论，独立 id 在任何语义下都安全，兼作同 msgId 幂等键）。前缀与 wechat-reply-client /
+ * wechat-broadcast-client 均不同源。sendMessage 本体零改动。
+ */
+export function deriveCommandClientId(msgId: string, toUserId: string): string {
+	return createHash("sha256").update(`wechat-command-client:${msgId}:${toUserId}`, "utf8").digest("hex");
+}
+
+/**
  * 回复意图文件 id（W3b 消费）：sha256("wechat-reply:"+outboxId) 全 64hex，确定性
  * （同 outboxId 二次 agent_end → 同 id → 文件幂等，不覆盖）。
  */

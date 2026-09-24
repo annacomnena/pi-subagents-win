@@ -4,8 +4,10 @@ import { join } from "node:path";
 
 export const REPLY_INTENT_STATUSES = ["pending", "sent", "failed", "unknown"] as const;
 export type ReplyIntentStatus = (typeof REPLY_INTENT_STATUSES)[number];
-/** 意图种类（0924 广播）：缺省/旧文件 = "reply"；"broadcast" 走 watcher 的 connected 门 + TTL（计划 §6）。 */
-export type ReplyIntentKind = "reply" | "broadcast";
+/** 意图种类（0924 广播）：缺省/旧文件 = "reply"；"broadcast" 走 watcher 的 connected 门 + TTL（计划 §6）；
+ *  "command" = 远程斜杠命令回执（0924 旁路）：与 reply 同待遇（watcher 无 mode 门/TTL/connected 门），
+ *  但可分型审计；消费端不产生 turn ⇒ 不进广播环路。 */
+export type ReplyIntentKind = "reply" | "broadcast" | "command";
 export interface ReplyIntent {
  version: 1; id: string; msgId: string; outboxId: string; fromId: string; clientId: string; text: string;
  status: ReplyIntentStatus; attempts: number; createdAt: string; updatedAt: string;
@@ -24,11 +26,19 @@ export function deriveReplyIntentId(outboxId: string): string { return createHas
 export function deriveBroadcastIntentId(roundId: string, fromId: string): string {
  return createHash("sha256").update(`wechat-broadcast:${roundId}:${fromId}`).digest("hex");
 }
+/**
+ * 命令回执 intent id（0924 远程斜杠命令旁路）：sha256("wechat-command:"+msgId)。
+ * 同 msgId 重复消费（stale 接管 / at-least-once 重放）→ 同 id → linkSync EEXIST → 不重写；
+ * 前缀与 wechat-reply: / wechat-broadcast: 均不同源（命名空间隔离）。64hex 同口径。
+ */
+export function deriveCommandIntentId(msgId: string): string {
+ return createHash("sha256").update(`wechat-command:${msgId}`).digest("hex");
+}
 function pathFor(dir: string, id: string): string { return join(dir, `${id}.json`); }
 function valid(x: unknown): x is ReplyIntent {
  if (!x || typeof x !== "object") return false;
  const v = x as ReplyIntent;
- return v.version === 1 && /^[0-9a-f]{64}$/.test(v.id) && typeof v.msgId === "string" && typeof v.outboxId === "string" && typeof v.fromId === "string" && typeof v.clientId === "string" && typeof v.text === "string" && REPLY_INTENT_STATUSES.includes(v.status) && Number.isInteger(v.attempts) && typeof v.createdAt === "string" && typeof v.updatedAt === "string" && (v.kind === undefined || v.kind === "reply" || v.kind === "broadcast");
+ return v.version === 1 && /^[0-9a-f]{64}$/.test(v.id) && typeof v.msgId === "string" && typeof v.outboxId === "string" && typeof v.fromId === "string" && typeof v.clientId === "string" && typeof v.text === "string" && REPLY_INTENT_STATUSES.includes(v.status) && Number.isInteger(v.attempts) && typeof v.createdAt === "string" && typeof v.updatedAt === "string" && (v.kind === undefined || v.kind === "reply" || v.kind === "broadcast" || v.kind === "command");
 }
 function atomic(path: string, value: unknown): void {
  mkdirSync(join(path, ".."), { recursive: true });

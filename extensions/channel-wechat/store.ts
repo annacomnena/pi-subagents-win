@@ -50,8 +50,11 @@ export interface InboundRecord {
 	/** 清洗后文本（parser 上限内；GUI 端点层再截断显示）。 */
 	text: string;
 	receivedAt: string;
-	/** W1 恒 pending（injected/rejected 留给 W2 注入门）。 */
-	state: "pending" | "injected" | "rejected";
+	/** W1 恒 pending（injected/rejected 留给 W2 注入门；consumed = 0924 远程命令旁路终态，
+	 *  Hermes 对照 §6.3「dispatched, not queued」第三态——既非 injected 也非 rejected，
+	 *  且**不满足** wechat-reply-hook 的 `state !== "injected"` 门 → 命令回执永不可能
+	 *  被当成 marker 轮回执）。 */
+	state: "pending" | "injected" | "rejected" | "consumed";
 	rejectedReason?: "not-allowlisted" | "write-failed";
 	artifactPending?: boolean;
 	/** W2 注入关联只读投影；旧记录无此键时为 undefined。 */
@@ -326,7 +329,7 @@ export class WechatStore {
 					fromNickname: typeof v.fromNickname === "string" ? v.fromNickname : null,
 					text: typeof v.text === "string" ? v.text : "",
 					receivedAt: typeof v.receivedAt === "string" ? v.receivedAt : "",
-					state: v.state === "injected" || v.state === "rejected" ? v.state : "pending",
+					state: v.state === "injected" || v.state === "rejected" || v.state === "consumed" ? v.state : "pending",
 					...(v.rejectedReason === "not-allowlisted" || v.rejectedReason === "write-failed" ? { rejectedReason: v.rejectedReason } : {}),
 					...(v.artifactPending === true ? { artifactPending: true } : {}),
 					...(typeof v.outboxId === "string" ? { outboxId: v.outboxId } : {}),

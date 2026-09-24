@@ -42,9 +42,7 @@ import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtim
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
-import { readWechatConfigPath, readWechatEnabled, readWechatInputConfig, readWechatReceiveEnabled, readWechatReplyConfig, setWechatReplyConfig, setWechatReplyMode, setWechatEnabled, readWechatCreds, wechatCredsPath } from "./runtime-host/wechat-bind.ts";
-import { defaultRuntimeDir } from "./runtime/journal.ts";
-import { WechatStore } from "./channel-wechat/store.ts";
+import { readWechatConfigPath, setWechatReplyConfig, setWechatReplyMode, setWechatEnabled } from "./runtime-host/wechat-bind.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
@@ -67,6 +65,8 @@ import { registerReportListener } from "./report.ts";
 import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
 import { registerOutboxBridge } from "./outbox-bridge.ts";
 import { registerWechatReplyHook } from "./wechat-reply-hook.ts";
+// 0924 远程斜杠命令旁路（白名单分级 + 未知命令显式拒绝；裁定⑤缺省 fail-closed）
+import { buildWechatStatusText, registerWechatRemoteCommands } from "./wechat-command-consumer.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts"; // G6 L3：GUI 自动拉起（opt-in）
 import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import type { WakeDecision } from "./runtime/wake.ts";
@@ -1863,6 +1863,9 @@ export default function (pi: ExtensionAPI) {
 	collect(registerMailboxConsumer(pi, {}));
 	collect(registerOutboxBridge(pi));
 	collect(registerWechatReplyHook(pi));
+	// 0924 远程斜杠命令旁路：inbox 消费端（session_start 起 watch/tick）+ 内部派发命令注册；
+	// 能力门缺省关闭 → 零副作用，与 outbox/广播链零交互（回执走 reply intent）。
+	collect(registerWechatRemoteCommands(pi));
 	// G6 L3：GUI 自动拉起（opt-in，gui.autoStart=true 才有动作；subagent 早退分支不达此处，tick 内 isMainSession 双保险）
 	collect(registerGuiAutoStart(pi));
 
@@ -2072,16 +2075,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub !== "status") { ctx.ui.notify("用法：/wechat on|off|status|reply on|off|reply mode broadcast|reply-only", "warning"); return; }
-			const configPath = readWechatConfigPath();
-			let worker = "(状态不可读)";
-			try {
-				const stats = new WechatStore(join(defaultRuntimeDir(), "wechat", "receive")).stats();
-				worker = `status=${stats.status} polls=${stats.counts.polls} received=${stats.counts.received}`;
-			} catch { /* tolerant status */ }
-			const creds = readWechatCreds(wechatCredsPath(defaultRuntimeDir()));
-			const botId = creds?.botId;
-			const replyCfg = readWechatReplyConfig(configPath);
-			ctx.ui.notify([`wechat: enabled=${readWechatEnabled(configPath)}`, `reply.enabled=${replyCfg.enabled} mode=${replyCfg.mode} scope=${replyCfg.sessionScope}`, `receive.enabled=${readWechatReceiveEnabled(configPath)}`, `input.enabled=${readWechatInputConfig(configPath).enabled} allowFrom=${readWechatInputConfig(configPath).allowFrom.length}`, `worker: ${worker}`, `credentials: ${creds ? `已绑定${botId ? ` botId=${botId.length > 6 ? `${botId.slice(0, 3)}…${botId.slice(-2)}` : "…"}` : ""}` : "未绑定"}`].join("\n"), "info");
+			// 0924：状态文本抽公共函数（与远程命令回执同源，研究 Q6.1#7 前置重构点）
+			ctx.ui.notify(buildWechatStatusText({ configPath: readWechatConfigPath() }), "info");
 		},
 	});
 	// global-view（0923 首阶段：只读聚合；与 global-view tool 共用 globalViewLogic）。

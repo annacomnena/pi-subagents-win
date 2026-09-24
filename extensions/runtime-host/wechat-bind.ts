@@ -237,6 +237,26 @@ export function readWechatInputConfig(configPath: string): WechatInputConfig {
 	}
 }
 
+/**
+ * 远程斜杠命令能力门（0924 旁路，用户裁定⑤ **fail-closed**）：
+ * `channels.wechat.remoteCommands.enabled === true` 才生效，缺段/坏 JSON/任何非 true → false。
+ * 与 Hermes `slash_access.py#L196-L222` 的 fail-open（未配 admin 即全开）刻意相反。
+ * 二次确认开关**不存在**（用户裁定②：不做 nonce/确认，sensitive 直接执行，仅留审计行）。
+ * never-throw；消费端在门为 false 时零 IO 零副作用（记录留 pending = 今天行为）。
+ */
+export interface WechatRemoteCommandConfig { enabled: boolean }
+
+export function readWechatRemoteCommandConfig(configPath: string): WechatRemoteCommandConfig {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+			channels?: { wechat?: { remoteCommands?: { enabled?: unknown } } };
+		};
+		return { enabled: raw?.channels?.wechat?.remoteCommands?.enabled === true };
+	} catch {
+		return { enabled: false };
+	}
+}
+
 export type WechatReplyMode = "reply-only" | "broadcast";
 export type WechatReplySessionScope = "owner" | "main" | "any";
 
