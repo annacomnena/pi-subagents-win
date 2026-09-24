@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
 | 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） |
 | 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） |
 | 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） |
@@ -53,6 +54,18 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 45 - 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast）
+
+- **日期**：2026-09-24
+- **一句话**：出站从「只回复微信触发轮」升级为**广播**——`channels.wechat.reply.mode` 缺省 `"broadcast"`；只有 **global master 会话**（`sessionScope` 缺省 `"owner"`：`readAttachment(masterAddress())?.sessionId === getCurrentSessionId()`，读不到/不匹配 fail-closed 不广播）在 `agent_settled`（`agent_end` 只暂存；Esc 中断无暂存 → 审计 `no-stash`）把该轮末条非空 assistant 原文（`>4000` 截断）发给 `WechatStore.knownChats()` 全部曾入站私聊（滤空/`@im.bot`、去重保序；群消息天然不进 inbox——parser `group_id` quarantine）。身份：intent id `sha256("wechat-broadcast:"+roundId+":"+fromId)`、per-recipient clientId `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`，一收件人一 intent（`kind:"broadcast"`），同轮 EEXIST 幂等、不同轮 `createdAt` 排队不覆盖。发送三门（watcher，顺序即契约）：mode 非 broadcast → 跳过（保留 pending、零审计）→ 共用一次机会 `attempts>=1`→`unknown` → TTL 10min（`BROADCAST_INTENT_TTL_MS`，createdAt 不可解析判过期）`failed(broadcast-expired)` **先于** connected 门（非 connected 保留 pending + 审计 `channel-not-connected`）；失败 per-recipient 一次机会不重试。回滚：`reply.mode="reply-only"`（秒级止发、pending 保留）或 `reply.enabled=false`（全停）。
+- **涉及模块**：`extensions/wechat-reply-hook.ts`（暂存/flush/资格门）、`extensions/runtime-host/wechat-reply.ts`（mode/TTL/connected 三门 `#L43-L61`）、`extensions/runtime-host/wechat-bind.ts#L263-L278`（`{enabled,mode,sessionScope}` + fail-closed）、`extensions/runtime/wechat-reply.ts#L24-L27` + `extensions/channel-wechat/send.ts#L72-L74`（intent id/clientId 派生）、`extensions/channel-wechat/store.ts#L349-L358`（`knownChats()`）、`extensions/index.ts#L2053-L2084`（`/wechat reply mode` + status 行）、`extensions/runtime-host/server.ts#L928`（status 响应 `mode` 字段）
+- **产物**：`plans/0924_wechat_broadcast_recon.md` / `plans/0924_wechat_broadcast_plan.md` / `plans/0924_wechat_broadcast_impl_report.md` / `plans/0924_wechat_broadcast_l4_review.md`（本地 gitignored）
+- **Wiki**：更新 `Wiki/Architecture/wechat-ilink-channel.md`——新增「出站广播」节（资格门 / mode 配置 / 触发时机 / 收件人集合 / 内容 / 身份派生 / 发送三门与顺序 / TTL / 回滚 / 已知近似）+ 修正 stale 句「群消息无法独立识别」（已被 parser `group_id` quarantine 取代）+ Open Questions 补广播待测项 + Evidence/source_paths 补代码位置
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`0a2b292`（feat：出站广播，11 files）+ `0337aac`（fix：L4 必须修 M1 reply-only 回滚止发 + 建议修 S1–S5，4 files）
+- **Verification**：`_test_wechat_broadcast.ts` **18 组断言块全绿**（含 M1 回滚止发 fetch=0、S5 的 TTL 先于 connected 门序 + 真实 `readAttachment(masterAddress())` 缺省路径 + `currentSid=undefined`）；`_test_wechat_reply.ts` **22 组旧路径红线原样**；`_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server` 回归全绿；L4 `plans/0924_wechat_broadcast_l4_review.md` **PASS-with-fixes**（1 必须修 + 5 建议修全部采纳闭环）。
 
 ### Item 44 - G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in）
 

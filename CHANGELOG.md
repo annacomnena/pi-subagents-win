@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] — 2026-09-24 (微信出站广播：`0a2b292`/`0337aac`)
+
+- **出站广播（缺省开启）**：`channels.wechat.reply.mode` 缺省 `"broadcast"`——global master 会话每轮 `agent_settled` 把该轮末条非空 assistant 原文（`>4000` → `slice(0,4000)+"…[截断]"`）发给**全部已曾入站私聊**；`"reply-only"` = 完全回旧行为（marker 路径逐字节不变）。`reply.enabled` 仍是总开关（缺省 true）。
+- **资格**：`channels.wechat.reply.sessionScope` 缺省 `"owner"`——`readAttachment(masterAddress())?.sessionId === getCurrentSessionId()`；attachment 读不到/不匹配 → fail-closed 不广播（审计 `master-attachment-unavailable`/`not-master-owner`，本会话无暂存时静默不落行）；另有 `main`/`any` 取值；subagent 一律不广播。
+- **触发**：`agent_end` 只暂存（每次覆盖 = 本轮最终态），`agent_settled` 才 flush 出意图；flush 无暂存（如 Esc 中断路径）→ 审计 `no-stash`；暂存会话 ≠ settled 会话 → 丢弃 + `stash-session-mismatch`。
+- **收件人**：`WechatStore.knownChats()`（inbox 全量 → 滤空 fromId 与 `@im.bot` → fromId 去重保序，最近入站优先）；**群消息天然不进 inbox**（parser 对 `group_id` 非空直接 quarantine）；空集合 → 审计 `no-known-chats`、零 intent。
+- **身份派生**：roundId = `sha256(sessionId:firstUserTs??"no-ts":sha256(firstUserText))`；intent id = `sha256("wechat-broadcast:"+roundId+":"+fromId)`，per-recipient clientId = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`；一个 intent 一收件人（`kind:"broadcast"`，旧文件无 kind 兼容为 reply）；同轮 `linkSync` EEXIST 幂等不重发、不同轮按 `createdAt` 升序排队。
+- **发送三门（watcher，顺序即契约；reply intent 三门全不受约束）**：① mode 非 broadcast → broadcast intent 整轮跳过（保留 pending、零审计）→ 共用一次机会规则 `attempts>=1` → `unknown(attempts-exhausted)` → ② TTL `BROADCAST_INTENT_TTL_MS=10min`（`createdAt` 不可解析也判过期，fail-closed）→ `failed(broadcast-expired)`，**先于** ③ connected 门（`status!=="connected"` → 审计 `channel-not-connected`、保留 pending 排队续发）。失败语义 per-recipient、一次机会不自动重试。
+- **回滚**：`reply.mode="reply-only"`（hook 立即弃暂存 + watcher 跳过残留 pending 广播 intent——秒级止发且不丢）或 `reply.enabled=false`（全停、pending 保留）。CLI `/wechat reply mode broadcast|reply-only`；`/wechat status` 含 `mode=`/`scope=`；`GET /v1/wechat/reply/status` 响应含 `mode`。
+- **已知近似（诚实记录）**：`receive/state.json.status` 是**接收 worker** 健康而非发送能力（worker 死但 token 有效时保守不出站）；配置文件整体坏 fail-closed 到 `reply-only`；roundId 无时间戳且同会话同文碰撞会吞第二轮（吞而不覆盖）；升级即开播（存量无 `mode` 键 → 缺省 broadcast+owner）。
+- **验收**：`_test_wechat_broadcast.ts` **18 组断言块**全绿（含 M1 回滚止发、TTL 先于 connected 门序、真实 `readAttachment(masterAddress())` 缺省路径）；`_test_wechat_reply.ts` 22 组旧路径红线原样；`_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server` 回归全绿；L4 `plans/0924_wechat_broadcast_l4_review.md` **PASS-with-fixes**（1 必须修 M1 + 5 建议修已闭环 `0337aac`）。
+- **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md`（新增「出站广播」节 + 修正 stale 句「群消息无法独立识别」）；Recent Work Item 45。
+
 ## [Unreleased] — 2026-09-24 (E2.3 单点翻转落地：`22e398a`/`f89abdb`；**G-B 完成**)
 
 - **单点翻转落地、缺省仍 v2（opt-in 逃生舱）**：`autonomy/collect.ts` 的 frontier 数据源改为按 env `PI_AUTONOMY_FRONTIER_SOURCE` 单点二选一——`trim()==="graph"` 才走 Graph（`readGraphSnapshot`→`toFrontierInput`），**缺省/其它任何值 = v2**（`collectGlobalView`）。**不写 `config.json`**、不新增 `collectAutonomyInputs` opts、`graph/**`/`autonomy/frontier.ts`/`protocol.ts`/`index.ts`/`package.json` 零改；单 commit 可 revert（`git revert 22e398a` 即回 v2，无状态迁移）。
