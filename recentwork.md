@@ -31,6 +31,7 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 34 | P0 | **微信端到端已打通**（真机消息正确解析并落 inbox；W2c owner 默认准入待 L4）+ 待办：热点层 v4 重做 | none | 见下「交接状态」 |
 | 33 | P0 | **微信接收真正打通**：真机消息形状对齐（message_id 数字/from_user_id/text_item.text/group_id） | none | quarantine 在 GUI 可见（当前盲区） |
 | 32 | P1 | autonomy 开关界面可达（D17）+ **前置修 R4**（ws-mail 到信成为 frontier 触发，已实现 `3d8409f`） | none | A4 `/wechat on|off|status`；audit 轮转（R5） |
 | 31 | P1 | 修 daemon 弹终端窗口（spawn 形状 windowsHide:false → true，含 worker 连带修） | none | —（已完成） |
@@ -42,6 +43,21 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 34 - 交接状态（2026-09-24，compaction 不可用 → 自动交接新会话）
+
+**微信链路（P0，已打通）**
+- 真机消息**已能正确接收并解析**：GUI 实测 `msgId=7508724292610502000`（数字 `message_id`）/ `from=o9cq…`（`from_user_id`）/ 正文 `现在测试微信途径。你好？`（`text_item.text`）。链路：`iLink 长轮询 → 真机字段解析 → 私有 inbox → GUI 只读展示`。
+- 关键修复：`3babd63`（真机形状：`message_id` 数字 / `from_user_id` / `text_item.text` / `group_id` 群消息拒收）；`842d49a`（真机协议：`get_updates_buf`/`msgs`，指南不可信）；`00b5f32`（W1 接收）；`168fed1`（W2 注入）；`18ba74d`（W2b 界面开关）。
+- **未提交（工作树）**：W2c = owner 默认准入（`ownerOpenId` 来自绑定响应 `ilink_user_id`）+ rejected 复活 + `GET /v1/wechat/quarantine` + GUI 被拒可见性。文件：`extensions/runtime-host/{wechat-bind.ts,wechat-input.ts,server.ts}`、`extensions/channel-wechat/store.ts`、`gui/src/pages/ChannelsPage.tsx`。
+- **在飞**：W2c 的 L4 = `run_mueyl6qa_r5w2`（产物 `plans/0924_wechat_owner_default_l4_review.md`）。PASS → 提交；must-fix → 修复轮。
+- 已知缺口（实现者自认）：owner 命中/缺失、复活幂等与"其它原因不复活"、quarantine 端点 401/脱敏 的**专项断言**未补（L4 已要求其自写探针）。
+
+**下一步（用户明确要求）**：**重做热点层** —— 依据 `plans/0924_hotspot_v4_ephemeral_working_set.md`（用户指出的计划文件；当前热点层"不理想"）。
+- 现状事实：`Wiki/_hotspot.md` rev 8、9 主题（上限 8）；`extensions/hotspot/{store.ts,tool.ts,validate.ts}`；上限语义已修（只在新增时生效，`e4a5874`）；CodeGraph 已初始化（`.codegraph/` 28MB 已 gitignore，符号验证可用）。
+- 待读该 v4 计划后按 lite 链推进（L1 检索 → L2 计划 → L3 实现 → L4 → L5）。
+
+**其它待办**：worker 成功时未清陈旧 `lastError`；微信真网 7 项已测 4 项（空批推进/响应形状/长轮询时长/消息形状），余 5 项待测；W3 出站回复（待用户定）。
 
 ### Item 33 - 微信接收真正打通：真机消息形状对齐
 
