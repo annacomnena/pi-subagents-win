@@ -31,12 +31,27 @@
 | 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
 | 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
 | 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
+| 29 | P1 | 微信输入 W2b：GUI 开关 + 白名单（hash id 可维护）+ 「为什么没进来」反馈（已实现 `18ba74d`） | Item 28 | 真机验证被**平台侧**阻塞（消息不进长轮询队列）→ 待用户核对推送/webhook 配置 |
 | 28 | P1 | 微信输入 W2（私聊文本注入 master，D15 六条件，已实现 `168fed1`） | Item 25 | W2b：GUI 开关 + 白名单（从最近发送者一键添加）+ 「为什么没进来」反馈 |
 | 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） |
 | 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 29 - 微信输入 W2b（界面开关 + 白名单 + 未生效反馈）+ 真机接收被平台侧阻塞
+
+- **日期**：2026-09-24
+- **一句话**：按 D17 把 W2 的注入开关从"手改 config.json"搬到 GUI：三端点（`input/set`、`input/status`、`senders`）+ GUI 区块（开关/白名单/一键加/为什么没进来）；白名单用 **hash id** 维护（刷新后仍可增删，且不暴露完整 openid）。
+- **涉及模块**：`extensions/runtime-host/{server.ts,wechat-bind.ts}`、`gui/src/pages/ChannelsPage.tsx`、`extensions/_test_wechat_input_set.ts`
+- **产物**：`plans/0924_wechat_input_w2b_spec.md`、`plans/0924_wechat_input_w2b_impl_report.md`、`plans/0924_wechat_input_w2b_l4_review.md`（PASS-with-must-fix，2 处契约偏差已修并加锁）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` → 「W2b 界面开关切片」
+- **Priority**：P1
+- **Status**：done（`18ba74d`）
+- **Commit**：`18ba74d`
+- **Verification**：端点级测试（401/403、status 零泄漏完整 openid、masterAlive 随心跳、审计尾行、senders 20 上限+去重+不写审计、set 保留其它字段/幂等/原子失败）+ W2 13 组 + W1 7 组 + runtime-host-server + smoke + GUI tsc/build 全绿。
+- **⚠️ 真机接收被平台侧阻塞（未解）**：两个受控探针（随机 UIN / **固定 UIN**，均空游标起步、唯一消费者）各 6 次 poll 全 `msgs:[]`，HTTP 200 且服务端接受并推进游标 ⇒ **本机实现无缺陷**，但该 bot 的消息**不进长轮询队列**。用户侧现象：曾收到 bot 自动回复"暂无法连接openclaw"（说明有东西在应答），该回复消失后长轮询仍恒空。**待用户在平台侧核对**：①「消息推送/Webhook/回调 URL」是否配置（应清空才能走长轮询）②绑定的 `bot_type=3` 与所聊 bot 是否同一个 ③是否需先建立会话。详见 Wiki 微信页「判定实验」节。
+- **旁**：`input.enabled=true` 且白名单为空时，期间收到的消息会被标 `rejected`（终态）——已在 Wiki 写明操作顺序。
 
 ### Item 28 - 微信输入 W2（私聊文本注入当前 master owner）
 

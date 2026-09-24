@@ -99,6 +99,23 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 
 远程消息到达而用户正在 master 交互时：缺省**直接插入**（远程通道本分），TUI 给醒目提示；「排队到本轮结束」留作后续可选开关。
 
+## W2b 界面开关切片（**已落地** `18ba74d`，D17）
+
+**动机**：D17「任何 opt-in 开关必须界面可达」——W2 的注入开关原先只能手改 `config.json`。
+
+**三端点**（均在 `authorizeCommand` 之后；`wechat.enabled=false` 时 **403**）：
+| 端点 | 语义 |
+|---|---|
+| `POST /v1/wechat/input/set` | `{enabled?, allowFrom?, add?: string[]（完整 openid）, remove?: string[]（hash id）}`；原子 read-modify-write 保留其它字段；trim/去重/去空；幂等；写失败 500。**响应只回 `{id, masked}` 投影，不回显完整 openid** |
+| `GET /v1/wechat/input/status` | `{enabled, allowFrom:[{id: sha256前12, masked}], allowFromCount, masterAlive, masterSid12?, lastDecision/lastReason/lastAt}`（`masterAlive` = **tick 级** `sessionAlive`；后三者取审计尾行） |
+| `GET /v1/wechat/senders` | 最近发送者（**完整 openid**，仅供本机受信 GUI 一键加白名单）：inbox 归并去重、按 lastAt 降序、**上限 20**、**不写审计/日志** |
+
+**GUI**：新增「允许微信消息进入对话」区块——开关 + 醒目警示（开启 = 微信当你的输入）+ 白名单列表（掩码 + 按 **hash id** 删除，**刷新后仍可维护**）+ 从最近发送者一键添加 + **「为什么没进来」**（`masterAlive` 红/绿 + 最近判定 + 时间 + 离线时提示 `/gui open`）。
+
+**L4 收口**（`plans/0924_wechat_input_w2b_l4_review.md`，PASS-with-must-fix）抓到并已修两处契约偏差：① `input/set` 原先置于 opt-in 闸**之前** ⇒ 禁用时返回 200 且写盘（规格要求 403）；② `set` 响应原先回显**完整 openid**（规格：仅 `/senders` 与 GUI 内存）。两处均补测试锁定。
+
+**操作顺序（重要，有依赖）**：① 先让消息"收得到" → ② 在「收到的消息」看到 → 点「从最近发送者一键添加」→ ③ 再打开 `input` 开关。**⚠️ 若白名单为空就先开 `input`，期间收到的消息会被判 `denied` 并标 `rejected`（终态），事后加白名单不补投。**
+
 ## 真机协议实测（2026-09-24，**指南不可信**）
 
 **结论：指南 §3 描述的响应形状与真机不符，实现必须按真机校准。**
@@ -115,6 +132,16 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针脚本已落地�
 **影响与修法**：W1 原按指南实现 ⇒ 游标取不到（`protocolErrors` 累积、游标永不推进）⇒ **一条消息也收不到**。修法 = `client.ts` 接受真机字段（游标 `get_updates_buf`→`sync_buf`→`buf`；列表 `msgs`→`item_list`），**两种形状都兼容**；`parser.ts` 宽容取 msgId（`id`/`msgId`/`msg_id`/`msg.id`）、无 `msg` 包装时按条目自身解析、内容项接受 `item_list`/`items`/`content_list`，并新增**脱敏形状签名**（未知结构 quarantine 时记 `shape={key:type}`，**只记键名与类型**）——用于一次性对齐真机字段。
 
 **教训（可复用）**：第三方协议文档**必须用真机响应校准**后才能作为实现依据；"真网未测"清单里的项要尽早打真机，否则整个通道可能只是"看起来实现了"。
+
+### 判定实验：消息不进长轮询队列（2026-09-24）
+
+两个受控探针（均为唯一消费者，worker 已停）：
+1. **随机 UIN + 空游标**：6 次 poll 全 `msgs:[]`；
+2. **固定 UIN（跨请求稳定）+ 空游标**：6 次 poll 全 `msgs:[]`（HTTP 200、服务端接受并返回新游标、`sentBufLen` 96）。
+
+**结论**：① 请求与游标处理**正常**（服务端接受并推进游标）；② **UIN 是否跨请求稳定不影响投递**；③ 该 bot 的消息**根本不进入长轮询队列** ⇒ 属**平台侧投递路径**问题（如平台仍把消息推给某个 webhook/后端、或该 bot 的消息走别的投递方式），不是本机实现缺陷。用户侧现象佐证：曾收到 bot 自动回复"暂无法连接openclaw"（说明**有东西在应答**），该回复消失后长轮询仍恒空。
+
+**待用户在平台侧核对**：① bot 的「消息推送 / Webhook / 回调 URL」是否配置（应清空才能走长轮询）；② 绑定用的 `bot_type`（我们用 3）与所聊 bot 是否同一个；③ 是否需要先与 bot 建立会话/好友关系才投递。
 
 ## W2 实现切片（**已落地** `168fed1`：微信私聊文本 → 当前 master owner）
 
