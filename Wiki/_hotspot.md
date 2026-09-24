@@ -4,7 +4,7 @@ kind: concept
 status: current
 updated: 2026-09-23
 schema_version: 1
-revision: 4
+revision: 6
 ---
 
 ## async-delivery-ownership
@@ -40,15 +40,6 @@ revision: 4
 - 证据：skills/workflow-orchestrator/SKILL.md → 档位（相对大小，不规定模型）
 - 内容更新：2026-09-23T01:04:44.000Z
 - 引用验证：2026-09-23T01:04:44.000Z
-
-## hidden-console-spawn
-
-- 标题：daemon 派生形状以 Runtime Daemon 存活机制为准（detached 为主路径）
-- 适用范围：常驻进程派生形状争议；本条目旧结论（windowsHide-only、勿用 detached）已被切片一切片推翻，不再作为路由依据
-- 入口：extensions/runtime-host/daemon-lifecycle.ts::defaultSpawnDaemon
-- 证据：Wiki/Decisions/runtime-daemon-lifetime.md
-- 内容更新：2026-09-23T00:00:00.000Z
-- 引用验证：2026-09-23T00:00:00.000Z
 
 ## default-async-dispatch
 
@@ -94,13 +85,15 @@ revision: 4
 
 ## wechat-ilink-login
 
-- 标题：微信 iLink 登录/绑定协议契约与绑定切片
-- 适用范围：扫码取码/状态轮询协议事实与 GUI 绑定切片边界（v1 只做绑定/解绑/状态）
+- 标题：微信 iLink 登录绑定 + 接收 W1
+- 适用范围：微信 iLink 通道：登录/绑定 v1（扫码/状态/解绑/开关）+ 接收 W1（长轮询 worker/游标/去重/私有 inbox，只收不投）
 - Wiki：Wiki/Architecture/wechat-ilink-channel.md → 登录/绑定协议契约（源码已验证）
-- 入口：scripts/wechat-ilink-probe.mjs::cmdLogin
+- Wiki：Wiki/Architecture/wechat-ilink-channel.md → W1 接收切片（**已实现**：长轮询 worker + 游标/去重/私有 inbox + 只读可见）
 - 证据：plans/0923_wechat_gui_bind_plan.md
-- 内容更新：2026-09-23T09:30:16.232Z
-- 引用验证：2026-09-23T09:30:16.232Z
+- 证据：extensions/_test_wechat_receive.ts
+- 证据：recentwork.md → Item 25 - 微信 iLink 接收 W1（只收不投：长轮询 + 游标/去重/私有 inbox + GUI 可见）
+- 内容更新：2026-09-24T00:37:26.486Z
+- 引用验证：2026-09-24T00:37:26.486Z
 
 ## gui-master-inject-trust
 

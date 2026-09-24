@@ -32,3 +32,6 @@ Wiki/_keywords.json
 
 # hotspot 工具 pending 队列误写 CWD（应在 agentDir）——见 recentwork Item 20 待办
 state/
+
+# hotspot 工具移除主题的恢复副本（派生/可重建，不入库）
+Wiki/_hotspot.trash.jsonl
