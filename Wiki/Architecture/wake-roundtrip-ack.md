@@ -2,7 +2,7 @@
 title: Wake 回信（round-trip 回执）
 kind: concept
 status: current
-updated: 2026-09-24
+updated: 2026-09-25
 source_paths:
   - extensions/runtime/wake.ts#L49-L64
   - extensions/runtime/wake.ts#L221
@@ -76,10 +76,12 @@ tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方
 
 ## Links Out
 
+- [[Local Master Ensure（幂等确保）]]
 - [[Wiki 索引]]
 
 ## Backlinks
 
+- [[Local Master Ensure（幂等确保）]]
 - [[Wiki 索引]]
 
 ## Open Questions

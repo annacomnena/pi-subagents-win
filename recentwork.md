@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） |
 | 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） |
 | 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
 | 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） |
@@ -55,6 +56,19 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 47 - local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活）
+
+- **日期**：2026-09-25
+- **一句话**：把「人手动去目标仓开 pi + `/master-attach --local`」变成主会话可调用的**幂等 ensure**——工具 `local-master-ensure` + 同名 slash `/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]` 双入口，三段幂等（活 owner → `already-running` 零动作；`state/local-master-launch/<scope>.json` wx first-wins 防重 → 窗口内重调 `launched(in-flight)` 零第二个 spawn；spawn **可见 WT tab** 后按严格判据轮询）。**零新增权力（核心）**：生产代码零 `attachMaster`/`forceStale`/`token`/`cutover`/`detach` 调用、不写 attachment、不代替 attach；认领由新会话 `session_start` 既有静默路径（`silentScopeGenesis` / `takeoverStaleScopeOwner`）完成；bootstrap prompt 无 token、不指示 forceStale、负向禁碰 global。**四层授权合取**：① `isSubagent()` 首行硬挡 + `DEFAULT_EXCLUDE_TOOLS` 纵深 ② `localMasterEnsureGate`（复用 `masterDispatchGate`：main / global owner 放行，tab/not-owner/unknown 拒）③ 只收 `cwd`（不收 scope/地址）④ 描述带 `USER_DIRECTIVE`；**免二次确认（用户裁定）**。参数 `{cwd, waitForReady?=true, timeoutMs?=60000（上限 180000）}` → 七态 `already-running|launched|ready|spawn-failed|timeout|invalid-cwd|stalled`；就绪判据六条（liveness/attachment/同 sessionId/同 generation/pid 活/`launchAt < liveness.updatedAt`）+ #A claim 观测（generation 前进），**拿不到 liveness 如实 `stalled` 不猜**；审计 `state/local-master-ensure-audit.jsonl` 每次调用（含被拒）一行 `{at,by,cwd,scope,action,result}` 六字段无正文。
+- **#A 消费循环注册语义（重要）**：注册点**唯一** = `mailbox-consumer.ts::registerScopeWakeLoop()`（`session_start` 处理块内 `setInterval(30s)`），全仓接线仅 `index.ts:1945`；**认领 ⟺ 注册**（同一 `session_start` 处理块内）；`triggerOwnershipRecheck()` 只补注册全局 watcher、**不**注册 scope 消费循环；**手动 `/master-attach --local` 不经过 `session_start` → 不注册消费循环**（L4 独立验证，限定：直到下一个 `session_start` 才补注册）——因此 ensure 的 `ready` 路径**必然注册**，也是「信躺着」（computer-use 死会话 mailbox 永远 pending）的机制解释。
+- **涉及模块**：`extensions/runtime/local-master-launch.ts`（`ensureLocalMaster`/`parseLocalMasterEnsureArgs`/`judgeLocalMasterEnsureReady`/`buildLocalMasterBootstrapPrompt`/marker 与审计 IO，纯库无 Pi API）、`extensions/master-tools.ts`（工具注册 + `localMasterEnsureGate`）、`extensions/index.ts`（slash handler + `ensureLocalMasterTab` spawn 通道 + `registerScopeWakeLoop` 接线）、`extensions/runner-argv.ts`（`DEFAULT_EXCLUDE_TOOLS`）、`extensions/_test_local_master_launch.ts`、`package.json`（`test:local-master-ensure`）
+- **产物**：`plans/0924_local_master_launch_recon.md`（L1）/ `plans/0924_local_master_launch_plan.md`（L2）/ `plans/0924_local_master_ensure_impl_report.md`（L3 + §7 L4 后修复）/ `plans/0924_local_master_ensure_l4_review.md`（L4 独立复核）（本地 gitignored）
+- **Wiki**：**新建** `Wiki/Architecture/local-master-ensure.md`（能力语义 / 七态 / 就绪判据六条+claim 观测 / 零新增权力 / 四层授权 / in-flight / 审计 / spawn 形状 / **#A 消费循环注册语义含「手动 attach 不注册」** / 已知残余 / Evidence / Open Questions）+ `Wiki/Decisions/local-master-claim.md`（补「认领路径与消费循环注册的耦合」句 + 互链）+ `Wiki/Architecture/wake-roundtrip-ack.md`（互链）+ `Wiki/_index.md`（架构导航条目）
+- **Priority**：P1
+- **Status**：done
+- **Commit**：`0586030`（feat：主会话按 cwd 幂等确保他仓 local master 存活，7 files）+ `f5a9b90`（fix：L4 必须修 M1 slash 参数解析纯函数 + 建议修 S1 fail-closed/S2 `windowEndsAt` 落盘/S3/S4/S5/S7，3 files）
+- **Verification**：`_test_local_master_launch.ts` **23 组断言块全绿**（2026-09-25 文档轮复跑 exit=0，含 F3/F4、H claim 观测、J1/J2 #A、K 静态耦合、L 解析 4 例）；L4 独立复核 `PASS-with-fixes`（4/4 变异被捕获；M1 已修，S1–S5/S7 已闭环，S6 端到端真 spawn 手测留人工）；文档轮 `check_repo_wiki.py` OK（16 页）+ `wiki-nav rebuild`。
 
 ### Item 46 - 微信远程斜杠命令旁路（`/xxx` → `consumed`，分级白名单 + 防绕过 + fail-closed）
 
