@@ -12,8 +12,9 @@
  * 三段幂等：
  *   1. precheck：已有**活** owner（attachment+liveness 同身份同代 + pid 活）→ `already-running`，
  *      零 spawn 零 in-flight 写（并顺手关掉历史窗口）；
- *   2. in-flight marker first-wins：`state/local-master-launch/<scope>.json`，窗口 = timeout+30s；
- *      窗口内同 scope 重调 → `launched` + inFlight=true（零第二个 spawn）；
+ *   2. in-flight marker first-wins：`state/local-master-launch/<scope>.json`，窗口 = timeout+30s
+ *      且**落盘**（`windowEndsAt`，first-wins：窗口属于最初那次 spawn，不由后续调用方的
+ *      timeout 现算）；窗口内同 scope 重调 → `launched` + inFlight=true（零第二个 spawn）；
  *   3. spawn 后按就绪判据轮询（waitForReady=false 则直接 `launched`）。
  *
  * 就绪判据（用户裁定 #7，严格）：
@@ -67,6 +68,38 @@ export const ENSURE_AUDIT_FILE = "local-master-ensure-audit.jsonl";
 export function clampEnsureTimeout(ms?: number): number {
 	if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return ENSURE_DEFAULT_TIMEOUT_MS;
 	return Math.min(Math.max(ms, 100), ENSURE_MAX_TIMEOUT_MS);
+}
+
+// ── slash 参数解析（纯函数；L4-M1）─────────────────────────────────
+
+export interface LocalMasterEnsureArgs {
+	/** 第一个 positional token（trim 后；无 → 空串，由 ensure 判 invalid-cwd）。 */
+	cwd: string;
+	/** `--no-wait` 是否出现（→ waitForReady:false）。 */
+	noWait: boolean;
+	/** `--timeout` 的值（仅有限数值时给出；非法/缺失 → 不给，走 clampEnsureTimeout 缺省）。 */
+	timeoutMs?: number;
+}
+
+/**
+ * `/local-master-ensure [--no-wait] [--timeout <ms>] [<cwd>]` 的解析（flag 与位置参数可任意顺序）。
+ *
+ * `--timeout` 是**带值 flag**：它的值本身不以 `--` 开头，但绝不能被当成 cwd——否则
+ * `--timeout 5000 C:\repo` 会取到 `cwd="5000"`；若会话 cwd 下恰有同名目录，就会在错误目录
+ * 开可见 tab，且新会话 `session_start` 会静默认领该目录 scope 的 local master（写 attachment、
+ * 需人工撤）——正是层③「防指向混淆」要防的事故（L4 必须修 M1）。
+ * 故：排除 `--timeout` 紧随的那个 token 后再取第一个非 flag token。
+ */
+export function parseLocalMasterEnsureArgs(args?: string): LocalMasterEnsureArgs {
+	const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+	const tIdx = parts.indexOf("--timeout");
+	const positional = parts.filter((p, i) => !p.startsWith("--") && i !== tIdx + 1);
+	const raw = tIdx >= 0 ? Number(parts[tIdx + 1]) : undefined;
+	return {
+		cwd: (positional[0] ?? "").trim(),
+		noWait: parts.includes("--no-wait"),
+		...(typeof raw === "number" && Number.isFinite(raw) ? { timeoutMs: raw } : {}),
+	};
 }
 
 function defaultIsDirectory(p: string): boolean {
@@ -180,6 +213,8 @@ export interface LaunchMarker {
 	scope: string;
 	runId: string | null;
 	at: string;
+	/** in-flight 窗口结束时刻（ISO；首次认领时落盘，first-wins，与后续调用方的 timeout 无关）。 */
+	windowEndsAt?: string;
 }
 
 function markerPath(scope: string, stateDir: string): string {
@@ -192,7 +227,8 @@ function tolerantReadMarker(path: string): LaunchMarker | null {
 		const raw = JSON.parse(readFileSync(path, "utf8")) as LaunchMarker;
 		if (typeof raw?.scope !== "string" || typeof raw?.at !== "string") return null;
 		if (typeof raw.runId !== "string" && raw.runId !== null) return null;
-		return { scope: raw.scope, runId: raw.runId ?? null, at: raw.at };
+		const windowEndsAt = typeof raw.windowEndsAt === "string" ? raw.windowEndsAt : undefined;
+		return { scope: raw.scope, runId: raw.runId ?? null, at: raw.at, ...(windowEndsAt ? { windowEndsAt } : {}) };
 	} catch {
 		return null;
 	}
@@ -205,9 +241,11 @@ function writeMarker(path: string, marker: LaunchMarker): void {
 
 /**
  * first-wins 认领 in-flight 窗口（用户裁定 #8）：
- *   wx 排他创建成功 → claimed（本次 spawn）；
- *   EEXIST → 读旧 marker：窗口内 → 不认领（调用方回 launched(in-flight) 零 spawn）；过期 → 删旧再 wx 一轮；
- *   仍失败（并发/IO）→ 不认领（宁可少开一个 tab；attachment 层 CAS 仍是最终单赢）。
+ *   wx 排他创建成功 → claimed（本次 spawn），**窗口结束时刻 `windowEndsAt` 同时落盘**；
+ *   EEXIST → 读旧 marker：以盘上 `windowEndsAt` 为准（无则按旧 `at`+本次 windowMs 兜底）
+ *     窗口内 → 不认领（调用方回 launched(in-flight) 零 spawn）；过期 → 删旧再 wx 一轮；
+ *   非 EEXIST 失败（权限/磁盘 IO）→ **fail-closed 不认领**（宁可少开一个 tab；attachment
+ *     层 CAS 仍是最终单赢）——与本 JSDoc 同口径（L4 建议修 S1：原实现 fail-open 与注释矛盾）。
  * 任何 IO 异常 never-throw。
  */
 export function claimLocalMasterLaunchMarker(
@@ -224,19 +262,39 @@ export function claimLocalMasterLaunchMarker(
 		try {
 			const fd = openSync(path, "wx");
 			try {
-				writeFileSync(fd, `${JSON.stringify({ scope, runId: null, at: new Date(opts.nowMs).toISOString() } satisfies LaunchMarker, null, 2)}\n`, "utf8");
+				writeFileSync(
+					fd,
+					`${JSON.stringify(
+						{
+							scope,
+							runId: null,
+							at: new Date(opts.nowMs).toISOString(),
+							windowEndsAt: new Date(opts.nowMs + opts.windowMs).toISOString(),
+						} satisfies LaunchMarker,
+						null,
+						2,
+					)}\n`,
+					"utf8",
+				);
 			} finally {
 				closeSync(fd);
 			}
 			return { claimed: true, marker: null };
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") {
-				// 非竞争性写失败（权限/磁盘）：降级为无 marker 的尽力启动（registry CAS 兜底单赢）。
-				return { claimed: true, marker: null };
+				// 非竞争性写失败（权限/磁盘 ENOTDIR/EACCES/ENOSPC…）→ fail-closed 不认领
+				// （L4 建议修 S1：宁可少开一个 tab；attachment 层 CAS 仍是最终单赢）。
+				return { claimed: false, marker: { scope, runId: null, at: new Date(opts.nowMs).toISOString() } };
 			}
 			const existing = tolerantReadMarker(path);
-			const atMs = existing ? Date.parse(existing.at) : NaN;
-			if (existing && Number.isFinite(atMs) && opts.nowMs - atMs < opts.windowMs) {
+			// 窗口以盘上值为准（S2）：first-wins 的窗口属于「那次 spawn」，不属于后续调用方；
+			// 无 windowEndsAt 的旧 marker 按 at + 本次 windowMs 兜底（与旧行为等价）。
+			const endMs = existing
+				? existing.windowEndsAt
+					? Date.parse(existing.windowEndsAt)
+					: Date.parse(existing.at) + opts.windowMs
+				: NaN;
+			if (existing && Number.isFinite(endMs) && opts.nowMs < endMs) {
 				return { claimed: false, marker: existing };
 			}
 			try {
@@ -249,10 +307,21 @@ export function claimLocalMasterLaunchMarker(
 	return { claimed: false, marker: tolerantReadMarker(path) ?? { scope, runId: null, at: new Date(opts.nowMs).toISOString() } };
 }
 
-/** spawn 成功后回写 runId（同窗口覆盖写；never-throw）。 */
+/**
+ * spawn 成功后回写 runId（同窗口覆盖写；never-throw）。
+ * **保留**首次认领落盘的 `windowEndsAt`（否则回写会把窗口重置为「now + 调用方窗口」，
+ *  破坏 first-wins——L4 建议修 S2）。
+ */
 export function updateLocalMasterLaunchMarker(scope: string, runId: string, opts: { stateDir: string; nowMs: number }): void {
 	try {
-		writeMarker(markerPath(scope, opts.stateDir), { scope, runId, at: new Date(opts.nowMs).toISOString() });
+		const path = markerPath(scope, opts.stateDir);
+		const prev = tolerantReadMarker(path);
+		writeMarker(path, {
+			scope,
+			runId,
+			at: new Date(opts.nowMs).toISOString(),
+			...(prev?.windowEndsAt ? { windowEndsAt: prev.windowEndsAt } : {}),
+		});
 	} catch {
 		/* best-effort：marker 只服务防重，不影响回执 */
 	}
@@ -404,7 +473,7 @@ export async function ensureLocalMaster(
 		};
 	}
 
-	// ── in-flight 防重（first-wins；窗口 = timeout + 30s）──
+	// ── in-flight 防重（first-wins；窗口 = 认领时的 timeout+30s，落盘 windowEndsAt 为准）──
 	const claim = claimLocalMasterLaunchMarker(scopeKey, {
 		stateDir,
 		nowMs: now(),

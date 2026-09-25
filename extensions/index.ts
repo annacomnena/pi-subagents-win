@@ -52,6 +52,7 @@ import {
 	ensureLocalMaster,
 	ensureResultIsError,
 	formatLocalMasterEnsureResult,
+	parseLocalMasterEnsureArgs,
 	type LocalMasterSpawn,
 } from "./runtime/local-master-launch.ts";
 import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
@@ -2191,10 +2192,10 @@ export default function (pi: ExtensionAPI) {
 	// local-master-ensure（0924 计划 §1）：与同名工具双入口——同一四层授权、同一审计行、
 	// 同一 ensure 编排；slash 面给用户手动用，工具面给主会话编排用。
 	pi.registerCommand("local-master-ensure", {
-		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 零动作；不带 forceStale/token）",
+		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 零动作；不带 forceStale/token）。仅在用户明确要求时使用",
 		handler: async (args, ctx) => {
-			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
-			const cwdArg = (parts.find((p) => !p.startsWith("--")) ?? "").trim();
+			// M1：解析抽成导出纯函数（flag 与位置参数任意顺序；--timeout 的值不得被当成 cwd）
+			const { cwd: cwdArg, noWait, timeoutMs: parsedTimeout } = parseLocalMasterEnsureArgs(args);
 			const sid = durableSessionIdentity(ctx as never);
 			const audit = (result: string): void =>
 				auditLocalMasterEnsure({
@@ -2217,9 +2218,6 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (!gate.ok) { audit(`rejected:${gate.reason}`); ctx.ui.notify(gate.text, "warning"); return; }
 			if (!ensureLocalMasterTab) { audit("rejected:no-channel"); ctx.ui.notify("local-master-ensure: spawn 通道不可用，拒绝", "warning"); return; }
-			const noWait = parts.includes("--no-wait");
-			const tIdx = parts.indexOf("--timeout");
-			const parsedTimeout = tIdx >= 0 ? Number(parts[tIdx + 1]) : undefined;
 			const r = await ensureLocalMaster(
 				{
 					cwd: cwdArg,

@@ -12,8 +12,9 @@
  *       global owner（tab 形态）放行（via owner）；通道缺席拒。
  *   D   层④ 描述授权语义：USER_DIRECTIVE + 零新增权力边界句。
  *   E   already-running 幂等：活 owner → 零动作零 spawn、不写 in-flight。
- *   F   in-flight 防重（first-wins，窗口 = timeout+30s）：窗口内同 scope 重调 →
- *       launched(in-flight) 零第二个 spawn；过期窗口可重新认领。
+ *   F   in-flight 防重（first-wins，窗口 = timeout+30s **且落盘 windowEndsAt**，L4-S2）：
+ *       窗口内同 scope 重调 → launched(in-flight) 零第二个 spawn；过期窗口可重新认领；
+ *       F3 非 EEXIST 写失败 → fail-closed 不认领（L4-S1，宁可少开一个 tab）。
  *   G   就绪判据（裁定 #7）逐条件：ready / stalled(no-liveness 不猜) /
  *       timeout(identity-mismatch, generation-mismatch, owner-pid-dead,
  *       liveness-not-updated)；ready 关闭窗口；超时钳制。
@@ -24,6 +25,8 @@
  *       **注册与认领同一处理块**——无 owner → genesis 成功 → 消费循环生效（信被 claim+spawn）；
  *       no-liveness 僵尸 → 新会话 skip → 不注册（信仍 pending）→ 同夹具 ensure 如实 stalled。
  *   K   双入口（同名 slash 命令 + 工具）与 #A 注册点的静态耦合校验。
+ *   L   slash 参数解析纯函数 parseLocalMasterEnsureArgs（L4-M1）：flag-first / cwd-first /
+ *       --no-wait 在前 / 非法 timeout 四例——--timeout 的值不得被当成 cwd。
  *
  * 运行：npm run test:local-master-ensure
  */
@@ -57,6 +60,7 @@ import {
 	ensureStatusForReason,
 	formatLocalMasterEnsureResult,
 	judgeLocalMasterEnsureReady,
+	parseLocalMasterEnsureArgs,
 	readLocalMasterEnsureAudit,
 	readLocalMasterLaunchMarker,
 	type LocalMasterEnsureDeps,
@@ -76,6 +80,14 @@ const ok = (name: string): void => {
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const cleanups: string[] = [];
+/** 临时目录/文件统一清理（L4-S3：断言失败也要清——挂到 process.on("exit") 兜底；rmSync 同步可跑）。 */
+function cleanupAll(): void {
+	for (const dir of cleanups.splice(0)) {
+		try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+	}
+	try { rmSync(RUNTIME, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
+process.on("exit", cleanupAll);
 /** 每个用例一个独立目标目录（scope = basename，恒唯一）；结束统一清理。 */
 function mkCwd(): string {
 	const dir = mkdtempSync(join(tmpdir(), "lms-cwd-"));
@@ -380,6 +392,43 @@ function loadTool(opts: { ensureLocalMasterTab?: LocalMasterSpawn } = {}): Tool 
 	assert.equal(claimLocalMasterLaunchMarker(scope, { stateDir: STATE, nowMs: clock.now(), windowMs: win }).claimed, true, "过期窗口可重新认领");
 	clearLocalMasterLaunchMarker(scope, STATE);
 	ok("F2 in-flight 窗口 = timeout + 30s");
+}
+
+// F3：非 EEXIST 写失败（目录路径落在一个文件上 → ENOTDIR）→ **fail-closed 不认领**（L4-S1）：
+//     与 JSDoc「宁可少开一个 tab」同口径；旧实现 fail-open（return claimed:true）与注释矛盾。
+{
+	const badState = join(tmpdir(), `lms-badstate-${process.pid}-${Date.now()}`);
+	writeFileSync(badState, "not a directory\n", "utf8");
+	cleanups.push(badState);
+	const claim = claimLocalMasterLaunchMarker("lms_fail_closed", { stateDir: badState, nowMs: Date.now(), windowMs: 5_000 });
+	assert.equal(claim.claimed, false, "非 EEXIST 写失败（ENOTDIR/EACCES…）→ 不认领（fail-closed）");
+	ok("F3 marker 写失败 fail-closed（S1：宁可少开一个 tab）");
+}
+
+// F4：in-flight 窗口落盘 first-wins（L4-S2）：窗口属于「那次 spawn」，不由后续调用方的 timeout 现算。
+//     首次 timeoutMs=180000（窗口 210s）→ 40s 后用 timeoutMs=1000 重调（旧算法窗口仅 31s、会误判过期开第二个 tab）。
+{
+	const cwd = mkCwd();
+	const scope = localMasterScope(cwd);
+	const fx = fixture(); // 无 owner
+	const counter = spawnCounter();
+	const clock = fakeClock();
+	const deps: LocalMasterEnsureDeps = {
+		spawn: counter.spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
+		readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, isAlive: isAliveFake,
+	};
+	const r1 = await ensureLocalMaster({ cwd, sessionId: "sess_main", waitForReady: false, timeoutMs: 180_000 }, deps);
+	assert.equal(r1.status, "launched");
+	const m = readLocalMasterLaunchMarker(scope, STATE);
+	assert.ok(m?.windowEndsAt, "marker 落盘 windowEndsAt");
+	assert.equal(Date.parse(m!.windowEndsAt!) - clock.now(), 180_000 + ENSURE_IN_FLIGHT_EXTRA_MS, "首次窗口 = 首次调用的 timeout+30s");
+	clock.advance(40_000);
+	const r2 = await ensureLocalMaster({ cwd, sessionId: "sess_main", waitForReady: false, timeoutMs: 1_000 }, deps);
+	assert.equal(r2.status, "launched");
+	assert.equal(r2.inFlight, true, "小 timeout 的重调仍在盘上首次窗口内（S2）");
+	assert.equal(counter.calls.length, 1, "零第二个 spawn");
+	clearLocalMasterLaunchMarker(scope, STATE);
+	ok("F4 in-flight 窗口落盘 first-wins（S2）");
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -701,7 +750,7 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	deliverLetter(wakeLetter(addr));
 	const spawned: string[] = [];
 	const pi = fakePi();
-	registerScopeWakeLoop(pi, {
+	const stop1 = registerScopeWakeLoop(pi, {
 		cwd,
 		intervalMs: 5,
 		spawn: (d, sid) => {
@@ -715,6 +764,7 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	assert.equal(spawned.length, 1, "消费循环已注册并消费（wake 信 → spawn）");
 	assert.equal(spawned[0], `${scope}:sess_lms_new`);
 	assert.equal(listLetters(addr, "pending").length, 0, "信被 claim（不再 pending）");
+	stop1(); // L4-S7：显式释放 disposer（不靠 interval.unref 退出）
 	ok("J1 #A：认领成功 ⟹ 消费循环随 session_start 注册并生效");
 }
 
@@ -730,7 +780,7 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	deliverLetter(wakeLetter(addr));
 	const spawned: string[] = [];
 	const pi = fakePi();
-	registerScopeWakeLoop(pi, {
+	const stop2 = registerScopeWakeLoop(pi, {
 		cwd,
 		intervalMs: 5,
 		spawn: (d) => {
@@ -754,6 +804,7 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	assert.equal(spawnCalls, 1, "僵尸仓照常开 tab（这正是恢复路径）");
 	assert.equal(r.status, "stalled");
 	assert.equal(r.reason, "no-liveness", "拿不到 liveness → stalled，不谎报 ready");
+	stop2(); // L4-S7：显式释放 disposer
 	ok("J2 #A：no-liveness 僵尸不注册消费循环 → ensure 如实 stalled（残余可报）");
 }
 
@@ -781,6 +832,11 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	const here = import.meta.dirname;
 	const src = readFileSync(join(here, "index.ts"), "utf8");
 	assert.ok(src.includes('pi.registerCommand("local-master-ensure"'), "同名 slash 命令已注册");
+	const cmdIdx = src.indexOf('pi.registerCommand("local-master-ensure"');
+	const cmdEnd = src.indexOf("pi.registerCommand(", cmdIdx + 1);
+	const cmdBlock = src.slice(cmdIdx, cmdEnd > 0 ? cmdEnd : undefined);
+	assert.ok(cmdBlock.includes("parseLocalMasterEnsureArgs"), "slash 解析走导出的纯函数 parseLocalMasterEnsureArgs（M1/S4）");
+	assert.ok(cmdBlock.includes("仅在用户明确要求时使用"), "slash 描述带用户明确要求句（S5）");
 	assert.ok(src.includes("ensure:slash"), "slash 面审计 action");
 	assert.ok(src.includes("localMasterEnsureGate"), "slash 面同一层②门");
 	assert.ok(/registerMasterTools\(pi, \{[^}]*ensureLocalMasterTab/.test(src), "registerMasterTools 已注入 ensureLocalMasterTab");
@@ -798,7 +854,32 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	ok("K 双入口 + #A 注册点静态耦合校验");
 }
 
-// ── 清理（临时 runtimeDir + 目标目录）───────────────────────────────
-for (const dir of cleanups) rmSync(dir, { recursive: true, force: true });
-rmSync(RUNTIME, { recursive: true, force: true });
+// ════════════════════════════════════════════════════════════════════
+// L — slash 参数解析纯函数（M1：--timeout 的值不得被当成 cwd）
+// ════════════════════════════════════════════════════════════════════
+{
+	// 1) flag 在前（L4 实跑复现：旧解析取 cwd="5000"）
+	const a1 = parseLocalMasterEnsureArgs("--timeout 5000 C:\\repo");
+	assert.equal(a1.cwd, "C:\\repo", "flag-first：cwd 取真正 positional，不吃 --timeout 的值");
+	assert.equal(a1.timeoutMs, 5000, "--timeout 的值仍被正常解析");
+	assert.equal(a1.noWait, false);
+	// 2) cwd 在前（命令描述里的书写顺序）
+	const a2 = parseLocalMasterEnsureArgs("C:\\repo --timeout 5000");
+	assert.equal(a2.cwd, "C:\\repo", "cwd-first 不回归");
+	assert.equal(a2.timeoutMs, 5000);
+	// 3) --no-wait 在前
+	const a3 = parseLocalMasterEnsureArgs("--no-wait C:\\repo");
+	assert.equal(a3.cwd, "C:\\repo", "--no-wait 是 flag，不吃 positional");
+	assert.equal(a3.noWait, true);
+	assert.equal(a3.timeoutMs, undefined, "未给 --timeout → 不给 timeoutMs（走缺省 60s）");
+	// 4) 非法 timeout（L4 实跑复现：旧解析取 cwd="abc"）
+	const a4 = parseLocalMasterEnsureArgs("--timeout abc C:\\repo");
+	assert.equal(a4.cwd, "C:\\repo", "非法 timeout 值也不得被当成 cwd");
+	assert.equal(a4.timeoutMs, undefined, "非法 → 不给，由 clampEnsureTimeout 缺省");
+	assert.equal(clampEnsureTimeout(a4.timeoutMs), 60_000, "非法 timeout 回落缺省 60s");
+	ok("L slash 参数解析 4 例（flag-first / cwd-first / --no-wait 在前 / 非法 timeout）");
+}
+
+// ── 清理（临时 runtimeDir + 目标目录；exit 钩子兑底，S3）──────
+cleanupAll();
 console.log(`_test_local_master_launch: all assertions passed (${n} groups)`);
