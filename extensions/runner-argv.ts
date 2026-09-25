@@ -15,13 +15,15 @@
  *     搜索走 bash。窄 allowlist 示例：["read", "bash"]。
  */
 
-/** 默认排他列表：子 agent 禁止再派发（防递归）、禁止 tab 编排、禁止计时器。 */
+/** 默认排他列表：子 agent 禁止再派发（防递归）、禁止 tab 编排、禁止计时器；
+ *  local-master-ensure（0924）入列 = 「启动他会话」的纵深防线（工具内 isSubagent 硬挡是第一道）。 */
 export const DEFAULT_EXCLUDE_TOOLS = [
 	"subagent-win",
 	"launch-tabs",
 	"set-timer",
 	"cancel-timer",
 	"list-timers",
+	"local-master-ensure",
 ] as const;
 
 /** per-call 工具策略（仅显式传入才生效）。 */

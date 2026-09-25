@@ -25,7 +25,7 @@ const BASE_TASK = "Task: do something";
 	assert.deepEqual(argv, [
 		CLI,
 		"--mode", "json", "--print", "--no-session",
-		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
+		"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers,local-master-ensure",
 		BASE_TASK,
 	]);
 	// 全字段变体也锁死（与抽取前 runSingle 的拼装顺序逐项一致）
@@ -37,7 +37,7 @@ const BASE_TASK = "Task: do something";
 		[
 			CLI,
 			"--mode", "json", "--print", "--no-session",
-			"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers",
+			"--exclude-tools", "subagent-win,launch-tabs,set-timer,cancel-timer,list-timers,local-master-ensure",
 			"--model", "Zhipu/glm-5.2",
 			"--thinking", "high",
 			"--append-system-prompt", "You are a searcher.",

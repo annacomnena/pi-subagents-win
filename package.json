@@ -114,6 +114,7 @@
     "test:injection-gate": "node --experimental-strip-types ./extensions/_test_injection_gate.ts",
     "test:scope-stale-takeover": "node --experimental-strip-types ./extensions/_test_scope_stale_takeover.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts",
+    "test:local-master-ensure": "node --experimental-strip-types ./extensions/_test_local_master_launch.ts",
     "gui:dev": "node scripts/gui-dev.mjs",
     "gui:build": "npm run build --prefix gui",
     "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts"

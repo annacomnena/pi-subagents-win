@@ -46,6 +46,14 @@ import {
 	readPressure,
 } from "./runtime/master-pressure.ts";
 import type { MasterSuccessionConfig } from "./runtime/master-auto.ts";
+import {
+	auditLocalMasterEnsure,
+	ensureLocalMaster,
+	ensureResultIsError,
+	formatLocalMasterEnsureResult,
+	type LocalMasterEnsureDeps,
+	type LocalMasterSpawn,
+} from "./runtime/local-master-launch.ts";
 
 export interface ToolOutcome {
 	text: string;
@@ -291,6 +299,41 @@ function toolSession(ctx: unknown): string {
 	return durableSessionIdentity(ctx as never);
 }
 
+// ── local-master-ensure 授权（0924 计划 §2 四层合取；层①③④在 execute 内，层②在此纯函数）──
+
+export type LocalMasterEnsureGate =
+	| { ok: true; via: "main" | "owner" }
+	| { ok: false; reason: "subagent" | "unknown-session" | "tab-session" | "not-owner" | "generation-mismatch"; text: string };
+
+/**
+ * 层②调用者资格：与 master-dispatch 同款口径（复用 masterDispatchGate——
+ * sub 硬挡 → 身份 unknown 拒 → global owner 放行 → main 放行 → tab/not-owner 拒）。
+ * 层① isSubagent 单独前置（硬挡文案与审计 reason 需独立可辨）；层③参数面与层④
+ * USER_DIRECTIVE 描述在工具/命令注册处。
+ */
+export function localMasterEnsureGate(input: {
+	sessionId: string;
+	isSub: boolean;
+	isTab: boolean;
+	isMain: boolean;
+	readAttachment: () => MasterAttachment | null;
+}): LocalMasterEnsureGate {
+	if (input.isSub) {
+		return { ok: false, reason: "subagent", text: "local-master-ensure: 子 agent 不可启动其他仓的会话（防扩散硬挡）" };
+	}
+	const g = masterDispatchGate(input);
+	if (g.ok) return { ok: true, via: g.via };
+	const text =
+		g.reason === "unknown-session"
+			? "local-master-ensure: 无法确定当前会话身份，拒绝"
+			: g.reason === "tab-session"
+				? "local-master-ensure: 任务 tab 不可启动其他仓的会话；用 tab-finish 回报主会话由主会话编排"
+				: g.reason === "not-owner"
+					? "local-master-ensure: 仅主会话或 global Master owner 可确保他仓 local master，拒绝"
+					: "local-master-ensure: Master 归属已变化（stale generation），拒绝；请重新确认 owner";
+	return { ok: false, reason: g.reason, text };
+}
+
 function textResult(outcome: ToolOutcome): { content: { type: string; text: string }[]; details?: Record<string, unknown>; isError?: boolean } {
 	return {
 		content: [{ type: "text", text: outcome.text }],
@@ -392,7 +435,15 @@ export function masterPressureLogic(usage: unknown): ToolOutcome {
 
 export function registerMasterTools(
 	pi: ExtensionAPI,
-	opts: { spawnSuccessor?: SpawnSuccessor; masterSuccession?: () => MasterSuccessionConfig; dispatchTab?: DispatchTab } = {},
+	opts: {
+		spawnSuccessor?: SpawnSuccessor;
+		masterSuccession?: () => MasterSuccessionConfig;
+		dispatchTab?: DispatchTab;
+		/** local-master-ensure 的 spawn 通道（index.ts 提供：wt 前置检查 + 账本 + spawnPiTab）。 */
+		ensureLocalMasterTab?: LocalMasterSpawn;
+		/** 测试注入用 ensure 依赖（时钟/sleep/fs；spawn 恒由 ensureLocalMasterTab 提供）。 */
+		ensureDeps?: Omit<LocalMasterEnsureDeps, "spawn">;
+	} = {},
 ): void {
 	const subBlocked = () => isSubagent();
 
@@ -675,6 +726,85 @@ export function registerMasterTools(
 			}
 			const text = `master-dispatch 已启动：${res.title} runId=${res.runId}（用 tab-status / reclaim-tabs 回收）`;
 			return { content: [{ type: "text", text }], details: { runId: res.runId, title: res.title, taskId: (params.taskId ?? "").trim(), mode, text } };
+		},
+	});
+
+	// local-master-ensure（0924 计划 §1/§2；用户裁定 1-10）：主会话按 cwd 幂等确保他仓
+	// local master 存活。四层授权合取（缺一即拒）：① isSubagent 硬挡（+ runner-argv
+	// DEFAULT_EXCLUDE_TOOLS 纵深）② 调用者资格 = main session 或 global master owner
+	//（localMasterEnsureGate 复用 masterDispatchGate 同款口径）③ 参数面只收 cwd
+	//（不收 scope/地址，防指向混淆）④ 描述带 USER_DIRECTIVE。
+	// 零新增权力：不写 attachment、不代替 attach、不带 forceStale/token/cutover/detach；
+	// 认领由新会话 session_start 的既有静默路径完成。每次调用（含被拒）写审计行。
+	pi.registerTool({
+		name: "local-master-ensure",
+		label: "Local Master Ensure",
+		description: [
+			"按 cwd 幂等确保目标仓库的 local master 活着：已有活 owner → already-running 零动作；无 owner / owner pid 死 → 开一个可见 pi tab，由新会话 session_start 的既有静默路径自动认领/接管（本工具不写 attachment、不代替 attach、不带 forceStale/token/cutover/detach）。",
+			"参数只有 cwd（scope/地址由它派生，不收 scope/地址参数）；仅主会话或 global Master owner 可调，子 agent 硬挡。开一个新进程等价于你手动去那个仓开一个会话。",
+			"不可与 attach/detach/transfer 组合；僵尸死角（no-liveness/身份不匹配）交还用户走 /master-attach --local --force-stale --confirm。",
+			USER_DIRECTIVE,
+		].join(" "),
+		parameters: Type.Object({
+			cwd: Type.String({ description: "目标仓目录（必填；必须存在且为目录）" }),
+			waitForReady: Type.Optional(Type.Boolean({ description: "缺省 true：轮询就绪再返回；false = 开完即回 launched" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "就绪超时毫秒，缺省 60000，上限 180000" })),
+		}),
+		renderCall(args, theme) {
+			const a = args as { cwd?: string };
+			return new Text(`${theme.fg("toolTitle", theme.bold("local-master-ensure"))} ${theme.fg("accent", String(a.cwd ?? "?"))}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = (result.details as { text?: string } | undefined)?.text ?? "";
+			return new Text(theme.fg("dim", text.slice(0, 200)), 0, 0);
+		},
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			const params = rawParams as { cwd?: string; waitForReady?: boolean; timeoutMs?: number };
+			const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
+			const sid = toolSession(ctx);
+			const scopeForAudit = cwd ? localMasterScope(cwd) : null;
+			const audit = (result: string): void =>
+				auditLocalMasterEnsure({ by: sid || "unknown", cwd, scope: scopeForAudit, action: "ensure:tool", result });
+			// 层① 身份硬挡（最高优先，与其余 master 写工具同款）
+			if (isSubagent()) {
+				audit("rejected:subagent");
+				const text = "local-master-ensure: 子 agent 不可启动其他仓的会话（防扩散硬挡）";
+				return textResult({ text, isError: true, details: { text, reason: "subagent" } });
+			}
+			if (!sid || sid === "unknown") {
+				audit("rejected:unknown-session");
+				const text = "local-master-ensure: 无法确定当前会话身份，拒绝";
+				return textResult({ text, isError: true, details: { text, reason: "unknown-session" } });
+			}
+			// 层② 调用者资格（复用 masterDispatchGate 口径：main session 或 global master owner）
+			const gate = localMasterEnsureGate({
+				sessionId: sid,
+				isSub: false,
+				isTab: isTabSession(),
+				isMain: isMainSession(),
+				readAttachment: () => readAttachment(masterAddress()),
+			});
+			if (!gate.ok) {
+				audit(`rejected:${gate.reason}`);
+				return textResult({ text: gate.text, isError: true, details: { text: gate.text, reason: gate.reason } });
+			}
+			if (!opts.ensureLocalMasterTab) {
+				audit("rejected:no-channel");
+				const text = "local-master-ensure: spawn 通道不可用，拒绝";
+				return textResult({ text, isError: true, details: { text, reason: "no-channel" } });
+			}
+			// 层③ 参数面：invalid-cwd 由 ensure 判定（零 spawn、零状态写）
+			const r = await ensureLocalMaster(
+				{ cwd, sessionId: sid, waitForReady: params.waitForReady, timeoutMs: params.timeoutMs },
+				{ ...(opts.ensureDeps ?? {}), spawn: opts.ensureLocalMasterTab },
+			);
+			audit(`${r.status}${r.reason ? `:${r.reason}` : ""}`);
+			const text = formatLocalMasterEnsureResult(r);
+			return textResult({
+				text,
+				isError: ensureResultIsError(r),
+				details: { text, ...(r as unknown as Record<string, unknown>) },
+			});
 		},
 	});
 

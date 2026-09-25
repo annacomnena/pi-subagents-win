@@ -46,7 +46,14 @@ import { readWechatConfigPath, setWechatReplyConfig, setWechatReplyMode, setWech
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
-import { localAgentFromCwd, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import { localAgentFromCwd, localMasterEnsureGate, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
+import {
+	auditLocalMasterEnsure,
+	ensureLocalMaster,
+	ensureResultIsError,
+	formatLocalMasterEnsureResult,
+	type LocalMasterSpawn,
+} from "./runtime/local-master-launch.ts";
 import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
@@ -70,7 +77,7 @@ import { buildWechatStatusText, registerWechatRemoteCommands } from "./wechat-co
 import { registerGuiAutoStart } from "./gui-autostart.ts"; // G6 L3：GUI 自动拉起（opt-in）
 import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
 import type { WakeDecision } from "./runtime/wake.ts";
-import type { ScopeWakeDecision } from "./runtime/scope.ts";
+import { localMasterScope, type ScopeWakeDecision } from "./runtime/scope.ts";
 import {
 	attachCurrentSession,
 	issueMasterHandoffToken,
@@ -90,7 +97,7 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
-import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
+import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
@@ -2181,6 +2188,51 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(out.text, out.isError ? "warning" : "info");
 		},
 	});
+	// local-master-ensure（0924 计划 §1）：与同名工具双入口——同一四层授权、同一审计行、
+	// 同一 ensure 编排；slash 面给用户手动用，工具面给主会话编排用。
+	pi.registerCommand("local-master-ensure", {
+		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 零动作；不带 forceStale/token）",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const cwdArg = (parts.find((p) => !p.startsWith("--")) ?? "").trim();
+			const sid = durableSessionIdentity(ctx as never);
+			const audit = (result: string): void =>
+				auditLocalMasterEnsure({
+					by: sid || "unknown",
+					cwd: cwdArg,
+					scope: cwdArg ? localMasterScope(cwdArg) : null,
+					action: "ensure:slash",
+					result,
+				});
+			// 层① 身份硬挡（与 /master-transfer / /autonomy kill 同款）
+			if (isSubagent()) { audit("rejected:subagent"); ctx.ui.notify("local-master-ensure: 子 agent 不可启动其他仓的会话", "warning"); return; }
+			if (!sid || sid === "unknown") { audit("rejected:unknown-session"); ctx.ui.notify("local-master-ensure: 无法确定当前会话身份，拒绝", "warning"); return; }
+			// 层② 调用者资格（与工具同口径：main session 或 global master owner）
+			const gate = localMasterEnsureGate({
+				sessionId: sid,
+				isSub: false,
+				isTab: isTabSession(),
+				isMain: isMainSession(),
+				readAttachment: () => readAttachment(masterAddress()),
+			});
+			if (!gate.ok) { audit(`rejected:${gate.reason}`); ctx.ui.notify(gate.text, "warning"); return; }
+			if (!ensureLocalMasterTab) { audit("rejected:no-channel"); ctx.ui.notify("local-master-ensure: spawn 通道不可用，拒绝", "warning"); return; }
+			const noWait = parts.includes("--no-wait");
+			const tIdx = parts.indexOf("--timeout");
+			const parsedTimeout = tIdx >= 0 ? Number(parts[tIdx + 1]) : undefined;
+			const r = await ensureLocalMaster(
+				{
+					cwd: cwdArg,
+					sessionId: sid,
+					waitForReady: !noWait,
+					...(typeof parsedTimeout === "number" && Number.isFinite(parsedTimeout) ? { timeoutMs: parsedTimeout } : {}),
+				},
+				{ spawn: ensureLocalMasterTab },
+			);
+			audit(`${r.status}${r.reason ? `:${r.reason}` : ""}`);
+			ctx.ui.notify(formatLocalMasterEnsureResult(r), ensureResultIsError(r) ? "warning" : "info");
+		},
+	});
 	pi.registerCommand("master-detach", {
 		description: "交接逻辑 Master：颁发 handoff token（/master-detach [reason]；接班者在 home 新会话接管）",
 		handler: async (args, ctx) => {
@@ -2436,7 +2488,47 @@ export default function (pi: ExtensionAPI) {
 		return masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
 	};
 
-	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, dispatchTab });
+	// local-master-ensure spawn 通道（0924 计划 §6）：与 spawnOneShotTab / spawnSuccessor
+	// 同款账本序列（dispatch → journal → link → spawn → failed 回写），但 prompt 是常驻
+	// master bootstrap（不经 buildWorkflowTabPrompt 的一次性纪律包装）；taskId = lms-<scope>。
+	// 可见 WT tab（非无头）；不设 PI_SUBAGENT → 新会话 session_start 走既有静默认领/接管。
+	// wt 缺席在生成 runId 之前返回 error（零账本）；spawnPiTab preflight/异步失败回写 launch_failed。
+	const ensureLocalMasterTab: LocalMasterSpawn = (args) => {
+		const wtPath = findWindowsTerminal();
+		if (!wtPath) return { error: "no wt.exe" };
+		let piCli: string;
+		try {
+			piCli = findPiCli();
+		} catch (err) {
+			return { error: `pi CLI: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		const runId = newTabRunId();
+		const title = `local-master ${args.scope}`;
+		const runsDir = defaultTabRunsDir();
+		const dispatch: TabDispatchRecord = {
+			id: runId, version: 1, taskId: args.taskId, mode: "execute", title, cwd: args.cwd,
+			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
+		};
+		const markFailed = (err: Error): void => {
+			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
+			writeTabDispatch(runsDir, failed);
+			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+		};
+		writeTabDispatch(runsDir, dispatch);
+		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
+		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: `local-master=${args.scope}` });
+		const result = spawnPiTab({
+			wtPath, piCli, cwd: args.cwd, title, prompt: args.prompt, tabRunId: runId, runsDir,
+			onSpawnError: markFailed,
+		});
+		if (result.error) {
+			markFailed(new Error(result.error));
+			return { runId, error: result.error };
+		}
+		return { runId };
+	};
+
+	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, dispatchTab, ensureLocalMasterTab });
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
@@ -2713,7 +2805,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
 				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
-				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
+				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3；仅 async:false 同步路径有效，异步 fan-out 忽略）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行（单发与并行 tasks 均适用）；**缺省 true（非阻塞，返回 runId 后靠完成事件/status 收割）**，只有本轮就要结果时才显式传 false 走同步等待" })),
@@ -2726,7 +2818,7 @@ export default function (pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
 			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
-			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers）之后" })),
+			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 		}),
 
 		// ── TUI 渲染 ──
