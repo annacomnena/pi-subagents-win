@@ -274,7 +274,7 @@ try {
 		const root = mkdtempSync(join(tmpdir(), "wechat-reply-s4-"));
 		try {
 			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
-			mkdirSync(stateDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } })); // B5：钉 mode 锁旧行为（缺省已改 broadcast，0924 计划 §2）
+			mkdirSync(stateDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } })); // B5：钉 mode 锁旧行为（0925 P0 起缺省已为 reply-only——此处显式钉值，不受缺省影响）
 			const outboxId = "a".repeat(64), store = new WechatStore(join(runtimeDir, "wechat", "receive"));
 			store.putInbox({ msgId: "m-private-userid", fromId: "openid-authoritative@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
 			const msgs = [{ role: "user", content: [{ type: "text", text: `dedupe:outbox:${outboxId}` }] }, { role: "assistant", content: [{ type: "text", text: "older" }] }, { role: "assistant", stopReason: "length", content: [{ type: "text", text: `last ${TO}` }] }];

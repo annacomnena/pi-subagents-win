@@ -74,6 +74,8 @@
     "test:identity": "node --experimental-strip-types ./extensions/_test_identity.ts",
     "test:register-graph": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_test_register_graph.ts",
     "test:wechat-reply": "node --experimental-strip-types ./extensions/_test_wechat_reply.ts",
+    "test:wechat-broadcast": "node --experimental-strip-types ./extensions/_test_wechat_broadcast.ts",
+    "test:wechat-outbound-auth": "node --experimental-strip-types ./extensions/_test_wechat_outbound_auth.ts",
     "test:wechat-artifact": "node --experimental-strip-types ./extensions/_test_wechat_artifact.ts",
     "test:wechat-remote-command": "node --experimental-strip-types ./extensions/_test_wechat_remote_command.ts",
     "smoke:extension-load": "node ./scripts/check-extension-load.mjs",

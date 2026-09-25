@@ -176,6 +176,18 @@ try {
 			// 0925 P0：响应新增 mode（缺省 reply-only——0925 起广播须显式开启；该 config 只写了 reply.enabled:false，未设 mode）
 			assert.deepEqual(projection, { enabled: false, mode: "reply-only", counts: { pending: 0, sent: 0, failed: 1, unknown: 0 }, lastAt: projection.lastAt, lastError: "auth" });
 			assert.ok(!JSON.stringify(projection).includes("private"));
+			// 0925 P0 L4-S1：策略拒绝在 status 面可解释——event:"denied" 行并入失败列表，
+			// 分类取 reason（仍过 safeReplyError 白名单）→ 不再投影成泛化 "send-error"。
+			// at 取晚于 intent.updatedAt 的固定偏移，保证「取最新一条」的选取确定性。
+			const deniedAuditPath = join(D, "state", "wechat-reply-audit.jsonl");
+			writeFileSync(deniedAuditPath, JSON.stringify({ at: new Date(Date.now() + 60_000).toISOString(), kind: "broadcast", event: "denied", reason: "broadcast-unauthorized", authz: "not-outbound-subscriber", from: "openid-SENTINEL" }) + "\n");
+			const deniedRes = await fetch(`${base}/v1/wechat/reply/status`, { headers: auth });
+			const deniedProjection = await deniedRes.json() as any;
+			assert.equal(deniedRes.status, 200);
+			assert.equal(deniedProjection.lastError, "broadcast-unauthorized", "denied 审计应投影为分类名而非 send-error");
+			assert.deepEqual(deniedProjection.counts, { pending: 0, sent: 0, failed: 1, unknown: 0 }, "审计行不计入 intent counts");
+			assert.ok(!JSON.stringify(deniedProjection).includes("SENTINEL"), "denied 审计不回显原始 fromId");
+			rmSync(deniedAuditPath, { force: true });
 			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
 		}
 		// L4-S6：诊断端 /v1/wechat/quarantine 补 command 审计行数

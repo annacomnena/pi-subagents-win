@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] — 2026-09-25 (微信出站收件授权 P0：`005410a` + L4 建议修〔本提交〕)
+
+- **授权集合与入站解耦（P0，用户已批准推翻信任假设）**：广播收件人 = `knownChats()` **候选池** ∩ **授权集合**（绑定 owner `credentials.ownerOpenId` ∪ `channels.wechat.reply.allowOut` 显式订阅，**缺省 `[]`**）；入站 `input.allowFrom` 与 rejected 记录**不参与**出站裁决（读/写/裁决三路零耦合，`wechat-outbound-auth.ts` 全文不出现 `allowFrom`/`knownChats`）；`allowOut` 三态 fail-closed（缺失/非法/坏文件均只收缩，`wechat-bind.ts::readWechatReplyConfig`）；HTTP 面**无任何端点可写 `allowOut`**（只能改配置文件）。
+- **发送前二次复核（现读当前授权，非入队快照）**：watcher 每轮现读 `ownerOpenId+allowOut`，门序 `enabled → 授权 → mode → attempts → TTL → connected`；入队后撤权/换绑的旧 pending 下一轮即 `failed(broadcast-unauthorized)`（`attempts=0`、终态 CAS 不可复活）+ `event:"denied"`（掩码 fromId + 具体 `authz`）审计；hook flush 侧先过滤候选池——全拒 → `no-authorized-recipients` 零 intent，部分拒 → 单行 `recipients-filtered{authorized,denied}`。
+- **`reply.mode` 缺省翻转 `broadcast` → `reply-only`（0925 P0 复裁）**：显式开启 ⇒ 缺省必须不开播 ⇒ **升级即停播**：存量无 `mode` 键的配置升级后不再广播，须显式 `mode:"broadcast"`；远程 `/wechat reply off → on` 也不再隐式开播（需同时 `reply mode broadcast`）。本仓 `config.json` 已显式 `reply-only` ⇒ 当前部署零影响。
+- **L4 建议修 S1–S6（`plans/0925_p0_outbound_auth_l4_review.md`：PASS-with-fixes，0 阻断）**：S1 `/v1/wechat/reply/status` 白名单增 `broadcast-unauthorized`/`broadcast-expired` + `event:"denied"` 并入失败列表（**策略拒绝不再投影成泛化 `send-error`**）+ 投影断言入 `_test_runtime_host_server`；S2 本条与 0924 广播条目改写（原「缺省开启/升级即开播」与现状相反）；S3 Wiki「出站广播」整段改写并标 0925 P0 复裁；S4 `_test_wechat_reply` 过期注释；S5 残余文档化（`enabled=false` 全关期间撤权 pending 不终态、无审计行，重开时授权门最先执行）；S6 `test:wechat-broadcast`/`test:wechat-outbound-auth` 登记进 npm test 族。
+- **验收**：`_test_wechat_outbound_auth` 7 组 / `_test_wechat_broadcast` 18 组 / `_test_wechat_reply` 22 组 / `_test_wechat_remote_command` 22 组 / `_test_runtime_host_server` + `node ./scripts/check-extension-load.mjs` 全绿（`timeout 300 npx tsx` 本机实跑）。
+- **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md`「出站广播」整段改写（0925 P0 复裁） + `wiki-nav rebuild`。
+
 ## [Unreleased] — 2026-09-25 (微信媒体探针**第四轮出站补测 + 人工确认收口**：`56e5088`；只改探针 + 文档，生产代码零改动)
 
 - **Phase ③ 最终结论**：**入站媒体（P1/P7）与出站媒体（P5/P6）规格均已真机定稿**——研究 §7 的依赖 **M1 ← P7** 与 **M4 ← P5→P6** 全部勾销，可开始 media gateway 实现（形状已锁，禁止在 P6 通过的形状外新增字段）。
@@ -50,14 +59,14 @@
 
 ## [Unreleased] — 2026-09-24 (微信出站广播：`0a2b292`/`0337aac`)
 
-- **出站广播（缺省开启）**：`channels.wechat.reply.mode` 缺省 `"broadcast"`——global master 会话每轮 `agent_settled` 把该轮末条非空 assistant 原文（`>4000` → `slice(0,4000)+"…[截断]"`）发给**全部已曾入站私聊**；`"reply-only"` = 完全回旧行为（marker 路径逐字节不变）。`reply.enabled` 仍是总开关（缺省 true）。
+- **出站广播（0924 上线时缺省开启；0925 P0 复裁后缺省已翻转为 `reply-only`，见顶部 0925 P0 条目）**：`channels.wechat.reply.mode="broadcast"` 时 global master 会话每轮 `agent_settled` 把该轮末条非空 assistant 原文（`>4000` → `slice(0,4000)+"…[截断]"`）发给**授权收件人**（0925 P0：候选池 = 已曾入站私聊，授权 = 绑定 owner ∪ `reply.allowOut`；0924 当时为「全部已曾入站私聊」）；`"reply-only"` = 完全回旧行为（marker 路径逐字节不变）。`reply.enabled` 仍是总开关（缺省 true）。
 - **资格**：`channels.wechat.reply.sessionScope` 缺省 `"owner"`——`readAttachment(masterAddress())?.sessionId === getCurrentSessionId()`；attachment 读不到/不匹配 → fail-closed 不广播（审计 `master-attachment-unavailable`/`not-master-owner`，本会话无暂存时静默不落行）；另有 `main`/`any` 取值；subagent 一律不广播。
 - **触发**：`agent_end` 只暂存（每次覆盖 = 本轮最终态），`agent_settled` 才 flush 出意图；flush 无暂存（如 Esc 中断路径）→ 审计 `no-stash`；暂存会话 ≠ settled 会话 → 丢弃 + `stash-session-mismatch`。
-- **收件人**：`WechatStore.knownChats()`（inbox 全量 → 滤空 fromId 与 `@im.bot` → fromId 去重保序，最近入站优先）；**群消息天然不进 inbox**（parser 对 `group_id` 非空直接 quarantine）；空集合 → 审计 `no-known-chats`、零 intent。
+- **收件人（0925 P0 修正）**：候选池 `WechatStore.knownChats()`（inbox 全量 → 滤空 fromId 与 `@im.bot` → fromId 去重保序，最近入站优先）**∩ 授权集合（绑定 owner ∪ `reply.allowOut`，入站 `allowFrom` 不参与）**；**群消息天然不进 inbox**（parser 对 `group_id` 非空直接 quarantine）；候选池空 → 审计 `no-known-chats`、零 intent；授权全拒 → `no-authorized-recipients`、零 intent。
 - **身份派生**：roundId = `sha256(sessionId:firstUserTs??"no-ts":sha256(firstUserText))`；intent id = `sha256("wechat-broadcast:"+roundId+":"+fromId)`，per-recipient clientId = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`；一个 intent 一收件人（`kind:"broadcast"`，旧文件无 kind 兼容为 reply）；同轮 `linkSync` EEXIST 幂等不重发、不同轮按 `createdAt` 升序排队。
-- **发送三门（watcher，顺序即契约；reply intent 三门全不受约束）**：① mode 非 broadcast → broadcast intent 整轮跳过（保留 pending、零审计）→ 共用一次机会规则 `attempts>=1` → `unknown(attempts-exhausted)` → ② TTL `BROADCAST_INTENT_TTL_MS=10min`（`createdAt` 不可解析也判过期，fail-closed）→ `failed(broadcast-expired)`，**先于** ③ connected 门（`status!=="connected"` → 审计 `channel-not-connected`、保留 pending 排队续发）。失败语义 per-recipient、一次机会不自动重试。
+- **发送门序（watcher，顺序即契约；reply/command intent 不受 mode/TTL/connected 门约束）**：① `reply.enabled`（command 回执豁免）→ ② **收件授权二次复核（0925 P0）**：未授权 → `failed(broadcast-unauthorized)` + `event:"denied"` 审计、`attempts` 不动 → ③ mode 非 broadcast → broadcast intent 整轮跳过（保留 pending、零审计）→ 共用一次机会规则 `attempts>=1` → `unknown(attempts-exhausted)` → ④ TTL `BROADCAST_INTENT_TTL_MS=10min`（`createdAt` 不可解析也判过期，fail-closed）→ `failed(broadcast-expired)`，**先于** ⑤ connected 门（`status!=="connected"` → 审计 `channel-not-connected`、保留 pending 排队续发）。失败语义 per-recipient、一次机会不自动重试。
 - **回滚**：`reply.mode="reply-only"`（hook 立即弃暂存 + watcher 跳过残留 pending 广播 intent——秒级止发且不丢）或 `reply.enabled=false`（全停、pending 保留）。CLI `/wechat reply mode broadcast|reply-only`；`/wechat status` 含 `mode=`/`scope=`；`GET /v1/wechat/reply/status` 响应含 `mode`。
-- **已知近似（诚实记录）**：`receive/state.json.status` 是**接收 worker** 健康而非发送能力（worker 死但 token 有效时保守不出站）；配置文件整体坏 fail-closed 到 `reply-only`；roundId 无时间戳且同会话同文碰撞会吞第二轮（吞而不覆盖）；升级即开播（存量无 `mode` 键 → 缺省 broadcast+owner）。
+- **已知近似（诚实记录）**：`receive/state.json.status` 是**接收 worker** 健康而非发送能力（worker 死但 token 有效时保守不出站）；配置文件整体坏 fail-closed 到 `reply-only`；roundId 无时间戳且同会话同文碰撞会吞第二轮（吞而不覆盖）；**升级即停播（0925 P0 复裁，与原条目相反）**：存量无 `mode` 键 → 缺省 `reply-only`，升级后不再广播，须显式 `mode:"broadcast"`（远程 `/wechat reply off→on` 同样不再隐式开播）；`reply.enabled=false` 全关期间被撤权的旧广播 pending 不终态、无审计行，重新 enabled 后授权门最先执行（先终态再发送）。
 - **验收**：`_test_wechat_broadcast.ts` **18 组断言块**全绿（含 M1 回滚止发、TTL 先于 connected 门序、真实 `readAttachment(masterAddress())` 缺省路径）；`_test_wechat_reply.ts` 22 组旧路径红线原样；`_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server` 回归全绿；L4 `plans/0924_wechat_broadcast_l4_review.md` **PASS-with-fixes**（1 必须修 M1 + 5 建议修已闭环 `0337aac`）。
 - **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md`（新增「出站广播」节 + 修正 stale 句「群消息无法独立识别」）；Recent Work Item 45。
 

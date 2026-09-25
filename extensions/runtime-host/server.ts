@@ -893,7 +893,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const safeReplyError = (value: string | undefined): string | null => {
 		if (!value) return null;
 		// Only expose a short classifier summary; never return arbitrary persisted data.
-		const kind = /^(auth|rate_limited|protocol|transient|attempts-exhausted|send-result-unknown)/.exec(value)?.[1];
+		// 0925 P0 L4-S1：策略拒绝/过期也是可解释终态——加 broadcast-unauthorized / broadcast-expired，
+		// 否则「策略拒绝」在 /v1/wechat/reply/status 上被投影成泛化 "send-error"（被读成传输失败）。
+		const kind = /^(auth|rate_limited|protocol|transient|attempts-exhausted|send-result-unknown|broadcast-unauthorized|broadcast-expired)/.exec(value)?.[1];
 		return kind ? kind : "send-error";
 	};
 	const drainWechatBody = (req: IncomingMessage): void => {
@@ -923,7 +925,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			try { audits = readFileSync(join(outboxStateDirFor(opts), "wechat-reply-audit.jsonl"), "utf8").split("\\n").filter(Boolean).slice(-500).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } }); } catch {}
 			const auditTimes = audits.map((a) => a.at).filter((at): at is string => typeof at === "string");
 			const lastAt = [...items.map((item) => item.updatedAt), ...auditTimes].sort().at(-1) ?? null;
-			const failed = [...items.filter((item) => item.error && item.status !== "sent").map((item) => ({ at: item.updatedAt, message: safeReplyError(item.error) })), ...audits.filter((a) => a.event === "failed" || a.event === "unknown" || (a.event === "skipped" && a.reason === "no-credentials")).map((a) => ({ at: a.at ?? "", message: safeReplyError(a.error) ?? (a.reason === "no-credentials" ? "no-credentials" : null) }))].filter((x) => x.message).sort((a, b) => b.at.localeCompare(a.at))[0];
+			// 0925 P0 L4-S1：event:"denied"（broadcast-unauthorized）并入失败列表，且 denied/TTL 审计行
+			// 无 error 字段、分类在 reason 上 → 回落读 reason（仍过白名单，绝不透传任意持久化数据）。
+			const failed = [...items.filter((item) => item.error && item.status !== "sent").map((item) => ({ at: item.updatedAt, message: safeReplyError(item.error) })), ...audits.filter((a) => a.event === "failed" || a.event === "unknown" || a.event === "denied" || (a.event === "skipped" && a.reason === "no-credentials")).map((a) => ({ at: a.at ?? "", message: safeReplyError(a.error ?? a.reason) ?? (a.reason === "no-credentials" ? "no-credentials" : null) }))].filter((x) => x.message).sort((a, b) => b.at.localeCompare(a.at))[0];
 			const replyCfg = readWechatReplyConfig(configPath);
 			respondJson(res, 200, { enabled: replyCfg.enabled, mode: replyCfg.mode, counts, lastAt, lastError: failed?.message ?? null });
 			return;
