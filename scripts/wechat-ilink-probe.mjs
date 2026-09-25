@@ -4,7 +4,9 @@
  *
  * 用法：
  *   node scripts/wechat-ilink-probe.mjs login [--timeout-ms N]
- *   node scripts/wechat-ilink-probe.mjs listen [--decrypt] [--out DIR] [--max-batches N] [--timeout-ms N]
+ *   node scripts/wechat-ilink-probe.mjs listen [--raw-items] [--decrypt] [--out DIR] [--max-batches N]
+ *                                                [--short] [--stop-on-hit] [--timeout-ms N]
+ *       --short = --max-batches 3 + --stop-on-hit：短跑，抓到一批新消息就收，少占游标（用户只发一次也能抓到）。
  *   node scripts/wechat-ilink-probe.mjs send <toUserId> <text> [contextToken] [--client-id ID] [--with-poll]
  *   node scripts/wechat-ilink-probe.mjs reply [--from-last] <toUserId> <text...>  // 用持久化的最近入站 context_token 回复
  *   node scripts/wechat-ilink-probe.mjs typing <toUserId> [contextToken]
@@ -15,7 +17,8 @@
  *       P5：出站媒体硬前置门——候选 upload 端点存在性（最小请求，无用户可见副作用）。
  *           同时打 1 个已知端点 + 1 个负控制路径，用于判读 401/403 是否只说明“鉴权先于路由”。
  *   node scripts/wechat-ilink-probe.mjs listen --raw-items
- *       P1：入站 item 形状采集（只记 type 取值 + 键名签名，不记文本/URL 值）。
+ *       P1：入站 item 形状采集——**每个 item type（type=1/2/3/4…）逐条**落盘完整键名签名到 items.jsonl，
+ *           字符串值一律降为 "string"、文本只记 textLen（不记任何原文/URL/key）。
  *   node scripts/wechat-ilink-probe.mjs conc [--mode read|send] [--n 3]
  *       P4：并发限流。read = 并发只读 getconfig（安全，可直接跑）；
  *           send = 真·poll+send，走既有 `send --with-poll`，需用户同意后手动执行。
@@ -59,7 +62,9 @@ const STATE_PATH = path.join(PROBE_DIR, "state.json");
 const MEASURE_PATH = path.join(PROBE_DIR, "measure.jsonl");
 const LAST_CONTEXT_PATH = path.join(PROBE_DIR, "last-context.json");
 const ITEMS_PATH = path.join(PROBE_DIR, "items.jsonl");   // P1 item 形状签名（脱敏）
-const DEFAULT_OUT_DIR = path.join(PROBE_DIR, "downloads");
+// 附件落盘固定 <tmp>/wechat-probe/attachments/（不进仓库、不进 plans/）；--out 可覆盖。
+// 命名：<msgId>_<kind>_<序号>.<ext>；只记 kind/host/hops/plainBytes，不记 URL/key/密文。
+const DEFAULT_OUT_DIR = path.join(os.tmpdir(), "wechat-probe", "attachments");
 
 let aborted = false;
 process.on("SIGINT", () => {
@@ -313,17 +318,20 @@ function printInboundMessage(m, index) {
   if (m.text) console.log(`    text: ${m.text.slice(0, 500)}`);
   if (m.contextTokenPresent) console.log(`    context_token: <present>（回复时自动回传，不打印原文）`);
   for (const a of (m.attachments || [])) {
-    console.log(`    attach: kind=${a.kind} name=${a.filename} size=${a.sizeBytes ?? "?"} host=${a.host} aesKey=<${a.aesKeyPresent ? "present" : "absent"}>`);
+    // 只打字段路径与 host：绝不打 URL 原文 / key 原文。
+    console.log(`    attach: kind=${a.kind} variant=${a.variantKey} name=${a.filename} size=${a.sizeBytes ?? "?"} midSize=${a.midSize ?? "-"} host=${a.host} urlPath=${a.urlPath ?? "-"} keyPath=${a.aesKeyPath ?? "-"} shape=${a.shape} aesKey=<${a.aesKeyPresent ? "present" : "absent"}>`);
   }
 }
 
-/** P1 形状签名：只保留键名与值的类型，字符串值一律降为 "string"（不落任何原文）。 */
+/** P1 形状签名：只保留键名与值的类型，字符串值一律降为 "string"（不落任何原文）。
+ *  深度上限放宽到 6：真机 image_item 已嵌两层（image_item.media.full_url），4 层会截断后续类型。 */
+const SIG_MAX_DEPTH = 6;
 function sigOf(v, depth = 0) {
   if (v === null) return "null";
-  if (Array.isArray(v)) return v.length && depth < 4 ? [sigOf(v[0], depth + 1)] : "array";
+  if (Array.isArray(v)) return v.length && depth < SIG_MAX_DEPTH ? [sigOf(v[0], depth + 1)] : "array";
   if (typeof v === "object") {
     const o = {};
-    for (const k of Object.keys(v)) o[k] = depth < 4 ? sigOf(v[k], depth + 1) : typeof v[k];
+    for (const k of Object.keys(v)) o[k] = depth < SIG_MAX_DEPTH ? sigOf(v[k], depth + 1) : typeof v[k];
     return o;
   }
   return typeof v;
@@ -335,6 +343,88 @@ function scalarEnum(v) {
   return v === undefined ? undefined : typeof v;
 }
 
+/** 附件变体键 → kind。键名 = 既有候选（image/file/video/audio_item）+ 真机实测（image_item）；不臆造新键。 */
+const VARIANT_KIND = { image_item: "image", file_item: "file", video_item: "video", audio_item: "audio" };
+/** item 内的非媒体键（逐键排除，避免把 msg_id / button_item_list 当附件）。 */
+const ITEM_META_KEYS = new Set([
+  "type", "create_time_ms", "update_time_ms", "is_completed", "msg_id", "message_id",
+  "button_item_list", "at_bot_username_list", "text_item",
+]);
+/** URL 候选键路径：首位 = 真机实测嵌套（image_item.media.full_url），其余 = 旧平铺候选（旧读数来源）。 */
+const URL_PATHS = [
+  ["media.full_url", (v) => v?.media?.full_url],
+  ["media.url", (v) => v?.media?.url],
+  ["full_url", (v) => v?.full_url],
+  ["url", (v) => v?.url],
+  ["download_url", (v) => v?.download_url],
+];
+/** AES key 候选键路径：首位 = 真机实测嵌套（media.aes_key），次位 = 真机实测顶层 aeskey。 */
+const AES_PATHS = [
+  ["media.aes_key", (v) => v?.media?.aes_key],
+  ["aeskey", (v) => v?.aeskey],
+  ["aes_key", (v) => v?.aes_key],
+];
+function pickPath(variant, paths) {
+  for (const [p, get] of paths) {
+    let v; try { v = get(variant); } catch { v = undefined; }
+    if (typeof v === "string" && v) return { value: v, path: p };
+  }
+  return { value: "", path: null };
+}
+/**
+ * 从 item 里抽附件引用：只按**已观测 / 既有候选**键路径查，命中即回报**真实键路径**（日志可输出）。
+ * 查不到 → shape="unknown-shape"，只带回变体键名（值不带出）；不猜字段名，由调用方如实落盘。
+ * 真机实测（B）：image_item = { aeskey, media:{encrypt_query_param,aes_key,full_url}, mid_size, … }。
+ */
+function extractAttachments(it) {
+  const out = [];
+  if (!it || typeof it !== "object") return out;
+  for (const key of Object.keys(it)) {
+    if (ITEM_META_KEYS.has(key)) continue;
+    const v = it[key];
+    if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+    const known = Object.prototype.hasOwnProperty.call(VARIANT_KIND, key);
+    const url = pickPath(v, URL_PATHS);
+    const aes = pickPath(v, AES_PATHS);
+    const nestedMedia = Boolean(v.media && typeof v.media === "object");
+    if (!known && !nestedMedia && !url.path && !aes.path) continue;   // 非附件变体（富卡片/列表等）
+    const absolute = /^https?:\/\//i.test(url.value);
+    const shape = url.path ? (absolute ? "url" : "url-non-absolute")
+      : aes.path ? "missing-url"
+      : "unknown-shape";
+    out.push({
+      kind: VARIANT_KIND[key] || "unknown",
+      variantKey: key,
+      variantKeys: Object.keys(v),
+      filename: typeof v.filename === "string" && v.filename ? v.filename
+        : (typeof v.file_name === "string" && v.file_name ? v.file_name : "unnamed"),
+      sizeBytes: typeof v.size === "number" ? v.size : (typeof v.filesize === "number" ? v.filesize : undefined),
+      midSize: typeof v.mid_size === "number" ? v.mid_size : undefined,
+      fileId: String(v.file_id || v.media_id || ""),
+      url: absolute ? url.value : "",
+      urlPath: url.path,
+      aesKey: aes.value,
+      aesKeyPath: aes.path,
+      encParamPresent: typeof v.media?.encrypt_query_param === "string" && v.media.encrypt_query_param.length > 0,
+      shape,
+    });
+  }
+  return out;
+}
+/** 消息 id 实际命中路径（真机：信封层 message_id=number、item 层 msg_id=string；id 可能整体缺）。 */
+function pickMessageId(msg, raw, items) {
+  const cands = [
+    ["id", msg?.id], ["msg_id", msg?.msg_id], ["message_id", msg?.message_id],
+    ["raw.id", raw?.id], ["raw.msg_id", raw?.msg_id], ["raw.message_id", raw?.message_id],
+  ];
+  for (const [p, v] of cands) if (v !== undefined && v !== null && String(v) !== "") return [String(v), p];
+  for (const it of items) {
+    const v = it && typeof it === "object" ? (it.msg_id ?? it.message_id) : undefined;
+    if (v !== undefined && v !== null && String(v) !== "") return [String(v), "item_list[].msg_id"];
+  }
+  return ["", "none"];
+}
+
 function normalizeUpdates(payload, prevBuf, opts = {}) {
   const rawList = Array.isArray(payload.item_list) ? payload.item_list
     : Array.isArray(payload.messages) ? payload.messages
@@ -343,9 +433,11 @@ function normalizeUpdates(payload, prevBuf, opts = {}) {
   const shapes = [];
   for (const raw of rawList) {
     const msg = (raw.msg && typeof raw.msg === "object" ? raw.msg : raw);
+    const items = Array.isArray(msg.item_list) ? msg.item_list : Array.isArray(raw.item_list) ? raw.item_list : [];
+    // id 先于形状解析：真机信封层常无 id（落在 item.msg_id），不修会把空串当 dedupe key 吞掉后续消息。
+    const [id, idPath] = pickMessageId(msg, raw, items);
     if (opts.rawItems) {
       // 在 senderId 判空之前采形状：即使无法归一化为消息，也保留 type/键名证据（P1）。
-      const items = Array.isArray(msg.item_list) ? msg.item_list : Array.isArray(raw.item_list) ? raw.item_list : [];
       shapes.push({
         envelope: {
           message_type: scalarEnum(msg.message_type ?? raw.message_type),
@@ -353,7 +445,9 @@ function normalizeUpdates(payload, prevBuf, opts = {}) {
           hasContextToken: Boolean(msg.context_token || raw.context_token),
           hasGroupId: Boolean(msg.group_id || raw.group_id),
         },
+        msgIdPath: idPath,
         itemCount: items.length,
+        itemTypes: [...new Set(items.map((it) => scalarEnum(it?.type)))],
         items: items.map((it) => ({
           type: scalarEnum(it?.type),
           variantKeys: it && typeof it === "object" ? Object.keys(it).filter((k) => k !== "type") : [],
@@ -368,37 +462,33 @@ function normalizeUpdates(payload, prevBuf, opts = {}) {
     let text = "";
     if (typeof msg.text === "string") text = msg.text;
     else if (typeof msg.content === "string") text = msg.content;
-    else if (Array.isArray(msg.item_list)) {
-      text = msg.item_list.map((it) => String(it?.text_item?.text || "")).filter(Boolean).join("\n");
-    }
+    else if (items.length) text = items.map((it) => String(it?.text_item?.text || "")).filter(Boolean).join("\n");
     const attachments = [];
-    if (Array.isArray(msg.item_list)) {
-      for (const it of msg.item_list) {
-        const media = it?.image_item || it?.file_item || it?.video_item || it?.audio_item;
-        if (!media) continue;
-        const url = String(media.url || media.download_url || "");
-        const gate = url ? isHostAllowed(url) : { ok: false, host: "<empty>" };
+    for (const it of items) {
+      for (const a of extractAttachments(it)) {
+        const gate = a.url ? isHostAllowed(a.url) : { ok: false, host: "<empty>" };
         attachments.push({
-          kind: it.image_item ? "image" : it.audio_item ? "audio" : it.video_item ? "video" : "file",
-          filename: String(media.filename || media.file_name || "unnamed"),
-          sizeBytes: typeof media.size === "number" ? media.size : undefined,
-          fileId: String(media.file_id || media.media_id || ""),
-          host: gate.host,
-          hostAllowed: gate.ok,
-          aesKeyPresent: Boolean(media.aes_key || media.aeskey),
-          _url: gate.ok ? url : undefined,           // 内存态仅保留，绝不打印/落盘
-          _aesKey: gate.ok ? String(media.aes_key || media.aeskey || "") : undefined,
+          kind: a.kind, variantKey: a.variantKey, filename: a.filename,
+          sizeBytes: a.sizeBytes, midSize: a.midSize, fileId: a.fileId,
+          shape: a.shape, variantKeys: a.variantKeys,
+          urlPath: a.urlPath, aesKeyPath: a.aesKeyPath, encParamPresent: a.encParamPresent,
+          host: gate.host, hostAllowed: gate.ok,
+          hasUrl: Boolean(a.url), hasKey: Boolean(a.aesKey), aesKeyPresent: Boolean(a.aesKey),
+          _url: gate.ok ? a.url : undefined,           // 内存态仅保留，绝不打印/落盘
+          _aesKey: gate.ok && a.aesKey ? a.aesKey : undefined,
         });
+        // 脱敏：只记 kind/键路径/host/判定/尺寸，不记 URL 原文、不记 key、不记密文。
         appendMeasure({
-          kind: "attachment_meta",
+          kind: "attachment_meta", attKind: a.kind, variantKey: a.variantKey, shape: a.shape,
           host: gate.host, allowed: gate.ok,
-          sizeBytes: typeof media.size === "number" ? media.size : null,
+          urlPath: a.urlPath, aesKeyPath: a.aesKeyPath,
+          sizeBytes: a.sizeBytes ?? null, midSize: a.midSize ?? null,
+          encParamPresent: a.encParamPresent, variantKeys: a.variantKeys,
         });
       }
     }
     messages.push({
-      id: String(msg.id || msg.msg_id || raw.id || ""),
-      senderId, displayName: typeof from.nickname === "string" ? from.nickname : undefined,
+      id, idPath, senderId, displayName: typeof from.nickname === "string" ? from.nickname : undefined,
       text, attachments,
       contextTokenPresent: Boolean(msg.context_token || raw.context_token),
       _contextToken: String(msg.context_token || raw.context_token || ""),
@@ -432,15 +522,19 @@ async function cmdListen(args) {
   const timeoutMs = timeoutMsFromArgs(args);
   const doDecrypt = args.includes("--decrypt");
   const outDir = flagValue(args, "--out") || DEFAULT_OUT_DIR;
-  const maxBRaw = flagValue(args, "--max-batches") ?? process.env.WECHAT_PROBE_MAX_BATCHES ?? "Infinity";
-  const maxB = Number(maxBRaw);
+  const shortRun = args.includes("--short");              // 短跑：3 批 + 命中即收
+  const stopOnHit = shortRun || args.includes("--stop-on-hit");
+  const maxBExplicit = flagValue(args, "--max-batches") ?? process.env.WECHAT_PROBE_MAX_BATCHES;
+  const maxBv = Number(maxBExplicit ?? (shortRun ? "3" : "Infinity"));
+  const maxB = Number.isFinite(maxBv) && maxBv > 0 ? maxBv : Infinity;
   const { botToken } = loadCredsOrThrow(args);
   const creds = loadJson(CREDS_PATH, {});
   const rawItems = args.includes("--raw-items");   // P1：只记 type/键名签名
   let state = loadJson(STATE_PATH, { buf: "", seenIds: [], lastMeasurement: null });
   const seen = new Set(state.seenIds || []);
   if (doDecrypt) fs.mkdirSync(outDir, { recursive: true });
-  console.log(`[probe] listen 启动：buf=${state.buf ? `<present len=${state.buf.length}>` : "<empty>"} decrypt=${doDecrypt} rawItems=${rawItems} timeout=${timeoutMs}ms`);
+  console.log(`[probe] listen 启动：buf=${state.buf ? `<present len=${state.buf.length}>` : "<empty>"} decrypt=${doDecrypt} rawItems=${rawItems} maxBatches=${maxB} stopOnHit=${stopOnHit} timeout=${timeoutMs}ms`);
+  if (doDecrypt) console.log(`[probe] 附件落盘目录：${outDir}（命名 <msgId>_<kind>_<序号>.<ext>；日志/measure 只记 kind/host/hops/plainBytes）`);
   let batches = 0;
   for (;;) {
     if (aborted || batches >= maxB) break;
@@ -480,11 +574,11 @@ async function cmdListen(args) {
         // 只打 type 取值与键名签名：无文本、无 URL、无 token。
         console.log(`    [item-shape] envelope=${JSON.stringify(s.envelope)} items=${JSON.stringify(s.items)}`);
         fs.appendFileSync(ITEMS_PATH, JSON.stringify({ ts: nowIso(), ...s }) + "\n", "utf8");
-        appendMeasure({ kind: "item_shape", envelope: s.envelope, itemCount: s.itemCount, types: s.items.map((i) => i.type ?? null) });
+        appendMeasure({ kind: "item_shape", envelope: s.envelope, itemCount: s.itemCount, types: s.items.map((i) => i.type ?? null), itemTypes: s.itemTypes, msgIdPath: s.msgIdPath });
       }
     }
     // 未知项 ③④：重放检测 + 空批是否推进 buf
-    const dupIds = messages.filter((m) => seen.has(m.id)).map((m) => m.id);
+    const dupIds = messages.filter((m) => m.id && seen.has(m.id)).map((m) => m.id);
     const bufAdvanced = nextBuf !== bufIn;
     appendMeasure({
       kind: "updates_batch", count: messages.length,
@@ -498,32 +592,58 @@ async function cmdListen(args) {
     let n = 0;
     let lastWithToken = null;
     for (const m of messages) {
-      if (seen.has(m.id)) { console.log(`[probe] 去重跳过 id=${m.id}（同一 buf 重放）`); continue; }
-      seen.add(m.id);
+      // 无 id 的消息不参与 dedupe（id 为空串会把后续消息全部当重放吞掉）。
+      if (m.id && seen.has(m.id)) { console.log(`[probe] 去重跳过 id=${m.id}（同一 buf 重放）`); continue; }
+      if (m.id) seen.add(m.id);
       printInboundMessage({ ...m, contextTokenPresent: m.contextTokenPresent }, ++n);
       if (m._contextToken) lastWithToken = m;
       if (doDecrypt) {
+        let attIdx = 0;
         for (const a of m.attachments) {
-          if (!a._url || !a._aesKey) { console.log(`    [decrypt] 跳过 ${a.filename}（缺 URL/key 或 host 被拦截）`); continue; }
+          // 跳过原因分类：不猜字段名，unknown-shape 只回带变体键名（签名在 items.jsonl）。
+          const skip = a.shape === "unknown-shape" ? "unknown-shape"
+            : a.shape === "missing-url" ? "missing-url"
+            : a.shape === "url-non-absolute" ? "url-non-absolute"
+            : !a.hasUrl ? "no-url"
+            : !a.hostAllowed ? "host-blocked"
+            : !a.hasKey ? "no-key"
+            : null;
+          if (skip) {
+            console.log(`    [decrypt] 跳过 ${a.filename}（${skip}；variant=${a.variantKey} urlPath=${a.urlPath ?? "-"} keyPath=${a.aesKeyPath ?? "-"}${skip === "unknown-shape" ? ` 键名=[${a.variantKeys.join(",")}] 已落盘 items.jsonl` : ` host=${a.host}`}）`);
+            appendMeasure({
+              kind: "attachment_skipped", reason: skip, attKind: a.kind, variantKey: a.variantKey,
+              shape: a.shape, host: a.host, urlPath: a.urlPath, aesKeyPath: a.aesKeyPath,
+              variantKeys: a.variantKeys,
+            });
+            if (skip === "host-blocked")
+              appendMeasure({ kind: "attachment_download_blocked", reason: "host-not-allowed", host: a.host, hops: 0 });
+            continue;
+          }
           try {
             const dl = await safeDownload(a._url, timeoutMs);
             if (dl.blocked) {
               console.log(`    [decrypt] 拒绝下载 ${a.filename}（${dl.reason} host=${dl.host} hops=${dl.hops}）`);
-              appendMeasure({ kind: "attachment_download_blocked", reason: dl.reason, host: dl.host, hops: dl.hops });
+              appendMeasure({ kind: "attachment_download_blocked", reason: dl.reason, attKind: a.kind, host: dl.host, hops: dl.hops });
               continue;
             }
             if (!dl.res.ok) {
-              console.log(`    [decrypt] 下载失败 HTTP ${dl.res.status}`);
-              appendMeasure({ kind: "attachment_download", ok: false, status: dl.res.status, host: dl.finalHost, hops: dl.hops });
+              console.log(`    [decrypt] 下载失败 ${a.filename} HTTP ${dl.res.status}（kind=${a.kind} host=${dl.finalHost} hops=${dl.hops}）`);
+              appendMeasure({ kind: "attachment_download", ok: false, status: dl.res.status, attKind: a.kind, host: dl.finalHost, hops: dl.hops });
               continue;
             }
             const plain = decryptEcb(Buffer.from(await dl.res.arrayBuffer()), a._aesKey);
-            const fp = path.join(outDir, `${m.id}_${a.filename}`.replace(/[\\/:*?"<>|]/g, "_"));
+            const extM = /\.([A-Za-z0-9]{1,8})$/.exec(a.filename);
+            const safeId = (m.id || "noid").replace(/[\\/:*?"<>|]/g, "_");
+            const fp = path.join(outDir, `${safeId}_${a.kind}_${++attIdx}${extM ? `.${extM[1]}` : ".bin"}`);
             fs.writeFileSync(fp, plain);
-            // 只记 host/跳数/字节数：不记最终 URL（P7 证据口径）。
-            appendMeasure({ kind: "attachment_download", ok: true, status: 200, host: dl.finalHost, hops: dl.hops, plainBytes: plain.length });
-            console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B) host=${dl.finalHost} hops=${dl.hops}`);
-          } catch (e) { console.log(`    [decrypt] 失败：${String(e.message).slice(0, 100)}`); }
+            // 只记 kind/host/跳数/明文字节：不记最终 URL、不记 key、不记密文（P7 证据口径）。
+            appendMeasure({ kind: "attachment_download", ok: true, status: 200, attKind: a.kind, host: dl.finalHost, hops: dl.hops, plainBytes: plain.length, urlPath: a.urlPath, aesKeyPath: a.aesKeyPath });
+            console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B) kind=${a.kind} host=${dl.finalHost} hops=${dl.hops} urlPath=${a.urlPath} keyPath=${a.aesKeyPath}`);
+          } catch (e) {
+            const msg = String(e.message).slice(0, 100).replace(/https?:\/\/\S+/gi, "<url>");
+            console.log(`    [decrypt] 失败：${msg}`);
+            appendMeasure({ kind: "attachment_decrypt_error", attKind: a.kind, error: msg });
+          }
         }
       }
     }
@@ -535,6 +655,10 @@ async function cmdListen(args) {
       console.log(`[probe] 已更新最近入站 context：${LAST_CONTEXT_PATH}（context_token: ${redactPresence(lastWithToken._contextToken)}，from=${lastWithToken.senderId}）`);
     }
     batches++;
+    if (stopOnHit && n > 0) {
+      console.log(`[probe] 命中新消息 ${n} 条，--stop-on-hit/--short 收束（游标已存，不长占）。`);
+      break;
+    }
     if (batches >= maxB) break;
   }
   console.log(`[probe] listen 结束：共 ${batches} 批，游标已存 ${STATE_PATH}。`);
@@ -998,7 +1122,7 @@ try {
   else if (cmd === "media-probe") await cmdMediaProbe(rest);
   else if (cmd === "status") cmdStatus();
   else {
-    console.error("用法：login | listen [--decrypt] [--raw-items] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
+    console.error("用法：login | listen [--raw-items] [--decrypt] [--short] [--stop-on-hit] [--max-batches N] [--out DIR] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
     process.exit(2);
   }
 } catch (e) {
