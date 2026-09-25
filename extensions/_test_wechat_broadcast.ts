@@ -8,6 +8,14 @@
  *        attach → fail-closed 不广播）；② 缺省 mode="broadcast"；③ 触发 = agent_settled
  *        （agent_end 只暂存，settled 无暂存 → 审计 no-stash）；④ TTL=10min 常量、failed 不重试。
  *
+ * 0925 P0 出站收件授权（astra §二第 1 项，用户批准推翻上述信任假设）对本文件的影响：
+ *   - **收件人假设变更**：knownChats() 不再直接等于收件人集合。广播收件人 = 绑定 owner
+ *     ∪ `reply.allowOut`（显式出站订阅，与入站 allowFrom 解耦）。多收件人用例改为在配置里
+ *     **显式订阅** `allowOut:[A,B,C]`——原断言强度（收件人数/toUserId 逐一对应/去重/
+ *     bot 防环/per-recipient clientId）逐条保留不变，只是授权前提从“曾发过消息”换成“显式授权”。
+ *   - **缺省 mode 变更**：broadcast 必须显式开启 → `{}` 缺省 `reply-only`（B9① 改为断言
+ *     缺省不广播 = 同强度反向断言）。B/C 越权与撤权旧 pending 终态化在 _test_wechat_outbound_auth.ts。
+ *
  * 跑法：`timeout 300 npx tsx extensions/_test_wechat_broadcast.ts`
  * 硬看门狗：超时即非零退出，绝不挂住。
  */
@@ -78,7 +86,9 @@ function mkEnv(config: unknown): Env {
 	writeFileSync(env.configPath, JSON.stringify(config));
 	return env;
 }
-const BROADCAST_CFG = { channels: { wechat: { reply: { mode: "broadcast" as const } } } };
+// 0925 P0：多收件人 = 显式出站订阅 allowOut（不再把 knownChats 当授权集合；owner 位由
+// credentials.ownerOpenId 提供，本文件多数用例不写 ownerOpenId ⇒ 走订阅位，语义更纯粹）。
+const BROADCAST_CFG = { channels: { wechat: { reply: { mode: "broadcast" as const, allowOut: [A, B, C] } } } };
 function envDeps(env: Env, over: Partial<ReplyHookDeps> = {}): ReplyHookDeps {
 	// 注意：本测试可能在 PI_SUBAGENT=1 的 agent 进程内跑（缺省 isSubagent()=true 会静默吞掉 flush），
 	// 故显式钉 subagent:()=>false；B6 的 subagent 用例再覆写为 true。
@@ -330,7 +340,7 @@ try {
 			assert.equal(intentFiles(env.stateDir).length, 0, "无 attachment 不应写 intent（fail-closed）");
 			assert.ok(auditRows(env.stateDir).some((r) => r.reason === "master-attachment-unavailable"), "缺 master-attachment-unavailable 审计");
 			// scope=main + tab（mainSession false）→ not-main-session
-			const mainCfg = mkEnv({ channels: { wechat: { reply: { mode: "broadcast", sessionScope: "main" } } } });
+			const mainCfg = mkEnv({ channels: { wechat: { reply: { mode: "broadcast", sessionScope: "main", allowOut: [A, B, C] } } } });
 			try {
 				putChat(mainCfg, "m-a", A);
 				const tab = envDeps(mainCfg, { mainSession: () => false });
@@ -339,7 +349,7 @@ try {
 				assert.ok(auditRows(mainCfg.stateDir).some((r) => r.reason === "not-main-session"), "缺 not-main-session 审计");
 			} finally { rmSync(mainCfg.root, { recursive: true, force: true }); }
 			// scope=any + 非 subagent → 正常写（逃生口）
-			const anyCfg = mkEnv({ channels: { wechat: { reply: { mode: "broadcast", sessionScope: "any" } } } });
+			const anyCfg = mkEnv({ channels: { wechat: { reply: { mode: "broadcast", sessionScope: "any", allowOut: [A, B, C] } } } });
 			try {
 				putChat(anyCfg, "m-a", A);
 				const anyDeps = envDeps(anyCfg, { mainSession: () => false, sessionId: () => OTHER_SID, masterSessionId: () => null });
@@ -405,15 +415,17 @@ try {
 	});
 
 	// ── B9 配置兼容（enabled 缺省 / 全关 / mode 非法 / scope 非法） ────
-	await check("B9 {} → enabled:true+mode:broadcast+scope:owner；enabled:false 两模式全关；mode/scope 非法 fail-closed；坏 JSON 文件 → reply-only", async () => {
+	await check("B9 {} → enabled:true+mode:reply-only(0925 P0 显式开启)+scope:owner+allowOut:[]；缺省不广播；enabled:false 两模式全关；mode/scope 非法 fail-closed；坏 JSON 文件 → reply-only", async () => {
 		resetWechatBroadcastStash();
-		// ① {}（无 reply 键）
+		// ① {}（无 reply 键）——0925 P0：广播须显式开启 ⇒ 缺省 mode=reply-only（同强度反向断言）
 		const emptyCfg = mkEnv({});
 		try {
-			assert.deepEqual(readWechatReplyConfig(emptyCfg.configPath), { enabled: true, mode: "broadcast", sessionScope: "owner" });
+			assert.deepEqual(readWechatReplyConfig(emptyCfg.configPath), { enabled: true, mode: "reply-only", sessionScope: "owner", allowOut: [] });
 			putChat(emptyCfg, "m-a", A);
 			const deps = envDeps(emptyCfg);
-			assert.equal(flushAfter(extractWechatReply(round("缺省问", 1758000009000, BODY), deps), deps).count, 1, "缺省配置应走广播");
+			assert.equal(extractWechatReply(round("缺省问", 1758000009000, BODY), deps).reason, "marker-not-first", "缺省应走 reply-only marker 路径（不暂存广播）");
+			assert.equal(flushWechatBroadcast(deps).count, 0, "缺省配置不应产生广播 intent（显式开启才开播）");
+			assert.equal(intentFiles(emptyCfg.stateDir).length, 0, "缺省配置写了广播 intent");
 		} finally { rmSync(emptyCfg.root, { recursive: true, force: true }); }
 		// ② enabled:false → 两模式全关（hook 零动作 + watcher 保留 pending）
 		const offCfg = mkEnv({ channels: { wechat: { reply: { enabled: false } } } });
@@ -460,7 +472,7 @@ try {
 		const brokenCfg = mkEnv({});
 		try {
 			writeFileSync(brokenCfg.configPath, "{ this is not json");
-			assert.deepEqual(readWechatReplyConfig(brokenCfg.configPath), { enabled: true, mode: "reply-only", sessionScope: "owner" });
+			assert.deepEqual(readWechatReplyConfig(brokenCfg.configPath), { enabled: true, mode: "reply-only", sessionScope: "owner", allowOut: [] });
 		} finally { rmSync(brokenCfg.root, { recursive: true, force: true }); }
 	});
 
@@ -484,7 +496,7 @@ try {
 	// ── M1（L4 必须修）mode=reply-only 回滚：残留 pending 广播不发 ──────
 	await check("M1 reply-only 回滚：残留 pending broadcast 不出站（fetch=0、仍 pending）；reply intent（无 kind）照发", async () => {
 		resetWechatBroadcastStash();
-		const env = mkEnv({ channels: { wechat: { reply: { mode: "reply-only" } } } });
+		const env = mkEnv({ channels: { wechat: { reply: { mode: "reply-only", allowOut: [A] } } } }); // 0925 P0：A 须在授权集合内，才能验“mode 门保留 pending”
 		try {
 			putChat(env, "m-a", A);
 			const dir = replyIntentDir(env.stateDir);

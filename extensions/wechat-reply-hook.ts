@@ -8,11 +8,12 @@ import { deriveBroadcastClientId, deriveReplyClientId } from "./channel-wechat/s
 import { WechatStore } from "./channel-wechat/store.ts";
 import { deriveBroadcastIntentId, deriveReplyIntentId, newReplyIntent, readReplyIntent, replyIntentDir } from "./runtime/wechat-reply.ts";
 import { readWechatConfigPath, readWechatReplyConfig, maskWechatOpenId } from "./runtime-host/wechat-bind.ts";
+import { authorizeBroadcastRecipient, readOutboundOwnerOpenId, type OutboundAuthContext } from "./runtime-host/wechat-outbound-auth.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
 
 export type ReplySkipReason = "no-text" | "reply-disabled" | "no-inbox-match" | "marker-not-first" | "bot-domain"
- | "no-stash" | "no-known-chats" | "not-main-session" | "not-master-owner" | "master-attachment-unavailable"
+ | "no-stash" | "no-known-chats" | "no-authorized-recipients" | "not-main-session" | "not-master-owner" | "master-attachment-unavailable"
  | "stash-session-mismatch";
 export interface ReplyHookDeps {
  stateDir?: string; runtimeDir?: string; configPath?: string; subagent?: () => boolean;
@@ -24,8 +25,10 @@ export interface ReplyHookDeps {
  mainSession?: () => boolean;
  /** 时钟注入（intent createdAt）。 */
  now?: () => Date;
- /** 收件人集合源（缺省 new WechatStore(join(runtimeDir,"wechat","receive"))，读其 knownChats()）。 */
+ /** 收件人候选池源（缺省 new WechatStore(join(runtimeDir,"wechat","receive")）：knownChats() 只是候选池 ≠ 授权集合，还需过出站授权门（0925 P0）。 */
  store?: () => WechatStore;
+ /** 绑定 owner openid（缺省 readOutboundOwnerOpenId(runtimeDir) = credentials.json 现读）——出站授权 owner 位。 */
+ ownerOpenId?: () => string | undefined;
 }
 function textOf(message: any): string {
  const c = message?.content;
@@ -84,8 +87,10 @@ export interface BroadcastFlushResult { written: boolean; count: number; reason?
 /**
  * agent_settled flush：资格门（缺省 owner = 只有 global master 会话广播，用户裁定①；
  * readAttachment 不可读/无 attachment → fail-closed 不广播）→ 取暂存 → 内容检查 →
- * 收件人集合（knownChats 去重）→ 每收件人写一个 kind:"broadcast" intent（一个 intent 一个收件人）。
- * 出站与否（connected 门 + TTL）在 watcher 侧判定，hook 只排队（计划 §1.1 门 4、§5）。
+ * 收件人 = knownChats() 候选池 ∩ **出站授权集合**（绑定 owner ∪ reply.allowOut，0925 P0；
+ * knownChats 不再直接当收件人集合，rejected / 入站白名单均不参与授权裁决）→
+ * 每收件人写一个 kind:"broadcast" intent（一个 intent 一个收件人）。
+ * 出站与否（connected 门 + TTL + **发送前二次复核**）在 watcher 侧判定，hook 只排队（计划 §1.1 门 4、§5）。
  */
 export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushResult {
  try {
@@ -120,9 +125,26 @@ export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushRe
   let chats: { fromId: string; lastAt: string }[] = [];
   try { chats = (deps.store ? deps.store() : new WechatStore(join(runtimeDir, "wechat", "receive"))).knownChats(); } catch { chats = []; }
   if (!chats.length) { audit(stateDir, { at: at(), event: "skipped", reason: "no-known-chats" }); return { written: false, count: 0, reason: "no-known-chats" }; }
+  // 0925 P0 出站收件授权：knownChats 只是候选池（可寻址的历史 chat）；授权集合与入站解耦 =
+  // 绑定 owner（credentials.ownerOpenId）∪ reply.allowOut（显式订阅，缺省空）。
+  // B（入站被拒且未订阅）、C（已撤销订阅）在这一门被拦下 → 不生成新广播 intent；
+  // owner 不可读 ⇒ owner 位缺席 ⇒ 授权集合只可能收缩（fail-closed，不扩张接收范围）。
+  const authCtx: OutboundAuthContext = {
+   ownerOpenId: deps.ownerOpenId ? deps.ownerOpenId() ?? null : readOutboundOwnerOpenId(runtimeDir),
+   allowOut: cfg.allowOut ?? [],
+  };
+  const recipients = chats.filter((chat) => authorizeBroadcastRecipient(chat.fromId, authCtx).authorized);
+  if (!recipients.length) {
+   audit(stateDir, { at: at(), event: "skipped", reason: "no-authorized-recipients", candidates: chats.length });
+   return { written: false, count: 0, reason: "no-authorized-recipients" };
+  }
+  if (recipients.length !== chats.length) {
+   // 单行摘要（audit 无轮转，不逐收件人落行）；被拒明细见发送侧终态审计 broadcast-unauthorized。
+   audit(stateDir, { at: at(), event: "recipients-filtered", kind: "broadcast", authorized: recipients.length, denied: chats.length - recipients.length });
+  }
   const now = deps.now?.();
   let count = 0;
-  for (const chat of chats) {
+  for (const chat of recipients) {
    const id = deriveBroadcastIntentId(stash.roundKey, chat.fromId);
    if (readReplyIntent(dir, id)) continue; // 同轮重复 flush：同 id → 文件已存在 → 不重写不重发
    const result = newReplyIntent(dir, { id, msgId: stash.roundKey, outboxId: stash.roundKey, fromId: chat.fromId, clientId: deriveBroadcastClientId(stash.roundKey, chat.fromId), text: stash.text, kind: "broadcast", ...(now ? { now } : {}) });

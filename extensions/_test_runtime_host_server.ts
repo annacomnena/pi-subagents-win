@@ -173,8 +173,8 @@ try {
 			const res = await fetch(`${base}/v1/wechat/reply/status`, { headers: auth });
 			assert.equal(res.status, 200);
 			const projection = await res.json() as any;
-			// 0924：响应新增 mode（缺省 broadcast——该 config 只写了 reply.enabled:false，未设 mode）
-			assert.deepEqual(projection, { enabled: false, mode: "broadcast", counts: { pending: 0, sent: 0, failed: 1, unknown: 0 }, lastAt: projection.lastAt, lastError: "auth" });
+			// 0925 P0：响应新增 mode（缺省 reply-only——0925 起广播须显式开启；该 config 只写了 reply.enabled:false，未设 mode）
+			assert.deepEqual(projection, { enabled: false, mode: "reply-only", counts: { pending: 0, sent: 0, failed: 1, unknown: 0 }, lastAt: projection.lastAt, lastError: "auth" });
 			assert.ok(!JSON.stringify(projection).includes("private"));
 			writeFileSync(autonomyConfigPath, JSON.stringify({ retained: true }));
 		}

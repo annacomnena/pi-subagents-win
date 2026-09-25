@@ -292,31 +292,40 @@ function replyConfigFallback(key: string, value: unknown, fallback: string): str
 }
 
 /**
- * reply 配置（0924 广播扩展）：
+ * reply 配置（0924 广播扩展 + 0925 P0 出站收件授权）：
  *   - enabled：语义不变（≠false ⇒ 缺省 true，坏文件也 true）——向后兼容红线，表达式逐字不动。
- *   - mode：缺失 → "broadcast"（用户裁定②）；"reply-only"/"broadcast" 原样；其它非法值 →
- *     fail-closed 到 "reply-only"（保守路径）+ 一次性 warn（计划 §2、验收 B9）；
- *     坏文件（JSON 解析抛/不可读）→ catch 同样 fail-closed "reply-only"（L4 S3：非法配置
- *     两种松紧统一取保守者；enabled 坏文件仍 true 是既有红线不动）。
+ *   - mode：缺失 → "reply-only"（0925 P0 复裁：广播必须**显式开启**，astra §二第 1 项 2）；
+ *     "reply-only"/"broadcast" 原样；其它非法值 → fail-closed 到 "reply-only"（保守路径）+
+ *     一次性 warn（计划 §2、验收 B9）；坏文件（JSON 解析抛/不可读）→ catch 同样 fail-closed
+ *     "reply-only"（L4 S3：非法配置两种松紧统一取保守者；enabled 坏文件仍 true 是既有红线不动）。
  *   - sessionScope：缺失 → "owner"（用户裁定①：只有 global master 会话广播）；合法值
  *     owner|main|any；非法 → fail-closed 到 "owner"。
+ *   - allowOut（0925 P0 新增）：**出站广播订阅集合**，与入站白名单 `input.allowFrom` 完全解耦
+ *     （不读、不复制、不等同）：缺失/非数组/坏文件 → `[]`（fail-closed）；数组 → 逐项取 string、
+ *     trim、去空、去重。广播收件人 = 绑定 owner（credentials.ownerOpenId）∪ allowOut，缺省只有
+ *     绑定 owner。撤销订阅 = 从 allowOut 移除（发送前二次复核立即生效，见 wechat-outbound-auth）。
  */
-export function readWechatReplyConfig(configPath: string): { enabled: boolean; mode: WechatReplyMode; sessionScope: WechatReplySessionScope } {
+export function readWechatReplyConfig(configPath: string): { enabled: boolean; mode: WechatReplyMode; sessionScope: WechatReplySessionScope; allowOut: string[] } {
 	try {
-		const raw = JSON.parse(readFileSync(configPath, "utf8")) as { channels?: { wechat?: { reply?: { enabled?: unknown; mode?: unknown; sessionScope?: unknown } } } };
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as { channels?: { wechat?: { reply?: { enabled?: unknown; mode?: unknown; sessionScope?: unknown; allowOut?: unknown } } } };
 		const reply = raw?.channels?.wechat?.reply;
 		const enabled = raw?.channels?.wechat?.reply?.enabled !== false;
-		const mode: WechatReplyMode = reply?.mode === undefined || reply?.mode === null ? "broadcast"
+		const mode: WechatReplyMode = reply?.mode === undefined || reply?.mode === null ? "reply-only"
 			: reply.mode === "broadcast" || reply.mode === "reply-only" ? (reply.mode as WechatReplyMode)
 			: (replyConfigFallback("mode", reply.mode, "reply-only") as WechatReplyMode);
 		const sessionScope: WechatReplySessionScope = reply?.sessionScope === undefined || reply?.sessionScope === null ? "owner"
 			: reply.sessionScope === "owner" || reply.sessionScope === "main" || reply.sessionScope === "any" ? (reply.sessionScope as WechatReplySessionScope)
 			: (replyConfigFallback("sessionScope", reply.sessionScope, "owner") as WechatReplySessionScope);
-		return { enabled, mode, sessionScope };
+		const rawAllowOut = reply?.allowOut;
+		const allowOut: string[] = Array.isArray(rawAllowOut)
+			? [...new Set(rawAllowOut.filter((x): x is string => typeof x === "string").map((x) => x.trim()).filter(Boolean))]
+			: rawAllowOut === undefined || rawAllowOut === null ? []
+			: (replyConfigFallback("allowOut", rawAllowOut, "(empty)"), [] as string[]);
+		return { enabled, mode, sessionScope, allowOut };
 	} catch {
 		// L4 S3：配置文件整体坏 = 非法配置 → mode fail-closed 到 reply-only（与 mode 取值非法同口径）；
-		// enabled:true 是向后兼容红线（坏文件也 true）保持不变。
-		return { enabled: true, mode: "reply-only", sessionScope: "owner" };
+		// enabled:true 是向后兼容红线（坏文件也 true）保持不变；allowOut 空 = 出站只可能到绑定 owner。
+		return { enabled: true, mode: "reply-only", sessionScope: "owner", allowOut: [] };
 	}
 }
 
