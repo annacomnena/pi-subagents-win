@@ -5,8 +5,12 @@
  * 用法：
  *   node scripts/wechat-ilink-probe.mjs login [--timeout-ms N]
  *   node scripts/wechat-ilink-probe.mjs listen [--raw-items] [--decrypt] [--out DIR] [--max-batches N]
- *                                                [--short] [--stop-on-hit] [--timeout-ms N]
+ *                                                [--short] [--stop-on-hit] [--timeout-ms N] [--replay-seq N]
  *       --short = --max-batches 3 + --stop-on-hit：短跑，抓到一批新消息就收，少占游标（用户只发一次也能抓到）。
+ *       --replay-seq N = 只读重放：把 get_updates_buf 内层「last-seen seq」回退到 N 再轮询，服务端按该 seq
+ *           回放历史消息（真机实测：seq>N 返回保留窗口内历史，单批上限 20 条；未知/空 buf 返回 ret=-3 或空）。**不改服务端状态、不发任何消息**；
+ *           回放批忽略 seen 去重（否则已收过的附件解密拿不到），落盘口径与正常 listen 完全一致。
+ *           落盘游标只进不退：回放返回的 buf seq 若低于本批前的头，仍持久化原头。
  *   node scripts/wechat-ilink-probe.mjs send <toUserId> <text> [contextToken] [--client-id ID] [--with-poll]
  *   node scripts/wechat-ilink-probe.mjs reply [--from-last] <toUserId> <text...>  // 用持久化的最近入站 context_token 回复
  *   node scripts/wechat-ilink-probe.mjs typing <toUserId> [contextToken]
@@ -40,7 +44,9 @@
  *   WECHAT_PROBE_EXTRA_HOSTS 附件 CDN 额外 allowlist，逗号分隔
  *
  * 安全：bot_token / context_token / aes_key 永不打到 stdout / measure.jsonl，
- *   只记存在性与长度。凭据文件尽量 0600（Windows 下 chmod 仅尽力，见清单文档）。
+ *   只记存在性与长度；AES key 格式诊断落 plans/.wechat-probe/key-format.json 时只记脱敏字段
+ *   （len/charset/hasPadding/prefix4/decodedByteLen/sampleHexPreview≤4B/same），附件明文只落本地文件系统。
+ *   凭据文件尽量 0600（Windows 下 chmod 仅尽力，见清单文档）。
  */
 import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
@@ -62,9 +68,11 @@ const STATE_PATH = path.join(PROBE_DIR, "state.json");
 const MEASURE_PATH = path.join(PROBE_DIR, "measure.jsonl");
 const LAST_CONTEXT_PATH = path.join(PROBE_DIR, "last-context.json");
 const ITEMS_PATH = path.join(PROBE_DIR, "items.jsonl");   // P1 item 形状签名（脱敏）
-// 附件落盘固定 <tmp>/wechat-probe/attachments/（不进仓库、不进 plans/）；--out 可覆盖。
-// 命名：<msgId>_<kind>_<序号>.<ext>；只记 kind/host/hops/plainBytes，不记 URL/key/密文。
-const DEFAULT_OUT_DIR = path.join(os.tmpdir(), "wechat-probe", "attachments");
+// 附件落盘固定 plans/.wechat-probe/attachments/（plans/ 已 gitignore，不进仓库）；--out 可覆盖。
+// 命名：<kind>-<msgId前8>-<原名（安全化）>；只记 kind/host/hops/plainBytes/magic/sha256_8，不记 URL/key/密文。
+const DEFAULT_OUT_DIR = path.join(PROBE_DIR, "attachments");
+// AES key 格式诊断（脱敏）：只记 len/charset/hasPadding/prefix4/decodedByteLen/sampleHexPreview(≤4B)/same，绝不记完整 key。
+const KEY_FORMAT_PATH = path.join(PROBE_DIR, "key-format.json");
 
 let aborted = false;
 process.on("SIGINT", () => {
@@ -96,7 +104,7 @@ function flagValue(args, name) {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 }
-const FLAG_WITH_VALUE = new Set(["--timeout-ms", "--out", "--max-batches", "--client-id", "--creds", "--to", "--mode", "--n"]);
+const FLAG_WITH_VALUE = new Set(["--timeout-ms", "--out", "--max-batches", "--client-id", "--creds", "--to", "--mode", "--n", "--replay-seq"]);
 function positionalArgs(args) {
   const out = [];
   for (let i = 0; i < args.length; i++) {
@@ -155,21 +163,178 @@ async function fetchJson(url, opts, timeoutMs) {
     return { httpStatus: res.status, ok: res.ok, payload, retryAfter, bodyBytes: text.length, topKeys };
   } finally { clearTimeout(t); }
 }
-function parseAesKey(raw) {
+// ---------- AES key 格式诊断 + 解密（真机实测：media.aes_key 与「32 hex」假设不符） ----------
+// 候选方案（研究 §3.2 第三方线索 + 真机形状），按序尝试；**解不开就如实失败并保留试过的方案**，不硬编码成功。
+const HEX32_RE = /^[a-f0-9]{32}$/i;
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const BASE64URL_RE = /^[A-Za-z0-9\-_]+={0,2}$/;
+/** 严格 base64 解码（拒绝尽力解码的垃圾）；urlLike 允许 -_ 字母表。 */
+function decodeB64(s, urlLike) {
+  if (typeof s !== "string" || !s) return null;
+  const alphabetOk = urlLike ? BASE64URL_RE.test(s) : BASE64_RE.test(s);
+  if (!alphabetOk) return null;
+  const norm = (urlLike ? s.replace(/-/g, "+").replace(/_/g, "/") : s) + "=".repeat((4 - (s.length % 4)) % 4);
+  if (norm.length % 4 !== 0) return null;
+  const b = Buffer.from(norm, "base64");
+  if (b.length === 0) return null;
+  // 回环校验：解出来的 base64 必须与输入一致（否则是非法字符被吞）。
+  if (b.toString("base64").replace(/=+$/, "") !== norm.replace(/=+$/, "")) return null;
+  return b;
+}
+function classifyCharset(s) {
+  if (typeof s !== "string" || !s) return "other";
+  if (/^[a-f0-9]+$/i.test(s)) return s.length % 2 === 0 ? "hex" : "hex-odd";
+  if (BASE64_RE.test(s)) return "base64";
+  if (BASE64URL_RE.test(s)) return "base64url";
+  return "other";
+}
+/** key 候选：每个候选是 {scheme, key(16B)}；顺序即优先级。 */
+function keyCandidates(raw) {
   const s = String(raw || "").trim();
-  if (/^[a-f0-9]{32}$/i.test(s)) return Buffer.from(s, "hex");
-  try {
-    const b = Buffer.from(s, "base64");
-    if (b.length === 16) return b;
-  } catch { /* fallthrough */ }
+  const out = [];
+  const add = (scheme, key) => {
+    if (Buffer.isBuffer(key) && key.length === 16 && !out.some((c) => c.scheme === scheme)) out.push({ scheme, key });
+  };
+  if (HEX32_RE.test(s)) add("hex32", Buffer.from(s, "hex"));                 // ① 32 hex 字符 → 16B
+  const b64 = decodeB64(s, false);
+  if (b64) {
+    const asLatin = b64.toString("latin1");
+    if (b64.length === 32 && HEX32_RE.test(asLatin)) add("base64(hex32)", Buffer.from(asLatin, "hex"));   // ② base64(hex字符串)→16B
+    if (b64.length === 16) add("base64(raw16)", b64);                         // ③ base64 → 16B
+  }
+  const b64u = decodeB64(s, true);
+  if (b64u && b64u.length === 16) add("base64url(raw16)", b64u);              // ④ base64url → 16B
+  add("utf8(raw16)", Buffer.from(s, "utf8"));                                 // ⑤ 直接 UTF-8 16 字节
+  return out;
+}
+/** 脱敏诊断记录（不含 key 原文；prefix4 前 4 字符、preview 前 4 字节 hex）。 */
+function analyzeKeyForDiag(raw) {
+  const s = String(raw || "");
+  if (!s) return null;
+  const cands = keyCandidates(s);
+  const b64 = decodeB64(s, false);
+  const b64u = decodeB64(s, true);
+  const previewSrc = cands[0]?.key ?? b64 ?? b64u ?? Buffer.from(s, "utf8");
+  return {
+    len: s.length,
+    charset: classifyCharset(s),
+    hasPadding: s.endsWith("="),
+    prefix4: s.slice(0, 4),
+    decodedByteLen: {
+      hex32: HEX32_RE.test(s) ? 16 : null,
+      base64: b64 ? b64.length : null,
+      base64url: b64u ? b64u.length : null,
+      utf8Raw: Buffer.byteLength(s, "utf8"),
+    },
+    sampleHexPreview: previewSrc.subarray(0, 4).toString("hex"),
+    candidates: cands.map((c) => c.scheme),
+  };
+}
+function deriveKeyHex(raw) {
+  const c = keyCandidates(raw);
+  return c[0] ? c[0].key.toString("hex") : null;
+}
+/** 魔数识别（解密成功的硬证据）。识别不出 → null（不硬编码“成功”）。 */
+function detectMagic(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return null;
+  const h = (o, n) => buf.subarray(o, Math.min(o + n, buf.length)).toString("hex").toUpperCase();
+  if (h(0, 3) === "FFD8FF") return "jpeg";
+  if (h(0, 4) === "89504E47") return "png";
+  if (h(0, 4) === "47494638") return "gif";
+  if (h(0, 4) === "25504446") return "pdf";              // %PDF
+  if (h(0, 9) === "232153494C4B5F5633") return "silk";   // #!SILK_V3
+  if (h(1, 9) === "232153494C4B5F5633") return "silk";   // 微信语音：0x02 前缀 + #!SILK_V3（真机实测）
+  if (h(0, 5) === "2321414D52") return "amr";            // #!AMR
+  if (h(0, 4) === "4F676753") return "ogg";
+  if (h(0, 4) === "52494646" && h(8, 4) === "57454250") return "webp";
+  if (h(0, 4) === "52494646" && h(8, 4) === "57415645") return "wav";
+  if (h(0, 4) === "504B0304" || h(0, 4) === "504B0506" || h(0, 4) === "504B0708") return "zip";
+  if (h(4, 4) === "66747970") return "mp4";              // ftyp
+  if (h(0, 4) === "1A45DFA3") return "ebml";             // webm/mkv
+  if (h(0, 3) === "494433") return "mp3";
+  if (h(0, 2) === "424D") return "bmp";
   return null;
 }
-function decryptEcb(encrypted, rawKey) {
-  const key = parseAesKey(rawKey);
-  if (!key) throw new Error("AES key 格式无效（需 32 hex 字符或 16 字节 base64）");
+function extFromMagic(magic) {
+  return ({ jpeg: "jpg", png: "png", gif: "gif", pdf: "pdf", silk: "silk", amr: "amr", ogg: "ogg",
+    webp: "webp", wav: "wav", zip: "zip", mp4: "mp4", ebml: "webm", mp3: "mp3", bmp: "bmp" })[magic] || null;
+}
+/** 文件名安全化：去路径分隔符/控制字符/保留字符，防 `..` 与 Windows 保留名；原名保留但清洗。 */
+function safeAttachName(name, kind, magic) {
+  let base = typeof name === "string" ? name : "";
+  base = base.replace(/[\x00-\x1F\x7F]/g, "").replace(/[\\/:*?"<>|]/g, "_").trim();
+  base = base.replace(/^[.\s]+/, "").replace(/[.\s]+$/, "");
+  if (base.length > 80) base = base.slice(0, 80);
+  if (!base || /^unnamed$/i.test(base)) base = "";
+  const ext = extFromMagic(magic);
+  if (!base) base = `${kind || "file"}${ext ? `.${ext}` : ".bin"}`;
+  else if (!/\.[A-Za-z0-9]{1,8}$/.test(base) && ext) base += `.${ext}`;
+  const stem = base.replace(/\.[^.]*$/, "");
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) base = `_${base}`;
+  return base;
+}
+/** 解密：逐候选 key 试 AES-128-ECB（先 PKCS7 校验，再退无 padding + 魔数判读）。 */
+function decryptAttachment(encrypted, rawKey) {
   const input = Buffer.isBuffer(encrypted) ? encrypted : Buffer.from(encrypted);
-  const d = createDecipheriv("aes-128-ecb", key, null);
-  return Buffer.concat([d.update(input), d.final()]);
+  const cands = keyCandidates(rawKey);
+  const tried = [];
+  if (!cands.length) {
+    throw Object.assign(new Error(`AES key 格式无效（len=${String(rawKey || "").length}，hex32/base64/base64url/utf8 均不产生 16B key）`), { keyTried: [] });
+  }
+  const passes = [];
+  for (const c of cands) {
+    for (const autoPad of [true, false]) {
+      try {
+        const d = createDecipheriv("aes-128-ecb", c.key, null);
+        d.setAutoPadding(autoPad);
+        const plain = Buffer.concat([d.update(input), d.final()]);
+        const magic = detectMagic(plain);
+        tried.push({ scheme: c.scheme, padding: autoPad ? "pkcs7" : "none", ok: true, magic });
+        passes.push({ scheme: c.scheme, padding: autoPad ? "pkcs7" : "none", plain, magic });
+      } catch {
+        tried.push({ scheme: c.scheme, padding: autoPad ? "pkcs7" : "none", ok: false });
+      }
+    }
+  }
+  // 判优：PKCS7+魔数 > 魔数 > PKCS7（都不满足 = 失败，不硬编码成功）。
+  const win = passes.find((p) => p.padding === "pkcs7" && p.magic)
+    || passes.find((p) => p.magic)
+    || passes.find((p) => p.padding === "pkcs7");
+  if (!win) throw Object.assign(new Error(`解密失败：${tried.length} 个候选方案均未通过 PKCS7（tried=[${tried.map((t) => `${t.scheme}:${t.padding}`).join(",")}]）`), { keyTried: tried });
+  return { plain: win.plain, scheme: win.scheme, padding: win.padding, magic: win.magic, tried };
+}
+/** 脱敏 key 诊断落盘（幂等：同 消息+附件序号+kind+keyPath 覆盖；索引为哈希，不存完整 id；绝无完整 key）。 */
+function recordKeyFormat(rec, seed) {
+  try {
+    ensureDir();
+    const cur = loadJson(KEY_FORMAT_PATH, null) || { discipline: "脱敏：len/charset/hasPadding/prefix4/decodedByteLen/sampleHexPreview(≤4B)/same；绝不记完整 key", samples: [] };
+    if (!Array.isArray(cur.samples)) cur.samples = [];
+    const id = createHash("sha256").update(String(seed)).digest("hex").slice(0, 16);
+    cur.samples = cur.samples.filter((s) => s?.id !== id);
+    cur.samples.push({ id, ts: nowIso(), ...rec });
+    cur.samples = cur.samples.slice(-60);
+    cur.updatedAt = nowIso();
+    const cnt = (arr) => arr.reduce((m, v) => { if (v != null) m[String(v)] = (m[String(v)] || 0) + 1; return m; }, {});
+    const decrypts = cur.samples.map((s) => s.decrypt).filter(Boolean);
+    const ok = decrypts.filter((d) => d.ok);
+    cur.conclusion = {
+      samples: cur.samples.length,
+      mediaKeyLen: cnt(cur.samples.map((s) => s.mediaAesKey?.len)),
+      mediaKeyCharset: cnt(cur.samples.map((s) => s.mediaAesKey?.charset)),
+      mediaKeyCandidates: cnt(cur.samples.map((s) => s.mediaAesKey?.candidates?.join("+"))),
+      topLevelCharset: cnt(cur.samples.map((s) => s.topLevelAeskey?.charset)),
+      topLevelSameAsMedia: cnt(cur.samples.map((s) => s.same)),
+      topLevelSameDerivedKey: cnt(cur.samples.map((s) => s.sameDerivedKey)),
+      decryptOk: `${ok.length}/${decrypts.length}`,
+      magicOk: `${ok.filter((d) => d.magicOk).length}/${decrypts.length}`,
+      winningSchemes: cnt(ok.map((d) => d.scheme)),
+      magics: cnt(ok.map((d) => d.magic)),
+    };
+    fs.writeFileSync(KEY_FORMAT_PATH, JSON.stringify(cur, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(KEY_FORMAT_PATH, 0o600); } catch { /* Windows：0600 仅尽力 */ }
+  } catch (e) {
+    console.log(`[probe] key-format 落盘失败：${String(e.message).slice(0, 80)}`);
+  }
 }
 // 纯 JS 二维码渲染：零依赖；优先尝试可选的 qrcode / qrcode-terminal（未安装则打印 URL）。
 async function renderQrHint(qrUrl, qrCode) {
@@ -386,6 +551,10 @@ function extractAttachments(it) {
     const known = Object.prototype.hasOwnProperty.call(VARIANT_KIND, key);
     const url = pickPath(v, URL_PATHS);
     const aes = pickPath(v, AES_PATHS);
+    // 两个 key 源分开抓（只进内存/脱敏诊断）：嵌套 media.aes_key 与顶层 aeskey（真机 image_item 两者都有）。
+    const aesKeyMedia = typeof v.media?.aes_key === "string" && v.media.aes_key ? v.media.aes_key : "";
+    const aesKeyTop = typeof v.aeskey === "string" && v.aeskey ? v.aeskey
+      : (typeof v.aes_key === "string" && v.aes_key ? v.aes_key : "");
     const nestedMedia = Boolean(v.media && typeof v.media === "object");
     if (!known && !nestedMedia && !url.path && !aes.path) continue;   // 非附件变体（富卡片/列表等）
     const absolute = /^https?:\/\//i.test(url.value);
@@ -405,6 +574,8 @@ function extractAttachments(it) {
       urlPath: url.path,
       aesKey: aes.value,
       aesKeyPath: aes.path,
+      aesKeyMedia,
+      aesKeyTop,
       encParamPresent: typeof v.media?.encrypt_query_param === "string" && v.media.encrypt_query_param.length > 0,
       shape,
     });
@@ -474,6 +645,14 @@ function normalizeUpdates(payload, prevBuf, opts = {}) {
           urlPath: a.urlPath, aesKeyPath: a.aesKeyPath, encParamPresent: a.encParamPresent,
           host: gate.host, hostAllowed: gate.ok,
           hasUrl: Boolean(a.url), hasKey: Boolean(a.aesKey), aesKeyPresent: Boolean(a.aesKey),
+          // key 格式诊断（脱敏，内存态）：两路 key 的 len/charset/... + 是否同值；不含 key 原文。
+          keyDiag: (a.aesKeyMedia || a.aesKeyTop) ? {
+            mediaAesKey: analyzeKeyForDiag(a.aesKeyMedia),
+            topLevelAeskey: analyzeKeyForDiag(a.aesKeyTop),
+            same: (a.aesKeyMedia && a.aesKeyTop) ? a.aesKeyMedia === a.aesKeyTop : null,
+            sameDerivedKey: (a.aesKeyMedia && a.aesKeyTop)
+              ? deriveKeyHex(a.aesKeyMedia) === deriveKeyHex(a.aesKeyTop) : null,
+          } : null,
           _url: gate.ok ? a.url : undefined,           // 内存态仅保留，绝不打印/落盘
           _aesKey: gate.ok && a.aesKey ? a.aesKey : undefined,
         });
@@ -518,6 +697,84 @@ async function safeDownload(url, timeoutMs, maxHops = 3) {
   }
 }
 
+/** --replay-seq：buf 是 proto{ 内层{field1=last-seen seq, …}, field2=会话标识 }（真机实测，只读回放用）。 */
+function readVarint(buf, off) {
+  let v = 0n, s = 0n, i = off;
+  for (; i < buf.length; i++) {
+    const c = buf[i];
+    v |= BigInt(c & 0x7f) << s;
+    s += 7n;
+    if (!(c & 0x80)) break;
+  }
+  return [v, i + 1];
+}
+function writeVarint(v) {
+  const out = [];
+  let x = BigInt(v);
+  do { let b = Number(x & 0x7fn); x >>= 7n; if (x > 0n) b |= 0x80; out.push(b); } while (x > 0n);
+  return Buffer.from(out);
+}
+function parseTlv(buf) {
+  const fields = {};
+  let p = 0;
+  while (p < buf.length) {
+    const [t, op] = readVarint(buf, p);
+    p = op;
+    const num = Number(t >> 3n), wire = Number(t & 7n);
+    if (wire === 0) { const [v, np] = readVarint(buf, p); fields[num] = { t: "v", v }; p = np; }
+    else if (wire === 2) { const [l, np] = readVarint(buf, p); const len = Number(l); fields[num] = { t: "l", b: buf.subarray(np, np + len) }; p = np + len; }
+    else break;
+  }
+  return fields;
+}
+function encodeTlv(fields) {
+  const parts = [];
+  for (const k of Object.keys(fields).map(Number).sort((a, b) => a - b)) {
+    const v = fields[k];
+    if (v.t === "v") { parts.push(writeVarint(k << 3), writeVarint(v.v)); }
+    else { parts.push(writeVarint((k << 3) | 2), writeVarint(v.b.length), Buffer.from(v.b)); }
+  }
+  return Buffer.concat(parts);
+}
+/** 取 buf 内层 field1（last-seen seq）；解析不了 → null（调用方退回原 buf，不猜）。 */
+function bufSeq(bufB64) {
+  try {
+    const fields = parseTlv(Buffer.from(String(bufB64 || ""), "base64"));
+    const inner = fields[1]?.t === "l" ? parseTlv(fields[1].b) : null;
+    const v = inner?.[1]?.t === "v" ? Number(inner[1].v) : null;
+    return Number.isFinite(v) ? v : null;
+  } catch { return null; }
+}
+/** 回退内层 seq 后重新编码；失败 → null（不猜、不伪造）。 */
+function rewindBufSeq(bufB64, seq) {
+  try {
+    const fields = parseTlv(Buffer.from(String(bufB64 || ""), "base64"));
+    if (fields[1]?.t !== "l") return null;
+    const inner = parseTlv(fields[1].b);
+    if (inner[1]?.t !== "v") return null;
+    inner[1] = { t: "v", v: BigInt(seq) };
+    fields[1] = { t: "l", b: encodeTlv(inner) };
+    return encodeTlv(fields).toString("base64");
+  } catch { return null; }
+}
+
+/** 落盘名的主体：kind 优先；kind=unknown（真机 voice_item 未进 VARIANT_KIND）时用变体键名去 _item。 */
+function nameStemFor(a) {
+  if (a.kind && a.kind !== "unknown") return a.kind;
+  return String(a.variantKey || "").replace(/_item$/, "") || a.kind || "file";
+}
+
+/** 落盘路径去重：同名已存在时加 -2/-3…（不覆盖既有样本）。 */
+function uniqueAttachPath(fp) {
+  if (!fs.existsSync(fp)) return fp;
+  const dir = path.dirname(fp), ext = path.extname(fp), stem = path.basename(fp, ext);
+  for (let i = 2; i < 100; i++) {
+    const c = path.join(dir, `${stem}-${i}${ext}`);
+    if (!fs.existsSync(c)) return c;
+  }
+  return path.join(dir, `${stem}-${Date.now()}${ext}`);
+}
+
 async function cmdListen(args) {
   const timeoutMs = timeoutMsFromArgs(args);
   const doDecrypt = args.includes("--decrypt");
@@ -530,15 +787,28 @@ async function cmdListen(args) {
   const { botToken } = loadCredsOrThrow(args);
   const creds = loadJson(CREDS_PATH, {});
   const rawItems = args.includes("--raw-items");   // P1：只记 type/键名签名
+  const replaySeqRaw = flagValue(args, "--replay-seq");
+  const replaySeq = replaySeqRaw === undefined ? null : Number(replaySeqRaw);
+  const doReplay = replaySeq !== null && Number.isFinite(replaySeq) && replaySeq >= 0;
+  if (replaySeq !== null && !doReplay) throw new Error("--replay-seq 需要 >= 0 的整数。");
+  let replayFirstPoll = doReplay;
   let state = loadJson(STATE_PATH, { buf: "", seenIds: [], lastMeasurement: null });
   const seen = new Set(state.seenIds || []);
   if (doDecrypt) fs.mkdirSync(outDir, { recursive: true });
   console.log(`[probe] listen 启动：buf=${state.buf ? `<present len=${state.buf.length}>` : "<empty>"} decrypt=${doDecrypt} rawItems=${rawItems} maxBatches=${maxB} stopOnHit=${stopOnHit} timeout=${timeoutMs}ms`);
-  if (doDecrypt) console.log(`[probe] 附件落盘目录：${outDir}（命名 <msgId>_<kind>_<序号>.<ext>；日志/measure 只记 kind/host/hops/plainBytes）`);
+  if (doDecrypt) console.log(`[probe] 附件落盘目录：${outDir}（命名 <kind>-<msgId前8>-<原名安全化>；日志/measure 只记 kind/host/hops/plainBytes/magic/sha256_8）`);
+  if (doReplay) console.log(`[probe] 只读重放：首 poll 把 buf 内层 seq 回退到 ${replaySeq}（当前头 seq=${bufSeq(state.buf) ?? "?"}；服务端按 seq 回放历史，不发任何消息）；回放批忽略 seen 去重。`);
   let batches = 0;
   for (;;) {
     if (aborted || batches >= maxB) break;
-    const bufIn = state.buf || "";
+    const headSeq = bufSeq(state.buf);
+    let bufIn = state.buf || "";
+    if (replayFirstPoll) {
+      replayFirstPoll = false;
+      const rewound = bufIn ? rewindBufSeq(bufIn, replaySeq) : null;
+      if (rewound) bufIn = rewound;
+      else console.log(`[probe] --replay-seq：buf 为空或不可解析，按原样轮询（不伪造游标）。`);
+    }
     let res;
     try {
       res = await fetchJson(`${BASE_URL}/ilink/bot/getupdates`, {
@@ -593,13 +863,29 @@ async function cmdListen(args) {
     let lastWithToken = null;
     for (const m of messages) {
       // 无 id 的消息不参与 dedupe（id 为空串会把后续消息全部当重放吞掉）。
-      if (m.id && seen.has(m.id)) { console.log(`[probe] 去重跳过 id=${m.id}（同一 buf 重放）`); continue; }
+      if (m.id && seen.has(m.id) && !doReplay) { console.log(`[probe] 去重跳过 id=${m.id}（同一 buf 重放）`); continue; }
+      if (m.id && seen.has(m.id) && doReplay) console.log(`[probe] 重放命中已见 id=${m.id}（--replay-seq 忽略去重，只读处理）`);
       if (m.id) seen.add(m.id);
       printInboundMessage({ ...m, contextTokenPresent: m.contextTokenPresent }, ++n);
       if (m._contextToken) lastWithToken = m;
-      if (doDecrypt) {
-        let attIdx = 0;
-        for (const a of m.attachments) {
+      for (const [attIdx, a] of m.attachments.entries()) {
+        const msgId8 = (m.id || "noid").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 8) || "noid";
+        // key 格式诊断记录（脱敏；无 key 则不记）。decrypt 字段在下面各分支里填。
+        const rec = {
+          msgId8, attIndex: attIdx, kind: a.kind, variantKey: a.variantKey, keyPath: a.aesKeyPath, urlPath: a.urlPath,
+          shape: a.shape, hostAllowed: a.hostAllowed,
+          mediaAesKey: a.keyDiag?.mediaAesKey ?? null,
+          topLevelAeskey: a.keyDiag?.topLevelAeskey ?? null,
+          same: a.keyDiag?.same ?? null,
+          sameDerivedKey: a.keyDiag?.sameDerivedKey ?? null,
+          decrypt: null,
+        };
+        if (a.keyDiag) {
+          // stdout 不打 prefix4/preview（不把部分 key 材料进日志）；完整脱敏字段在 key-format.json。
+          console.log(`    [key-diag] kind=${a.kind} keyPath=${a.aesKeyPath ?? "-"} mediaKeyLen=${a.keyDiag.mediaAesKey?.len ?? "-"} charset=${a.keyDiag.mediaAesKey?.charset ?? "-"} candidates=[${(a.keyDiag.mediaAesKey?.candidates || []).join(",")}] topLen=${a.keyDiag.topLevelAeskey?.len ?? "-"} same=${rec.same} sameDerived=${rec.sameDerivedKey}`);
+        }
+        try {
+          if (!doDecrypt) continue;
           // 跳过原因分类：不猜字段名，unknown-shape 只回带变体键名（签名在 items.jsonl）。
           const skip = a.shape === "unknown-shape" ? "unknown-shape"
             : a.shape === "missing-url" ? "missing-url"
@@ -610,6 +896,7 @@ async function cmdListen(args) {
             : null;
           if (skip) {
             console.log(`    [decrypt] 跳过 ${a.filename}（${skip}；variant=${a.variantKey} urlPath=${a.urlPath ?? "-"} keyPath=${a.aesKeyPath ?? "-"}${skip === "unknown-shape" ? ` 键名=[${a.variantKeys.join(",")}] 已落盘 items.jsonl` : ` host=${a.host}`}）`);
+            rec.decrypt = { ok: false, skipped: skip };
             appendMeasure({
               kind: "attachment_skipped", reason: skip, attKind: a.kind, variantKey: a.variantKey,
               shape: a.shape, host: a.host, urlPath: a.urlPath, aesKeyPath: a.aesKeyPath,
@@ -619,37 +906,53 @@ async function cmdListen(args) {
               appendMeasure({ kind: "attachment_download_blocked", reason: "host-not-allowed", host: a.host, hops: 0 });
             continue;
           }
-          try {
-            const dl = await safeDownload(a._url, timeoutMs);
-            if (dl.blocked) {
-              console.log(`    [decrypt] 拒绝下载 ${a.filename}（${dl.reason} host=${dl.host} hops=${dl.hops}）`);
-              appendMeasure({ kind: "attachment_download_blocked", reason: dl.reason, attKind: a.kind, host: dl.host, hops: dl.hops });
-              continue;
-            }
-            if (!dl.res.ok) {
-              console.log(`    [decrypt] 下载失败 ${a.filename} HTTP ${dl.res.status}（kind=${a.kind} host=${dl.finalHost} hops=${dl.hops}）`);
-              appendMeasure({ kind: "attachment_download", ok: false, status: dl.res.status, attKind: a.kind, host: dl.finalHost, hops: dl.hops });
-              continue;
-            }
-            const plain = decryptEcb(Buffer.from(await dl.res.arrayBuffer()), a._aesKey);
-            const extM = /\.([A-Za-z0-9]{1,8})$/.exec(a.filename);
-            const safeId = (m.id || "noid").replace(/[\\/:*?"<>|]/g, "_");
-            const fp = path.join(outDir, `${safeId}_${a.kind}_${++attIdx}${extM ? `.${extM[1]}` : ".bin"}`);
-            fs.writeFileSync(fp, plain);
-            // 只记 kind/host/跳数/明文字节：不记最终 URL、不记 key、不记密文（P7 证据口径）。
-            appendMeasure({ kind: "attachment_download", ok: true, status: 200, attKind: a.kind, host: dl.finalHost, hops: dl.hops, plainBytes: plain.length, urlPath: a.urlPath, aesKeyPath: a.aesKeyPath });
-            console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B) kind=${a.kind} host=${dl.finalHost} hops=${dl.hops} urlPath=${a.urlPath} keyPath=${a.aesKeyPath}`);
-          } catch (e) {
-            const msg = String(e.message).slice(0, 100).replace(/https?:\/\/\S+/gi, "<url>");
-            console.log(`    [decrypt] 失败：${msg}`);
-            appendMeasure({ kind: "attachment_decrypt_error", attKind: a.kind, error: msg });
+          const dl = await safeDownload(a._url, timeoutMs);
+          if (dl.blocked) {
+            console.log(`    [decrypt] 拒绝下载 ${a.filename}（${dl.reason} host=${dl.host} hops=${dl.hops}）`);
+            rec.decrypt = { ok: false, skipped: dl.reason, host: dl.host, hops: dl.hops };
+            appendMeasure({ kind: "attachment_download_blocked", reason: dl.reason, attKind: a.kind, host: dl.host, hops: dl.hops });
+            continue;
           }
+          if (!dl.res.ok) {
+            console.log(`    [decrypt] 下载失败 ${a.filename} HTTP ${dl.res.status}（kind=${a.kind} host=${dl.finalHost} hops=${dl.hops}）`);
+            rec.decrypt = { ok: false, httpStatus: dl.res.status };
+            appendMeasure({ kind: "attachment_download", ok: false, status: dl.res.status, attKind: a.kind, host: dl.finalHost, hops: dl.hops });
+            continue;
+          }
+          const dec = decryptAttachment(Buffer.from(await dl.res.arrayBuffer()), a._aesKey);
+          const plain = dec.plain;
+          const magic = dec.magic;
+          const sha8 = createHash("sha256").update(plain).digest("hex").slice(0, 8);
+          const want = path.join(outDir, `${a.kind}-${msgId8}-${safeAttachName(a.filename, nameStemFor(a), magic)}`);
+          const fp = uniqueAttachPath(want);
+          fs.writeFileSync(fp, plain);
+          // 魔数 = 解密成功的硬证据；只记 kind/host/跳数/明文字节/魔数/摘要，不记 URL、key、密文。
+          rec.decrypt = { ok: true, scheme: dec.scheme, padding: dec.padding, magic, magicOk: Boolean(magic), plainBytes: plain.length, sha256_8: sha8, tried: dec.tried };
+          appendMeasure({
+            kind: "attachment_download", ok: true, status: 200, attKind: a.kind, host: dl.finalHost, hops: dl.hops,
+            plainBytes: plain.length, magic, magicOk: Boolean(magic), sha256_8: sha8,
+            keyScheme: dec.scheme, keyPadding: dec.padding, urlPath: a.urlPath, aesKeyPath: a.aesKeyPath,
+          });
+          console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B) magic=${magic ?? "-"} sha256_8=${sha8} key=${dec.scheme}/${dec.padding} kind=${a.kind} host=${dl.finalHost} hops=${dl.hops} urlPath=${a.urlPath} keyPath=${a.aesKeyPath}`);
+        } catch (e) {
+          const msg = String(e.message).slice(0, 200).replace(/https?:\/\/\S+/gi, "<url>");
+          console.log(`    [decrypt] 失败：${msg}`);
+          rec.decrypt = { ok: false, error: msg, tried: e.keyTried ?? undefined };
+          appendMeasure({ kind: "attachment_decrypt_error", attKind: a.kind, error: msg });
+        } finally {
+          if (a.keyDiag) recordKeyFormat(rec, `${m.id || "noid"}|${attIdx}|${a.kind}|${a.aesKeyPath || "-"}`);
         }
       }
     }
-    state = { buf: nextBuf, seenIds: [...seen].slice(-500), lastMeasurement: nowIso() };
+    // 回放批落盘游标只进不退：返回 buf 的 seq 未到原头时保留原头（且不回写过期 context_token）。
+    const respSeq = bufSeq(nextBuf);
+    const replayAdvanced = !doReplay || (headSeq != null && respSeq != null && respSeq >= headSeq);
+    const persistBuf = replayAdvanced ? nextBuf : state.buf;
+    if (doReplay && !replayAdvanced)
+      console.log(`[probe] --replay-seq：返回 seq=${respSeq ?? "?"} 未到原头 ${headSeq ?? "?"}，保留原游标（不回退）。`);
+    state = { buf: persistBuf, seenIds: [...seen].slice(-500), lastMeasurement: nowIso() };
     saveJson0600(STATE_PATH, state);   // 游标每批持久化，Ctrl+C 不丢
-    if (lastWithToken) {
+    if (lastWithToken && replayAdvanced) {
       saveLastContext(lastWithToken);
       // 只写路径与存在性，不打印 token 原文。
       console.log(`[probe] 已更新最近入站 context：${LAST_CONTEXT_PATH}（context_token: ${redactPresence(lastWithToken._contextToken)}，from=${lastWithToken.senderId}）`);
@@ -1122,7 +1425,7 @@ try {
   else if (cmd === "media-probe") await cmdMediaProbe(rest);
   else if (cmd === "status") cmdStatus();
   else {
-    console.error("用法：login | listen [--raw-items] [--decrypt] [--short] [--stop-on-hit] [--max-batches N] [--out DIR] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
+    console.error("用法：login | listen [--raw-items] [--decrypt] [--short] [--stop-on-hit] [--max-batches N] [--replay-seq N] [--out DIR] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
     process.exit(2);
   }
 } catch (e) {
