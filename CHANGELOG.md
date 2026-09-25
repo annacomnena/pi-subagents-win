@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] — 2026-09-25 (微信媒体探针**第四轮出站补测 + 人工确认收口**：`56e5088`；只改探针 + 文档，生产代码零改动)
+
+- **Phase ③ 最终结论**：**入站媒体（P1/P7）与出站媒体（P5/P6）规格均已真机定稿**——研究 §7 的依赖 **M1 ← P7** 与 **M4 ← P5→P6** 全部勾销，可开始 media gateway 实现（形状已锁，禁止在 P6 通过的形状外新增字段）。
+- **四条最终判定（证据形态 = B + 人工确认，用户逐条原话入档 `plans/0925_wechat_media_probe_results.md` §11.5）**：① **P3 同 `client_id` 双发 → 手机只收到 1 条 ⇒ 服务端按 `client_id` 去重：同 id 双发只投递 1 条**（W3a E-2 遗留问题最终答案）；② **P8 URL →「链接收到了」⇒ 原样发出且被渲染为链接形态**（可点性因非真实站点不可验、卡片缩略图仍 U）；③ **P6 出站发图 → 1×1 纯色 PNG 已收到 ⇒ 出站发图端到端通过**；④ **P2 4001 字符 → 用户「不太确定」⇒ 保留半边结论：服务端 `ret=0` 接受（B），微信端截断仍为 U（不硬下结论）**。
+- **契约级推论（广播/回复都适用）**：服务端按 `client_id` 去重 ⇒ **广播给多收件人必须 per-recipient clientId**，否则不同收件人因共用同 id **互相去重吞掉**；已实现的 `deriveBroadcastClientId(roundId, toUserId)`（`extensions/channel-wechat/send.ts#L72-L74`）**被真机验证为必要且正确**（本页 Open Questions ⑤ / 广播 ③ 由此关闭）。
+- **出站媒体规格（B，三段全通）**：`POST /ilink/bot/getuploadurl`（单键 `upload_full_url`）→ **AES-128-ECB + PKCS7 密文 `POST` `application/octet-stream`** → **`x-encrypted-param`（480B）= `encrypt_query_param`**（无需 PUT / 无 `upload_param` 分支）→ `sendmessage` **`item_list` 只放媒体项**（**caption 必须单独发一条文本**，同条 = `ret=-2 invalid arguments` n=2 否证）、`media:{encrypt_query_param, aes_key:base64(hex32), encrypt_type:1}`、`mid_size`=密文字节、**不需 `context_token`**。
+- **第四轮探针观测面（commit `56e5088`）**：`send --to-last`（收件人反查，openid 不上命令行）、`textLen`/`errmsg`/`itemListLen` 落 `measure.jsonl`、`latestInboxFromId()` 跳过 `@im.bot`（收件人防环）。
+- **残余 U（7）**：P2 4001 字符截断 / 入站附件体积上限·长语音·下载耗时·双游标互抢 / 真机 302 实况 / 大媒体·其它 `media_type` / 上传失败·重试语义 / bot 回声·URL 卡片缩略图 / P4-poll+send 429（另：`type=5` 与群·小程序卡片 item 形状未采）。
+- **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md` 新增「出站媒体规格（第四轮 + 人工确认）」与「`client_id` 去重语义（人工确认）」两节 + 出站协议契约 / 出站 upload 残余 / 广播 per-recipient clientId / Open Questions / Summary / Evidence 修订；`wiki-nav rebuild`；Recent Work Item 49；收尾报告 `plans/0925_wechat_media_probe_wrapup_report.md`（含 media gateway 规格移交清单）。
+
 ## [Unreleased] — 2026-09-25 (微信媒体探针 Phase ③ 收尾：`6a72b19`/`9f52a4a`/`d724f6a`；**只改探针，生产代码零改动**)
 
 - **入站 item type 矩阵（B 级真机）**：`1`=文本(`text_item`) / `2`=图片(`image_item`) / `3`=语音(`voice_item`) / `4`=文件(`file_item`)；**链接作为文本处理（无独立 type）**；信封 `{message_type, message_state, hasContextToken, hasGroupId}`（实测 1/2/true/false）；item 公共键 `create_time_ms/update_time_ms/is_completed/msg_id(string)/button_item_list/at_bot_username_list`，id 双层（信封 `message_id:number` / item `msg_id:string`）。

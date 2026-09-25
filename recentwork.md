@@ -16,7 +16,8 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
-| 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | P6-cdn/P6-send/P2/P3/P8 待用户同意（残留 U 10 项） |
+| 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 |
+| 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | —（第四轮补测 + 人工确认已由 **Item 49** 收口） |
 | 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） |
 | 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） |
 | 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
@@ -57,6 +58,22 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 49 - 微信媒体探针第四轮出站补测 + 人工确认收口（Phase ③ 最终定稿）
+
+- **日期**：2026-09-25
+- **一句话**：用户授权的第四轮出站补测（commit **`56e5088`**，探针观测面）跑完 **P6 / P2 / P3 / P8**，再由**用户逐条人工确认**收口——**Phase ③ 至此定稿：入站媒体（P1/P7）与出站媒体（P5/P6）规格均已真机定稿**。
+- **四条最终判定（证据形态 = B + 人工确认，权威人工判定）**：① **P3 同 `client_id` 双发 → 手机只收到 1 条 ⇒ 服务端按 `client_id` 去重，同 id 双发只投 1 条**（W3a E-2 最终答案）；② **P8 URL →「链接收到了」⇒ 原样发出且被渲染为链接形态**（可点性因非真站不可验）；③ **P6 出站发图 → 1×1 纯色 PNG 已收到 ⇒ 端到端通过**；④ **P2 4001 字符 → 用户「不太确定」⇒ 半边结论保留：服务端 `ret=0` 接受（B）、微信端截断仍 U**。
+- **契约级推论**：既然服务端按 `client_id` 去重，**广播给多收件人必须 per-recipient clientId**（否则不同收件人因同 id 互相去重吞件）⇒ 已实现的 `deriveBroadcastClientId(roundId, toUserId)`（`extensions/channel-wechat/send.ts#L72-L74`）**被真机验证为必要且正确**。
+- **出站媒体规格（B，三段全通）**：`getuploadurl`（单键 `upload_full_url`）→ AES-128-ECB 密文 `POST` → `x-encrypted-param`(480B)=`encrypt_query_param` → `sendmessage` **`item_list` 只放媒体项**（**caption 必须单独发**，同条 = `ret=-2 invalid arguments`）、`media:{encrypt_query_param, aes_key:base64(hex32), encrypt_type:1}`、`mid_size`=密文字节、**不需 `context_token`**。
+- **涉及模块**：探针 `scripts/wechat-ilink-probe.mjs`（`--to-last` 收件人反查、`textLen`/`errmsg` 落 measure、`@im.bot` 收件人防环；commit `56e5088`）；**生产代码零改动**。
+- **产物**：`plans/0925_wechat_media_probe_results.md`（§11 第四轮 + **§11.5 人工确认结果** + §11.8 Phase ③ 最终结论）/ `plans/0925_wechat_media_probe_wrapup_report.md`（收尾报告，含规格移交清单）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` 新增 **「出站媒体规格（第四轮 + 人工确认）」** 与 **「`client_id` 去重语义（人工确认）」** 两节，修订「出站 upload 端点」残余 U、出站协议契约、出站广播 per-recipient clientId、Open Questions（⑤③⑩ 等已定划除，新增⑪⑫⑬）、Summary、Evidence；`wiki-nav rebuild`
+- **残余 U（7）**：P2 4001 截断 / 大文件·长语音体积上限与下载耗时 / 真机 302 / 大媒体·其它 `media_type` / 上传失败·重试语义 / 回声·卡片缩略图 / P4-poll+send 429（另：`type=5` 与群·小程序形状仍未采）。
+- **Priority**：P1
+- **Status**：done（Phase ③ 探针阶段全部收口；media gateway 实现依赖的 P1/P5/P6/P7 均已 B 级定稿）
+- **Commit**：`56e5088`（第四轮探针观测面）；本次文档收尾 commit 见 CHANGELOG 同 Item 行
+- **Verification**：`measure.jsonl` `kind=send_dedup{textLen:4001, ret:0}` ×3 + `kind=media_probe.stage=send messageIdPresent:true` 与报告 §11 时间线一致；四条人工判定原话已原文入档（§11.5）；纪律 = 零生产代码、零探针脚本改动，`git add` 只含 Wiki/recentwork/CHANGELOG 三个具体文件。
 
 ### Item 48 - 微信媒体探针 Phase ③ 收尾（入站媒体与附件规格真机定稿）
 

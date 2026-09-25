@@ -28,7 +28,7 @@ source_paths:
 
 ## Summary
 
-iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**入站媒体规格（真机实测：item type 矩阵 / 嵌套 `media.*` 形状 / `base64(hex32)` AES key / AES-128-ECB+PKCS7 解密 6/6 + 魔数，见「入站媒体与附件规格」节）**、**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
+iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**入站媒体规格（真机实测：item type 矩阵 / 嵌套 `media.*` 形状 / `base64(hex32)` AES key / AES-128-ECB+PKCS7 解密 6/6 + 魔数，见「入站媒体与附件规格」节）**、**出站媒体规格（三段式 getuploadurl → CDN 密文 POST → 纯媒体 `item_list`；caption 必须单独发；不需 `context_token`；1×1 PNG 端到端人工确认，见「出站媒体规格」节）**、**`client_id` 去重语义（服务端按 id 去重，同 id 双发只投 1 条 → 多收件人必须 per-recipient clientId，人工确认）**、**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
 
 ## Current Contract
 
@@ -44,8 +44,9 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - **请求**：`POST {base}/ilink/bot/sendmessage`；鉴权头同 getupdates（`AuthorizationType: ilink_bot_token`、`Authorization: Bearer <bot_token>`、`X-WECHAT-UIN`，另有 JSON content-type）。出处：`extensions/channel-wechat/send.ts#L110-L113`；`plans/0924_wechat_w3a_calibration.md`。
 - **Body**：`base_info.channel_version="2.0.0"`；`msg` 含 `from_user_id:""`、`to_user_id`、`client_id`、`message_type:2`、`message_state:2`、`item_list:[{type:1,text_item:{text}}]`；**不带 `context_token`**。出处：`extensions/channel-wechat/send.ts#L121-L128`；校准依据：`plans/0924_wechat_w3a_calibration.md`。
 - **真机响应**：HTTP 200 + `{message_id}`；无 `ret`/`errcode`/`errmsg`。`send.ts` 将缺失业务码按 0 处理，因此该响应判为成功。出处：`extensions/channel-wechat/send.ts#L159-L170`；`plans/0924_wechat_w3a_calibration.md`。
-- **client_id 去重：未定论**：相同 ID 两次请求 API 均回 sent；服务端/客户端是否只投递一条，待人工观察微信端收件数。出处：`plans/0924_wechat_w3a_calibration.md`。
-- **未验证**：文本长度上限、429/并发 poll 限流、bot 自发回声行为。出处：`plans/0924_wechat_w3a_calibration.md`。
+- **client_id 去重（已定，人工确认）**：服务端**按 `client_id` 去重——相同 id 双发只投递 1 条**（第四轮固定 id 连发 2 次均 `ret=0`，用户手机只收到 1 条；B + 人工确认）⇒ **多收件人必须 per-recipient clientId**。出处：`plans/0925_wechat_media_probe_results.md` §11.5；见「`client_id` 去重语义」节。
+- **出站 URL 渲染（已定，人工确认）**：`text_item.text` 原样发出的 URL **被微信端渲染为链接形态**（B + 人工确认）；是否出卡片缩略图、可点性未验证。出处：同上 §11.5 判定表 #2。
+- **未验证**：429/并发 poll 限流（读端点并发 3× 无 429 已测）、bot 自发回声（窗口内未观测到，非穷尽）、**4001 字符在微信端是否被截断（服务端 `ret=0` 接受 = B，截断 = U）**。出处：`plans/0924_wechat_w3a_calibration.md` + `plans/0925_wechat_media_probe_results.md` §11。
 
 ## Key Symbols
 
@@ -254,7 +255,43 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 | `OPTIONS`（任一路径） | 照样走鉴权+参数校验 | **方法论：不能用 OPTIONS 判「方法是否支持」** |
 
 - 负控制（不存在路径 → 404）证明本服务**能**用 404 区分「路径不存在」⇒ 200 有信息量；`getuploadurl` 只回 `upload_full_url`、无 `upload_param`，落在 Hermes 已覆盖的分支（C↔B 自洽）。
-- **仍未测（U）**：CDN 是否收我们的密文与 POST 方法（Hermes 称旧 PUT 会 404 须 POST，**C 级未本机验证**）、`x-encrypted-param` 是否返回、`sendmessage` 带媒体 item 是否被接受、是否强制 `context_token` ⇒ **P6 取证前不写任何出站媒体生产代码**。
+- **仍未测（U）**：~~CDN 是否收我们的密文与 POST 方法、`x-encrypted-param` 是否返回、`sendmessage` 带媒体 item 是否被接受、是否强制 `context_token`~~ —— **均已在第四轮真机收口（B + 人工确认）**，见下节「出站媒体规格」。**残余仅剩**：大媒体（本轮 70B/80B 密文）、其它 `media_type`、上传失败/重试语义。
+
+### 出站媒体规格（真机实测 2026-09-25 第四轮 + 人工确认）
+
+> **证据级别 B（本机真机）+ 人工确认**：`plans/0925_wechat_media_probe_results.md` §11（第四轮，探针 commit `56e5088`，基线 `4f67753`）+ §11.5（用户人工判定，原话「1条，4001个a我不太确定其实，链接收到了，肯定打不开毕竟不是真网站」）。
+
+**三段式全部本机真机打通**：
+
+| 段 | 规格 | 实测 |
+|---|---|---|
+| ① 申请预签名 URL | `POST /ilink/bot/getuploadurl`，body `filekey, media_type, to_user_id, rawsize, rawfilemd5, filesize, no_need_thumb, aeskey` | 200 + **单键 `upload_full_url`**（host 落 allowlist）；无 `upload_param` 分支 |
+| ② 上传密文 | **AES-128-ECB（随机 16B key + PKCS#7）→ `POST` `application/octet-stream`** 到该预签名 URL | **4/4 HTTP 200**，响应头 **`x-encrypted-param`（480B）= `encrypt_query_param`**；**无需 PUT** |
+| ③ 发消息 | `sendmessage`，`item_list` **只放一个媒体 item** | **200 + `message_id`** |
+
+**实测通过的出站媒体 body（字段不得增删）**：
+```
+{ base_info:{channel_version:"2.0.0"},
+  msg:{ from_user_id:"", to_user_id:<收件人>, client_id:<per-recipient uuid>,
+        message_type:2, message_state:2,
+        item_list:[{ type:2,
+          image_item:{ media:{ encrypt_query_param:<x-encrypted-param 480B>, aes_key:base64(hex32), encrypt_type:1 },
+                       mid_size:<密文字节> } }] } }
+```
+
+- **`item_list` 只放媒体项，caption 必须单独发一条文本**：`[text, image]` 同 `item_list` → **`HTTP 200 / ret=-2 invalid arguments / 无 message_id`**（n=2，B）。与 Hermes「caption 单独发」一致（C↔B）；photon-hq「caption 可与媒体同条」**被本机否证**。
+- **`media` 三键**：`encrypt_query_param`（= CDN 响应头 `x-encrypted-param` 480B）、`aes_key` = **`base64(hex32)`**（与入站同格式）、`encrypt_type:1`。
+- **`mid_size` = 密文字节**（同 Hermes `ciphertext_size`）。注意与入站口径不同：入站 `mid_size` = 解密后 plainBytes，两侧勿混用。
+- **不需要 `context_token`**：出站 send 未带该字段仍拿到 `message_id` ⇒ 研究 U4 对「出站 send 段」给出正向证据。
+- **端到端人工确认（B + 人工确认）**：用户确认 **1×1 纯色 PNG 已收到** ⇒ **出站发图端到端通过**；**URL 被渲染为链接形态**（同为人工确认）。
+- **残余 U（出站媒体）**：大媒体（>100B）、其它 `media_type`、**上传失败/重试语义**、caption 单独发是否实际可用。
+
+### `client_id` 去重语义（**人工确认**，契约级）
+
+- **服务端按 `client_id` 去重：相同 id 双发只投递 1 条。** 证据：第四轮固定 `client_id` 连发 2 次同文（13:23:09Z / 13:23:13Z，均 200 / `ret=0`），**用户手机只收到 1 条**。证据级 = **B + 人工确认**（`plans/0925_wechat_media_probe_results.md` §11.5 判定表 #1）——这是 **W3a E-2 遗留问题的最终答案**，本页 Open Questions ⑤ 由此关闭。
+- **推论（广播/回复的硬约束）**：**广播给多收件人时必须 per-recipient clientId** —— 若复用同一 id，不同收件人会因服务端按 id 去重而**互相吞掉**（部分收件人收不到）。
+- **既有实现因此被真机验证为「必要且正确」**：`deriveBroadcastClientId(roundId, toUserId)` = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`（`extensions/channel-wechat/send.ts#L72-L74`）；命令回执 clientId 同纪律（`send.ts#L82`）。
+- **边界（勿过度外推）**：去重发生在**投递层**——协议层两次调用都成功（`ret=0`），**不能**拿「第二次被拒」当去重信号；同 id 跨轮次/长时间窗是否仍只投一条**未穷尽测试** ⇒ 幂等键仍应 per-recipient 派生，不要依赖跨轮去重。
 
 ### 采集方法备忘：只读回放（B）
 
@@ -310,7 +347,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 - roundId = `sha256(`${sessionId}:${firstUserTs ?? "no-ts"}:sha256(firstUserText)}`)`——同会话同首问同时间戳 → 同 roundId。出处：`extensions/wechat-reply-hook.ts#L61-L64`。
 - **intent id** = `sha256("wechat-broadcast:"+roundId+":"+fromId)`；**一个 intent 一收件人**（`kind:"broadcast"` 字段，旧文件无 `kind` 按 reply 兼容——`valid()` 放宽）。出处：`extensions/runtime/wechat-reply.ts#L24-L27`、`#L31`、`extensions/wechat-reply-hook.ts#L125-L132`。
-- **per-recipient clientId** = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`——服务端 client_id 去重语义未定论（Open Questions ⑤），跨收件人复用同一 id 有「按 id 全局去重丢件」风险，独立 id 在任何服务端语义下都安全且成为 per-recipient 幂等键。出处：`extensions/channel-wechat/send.ts#L72-L74`。
+- **per-recipient clientId** = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`——**服务端 `client_id` 去重语义已人工确认（B + 人工确认）：同 id 双发只投 1 条**（见「`client_id` 去重语义」节）⇒ 跨收件人复用同一 id **必然**造成按 id 全局去重丢件，**per-recipient 是硬要求**，独立 id 同时成为 per-recipient 幂等键。出处：`extensions/channel-wechat/send.ts#L72-L74`。
 - **同轮幂等**：重复 flush → 同 id → `linkSync` EEXIST → 不重写不重发；**不同轮不覆盖**：不同 roundId → 不同文件，`listReplyIntents` 按 `createdAt` 升序排队串行消费。出处：`extensions/runtime/wechat-reply.ts#L41`、`extensions/wechat-reply-hook.ts#L127`。
 
 ### 发送三门（watcher 侧，顺序即契约；reply intent 三门全不受约束）
@@ -439,6 +476,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 远程斜杠命令（commit `488e942`，L4 修复 `ebb9e04`）：`extensions/runtime/wechat-remote-command.ts`（`normalizeForClassify#L118`、`classifyRemoteCommand#L227`、`ENTRIES#L166`、`DANGER_EXACT#L130`）、`extensions/wechat-command-consumer.ts`（`scanWechatRemoteCommands#L250`、`registerWechatRemoteCommands#L494`、`defaultRemoteCommandDeps#L404`、`buildWechatStatusText#L170`）、`extensions/runtime-host/wechat-input.ts#L39-L51`（M2 注入点门）、`extensions/runtime-host/wechat-bind.ts#L249-L257`（能力门 fail-closed）、`extensions/channel-wechat/store.ts#L57`+`#L332`（`consumed` 终态与透传）、`extensions/runtime/wechat-reply.ts#L34` + `extensions/channel-wechat/send.ts#L82`（intent id / clientId 派生）、`extensions/runtime-host/wechat-reply.ts#L36`+`#L44`（command 豁免 `reply.enabled` 门）、`extensions/index.ts#L1868`（接线）、`README.md#L71`（运行时 pi ≥ 0.87）。
 - 命令通道验收：`extensions/_test_wechat_remote_command.ts`（22 组断言块 + 15 条绕过矩阵，修复后实跑全绿）；L4 复核 `plans/0924_wechat_remote_command_l4_review.md`（本地 gitignored）。
 - 入站媒体与附件规格（媒体探针三轮，commit `6a72b19` + `9f52a4a` + `d724f6a`，仅 `scripts/wechat-ilink-probe.mjs`）：`scripts/wechat-ilink-probe.mjs`（`isHostAllowed`/`CDN_SUFFIX_ALLOW#L141-L149`、key 候选链 `#L202`、解密与判优 `#L276-L303`、`extractAttachments` 按 `media.full_url`/`media.aes_key`、`--replay-seq#L700`、`upload-probe`/`media-probe`）；本地 `plans/0925_wechat_media_probe_results.md` §9/§10（B 级权威）+ `plans/0924_wechat_media_gateway_research.md` §0/§3.4（P1–P8 判读口径与 M1/M4 依赖）；脱敏测量 `plans/.wechat-probe/items.jsonl`（43 行签名，type 1/2/3/4 全覆盖）、`key-format.json`（6 样本 + `conclusion{decryptOk:"6/6", magicOk:"6/6"}`）、`measure.jsonl`（`kind=attachment_download` 带 `magic/sha256_8/keyScheme`）。
+- 出站媒体规格 + `client_id` 去重语义（第四轮补测，commit `56e5088`，基线 `4f67753`；**B + 人工确认**）：本地 `plans/0925_wechat_media_probe_results.md` §11（发送时间线 / 三段实测 / 形状 A `ret=-2` 否证）与 **§11.5（用户人工确认：P3 收到 1 条 / P8 链接已收到 / P6 图已收到 / P2 「不太确定」）**、§11.8（Phase ③ 最终结论与残余 U 7 项）；脱敏测量 `plans/.wechat-probe/measure.jsonl`（`kind=media_probe` ×13、`kind=send_dedup` ×3 带 `textLen`/`clientIdReused`）；per-recipient clientId 派生 `extensions/channel-wechat/send.ts#L72-L74`。
 
 ## Links Out
 
@@ -451,8 +489,8 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 ## Open Questions
 
-- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放已测（`--replay-seq` 只读回放，见「采集方法备忘」）；④空批推进游标已测；⑤相同 `client_id` 的服务端去重未定论（API 双发均成功，手机端条数待人工观察）；⑥并发 poll+send 限流/429 未测；⑦附件 **host 已测**（`novac2c.cdn.weixin.qq.com`，命中 `.qq.com` allowlist，6/6 hops=0），**单文件体积上限/长语音/大文件表现/下载耗时未测**。另：出站文本长度上限与 bot 回声行为未验证。
-- 媒体（Phase ③ 探针残留 U 项，需用户同意才可测）：① **P6-cdn** —— CDN 是否收我们的密文 POST、`x-encrypted-param` 是否返回、POST/PUT 哪个成功（不打扰用户，一句话同意即可）；② **P6-send** —— `sendmessage` 带媒体 item 是否被手机端正确渲染（灰图 = `aes_key` 编码坑），会打扰用户一次；③ **P2** 出站文本 4000/4001/8000 边界；④ **P3** 同 `client_id` 双发去重（需人工数条数）；⑤ **P8** 出站 URL 渲染 + bot 自发回声；⑥ **P4-poll+send** 并发 429/`Retry-After`（读端点并发已测：3× 无 429）；⑦ 真机 302 实况（本轮 hops=0 未见跳转，越域拒绝只有 stub 证据）；⑧ 附件体积上限 / 长语音 / probe 与 worker 两套游标是否互抢消息；⑨ `type=5`（video）与群/小程序卡片 item 形状未采；⑩ 是否强制 `context_token`（研究 U4）。
+- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放已测（`--replay-seq` 只读回放，见「采集方法备忘」）；④空批推进游标已测；~~⑤相同 `client_id` 的服务端去重未定论~~ → **已定（人工确认）：同 id 双发只投 1 条**，见「`client_id` 去重语义」节；⑥并发 poll+send 限流/429 未测（读端点 3× 已测无 429）；⑦附件 **host 已测**（`novac2c.cdn.weixin.qq.com`，命中 `.qq.com` allowlist，6/6 hops=0），**单文件体积上限/长语音/大文件表现/下载耗时未测**。另：**出站文本长度——服务端 4001 字符 `ret=0` 接受（B），微信端是否截断未定（U，用户「不太确定」）**；**bot 回声**——第四轮窗口内未观测到（非穷尽）；**出站 URL 已渲染为链接形态（人工确认）**。
+- 媒体（Phase ③ 残留 U 项，**第四轮 + 人工确认后已大幅收口**）：~~① P6-cdn / ② P6-send / ③ P2 长度 / ④ P3 去重 / ⑤ P8 URL 渲染与回声~~ **均已收口**（①② = 真机 B + 1×1 PNG 人工确认；③ = 服务端接受 B、**截断仍 U**；④ = **1 条 → 去重成立，人工确认**；⑤ = 链接形态人工确认、回声窗口内未观测到）；**⑩ 是否强制 `context_token`** → 出站 send 段已证**不需**（B）。**仍开的残余**：⑥ **P4-poll+send** 并发 429/`Retry-After`；⑦ **真机 302 实况**（6/6 hops=0，越域拒绝只有 stub 证据）；⑧ **附件体积上限 / 长语音 / 下载耗时 / probe 与 worker 双游标互抢**；⑨ **`type=5`（video）与群/小程序卡片 item 形状**；**新增：⑪ 大媒体（>100B）与其它 `media_type`；⑫ 上传失败/重试语义；⑬ 4001 字符截断与 URL 卡片缩略图形态**。
 - 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。
-- 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；③ 服务端 `client_id` 去重语义仍**未定论**（已用 per-recipient clientId 规避跨收件人互斥，同 id 双发是否只投一条未知，沿用⑤）；④ 出站文本长度上限未测（4000 为本地预算）。
+- 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；~~③ 服务端 `client_id` 去重语义仍未定论~~ → **已定（人工确认）：同 id 双发只投 1 条 ⇒ per-recipient clientId 是硬要求**，见「`client_id` 去重语义」节；④ 出站文本长度——4000 为本地预算，协议层 4001 已证被服务端接受（B），**微信端截断未定（U）**。
 - 远程斜杠命令通道待实测/未决：① 真机会话内 `/wechat-remote-run` 派发（含 agent 忙时 defer 窗口）只有静态依据 + fakePi 单测，**未做真机会话验证**；② GUI 面未做——`remoteCommands.enabled` 界面开关（D17）与 inbox 对 `state:"consumed"` 的徽章渲染（当前显示字面 `consumed`）；③ 诊断面只给 `commandAuditLines` 行数，`consumed` 记录明细仍不可见（quarantine 列表只列 `rejected`）；④ 真机端到端被平台侧消息投递问题阻塞（见「判定实验」节）——通道目前只有本机断言与 fakePi 证据。
