@@ -37,7 +37,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-local-master-ensure-env-"));
 delete process.env.PI_SUBAGENT; // 测试进程非子 agent
@@ -907,12 +907,25 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	assert.ok(claimIdx > sessionStartIdx && activateIdx > claimIdx, "认领（silentScopeGenesis）在激活（activateScopeConsumption）之前、同一处理块");
 
 	// 0926 P1：单一幂等激活入口——全仓生产调用恰 3 处（session_start + 工具 attach + slash attach）
+	// L4 S3：扫描面 = **全仓递归**生产 .ts（排除 `_`/`.` 前缀的测试与临时件、node_modules、out/dist、.d.ts），
+	// 不再只扫 extensions 根层 + 2 个显式文件（否则 runtime/**、runtime-host/** 不在口径内，“全仓恰 N 处”不成立）。
+	const repoRoot = dirname(here);
+	const listProdTs = (dir: string): string[] => {
+		const out: string[] = [];
+		for (const d of readdirSync(dir, { withFileTypes: true })) {
+			if (["node_modules", ".git", "out", "dist"].includes(d.name)) continue;
+			const full = join(dir, d.name);
+			if (d.isDirectory()) out.push(...listProdTs(full));
+			else if (d.name.endsWith(".ts") && !d.name.startsWith("_") && !d.name.startsWith(".") && !d.name.endsWith(".d.ts")) out.push(relative(repoRoot, full));
+		}
+		return out.sort();
+	};
+	const prodFiles = listProdTs(repoRoot);
 	const callsIn = (text: string): number => text.split("activateScopeConsumption({").length - 1;
-	const prodFiles = [...readdirSync(here).filter((f) => f.endsWith(".ts") && !f.startsWith("_")), "runtime/local-master-launch.ts", "runtime/scope-consume.ts"];
 	let total = 0;
 	for (const f of prodFiles) {
 		try {
-			total += callsIn(readFileSync(join(here, f), "utf8"));
+			total += callsIn(readFileSync(join(repoRoot, f), "utf8"));
 		} catch {
 			/* 文件不存在跳过 */
 		}
@@ -948,8 +961,8 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	let writers = 0;
 	for (const f of prodFiles) {
 		try {
-			const t = readFileSync(join(here, f), "utf8");
-			if (f !== "runtime/scope-consume.ts") writers += t.split("recordConsumeTick(").length - 1 - (t.split("function recordConsumeTick(").length - 1);
+			const t = readFileSync(join(repoRoot, f), "utf8");
+			if (f !== "extensions/runtime/scope-consume.ts") writers += t.split("recordConsumeTick(").length - 1 - (t.split("function recordConsumeTick(").length - 1);
 		} catch {
 			/* 跳过 */
 		}

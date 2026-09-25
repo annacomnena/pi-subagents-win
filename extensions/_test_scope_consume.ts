@@ -13,7 +13,8 @@
  *   6  tick 自检：所有权/代次变化 → 循环自停 + 出表，旧代不再写证据（旧代进展不证明新代就绪）。
  *   7  attach 路径（与 session_start 共用同一入口 + lastScopeWiring）→ 不重启会话也有消费循环。
  *   8  证据**不并入 scope-liveness**（liveness 文件不被 tick 覆写；session-hooks/liveness 零引用）。
- *   9  disposer 停掉本 wiring 启动的 handle。
+ *      （L4 S6 更正：原列的第 9 条「disposer 停掉本 wiring 启动的 handle」实际并入组 7 ——
+ *        `ok 7 … + disposer`；全文件共 **8 组**，与尾行 `8 groups` 一致。）
  *
  * 运行：npm run test:local-master-consumption（= test:scope-consume）
  */
@@ -156,6 +157,9 @@ const evOf = (scope: string): ScopeConsumeEvidence | null => readConsumeEvidence
 	assert.equal(judgeConsumeFresh({ ...ev, lastTickAt: "2026-09-26T11:58:00.000Z" }, base).reason, "stale", "超过 90s → stale");
 	assert.equal(judgeConsumeFresh({ ...ev, lastTickAt: "2026-09-26T11:58:00.000Z" }, { ...base, freshMs: 300_000 }).fresh, true, "freshMs 可注入");
 	assert.equal(judgeConsumeFresh({ ...ev, lastTickAt: "not-a-date" }, base).reason, "stale", "坏时间戳按 stale（不猜）");
+	// L4 S4：未来时间戳（时钟回拨/坏盘面）超 freshMs 容差 → 也判 stale（不伪造新鲜）；容差内仍容忍
+	assert.equal(judgeConsumeFresh({ ...ev, lastTickAt: "2026-09-26T12:02:00.000Z" }, base).reason, "stale", "未来 120s → stale");
+	assert.equal(judgeConsumeFresh({ ...ev, lastTickAt: "2026-09-26T12:00:05.000Z" }, base).fresh, true, "未来 5s 容差内仍容忍");
 	assert.equal(CONSUME_FRESH_MS, 90_000);
 	ok("2 judgeConsumeFresh 五种 reason + freshMs 可注入");
 }
@@ -366,6 +370,23 @@ const evOf = (scope: string): ScopeConsumeEvidence | null => readConsumeEvidence
 	// 身份/接线缺失的受控降级
 	assert.deepEqual(activateScopeConsumption({ sessionId: "unknown", cwd }), { activated: false, reason: "bad-session" });
 	assert.deepEqual(activateScopeConsumption({ sessionId: "sess_sc6", cwd: "" }), { activated: false, reason: "no-cwd" });
+	// L4 S1：异常路径不留「无 timer 的幻影条目」——wiring.intervalMs 取值抛错 → not-owner 回落且不出表
+	const ghostCwd = mkCwd();
+	const ghostScope = localMasterScope(ghostCwd);
+	assert.equal(silentScopeGenesis("sess_ghost", ghostCwd).outcome, "attached");
+	const boomWiring: ScopeWakeLoopWiring = {
+		spawn: () => "tab_ghost",
+		get intervalMs(): number {
+			throw new Error("boom-wiring");
+		},
+	};
+	const rg = activateScopeConsumption({ sessionId: "sess_ghost", cwd: ghostCwd, wiring: boomWiring });
+	assert.deepEqual(rg, { activated: false, scope: ghostScope, reason: "not-owner" }, "S1 异常回落仍归 not-owner（枚举不变）");
+	assert.equal(
+		listActiveScopeConsumers().filter((c) => c.scope === ghostScope).length,
+		0,
+		"S1 异常不留幻影条目（无 timer 却在表里 ⇒ 同身份再激活 alreadyRunning 却永不 tick ⇒ ensure 永久降级）",
+	);
 	stop();
 	assert.equal(listActiveScopeConsumers().filter((c) => c.scope === scope).length, 0, "disposer 停掉本 wiring 的 handle");
 	const frozen = evOf(scope)!.tickCount;

@@ -129,7 +129,8 @@ export type ConsumeFreshReason = "ok" | "missing" | "identity-mismatch" | "old-g
  *   missing            证据缺席（从未 tick / 写失败）
  *   identity-mismatch  证据属于别的会话（旧 owner）
  *   old-generation     证据属于旧代（ownership transfer 后旧代进展不证明新代就绪）
- *   stale              同身份但 lastTickAt 超过 freshMs（连续 3 次 tick 缺席）
+ *   stale              同身份但 lastTickAt 超过 freshMs（连续 3 次 tick 缺席）；
+ *                      亦含**未来时间戳**（时钟回拨/坏盘面，超出 freshMs 容差不判新鲜）
  *   ok                 fresh
  *
  * 只用于 ensure 判定与验收观测；**不进 judgeScopeOwnerStale / forceStale / reclaim / gate 任何
@@ -145,5 +146,8 @@ export function judgeConsumeFresh(
 	const age = input.nowMs - Date.parse(evidence.lastTickAt);
 	const freshMs = input.freshMs ?? CONSUME_FRESH_MS;
 	if (!Number.isFinite(age) || age > freshMs) return { fresh: false, reason: "stale" };
+	// L4 S4：未来时间戳（时钟回拨/坏盘面）在 freshMs 容差外也不算新鲜——不伪造新鲜；
+	// 容差内（age ≥ -freshMs）的微小时钟偏差仍容忍。
+	if (age < -freshMs) return { fresh: false, reason: "stale" };
 	return { fresh: true, reason: "ok" };
 }

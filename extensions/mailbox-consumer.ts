@@ -561,6 +561,10 @@ export function deactivateScopeConsumption(scope: string, why: string): void {
  * 不抛；失败按受控枚举回执：not-wired（本进程从未登记 wiring，仅隔离测试出现）/
  * bad-session（身份不可判定）/ no-cwd / not-owner（含 parse 异常的 fail-safe 回落——
  * 存疑时一律不启动消费）。
+ * L4 建议修：① 认领（入表）放在 `setInterval` 成功之后 + 异常时出表——不留「无 timer 的
+ * 幻影条目」（幻影会让后续同身份激活拿到 alreadyRunning 却永不 tick ⇒ 证据恒缺失、ensure
+ * 永久降级卡死）；② 异常回落额外 `console.warn` 一行——真实 IO/解析故障与「非 owner」不再
+ * 被静默混同（回执枚举仍为原 4 值，不新增第 5 个）。
  */
 export function activateScopeConsumption(input: {
 	sessionId: string;
@@ -568,6 +572,7 @@ export function activateScopeConsumption(input: {
 	wiring?: ScopeWakeLoopWiring;
 }): ActivateScopeConsumeResult {
 	let scope: string | undefined;
+	let claimed = false; // 是否已入表（S1：异常时只清自己入的表，不动别人的既有条目）
 	try {
 		const sid = input.sessionId;
 		if (!sid || sid === "unknown") return { activated: false, reason: "bad-session" };
@@ -605,7 +610,7 @@ export function activateScopeConsumption(input: {
 			const cur = activeScopeLoops.get(scopeKey);
 			if (cur && cur.stop === stop) activeScopeLoops.delete(scopeKey);
 		};
-		activeScopeLoops.set(scopeKey, { sessionId: sid, generation, wiringId: wiringIdOf(wiring), stop });
+		const entry = { sessionId: sid, generation, wiringId: wiringIdOf(wiring), stop };
 
 		const tick = (): void => {
 			if (stopped) return;
@@ -666,9 +671,21 @@ export function activateScopeConsumption(input: {
 		};
 		timer = setInterval(tick, wiring.intervalMs ?? 30_000);
 		timer.unref?.();
+		// S1：认领放在 interval 成功之后——在此之前任何异常都不会在表里留下无 timer 的幻影条目。
+		activeScopeLoops.set(scopeKey, entry);
+		claimed = true;
 		return { activated: true, scope, sessionId: sid, generation, alreadyRunning: false, stoppedOld };
-	} catch {
-		// fail-safe：任何解析/IO 异常按「身份不可判定」处理——不启动消费（不猜）。
+	} catch (e) {
+		// S1：入表后若有异常，出表（防幻影：同身份再激活会拿到 alreadyRunning 却永不 tick）。
+		if (claimed && scope) {
+			const cur = activeScopeLoops.get(scope);
+			if (cur) activeScopeLoops.delete(scope);
+		}
+		// fail-safe：任何解析/IO 异常按「身份不可判定」处理——不启动消费（不猜）；
+		// S2：同时落一行 warn，真实故障不被静默掩盖（枚举仍归 not-owner，不新增第 5 值）。
+		console.warn(
+			`activateScopeConsumption: 异常按 not-owner 回落（fail-safe，不启动消费）scope=${scope ?? "-"} err=${e instanceof Error ? e.message : String(e)}`,
+		);
 		return { activated: false, ...(scope ? { scope } : {}), reason: "not-owner" };
 	}
 }

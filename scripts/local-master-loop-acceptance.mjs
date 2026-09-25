@@ -24,10 +24,13 @@
  *   ⑦ node scripts/local-master-loop-acceptance.mjs wait --what result --timeout 300000
  *   ⑧ node scripts/local-master-loop-acceptance.mjs check && ... report
  *   中断场景：在 ⑤ 前/后只 kill **测试会话**（禁止杀用户工作中的 master），恢复后从 ③ 续跑；
- *   中断落账：node scripts/local-master-loop-acceptance.mjs mark --phase interrupted-before-claim
- *             --disposition interrupted-before-claim（或 interrupted-after-claim）
+ *   中断落账：node scripts/local-master-loop-acceptance.mjs mark --phase interrupt
+ *             --disposition interrupted-before-claim|interrupted-after-claim --reason "<事实>"
+ *   （L4 M1/M2：mark 只收中断/受阻类 + 必填 reason；result-received 只能由 check 按 RESULT
+ *     关联**机器判定**，任何人工/手写落账都不得把零结果翻成成功。）
  *
- * 预算（astra 建议首版，**可配置**，非硬编码）：健康态接单 ≤90s；小任务 5min 内结果或明确超期。
+ * 预算（astra 建议首版，**可配置**，非硬编码）：健康态接单 ≤90s；小任务 5min 内结果或明确超期；
+ * A4（计划 §6）：tEvidenceFresh − tEnsureCalled ≤ 90s（回读生产 ensure 审计尾行，缺维即红）。
  *
  * 用法：node scripts/local-master-loop-acceptance.mjs <init|inject|wait|check|report|mark|runbook|help>
  * 退出码：0 = 通过；1 = 未通过/超时（可追踪失败，不伪造成功）。
@@ -60,12 +63,29 @@ const DISPOSITIONS = [
 	"unknown",
 ];
 
+/** mark 人工落账受控枚举（L4 M2）：只收中断/受阻类；result-received 显式拒绝（成功只能机器判定）。 */
+const MARK_DISPOSITIONS = ["interrupted-before-claim", "interrupted-after-claim", "blocked", "unknown"];
+/** mark 的 phase 受控枚举；只有 interrupt 参与 check 的处置推导。 */
+const MARK_PHASES = ["interrupt", "note"];
+/** 可作「可追踪失败」解释的处置（L4 M1）：零 RESULT 时必须落在这些枚举**且带 reason**。 */
+const EXPLAINABLE_DISPOSITIONS = new Set([
+	"no-result-timeout",
+	"interrupted-before-claim",
+	"interrupted-after-claim",
+	"blocked",
+	"consume-unverified",
+	"spawn-failed",
+	"stale-claimed-recovered",
+	"unknown",
+]);
+
 /** 首版验收预算（可配置：CLI flag 覆盖，勿硬编码不可调）。 */
 const BUDGET_DEFAULTS = {
 	claimBudgetMs: 90_000, // 健康态接单（astra 建议，待批准为门槛）
 	resultBudgetMs: 300_000, // 小任务闭环 5min（超期 = 明确可追踪失败，挂死 = 不合格）
 	pendingBudgetMs: 300_000, // pending 信龄上限（超过 → 「貌似健康却永久 pending」）
 	blockBudgetMs: 180_000, // 受阻暴露：可 claim 信龄 > 该值仍未 claim → blocked
+	ensureFreshBudgetMs: 90_000, // A4：tEvidenceFresh − tEnsureCalled ≤ 90s（计划 §6）
 };
 
 function parseFlags(argv) {
@@ -161,19 +181,59 @@ async function prod() {
 /** 账本计数：lms-<scope>（ensure dispatch）与 l2-<scope.slice(0,14)>（wake tab dispatch）。 */
 function ledgerCounts(scope) {
 	const dir = runsLedgerDir();
-	const out = { lms: 0, l2: 0, ids: [] };
+	const out = { lms: 0, l2: 0, lmsIds: [], l2Ids: [] };
 	if (!existsSync(dir)) return out;
 	const l2Key = `l2-${scope.slice(0, 14)}`;
 	for (const f of readdirSync(dir)) {
 		if (!f.endsWith(".json")) continue;
 		const rec = readJson(join(dir, f));
 		if (!rec || typeof rec.taskId !== "string") continue;
-		if (rec.taskId === `lms-${scope}` || rec.taskId.startsWith(`lms-${scope}`)) out.lms++;
-		else if (rec.taskId === l2Key || rec.taskId.startsWith(l2Key)) out.l2++;
-		else continue;
-		out.ids.push(rec.id);
+		if (typeof rec.id !== "string") continue;
+		if (rec.taskId === `lms-${scope}` || rec.taskId.startsWith(`lms-${scope}`)) {
+			out.lms++;
+			out.lmsIds.push(rec.id);
+		} else if (rec.taskId === l2Key || rec.taskId.startsWith(l2Key)) {
+			out.l2++;
+			out.l2Ids.push(rec.id);
+		}
 	}
 	return out;
+}
+
+/** 生产 ensure 审计行文件（六字段 {at,by,cwd,scope,action,result}，无正文；直接复用）。 */
+const ensureAuditFile = () => join(stateDir(), "local-master-ensure-audit.jsonl");
+
+/** 回读本 scope、本 run 窗口内的 ensure 审计尾行（L4 M3：A4 需要 tEnsureCalled/ensureRunId/result）。 */
+function readEnsureAuditTail(scope, sinceIso) {
+	let text = "";
+	try {
+		text = readFileSync(ensureAuditFile(), "utf8");
+	} catch {
+		return null; // 审计文件不存在 = 从未调过 ensure（A4 判红，不猜）
+	}
+	const parsed = Date.parse(String(sinceIso ?? ""));
+	const since = Number.isFinite(parsed) ? parsed : 0;
+	let tail = null;
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const e = JSON.parse(line);
+			if (!e || e.scope !== scope) continue;
+			const t = Date.parse(e.at);
+			if (!Number.isFinite(t) || t < since) continue;
+			tail = e;
+		} catch {
+			/* 坏行跳过 */
+		}
+	}
+	return tail;
+}
+
+/** 本次 ensure 的 runId = 基线之后新增的 lms 账本 id（ensure 未 dispatch 时 = null，如 already-running）。 */
+function latestEnsureRunId(cur, ledger) {
+	const base = new Set(cur.baseline?.lmsIds ?? []);
+	for (const id of ledger.lmsIds) if (!base.has(id)) return id;
+	return null;
 }
 
 function findResultLetter(mailbox, addr, messageId) {
@@ -217,6 +277,7 @@ async function cmdInit(flags, positional) {
 		evidence: ev ? { sessionId: ev.sessionId, generation: ev.generation, lastTickAt: ev.lastTickAt, tickCount: ev.tickCount } : null,
 		lmsDispatch: ledger.lms,
 		l2Dispatch: ledger.l2,
+		lmsIds: ledger.lmsIds,
 	};
 	const meta = { runId, scenario, repo, scope: sc, addr, startedAt: new Date().toISOString() };
 	mkdirSync(accDir(), { recursive: true });
@@ -234,6 +295,8 @@ async function cmdInit(flags, positional) {
 	console.log(`runId=${runId}`);
 	console.log(`scenario=${scenario} scope=${sc} addr=${addr}`);
 	console.log(`baseline: cutover=${baseline.cutoverEnabled} owner=${baseline.sessionId ?? "-"} gen=${baseline.generation ?? "-"} evidence=${baseline.evidence ? `${baseline.evidence.sessionId.slice(0, 8)}/gen${baseline.evidence.generation}/ticks${baseline.evidence.tickCount}` : "none"} ledger(lms=${baseline.lmsDispatch},l2=${baseline.l2Dispatch})`);
+	// S5：账本来源必须可见（PI_RUNTIME_DIR 不隔离 tab-runs；不设 PI_TAB_RUNS_DIR 就会被真实账本污染）
+	console.log(`ledgerDir=${runsLedgerDir()}${process.env.PI_TAB_RUNS_DIR?.trim() ? "（PI_TAB_RUNS_DIR 隔离）" : "（默认真实 ~/.pi/agent/tab-runs，非隔离；隔离请显式设 PI_TAB_RUNS_DIR）"}`);
 }
 
 async function cmdInject(flags) {
@@ -306,9 +369,15 @@ async function cmdWait(flags) {
 				if (j.fresh) {
 					found = true;
 					detail = `lastTickAt=${ev.lastTickAt} reason=${ev.lastTickReason} ticks=${ev.tickCount} gen=${ev.generation}`;
+					// L4 M3：同点回读生产 ensure 审计尾行，落 tEnsureCalled / ensureRunId / result（供 check 出 A4 断言）
+					const auditTail = readEnsureAuditTail(sc, cur.startedAt);
+					const ensureRunId = latestEnsureRunId(cur, ledgerCounts(sc));
 					record({
 						runId: cur.runId, scenario: cur.scenario, scope: sc, generation: ev.generation,
 						phase: "wait-evidence", evidenceLastTickAt: ev.lastTickAt, tEvidenceFresh: Date.now(),
+						tEnsureCalled: auditTail ? Date.parse(auditTail.at) : null,
+						ensureRunId,
+						ensureResult: auditTail?.result ?? null,
 						disposition: "unknown",
 					});
 				} else {
@@ -396,6 +465,7 @@ async function cmdCheck(flags) {
 		resultBudgetMs: Number(flags["result-budget-ms"] ?? BUDGET_DEFAULTS.resultBudgetMs),
 		pendingBudgetMs: Number(flags["pending-budget-ms"] ?? BUDGET_DEFAULTS.pendingBudgetMs),
 		blockBudgetMs: Number(flags["block-budget-ms"] ?? BUDGET_DEFAULTS.blockBudgetMs),
+		ensureFreshBudgetMs: Number(flags["ensure-fresh-budget-ms"] ?? BUDGET_DEFAULTS.ensureFreshBudgetMs),
 	};
 	const injects = records.filter((r) => r.phase === "inject");
 	const checks = [];
@@ -415,10 +485,30 @@ async function cmdCheck(flags) {
 	if (cur.scenario === "existing-owner") {
 		add("zero-spawn", ledger.lms === (cur.baseline?.lmsDispatch ?? 0), `lms ${cur.baseline?.lmsDispatch} → ${ledger.lms}`);
 	} else if (cur.scenario === "cold") {
-		add("one-dispatch", ledger.lms >= (cur.baseline?.lmsDispatch ?? 0) && ledger.lms <= (cur.baseline?.lmsDispatch ?? 0) + 1, `lms ${cur.baseline?.lmsDispatch} → ${ledger.lms}`);
+		// L4 M4：计划 §6 A5 = cold 轮账本恰 +1（+0 = ensure 从未 dispatch，不得 PASS）
+		const base = cur.baseline?.lmsDispatch ?? 0;
+		add("one-dispatch", ledger.lms === base + 1, `lms ${base} → ${ledger.lms}（cold 恰 +1，允许 +0 会放过 ensure 缺席）`);
 	}
 
-	let finalDisposition = injects.length ? "unknown" : "unknown";
+	// L4 M3 / 计划 §6 A4：tEvidenceFresh − tEnsureCalled ≤ 预算（缺维即红，不猜）
+	const auditTail = readEnsureAuditTail(sc, cur.startedAt);
+	const tEnsureCalled = auditTail ? Date.parse(auditTail.at) : null;
+	const ensureRunId = latestEnsureRunId(cur, ledger);
+	const waitEvRec = [...records].reverse().find((r) => r.phase === "wait-evidence" && Number.isFinite(r.tEvidenceFresh));
+	const tEvidenceFresh = waitEvRec?.tEvidenceFresh ?? (ev ? Date.parse(ev.lastTickAt) : null);
+	if (tEnsureCalled === null || !Number.isFinite(tEnsureCalled)) {
+		add("ensure-a4-budget", false, `tEnsureCalled 缺维：本 run 窗口内无本 scope 的 ${ensureAuditFile()} 审计行（since=${cur.startedAt ?? "-"}）`);
+	} else if (tEvidenceFresh === null || !Number.isFinite(tEvidenceFresh)) {
+		add("ensure-a4-budget", false, `tEvidenceFresh 缺维（无 wait-evidence 记录且无消费证据）tEnsureCalled=${tEnsureCalled}`);
+	} else {
+		const d = tEvidenceFresh - tEnsureCalled;
+		add(
+			"ensure-a4-budget",
+			d <= budget.ensureFreshBudgetMs,
+			`tEvidenceFresh − tEnsureCalled = ${d}ms ≤ ${budget.ensureFreshBudgetMs}ms（result=${auditTail.result} ensureRunId=${ensureRunId ?? "-"}）`,
+		);
+	}
+
 	const rows = [];
 	for (const inj of injects) {
 		const hit = findResultLetter(mailbox, address.masterAddress(), inj.messageId);
@@ -454,23 +544,65 @@ async function cmdCheck(flags) {
 		if (pendingMs !== null) add(`not-permanently-pending:${inj.messageId.slice(0, 12)}`, pendingMs <= budget.pendingBudgetMs, `pending ${pendingMs}ms ≤ ${budget.pendingBudgetMs}ms`);
 	}
 
-	const interrupted = records.find((r) => r.phase === "interrupt");
-	if (interrupted?.disposition && interrupted.disposition !== "unknown") finalDisposition = interrupted.disposition;
-	else if (rows.length === 0) finalDisposition = "unknown";
-	else if (rows.every((r) => r.result)) finalDisposition = "result-received";
-	else if (!fresh.fresh && fresh.reason !== "ok") finalDisposition = "consume-unverified";
-	else if (rows.some((r) => r.status === "pending" && (r.pendingMs ?? 0) > budget.blockBudgetMs)) finalDisposition = "blocked";
-	else finalDisposition = "unknown"; // 无法证明完成 → unknown，不伪造成功
-
 	// F1 受阻暴露：lastTickReason 直接给出原因（不靠人工巡视 PID）
 	const blockedReason = ev && ["cutover-off", "in-flight", "no-mail", "tick-error"].includes(ev.lastTickReason) ? ev.lastTickReason : null;
+
+	// 机器处置（先算）：result-received 恒由「每条 inject 都有 RESULT」推出（L4 M2：mark/手写值不得覆盖零结果判定）
+	const machineDisposition =
+		rows.length === 0
+			? "unknown"
+			: rows.every((r) => r.result)
+				? "result-received"
+				: !fresh.fresh && fresh.reason !== "ok"
+					? "consume-unverified"
+					: rows.some((r) => r.status === "pending" && (r.pendingMs ?? 0) > budget.blockBudgetMs)
+						? "blocked"
+						: "unknown"; // 无法证明完成 → unknown，不伪造成功
+	const interrupted = records.find((r) => r.phase === "interrupt");
+	// mark 只作中断/受阻类落账；result-received 值（含手写 jsonl）一律不参与 → 成功只能机器判定
+	let finalDisposition = machineDisposition;
+	if (machineDisposition !== "result-received" && interrupted?.disposition && interrupted.disposition !== "unknown" && interrupted.disposition !== "result-received") {
+		finalDisposition = interrupted.disposition;
+	}
+
+	// 可追踪失败的 reason（mark --reason / wait-timeout / 机器自解释），L4 M1 判定用
+	const reasonFor = (disp) => {
+		const same = [...records].reverse().find((r) => r.disposition === disp && typeof r.reason === "string" && r.reason.trim());
+		if (same) return same.reason.trim();
+		if (disp === "blocked" && blockedReason) return `lastTickReason=${blockedReason}`;
+		if (disp === "consume-unverified" && fresh.reason && fresh.reason !== "ok") return `consume-evidence-${fresh.reason}`;
+		const any = [...records].reverse().find((r) => typeof r.reason === "string" && r.reason.trim());
+		return any ? any.reason.trim() : "";
+	};
+	const runReason = reasonFor(finalDisposition);
+	const zeroResults = !rows.some((r) => r.result);
+
+	// L4 M1：每条 inject 必须「唯一关联结果」**或**「可追踪失败处置 + reason」，两者都不满足 → exit 1。
+	// 零结果 + disposition=unknown（无 reason）不得 exit 0——这正是「成功词义膨胀」要防的事。
+	for (const inj of injects) {
+		const hit = findResultLetter(mailbox, address.masterAddress(), inj.messageId);
+		const correlated = Boolean(hit) && hit.letter.frame.inReplyTo === inj.messageId && hit.letter.frame.to === address.masterAddress();
+		const unknownNoResult = finalDisposition === "unknown" && zeroResults;
+		const explainable = !hit && EXPLAINABLE_DISPOSITIONS.has(finalDisposition) && Boolean(runReason) && !unknownNoResult;
+		add(
+			`inject-outcome:${inj.messageId.slice(0, 12)}`,
+			correlated || explainable,
+			correlated
+				? "result-correlated"
+				: hit
+					? `RESULT 存在但未对齐 inReplyTo=${hit.letter.frame.inReplyTo}`
+					: `无关联 RESULT；disposition=${finalDisposition} reason=${runReason || "（缺 reason）"}${unknownNoResult ? "；零结果 + unknown 不得 PASS" : ""}`,
+		);
+	}
+
 	if (finalDisposition === "blocked") add("blocked-explained", Boolean(blockedReason), `lastTickReason=${blockedReason ?? "n/a"}`);
 
 	const failed = checks.filter((c) => !c.pass);
 	for (const c of checks) console.log(`${c.pass ? "ok  " : "FAIL"} ${c.id}: ${c.detail}`);
 	console.log(`\ndisposition=${finalDisposition}（受控枚举；无法证明完成时 = unknown，不伪造成功）`);
+	console.log(`ensure: tEnsureCalled=${tEnsureCalled ?? "-"} ensureRunId=${ensureRunId ?? "-"} result=${auditTail?.result ?? "-"} tEvidenceFresh=${tEvidenceFresh ?? "-"}`);
 	console.log(`correlation: 请求 ${rows.length} / 结果 ${rows.filter((r) => r.result).length} / pending ${rows.filter((r) => r.status === "pending").length} / claimed ${rows.filter((r) => r.status === "claimed").length}`);
-	console.log(`budgets: claim≤${budget.claimBudgetMs}ms result≤${budget.resultBudgetMs}ms pending≤${budget.pendingBudgetMs}ms block>${budget.blockBudgetMs}ms`);
+	console.log(`budgets: claim≤${budget.claimBudgetMs}ms result≤${budget.resultBudgetMs}ms pending≤${budget.pendingBudgetMs}ms block>${budget.blockBudgetMs}ms ensure-fresh≤${budget.ensureFreshBudgetMs}ms`);
 	record({
 		runId: cur.runId, scenario: cur.scenario, scope: sc, generation: gen, phase: "check",
 		disposition: finalDisposition, checks: checks.length, failed: failed.length, rows,
@@ -481,7 +613,7 @@ async function cmdCheck(flags) {
 function cmdReport(flags) {
 	const cur = loadCurrent(flags);
 	const records = readRecords(cur.runId);
-	const cols = ["at", "phase", "messageId", "inReplyTo", "generation", "tLetterDelivered", "tEvidenceFresh", "tClaimed", "tSpawned", "tResult", "disposition"];
+	const cols = ["at", "phase", "messageId", "inReplyTo", "generation", "tLetterDelivered", "tEvidenceFresh", "tEnsureCalled", "ensureRunId", "ensureResult", "tClaimed", "tSpawned", "tResult", "disposition"];
 	console.log(cols.join("\t"));
 	for (const r of records) {
 		console.log(cols.map((c) => (r[c] === undefined || r[c] === null ? "-" : String(r[c]).slice(0, 40))).join("\t"));
@@ -492,19 +624,29 @@ async function cmdMark(flags) {
 	const cur = loadCurrent(flags);
 	const phase = String(flags.phase ?? "interrupt");
 	const disposition = String(flags.disposition ?? "unknown");
-	if (!DISPOSITIONS.includes(disposition)) fail(`--disposition 必须是受控枚举之一：${DISPOSITIONS.join(" | ")}`);
+	// L4 M2：人工入口不得改写本应由盘面证明的最终处置（result-received 显式拒绝）
+	if (disposition === "result-received") {
+		fail("--disposition=result-received 被拒绝：成功只能由 check 按 RESULT 关联机器判定，mark 不得伪造（L4 M2）");
+	}
+	if (!MARK_PHASES.includes(phase)) fail(`--phase 必须是受控枚举之一：${MARK_PHASES.join(" | ")}（只有 interrupt 参与 check 处置推导）`);
+	if (!MARK_DISPOSITIONS.includes(disposition)) fail(`--disposition 只收中断/受阻类：${MARK_DISPOSITIONS.join(" | ")}`);
+	// L4 M1：check 只认「带 reason 的可追踪失败」，无 reason 的落账不作数
+	const reason = typeof flags.reason === "string" && flags.reason.trim() ? flags.reason.trim() : "";
+	if (!reason) fail("--reason 必填：无 reason 的处置不能作为可追踪失败通过 check（L4 M1）");
 	const { scope, registry } = await prod();
 	const att = registry.readAttachment(scope.localMasterAddress(cur.scope));
 	void scope;
 	record({
 		runId: cur.runId, scenario: cur.scenario, scope: cur.scope, generation: att?.generation ?? null,
-		phase, disposition, ...(flags.reason ? { reason: String(flags.reason) } : {}),
+		phase, disposition, reason,
 	});
-	console.log(`marked phase=${phase} disposition=${disposition}`);
+	console.log(`marked phase=${phase} disposition=${disposition} reason=${reason}`);
 }
 
 function cmdRunbook() {
 	console.log(`runbook（8 步主链；真进程/可见 tab/可中断测试会话只在隔离环境执行，不进 npm test）：`);
+	console.log(`前置：harness 与发起 ensure 的 Interface 必须同一 PI_RUNTIME_DIR（A4 回读 state/local-master-ensure-audit.jsonl；不同 runtime 会判「tEnsureCalled 缺维」红）`);
+	console.log(`  另：隔离账本请显式设 PI_TAB_RUNS_DIR（PI_RUNTIME_DIR 不隔离 tab-runs；init 会打印账本来源）`);
 	console.log(`  1) init <test-repo> --scenario cold`);
 	console.log(`  2) 主会话真实 slash：/local-master-ensure <test-repo> --timeout 90000（真实 UI，不代打）`);
 	console.log(`  3) wait --what evidence --timeout 120000`);
@@ -513,9 +655,10 @@ function cmdRunbook() {
 	console.log(`  6) wait --what spawned --timeout 90000`);
 	console.log(`  7) wait --what result --timeout 300000`);
 	console.log(`  8) check && report`);
-	console.log(`中断场景：在 5) 前/后只 kill 测试会话（禁止杀用户工作中的 master），恢复后从 3) 续跑，并 mark --phase interrupt --disposition interrupted-before-claim|interrupted-after-claim`);
-	console.log(`\n预算（可配置）: claim≤${BUDGET_DEFAULTS.claimBudgetMs}ms result≤${BUDGET_DEFAULTS.resultBudgetMs}ms pending≤${BUDGET_DEFAULTS.pendingBudgetMs}ms`);
+	console.log(`中断场景：在 5) 前/后只 kill 测试会话（禁止杀用户工作中的 master），恢复后从 3) 续跑，并 mark --phase interrupt --disposition interrupted-before-claim|interrupted-after-claim --reason "<事实>"（无 reason 不作数）`);
+	console.log(`\n预算（可配置）: claim≤${BUDGET_DEFAULTS.claimBudgetMs}ms result≤${BUDGET_DEFAULTS.resultBudgetMs}ms pending≤${BUDGET_DEFAULTS.pendingBudgetMs}ms ensure-fresh(A4)≤${BUDGET_DEFAULTS.ensureFreshBudgetMs}ms`);
 	console.log(`处置受控枚举: ${DISPOSITIONS.join(" | ")}`);
+	console.log(`mark 可落账处置: ${MARK_DISPOSITIONS.join(" | ")}（result-received 只能由 check 机器判定）；phase: ${MARK_PHASES.join(" | ")}`);
 	console.log(`验收记录: ${accDir()}/<runId>.jsonl（仅此命名空间；结束可归档/删除）`);
 }
 
@@ -526,11 +669,13 @@ function cmdHelp() {
   init <repo> --scenario <cold|existing-owner|attach-no-restart|interrupt-before-claim|interrupt-after-claim|blocked|kill-vs-cutover> [--run <id>]
   inject [--from <addr>] [--body <text>] [--run <id>]
   wait --what evidence|claimed|spawned|result --timeout <ms> [--run <id>]
-  mark --phase <phase> --disposition <enum> [--reason <text>]
-  check [--claim-budget-ms N] [--result-budget-ms N] [--pending-budget-ms N] [--block-budget-ms N]
+  mark --phase <interrupt|note> --disposition <${MARK_DISPOSITIONS.join("|")}> --reason <text>   （result-received 显式拒绝）
+  check [--claim-budget-ms N] [--result-budget-ms N] [--pending-budget-ms N] [--block-budget-ms N] [--ensure-fresh-budget-ms N]
   report | runbook
 
 红线: ensure 必须由主会话真实 slash / 工具发起；邮箱指令走生产 deliverLetter；本脚本只观测与投信。
+判据: 每条 inject 必须 result-correlated，或可追踪失败处置 + reason（零结果 + unknown 不得 exit 0）；
+      A4 = tEvidenceFresh − tEnsureCalled ≤ 预算（回读 state/local-master-ensure-audit.jsonl，缺维即红）。
 处置枚举: ${DISPOSITIONS.join(" | ")}`);
 }
 
