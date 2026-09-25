@@ -70,7 +70,7 @@ import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsy
 import { registerEventBus, triggerOwnershipRecheck } from "./event-bus.ts";
 import { registerAsyncResultWatcher } from "./async-result-watcher.ts";
 import { registerReportListener } from "./report.ts";
-import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop } from "./mailbox-consumer.ts";
+import { registerMailboxConsumer, registerWakeLoop, registerScopeWakeLoop, activateScopeConsumption } from "./mailbox-consumer.ts";
 import { registerOutboxBridge } from "./outbox-bridge.ts";
 import { registerWechatReplyHook } from "./wechat-reply-hook.ts";
 // 0924 远程斜杠命令旁路（白名单分级 + 未知命令显式拒绝；裁定⑤缺省 fail-closed）
@@ -2123,6 +2123,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（best-effort，与 master-attach 工具同）
 			try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
+			// 0926 P1：attach 成功即补激活 scope 消费循环（与 session_start 同一个幂等入口；
+			// best-effort，失败不影响接管——消费侧是否就绪由 ensure 按消费证据判定）。
+			try { activateScopeConsumption({ sessionId: sid, cwd: ctx.cwd }); } catch { /* best-effort */ }
 			ctx.ui.notify(`master-attach 成功${localAgent ? `（local ${localAgent}）` : ""}：gen=${r.attachment.generation}${r.genesis ? "（genesis）" : ""} session=${sid.slice(0, 12)}`, "info");
 		},
 	});
@@ -2192,7 +2195,7 @@ export default function (pi: ExtensionAPI) {
 	// local-master-ensure（0924 计划 §1）：与同名工具双入口——同一四层授权、同一审计行、
 	// 同一 ensure 编排；slash 面给用户手动用，工具面给主会话编排用。
 	pi.registerCommand("local-master-ensure", {
-		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 零动作；不带 forceStale/token）。仅在用户明确要求时使用",
+		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 且消费证据新鲜零动作；消费侧未证明 → consume-unverified；不带 forceStale/token）。仅在用户明确要求时使用",
 		handler: async (args, ctx) => {
 			// M1：解析抽成导出纯函数（flag 与位置参数任意顺序；--timeout 的值不得被当成 cwd）
 			const { cwd: cwdArg, noWait, timeoutMs: parsedTimeout } = parseLocalMasterEnsureArgs(args);

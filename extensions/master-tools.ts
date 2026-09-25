@@ -18,6 +18,7 @@ import { formatNotHomeDirMessage, isExactHomeCwd } from "./runtime/master-home-g
 import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { durableSessionIdentity, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import { triggerOwnershipRecheck } from "./event-bus.ts";
+import { activateScopeConsumption } from "./mailbox-consumer.ts";
 import {
 	attachCurrentSession,
 	getMasterStatus,
@@ -517,8 +518,11 @@ export function registerMasterTools(
 			const outcome = masterAttachLogic(sid, params, { cwd, initialCwd: readSessionStartCwd(sid) });
 			// Phase 5.6：本会话刚 attach 成 owner → 补注册 result watcher（succession 后继 tab 在
 			// session_start 之后才成 owner，一次性 session_start 判定漏注册；best-effort，失败不影响接管）。
+			// 0926 P1：同分支补激活 scope 消费循环（与 session_start / slash 入口共用同一个幂等
+			// 激活入口 activateScopeConsumption，双入口不各写一套；best-effort，失败不影响接管）。
 			if (!outcome.isError) {
 				try { triggerOwnershipRecheck(); } catch { /* best-effort */ }
+				try { activateScopeConsumption({ sessionId: sid, cwd }); } catch { /* best-effort */ }
 			}
 			return textResult({ ...outcome, details: { ...(outcome.details ?? {}), text: outcome.text } });
 		},
@@ -740,7 +744,7 @@ export function registerMasterTools(
 		name: "local-master-ensure",
 		label: "Local Master Ensure",
 		description: [
-			"按 cwd 幂等确保目标仓库的 local master 活着：已有活 owner → already-running 零动作；无 owner / owner pid 死 → 开一个可见 pi tab，由新会话 session_start 的既有静默路径自动认领/接管（本工具不写 attachment、不代替 attach、不带 forceStale/token/cutover/detach）。",
+			"按 cwd 幂等确保目标仓库的 local master 活着：已有活 owner **且消费证据新鲜** → already-running 零动作；活 owner 但消费侧未证明 → consume-unverified（明确降级：不 spawn、不自动接管、不强接）；无 owner / owner pid 死 → 开一个可见 pi tab，由新会话 session_start 的既有静默路径自动认领/接管（本工具不写 attachment、不代替 attach、不带 forceStale/token/cutover/detach）。",
 			"参数只有 cwd（scope/地址由它派生，不收 scope/地址参数）；仅主会话或 global Master owner 可调，子 agent 硬挡。开一个新进程等价于你手动去那个仓开一个会话。",
 			"不可与 attach/detach/transfer 组合；僵尸死角（no-liveness/身份不匹配）交还用户走 /master-attach --local --force-stale --confirm。",
 			USER_DIRECTIVE,

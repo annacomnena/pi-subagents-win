@@ -118,6 +118,9 @@
     "test:scope-stale-takeover": "node --experimental-strip-types ./extensions/_test_scope_stale_takeover.ts",
     "test:local-master": "node --experimental-strip-types ./extensions/_test_local_master.ts",
     "test:local-master-ensure": "node --experimental-strip-types ./extensions/_test_local_master_launch.ts",
+    "test:scope-consume": "node --experimental-strip-types ./extensions/_test_scope_consume.ts",
+    "test:local-master-consumption": "node --experimental-strip-types ./extensions/_test_scope_consume.ts",
+    "accept:local-master-loop": "node ./scripts/local-master-loop-acceptance.mjs",
     "gui:dev": "node scripts/gui-dev.mjs",
     "gui:build": "npm run build --prefix gui",
     "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts"

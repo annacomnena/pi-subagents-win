@@ -59,6 +59,7 @@ import {
 	takeoverStaleScopeOwner,
 	type ScopeWakeDecision,
 } from "./runtime/scope.ts";
+import { recordConsumeTick } from "./runtime/scope-consume.ts";
 
 export interface ConsumeOptions {
 	sessionId: string | undefined;
@@ -486,18 +487,204 @@ export function registerWakeLoop(
 	};
 }
 
+// ── scope 消费循环：单一幂等激活入口（0926 P1，astra 第 1/2 条）──────────
+//
+// 为什么收拢：注册原先只在 session_start 处理块内且与认领同块，手工 /master-attach 成功后
+// **不会**补注册（残余：attach 之后到下一个 session_start 之间，信会一直 pending）。收拢后
+// session_start 与两个 attach 入口（master-tools.ts / index.ts）共用同一个幂等激活函数——
+// 双入口各加一行调用，**不各写一套**。
+//
+// 幂等与单消费者：模块级注册表按 scope 单键。同 scope+sessionId+generation 已在跑 →
+// alreadyRunning（零第二个 interval）；同 scope 不同 owner/代次 → 先停旧再起新（stoppedOld）
+// ——同一时刻该 scope 恒至多一个有效消费者。owner 门语义零改动：非本会话不激活（脑裂防线）。
+//
+// 证据：**只有 tick 写**（fire 与 no-fire 都写）；activateScopeConsumption 成功 ≠ 能消费，
+// 注册时绝不写证据（astra 第 2 条字面要求）。
+
+export interface ScopeWakeLoopWiring {
+	/** scope 解析 cwd（缺省激活时 process.cwd()） */
+	cwd?: string;
+	spawn: (decision: ScopeWakeDecision, sessionId: string | undefined) => string;
+	mailboxDir?: string;
+	stateDir?: string;
+	runsDir?: string;
+	intervalMs?: number;
+}
+
+export type ActivateScopeConsumeResult =
+	| { activated: true; scope: string; sessionId: string; generation: number; alreadyRunning: boolean; stoppedOld: boolean }
+	| { activated: false; scope?: string; reason: "not-wired" | "not-owner" | "bad-session" | "no-cwd" };
+
+interface ActiveScopeLoop {
+	sessionId: string;
+	generation: number;
+	wiringId: number;
+	stop: (why: string) => void;
+}
+
+/** 按 scope 单键：同一 scope 恒至多一个消费循环。 */
+const activeScopeLoops = new Map<string, ActiveScopeLoop>();
+/** 本进程最近一次 registerScopeWakeLoop 登记的 wiring（attach 路径复用；生产唯一 index.ts）。 */
+let lastScopeWiring: ScopeWakeLoopWiring | null = null;
+const wiringIds = new WeakMap<object, number>();
+let wiringSeq = 0;
+
+function wiringIdOf(wiring: ScopeWakeLoopWiring): number {
+	let id = wiringIds.get(wiring);
+	if (id === undefined) {
+		id = ++wiringSeq;
+		wiringIds.set(wiring, id);
+	}
+	return id;
+}
+
+/** 只读观测（测试/验收）：当前活跃 scope 消费者清单（同一 scope 至多一行）。 */
+export function listActiveScopeConsumers(): Array<{ scope: string; sessionId: string; generation: number }> {
+	return [...activeScopeLoops].map(([scope, e]) => ({ scope, sessionId: e.sessionId, generation: e.generation }));
+}
+
 /**
- * 注册 Local Master v1 唤醒循环（per-repo，0920）：与 registerWakeLoop 同形态但独立 interval。
+ * 停止某 scope 的消费循环（只停 timer + 出表：不写 attachment、不释放信 claim——
+ * stale 恢复是既有 mailbox 语义，不动）。never-throw。
+ */
+export function deactivateScopeConsumption(scope: string, why: string): void {
+	try {
+		activeScopeLoops.get(scope)?.stop(why);
+	} catch {
+		/* never-throw：停循环失败不破坏会话 */
+	}
+}
+
+/**
+ * 单一幂等激活入口（session_start 与两个 attach 入口共用）。
+ *
+ * 不抛；失败按受控枚举回执：not-wired（本进程从未登记 wiring，仅隔离测试出现）/
+ * bad-session（身份不可判定）/ no-cwd / not-owner（含 parse 异常的 fail-safe 回落——
+ * 存疑时一律不启动消费）。
+ */
+export function activateScopeConsumption(input: {
+	sessionId: string;
+	cwd?: string;
+	wiring?: ScopeWakeLoopWiring;
+}): ActivateScopeConsumeResult {
+	let scope: string | undefined;
+	try {
+		const sid = input.sessionId;
+		if (!sid || sid === "unknown") return { activated: false, reason: "bad-session" };
+		const wiring = input.wiring ?? lastScopeWiring;
+		if (!wiring || typeof wiring.spawn !== "function") return { activated: false, reason: "not-wired" };
+		const rawCwd = input.cwd ?? wiring.cwd ?? process.cwd();
+		if (!rawCwd || !String(rawCwd).trim()) return { activated: false, reason: "no-cwd" };
+		scope = localMasterScope(String(rawCwd).trim());
+		const addr = localMasterAddress(scope);
+		// owner 门（与旧 session_start 注册闸同一判定，语义零改动）：非本 scope owner 零动作。
+		const att = readAttachment(addr);
+		if (!att || att.sessionId !== sid) return { activated: false, scope, reason: "not-owner" };
+		const generation = att.generation;
+		const existing = activeScopeLoops.get(scope);
+		if (existing && existing.sessionId === sid && existing.generation === generation) {
+			// 幂等：同身份已在跑 → 零第二个 interval。
+			return { activated: true, scope, sessionId: sid, generation, alreadyRunning: true, stoppedOld: false };
+		}
+		let stoppedOld = false;
+		if (existing) {
+			// 所有权变化 / 代次变化：先停旧循环再起新（同一时刻恒至多一个消费者）。
+			existing.stop("replaced");
+			activeScopeLoops.delete(scope);
+			stoppedOld = true;
+		}
+		const scopeKey = scope;
+		let timer: ReturnType<typeof setInterval> | null = null;
+		let stopped = false;
+		const stop = (why: string): void => {
+			if (stopped) return;
+			stopped = true;
+			void why; // 诊断语义由调用方/自检方掌握；停循环只停 timer
+			if (timer) clearInterval(timer);
+			timer = null;
+			const cur = activeScopeLoops.get(scopeKey);
+			if (cur && cur.stop === stop) activeScopeLoops.delete(scopeKey);
+		};
+		activeScopeLoops.set(scopeKey, { sessionId: sid, generation, wiringId: wiringIdOf(wiring), stop });
+
+		const tick = (): void => {
+			if (stopped) return;
+			// tick 自检（无后台 reaper，保持既有设计）：所有权失效/代次变化 → 停自己 + 出表，
+			// 下一次 owner 的 tick/激活负责接手；**旧代不得继续写证据**（旧代进展不能证明新代就绪）。
+			const nowAtt = readAttachment(addr);
+			if (!nowAtt || nowAtt.sessionId !== sid || nowAtt.generation !== generation) {
+				deactivateScopeConsumption(scopeKey, "ownership-changed");
+				return;
+			}
+			let reason = "tick-error";
+			let fired: ScopeWakeDecision | null = null;
+			try {
+				const d = evaluateScopeWake({
+					sessionId: sid,
+					scope: scopeKey,
+					mailboxDir: wiring.mailboxDir,
+					stateDir: wiring.stateDir,
+					runsDir: wiring.runsDir,
+				});
+				if (d.fire) {
+					fired = d;
+					reason = "fired"; // claim 已发生（spawn 结果另由 wake-spawn-failed 记账）
+				} else {
+					reason = d.reason ?? "no-mail";
+				}
+			} catch {
+				reason = "tick-error";
+			}
+			try {
+				if (fired) {
+					try {
+						const tabRunId = wiring.spawn(fired, sid);
+						confirmScopeWakeSpawn(scopeKey, tabRunId, {
+							stateDir: wiring.stateDir,
+							mailboxDir: wiring.mailboxDir,
+							sessionId: sid,
+						});
+					} catch (e) {
+						auditScopeWakeSpawnFailed(scopeKey, e instanceof Error ? e.message : String(e), wiring.stateDir);
+					}
+				}
+			} finally {
+				// fire 与 no-fire **都写**（no-fire 也证明循环活着）；写失败静默不打断唤醒循环。
+				if (!stopped) {
+					recordConsumeTick(
+						{
+							scope: scopeKey,
+							sessionId: sid,
+							generation,
+							lastTickReason: reason,
+							...(fired ? { lastFireAt: new Date().toISOString(), lastClaimedCount: fired.letters.length } : {}),
+						},
+						{ stateDir: wiring.stateDir },
+					);
+				}
+			}
+		};
+		timer = setInterval(tick, wiring.intervalMs ?? 30_000);
+		timer.unref?.();
+		return { activated: true, scope, sessionId: sid, generation, alreadyRunning: false, stoppedOld };
+	} catch {
+		// fail-safe：任何解析/IO 异常按「身份不可判定」处理——不启动消费（不猜）。
+		return { activated: false, ...(scope ? { scope } : {}), reason: "not-owner" };
+	}
+}
+
+/**
+ * 注册 Local Master v1 唤醒循环（per-repo，0920）：**签名与导出保持不变**（index.ts 接线不变）。
  *
  * session_start（子 agent 恒跳过）：
  *   1. 静默 genesis（S2）：本 scope 无 owner → 静默认领（有 owner / 身份 unknown /
  *      attach 失败全静默 no-op，不重试不上报；不调 triggerOwnershipRecheck）；
- *   2. 本会话是本 scope owner（新认领或在位）→ 启动 tick；否则零动作
- *      （脑裂回归：同仓第二会话不注册消费端，在位者 attachment 无感）。
- * tick：evaluateScopeWake（cutover off / 无 owner / 无 wake 类信 / in-flight → 空转，Q4）
- *   → spawn（调用方注入，cwd 由调用方按 decision.repoCwd 传 scope 仓 toplevel）
- *   → confirmScopeWakeSpawn（wake-state 以 <scope> 命名 + 同 holder ack）；
- *   spawn 抛错 → per-scope attention（wake-spawn-failed），信留 claimed（stale 恢复）。
+ *   2. 本会话是本 scope owner（新认领或在位）→ 调**唯一**激活入口 activateScopeConsumption；
+ *      否则零动作（脑裂回归：同仓第二会话不注册消费端，在位者 attachment 无感）。
+ * tick（在 activateScopeConsumption 内）：evaluateScopeWake（cutover off / 无 owner / 无 wake 类信
+ *   / in-flight → 空转，Q4）→ spawn（调用方注入，cwd 由调用方按 decision.repoCwd 传 scope 仓 toplevel）
+ *   → confirmScopeWakeSpawn（wake-state 以 <scope> 命名 + 同 holder ack）；spawn 抛错 →
+ *   per-scope attention（wake-spawn-failed），信留 claimed（stale 恢复）；每 tick 写消费进展证据。
  * 不碰全局 event-bus 注册逻辑；scope 消费端只吃 wake/命令类信（S7 谓词在 evaluate 内）。
  */
 export function registerScopeWakeLoop(
@@ -514,9 +701,13 @@ export function registerScopeWakeLoop(
 		intervalMs?: number;
 	},
 ): () => void {
-	let interval: ReturnType<typeof setInterval> | null = null;
-	let sessionGen = 0;
+	// 登记 wiring（attach 路径省略 wiring 时复用本进程最近一次登记的这份——生产唯一 index.ts）。
+	const wiring: ScopeWakeLoopWiring = { ...opts };
+	lastScopeWiring = wiring;
+	const wiringId = wiringIdOf(wiring);
+	let disposed = false;
 	pi.on("session_start", (_event, ctx) => {
+		if (disposed) return; // disposer 已解绑（pi.on 无 off，以 disposed 旗标等价解绑）
 		try {
 			if (isSubagent()) return;
 			const sid = durableSessionIdentity(ctx ?? null);
@@ -549,44 +740,18 @@ export function registerScopeWakeLoop(
 				}
 				att = readAttachment(addr);
 			}
-			// 仅当本会话是本 scope owner（新接管或在位）才注册唤醒循环；否则零动作
+			// 仅当本会话是本 scope owner（新接管或在位）才激活；否则零动作。
 			if (!att || att.sessionId !== sid) return;
-			const myGen = ++sessionGen;
-			const closed = (): boolean => myGen !== sessionGen;
-			if (interval) clearInterval(interval);
-			interval = setInterval(() => {
-				if (closed()) return;
-				try {
-					const d = evaluateScopeWake({
-						sessionId: sid,
-						scope,
-						mailboxDir: opts.mailboxDir,
-						stateDir: opts.stateDir,
-						runsDir: opts.runsDir,
-					});
-					if (!d.fire) return;
-					try {
-						const tabRunId = opts.spawn(d, sid);
-						confirmScopeWakeSpawn(scope, tabRunId, {
-							stateDir: opts.stateDir,
-							mailboxDir: opts.mailboxDir,
-							sessionId: sid,
-						});
-					} catch (e) {
-						auditScopeWakeSpawnFailed(scope, e instanceof Error ? e.message : String(e), opts.stateDir);
-					}
-				} catch {
-					/* 唤醒循环永不破坏会话 */
-				}
-			}, opts.intervalMs ?? 30_000);
-			interval.unref?.();
+			activateScopeConsumption({ sessionId: sid, cwd, wiring });
 		} catch {
 			/* genesis/注册失败永不破坏会话 */
 		}
 	});
 	return () => {
-		sessionGen++;
-		if (interval) clearInterval(interval);
-		interval = null;
+		// 解绑 session_start（disposed 旗标）+ 停本 wiring 启动的全部 handle。
+		disposed = true;
+		for (const [, entry] of [...activeScopeLoops]) {
+			if (entry.wiringId === wiringId) entry.stop("disposed");
+		}
 	};
 }

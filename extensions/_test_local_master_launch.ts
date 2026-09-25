@@ -27,12 +27,15 @@
  *   K   双入口（同名 slash 命令 + 工具）与 #A 注册点的静态耦合校验。
  *   L   slash 参数解析纯函数 parseLocalMasterEnsureArgs（L4-M1）：flag-first / cwd-first /
  *       --no-wait 在前 / 非法 timeout 四例——--timeout 的值不得被当成 cwd。
+ *   M   0926 P1：「活 owner」与「消费侧就绪」拆分——无新鲜消费证据 → consume-unverified
+ *       （isError、零 spawn、零接管）；stale/identity-mismatch/old-generation 降级；
+ *       launched→ready 需消费证据；并发两次 ensure 恰 1 dispatch。
  *
  * 运行：npm run test:local-master-ensure
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -50,6 +53,7 @@ import { readScopeLiveness, writeScopeLiveness, type ScopeLiveness } from "./run
 import { localMasterAddress, localMasterScope, silentScopeGenesis } from "./runtime/scope.ts";
 import { DEFAULT_EXCLUDE_TOOLS } from "./runner-argv.ts";
 import { registerScopeWakeLoop } from "./mailbox-consumer.ts";
+import { CONSUME_FRESH_MS, judgeConsumeFresh, readConsumeEvidence, recordConsumeTick, type ScopeConsumeEvidence } from "./runtime/scope-consume.ts";
 import { localMasterEnsureGate, masterDispatchGate, registerMasterTools } from "./master-tools.ts";
 import {
 	claimLocalMasterLaunchMarker,
@@ -57,6 +61,7 @@ import {
 	clearLocalMasterLaunchMarker,
 	ENSURE_IN_FLIGHT_EXTRA_MS,
 	ensureLocalMaster,
+	ensureResultIsError,
 	ensureStatusForReason,
 	formatLocalMasterEnsureResult,
 	judgeLocalMasterEnsureReady,
@@ -112,13 +117,23 @@ function fakeClock(startMs = Date.parse("2026-09-24T12:00:00.000Z")) {
 const DEAD_PID = 424_242;
 const isAliveFake = (pid: number): boolean => pid !== DEAD_PID;
 
-/** 可变夹具：attachment / liveness 走注入 reader（确定性，不依赖真实 pid）。 */
-function fixture(opts: { att?: MasterAttachment | null; lv?: ScopeLiveness | null } = {}) {
-	const state: { att: MasterAttachment | null; lv: ScopeLiveness | null } = {
+/** 可变夹具：attachment / liveness / 消费证据 走注入 reader（确定性，不依赖真实 pid）。 */
+function fixture(opts: { att?: MasterAttachment | null; lv?: ScopeLiveness | null; ev?: ScopeConsumeEvidence | null } = {}) {
+	const state: { att: MasterAttachment | null; lv: ScopeLiveness | null; ev: ScopeConsumeEvidence | null } = {
 		att: opts.att ?? null,
 		lv: opts.lv ?? null,
+		ev: opts.ev ?? null,
 	};
-	return { state, readAttachment: () => state.att, readLiveness: () => state.lv };
+	return {
+		state,
+		readAttachment: () => state.att,
+		readLiveness: () => state.lv,
+		readConsumeEvidence: () => state.ev,
+	};
+}
+
+function makeEv(scope: string, sessionId: string, generation: number, lastTickAt: string, extra: Partial<ScopeConsumeEvidence> = {}): ScopeConsumeEvidence {
+	return { version: 1, scope, sessionId, generation, lastTickAt, pid: 777_777, lastTickReason: "no-mail", tickCount: 1, ...extra };
 }
 
 function makeAtt(addr: ObjectAddress, sessionId: string, generation: number): MasterAttachment {
@@ -312,6 +327,7 @@ function loadTool(opts: { ensureLocalMasterTab?: LocalMasterSpawn } = {}): Tool 
 	const fx = fixture({
 		att: makeAtt(addr, "sess_alive", 4),
 		lv: makeLv(scope, "sess_alive", 4, 777_777, "2026-09-24T12:00:05.000Z"),
+		ev: makeEv(scope, "sess_alive", 4, "2026-09-24T12:00:00.000Z"), // 0926：活 owner 还需消费证据才回 already-running
 	});
 	const counter = spawnCounter();
 	const clock = fakeClock();
@@ -319,13 +335,16 @@ function loadTool(opts: { ensureLocalMasterTab?: LocalMasterSpawn } = {}): Tool 
 		{ cwd, sessionId: "sess_main" },
 		{
 			spawn: counter.spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
-			readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, isAlive: isAliveFake,
+			readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, readConsumeEvidence: fx.readConsumeEvidence, isAlive: isAliveFake,
 		},
 	);
 	assert.equal(r.status, "already-running");
 	assert.equal(r.generation, 4);
 	assert.equal(r.liveness?.sessionId, "sess_alive");
 	assert.equal(r.liveness?.alive, true);
+	assert.equal(r.consumption?.state, "fresh", "already-running 必须带新鲜消费证据");
+	assert.equal(r.consumption?.lastTickAt, "2026-09-24T12:00:00.000Z");
+	assert.equal(ensureResultIsError(r), false, "活 owner + 消费证据新鲜 → 非错误");
 	assert.equal(counter.calls.length, 0, "活 master 零动作零 spawn");
 	assert.equal(markerExists(scope), false, "already-running 不写 in-flight");
 	ok("E already-running 幂等（零动作零状态写）");
@@ -455,17 +474,18 @@ async function runPollCase(
 		{ cwd, sessionId: "sess_main", timeoutMs: opts.timeoutMs ?? 1_000 },
 		{
 			spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
-			readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, isAlive: isAliveFake,
+			readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, readConsumeEvidence: fx.readConsumeEvidence, isAlive: isAliveFake,
 		},
 	);
 	return { r, spawnCalls, scope, cwd };
 }
 
-// G1 ready：无 owner → 新会话 genesis（gen 0→1）+ liveness 全绿 + updatedAt > launchAt
+// G1 ready：无 owner → 新会话 genesis（gen 0→1）+ liveness 全绿 + updatedAt > launchAt + 消费证据 fresh
 {
 	const { r, spawnCalls } = await runPollCase((fx, launchAt, scope, addr) => {
 		fx.state.att = makeAtt(addr, "sess_new", 1);
 		fx.state.lv = makeLv(scope, "sess_new", 1, 111, new Date(Date.parse(launchAt) + 1_000).toISOString());
+		fx.state.ev = makeEv(scope, "sess_new", 1, launchAt);
 	});
 	assert.equal(r.status, "ready", `G1 ready 实际=${r.status}/${r.reason}`);
 	assert.equal(r.generation, 1);
@@ -487,6 +507,7 @@ async function runPollCase(
 		(fx, launchAt, s, a) => {
 			fx.state.att = makeAtt(a, "sess_takeover", 3);
 			fx.state.lv = makeLv(s, "sess_takeover", 3, 222, new Date(Date.parse(launchAt) + 1_000).toISOString());
+			fx.state.ev = makeEv(s, "sess_takeover", 3, launchAt);
 		},
 		{ preAtt, preLv },
 	);
@@ -573,13 +594,15 @@ async function runPollCase(
 	ok("G3-G6 timeout 逐条件（identity/generation/pid/updatedAt）");
 }
 
-// G7 纯函数直测：#7 六条件 + reason 枚举 + stalled/timeout 分类 + 超时钳制
+// G7 纯函数直测：#7 六条件 + 第 8 条消费证据 + reason 枚举 + stalled/timeout 分类 + 超时钳制
 {
 	const scope = "g7-scope";
 	const addr = localMasterAddress(scope);
 	const att = makeAtt(addr, "s", 5);
 	const lv = makeLv(scope, "s", 5, 42, "2026-09-24T12:00:10.000Z");
-	const base = { attachment: att, liveness: lv, launchAt: "2026-09-24T12:00:05.000Z", isAlive: () => true };
+	const nowMs = Date.parse("2026-09-24T12:00:10.000Z");
+	const ev = makeEv(scope, "s", 5, "2026-09-24T12:00:09.000Z");
+	const base = { attachment: att, liveness: lv, launchAt: "2026-09-24T12:00:05.000Z", isAlive: () => true, consumeEvidence: ev, nowMs };
 	assert.deepEqual(judgeLocalMasterEnsureReady(base), { ready: true, reason: "ready" });
 	assert.equal(judgeLocalMasterEnsureReady({ ...base, liveness: null }).reason, "no-liveness");
 	assert.equal(judgeLocalMasterEnsureReady({ ...base, attachment: null }).reason, "no-owner");
@@ -590,15 +613,32 @@ async function runPollCase(
 	// claim 观测：六条全绿但 generation 未前进 → 不 ready
 	assert.equal(judgeLocalMasterEnsureReady({ ...base, claimedFromGeneration: 5 }).reason, "claim-not-observed");
 	assert.equal(judgeLocalMasterEnsureReady({ ...base, claimedFromGeneration: 4 }).ready, true);
+	// 第 8 条（append-last）：前 7 条全绿但消费证据不成立 → consume-evidence-*
+	assert.equal(judgeLocalMasterEnsureReady({ ...base, consumeEvidence: null }).reason, "consume-evidence-missing");
+	assert.equal(judgeLocalMasterEnsureReady({ ...base, consumeEvidence: { ...ev, sessionId: "other" } }).reason, "consume-evidence-identity-mismatch");
+	assert.equal(judgeLocalMasterEnsureReady({ ...base, consumeEvidence: { ...ev, generation: 4 } }).reason, "consume-evidence-old-generation");
+	assert.equal(
+		judgeLocalMasterEnsureReady({ ...base, consumeEvidence: { ...ev, lastTickAt: "2026-09-24T11:58:00.000Z" } }).reason,
+		"consume-evidence-stale",
+	);
+	// 阈值可注入（不硬编码 90s）：同证据在放宽的 freshMs 下算新鲜
+	assert.equal(
+		judgeLocalMasterEnsureReady({ ...base, consumeEvidence: { ...ev, lastTickAt: "2026-09-24T11:58:00.000Z" }, consumeFreshMs: 300_000 }).ready,
+		true,
+	);
 	assert.equal(ensureStatusForReason("no-liveness"), "stalled");
 	assert.equal(ensureStatusForReason("no-owner"), "stalled");
 	assert.equal(ensureStatusForReason("claim-not-observed"), "stalled");
+	for (const rr of ["consume-evidence-missing", "consume-evidence-stale", "consume-evidence-identity-mismatch", "consume-evidence-old-generation"]) {
+		assert.equal(ensureStatusForReason(rr), "stalled", `${rr} → stalled（证据不足，不猜）`);
+	}
 	assert.equal(ensureStatusForReason("identity-mismatch"), "timeout");
 	assert.equal(ensureStatusForReason("owner-pid-dead"), "timeout");
 	assert.equal(clampEnsureTimeout(undefined), 60_000);
 	assert.equal(clampEnsureTimeout(999_999), 180_000);
 	assert.equal(clampEnsureTimeout(-5), 60_000);
-	ok("G7 就绪判据纯函数（六条件 + claim 观测 + 分类 + 超时钳制）");
+	assert.equal(CONSUME_FRESH_MS, 90_000, "新鲜度阈值 = 3×30s tick = astra 90s 预算上界");
+	ok("G7 就绪判据纯函数（六条件 + claim 观测 + 第 8 条消费证据 + 分类 + 钳制）");
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -676,6 +716,9 @@ async function runPollCase(
 	const scope2 = localMasterScope(cwd2);
 	attachMaster({ sessionId: "sess_tool_alive", agent: localMasterAddress(scope2), detail: cwd2 });
 	writeScopeLiveness({ scopeKey: scope2, sessionId: "sess_tool_alive", generation: 1, pid: process.pid });
+	// 0926：活 owner 还需消费证据才回 already-running（真实盘面写一条同身份新鲜 tick 证据）
+	assert.ok(recordConsumeTick({ scope: scope2, sessionId: "sess_tool_alive", generation: 1, lastTickReason: "no-mail" }, { stateDir: STATE }), "证据写入");
+	assert.equal(readConsumeEvidence(scope2, { stateDir: STATE })!.sessionId, "sess_tool_alive");
 	const res2 = await tool.execute("i2", { cwd: cwd2 }, undefined, undefined, { sessionManager: { sessionId: "sess_main_audit2" } });
 	assert.notEqual(res2.isError, true, "already-running 非错误");
 	assert.ok(res2.content[0].text.includes("already-running"), res2.content[0].text);
@@ -818,11 +861,22 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	const att = readAttachment(addr)!;
 	const lv = readScopeLiveness(scope)!;
 	const launchAt = new Date(Date.parse(lv.updatedAt) - 1_000).toISOString();
-	assert.equal(judgeLocalMasterEnsureReady({ attachment: att, liveness: lv, launchAt }).ready, true, "真实盘面 + 活 pid（测试进程自身）→ ready");
-	const v2 = judgeLocalMasterEnsureReady({ attachment: att, liveness: lv, launchAt: new Date(Date.parse(lv.updatedAt) + 1_000).toISOString() });
+	// 0926：真实盘面上，判据前 7 条全绿但**无消费证据** → 不 ready（第 8 条）
+	assert.equal(readConsumeEvidence(scope, { stateDir: STATE }), null, "夹具：尚无消费证据");
+	const v0 = judgeLocalMasterEnsureReady({ attachment: att, liveness: lv, launchAt });
+	assert.equal(v0.ready, false, "无消费证据 → 不 ready");
+	assert.equal(v0.reason, "consume-evidence-missing");
+	// 真实 tick 证据写入后（唯一写手 = recordConsumeTick）→ ready
+	assert.ok(recordConsumeTick({ scope, sessionId: "sess_real_owner", generation: 1, lastTickReason: "no-mail" }, { stateDir: STATE }));
+	assert.equal(
+		judgeLocalMasterEnsureReady({ attachment: att, liveness: lv, launchAt, consumeEvidence: readConsumeEvidence(scope, { stateDir: STATE }) }).ready,
+		true,
+		"真实盘面 + 活 pid（测试进程自身）+ 消费证据 → ready",
+	);
+	const v2 = judgeLocalMasterEnsureReady({ attachment: att, liveness: lv, launchAt: new Date(Date.parse(lv.updatedAt) + 1_000).toISOString(), consumeEvidence: readConsumeEvidence(scope, { stateDir: STATE }) });
 	assert.equal(v2.ready, false, "launchAt 晚于 liveness → 不算数");
 	assert.equal(v2.reason, "liveness-not-updated");
-	ok("J3 #7 判据在真实盘面上的口径（含 launchAt 边界）");
+	ok("J3 判据在真实盘面上的口径（含 launchAt 边界 + 消费证据第 8 条）");
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -848,10 +902,60 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	const regIdx = consumerSrc.indexOf("export function registerScopeWakeLoop");
 	const sessionStartIdx = consumerSrc.indexOf('pi.on("session_start"', regIdx);
 	const claimIdx = consumerSrc.indexOf("silentScopeGenesis", sessionStartIdx);
-	const registerIdx = consumerSrc.indexOf("setInterval", sessionStartIdx);
+	const activateIdx = consumerSrc.indexOf("activateScopeConsumption({ sessionId: sid, cwd, wiring })", sessionStartIdx);
 	assert.ok(regIdx > 0 && sessionStartIdx > regIdx, "消费循环注册点 = registerScopeWakeLoop 的 session_start");
-	assert.ok(claimIdx > sessionStartIdx && registerIdx > claimIdx, "认领（silentScopeGenesis）在注册（setInterval）之前、同一处理块");
-	ok("K 双入口 + #A 注册点静态耦合校验");
+	assert.ok(claimIdx > sessionStartIdx && activateIdx > claimIdx, "认领（silentScopeGenesis）在激活（activateScopeConsumption）之前、同一处理块");
+
+	// 0926 P1：单一幂等激活入口——全仓生产调用恰 3 处（session_start + 工具 attach + slash attach）
+	const callsIn = (text: string): number => text.split("activateScopeConsumption({").length - 1;
+	const prodFiles = [...readdirSync(here).filter((f) => f.endsWith(".ts") && !f.startsWith("_")), "runtime/local-master-launch.ts", "runtime/scope-consume.ts"];
+	let total = 0;
+	for (const f of prodFiles) {
+		try {
+			total += callsIn(readFileSync(join(here, f), "utf8"));
+		} catch {
+			/* 文件不存在跳过 */
+		}
+	}
+	assert.equal(total, 3, `activateScopeConsumption 生产调用恰 3 处，实际=${total}`);
+	assert.equal(callsIn(consumerSrc), 1, "mailbox-consumer 内只有 session_start 一处调用（实现单点）");
+	// 两个 attach 入口：与 triggerOwnershipRecheck 同一成功分支、同一共享函数（不各写一套）
+	const slashStart = src.indexOf('pi.registerCommand("master-attach"');
+	const slashEnd = src.indexOf("pi.registerCommand(", slashStart + 1);
+	const slashBlock = src.slice(slashStart, slashEnd > 0 ? slashEnd : undefined);
+	assert.ok(slashBlock.includes("triggerOwnershipRecheck") && slashBlock.includes("activateScopeConsumption({"), "slash attach 同分支补激活");
+	assert.ok(slashBlock.indexOf("triggerOwnershipRecheck") < slashBlock.indexOf("activateScopeConsumption({"), "slash：激活在 ownership recheck 之后");
+	const toolStart = toolsSrc.indexOf('name: "master-attach"');
+	const toolEnd = toolsSrc.indexOf("pi.registerTool(", toolStart + 1);
+	const toolBlock = toolsSrc.slice(toolStart, toolEnd > 0 ? toolEnd : undefined);
+	assert.ok(toolBlock.includes("triggerOwnershipRecheck") && toolBlock.includes("activateScopeConsumption({"), "工具 attach 同分支补激活");
+	assert.ok(toolBlock.indexOf("triggerOwnershipRecheck") < toolBlock.indexOf("activateScopeConsumption({"), "工具：激活在 ownership recheck 之后");
+	// registerScopeWakeLoop 导出与签名不变（index.ts 接线不变）
+	assert.ok(consumerSrc.includes("export function registerScopeWakeLoop"), "registerScopeWakeLoop 仍导出");
+	assert.ok(/registerScopeWakeLoop\(pi, \{/.test(src), "index.ts 生产接线保持不变");
+
+	// 零新增权力（静态 grep，先剥注释避免口径被注释文本干扰）：证据/判据层不得出现 attach/forceStale/liveness 写手
+	const stripComments = (t: string): string => t.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+	const consumeSrc = stripComments(readFileSync(join(here, "runtime", "scope-consume.ts"), "utf8"));
+	for (const forbidden of ["attachMaster(", "attachCurrentSession(", "forceStale", "takeoverStaleScopeOwner", "writeScopeLiveness", "setCutover"]) {
+		assert.ok(!consumeSrc.includes(forbidden), `scope-consume.ts 不得出现 ${forbidden}（零新增权力/不扩 scope-liveness）`);
+	}
+	const launchSrc = stripComments(readFileSync(join(here, "runtime", "local-master-launch.ts"), "utf8"));
+	for (const forbidden of ["attachMaster(", "attachCurrentSession(", "takeoverStaleScopeOwner(", "writeScopeLiveness(", "judgeScopeOwnerStale("]) {
+		assert.ok(!launchSrc.includes(forbidden), `local-master-launch.ts 不得出现 ${forbidden}（新证据不进既有接管判据）`);
+	}
+	// 证据唯一写手 = 消费 tick（全仓生产只有 mailbox-consumer 调 recordConsumeTick）
+	let writers = 0;
+	for (const f of prodFiles) {
+		try {
+			const t = readFileSync(join(here, f), "utf8");
+			if (f !== "runtime/scope-consume.ts") writers += t.split("recordConsumeTick(").length - 1 - (t.split("function recordConsumeTick(").length - 1);
+		} catch {
+			/* 跳过 */
+		}
+	}
+	assert.equal(writers, 1, `recordConsumeTick 生产调用恰 1 处（唯一写手 = tick），实际=${writers}`);
+	ok("K 单一激活入口/接线/零新增权力/唯一写手 静态耦合校验");
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -879,6 +983,140 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	assert.equal(clampEnsureTimeout(a4.timeoutMs), 60_000, "非法 timeout 回落缺省 60s");
 	ok("L slash 参数解析 4 例（flag-first / cwd-first / --no-wait 在前 / 非法 timeout）");
 }
+
+// ══════════════════════════════════════════════════════════════════
+// M — 0926 P1：「活 owner」与「消费侧就绪」拆分 + 降级语义（不自动接管）
+// ══════════════════════════════════════════════════════════════════
+
+// M1：活 owner 但**无消费证据** → consume-unverified（isError、零 spawn、零 marker、人权指引）
+{
+	const cwd = mkCwd();
+	const scope = localMasterScope(cwd);
+	const addr = localMasterAddress(scope);
+	const fx = fixture({
+		att: makeAtt(addr, "sess_alive", 4),
+		lv: makeLv(scope, "sess_alive", 4, 777_777, "2026-09-24T12:00:05.000Z"),
+	});
+	const counter = spawnCounter();
+	const clock = fakeClock();
+	const deps: LocalMasterEnsureDeps = {
+		spawn: counter.spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
+		readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, readConsumeEvidence: fx.readConsumeEvidence, isAlive: isAliveFake,
+	};
+	const r = await ensureLocalMaster({ cwd, sessionId: "sess_main" }, deps);
+	assert.equal(r.status, "consume-unverified", "降级不回 already-running（变异 5 守卫）");
+	assert.equal(r.reason, "consume-evidence-missing");
+	assert.equal(r.consumption?.state, "missing");
+	assert.equal(r.generation, 4, "仍如实回快照");
+	assert.equal(ensureResultIsError(r), true, "消费侧未证明 = 错误回执");
+	assert.equal(counter.calls.length, 0, "降级不 spawn");
+	assert.equal(markerExists(scope), false, "降级不写 in-flight");
+	const text = formatLocalMasterEnsureResult(r);
+	assert.ok(text.includes("进程活着，消费侧未证明"), `文案：${text}`);
+	assert.ok(text.includes("不自动接管、不强接、零 spawn"), "明示不自动 force takeover");
+	assert.ok(text.includes("/master-attach --local --force-stale --confirm"), "给人权指引（工具不代持权力）");
+	ok("M1 consume-unverified：活 owner 无消费证据 → 明确降级（零 spawn 零接管）");
+}
+
+// M2：证据不成立的其余三种 reason（stale / identity-mismatch / old-generation）
+{
+	const cwd = mkCwd();
+	const scope = localMasterScope(cwd);
+	const addr = localMasterAddress(scope);
+	const att = makeAtt(addr, "sess_alive", 4);
+	const lv = makeLv(scope, "sess_alive", 4, 777_777, "2026-09-24T12:00:05.000Z");
+	const run = async (ev: ScopeConsumeEvidence | null): Promise<LocalMasterEnsureResult> => {
+		const fx = fixture({ att, lv, ev });
+		const counter = spawnCounter();
+		const clock = fakeClock();
+		return ensureLocalMaster(
+			{ cwd, sessionId: "sess_main" },
+			{
+				spawn: counter.spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
+				readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, readConsumeEvidence: fx.readConsumeEvidence, isAlive: isAliveFake,
+			},
+		);
+	};
+	const stale = await run(makeEv(scope, "sess_alive", 4, "2026-09-24T11:58:00.000Z")); // > 90s 未 tick
+	assert.equal(stale.status, "consume-unverified");
+	assert.equal(stale.reason, "consume-evidence-stale");
+	assert.equal(stale.consumption?.state, "stale");
+	const mismatch = await run(makeEv(scope, "sess_other", 4, "2026-09-24T12:00:00.000Z"));
+	assert.equal(mismatch.reason, "consume-evidence-identity-mismatch");
+	// ownership transfer：旧代证据不能证明新代就绪（D3）
+	const oldGen = await run(makeEv(scope, "sess_alive", 3, "2026-09-24T12:00:00.000Z"));
+	assert.equal(oldGen.status, "consume-unverified");
+	assert.equal(oldGen.reason, "consume-evidence-old-generation");
+	assert.equal(oldGen.generation, 4, "attachment 已是新代、证据仍是旧代 → 降级");
+	ok("M2 consume-evidence-stale / identity-mismatch / old-generation（transfer 旧代不算数）");
+}
+
+// M3：工具面真实盘面（隔离 PI_RUNTIME_DIR）：无证据 → isError + 审计受控枚举
+{
+	const counter = spawnCounter();
+	const tool = loadTool({ ensureLocalMasterTab: counter.spawn })!;
+	const cwd = mkCwd();
+	const scope = localMasterScope(cwd);
+	attachMaster({ sessionId: "sess_no_ev", agent: localMasterAddress(scope), detail: cwd });
+	writeScopeLiveness({ scopeKey: scope, sessionId: "sess_no_ev", generation: 1, pid: process.pid });
+	assert.equal(readConsumeEvidence(scope, { stateDir: STATE }), null, "夹具：无消费证据");
+	const res = await tool.execute("m3", { cwd }, undefined, undefined, { sessionManager: { sessionId: "sess_main_m3" } });
+	assert.equal(res.isError, true, "工具面消费侧未证明 = isError");
+	assert.ok(res.content[0].text.includes("consume-unverified"), res.content[0].text);
+	assert.equal(res.details?.reason, "consume-evidence-missing");
+	assert.equal(res.details?.status, "consume-unverified");
+	assert.equal(counter.calls.length, 0, "工具面零 spawn");
+	assert.notEqual(res.content[0].text.includes("already-running"), true, "不得回 already-running");
+	const rows = readLocalMasterEnsureAudit(STATE);
+	assert.equal(rows.slice(-1)[0]!.action, "ensure:tool");
+	assert.equal(rows.slice(-1)[0]!.result, "consume-unverified:consume-evidence-missing", "审计 result 仍是受控枚举");
+	// 补一条同身份新鲜证据 → 同一夹具回升 already-running（证据是唯一开关）
+	assert.ok(recordConsumeTick({ scope, sessionId: "sess_no_ev", generation: 1, lastTickReason: "no-mail" }, { stateDir: STATE }));
+	const res2 = await tool.execute("m3b", { cwd }, undefined, undefined, { sessionManager: { sessionId: "sess_main_m3" } });
+	assert.notEqual(res2.isError, true, "证据新鲜 → 非错误");
+	assert.ok(res2.content[0].text.includes("already-running"), res2.content[0].text);
+	assert.equal(counter.calls.length, 0, "两次都零 spawn");
+	ok("M3 工具面：无证据 consume-unverified（审计枚举）/ 有证据 already-running");
+}
+
+// M4：launched → ready 也必须由消费事实证明（第 8 条；变异 4 守卫）
+{
+	const { r, spawnCalls } = await runPollCase((fx, launchAt, scope, addr) => {
+		fx.state.att = makeAtt(addr, "sess_new", 1);
+		fx.state.lv = makeLv(scope, "sess_new", 1, 111, new Date(Date.parse(launchAt) + 1_000).toISOString());
+		// 故意不写证据
+		void scope;
+	});
+	assert.equal(spawnCalls, 1);
+	assert.equal(r.status, "stalled", "liveness 全绿 + gen 前进但无消费证据 → 不判 ready");
+	assert.equal(r.reason, "consume-evidence-missing");
+	assert.equal(r.consumption?.state, "missing");
+	ok("M4 launched→ready 需消费证据（活进程 ≠ 收信就绪）");
+}
+
+// M5：同 scope 并发两次 ensure → 恰一次 dispatch（D1；另一调用 in-flight）
+{
+	const cwd = mkCwd();
+	const scope = localMasterScope(cwd);
+	const fx = fixture();
+	const counter = spawnCounter();
+	const clock = fakeClock();
+	const deps: LocalMasterEnsureDeps = {
+		spawn: counter.spawn, now: clock.now, sleep: clock.sleep, stateDir: STATE, pollIntervalMs: 10,
+		readAttachment: fx.readAttachment, readLiveness: fx.readLiveness, readConsumeEvidence: fx.readConsumeEvidence, isAlive: isAliveFake,
+	};
+	const [r1, r2] = await Promise.all([
+		ensureLocalMaster({ cwd, sessionId: "sess_main", waitForReady: false, timeoutMs: 5_000 }, deps),
+		ensureLocalMaster({ cwd, sessionId: "sess_main", waitForReady: false, timeoutMs: 5_000 }, deps),
+	]);
+	assert.equal(counter.calls.length, 1, "并发两次 ensure 恰一次 dispatch（不出现两个有效消费者）");
+	const infl = [r1, r2].filter((r) => r.inFlight === true).length;
+	assert.equal(infl, 1, "第二个调用回 in-flight（零第二个 spawn）");
+	assert.equal([r1, r2].filter((r) => r.status === "launched" && !r.inFlight).length, 1);
+	clearLocalMasterLaunchMarker(scope, STATE);
+	ok("M5 同 scope 并发 ensure：恰 1 dispatch + 1 in-flight");
+}
+
 
 // ── 清理（临时 runtimeDir + 目标目录；exit 钩子兑底，S3）──────
 cleanupAll();

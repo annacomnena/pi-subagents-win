@@ -21,14 +21,11 @@
  *   liveness && attachment && 同 sessionId && 同 generation && isProcessAlive(pid)
  *   && launchAt < liveness.updatedAt → `ready`；拿不到 liveness → 如实 `stalled`（不猜）。
  *
- * 消费侧就绪（追加要求 #A）：local master 的信箱消费循环只在 `session_start` 注册
- * （mailbox-consumer.ts registerScopeWakeLoop），且**注册与认领在同一处理块内**——
- * session_start 里 silentScopeGenesis / takeoverStaleScopeOwner 之后 `att.sessionId === sid`
- * 才 setInterval。新会话的认领只可能来自该处理块，故 launched 模式在 #7 判据之上再要求
- * **观测到 claim**（attachment.generation 高于 precheck 快照；无 attachment 时快照记 0，
- * genesis 生成 1 恒前进）：claim ⟹ 消费循环已随 session_start 注册。liveness 全绿但
- * generation 未前进（既有 owner 复活/后补写心跳，其消费侧无法从盘面验证）→ 不判 ready，
- * 归 `stalled(claim-not-observed)`。这是不扩权前提下可机器验证的最强判据；残余见实现报告。
+ * 消费侧就绪（#A → 0926 P1）：local master 的「可用」由**消费事实**证明。第一段约束是
+ * launched 模式观测到 claim（attachment.generation 高于 precheck 快照）；第二段（0926）
+ * 要求 tick 写入的消费进展证据（state/scope-consume/<scope>.json，唯一写手 = 消费 tick）
+ * **fresh**：证据绑定 sessionId+generation+lastTickAt，旧代/异身份/陈旧证据一律不算数
+ * （judgeConsumeFresh）。缺证据 → 如实降级，不猜、不 spawn、不自动 force takeover。
  *
  * 纯库：spawn/clock/sleep/fs 全可注入，无 Pi API 依赖（同 master-transfer 纪律）。
  * 审计：`state/local-master-ensure-audit.jsonl`，行 {at, by, cwd, scope, action, result}，无正文。
@@ -52,6 +49,12 @@ import { defaultRuntimeDir } from "./journal.ts";
 import { isProcessAlive, readScopeLiveness, type ScopeLiveness } from "./liveness.ts";
 import { readAttachment, type MasterAttachment } from "./registry.ts";
 import { localMasterAddress, localMasterScope } from "./scope.ts";
+import {
+	judgeConsumeFresh,
+	readConsumeEvidence as readConsumeEvidenceFile,
+	type ConsumeFreshReason,
+	type ScopeConsumeEvidence,
+} from "./scope-consume.ts";
 
 // ── 常量 ───────────────────────────────────────────────────────────
 
@@ -118,6 +121,7 @@ function sid12(s: string): string {
 
 export type LocalMasterEnsureStatus =
 	| "already-running"
+	| "consume-unverified"
 	| "launched"
 	| "ready"
 	| "spawn-failed"
@@ -146,11 +150,34 @@ export interface LocalMasterEnsureResult {
 	reason?: string;
 	/** 仅 spawn-failed：spawn 层原始错误串（launch_failed 账本同源）。 */
 	detail?: string;
+	/** 消费侧就绪证据快照（ready / already-running / consume-unverified / consume-evidence-* 时给）。 */
+	consumption?: EnsureConsumptionSnapshot;
 }
 
-/** status → 是否算错误回执（invalid-cwd/spawn-failed/timeout/stalled 为错）。 */
+export interface EnsureConsumptionSnapshot {
+	state: "fresh" | "missing" | "stale" | "identity-mismatch" | "old-generation";
+	lastTickAt?: string;
+	tickCount?: number;
+}
+
+/** judgeConsumeFresh → 回执快照 state（ok → fresh）。 */
+function consumptionSnapshot(
+	ev: ScopeConsumeEvidence | null,
+	j: { fresh: boolean; reason: ConsumeFreshReason },
+): EnsureConsumptionSnapshot {
+	const state: EnsureConsumptionSnapshot["state"] = j.fresh ? "fresh" : j.reason === "ok" ? "missing" : j.reason;
+	return { state, ...(ev ? { lastTickAt: ev.lastTickAt, tickCount: ev.tickCount } : {}) };
+}
+
+/** status → 是否算错误回执（invalid-cwd/spawn-failed/timeout/stalled/consume-unverified 为错）。 */
 export function ensureResultIsError(r: LocalMasterEnsureResult): boolean {
-	return r.status === "invalid-cwd" || r.status === "spawn-failed" || r.status === "timeout" || r.status === "stalled";
+	return (
+		r.status === "invalid-cwd" ||
+		r.status === "spawn-failed" ||
+		r.status === "timeout" ||
+		r.status === "stalled" ||
+		r.status === "consume-unverified"
+	);
 }
 
 // ── 就绪判据（纯函数，可单测）──────────────────────────────────────
@@ -162,11 +189,19 @@ export interface ReadyCheckInput {
 	isAlive?: (pid: number) => boolean;
 	/** launched 模式：precheck 快照 generation（无 attachment 记 0）。给出时必须观测到前进（#A claim 判据）。 */
 	claimedFromGeneration?: number;
+	/** 消费进展证据（缺省视为缺席 → 第 8 条不成立；生产经 ensureLocalMaster 默认真实读取）。 */
+	consumeEvidence?: ScopeConsumeEvidence | null;
+	/** 新鲜度阈值（缺省 CONSUME_FRESH_MS；测试可注入）。 */
+	consumeFreshMs?: number;
+	/** 判新鲜度的当前时刻（缺省 Date.now()；测试随 fake clock 注入）。 */
+	nowMs?: number;
 }
 
 /**
- * #7 就绪判据逐条 + #A claim 观测。首次不满足的 reason 即回执 reason（受控枚举，无正文）。
- * 不满足 ≠ 失败：调用方轮询到 deadline 再分类（stalled vs timeout）。
+ * #7 就绪判据逐条 + #A claim 观测 + 第 8 条消费证据（0926，**append-last 只收紧不放松**：
+ * 第 1–7 条 reason 优先序逐字不变，新增 reason 一律排在 claim-not-observed 之后）。
+ * 首次不满足的 reason 即回执 reason（受控枚举，无正文）。不满足 ≠ 失败：调用方轮询到
+ * deadline 再分类（stalled vs timeout）。
  */
 export function judgeLocalMasterEnsureReady(input: ReadyCheckInput): { ready: boolean; reason: string } {
 	const alive = input.isAlive ?? isProcessAlive;
@@ -180,12 +215,29 @@ export function judgeLocalMasterEnsureReady(input: ReadyCheckInput): { ready: bo
 	if (input.claimedFromGeneration !== undefined && !(attachment.generation > input.claimedFromGeneration)) {
 		return { ready: false, reason: "claim-not-observed" };
 	}
+	// 第 8 条（0926 P1，append-last）：活进程 ≠ 能消费，ready 必须由消费事实证明。
+	const fresh = judgeConsumeFresh(input.consumeEvidence ?? null, {
+		sessionId: attachment.sessionId,
+		generation: attachment.generation,
+		nowMs: input.nowMs ?? Date.now(),
+		...(input.consumeFreshMs !== undefined ? { freshMs: input.consumeFreshMs } : {}),
+	});
+	if (!fresh.fresh) return { ready: false, reason: `consume-evidence-${fresh.reason}` };
 	return { ready: true, reason: "ready" };
 }
 
-/** deadline 分类：判不了/没认领 → stalled（不猜）；判得了但没就绪 → timeout（带快照）。 */
+/** consume-evidence-* 的 reason 集（分类/受控枚举用）。 */
+export const CONSUME_EVIDENCE_REASONS = [
+	"consume-evidence-missing",
+	"consume-evidence-stale",
+	"consume-evidence-identity-mismatch",
+	"consume-evidence-old-generation",
+] as const;
+
+/** deadline 分类：判不了/没认领/消费证据不足 → stalled（不猜）；判得了但没就绪 → timeout（带快照）。 */
 export function ensureStatusForReason(reason: string | undefined): "stalled" | "timeout" {
-	return reason === "no-liveness" || reason === "no-owner" || reason === "claim-not-observed"
+	return reason === "no-liveness" || reason === "no-owner" || reason === "claim-not-observed" ||
+		(reason !== undefined && (CONSUME_EVIDENCE_REASONS as readonly string[]).includes(reason))
 		? "stalled"
 		: "timeout";
 }
@@ -420,6 +472,10 @@ export interface LocalMasterEnsureDeps {
 	sleep?: (ms: number) => Promise<void>;
 	readAttachment?: (agent: ObjectAddress) => MasterAttachment | null;
 	readLiveness?: (scope: string) => ScopeLiveness | null;
+	/** 消费进展证据读取（缺省读真实 stateDir；测试注入隔离夹具）。 */
+	readConsumeEvidence?: (scope: string) => ScopeConsumeEvidence | null;
+	/** 消费证据新鲜度阈值（缺省 CONSUME_FRESH_MS；验收预算可调可测）。 */
+	consumeFreshMs?: number;
 	isAlive?: (pid: number) => boolean;
 	isDirectory?: (cwd: string) => boolean;
 	stateDir?: string;
@@ -442,6 +498,7 @@ export async function ensureLocalMaster(
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 	const readAtt = deps.readAttachment ?? ((agent: ObjectAddress) => readAttachment(agent));
 	const readLv = deps.readLiveness ?? ((scope: string) => readScopeLiveness(scope));
+	const readEv = deps.readConsumeEvidence ?? ((scope: string) => readConsumeEvidenceFile(scope, { stateDir }));
 	const isAlive = deps.isAlive ?? isProcessAlive;
 	const isDirectory = deps.isDirectory ?? defaultIsDirectory;
 	const stateDir = deps.stateDir ?? join(defaultRuntimeDir(), "state");
@@ -459,17 +516,44 @@ export async function ensureLocalMaster(
 	const scopeKey = scope!;
 	const addr = agentAddress!;
 
-	// ── precheck：活 owner → already-running（幂等零动作；顺手关掉历史 in-flight 窗口）──
+	// ── precheck：活 owner → 已有 owner 分支（幂等零动作；顺手关掉历史 in-flight 窗口）──
+	// 0926 P1：「活 owner」≠「消费侧就绪」。身份/PID 全过但**没有新鲜消费证据**时明确降级为
+	// consume-unverified（isError）——不自动接管、不强接、不 spawn（零新增权力）。
 	const preAtt = readAtt(addr);
 	const preLv = readLv(scopeKey);
 	if (preAtt && preLv && preLv.sessionId === preAtt.sessionId && preLv.generation === preAtt.generation && isAlive(preLv.pid)) {
 		clearLocalMasterLaunchMarker(scopeKey, stateDir);
+		const ev = readEv(scopeKey);
+		const j = judgeConsumeFresh(ev, {
+			sessionId: preAtt.sessionId,
+			generation: preAtt.generation,
+			nowMs: now(),
+			...(deps.consumeFreshMs !== undefined ? { freshMs: deps.consumeFreshMs } : {}),
+		});
+		const liveness: EnsureLivenessSnapshot = {
+			sessionId: preLv.sessionId,
+			pid: preLv.pid,
+			alive: true,
+			updatedAt: preLv.updatedAt,
+		};
+		if (!j.fresh) {
+			return {
+				status: "consume-unverified",
+				scope: scopeKey,
+				agentAddress: addr,
+				liveness,
+				generation: preAtt.generation,
+				reason: `consume-evidence-${j.reason}`,
+				consumption: consumptionSnapshot(ev, j),
+			};
+		}
 		return {
 			status: "already-running",
 			scope: scopeKey,
 			agentAddress: addr,
-			liveness: { sessionId: preLv.sessionId, pid: preLv.pid, alive: true, updatedAt: preLv.updatedAt },
+			liveness,
 			generation: preAtt.generation,
+			consumption: consumptionSnapshot(ev, j),
 		};
 	}
 
@@ -536,9 +620,13 @@ export async function ensureLocalMaster(
 			launchAt,
 			isAlive,
 			claimedFromGeneration: preGen,
+			consumeEvidence: readEv(scopeKey),
+			...(deps.consumeFreshMs !== undefined ? { consumeFreshMs: deps.consumeFreshMs } : {}),
+			nowMs: now(),
 		});
 		if (v.ready && att && lv) {
 			clearLocalMasterLaunchMarker(scopeKey, stateDir);
+			const ev = readEv(scopeKey);
 			return {
 				status: "ready",
 				scope: scopeKey,
@@ -546,9 +634,12 @@ export async function ensureLocalMaster(
 				runId,
 				liveness: { sessionId: lv.sessionId, pid: lv.pid, alive: true, updatedAt: lv.updatedAt },
 				generation: att.generation,
+				...(ev ? { consumption: { state: "fresh", lastTickAt: ev.lastTickAt, tickCount: ev.tickCount } as EnsureConsumptionSnapshot } : {}),
 			};
 		}
 		if (now() >= deadline) {
+			const ev = readEv(scopeKey);
+			const consumeReason = v.reason?.startsWith("consume-evidence-") ? v.reason.slice("consume-evidence-".length) : null;
 			return {
 				status: ensureStatusForReason(v.reason),
 				scope: scopeKey,
@@ -557,6 +648,14 @@ export async function ensureLocalMaster(
 				reason: v.reason,
 				...(att ? { generation: att.generation } : {}),
 				...(lv ? { liveness: { sessionId: lv.sessionId, pid: lv.pid, alive: isAlive(lv.pid), updatedAt: lv.updatedAt } } : {}),
+				...(consumeReason
+					? {
+						consumption: consumptionSnapshot(ev, {
+							fresh: false,
+							reason: consumeReason as ConsumeFreshReason,
+						}),
+					}
+					: {}),
 			};
 		}
 		await sleep(pollIntervalMs);
@@ -571,7 +670,9 @@ export function formatLocalMasterEnsureResult(r: LocalMasterEnsureResult): strin
 	const run = r.runId ? ` runId=${r.runId}` : "";
 	switch (r.status) {
 		case "already-running":
-			return `${head}: ${where} owner=${r.liveness ? sid12(r.liveness.sessionId) : "?"} gen=${r.generation} liveness pid=${r.liveness?.pid} alive（活 master，零动作零 spawn）`;
+			return `${head}: ${where} owner=${r.liveness ? sid12(r.liveness.sessionId) : "?"} gen=${r.generation} liveness pid=${r.liveness?.pid} alive 消费证据=${r.consumption?.lastTickAt ?? "-"}（活 master 且消费侧就绪，零动作零 spawn）`;
+		case "consume-unverified":
+			return `${head}: ${where} owner=${r.liveness ? sid12(r.liveness.sessionId) : "?"} gen=${r.generation} liveness pid=${r.liveness?.pid} alive（进程活着，消费侧未证明，reason=${r.reason}）——不自动接管、不强接、零 spawn；请在该仓开一个会话/session_start（或由该仓会话执行 /master-attach --local），也可由用户执行 /master-attach --local --force-stale --confirm 处置死角（本工具不带该权力）`;
 		case "launched":
 			return r.inFlight
 				? `${head}(in-flight): ${where}${run}（窗口内在途启动，零第二个 spawn）`
