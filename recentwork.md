@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | P6-cdn/P6-send/P2/P3/P8 待用户同意（残留 U 10 项） |
 | 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） |
 | 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） |
 | 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
@@ -56,6 +57,20 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 48 - 微信媒体探针 Phase ③ 收尾（入站媒体与附件规格真机定稿）
+
+- **日期**：2026-09-25
+- **一句话**：三轮真机探针把「入站媒体能不能收、怎么解密」从 C 级猜测变成 **B 级规格**——**item type 矩阵 `1`=文本(`text_item`)/`2`=图片(`image_item`)/`3`=语音(`voice_item`)/`4`=文件(`file_item`)，链接走文本无独立 type**；**附件 URL/key 在嵌套 `media.full_url`/`media.aes_key`**（顶层另有 `image_item.aeskey`），item 公共键 `create_time_ms/update_time_ms/is_completed/msg_id/button_item_list/at_bot_username_list`，信封 `{message_type, message_state, hasContextToken, hasGroupId}`；**key 格式 = `media.aes_key` 为 `base64(hex32)`（len44 → 32B hex 文本 → 16B）、顶层 `aeskey` 为 hex len32（派生同一把 key）**；**AES-128-ECB + PKCS7 真机 6/6 解密 + 6/6 魔数**（jpeg×2 / pdf×2 / silk×2 `0x02#!SILK_V3`）。**实测与官方指南（C 级）不符**：指南的平铺 `image_item:{file_id,url,aes_key}` 与「aes_key = 32hex 或 16B base64」均不成立（这是「指南不可信」的第二例）。
+- **P5 出站硬门通过（B）**：`ilink/bot/getuploadurl` **存在**（200 + 单键 `upload_full_url`，816B 预签名 URL，host=`novac2c.cdn.weixin.qq.com` 命中 allowlist `.qq.com`；坏/无 token → -14、空 body → -2）；`ilink/bot/upload` **404 ⇒ 两段式**；OPTIONS 被当普通请求处理（不能用它判方法支持）。**CDN 密文 POST 与 `sendmessage` 带媒体 item 仍未测（U）** ⇒ M4 出站媒体在 P6 取证前不写生产代码。
+- **CDN 边界（B）**：6/6 host 命中 allowlist、**hops=0**；探针下载 `redirect:"manual"` + 每跳复检（302 越域 stub 实测被拒）；**取证手段新增**：`listen --replay-seq N` 只读回放（buf 内层 seq 回退 → 服务端回放历史，游标只进不退），无需用户重发。
+- **涉及模块**：`scripts/wechat-ilink-probe.mjs`（唯一入库文件；`extractAttachments` 按实测形状、key 候选链与解密判优、`CDN_SUFFIX_ALLOW`/`isHostAllowed`、`--replay-seq`、`upload-probe`/`media-probe` 同意门）；**生产代码零改动**（`extensions/**`、`runtime/graph/**`、各 wechat 生产文件一律未碰）。
+- **产物**：`plans/0925_wechat_media_probe_results.md`（§0/§5/§9/§10 权威报告）/ `plans/0924_wechat_media_gateway_research.md`（§0 探针清单 / §3.4 设计 / §7 路线图）/ `plans/.wechat-probe/{items.jsonl, key-format.json, measure.jsonl, attachments/}`（本地 gitignored，key-format 已脱敏）/ `plans/0925_wechat_media_probe_wrapup_report.md`（L5 收尾）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` **新增「入站媒体与附件规格（真机实测 2026-09-25，媒体探针 Phase ③）」**（type 矩阵 / 字段形状表 / AES key 格式与解密 / CDN allowlist 与下载纪律 / 出站 upload 端点 / 只读回放备忘）+ frontmatter `source_paths` + Evidence + Open Questions（残留 U 10 项）+ Summary 互链；`wiki-nav rebuild`
+- **Priority**：P1
+- **Status**：done（探针阶段完成；P6/P2/P3/P8 与体积上限类 U 项阻塞在「需用户同意/需用户重发」）
+- **Commit**：`6a72b19`（探针 M0 实验子命令）+ `9f52a4a`（附件提取按真机实测形状 + 全类型签名 + 短跑）+ `d724f6a`（AES key 格式诊断 + 真机解密落盘 + `--replay-seq` 只读重放）；文档收尾 commit 见 CHANGELOG 同 Item 行
+- **Verification**：`key-format.json` `conclusion{decryptOk:"6/6", magicOk:"6/6", winningSchemes:{"base64(hex32)":6}, magics:{jpeg:2,pdf:2,silk:2}}` 与报告 §10 交叉一致；`items.jsonl` 43 行覆盖 type 1/2/3/4 四类签名；stub 回归 35/35 PASS（key/URL/token 泄漏 grep 0）；纪律复核 = 零 `sendmessage`、零上传、零生产代码改动、`git add` 只含具体文档文件。
 
 ### Item 47 - local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活）
 

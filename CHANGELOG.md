@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased] — 2026-09-25 (微信媒体探针 Phase ③ 收尾：`6a72b19`/`9f52a4a`/`d724f6a`；**只改探针，生产代码零改动**)
+
+- **入站 item type 矩阵（B 级真机）**：`1`=文本(`text_item`) / `2`=图片(`image_item`) / `3`=语音(`voice_item`) / `4`=文件(`file_item`)；**链接作为文本处理（无独立 type）**；信封 `{message_type, message_state, hasContextToken, hasGroupId}`（实测 1/2/true/false）；item 公共键 `create_time_ms/update_time_ms/is_completed/msg_id(string)/button_item_list/at_bot_username_list`，id 双层（信封 `message_id:number` / item `msg_id:string`）。
+- **字段形状（实测与官方指南 C 级描述不符——高价值发现）**：附件 URL/key 在**嵌套 `media.full_url` / `media.aes_key`**（非平铺），图片另有顶层小写 `aeskey`；尺寸用 `mid_size/thumb_*/hd_size/len`（无通用 `size`），`file_id`/`media_id` **未观测到** ⇒ 指南的平铺 `image_item:{file_id,url,aes_key}` 不成立；43 行脱敏签名覆盖四类（`voice_item` 另有 `encode_type/bits_per_sample/sample_rate/playtime/text`，`file_item` 另有 `file_name/md5/len`）。
+- **AES key 格式（关键结论，6/6 一致）**：`media.aes_key` = **base64（len44 带 padding）→ 32B ASCII hex 文本 → 16B key（即 `base64(hex32)` 双层）**；顶层 `aeskey` = **hex（len32）→ 16B**，与前者字符串不同但**派生同一把 key**（`sameDerivedKey:true`）；`file_item`/`voice_item` 无顶层 `aeskey`。**解密 = AES-128-ECB + PKCS7**，候选链逐方案试出（非硬编码），**真机 6/6 解密 + 6/6 魔数**（`FFD8FF` jpeg×2 / `%PDF` pdf×2 / `0x02#!SILK_V3` silk×2）；指南「aes_key = 32hex 或 16B base64」两种说法均不成立（旧 `parseAesKey` 据此判「格式无效」是第二轮失败根因）。
+- **CDN 边界（B）**：6/6 host=`novac2c.cdn.weixin.qq.com` 命中 allowlist 后缀 `.qq.com`、**hops=0**（未见 302）；探针下载 `redirect:"manual"` + 每跳复检 `isHostAllowed`（≤3 跳），**302 越域 stub 实测被拒**（`host-not-allowed hops=1`）+ 初始越域 `hops=0` 审计；落盘名安全化（中文保留、`../` → `_`）。**生产侧仍无下载/解密代码（M1 范围）**。
+- **出站 upload（硬门 P5 通过，B）**：`POST /ilink/bot/getuploadurl` **存在**（200 + 单键 `upload_full_url`，816B 预签名 URL，host 命中 allowlist；坏/无 token → `errcode=-14`、空 body → `ret=-2`）；`POST /ilink/bot/upload` **404 ⇒ 两段式**（D 级分歧收敛）；OPTIONS 被当普通请求处理（**不能用 OPTIONS 判方法支持**）。**仍未测（U）**：CDN 密文 POST/`x-encrypted-param`、`sendmessage` 带媒体 item、是否强制 `context_token` ⇒ **P6 取证前不写任何出站媒体生产代码**。
+- **取证手段新增（B）**：`getupdates` buf 内层 seq 回退 → 服务端按 seq **只读回放**保留窗口历史（单批 ≤20，空 buf 0 条、无关 buf `ret=-3`）；`listen --replay-seq N` 忽略 seen 去重、**落盘游标只进不退**、不回写过期 `context_token` —— 无需用户重发即可重取历史附件样本。
+- **残留 U 项（10）**：P6-cdn / P6-send / P2 长度 4000·4001·8000 / P3 同 `client_id` 双发去重 / P8 URL 渲染+回声 / P4-poll+send 429（读端点并发已测 3× 无 429）/ 真机 302 实况 / 附件体积上限·长语音·probe 与 worker 游标互抢 / `type=5` 与群·小程序卡片 item 形状 / 是否强制 `context_token`。前 5 项阻塞在**需用户同意**。
+- **验收与纪律**：`key-format.json` `conclusion{decryptOk:"6/6", magicOk:"6/6"}` 与报告 §10 一致；`items.jsonl` 43 行覆盖四类签名；stub 回归 35/35 PASS、key/URL/token 泄漏 grep 0；本轮**零 `sendmessage`、零上传、零生产代码改动**。
+- **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md`（新增「入站媒体与附件规格（真机实测 2026-09-25，媒体探针 Phase ③）」+ frontmatter/Evidence/Open Questions/Summary 互链）；Recent Work Item 48。
+
 ## [Unreleased] — 2026-09-25 (local-master-ensure：`0586030`/`f5a9b90`)
 
 - **能力（双入口，幂等 ensure）**：工具 `local-master-ensure`（`master-tools.ts:739`）+ 同名 slash `/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]`（`index.ts:2194`）——同一四层门、同一 `ensureLocalMaster()` 编排、同一审计（`ensure:tool`/`ensure:slash`）。语义 = **幂等“确保活着”而非强行接管**：三段 = precheck（活 owner → `already-running` 零动作零状态写）→ in-flight `wx` first-wins（窗口内重调 `launched(in-flight)` 零第二个 spawn）→ spawn **可见 WT tab**（`spawnPiTab`，taskId `lms-<scope>`、账本 dispatch+link、wt 缺席零账本、失败回写 `launch_failed`）后轮询就绪。参数 `{cwd, waitForReady?=true, timeoutMs?=60000}`，`clampEnsureTimeout` 上限 180000/下限 100ms/非法回落缺省 → 七态 `already-running|launched|ready|spawn-failed|timeout|invalid-cwd|stalled`（`invalid-cwd/spawn-failed/timeout/stalled` 为错态）。

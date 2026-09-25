@@ -20,13 +20,15 @@ source_paths:
   - extensions/wechat-command-consumer.ts
   - extensions/runtime-host/wechat-input.ts
   - extensions/index.ts
+  - plans/0925_wechat_media_probe_results.md
+  - plans/0924_wechat_media_gateway_research.md
 ---
 
 # 微信 iLink 通道
 
 ## Summary
 
-iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
+iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**入站媒体规格（真机实测：item type 矩阵 / 嵌套 `media.*` 形状 / `base64(hex32)` AES key / AES-128-ECB+PKCS7 解密 6/6 + 魔数，见「入站媒体与附件规格」节）**、**出站广播**（`reply.mode="broadcast"`：global master 会话 → 全部已知私聊）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
 
 ## Current Contract
 
@@ -184,6 +186,79 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 **结论**：① 请求与游标处理**正常**（服务端接受并推进游标）；② **UIN 是否跨请求稳定不影响投递**；③ 该 bot 的消息**根本不进入长轮询队列** ⇒ 属**平台侧投递路径**问题（如平台仍把消息推给某个 webhook/后端、或该 bot 的消息走别的投递方式），不是本机实现缺陷。用户侧现象佐证：曾收到 bot 自动回复"暂无法连接openclaw"（说明**有东西在应答**），该回复消失后长轮询仍恒空。
 
 **待用户在平台侧核对**：① bot 的「消息推送 / Webhook / 回调 URL」是否配置（应清空才能走长轮询）；② 绑定用的 `bot_type`（我们用 3）与所聊 bot 是否同一个；③ 是否需要先与 bot 建立会话/好友关系才投递。
+
+## 入站媒体与附件规格（真机实测 2026-09-25，媒体探针 Phase ③）
+
+> **证据级别 B（本机真机实测）**：`plans/0925_wechat_media_probe_results.md` §9/§10（三轮探针，commit `6a72b19` → `9f52a4a` → `d724f6a`，唯一入库文件 `scripts/wechat-ilink-probe.mjs`，**未改任何生产代码**）+ `plans/.wechat-probe/items.jsonl`（43 行脱敏键名签名）+ `plans/.wechat-probe/key-format.json`（6 样本脱敏诊断 + `conclusion` 汇总）。
+> **⚠️ 高价值发现：实测与官方接入指南（C 级）描述不符** —— 指南 §二.3 的平铺 `image_item:{file_id, url, aes_key}` 形状、以及「`aes_key` = 32 hex 或 16B base64」的解密口径，在真机上**都不成立**；入站媒体实现必须按本节真机形状（这与「真机协议实测：指南不可信」是同一类教训的第二例）。
+
+### item type 矩阵（B）
+
+| `type` | 含义 | item 变体键 | 真机样本 |
+|---|---|---|---|
+| `1` | 文本 | `text_item` | `items.jsonl`（含纯 URL 文本） |
+| `2` | 图片 | `image_item` | `items.jsonl` + 2 个解密 jpg |
+| `3` | 语音 | `voice_item` | `items.jsonl` + 2 个解密 silk |
+| `4` | 文件 | `file_item` | `items.jsonl` + 2 个解密 pdf |
+
+- **链接作为文本处理**（无独立 item type）：43 条样本中只出现 1/2/3/4，链接走 `type=1 text_item`。
+- `type=5`（video）**未采样**（U）；群 / 小程序卡片的 item 也未采（U，不影响类型矩阵）。
+- 口径提醒：`type` 是 **item 级**枚举，与信封级 `message_type`（实测取值 1）不是同一枚举，不得互推。
+
+### 信封与 item 公共字段（B）
+
+- **信封（逐条消息）**：`{message_type, message_state, hasContextToken, hasGroupId}`，实测取值 `message_type=1`、`message_state=2`、`hasContextToken=true`、`hasGroupId=false`。
+- **id 双层**：信封层 `message_id`（number，`msgIdPath="message_id"`）；item 层 `msg_id`（string）。信封无 item 级 id 字段。
+- **item 公共键（四类全有）**：`create_time_ms:number`、`update_time_ms:number`、`is_completed:boolean`、`msg_id:string`、`button_item_list:array`、`at_bot_username_list:array`。
+
+### 各类型 item 形状（签名降级为类型，原文见 `items.jsonl`）
+
+| type | 变体键形状 |
+|---|---|
+| 1 | `text_item:{text:string}` |
+| 2 | `image_item:{aeskey:string, **media:{encrypt_query_param, aes_key, full_url}**, mid_size:number, thumb_size:number, thumb_height:number, thumb_width:number, hd_size:number}` |
+| 3 | `voice_item:{media:{encrypt_query_param, aes_key, full_url}, encode_type:number, bits_per_sample:number, sample_rate:number, playtime:number, text:string}` |
+| 4 | `file_item:{media:{encrypt_query_param, aes_key, full_url}, file_name:string, md5:string, len:string}` |
+
+- **附件 URL / key 在嵌套 `media.full_url` 与 `media.aes_key`**（不是平铺顶层）；图片另有顶层小写 `aeskey`（见下节）。文件名在 `file_item.file_name`（image/voice 无文件名字段，落盘名需安全化派生）。
+- 尺寸用 `mid_size` / `thumb_*` / `hd_size` / `len`，**没有**通用 `size`；`file_id`/`media_id` **未观测到**（指南写法不成立）。
+- 与旧读数的差异及失败根因（平铺 `media.url` 提取 → URL 为空 → 下载/解密从未发起）：`plans/0925_wechat_media_probe_results.md` §9.1–§9.2。
+
+### AES key 格式与解密（B，6/6）
+
+| 项 | 真机实测（6 样本一致） |
+|---|---|
+| `media.aes_key` | **`len=44` / base64 / 带 padding** → base64 解码得 **32B ASCII hex 文本** → hex 解码得 **16B AES-128 key**，即 **`base64(hex32)` 双层编码** |
+| 顶层 `aeskey`（**仅 `image_item` 有**） | **`len=32` / hex** → 16B；与 `media.aes_key` **字符串不同**（`same:false`）但**派生 16B key 相同**（`sameDerivedKey:true`）= 同一把 key 两种编码 |
+| `file_item` / `voice_item` 顶层 | **无** `aeskey`（key 只在 `media.aes_key`） |
+| 解密算法 | **AES-128-ECB + PKCS7**；候选链（32hex / base64→16B / base64url / `base64(hex32)`）**逐方案试出**，判优 = PKCS7+魔数 > 魔数 > PKCS7，全不中如实失败 —— **不是硬编码成功** |
+| 真机结果 | **解密 6/6 + 魔数 6/6**：`FFD8FF`→jpeg×2（plainBytes = `mid_size`）、`%PDF`→pdf×2、`0x02`+`#!SILK_V3`→silk×2 |
+
+- **与指南（C 级）冲突点**：指南 L200 称「`aes_key` = 32 hex 或 16B base64」——真机值两者都不是（base64 解出 **32B** 而非 16B），旧 `parseAesKey` 因此直接判「格式无效」；Hermes `weixin.py#L2145-L2225`「`aes_key` 必须是 base64(hex 字符串)、`b64(raw)` 会灰图」与实测自洽（C↔B），photon-hq 的 `aes_key(base64)` 是**不完整表述**。
+- 脱敏纪律：诊断只记 `len/charset/hasPadding/prefix4/decodedByteLen/sampleHexPreview(≤4B)/same`，**无完整 key**；grep 44 字符 base64 / 32 hex / 完整 key = 0 命中。
+
+### CDN 边界与下载纪律（B）
+
+- 6/6 附件 host = **`novac2c.cdn.weixin.qq.com`**，命中 allowlist 后缀 **`.qq.com`**，**hops=0**（本轮未见 302）。探针侧 `CDN_SUFFIX_ALLOW = [.qq.com, .qpic.cn, .weixin.qq.com, .wx.qq.com, .cdn.cn]` + 同源 host + `WECHAT_PROBE_EXTRA_HOSTS`（`scripts/wechat-ilink-probe.mjs#L141-L149::isHostAllowed`）。
+- 下载面：`redirect:"manual"` + **每跳复检** `isHostAllowed`（≤3 跳），拒绝记 `attachment_download_blocked{reason,host,hops}`；**302 越域实测被拒**（stub 回归 `host-not-allowed hops=1`），初始越域补记 `hops=0` 审计；成功记 `attachment_download{status,host,hops,plainBytes}`（**不记 URL/key/密文**）。
+- **生产侧仍无任何下载/解密代码**（M1 范围）；文件名安全化实测中文保留、`../` 路隔符 → `_`（无穿越）。
+
+### 出站 upload 端点（B，硬门 P5 已通过）
+
+| 探测 | 实测 | 判读 |
+|---|---|---|
+| `POST /ilink/bot/getuploadurl`（占位参数） | **200**，响应**单键 `upload_full_url`**（816B 预签名 URL，host=`novac2c.cdn.weixin.qq.com` 命中 allowlist），无 `data` 包裹 | **端点存在并真的发预签名 URL** |
+| 同上，坏 / 无 token | `errcode=-14`（session timeout） | **鉴权生效** |
+| 同上，空 body | `ret=-2` | 参数校验生效 |
+| `POST /ilink/bot/upload`（multipart 候选） | **404 + 空体** | **路径不存在** ⇒ D 级分歧收敛，**两段式** |
+| `OPTIONS`（任一路径） | 照样走鉴权+参数校验 | **方法论：不能用 OPTIONS 判「方法是否支持」** |
+
+- 负控制（不存在路径 → 404）证明本服务**能**用 404 区分「路径不存在」⇒ 200 有信息量；`getuploadurl` 只回 `upload_full_url`、无 `upload_param`，落在 Hermes 已覆盖的分支（C↔B 自洽）。
+- **仍未测（U）**：CDN 是否收我们的密文与 POST 方法（Hermes 称旧 PUT 会 404 须 POST，**C 级未本机验证**）、`x-encrypted-param` 是否返回、`sendmessage` 带媒体 item 是否被接受、是否强制 `context_token` ⇒ **P6 取证前不写任何出站媒体生产代码**。
+
+### 采集方法备忘：只读回放（B）
+
+`getupdates` 的 `get_updates_buf` 是 proto `{内层 field1 = last-seen seq, …}/{会话标识}`；把内层 seq 回退后**服务端按该 seq 回放保留窗口历史消息**（单批 ≤20；空 buf → 0 条、无关 buf → `ret=-3` 拒绝）。探针 `listen --replay-seq N` 只发只读 `getupdates`、回放批忽略 seen 去重、**落盘游标只进不退**、不回写过期 `context_token`、与 worker 两套 buf 独立 —— 这是「无需用户重发即可重取历史附件样本」的可复用取证手段。
 
 ## W2 实现切片（**已落地** `168fed1`：微信私聊文本 → 当前 master owner）
 
@@ -363,6 +438,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 广播验收：`extensions/_test_wechat_broadcast.ts`（18 组断言块，修复后实跑全绿）；L4 复核 `plans/0924_wechat_broadcast_l4_review.md`（本地 gitignored）。
 - 远程斜杠命令（commit `488e942`，L4 修复 `ebb9e04`）：`extensions/runtime/wechat-remote-command.ts`（`normalizeForClassify#L118`、`classifyRemoteCommand#L227`、`ENTRIES#L166`、`DANGER_EXACT#L130`）、`extensions/wechat-command-consumer.ts`（`scanWechatRemoteCommands#L250`、`registerWechatRemoteCommands#L494`、`defaultRemoteCommandDeps#L404`、`buildWechatStatusText#L170`）、`extensions/runtime-host/wechat-input.ts#L39-L51`（M2 注入点门）、`extensions/runtime-host/wechat-bind.ts#L249-L257`（能力门 fail-closed）、`extensions/channel-wechat/store.ts#L57`+`#L332`（`consumed` 终态与透传）、`extensions/runtime/wechat-reply.ts#L34` + `extensions/channel-wechat/send.ts#L82`（intent id / clientId 派生）、`extensions/runtime-host/wechat-reply.ts#L36`+`#L44`（command 豁免 `reply.enabled` 门）、`extensions/index.ts#L1868`（接线）、`README.md#L71`（运行时 pi ≥ 0.87）。
 - 命令通道验收：`extensions/_test_wechat_remote_command.ts`（22 组断言块 + 15 条绕过矩阵，修复后实跑全绿）；L4 复核 `plans/0924_wechat_remote_command_l4_review.md`（本地 gitignored）。
+- 入站媒体与附件规格（媒体探针三轮，commit `6a72b19` + `9f52a4a` + `d724f6a`，仅 `scripts/wechat-ilink-probe.mjs`）：`scripts/wechat-ilink-probe.mjs`（`isHostAllowed`/`CDN_SUFFIX_ALLOW#L141-L149`、key 候选链 `#L202`、解密与判优 `#L276-L303`、`extractAttachments` 按 `media.full_url`/`media.aes_key`、`--replay-seq#L700`、`upload-probe`/`media-probe`）；本地 `plans/0925_wechat_media_probe_results.md` §9/§10（B 级权威）+ `plans/0924_wechat_media_gateway_research.md` §0/§3.4（P1–P8 判读口径与 M1/M4 依赖）；脱敏测量 `plans/.wechat-probe/items.jsonl`（43 行签名，type 1/2/3/4 全覆盖）、`key-format.json`（6 样本 + `conclusion{decryptOk:"6/6", magicOk:"6/6"}`）、`measure.jsonl`（`kind=attachment_download` 带 `magic/sha256_8/keyScheme`）。
 
 ## Links Out
 
@@ -375,7 +451,8 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 ## Open Questions
 
-- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放未测；④空批推进游标已测；⑤相同 `client_id` 的服务端去重未定论（API 双发均成功，手机端条数待人工观察）；⑥并发 poll+send 限流/429 未测；⑦附件 URL 主机/大小限制未测。另：出站文本长度上限与 bot 回声行为未验证。
+- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放已测（`--replay-seq` 只读回放，见「采集方法备忘」）；④空批推进游标已测；⑤相同 `client_id` 的服务端去重未定论（API 双发均成功，手机端条数待人工观察）；⑥并发 poll+send 限流/429 未测；⑦附件 **host 已测**（`novac2c.cdn.weixin.qq.com`，命中 `.qq.com` allowlist，6/6 hops=0），**单文件体积上限/长语音/大文件表现/下载耗时未测**。另：出站文本长度上限与 bot 回声行为未验证。
+- 媒体（Phase ③ 探针残留 U 项，需用户同意才可测）：① **P6-cdn** —— CDN 是否收我们的密文 POST、`x-encrypted-param` 是否返回、POST/PUT 哪个成功（不打扰用户，一句话同意即可）；② **P6-send** —— `sendmessage` 带媒体 item 是否被手机端正确渲染（灰图 = `aes_key` 编码坑），会打扰用户一次；③ **P2** 出站文本 4000/4001/8000 边界；④ **P3** 同 `client_id` 双发去重（需人工数条数）；⑤ **P8** 出站 URL 渲染 + bot 自发回声；⑥ **P4-poll+send** 并发 429/`Retry-After`（读端点并发已测：3× 无 429）；⑦ 真机 302 实况（本轮 hops=0 未见跳转，越域拒绝只有 stub 证据）；⑧ 附件体积上限 / 长语音 / probe 与 worker 两套游标是否互抢消息；⑨ `type=5`（video）与群/小程序卡片 item 形状未采；⑩ 是否强制 `context_token`（研究 U4）。
 - 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。
 - 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；③ 服务端 `client_id` 去重语义仍**未定论**（已用 per-recipient clientId 规避跨收件人互斥，同 id 双发是否只投一条未知，沿用⑤）；④ 出站文本长度上限未测（4000 为本地预算）。
 - 远程斜杠命令通道待实测/未决：① 真机会话内 `/wechat-remote-run` 派发（含 agent 忙时 defer 窗口）只有静态依据 + fakePi 单测，**未做真机会话验证**；② GUI 面未做——`remoteCommands.enabled` 界面开关（D17）与 inbox 对 `state:"consumed"` 的徽章渲染（当前显示字面 `consumed`）；③ 诊断面只给 `commandAuditLines` 行数，`consumed` 记录明细仍不可见（quarantine 列表只列 `rejected`）；④ 真机端到端被平台侧消息投递问题阻塞（见「判定实验」节）——通道目前只有本机断言与 fakePi 证据。
