@@ -11,7 +11,9 @@
  *           回放历史消息（真机实测：seq>N 返回保留窗口内历史，单批上限 20 条；未知/空 buf 返回 ret=-3 或空）。**不改服务端状态、不发任何消息**；
  *           回放批忽略 seen 去重（否则已收过的附件解密拿不到），落盘口径与正常 listen 完全一致。
  *           落盘游标只进不退：回放返回的 buf seq 若低于本批前的头，仍持久化原头。
- *   node scripts/wechat-ilink-probe.mjs send <toUserId> <text> [contextToken] [--client-id ID] [--with-poll]
+ *   node scripts/wechat-ilink-probe.mjs send <toUserId> <text> [contextToken] [--client-id ID] [--with-poll] [--to-last]
+ *       --to-last = 收件人不写在命令行：从 probe last-context.json → host inbox 反查（自动跳过 @im.bot 防环域），
+ *                   用于出站补测（P2/P3/P8）时不把 openid 硬编码/暴露在命令行。
  *   node scripts/wechat-ilink-probe.mjs reply [--from-last] <toUserId> <text...>  // 用持久化的最近入站 context_token 回复
  *   node scripts/wechat-ilink-probe.mjs typing <toUserId> [contextToken]
  *   node scripts/wechat-ilink-probe.mjs status
@@ -448,14 +450,16 @@ function loadCredsOrThrow(args = []) {
 
 /** 最近入站发件人（P5 的 to_user_id 占位用真实值）：probe 自己的 last-context → host inbox 最新记录。 */
 function latestInboxFromId() {
+  // 防环域不作为收件人：bot 自身回声（@im.bot）若污染 last-context/inbox，也不能拿它当 to_user_id。
+  const notBot = (v) => typeof v === "string" && v.length > 0 && !v.endsWith("@im.bot");
   const lc = loadJson(LAST_CONTEXT_PATH, null);
-  if (lc?.toUserId) return String(lc.toUserId);
+  if (notBot(lc?.toUserId)) return String(lc.toUserId);
   try {
     const dir = path.join(hostRuntimeDir(), "wechat", "receive", "inbox");
     const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
     for (let i = files.length - 1; i >= 0; i--) {
       const o = loadJson(path.join(dir, files[i]), null);
-      if (o?.fromId) return String(o.fromId);
+      if (notBot(o?.fromId)) return String(o.fromId);
     }
   } catch { /* host inbox 不可用则返回空串，由调用方决定是否继续 */ }
   return "";
@@ -480,7 +484,8 @@ function loadLastContextOrThrow() {
 function printInboundMessage(m, index) {
   // 只打印脱敏字段：id / sender / 文本 / 附件元数据（无 aes_key、无 token）。
   console.log(`--- inbound #${index} id=${m.id} from=${m.senderId}${m.displayName ? `(${m.displayName})` : ""}`);
-  if (m.text) console.log(`    text: ${m.text.slice(0, 500)}`);
+  // textLen = 回声判读用（出站 4001 字符是否被截断，只看长度不看正文截取）。
+  if (m.text) console.log(`    text(len=${m.text.length}): ${m.text.slice(0, 500)}`);
   if (m.contextTokenPresent) console.log(`    context_token: <present>（回复时自动回传，不打印原文）`);
   for (const a of (m.attachments || [])) {
     // 只打字段路径与 host：绝不打 URL 原文 / key 原文。
@@ -969,8 +974,14 @@ async function cmdListen(args) {
 
 async function cmdSend(args) {
   const timeoutMs = timeoutMsFromArgs(args);
-  const [toUserId, text, contextToken] = positionalArgs(args);
-  if (!toUserId || !text) throw new Error("用法：send <toUserId> <text> [contextToken] [--client-id ID] [--with-poll]");
+  const useLast = args.includes("--to-last");
+  const pos = positionalArgs(args);
+  // --to-last：收件人由 last-context.json / host inbox 反查（不硬编码 openid，不出现在命令行）。
+  const toUserId = useLast ? latestInboxFromId() : pos[0];
+  const text = useLast ? pos[0] : pos[1];
+  const contextToken = useLast ? pos[1] : pos[2];
+  if (!toUserId) throw new Error("--to-last 解析不到收件人（last-context.json 与 host inbox 均空或只有 @im.bot）。先 listen 拿一条入站。");
+  if (!text) throw new Error("用法：send [<toUserId>] <text> [contextToken] [--to-last] [--client-id ID] [--with-poll]");
   const clientIdOpt = flagValue(args, "--client-id");
   const clientId = clientIdOpt || randomUUID();
   const withPoll = args.includes("--with-poll");
@@ -1004,7 +1015,8 @@ async function cmdSend(args) {
     res = await doSend();
   }
   const ret = res.payload?.ret ?? res.payload?.errcode ?? (res.ok ? 0 : res.httpStatus);
-  appendMeasure({ kind: "send_dedup", clientIdReused: Boolean(clientIdOpt), httpStatus: res.httpStatus, ret });
+  // textLen = P2 出站长度上限的本地证据（发了多长）；不含正文、不含收件人。
+  appendMeasure({ kind: "send_dedup", clientIdReused: Boolean(clientIdOpt), httpStatus: res.httpStatus, ret, textLen: text.length, toLast: useLast });
   if (contextToken !== undefined) {
     appendMeasure({ kind: "context_token_result", op: "sendmessage", ok: res.ok && ret === 0, ret });
   }
@@ -1377,12 +1389,14 @@ async function cmdMediaProbe(args) {
   }, timeoutMs);
   const p3 = (r3.payload && typeof r3.payload === "object") ? r3.payload : {};
   const ret3 = typeof p3.ret === "number" ? p3.ret : (typeof p3.errcode === "number" ? p3.errcode : null);
+  // errmsg = 服务端诊断串（非凭据）；脱敏只剥 URL，便于判读 ret!=0 的缺字段，不猜字段名。
+  const errmsg3 = typeof p3.errmsg === "string" ? p3.errmsg.replace(/https?:\/\/\S+/gi, "<url>") : null;
   appendMeasure({
-    kind: "media_probe", stage: "send", httpStatus: r3.httpStatus, ret: ret3,
+    kind: "media_probe", stage: "send", httpStatus: r3.httpStatus, ret: ret3, errmsg: errmsg3,
     payloadKeys: Object.keys(p3).slice(0, 20), hasCaption: Boolean(caption),
-    messageIdPresent: "message_id" in p3,
+    messageIdPresent: "message_id" in p3, itemListLen: itemList.length, itemTypes: itemList.map((i) => i.type),
   });
-  console.log(`[probe] send: HTTP ${r3.httpStatus} ret=${ret3} keys=[${Object.keys(p3).join(",")}] → 请在手机端确认图片可见且清晰（人工验收点）。`);
+  console.log(`[probe] send: HTTP ${r3.httpStatus} ret=${ret3} errmsg=${errmsg3 ?? "<absent>"} keys=[${Object.keys(p3).join(",")}]${p3.message_id ? ` message_id=<present>` : " message_id=<absent>"} → 请在手机端确认图片可见且清晰（人工验收点）。`);
 }
 
 function cmdStatus() {
@@ -1425,7 +1439,7 @@ try {
   else if (cmd === "media-probe") await cmdMediaProbe(rest);
   else if (cmd === "status") cmdStatus();
   else {
-    console.error("用法：login | listen [--raw-items] [--decrypt] [--short] [--stop-on-hit] [--max-batches N] [--replay-seq N] [--out DIR] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
+    console.error("用法：login | listen [--raw-items] [--decrypt] [--short] [--stop-on-hit] [--max-batches N] [--replay-seq N] [--out DIR] | send [<toUserId>] <text> [contextToken] [--to-last] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
     process.exit(2);
   }
 } catch (e) {
