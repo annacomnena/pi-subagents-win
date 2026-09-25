@@ -10,6 +10,26 @@
  *   node scripts/wechat-ilink-probe.mjs typing <toUserId> [contextToken]
  *   node scripts/wechat-ilink-probe.mjs status
  *
+ * 探针阶段（M0，plans/0924_wechat_media_gateway_research.md §3.4 P1–P8）实验子命令：
+ *   node scripts/wechat-ilink-probe.mjs upload-probe [--to <uid>] [--creds host|probe]
+ *       P5：出站媒体硬前置门——候选 upload 端点存在性（最小请求，无用户可见副作用）。
+ *           同时打 1 个已知端点 + 1 个负控制路径，用于判读 401/403 是否只说明“鉴权先于路由”。
+ *   node scripts/wechat-ilink-probe.mjs listen --raw-items
+ *       P1：入站 item 形状采集（只记 type 取值 + 键名签名，不记文本/URL 值）。
+ *   node scripts/wechat-ilink-probe.mjs conc [--mode read|send] [--n 3]
+ *       P4：并发限流。read = 并发只读 getconfig（安全，可直接跑）；
+ *           send = 真·poll+send，走既有 `send --with-poll`，需用户同意后手动执行。
+ *   node scripts/wechat-ilink-probe.mjs media-probe [--stage pre|cdn|send] [--consent cdn|send] [--file F] [--caption T]
+ *       P6：出站两段式上传。pre = getuploadurl（无副作用，可直接跑）；
+ *           cdn = 密文 POST 到微信 CDN（写第三方存储，需 --consent cdn）；
+ *           send = 再发一条带图片 item 的 sendmessage（**会打扰用户**，需 --consent send + 手机端人工确认）。
+ *           cdn/send 的请求形状取自两份独立 C 级实现（Hermes weixin.py / photon-hq），脚本内已标注。
+ *   P2/P3/P6/P8 用既有 `send` / `listen` 组合完成（见探针报告里的命令清单），不另造端点。
+ *
+ * 凭据（红线）：优先用本探针自己的 plans/.wechat-probe/creds.json；缺失时回退 host 侧
+ *   <runtimeDir>/wechat/credentials.json，读法与 extensions/runtime-host/wechat-bind.ts#readWechatCreds
+ *   严格同口径（botToken/boundAt/baseUrl 三串必须非空，坏 JSON → null）。token 永不打印/落盘到 measure。
+ *
  * 环境变量覆盖（用于 stub 测试）：
  *   WECHAT_ILINK_BASE_URL   默认 https://ilinkai.weixin.qq.com
  *   WECHAT_PROBE_DIR        默认 plans/.wechat-probe
@@ -20,8 +40,9 @@
  *   只记存在性与长度。凭据文件尽量 0600（Windows 下 chmod 仅尽力，见清单文档）。
  */
 import { Buffer } from "node:buffer";
-import { createDecipheriv, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -37,6 +58,7 @@ const CREDS_PATH = path.join(PROBE_DIR, "creds.json");
 const STATE_PATH = path.join(PROBE_DIR, "state.json");
 const MEASURE_PATH = path.join(PROBE_DIR, "measure.jsonl");
 const LAST_CONTEXT_PATH = path.join(PROBE_DIR, "last-context.json");
+const ITEMS_PATH = path.join(PROBE_DIR, "items.jsonl");   // P1 item 形状签名（脱敏）
 const DEFAULT_OUT_DIR = path.join(PROBE_DIR, "downloads");
 
 let aborted = false;
@@ -69,7 +91,7 @@ function flagValue(args, name) {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 }
-const FLAG_WITH_VALUE = new Set(["--timeout-ms", "--out", "--max-batches", "--client-id"]);
+const FLAG_WITH_VALUE = new Set(["--timeout-ms", "--out", "--max-batches", "--client-id", "--creds", "--to", "--mode", "--n"]);
 function positionalArgs(args) {
   const out = [];
   for (let i = 0; i < args.length; i++) {
@@ -122,7 +144,10 @@ async function fetchJson(url, opts, timeoutMs) {
     let json = {};
     try { json = text ? JSON.parse(text) : {}; } catch { json = { _raw_len: text.length }; }
     const payload = (json && typeof json === "object" && json.data && typeof json.data === "object") ? json.data : json;
-    return { httpStatus: res.status, ok: res.ok, payload };
+    // Retry-After 只在 429/503 出现，是限流证据，非秘密 → 记录（P4/S1）。
+    const retryAfter = res.headers.get("retry-after");
+    const topKeys = (json && typeof json === "object") ? Object.keys(json) : [];
+    return { httpStatus: res.status, ok: res.ok, payload, retryAfter, bodyBytes: text.length, topKeys };
   } finally { clearTimeout(t); }
 }
 function parseAesKey(raw) {
@@ -215,10 +240,55 @@ async function cmdLogin(args) {
   }
 }
 
-function loadCredsOrThrow() {
-  const c = loadJson(CREDS_PATH, null);
-  if (!c?.botToken) throw new Error(`无凭据：先跑 login（期望 ${CREDS_PATH}）。`);
-  return c;
+/** host 侧凭据路径：与 runtime/journal.ts#defaultRuntimeDir + wechat-bind.ts#wechatCredsPath 同口径。 */
+function hostRuntimeDir() {
+  const override = (process.env.PI_RUNTIME_DIR || "").trim();
+  return override ? override : path.join(os.homedir(), ".pi", "agent", "runtime");
+}
+function hostCredsPath() {
+  return path.join(hostRuntimeDir(), "wechat", "credentials.json");
+}
+/** host 凭据读法：与 extensions/runtime-host/wechat-bind.ts#readWechatCreds 严格同口径
+ *  （botToken/boundAt/baseUrl 三串必须非空；坏 JSON/缺字段 → null；错误信息不含 token 原文）。 */
+function readHostCreds() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(hostCredsPath(), "utf8"));
+    if (typeof raw.botToken !== "string" || raw.botToken.length === 0) return null;
+    if (typeof raw.boundAt !== "string" || raw.boundAt.length === 0) return null;
+    if (typeof raw.baseUrl !== "string" || raw.baseUrl.length === 0) return null;
+    return { botToken: raw.botToken, boundAt: raw.boundAt, baseUrl: raw.baseUrl };
+  } catch {
+    return null;
+  }
+}
+/** 凭据解析：缺省 probe creds 优先（历史口径），无则回退 host 只读凭据；`--creds host|probe` 可强制。
+ *  只返回 token 本身供内存内构造鉴权头，日志只打来源路径与存在性。 */
+function loadCredsOrThrow(args = []) {
+  const want = flagValue(args, "--creds");
+  if (want !== "host") {
+    const c = loadJson(CREDS_PATH, null);
+    if (c?.botToken) return { botToken: c.botToken, source: CREDS_PATH, loginTs: c.loginTs };
+    if (want === "probe") throw new Error(`无凭据：先跑 login（期望 ${CREDS_PATH}）。`);
+  }
+  const h = readHostCreds();
+  if (!h) throw new Error(`无凭据：probe(${CREDS_PATH}) 与 host(${hostCredsPath()}) 均无可用 bot_token；先 login 或完成绑定。`);
+  console.log(`[probe] 凭据来源：host ${hostCredsPath()}（bot_token: ${redactPresence(h.botToken)}）`);
+  return { botToken: h.botToken, source: hostCredsPath(), loginTs: h.boundAt };
+}
+
+/** 最近入站发件人（P5 的 to_user_id 占位用真实值）：probe 自己的 last-context → host inbox 最新记录。 */
+function latestInboxFromId() {
+  const lc = loadJson(LAST_CONTEXT_PATH, null);
+  if (lc?.toUserId) return String(lc.toUserId);
+  try {
+    const dir = path.join(hostRuntimeDir(), "wechat", "receive", "inbox");
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+    for (let i = files.length - 1; i >= 0; i--) {
+      const o = loadJson(path.join(dir, files[i]), null);
+      if (o?.fromId) return String(o.fromId);
+    }
+  } catch { /* host inbox 不可用则返回空串，由调用方决定是否继续 */ }
+  return "";
 }
 
 function saveLastContext(msg) {
@@ -247,13 +317,51 @@ function printInboundMessage(m, index) {
   }
 }
 
-function normalizeUpdates(payload, prevBuf) {
+/** P1 形状签名：只保留键名与值的类型，字符串值一律降为 "string"（不落任何原文）。 */
+function sigOf(v, depth = 0) {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return v.length && depth < 4 ? [sigOf(v[0], depth + 1)] : "array";
+  if (typeof v === "object") {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = depth < 4 ? sigOf(v[k], depth + 1) : typeof v[k];
+    return o;
+  }
+  return typeof v;
+}
+/** 枚举类字段（type/message_type/message_state）允许记取值：仅 number 或短标识符串。 */
+function scalarEnum(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && /^[A-Za-z0-9_]{1,24}$/.test(v)) return v;
+  return v === undefined ? undefined : typeof v;
+}
+
+function normalizeUpdates(payload, prevBuf, opts = {}) {
   const rawList = Array.isArray(payload.item_list) ? payload.item_list
     : Array.isArray(payload.messages) ? payload.messages
     : Array.isArray(payload.msgs) ? payload.msgs : [];
   const messages = [];
+  const shapes = [];
   for (const raw of rawList) {
     const msg = (raw.msg && typeof raw.msg === "object" ? raw.msg : raw);
+    if (opts.rawItems) {
+      // 在 senderId 判空之前采形状：即使无法归一化为消息，也保留 type/键名证据（P1）。
+      const items = Array.isArray(msg.item_list) ? msg.item_list : Array.isArray(raw.item_list) ? raw.item_list : [];
+      shapes.push({
+        envelope: {
+          message_type: scalarEnum(msg.message_type ?? raw.message_type),
+          message_state: scalarEnum(msg.message_state ?? raw.message_state),
+          hasContextToken: Boolean(msg.context_token || raw.context_token),
+          hasGroupId: Boolean(msg.group_id || raw.group_id),
+        },
+        itemCount: items.length,
+        items: items.map((it) => ({
+          type: scalarEnum(it?.type),
+          variantKeys: it && typeof it === "object" ? Object.keys(it).filter((k) => k !== "type") : [],
+          sig: sigOf(it),
+          textLen: typeof it?.text_item?.text === "string" ? it.text_item.text.length : undefined,
+        })),
+      });
+    }
     const from = (msg.from && typeof msg.from === "object" ? msg.from : raw.from) || {};
     const senderId = String(from.id || from.wxid || from.user_id || msg.from_user_id || raw.from_user_id || "");
     if (!senderId) continue;
@@ -297,7 +405,27 @@ function normalizeUpdates(payload, prevBuf) {
     });
   }
   const nextBuf = String(payload.buf || payload.next_buf || payload.get_updates_buf || prevBuf);
-  return { messages, nextBuf };
+  return { messages, nextBuf, shapes };
+}
+
+/** P7/K2：带 redirect:"manual" 的下载——每一跳复检 allowlist（0923 L4 残余风险①：302 可越域）。 */
+async function safeDownload(url, timeoutMs, maxHops = 3) {
+  let cur = url;
+  for (let hops = 0; ; ) {
+    const gate = isHostAllowed(cur);
+    if (!gate.ok) return { blocked: true, reason: "host-not-allowed", host: gate.host, hops };
+    const res = await fetch(cur, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      if (!loc) return { blocked: true, reason: "3xx-missing-location", host: "<unknown>", hops };
+      if (++hops > maxHops) return { blocked: true, reason: "too-many-hops", host: "<unknown>", hops };
+      try { cur = new URL(loc, cur).toString(); } catch { return { blocked: true, reason: "bad-location", host: "<invalid>", hops }; }
+      continue;
+    }
+    let finalHost = "<unknown>";
+    try { finalHost = new URL(cur).hostname; } catch { /* ignore */ }
+    return { res, finalHost, hops };
+  }
 }
 
 async function cmdListen(args) {
@@ -306,12 +434,13 @@ async function cmdListen(args) {
   const outDir = flagValue(args, "--out") || DEFAULT_OUT_DIR;
   const maxBRaw = flagValue(args, "--max-batches") ?? process.env.WECHAT_PROBE_MAX_BATCHES ?? "Infinity";
   const maxB = Number(maxBRaw);
-  const { botToken } = loadCredsOrThrow();
+  const { botToken } = loadCredsOrThrow(args);
   const creds = loadJson(CREDS_PATH, {});
+  const rawItems = args.includes("--raw-items");   // P1：只记 type/键名签名
   let state = loadJson(STATE_PATH, { buf: "", seenIds: [], lastMeasurement: null });
   const seen = new Set(state.seenIds || []);
   if (doDecrypt) fs.mkdirSync(outDir, { recursive: true });
-  console.log(`[probe] listen 启动：buf=${state.buf ? `<present len=${state.buf.length}>` : "<empty>"} decrypt=${doDecrypt} timeout=${timeoutMs}ms`);
+  console.log(`[probe] listen 启动：buf=${state.buf ? `<present len=${state.buf.length}>` : "<empty>"} decrypt=${doDecrypt} rawItems=${rawItems} timeout=${timeoutMs}ms`);
   let batches = 0;
   for (;;) {
     if (aborted || batches >= maxB) break;
@@ -345,7 +474,15 @@ async function cmdListen(args) {
       await new Promise((r) => setTimeout(r, 5000));
       continue;
     }
-    const { messages, nextBuf } = normalizeUpdates(res.payload, bufIn);
+    const { messages, nextBuf, shapes } = normalizeUpdates(res.payload, bufIn, { rawItems });
+    if (rawItems && shapes.length) {
+      for (const s of shapes) {
+        // 只打 type 取值与键名签名：无文本、无 URL、无 token。
+        console.log(`    [item-shape] envelope=${JSON.stringify(s.envelope)} items=${JSON.stringify(s.items)}`);
+        fs.appendFileSync(ITEMS_PATH, JSON.stringify({ ts: nowIso(), ...s }) + "\n", "utf8");
+        appendMeasure({ kind: "item_shape", envelope: s.envelope, itemCount: s.itemCount, types: s.items.map((i) => i.type ?? null) });
+      }
+    }
     // 未知项 ③④：重放检测 + 空批是否推进 buf
     const dupIds = messages.filter((m) => seen.has(m.id)).map((m) => m.id);
     const bufAdvanced = nextBuf !== bufIn;
@@ -369,12 +506,23 @@ async function cmdListen(args) {
         for (const a of m.attachments) {
           if (!a._url || !a._aesKey) { console.log(`    [decrypt] 跳过 ${a.filename}（缺 URL/key 或 host 被拦截）`); continue; }
           try {
-            const dl = await fetch(a._url, { signal: AbortSignal.timeout(timeoutMs) });
-            if (!dl.ok) { console.log(`    [decrypt] 下载失败 HTTP ${dl.status}`); continue; }
-            const plain = decryptEcb(Buffer.from(await dl.arrayBuffer()), a._aesKey);
+            const dl = await safeDownload(a._url, timeoutMs);
+            if (dl.blocked) {
+              console.log(`    [decrypt] 拒绝下载 ${a.filename}（${dl.reason} host=${dl.host} hops=${dl.hops}）`);
+              appendMeasure({ kind: "attachment_download_blocked", reason: dl.reason, host: dl.host, hops: dl.hops });
+              continue;
+            }
+            if (!dl.res.ok) {
+              console.log(`    [decrypt] 下载失败 HTTP ${dl.res.status}`);
+              appendMeasure({ kind: "attachment_download", ok: false, status: dl.res.status, host: dl.finalHost, hops: dl.hops });
+              continue;
+            }
+            const plain = decryptEcb(Buffer.from(await dl.res.arrayBuffer()), a._aesKey);
             const fp = path.join(outDir, `${m.id}_${a.filename}`.replace(/[\\/:*?"<>|]/g, "_"));
             fs.writeFileSync(fp, plain);
-            console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B)`);
+            // 只记 host/跳数/字节数：不记最终 URL（P7 证据口径）。
+            appendMeasure({ kind: "attachment_download", ok: true, status: 200, host: dl.finalHost, hops: dl.hops, plainBytes: plain.length });
+            console.log(`    [decrypt] 已保存 ${fp} (${plain.length}B) host=${dl.finalHost} hops=${dl.hops}`);
           } catch (e) { console.log(`    [decrypt] 失败：${String(e.message).slice(0, 100)}`); }
         }
       }
@@ -399,7 +547,7 @@ async function cmdSend(args) {
   const clientIdOpt = flagValue(args, "--client-id");
   const clientId = clientIdOpt || randomUUID();
   const withPoll = args.includes("--with-poll");
-  const { botToken } = loadCredsOrThrow();
+  const { botToken } = loadCredsOrThrow(args);
   const body = {
     base_info: { channel_version: "2.0.0" },
     msg: {
@@ -422,7 +570,7 @@ async function cmdSend(args) {
     }, timeoutMs)]);
     res = s.status === "fulfilled" ? s.value : { httpStatus: 0, ok: false, payload: { _error: String(s.reason).slice(0, 120) } };
     const pollSt = p.status === "fulfilled" ? p.value.httpStatus : 0;
-    appendMeasure({ kind: "concurrency_probe", sendHttp: res.httpStatus, pollHttp: pollSt });
+    appendMeasure({ kind: "concurrency_probe", sendHttp: res.httpStatus, pollHttp: pollSt, sendRetryAfter: res.retryAfter ?? null, pollRetryAfter: p.status === "fulfilled" ? (p.value.retryAfter ?? null) : null });
     if (res.httpStatus === 429 || pollSt === 429) console.log("[probe] 观察到 429：同 token 并发被限流。");
     else console.log(`[probe] 并发完成：send=${res.httpStatus} poll=${pollSt}（均非 429 则暂无线流证据）`);
   } else {
@@ -457,7 +605,7 @@ async function cmdReply(args) {
   const record = loadLastContextOrThrow();
   if (fromLast) toUserId = record.toUserId;
   if (!toUserId) throw new Error(`最近入站记录缺少 toUserId，请显式传 toUserId（期望 ${LAST_CONTEXT_PATH}）。`);
-  const { botToken } = loadCredsOrThrow();
+  const { botToken } = loadCredsOrThrow(args);
   const contextToken = record.contextToken;
   const body = {
     base_info: { channel_version: "2.0.0" },
@@ -487,7 +635,7 @@ async function cmdTyping(args) {
   const timeoutMs = timeoutMsFromArgs(args);
   const [toUserId, contextToken] = positionalArgs(args);
   if (!toUserId) throw new Error("用法：typing <toUserId> [contextToken]");
-  const { botToken } = loadCredsOrThrow();
+  const { botToken } = loadCredsOrThrow(args);
   const cfg = await fetchJson(`${BASE_URL}/ilink/bot/getconfig`, {
     method: "POST", headers: authHeaders(botToken),
     body: JSON.stringify({ ilink_user_id: toUserId, ...(contextToken ? { context_token: contextToken } : {}) }),
@@ -504,6 +652,310 @@ async function cmdTyping(args) {
   }, timeoutMs);
   console.log(res.ok ? "[probe] typing 已发送。" : `[probe] sendtyping HTTP ${res.httpStatus}`);
   appendMeasure({ kind: "context_token_result", op: "sendtyping", ok: res.ok, httpStatus: res.httpStatus });
+}
+
+// ---------- P5：出站媒体硬前置门（upload 端点存在性，无用户可见副作用） ----------
+/** payload 字段摘要：只记类型/长度/键名；字符串若是 URL 则记 host 与 allowlist 判定，不记原串。 */
+function fieldSummary(v, depth = 0) {
+  if (v === null || v === undefined) return "null";
+  if (Array.isArray(v)) return { t: "array", len: v.length };
+  if (typeof v === "object") {
+    if (depth >= 2) return { t: "object", keys: Object.keys(v).slice(0, 20) };
+    const o = {};
+    for (const [k, val] of Object.entries(v)) o[k] = fieldSummary(val, depth + 1);
+    return o;
+  }
+  if (typeof v === "string") {
+    if (/^https?:\/\//i.test(v)) {
+      const gate = isHostAllowed(v);
+      return { t: "url", len: v.length, host: gate.host, hostAllowed: gate.ok };
+    }
+    return { t: "string", len: v.length, enum: /^[A-Za-z0-9_\-]{1,16}$/.test(v) ? v : undefined };
+  }
+  if (typeof v === "number" || typeof v === "boolean") return { t: typeof v, v };
+  return { t: typeof v };
+}
+/** 错误文案脱敏：URL 全部抹掉，长标识符串全部抹掉，只留可读短文本。 */
+function redactErrmsg(s) {
+  return String(s || "")
+    .replace(/https?:\/\/\S+/gi, "<url>")
+    .replace(/[A-Za-z0-9_@.\-]{12,}/g, "…")
+    .slice(0, 120);
+}
+/**
+ * 只打候选路径的“最小请求”，不下载、不上传任何媒体、不给任何人发消息。
+ * 判读依赖两个控制组：
+ *   control_known     = 既有端点 getconfig（同时验证 bot_token 仍有效）
+ *   control_negative  = 明确不存在的路径（验证 401/403 是否只是“鉴权先于路由”）
+ * 只记录 HTTP 状态 + 业务码 + payload 键名（不记任何值、不记 to_user_id 原文）。
+ */
+async function cmdUploadProbe(args) {
+  const timeoutMs = timeoutMsFromArgs(args);
+  const { botToken } = loadCredsOrThrow(args);
+  const toUserId = flagValue(args, "--to") || latestInboxFromId();
+  console.log(`[probe] P5 upload 端点探测：to_user_id=${toUserId ? "<present>" : "<absent>"} timeout=${timeoutMs}ms（不发消息、不上传媒体）`);
+  const results = [];
+  const hit = async (op, method, urlPath, headers, body) => {
+    let res;
+    try {
+      res = await fetchJson(`${BASE_URL}${urlPath}`, { method, headers, body }, timeoutMs);
+    } catch (e) {
+      const rec = { op, method, path: urlPath, httpStatus: 0, error: String(e.message).slice(0, 80) };
+      results.push(rec); appendMeasure({ kind: "upload_endpoint_probe", ...rec });
+      console.log(`[probe] ${op}: ${method} ${urlPath} → 网络错误（${rec.error}）`);
+      return rec;
+    }
+    const p = (res.payload && typeof res.payload === "object") ? res.payload : {};
+    const ret = typeof p.ret === "number" ? p.ret : (typeof p.errcode === "number" ? p.errcode : null);
+    const rec = {
+      op, method, path: urlPath, httpStatus: res.httpStatus, ret,
+      payloadKeys: Object.keys(p).slice(0, 30),
+      topKeys: (res.topKeys || []).slice(0, 30),
+      fields: fieldSummary(p),
+      errmsg: redactErrmsg(p.errmsg || p.message),
+      bodyBytes: typeof res.bodyBytes === "number" ? res.bodyBytes : null,
+      retryAfter: res.retryAfter ?? null,
+    };
+    results.push(rec); appendMeasure({ kind: "upload_endpoint_probe", ...rec });
+    console.log(`[probe] ${op}: ${method} ${urlPath} → HTTP ${res.httpStatus} ret=${ret} top=[${rec.topKeys.join(",")}] data=[${rec.payloadKeys.join(",")}]${rec.errmsg ? ` errmsg=${JSON.stringify(rec.errmsg)}` : ""}`);
+    return rec;
+  };
+  await hit("control_known", "POST", "/ilink/bot/getconfig", authHeaders(botToken), JSON.stringify(toUserId ? { ilink_user_id: toUserId } : {}));
+  await hit("control_known_noparam", "POST", "/ilink/bot/getconfig", authHeaders(botToken), "{}");
+  // 控制组 2：明确不存在的路径（单个，不是穷举）。
+  await hit("control_negative", "POST", "/ilink/bot/__probe_ctrl_no_such_path__", authHeaders(botToken), "{}");
+
+  // 候选 A：getuploadurl（C/D 级候选：photon-hq 逆向实现 + Hermes 同名端点）。
+  const raw = Buffer.from("test", "utf8");          // 占位内容，不上传
+  const p5Body = JSON.stringify({
+    filekey: randomBytes(16).toString("hex"),        // 占位 32hex（语义未知，候选实现字段名）
+    media_type: 1,                                   // UploadMediaType.IMAGE（C 级候选枚举）
+    to_user_id: toUserId,
+    rawsize: raw.length,                             // md5/size 自洽（研究 §3.4 建议 rawsize=8，此处取真实长度）
+    rawfilemd5: createHash("md5").update(raw).digest("hex"),
+    filesize: 16,                                    // AES-128-ECB + PKCS7 后长度
+    no_need_thumb: true,
+    aeskey: randomBytes(16).toString("hex"),         // 占位 32hex 随机密钥
+  });
+  await hit("p5_getuploadurl_options", "OPTIONS", "/ilink/bot/getuploadurl", authHeaders(botToken), undefined);
+  await hit("p5_getuploadurl_post", "POST", "/ilink/bot/getuploadurl", authHeaders(botToken), p5Body);
+  // 鉴权敏感性（只读、无副作用）：坏 token / 无 token / 空 body，判断该端点是否校验 Authorization、是否校验参数。
+  const badAuth = { ...authHeaders(botToken), Authorization: "Bearer probe_invalid_token_0000000000" };
+  const noAuth = { "content-type": "application/json", "iLink-App-ClientVersion": CLIENT_VERSION };
+  await hit("p5_getuploadurl_badtoken", "POST", "/ilink/bot/getuploadurl", badAuth, p5Body);
+  await hit("p5_getuploadurl_noauth", "POST", "/ilink/bot/getuploadurl", noAuth, p5Body);
+  await hit("p5_getuploadurl_emptybody", "POST", "/ilink/bot/getuploadurl", authHeaders(botToken), "{}");
+  await hit("control_known_badtoken", "POST", "/ilink/bot/getconfig", badAuth, JSON.stringify(toUserId ? { ilink_user_id: toUserId } : {}));
+
+  // 候选 B：/ilink/bot/upload（D 级分歧：另有实现声称 multipart 上传）。
+  const mpHeaders = { ...authHeaders(botToken), "content-type": "multipart/form-data; boundary=probeboundary" };
+  await hit("p5_upload_options", "OPTIONS", "/ilink/bot/upload", authHeaders(botToken), undefined);
+  await hit("p5_upload_post", "POST", "/ilink/bot/upload", mpHeaders, "--probeboundary--\r\n");
+
+  const known = results.find((r) => r.op === "control_known");
+  const known2 = results.find((r) => r.op === "control_known_noparam");
+  const neg = results.find((r) => r.op === "control_negative");
+  const classify = (rec) => {
+    if (!rec || rec.httpStatus === 0) return "network-error（未定论）";
+    if (rec.op.endsWith("_badtoken") || rec.op.endsWith("_noauth")) {
+      const hasUrl = JSON.stringify(rec.fields || {}).includes('\"t\":\"url\"');
+      return rec.ret === -14 ? "鉴权对照：errcode -14（session timeout）→ 该路径确实校验 token，好 token 的 200 才有效"
+        : hasUrl ? "鉴权对照：无 token 也拿到 URL → 该路径不校验 Authorization"
+        : `鉴权对照：HTTP ${rec.httpStatus} ret=${rec.ret ?? "?"}`;
+    }
+    if (rec.op.endsWith("_emptybody"))
+      return rec.ret != null && rec.ret !== 0 ? `参数对照：ret=${rec.ret} → body 参数被校验，占位参数非必需但不可为空`
+        : "参数对照：空 body 也通过 → 服务端不校验该 body";
+    if (rec.op.endsWith("_options"))
+      return rec.httpStatus === 404 || rec.httpStatus === 405 ? "OPTIONS 404/405（路径未识别）"
+        : rec.httpStatus >= 200 && rec.httpStatus < 300 ? "OPTIONS 2xx（方法被接受；弱证据，不证明业务实现）"
+        : `OPTIONS HTTP ${rec.httpStatus}（不作为存在性证据）`;
+    if (neg && (neg.httpStatus === 401 || neg.httpStatus === 403) && (rec.httpStatus === 401 || rec.httpStatus === 403))
+      return "401/403 且负控制同码 → 鉴权先于路由，不能据此断定存在/不存在";
+    if (rec.httpStatus === 404 || rec.httpStatus === 405) return "路径不存在（404/405）";
+    if (rec.httpStatus === 401 || rec.httpStatus === 403) return "端点存在但无权限（401/403，负控制非同码）";
+    if (rec.httpStatus >= 200 && rec.httpStatus < 300) {
+      const hasUrl = JSON.stringify(rec.fields || {}).includes('"t":"url"');
+      return rec.payloadKeys.includes("upload_param") ? "可用（200 + upload_param）"
+        : hasUrl ? "200 + 返回 URL 字段（upload_full_url）→ 与 C/D 级候选键名不同，但端点确实应答"
+        : "200 但无 URL/upload_param → 形状与候选实现不符";
+    }
+    if (neg && neg.httpStatus === rec.httpStatus) return `HTTP ${rec.httpStatus} 与负控制同码 → 大概率不存在`;
+    return `HTTP ${rec.httpStatus}（参数层错误）→ 路径可能存在，需调参复测`;
+  };
+  const verdicts = {};
+  for (const rec of results.filter((r) => r.op.startsWith("p5_"))) verdicts[rec.op] = classify(rec);
+  const tokenOk = known && known.httpStatus >= 200 && known.httpStatus < 300 && known.ret === 0;
+  appendMeasure({ kind: "p5_verdict", tokenOk: Boolean(tokenOk), controlKnown: known?.httpStatus ?? null, controlKnownRet: known?.ret ?? null, controlKnownNoParamRet: known2?.ret ?? null, controlNegative: neg?.httpStatus ?? null, verdicts });
+  console.log(`[probe] P5 判读：`);
+  console.log(`  - 控制组 getconfig HTTP ${known?.httpStatus ?? "?"} 业务码=${known?.ret ?? "?"}（无参对照=${known2?.ret ?? "?"}）：${tokenOk ? "token 有效" : "业务码非 0 → 先确认该码含义，再看候选结果"}`);
+  console.log(`  - 负控制（不存在路径）HTTP ${neg?.httpStatus ?? "?"}：${neg && (neg.httpStatus === 401 || neg.httpStatus === 403) ? "鉴权先于路由 → 401/403 不可作为存在性证据" : "能区分不存在路径"}`);
+  for (const [k, v] of Object.entries(verdicts)) console.log(`  - ${k}: ${v}`);
+  const urls = (rec) => Boolean(rec && JSON.stringify(rec.fields || {}).includes('\"t\":\"url\"'));
+  const authNote = (rec) => !rec ? "未测"
+    : rec.httpStatus === 0 ? "网络错误"
+    : urls(rec) ? `HTTP ${rec.httpStatus} + 返回 URL` : `HTTP ${rec.httpStatus} ret=${rec.ret ?? "?"}${rec.errmsg ? ` (${rec.errmsg})` : ""}`;
+  const authSummary = {
+    goodToken: authNote(results.find((r) => r.op === "p5_getuploadurl_post")),
+    badToken: authNote(results.find((r) => r.op === "p5_getuploadurl_badtoken")),
+    noAuth: authNote(results.find((r) => r.op === "p5_getuploadurl_noauth")),
+    emptyBody: authNote(results.find((r) => r.op === "p5_getuploadurl_emptybody")),
+    getconfigBadToken: authNote(results.find((r) => r.op === "control_known_badtoken")),
+  };
+  appendMeasure({ kind: "p5_auth_probe", ...authSummary });
+  console.log(`[probe] P5 鉴权/参数敏感性：`);
+  console.log(`  - getuploadurl 好 token: ${authSummary.goodToken}`);
+  console.log(`  - getuploadurl 坏 token: ${authSummary.badToken}`);
+  console.log(`  - getuploadurl 无 token: ${authSummary.noAuth}`);
+  console.log(`  - getuploadurl 空 body: ${authSummary.emptyBody}`);
+  console.log(`  - getconfig 坏 token 对照: ${authSummary.getconfigBadToken}`);
+  console.log(`[probe] 结果已记入 ${MEASURE_PATH}（kind=upload_endpoint_probe / p5_verdict / p5_auth_probe，仅状态码+键名）。`);
+}
+
+// ---------- P4：同 token 并发限流（read 模式为无副作用子集） ----------
+async function cmdConc(args) {
+  const timeoutMs = timeoutMsFromArgs(args);
+  const mode = flagValue(args, "--mode") || "read";
+  const n = Math.min(Math.max(Number(flagValue(args, "--n") || "3"), 1), 8);
+  if (mode === "send") {
+    console.log("[probe] conc --mode send = 真·poll+send 并发（会给本人发一条文本，需用户同意后手动执行）：");
+    console.log("[probe]   node scripts/wechat-ilink-probe.mjs send <toUserId> \"并发测试\" --with-poll");
+    console.log("[probe]   （已加 Retry-After 记录：measure.jsonl 的 concurrency_probe.sendRetryAfter/pollRetryAfter）");
+    return;
+  }
+  const { botToken } = loadCredsOrThrow(args);
+  const toUserId = flagValue(args, "--to") || latestInboxFromId();
+  const t0 = Date.now();
+  const rs = await Promise.allSettled(Array.from({ length: n }, () =>
+    fetchJson(`${BASE_URL}/ilink/bot/getconfig`, {
+      method: "POST", headers: authHeaders(botToken),
+      body: JSON.stringify(toUserId ? { ilink_user_id: toUserId } : {}),
+    }, timeoutMs)));
+  const statuses = rs.map((r) => (r.status === "fulfilled" ? r.value.httpStatus : 0));
+  const retryAfters = rs.map((r) => (r.status === "fulfilled" ? (r.value.retryAfter ?? null) : null));
+  const rets = rs.map((r) => {
+    if (r.status !== "fulfilled") return null;
+    const p = r.value.payload || {};
+    return typeof p.ret === "number" ? p.ret : (typeof p.errcode === "number" ? p.errcode : null);
+  });
+  const elapsedMs = Date.now() - t0;
+  appendMeasure({ kind: "concurrency_probe", mode: "read", n, statuses, rets, retryAfters, elapsedMs });
+  console.log(`[probe] 并发 ${n}×getconfig（只读；不含 getupdates/sendmessage，避免与 worker 游标互相抢取消息）`);
+  console.log(`[probe]   HTTP=[${statuses.join(",")}] ret=[${rets.join(",")}] Retry-After=[${retryAfters.map((x) => x ?? "-").join(",")}] 耗时=${elapsedMs}ms`);
+  if (statuses.includes(429)) console.log("[probe] 观察到 429：同 token 并发被限流（读端点，B 级）。" );
+  else {
+    console.log("[probe] 读端点未见 429；这只证明读端点并发可接受。poll+send 组合仍未测（需用户同意后跑 send --with-poll）。" );
+    if (statuses.every((s) => s >= 400 && s < 500)) console.log("[probe] 注意：全部为 4xx 参数层响应 → 只能说明未触发限流，不能证明并发吞吐。" );
+  }
+}
+
+// ---------- P6：出站两段式上传（staged + 显式同意门；形状来源见每处 C 级标注） ----------
+/** 最小 1×1 PNG（70B）：默认探针样本，不从磁盘拿用户文件。 */
+const MIN_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/** 原始请求（CDN/sendmessage 响应可能非 JSON；只回状态+头+体长/体，不回 URL）。 */
+async function rawRequest(url, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(new Error(`HTTP 超时 ${timeoutMs}ms`)), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: opts?.signal ?? ctrl.signal });
+    const text = await res.text();
+    return { status: res.status, ok: res.ok, headers: res.headers, bodyText: text };
+  } finally { clearTimeout(t); }
+}
+function aesPaddedSize(n) { const r = n % 16; return n + (r === 0 ? 16 : 16 - r); }   // PKCS#7
+
+async function cmdMediaProbe(args) {
+  const timeoutMs = timeoutMsFromArgs(args);
+  const stage = flagValue(args, "--stage") || "pre";
+  const consent = flagValue(args, "--consent");
+  if (!["pre", "cdn", "send"].includes(stage)) throw new Error("用法：media-probe [--stage pre|cdn|send] [--consent cdn|send] [--file F] [--caption T] [--to uid]");
+  if (stage === "cdn" && consent !== "cdn" && consent !== "send")
+    throw new Error("cdn 阶段需要 --consent cdn：会把密文 POST 到微信 CDN（写第三方存储，不给任何人发消息）。需先征得用户同意。");
+  if (stage === "send" && consent !== "send")
+    throw new Error("send 阶段需要 --consent send：会给本人发一张测试图片（会打扰用户；需用户明确同意 + 手机端人工确认图片可见清晰）。");
+  const { botToken } = loadCredsOrThrow(args);
+  const toUserId = flagValue(args, "--to") || latestInboxFromId();
+  if (!toUserId) throw new Error("缺收件人：传 --to <uid>，或先跑 listen 拿到最近入站发件人。");
+
+  const file = flagValue(args, "--file");
+  const plain = file ? fs.readFileSync(file) : Buffer.from(MIN_PNG_B64, "base64");
+  const aesKey = randomBytes(16);
+  const filekey = randomBytes(16).toString("hex");
+  console.log(`[probe] P6 stage=${stage} consent=${consent || "-"} 样本=${file ? "<--file>" : "最小PNG"}(${plain.length}B) to=${"<present>"}`);
+
+  // ── stage pre：getuploadurl（无副作用） ──
+  // 请求字段名 = Hermes weixin.py#L519-L548 / photon-hq 两份 C 级实现同名；本机实测已返回 upload_full_url。
+  const upBody = JSON.stringify({
+    filekey, media_type: 1, to_user_id: toUserId,
+    rawsize: plain.length, rawfilemd5: createHash("md5").update(plain).digest("hex"),
+    filesize: aesPaddedSize(plain.length), no_need_thumb: true, aeskey: aesKey.toString("hex"),
+  });
+  const r1 = await fetchJson(`${BASE_URL}/ilink/bot/getuploadurl`, {
+    method: "POST", headers: authHeaders(botToken), body: upBody,
+  }, timeoutMs);
+  const p1 = (r1.payload && typeof r1.payload === "object") ? r1.payload : {};
+  const upUrl = typeof p1.upload_full_url === "string" ? p1.upload_full_url : "";
+  const upParam = typeof p1.upload_param === "string" ? p1.upload_param : "";
+  const gate = upUrl ? isHostAllowed(upUrl) : { ok: false, host: "<none>" };
+  appendMeasure({
+    kind: "media_probe", stage: "pre", httpStatus: r1.httpStatus,
+    topKeys: (r1.topKeys || []).slice(0, 20), hasFullUrl: Boolean(upUrl), hasUploadParam: Boolean(upParam),
+    host: gate.host, hostAllowed: gate.ok, plainBytes: plain.length,
+  });
+  console.log(`[probe] pre: HTTP ${r1.httpStatus} top=[${(r1.topKeys || []).join(",")}] upload_full_url=${upUrl ? "<present>" : "<absent>"} upload_param=${upParam ? "<present>" : "<absent>"} host=${gate.host} allow=${gate.ok}`);
+  if (stage === "pre") { console.log("[probe] pre 完成（只拿预签名 URL，未上传、未发送）。"); return; }
+  if (!upUrl) { console.log("[probe] 无可用上传 URL，中止（不猜测其它字段）。"); return; }
+  if (!gate.ok) { console.log("[probe] 上传 URL host 不在 allowlist，中止（K2 SSRF 纪律）。"); return; }
+
+  // ── stage cdn：AES-128-ECB 加密 → POST 密文（Hermes weixin.py#L551-L580：POST + application/octet-stream，旧 PUT 会 404） ──
+  const c = createCipheriv("aes-128-ecb", aesKey, null);
+  const cipher = Buffer.concat([c.update(plain), c.final()]);
+  let cdn = await rawRequest(upUrl, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: cipher }, timeoutMs);
+  let cdnMethod = "POST";
+  if (cdn.status === 403 || cdn.status === 404 || cdn.status === 405) {
+    const alt = await rawRequest(upUrl, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: cipher }, timeoutMs);
+    appendMeasure({ kind: "media_probe", stage: "cdn_retry", method: "PUT", httpStatus: alt.status, bodyBytes: alt.bodyText.length });
+    if (alt.status === 200) { cdn = alt; cdnMethod = "PUT"; }
+  }
+  // 关键返回：响应头 x-encrypted-param = 后续 sendmessage 的 encrypt_query_param（Hermes 同名头）。
+  const encParam = cdn.headers.get("x-encrypted-param");
+  appendMeasure({
+    kind: "media_probe", stage: "cdn", method: cdnMethod, httpStatus: cdn.status,
+    cipherBytes: cipher.length, encParamPresent: Boolean(encParam), encParamLen: encParam ? encParam.length : 0,
+    respBytes: cdn.bodyText.length, respJsonKeys: (() => { try { return Object.keys(JSON.parse(cdn.bodyText)).slice(0, 20); } catch { return []; } })(),
+  });
+  console.log(`[probe] cdn: ${cdnMethod} → HTTP ${cdn.status} 密文=${cipher.length}B x-encrypted-param=${encParam ? `<present len=${encParam.length}>` : "<absent>"} 响应体=${cdn.bodyText.length}B`);
+  if (cdn.status !== 200 || !encParam) {
+    console.log("[probe] CDN 上传未拿到 x-encrypted-param，中止（不臆造 encrypt_query_param）。");
+    return;
+  }
+  if (stage !== "send") { console.log("[probe] cdn 完成（未发送任何消息）；手机端不受影响。"); return; }
+
+  // ── stage send：sendmessage 带图片 item（Hermes weixin.py#L2197-L2225：type=2 / image_item.media / mid_size；
+  //    aes_key 必须是 base64(hex字符串) —— Hermes 注释坑位，b64(raw) 会让对端变灰图） ──
+  const aesKeyForApi = Buffer.from(aesKey.toString("hex"), "ascii").toString("base64");
+  const mediaItem = {
+    type: 2,
+    image_item: { media: { encrypt_query_param: encParam, aes_key: aesKeyForApi, encrypt_type: 1 }, mid_size: cipher.length },
+  };
+  const caption = flagValue(args, "--caption");
+  const itemList = caption ? [{ type: 1, text_item: { text: caption } }, mediaItem] : [mediaItem];   // P6 附带测：caption+图片同 item_list
+  const sendBody = {
+    base_info: { channel_version: "2.0.0" },
+    msg: { from_user_id: "", to_user_id: toUserId, client_id: randomUUID(), message_type: 2, message_state: 2, item_list: itemList },
+  };
+  const r3 = await fetchJson(`${BASE_URL}/ilink/bot/sendmessage`, {
+    method: "POST", headers: authHeaders(botToken), body: JSON.stringify(sendBody),
+  }, timeoutMs);
+  const p3 = (r3.payload && typeof r3.payload === "object") ? r3.payload : {};
+  const ret3 = typeof p3.ret === "number" ? p3.ret : (typeof p3.errcode === "number" ? p3.errcode : null);
+  appendMeasure({
+    kind: "media_probe", stage: "send", httpStatus: r3.httpStatus, ret: ret3,
+    payloadKeys: Object.keys(p3).slice(0, 20), hasCaption: Boolean(caption),
+    messageIdPresent: "message_id" in p3,
+  });
+  console.log(`[probe] send: HTTP ${r3.httpStatus} ret=${ret3} keys=[${Object.keys(p3).join(",")}] → 请在手机端确认图片可见且清晰（人工验收点）。`);
 }
 
 function cmdStatus() {
@@ -541,9 +993,12 @@ try {
   else if (cmd === "send") await cmdSend(rest);
   else if (cmd === "reply") await cmdReply(rest);
   else if (cmd === "typing") await cmdTyping(rest);
+  else if (cmd === "upload-probe") await cmdUploadProbe(rest);
+  else if (cmd === "conc") await cmdConc(rest);
+  else if (cmd === "media-probe") await cmdMediaProbe(rest);
   else if (cmd === "status") cmdStatus();
   else {
-    console.error("用法：login | listen [--decrypt] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | status");
+    console.error("用法：login | listen [--decrypt] [--raw-items] | send <toUserId> <text> [contextToken] | reply [--from-last] <toUserId> <text...> | typing <toUserId> [contextToken] | upload-probe [--to uid] [--creds host|probe] | conc [--mode read|send] [--n N] | media-probe [--stage pre|cdn|send --consent ...] | status");
     process.exit(2);
   }
 } catch (e) {
