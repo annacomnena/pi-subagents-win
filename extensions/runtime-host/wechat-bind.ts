@@ -257,6 +257,27 @@ export function readWechatRemoteCommandConfig(configPath: string): WechatRemoteC
 	}
 }
 
+/**
+ * M1 入站图片附件能力门（0925，opt-in **缺省 false**）：
+ * `channels.wechat.artifact.enabled === true` 才下载/解密/落盘入站图片并把 `artifactRef` 注入正文。
+ * 读法照抄 readWechatRemoteCommandConfig（=== true；缺段/坏 JSON/非 true → false，never-throw、
+ * fail-closed）——**刻意不用 reply 式 `!== false` fail-open**：媒体下载是新增行为，须显式 true
+ * （研究 §8.4：升级即行为变化的前例 ⇒ 媒体开关必须显式默认 false）。worker 每批读一次 ⇒
+ * 免重启开/关；OFF ⇒ 零下载、零目录、零抽取、注入无后缀（A11 断言）。
+ */
+export interface WechatArtifactConfig { enabled: boolean }
+
+export function readWechatArtifactConfig(configPath: string): WechatArtifactConfig {
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+			channels?: { wechat?: { artifact?: { enabled?: unknown } } };
+		};
+		return { enabled: raw?.channels?.wechat?.artifact?.enabled === true };
+	} catch {
+		return { enabled: false };
+	}
+}
+
 export type WechatReplyMode = "reply-only" | "broadcast";
 export type WechatReplySessionScope = "owner" | "main" | "any";
 

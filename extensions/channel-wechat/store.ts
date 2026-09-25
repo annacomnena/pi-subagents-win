@@ -10,6 +10,9 @@
  *     quarantine.jsonl 非文本/坏格式条目（脱敏 reason；可查，不静默丢弃）
  *     state.json       {status, lastPollAt, counts, lastError, authRequiredAt, epoch}
  *     worker.json      supervisor 的 worker pid 文件（channel-supervisor.ts 读写）
+ *   <runtimeDir>/wechat/artifacts/ （M1 附件，0925；**本模块不读写该目录**）
+ *     files/<sha256>.jpg|png  内容寻址附件（channel-wechat/artifact.ts 写；记录只存相对引用
+ *                             artifactRef = "wechat/artifacts/files/<sha256>.<ext>"，绝不内联内容）
  *
  * 不变量（§4.2/§4.3/§4.5 + MF1 修复 0924）：
  *   - commitBatch(prevBuf,nextBuf,recs) 只做游标提交——调用方（worker）必须**先** claimMessage +
@@ -60,6 +63,10 @@ export interface InboundRecord {
 	/** W2 注入关联只读投影；旧记录无此键时为 undefined。 */
 	outboxId?: string;
 	injectedAt?: string;
+	/** M1 附件引用（0925）：**相对 runtimeDir** 的路径 `wechat/artifacts/files/<sha256>.<jpg|png>`。
+	 *  只给路径引用——绝不内联 base64/密文/URL/aes_key（注入侧 join(runtimeDir, ref) 现解绝对路径；
+	 *  投影原样透传相对值。旧记录无此键 ⇒ undefined（OFF 零行为）。 */
+	artifactRef?: string;
 }
 
 export interface WechatReceiveCounts {
@@ -332,6 +339,7 @@ export class WechatStore {
 					state: v.state === "injected" || v.state === "rejected" || v.state === "consumed" ? v.state : "pending",
 					...(v.rejectedReason === "not-allowlisted" || v.rejectedReason === "write-failed" ? { rejectedReason: v.rejectedReason } : {}),
 					...(v.artifactPending === true ? { artifactPending: true } : {}),
+					...(typeof v.artifactRef === "string" && v.artifactRef !== "" ? { artifactRef: v.artifactRef } : {}),
 					...(typeof v.outboxId === "string" ? { outboxId: v.outboxId } : {}),
 					...(typeof v.injectedAt === "string" ? { injectedAt: v.injectedAt } : {}),
 				});

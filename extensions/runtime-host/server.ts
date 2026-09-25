@@ -1101,6 +1101,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					receivedAt: r.receivedAt,
 					state: r.state,
 					...(r.artifactPending === true ? { artifactPending: true } : {}),
+					// M1（0925）：附件只透传**相对路径**（无绝对盘符、无 URL/key；A10/A17 哨兵锁死）
+					...(typeof r.artifactRef === "string" && r.artifactRef !== "" ? { artifactRef: r.artifactRef } : {}),
 				})),
 			});
 			return;

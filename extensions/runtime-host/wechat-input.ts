@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, mkdirSync, openSync, closeSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, openSync, closeSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { inboxFileName, WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
@@ -23,6 +23,25 @@ function audit(path: string, data: Record<string, unknown>): void {
 function atomicRecord(dir: string, rec: InboundRecord & { injectedAt?: string; outboxId?: string }): void {
  const file=join(dir,"inbox",inboxFileName(rec.msgId)); const tmp=`${file}.${process.pid}.tmp`;
  writeFileSync(tmp,JSON.stringify(rec,null,2)+"\n",{mode:0o600}); renameSync(tmp,file);
+}
+// M1（0925）附件后缀：只给**路径引用**（绝对路径现解），绝不内联 base64/密文/URL/aes_key（计划 §5.4）。
+// artifactRef 形态由 worker 侧内容寻址命名锁死（`wechat/artifacts/files/<sha256>.<jpg|png>`）——
+// 严格正则兼作路径安全门（拒 `..`/绝对路径/盘符）；形态不符 ⇒ 不追加后缀（回旧格式，fail-safe）。
+const ARTIFACT_REF_RE=/^wechat\/artifacts\/files\/[0-9a-f]{64}\.(jpg|png)$/;
+function artifactSuffix(runtimeDir:string,ref:string|undefined):string{
+ if(typeof ref!=="string"||!ARTIFACT_REF_RE.test(ref))return "";
+ const abs=join(runtimeDir,ref); const mime=ref.endsWith(".png")?"image/png":"image/jpeg";
+ let bytes=-1; try{bytes=statSync(abs).size;}catch{}
+ return bytes>=0?` 〔附件：${abs} (${mime}, ${bytes}B)〕`:` 〔附件：${abs} (${mime})〕`;
+}
+/** 正文组装：artifactRef 缺席 ⇒ 旧表达式**逐字节保留**（_test_wechat_input T9 精确等值 = OFF 零行为锚）；
+ *  在场 ⇒ 追加一个带前导空格的路径引用后缀（text 空 ⇒ 正文即 `[微信 mask] 〔附件：…〕`）。 */
+function composeWechatBody(runtimeDir:string,record:InboundRecord):string{
+ const m=`[微信 ${mask(record.fromId)}]`;
+ const base=`${m} ${record.text}`;
+ const suffix=artifactSuffix(runtimeDir,record.artifactRef);
+ if(suffix==="")return base;
+ return record.text!==""?`${base}${suffix}`:`${m}${suffix}`;
 }
 export function tryInjectPending(opts: WechatInputOptions): { injected: boolean; reason?: string } {
  const config=(opts.readConfig??readWechatInputConfig)(opts.configPath);
@@ -65,7 +84,7 @@ export function tryInjectPending(opts: WechatInputOptions): { injected: boolean;
   owner=(opts.readOwner??readAttachment)(masterAddress());
   if(!owner || owner.sessionId!==before.sessionId || owner.generation!==before.generation) { audit(opts.runtimeDir,{...base,decision:"skipped",reason:"owner-changed",ownerSid:before.sessionId.slice(0,12),generation:before.generation}); return {injected:false,reason:"owner-changed"}; }
   mkdirSync(outDir,{recursive:true});
-  const item=newOutboxItem({dedupeKey,commandKey:id,to:`pi://${owner.sessionId}` as `pi://${string}`,sessionId:owner.sessionId,text:`[微信 ${mask(record.fromId)}] ${record.text}`,now:opts.now??new Date()});
+  const item=newOutboxItem({dedupeKey,commandKey:id,to:`pi://${owner.sessionId}` as `pi://${string}`,sessionId:owner.sessionId,text:composeWechatBody(opts.runtimeDir,record),now:opts.now??new Date()});
   writeOutboxItem(outDir,item);
   const updated={...record,state:"injected" as const,injectedAt:at,outboxId:item.id};
   atomicRecord(dir,updated);

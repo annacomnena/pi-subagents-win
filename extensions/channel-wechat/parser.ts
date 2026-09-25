@@ -39,9 +39,60 @@ export interface QuarantineEntry {
 	artifactPending?: boolean;
 }
 
+/** M1 附件引用（**仅内存**：url/aesKey 绝不落盘/日志/投影——由 worker 即时消费，见 artifact.ts）。 */
+export interface InboundAttachment {
+	msgId: string;
+	/** 内容项在 item_list 中的下标（幂等键 `msgId#itemIdx` 的一半；不进路径）。 */
+	itemIdx: number;
+	kind: "image";
+	/** 真机键路径 `image_item.media.full_url`（B；只认真机已证两键，不臆造）。 */
+	url: string;
+	/** 真机键路径 `image_item.media.aes_key`（B：base64(hex32)）。 */
+	aesKey: string;
+	/** `image_item.mid_size`（真机 B：恒等于明文字节数；worker 落盘前断言）。 */
+	midSize?: number;
+	/** 合成纯图 inbox 记录所需发送者（parser 已脱敏口径；M1 只给 worker 用）。 */
+	fromId: string;
+	fromNickname: string | null;
+}
+
+export interface ParseBatchOptions {
+	/** 门控（worker 每批读 channels.wechat.artifact.enabled）；缺省/假 ⇒ 输出与历史逐字节相同。 */
+	extractAttachments?: boolean;
+}
+
 export interface ParseBatchResult {
 	items: InboundText[];
 	quarantined: QuarantineEntry[];
+	/** 仅 `extractAttachments` 为真时存在（OFF 时该键**不出现** ⇒ 逐字节等价，A11 锁死）。 */
+	attachments?: InboundAttachment[];
+}
+
+/** 门控的图片附件抽取：只认真机已证键路径 `image_item.media.{full_url,aes_key}`；不命中 → null
+ *  （该 item 落回下方既有非文本 quarantine 分支，reason 与 OFF 逐字节相同——不臆造键）。 */
+function pickImageAttachment(
+	c: Record<string, unknown>,
+	base: { msgId: string; itemIdx: number; fromId: string; fromNickname: string | null },
+): InboundAttachment | null {
+	const img = isObj(c.image_item) ? c.image_item : null;
+	if (img === null) return null;
+	const media = isObj(img.media) ? img.media : null;
+	if (media === null) return null;
+	const url = media.full_url;
+	const aesKey = media.aes_key;
+	if (typeof url !== "string" || url.length === 0) return null;
+	if (typeof aesKey !== "string" || aesKey.length === 0) return null;
+	const midSize = typeof img.mid_size === "number" && Number.isFinite(img.mid_size) ? img.mid_size : undefined;
+	return {
+		msgId: base.msgId,
+		itemIdx: base.itemIdx,
+		kind: "image",
+		url,
+		aesKey,
+		...(midSize !== undefined ? { midSize } : {}),
+		fromId: base.fromId,
+		fromNickname: base.fromNickname,
+	};
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -101,10 +152,16 @@ const NON_TEXT_TYPES = new Set([
 /**
  * 解析一批原始 item_list：文本 → items；非文本/未知/坏结构 → quarantined（脱敏）。
  * 单条坏**条目**不拖垮整批（逐条独立 try 面）；无 msgId 或 msg 无 item_list → quarantine。
+ *
+ * M1（计划 §2.2）：第三参 `opts.extractAttachments` 为真时，`type==2`（number/string 形态均兼容）
+ * 且真机两键命中的 item 抽进 `attachments[]`（该 item **不再**进 quarantined）；opts 缺省/假 ⇒
+ * **输出与历史逐字节相同**（不抽、照旧 quarantine）——由 _test_wechat_artifact T3 等值断言锁死。
  */
-export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchResult {
+export function parseBatch(rawItems: unknown[], receivedAt: string, opts?: ParseBatchOptions): ParseBatchResult {
+	const extract = opts?.extractAttachments === true;
 	const items: InboundText[] = [];
 	const quarantined: QuarantineEntry[] = [];
+	const attachments: InboundAttachment[] = [];
 	/** L4 MF1：批内已见 msgId——重复必须 quarantine（fail-visible），不得让 worker 静默去重吞消息。 */
 	const seenMsgIds = new Set<string>();
 	for (const entry of rawItems) {
@@ -164,7 +221,9 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 		}
 		// 内层内容项：取**第一条可识别文本**（v1：一条消息一条文本；多内容项其余 quarantine 记录）
 		let textTaken = false;
+		let itemIdx = -1;
 		for (const c of inner) {
+			itemIdx += 1;
 			if (!isObj(c)) {
 				quarantined.push({ msgId, reason: "内容项不是对象", at: receivedAt });
 				continue;
@@ -190,6 +249,15 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 				}
 				continue;
 			}
+			// M1 门控抽取（计划 §2.2：置于非文本 quarantine 分支**之前**）：type=2 图片两键命中
+			// → attachments[]，该 item 不再 quarantine；不命中 → 落回下方既有分支（reason 不变）。
+			if (extract && type === "2") {
+				const att = pickImageAttachment(c, { msgId, itemIdx, fromId, fromNickname });
+				if (att !== null) {
+					attachments.push(att);
+					continue;
+				}
+			}
 			// 非文本（有类型名）→ quarantine + artifact_pending 标记（元数据：类型名 + 可选 size 数字；无 URL/正文）
 			if (type !== "") {
 				const size = typeof c.size === "number" && Number.isFinite(c.size) ? c.size : undefined;
@@ -204,5 +272,6 @@ export function parseBatch(rawItems: unknown[], receivedAt: string): ParseBatchR
 			quarantined.push({ msgId, reason: `未知消息结构（无文本字段、无类型名）；shape=${shapeSig(c)}`, at: receivedAt });
 		}
 	}
-	return { items, quarantined };
+	// OFF ⇒ 返回对象**不含** attachments 键（逐字节等价；A11 断言 `"attachments" in result === false`）
+	return extract ? { items, quarantined, attachments } : { items, quarantined };
 }

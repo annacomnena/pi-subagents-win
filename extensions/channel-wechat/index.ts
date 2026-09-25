@@ -17,14 +17,17 @@
  * 安全（§4.1）：bot_token 只从凭据文件读入内存 → client Authorization header；不进 argv/env/
  * 日志/状态。红线：只 import node 内建 + 本目录模块 + runtime 纯函数 + runtime-host/wechat-bind
  * （凭据读写纯函数）。禁 Pi API / extensions/index.ts。
+ * M1（0925）：入站附件下载门 `channels.wechat.artifact.enabled`（缺省 false，每批读 ⇒ 免重启开关）
+ * 由 wechat-bind.readWechatArtifactConfig 提供——**artifact.ts 零凭据 import**：下载不经凭据面，
+ * worker 只把 `{url, aesKey, limits, fetch}` 交给漏斗（计划 §2.1 红线①）。
  */
 
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { defaultPkgConfigPath } from "../runtime/master-injection.ts";
-import { readWechatCreds, readWechatEnabled, readWechatReceiveEnabled, wechatCredsPath, WECHAT_DEFAULT_BASE_URL, type WechatFetch } from "../runtime-host/wechat-bind.ts";
+import { readWechatArtifactConfig, readWechatCreds, readWechatEnabled, readWechatReceiveEnabled, wechatCredsPath, WECHAT_DEFAULT_BASE_URL, type WechatFetch } from "../runtime-host/wechat-bind.ts";
 import { isProcessAlive } from "../runtime/liveness.ts";
 import { WechatStore } from "./store.ts";
 import { getUpdates, type GetUpdatesReq } from "./client.ts";
@@ -44,6 +47,8 @@ export interface CreateWechatWorkerOptions {
 	backoffStartMs?: number;
 	backoffMaxMs?: number;
 	log?: (msg: string) => void;
+	/** M1 附件门 config 路径（缺省包根 config.json；子进程入口透传 env 解析后的路径）。 */
+	configPath?: string;
 }
 
 export type CreateWechatWorkerResult =
@@ -57,6 +62,8 @@ export function createWechatWorker(opts: CreateWechatWorkerOptions): CreateWecha
 	const creds = readWechatCreds(wechatCredsPath(opts.runtimeDir));
 	if (creds === null) return { ok: false, reason: "no-credentials" };
 	const store = new WechatStore(WechatStore.resolveDir(opts.runtimeDir), opts.now !== undefined ? { now: () => new Date(opts.now()) } : {});
+	// M1 附件门：每批读一次 config（缺省 false ⇒ 零行为）；落盘根 = <runtimeDir>/wechat/artifacts
+	const configPath = opts.configPath ?? defaultPkgConfigPath();
 	const handle = startWechatWorker({
 		baseUrl: opts.baseUrl ?? creds.baseUrl ?? WECHAT_DEFAULT_BASE_URL,
 		botToken: creds.botToken,
@@ -70,6 +77,8 @@ export function createWechatWorker(opts: CreateWechatWorkerOptions): CreateWecha
 		...(opts.log !== undefined ? { log: opts.log } : {}),
 		// fetch 注入：包装真 client（缺省 fetchUpdates = 真 client + global fetch）
 		...(opts.fetch !== undefined ? { fetchUpdates: (req: GetUpdatesReq) => getUpdates(req, opts.fetch) } : {}),
+		readArtifactGate: () => readWechatArtifactConfig(configPath).enabled,
+		artifactDir: join(opts.runtimeDir, "wechat", "artifacts"),
 	});
 	return { ok: true, handle, store };
 }
@@ -100,7 +109,7 @@ if (isMainModule()) {
 		console.error("wechat worker: 凭据缺失（先完成扫码绑定）");
 		process.exit(0);
 	}
-	const r = createWechatWorker({ runtimeDir });
+	const r = createWechatWorker({ runtimeDir, configPath });
 	if (!r.ok) {
 		console.error("wechat worker: 凭据不可读，退出");
 		process.exit(0);
