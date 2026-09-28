@@ -2,7 +2,7 @@
 title: 微信 iLink 通道
 kind: concept
 status: current
-updated: 2026-09-25
+updated: 2026-09-28
 source_paths:
   - scripts/wechat-ilink-probe.mjs
   - plans/0923_wechat_ilink_probe_checklist.md
@@ -24,13 +24,21 @@ source_paths:
   - plans/0925_wechat_media_probe_results.md
   - plans/0924_wechat_media_gateway_research.md
   - plans/0925_p0_outbound_auth_l4_review.md
+  - extensions/channel-wechat/artifact.ts
+  - extensions/channel-wechat/worker.ts
+  - extensions/channel-wechat/index.ts
+  - plans/0925_wechat_artifact_M1_plan.md
+  - plans/0925_wechat_artifact_M1_impl_report.md
+  - plans/0925_wechat_artifact_M1_l4_review.md
+  - plans/0927_m1_enable_checklist.md
+  - plans/0928_wechat_artifact_M1_wrapup_report.md
 ---
 
 # 微信 iLink 通道
 
 ## Summary
 
-iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**入站媒体规格（真机实测：item type 矩阵 / 嵌套 `media.*` 形状 / `base64(hex32)` AES key / AES-128-ECB+PKCS7 解密 6/6 + 魔数，见「入站媒体与附件规格」节）**、**出站媒体规格（三段式 getuploadurl → CDN 密文 POST → 纯媒体 `item_list`；caption 必须单独发；不需 `context_token`；1×1 PNG 端到端人工确认，见「出站媒体规格」节）**、**`client_id` 去重语义（服务端按 id 去重，同 id 双发只投 1 条 → 多收件人必须 per-recipient clientId，人工确认）**、**出站广播**（`reply.mode="broadcast"` 显式开播：global master 会话 → 授权收件人 = 绑定 owner ∪ `reply.allowOut`；**缺省 `reply-only` 停播（0925 P0 复裁）**）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]。协议剩余未知项及校准状态见「Open Questions」与各契约节。
+iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接收、master 注入、文本出站回复、**入站媒体规格（真机实测：item type 矩阵 / 嵌套 `media.*` 形状 / `base64(hex32)` AES key / AES-128-ECB+PKCS7 解密 6/6 + 魔数，见「入站媒体与附件规格」节）**、**出站媒体规格（三段式 getuploadurl → CDN 密文 POST → 纯媒体 `item_list`；caption 必须单独发；不需 `context_token`；1×1 PNG 端到端人工确认，见「出站媒体规格」节）**、**`client_id` 去重语义（服务端按 id 去重，同 id 双发只投 1 条 → 多收件人必须 per-recipient clientId，人工确认）**、**出站广播**（`reply.mode="broadcast"` 显式开播：global master 会话 → 授权收件人 = 绑定 owner ∪ `reply.allowOut`；**缺省 `reply-only` 停播（0925 P0 复裁）**）与**远程斜杠命令旁路**（`/xxx` 在进 LLM 前被消费端拿下 → `consumed`，零转写污染），以及**入站图片附件 M1**（opt-in `channels.wechat.artifact.enabled`，worker 下载+解密+内容寻址落盘 → 注入正文追加 `〔附件：<绝对路径>〕` 后缀，模型经 pi 内建 `read` 读图，**真机验收通过 2026-09-28**，含「模型真读出图中文字」硬标准）均已实现。广播契约见 [[#出站广播]]，命令通道契约见 [[#远程斜杠命令]]，附件契约见「入站图片附件 M1」节。协议剩余未知项及校准状态见「Open Questions」与各契约节。
 
 ## Current Contract
 
@@ -40,6 +48,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - Token/QR 生命周期："无人开 UI 即失能"——以真网测量为准，失效以首次 401/403 时间戳判定。
 - 进程放置：受监督 worker，不进 daemon 事件循环。
 - 安全约束：仅访问 `https://ilinkai.weixin.qq.com` + allowlist 附件 CDN 主机；`send` 当前仅 text。
+- 附件入站（M1，opt-in）：`channels.wechat.artifact.enabled`（JSON 字面量 `true` 才开，缺省/坏配置 fail-closed），worker **每批**重读 ⇒ **免重启开关（生效时延 ≤ 一个长轮询周期 ≈≤95.3s）**；落盘 `<runtimeDir>/wechat/artifacts/files/<sha256>.(jpg|png)`（内容寻址去重、明文、**无 GC/配额 = M2**）；注入正文只追加路径后缀 `〔附件：<绝对路径> (<mime>, <bytes>B)〕`（无 base64/URL/key），模型读图 = 会话内建 `read` + **多模态模型前置**（见「入站图片附件 M1」节）。
 
 ## 出站协议契约（真机校准 2026-09-24）
 
@@ -299,6 +308,67 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 `getupdates` 的 `get_updates_buf` 是 proto `{内层 field1 = last-seen seq, …}/{会话标识}`；把内层 seq 回退后**服务端按该 seq 回放保留窗口历史消息**（单批 ≤20；空 buf → 0 条、无关 buf → `ret=-3` 拒绝）。探针 `listen --replay-seq N` 只发只读 `getupdates`、回放批忽略 seen 去重、**落盘游标只进不退**、不回写过期 `context_token`、与 worker 两套 buf 独立 —— 这是「无需用户重发即可重取历史附件样本」的可复用取证手段。
 
+## 入站图片附件 M1（已实现 `6ae8e0d`，L4 建议修 S3/S4 `972e29f`；**真机验收通过 2026-09-28**）
+
+> 证据级别：**实现面 A（源码逐行 + 20 组断言块回归）+ 验收面 B（本机真机端到端）**。规格 `plans/0925_wechat_artifact_M1_plan.md`、实现报告 `plans/0925_wechat_artifact_M1_impl_report.md`、L4 独立复核 `plans/0925_wechat_artifact_M1_l4_review.md`（**PASS / 0 阻断** / 8 条建议修，其中 S3/S4 已修于 `972e29f`）、启用清单 `plans/0927_m1_enable_checklist.md`、收尾报告 `plans/0928_wechat_artifact_M1_wrapup_report.md`（plans/ 本地 gitignored）。
+
+### 启用配置与免重启语义
+
+- **键**：`channels.wechat.artifact.enabled`，必须是 **JSON 字面量 `true`**（`=== true`，字符串 `"true"` 不算）；文件 = **仓库根 `config.json`**（`PI_CHANNEL_WECHAT_CONFIG` env 由 supervisor 注入 server 的 configPath，无 env 覆盖到别处）。
+- **读取**：`extensions/runtime-host/wechat-bind.ts#L270::readWechatArtifactConfig` —— `readFileSync + JSON.parse`，`raw.channels.wechat.artifact.enabled === true` 才 `{enabled:true}`；缺段/坏 JSON/非 true/缺文件 → `{enabled:false}`，never-throw、**fail-closed**（与 `remoteCommands` 同款）。
+- **免重启（0 个进程需重启）**：`extensions/channel-wechat/index.ts#L80` `readArtifactGate: () => readWechatArtifactConfig(configPath).enabled`，由 `worker.ts#L179` `const gateOn = readArtifactGate() && artifactDir !== undefined` **每批**调用（每次 `getupdates` 长轮询返回后、`parseBatch` 之前）⇒ 改完配置**下一批即生效**，时延 ≤ 一个长轮询周期（`GETUPDATES_DEFAULT_TIMEOUT_MS = 95_000` + `pollGapMs = 250` ⇒ **≈≤95.3s**；2026-09-28 真机实测生效时延 ≤95s）。注入侧 `composeWechatBody` **无 gate**（只看记录字段）；supervisor `sync` 的 spawn 三条件（`enabled`/`receive.enabled`/凭据）**不含 artifact 段** ⇒ 改它既不 spawn 也不收走 worker；会话/`outbox-bridge` 与附件无关。
+- **无 CLI/GUI 开关**（R5 裁定 M1 手改 config；`POST /v1/wechat/enable` 只写 `channels.wechat.enabled`，不碰 artifact 段）；也**无任何端点暴露当前 gate 值**，生效与否只能行为验证（落盘 + 投影 + 注入审计三路交叉）。
+- **注意（L4-S5）**：gate 在**批与批之间**翻转即时生效，在途批次按当时门执行 ⇒ **启用期间不要反复热改** config（避免在途消息按 OFF 落 `附件失败[#i]` 行后永不补下，fail-visible 但白发一条失败记录）。
+
+### 落盘规格
+
+| 项 | 规格 | 源码位置 |
+|---|---|---|
+| 路径 | `<runtimeDir>/wechat/artifacts/files/<sha256hex>.jpg\|png`（`<runtimeDir>` 默认 `~/.pi/agent/runtime`） | `artifact.ts::ARTIFACT_REL_BASE = "wechat/artifacts/files"`（`#L50`）、`index.ts#L81` `artifactDir = join(runtimeDir,"wechat","artifacts")` |
+| 目录创建 | **惰性**：首次成功落盘 `mkdirSync(filesDir,{recursive:true})`；OFF / 从未成功 ⇒ 整个 `artifacts/` 不存在 | `artifact.ts#L237` |
+| 去重 | 内容寻址：文件名 = `sha256(明文)`，同内容恒同名 ⇒ 同图重发仍 1 文件、两记录同一 `artifactRef` | `artifact.ts`（V5 实测） |
+| 入漏斗条件 | `type==2` 图片 + 真机两键 `image_item.media.{full_url,aes_key}` 命中 + 发送者过 `input.allowFrom`；host 后缀 allowlist（真机 `novac2c.cdn.weixin.qq.com` 命中 `.qq.com`）+ `redirect:"manual"` **≤3 跳每跳复检**；魔数只认 `FFD8FF`（jpeg）/`89504E47`（png）；key = `base64(hex32)` 派生 → AES-128-ECB+PKCS7 | `parser.ts#L254`、`artifact.ts`（`isHostAllowed`/`decryptImage`/`storeArtifact`） |
+| 限额 | 单文件 8MB（`readBodyLimited`：Content-Length 预拒 + **流式累计复拒**，下载过程中生效）；单消息 1 图（第 2 张 → `extra-image` 失败行）；批预算 30s / 单请求 15s | `artifact.ts`、`worker.ts`（代码常数非 config） |
+| 原子写 | tmp 位于 `artifacts/` 根（`wx` 独占、0600）→ `rename` 进 `files/` → `chmodSync(0600)`；**Windows 上 0600 是「尽力」**（chmod 只映射只读位），机密性靠 `~/.pi/agent` 的 NTFS ACL 继承 | `artifact.ts#L240-L254` |
+| 崩溃残留清扫（L4-S3，`972e29f`） | 每次 `storeArtifact` **先** `sweepStaleTmp`：只扫 `artifacts/` 根一层、只删 `tmp*.tmp` 且 **mtime>1h** 的普通文件（在写 tmp 永不被删、不碰 `files/` 正式产物、never-throw） | `artifact.ts#L192`/`#L232` |
+| `artifactRef` 形状 | 相对 runtimeDir 的 `wechat/artifacts/files/<64hex>.(jpg\|png)`；**单一形状门** `ARTIFACT_REF_RE`（`wechat-input.ts#L31`，`..`/盘符/URL/非 hex 一律不符）；投影侧 `server.ts` **import 同一个常量**（L4-S4，不维护第二份规则） | `wechat-input.ts#L31`、`server.ts#L1111` |
+| 索引 / GC | **无索引 json、无配额、无期限、无 GC**（刻意）⇒ 删 `artifacts/` 即回 M0、零迁移；**正式产物明文长期保留 = M2 R1** | `artifact.ts` 头注 |
+
+失败可见面：失败落 `quarantine.jsonl` 行 `附件失败[#i]:<失败类>（无 URL/key）`（失败类只可能是 `http-<code>`/`host-not-allowed`/`too-large`/`magic-mismatch`/`decrypt-failed`/`internal`…，异常文本被 `catch → internal` 吞掉）；**`aes_key`/CDN URL/botToken 绝不落盘**（V10 哨兵 0 命中 + L4 植入式变异 3/3 被抓）。
+
+### 注入正文形状
+
+- 后缀由 `wechat-input.ts` `artifactSuffix()` 生成，**逐字段**：`` 〔附件：<绝对路径> (<mime>, <bytes>B)〕 `` —— 绝对路径 = `join(runtimeDir, ref)` 现解；mime 由扩展名映射（仅 `image/jpeg` / `image/png`）；bytes = 注入时 `statSync` 现取，stat 失败降级为 `(image/jpeg)` 无 bytes（**fail-safe 不丢引用**）。
+- 完整注入正文（真机实录）：``[微信 o9cq80…chat] 〔附件：C:\Users\Annacomnena\.pi\agent\runtime\wechat\artifacts\files\<sha256>.jpg (image/jpeg, 46499B)〕``；纯图消息 `text==""` 时正文即 ``[微信 <mask>] 〔附件：…〕``（`composeWechatBody` 空文本分支）。
+- ref 缺席 / 形状不符 → **旧表达式逐字节保留**（OFF 零行为锚：`_test_wechat_input` T9 精确等值 + artifact 测试 V11/T3）。
+- 后缀里**绝无** base64 密文 / URL / `aes_key`（V9 断言）；`/v1/wechat/inbox` 投影只透传通过形状门的**相对** `artifactRef`，无盘符/URL（V19：9 条非法 ref 一律不透传且与注入侧同一正则）。
+
+### 模型读图机制（pi 内建 `read` + **多模态前置**）
+
+1. **注入正文只有路径、没有任何「读图」指令** ⇒ 模型必须**自己发起** `read(path=<附件绝对路径>)`。pi 内建 `read` 工具读文件 → 魔数嗅探（jpeg `FFD8FF` / png / gif / webp / bmp）命中即**把图片作为附件（image content block）返回**（工具描述："Supports text files and images… Images are sent as attachments."）；M1 落盘恒为 jpg/png ⇒ 必命中。图片随后按会话模型的 `input` 能力入历史（`inputLimits.images.resize`：≤2000px / 4.5MiB base64 / JPEG q80 ⇒ 大图不撑爆请求）。
+2. **前置① 模型必须多模态**：`~/.pi/agent/models.json` 当前模型 `input` 含 `"image"`（2026-09-28 实查 `mimo-v2.6-flash` → `"input": ["text","image"]` ✓）。⚠️ **纯文本模型下验收不成立**（`read` 仍返回附件但模型看不见）——这是硬边界，验收前 `/model` 核对。
+3. **前置② 必须另发一条文本**触发：如「读出上一条附件图片里的文字」→ 模型才调 `read`。**只发图不发指令 = 模型不读图**（操作要点）。
+4. **无备用 OCR/转述**：M1 范围内刻意不做（L2 §1 推后）；RPC `prompt` 的 `images` 字段是另一条 GUI/扩展直发通道，微信注入链不用 ⇒ 模型不支持 image 就换模型，没有降级方案。
+
+### 真机验收证据（2026-09-28，权威）
+
+| # | 环节 | 实证 |
+|---|---|---|
+| 1 | 启用 | 仓库根 `config.json` → `channels.wechat.artifact = {"enabled":true}`；**免重启**，下一批生效（时延 ≤95s） |
+| 2 | 下载→解密→落盘 | `~/.pi/agent/runtime/wechat/artifacts/files/18aac6b930d75f083f0185fcda932ff0275a87708748f8f542e71ee78e1daad2.jpg`：**46,499 字节**、魔数 **`FFD8FF`**（`FF D8 FF E1` = APP1/Exif baseline JPEG）、SOF 尺寸 **1200×2670**、mtime 2026-09-28 17:04（目录恰 1 文件 = 内容寻址去重） |
+| 3 | 记录与投影 | inbox `receive/inbox/7510263246191068000.bb23b816.json`：`text:""` + `artifactRef:"wechat/artifacts/files/18aac6b9….jpg"` + `state:"injected"`（相对 ref、无盘符/URL/key） |
+| 4 | 注入正文 | outbox `state/message-outbox/172d8d19….json` `text` = `[微信 o9cq80…chat] 〔附件：C:\…\18aac6b9….jpg (image/jpeg, 46499B)〕`，`status:"delivered"`；审计 `state/wechat-input-audit.jsonl` 09:04:54Z `decision:accepted, reason:injected` |
+| 5 | **⭐ 模型真读出内容**（astra 硬标准："只有路径进注入正文不算通过，下载成功也不算通过"） | 会话 transcript（`01a0cc02…` 会话，2026-09-28T09:05:20Z）：**`read` 工具调用 `arguments.path = …/18aac6b9….jpg`**（transcript 中 sha 出现 4 次）→ assistant 复述图中文字 **`test-9f3a`**（与原图一致）⇒ **验收成立** |
+| 6 | 多模态前置 | `~/.pi/agent/models.json` → `mimo-v2.6-flash` 的 `"input": ["text","image"]` ✓（纯文本模型下第 5 项不成立） |
+
+### 已知边界（诚实清单，不得读成「图片问题已全部解决」）
+
+- **pi `read` 读图边角**：**渐进式 JPEG**（`FFD8 FF F7` 起，SOF2）与**动画 PNG**（含 acTL chunk）被 pi 的魔数嗅探判为"非图片"→ 按二进制文本**读出乱码**（pi 读侧行为，非本仓代码）。微信照片通常 baseline JPEG（本次验收图为 `FFE1`，命中）；若验收图恰好渐进式 → 换普通照片或先转码。`pi-image-tools` 扩展是剪贴板/预览工具，**不是**模型读图机制。
+- **artifacts 明文长期保留、无 GC/配额/期限** = **M2 R1**（本次刻意不做；只清 >1h 的 `tmp*.tmp` 崩溃残留）。删除 = 手动 `rm -rf artifacts/`（无索引零风险）。
+- 其余 M2/M3 残余：无 IP 段复验（R4，越域拒绝只有 host 后缀 + 每跳复检 + ≤3 跳）、无 CLI/GUI 开关（R5）、无 GUI quarantine 徽章（R6）、无「只落盘不注入」子开关（R8）、单消息单图（R10）、gzip 解压炸弹无专门用例、真机下载耗时/体积常数回采（U8）。
+- **语音 / 文件不进漏斗**：`type=3`（voice）/`type=4`（file）**不下载**，照旧进 quarantine（`非文本消息（type=…）`）——M1 只做图片；这是「发语音/文件」后续工作的起点（见 Open Questions）。
+- 启用期间勿反复热改 config（S5，见「启用配置」节）。
+
 ## W2 实现切片（**已落地** `168fed1`：微信私聊文本 → 当前 master owner）
 
 **边界**：只做「判定 + 注入通路」；**界面开关属 W2b**（D17：开关必须界面可达）。
@@ -491,6 +561,8 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 入站媒体与附件规格（媒体探针三轮，commit `6a72b19` + `9f52a4a` + `d724f6a`，仅 `scripts/wechat-ilink-probe.mjs`）：`scripts/wechat-ilink-probe.mjs`（`isHostAllowed`/`CDN_SUFFIX_ALLOW#L141-L149`、key 候选链 `#L202`、解密与判优 `#L276-L303`、`extractAttachments` 按 `media.full_url`/`media.aes_key`、`--replay-seq#L700`、`upload-probe`/`media-probe`）；本地 `plans/0925_wechat_media_probe_results.md` §9/§10（B 级权威）+ `plans/0924_wechat_media_gateway_research.md` §0/§3.4（P1–P8 判读口径与 M1/M4 依赖）；脱敏测量 `plans/.wechat-probe/items.jsonl`（43 行签名，type 1/2/3/4 全覆盖）、`key-format.json`（6 样本 + `conclusion{decryptOk:"6/6", magicOk:"6/6"}`）、`measure.jsonl`（`kind=attachment_download` 带 `magic/sha256_8/keyScheme`）。
 - 出站媒体规格 + `client_id` 去重语义（第四轮补测，commit `56e5088`，基线 `4f67753`；**B + 人工确认**）：本地 `plans/0925_wechat_media_probe_results.md` §11（发送时间线 / 三段实测 / 形状 A `ret=-2` 否证）与 **§11.5（用户人工确认：P3 收到 1 条 / P8 链接已收到 / P6 图已收到 / P2 「不太确定」）**、§11.8（Phase ③ 最终结论与残余 U 7 项）；脱敏测量 `plans/.wechat-probe/measure.jsonl`（`kind=media_probe` ×13、`kind=send_dedup` ×3 带 `textLen`/`clientIdReused`）；per-recipient clientId 派生 `extensions/channel-wechat/send.ts#L72-L74`。
 
+- **入站图片附件 M1（真机验收通过 2026-09-28）**：`extensions/runtime-host/wechat-bind.ts#L270`（`readWechatArtifactConfig` fail-closed）、`extensions/channel-wechat/index.ts#L80`+`#L81`（`readArtifactGate` 每批读 + `artifactDir`）、`extensions/channel-wechat/worker.ts#L179`（`gateOn` 每批求值）、`extensions/channel-wechat/artifact.ts`（`ARTIFACT_REL_BASE#L50`、`storeArtifact`、`sweepStaleTmp#L192` L4-S3、`readBodyLimited`、`processAttachment`）、`extensions/channel-wechat/parser.ts#L254`（type=2 两键抽取）、`extensions/runtime-host/wechat-input.ts#L31`（`ARTIFACT_REF_RE` 单一形状门）+ `artifactSuffix`/`composeWechatBody#L42`（注入后缀）、`extensions/runtime-host/server.ts#L1111`（投影形状门 L4-S4）；验收 `extensions/_test_wechat_artifact.ts`（20 组断言块，含 V9 注入/V10 秘密哨兵/V11 OFF 零行为/V19 投影形状门，修复后实跑全绿）；L4 复核 `plans/0925_wechat_artifact_M1_l4_review.md`（PASS / 0 阻断 / 8 建议修；本地 gitignored）。**真机证据**：落盘文件 `…/wechat/artifacts/files/18aac6b9….jpg`（46,499B / `FFD8FF` / 1200×2670）、inbox `7510263246191068000.bb23b816.json`（`artifactRef` + `injected`）、outbox `172d8d19….json`（`〔附件：… (image/jpeg, 46499B)〕` delivered）、`wechat-input-audit.jsonl` 09:04:54Z `accepted/injected`、会话 transcript 09:05:20Z `read` 调用 + 复述 `test-9f3a`、`models.json` `mimo-v2.6-flash` `input:["text","image"]`；收尾报告 `plans/0928_wechat_artifact_M1_wrapup_report.md`。
+
 ## Links Out
 
 - [[审批门策略]]
@@ -507,3 +579,4 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。
 - 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；~~③ 服务端 `client_id` 去重语义仍未定论~~ → **已定（人工确认）：同 id 双发只投 1 条 ⇒ per-recipient clientId 是硬要求**，见「`client_id` 去重语义」节；④ 出站文本长度——4000 为本地预算，协议层 4001 已证被服务端接受（B），**微信端截断未定（U）**。
 - 远程斜杠命令通道待实测/未决：① 真机会话内 `/wechat-remote-run` 派发（含 agent 忙时 defer 窗口）只有静态依据 + fakePi 单测，**未做真机会话验证**；② GUI 面未做——`remoteCommands.enabled` 界面开关（D17）与 inbox 对 `state:"consumed"` 的徽章渲染（当前显示字面 `consumed`）；③ 诊断面只给 `commandAuditLines` 行数，`consumed` 记录明细仍不可见（quarantine 列表只列 `rejected`）；④ 真机端到端被平台侧消息投递问题阻塞（见「判定实验」节）——通道目前只有本机断言与 fakePi 证据。
+- 入站图片附件 M1 后续（按 M2/M3 分层，**均未做**）：① **M2 R1** artifacts 明文保留期限/容量/清理规则 + 孤儿无引用文件回收（重下得到不同字节时旧文件成无引用孤儿）；② M2 R4 下载 host 的 IP 段复验（防 DNS rebinding/内网 SSRF，现只靠 host 后缀 + 每跳复检）；③ M2 R5/R6 CLI/GUI 开关与 quarantine 徽章、R8「只落盘不注入」子开关；④ **M3 语音（`type=3`，silk 解密已由探针 6/6 验证）与文件（`type=4`）入站**——今天两者只进 quarantine 不下载，含解密/落盘/注入形状与「模型怎么消费」（silk 非图片，`read` 用不上 ⇒ 需转写或另想机制）；⑤ U8 真机下载耗时/体积常数回采校准 30s/15s 预算。

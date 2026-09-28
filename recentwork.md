@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） |
 | 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 |
 | 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | —（第四轮补测 + 人工确认已由 **Item 49** 收口） |
 | 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） |
@@ -58,6 +59,20 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+
+### Item 50 - M1 入站图片附件：真机验收通过 + 文档收尾
+
+- **日期**：2026-09-28
+- **一句话**：M1（入站图片附件）在真机**完整验收通过**并完成文档收尾——**启用 `channels.wechat.artifact.enabled = true` 免重启生效（worker 每批读 gate，时延 ≤95s）**；用户从微信发图 → worker CDN 下载 → AES-128-ECB 解密 → 落盘 `artifacts/files/<sha256>.jpg`（**46,499 字节、魔数 `FFD8FF`、1200×2670**）→ 注入正文带 ` 〔附件：<绝对路径> (image/jpeg, 46499B)〕` → **⭐ 模型用 pi 内建 `read` 读该 jpg 并复述图中文字 `test-9f3a`**（astra 硬标准「只有路径进注入正文不算、下载成功也不算」⇒ **验收成立**）。
+- **验收证据链（2026-09-28，权威）**：① gate = `true`（仓库根 `config.json`，`readWechatArtifactConfig` `=== true` 才开）；② 落盘 `~/.pi/agent/runtime/wechat/artifacts/files/18aac6b930d75f083…daad2.jpg`（46,499B / `FFD8FF E1` baseline / SOF 1200×2670 / 目录恰 1 文件）；③ inbox `7510263246191068000.bb23b816.json` = `text:""` + 相对 `artifactRef` + `state:injected`；④ outbox `172d8d19….json` 正文含 `〔附件：… (image/jpeg, 46499B)〕`（delivered）+ 审计 `accepted/injected` 09:04:54Z；⑤ **transcript 09:05:20Z：`read` 调用 `path=…/18aac6b9….jpg` → assistant 复述 `test-9f3a`**；⑥ 前置：`models.json` `mimo-v2.6-flash` `input:["text","image"]`（**纯文本模型下验收不成立**）；⑦ 操作要点：注入正文只有路径、无"读图"指令 ⇒ **需另发一条文本触发 `read`**。
+- **涉及模块**：**本阶段零生产代码改动**；被固化的事实逐文件核对：`extensions/runtime-host/wechat-bind.ts#L270`（`readWechatArtifactConfig` fail-closed）、`extensions/channel-wechat/index.ts#L80-81`（每批 `readArtifactGate` + `artifactDir`）、`worker.ts#L179`（`gateOn`）、`artifact.ts`（`ARTIFACT_REL_BASE`/原子写/`sweepStaleTmp`）、`wechat-input.ts#L31/L42`（`ARTIFACT_REF_RE` 单一形状门 + `artifactSuffix`/`composeWechatBody`）、`server.ts#L1111`（投影形状门 L4-S4）。
+- **产物**：`plans/0928_wechat_artifact_M1_wrapup_report.md`（收尾报告：Wiki 页/章节、条目号、验收证据链、残余、语音/文件移交要点）
+- **Wiki**：`Wiki/Architecture/wechat-ilink-channel.md` 新增 **「入站图片附件 M1」** 章节（启用配置与免重启语义 / 落盘规格 / 注入正文形状 / 模型读图机制〔pi 内建 read + 多模态前置〕/ 真机验收证据表 / 已知边界）+ Summary、Current Contract、Evidence、Open Questions（M2/M3 残余）修订 + frontmatter `source_paths`/`updated`；`wiki-nav rebuild`
+- **残余（M2/M3，均未做）**：M2 R1 artifacts 明文保留期限/容量/GC + 孤儿回收；R4 IP 段复验；R5/R6 CLI/GUI 开关与 quarantine 徽章；R8「只落盘不注入」子开关；U8 下载耗时/体积回采；**M3 语音（type=3）/文件（type=4）入站**（今天只进 quarantine 不下载；silk 非图片 ⇒ 模型 `read` 用不上，需转写机制）；已知边角：pi `read` 把渐进式 JPEG / 动画 PNG 读成乱码（pi 读侧行为）。
+- **Priority**：P1
+- **Status**：done（M1 全链路真机验收通过；L4 PASS/0 阻断，S3/S4 已修）
+- **Commit**：实现 `6ae8e0d`（feat M1）+ `972e29f`（S3/S4）；本次文档收尾 commit 见 CHANGELOG 同 Item 行
+- **Verification**：落盘文件属性/魔数/SOF 尺寸实测、inbox/outbox/审计三处正文逐字段比对、transcript 中 `read` 调用与 `test-9f3a` 复述、`models.json` `input` 含 `image` 均本机实查；纪律 = 只 `git add` Wiki/recentwork/CHANGELOG 三个具体文件（不碰生产代码、不碰 `scripts/boot-*`）。
 
 ### Item 49 - 微信媒体探针第四轮出站补测 + 人工确认收口（Phase ③ 最终定稿）
 

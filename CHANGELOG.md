@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — 2026-09-28 (微信**入站图片附件 M1 真机验收通过** + 文档收尾；实现 `6ae8e0d` + L4 建议修 `972e29f`，本条目为纯文档提交)
+
+- **真机验收证据链（2026-09-28，权威）**：启用 `channels.wechat.artifact.enabled = true`（**免重启**——`worker.ts#L179` 每批 `readArtifactGate()` 重读仓库根 `config.json`，生效时延 ≤ 一个长轮询周期 ≈≤95.3s，实测 ≤95s）→ 用户发图 → worker CDN 下载 + AES-128-ECB 解密 → 落盘 `~/.pi/agent/runtime/wechat/artifacts/files/18aac6b930d75f083…daad2.jpg`（**46,499 字节**、魔数 **`FFD8FF`**（`FFE1` baseline）、SOF **1200×2670**、目录恰 1 文件 = 内容寻址去重）→ inbox 记录 `text:""` + 相对 `artifactRef` + `state:"injected"` → outbox 正文 `[微信 o9cq80…chat] 〔附件：<绝对路径> (image/jpeg, 46499B)〕`（delivered，审计 `accepted/injected`）。
+- **⭐ 验收核心（astra 硬标准「只有路径进注入正文不算通过，下载成功也不算通过」）**：模型用 pi 内建 **`read`** 工具读该 jpg（transcript 中 `read.arguments.path = …/18aac6b9….jpg`）→ **复述出图中文字 `test-9f3a`** ⇒ **验收成立**。**两个前置（缺一不成立）**：① 会话模型必须多模态——`models.json` `mimo-v2.6-flash` `input:["text","image"]` ✓（**纯文本模型下 read 仍返回附件但模型看不见，验收不成立**）；② 注入正文只有路径、**无"读图"指令** ⇒ 必须**另发一条文本**（如「读出上一条附件图片里的文字」）触发 read。
+- **机制与边界（固化进 Wiki）**：gate = `wechat-bind.ts#L270 readWechatArtifactConfig`（`=== true`，never-throw fail-closed）；落盘 `<runtimeDir>/wechat/artifacts/files/<sha256>.(jpg|png)`（原子写 tmp→rename + 0600 尽力位 + L4-S3 `sweepStaleTmp` 清 >1h 明文残留）；注入后缀 = `wechat-input.ts::artifactSuffix`，形状门 `ARTIFACT_REF_RE`（投影侧 `server.ts` 同一常量 = L4-S4），后缀绝无 base64/URL/key；**已知边界**：pi `read` 把**渐进式 JPEG / 动画 PNG 读成乱码**（pi 读侧行为）、**artifacts 明文长期保留、无 GC/配额（= M2 R1）**、语音/文件（type 3/4）仍只进 quarantine 不下载。
+- **残余（M2/M3 待做）**：R1 artifacts 保留期限/容量/清理 + 孤儿回收；R4 下载 host IP 段复验；R5/R6 CLI/GUI 开关与 quarantine 徽章；R8「只落盘不注入」子开关；U8 下载耗时/体积常数回采；**M3 语音/文件入站**（silk 非图片 ⇒ 需转写机制，`read` 用不上）。
+- **文档**：Wiki `Wiki/Architecture/wechat-ilink-channel.md` 新增「入站图片附件 M1」章节（启用配置与免重启语义 / 落盘规格 / 注入正文形状 / 模型读图机制〔内建 read + 多模态前置〕/ 真机验收证据表 / 已知边界）+ Summary、Current Contract、Evidence、Open Questions、frontmatter `source_paths`/`updated` 修订；`wiki-nav rebuild`；Recent Work **Item 50**；收尾报告 `plans/0928_wechat_artifact_M1_wrapup_report.md`（含 M2/M3 残余与「发语音/文件」移交要点）。**本条目零生产代码改动。**
+
 ## [Unreleased] — 2026-09-25 (微信出站收件授权 P0：`005410a` + L4 建议修〔本提交〕)
 
 - **授权集合与入站解耦（P0，用户已批准推翻信任假设）**：广播收件人 = `knownChats()` **候选池** ∩ **授权集合**（绑定 owner `credentials.ownerOpenId` ∪ `channels.wechat.reply.allowOut` 显式订阅，**缺省 `[]`**）；入站 `input.allowFrom` 与 rejected 记录**不参与**出站裁决（读/写/裁决三路零耦合，`wechat-outbound-auth.ts` 全文不出现 `allowFrom`/`knownChats`）；`allowOut` 三态 fail-closed（缺失/非法/坏文件均只收缩，`wechat-bind.ts::readWechatReplyConfig`）；HTTP 面**无任何端点可写 `allowOut`**（只能改配置文件）。
