@@ -153,7 +153,7 @@ import { setAutonomyEnabled } from "./autonomy-config.ts";
 import { readAutonomyConfig } from "../runtime/autonomy/config.ts";
 import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/collect.ts";
 import { readKillSwitch } from "../runtime/autonomy/kill-switch.ts";
-import { startWechatInput } from "./wechat-input.ts";
+import { ARTIFACT_REF_RE, startWechatInput } from "./wechat-input.ts";
 import { startWechatReplyWatcher } from "./wechat-reply.ts";
 import { listReplyIntents, replyIntentDir } from "../runtime/wechat-reply.ts";
 import { readAttachment } from "../runtime/registry.ts";
@@ -1106,7 +1106,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					state: r.state,
 					...(r.artifactPending === true ? { artifactPending: true } : {}),
 					// M1（0925）：附件只透传**相对路径**（无绝对盘符、无 URL/key；A10/A17 哨兵锁死）
-					...(typeof r.artifactRef === "string" && r.artifactRef !== "" ? { artifactRef: r.artifactRef } : {}),
+					// L4-S4：投影侧套**同一形状门**（与注入侧共用 wechat-input.ARTIFACT_REF_RE 单一来源，
+					// 不维护第二份宽松规则）——形状不符（`..`/绝对路径/盘符/URL/非 sha 名）⇒ 不透传。
+					...(typeof r.artifactRef === "string" && ARTIFACT_REF_RE.test(r.artifactRef) ? { artifactRef: r.artifactRef } : {}),
 				})),
 			});
 			return;

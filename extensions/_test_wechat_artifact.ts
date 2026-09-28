@@ -25,12 +25,17 @@
  *   V17 投影：/v1/wechat/inbox 含 artifactRef（相对路径），无绝对盘符/URL/key
  *   V10 秘密哨兵：SENTINEL_TOKEN/AES_KEY/CDN_URL × 文件树+stdout/stderr+state/审计+端点响应 = 0 命中
  *   V11 opt-in OFF 零行为：缺省 gate → 零 CDN 请求/零目录/parseBatch 等价/注入正文精确等于旧格式
+ *   V18 崩溃残留 tmp 清扫（L4-S3）：真崩溃点子进程 SIGKILL 残留；>1h 才清（1h 内/正在写/非 tmp 名
+ *      不删）、去重命中也清、files/ 正式产物不动（不递归删目录）
+ *   V19 投影 artifactRef 形状门（L4-S4）：合法相对路径透传；`..`/绝对路径/盘符/URL/非 sha 名不透传，
+ *      且与注入侧 ARTIFACT_REF_RE 逐条一致（单一来源）
  */
 
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -39,12 +44,14 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "wechat-art-test-env-"))
 
 import {
 	ARTIFACT_REL_BASE,
+	ARTIFACT_TMP_MAX_AGE_MS,
 	deriveAesKey,
 	decryptImage,
 	isHostAllowed,
 	quarantineHasArtifactFailure,
 	safeDownload,
 	storeArtifact,
+	sweepStaleTmp,
 } from "./channel-wechat/artifact.ts";
 import { parseBatch } from "./channel-wechat/parser.ts";
 import { WechatStore, type InboundRecord } from "./channel-wechat/store.ts";
@@ -54,7 +61,7 @@ import {
 	wechatCredsPath,
 	writeWechatCreds0600,
 } from "./runtime-host/wechat-bind.ts";
-import { tryInjectPending } from "./runtime-host/wechat-input.ts";
+import { ARTIFACT_REF_RE, tryInjectPending } from "./runtime-host/wechat-input.ts";
 import { listOutboxItems } from "./runtime/message-outbox.ts";
 import { classifyRemoteCommand } from "./runtime/wechat-remote-command.ts";
 import { createRuntimeHostServer, type RuntimeHostHandle } from "./runtime-host/server.ts";
@@ -986,6 +993,110 @@ async function v17(): Promise<void> {
 	}
 }
 
+// ── V18 崩溃残留 tmp 清扫（L4-S3：>1h 才清，不递归删目录）────────────
+
+async function v18(): Promise<void> {
+	const dir = mkdtemp("wx-art-v18-");
+	try {
+		const adir = join(dir, "wechat", "artifacts");
+		mkdirSync(join(adir, "files"), { recursive: true });
+		// ① 真崩溃点：子进程按 storeArtifact 同款现场（`wx` 独占 + 0600 + 半开 tmp）写完后 SIGKILL 自杀
+		const residue = join(adir, `tmp${process.pid}.1oabcd.crash01.tmp`);
+		const crash = spawnSync(process.execPath, [
+			"-e",
+			'const fs=require("node:fs");const fd=fs.openSync(process.argv[1],"wx",0o600);fs.writeFileSync(fd,Buffer.alloc(512,0xff));fs.closeSync(fd);process.kill(process.pid,"SIGKILL");',
+			residue,
+		]);
+		assert.ok(crash.status !== 0 || crash.signal !== null, `子进程必须非正常退出（status=${crash.status} signal=${crash.signal}）`);
+		assert.ok(existsSync(residue), "崩溃后 tmp 残留在盘上（明文，无引用）");
+		// ② 边界（崩溃 <1h / 正在写）：不删
+		assert.ok(storeArtifact(PNG_PLAIN, { artifactsDir: adir }).ok, "首写成功（触发清扫）");
+		assert.ok(existsSync(residue), "崩溃 <1h 不清（同一道年龄门也保护正在写的 tmp）");
+		// ③ 时间流逝 >1h：下次 storeArtifact（下次启动路径）清掉
+		const old = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+		utimesSync(residue, old, old);
+		const inFlight = join(adir, "tmp777.1oabcd.inflight.tmp"); // 模拟另一进程正在写（新鲜 mtime）
+		writeFileSync(inFlight, JPEG_PLAIN, { mode: 0o600 });
+		const notTmp = join(adir, "keep.old"); // 不匹配 tmp*.tmp ⇒ 永不删
+		writeFileSync(notTmp, "keep");
+		utimesSync(notTmp, old, old);
+		assert.ok(storeArtifact(JPEG_PLAIN, { artifactsDir: adir }).ok, "第二写成功");
+		assert.ok(!existsSync(residue), "崩溃残留 >1h → 被清（含明文）");
+		assert.ok(existsSync(inFlight), "1h 内/正在写的 tmp 不删（边界）");
+		assert.ok(existsSync(notTmp), "非 tmp*.tmp 名不删（形状门，非递归删目录）");
+		// ④ 去重命中同样清扫（清扫在去重早退之前 ⇒ 同内容重发的下次启动也能清）
+		const stale2 = join(adir, "tmp888.1oabcd.stale2.tmp");
+		writeFileSync(stale2, JPEG_PLAIN, { mode: 0o600 });
+		utimesSync(stale2, old, old);
+		const again = storeArtifact(JPEG_PLAIN, { artifactsDir: adir });
+		assert.ok(again.ok && again.value.deduped, "同内容第二次 → 去重命中");
+		assert.ok(!existsSync(stale2), "去重命中分支同样清扫");
+		// ⑤ 正式产物完好：清扫只动 artifacts 根一层的 tmp，不碰 files/
+		assert.ok(existsSync(join(adir, "files", `${sha256(PNG_PLAIN)}.png`)), "files/ 新产物完好");
+		assert.ok(existsSync(join(adir, "files", `${sha256(JPEG_PLAIN)}.jpg`)), "files/ 既有产物完好");
+		// ⑥ sweepStaleTmp 单元：never-throw + 返回实删数；年龄门由 maxAgeMs 参数控制
+		assert.equal(sweepStaleTmp(join(dir, "nope")), 0, "目录不存在 ⇒ 0，不抛");
+		assert.equal(sweepStaleTmp(adir), 0, "无 >1h 残留 ⇒ 删 0（新鲜 tmp 仍在）");
+		const stale3 = join(adir, "tmp999.1oabcd.stale3.tmp");
+		writeFileSync(stale3, JPEG_PLAIN, { mode: 0o600 });
+		utimesSync(stale3, old, old);
+		assert.equal(sweepStaleTmp(adir), 1, "恰好删 1 个（返回实删数）");
+		assert.ok(!existsSync(stale3), "指定 tmp 已删");
+		assert.ok(existsSync(inFlight) && existsSync(notTmp), "再次清扫仍不碰新鲜/非 tmp 名");
+		assert.ok(ARTIFACT_TMP_MAX_AGE_MS === 60 * 60 * 1000, "阈值 = 1h（L4 建议口径）");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// ── V19 投影 artifactRef 形状门（L4-S4：复用注入侧正则，不透传非法值）──
+
+async function v19(): Promise<void> {
+	const dir = mkdtemp("wx-art-v19-");
+	let h: RuntimeHostHandle | null = null;
+	try {
+		const rt = join(dir, "wechat-rt");
+		mkdirSync(rt, { recursive: true });
+		const cfg = join(dir, "config.json");
+		writeFixtureConfig(cfg, { enabled: true, receive: { enabled: true } });
+		const good = `${ARTIFACT_REL_BASE}/${"a".repeat(64)}.jpg`;
+		const bad = [
+			"../../../etc/passwd",
+			"wechat/artifacts/files/../../../secret",
+			"C:\\Windows\\win.ini",
+			"/etc/passwd",
+			`${"A".repeat(64)}.jpg`, // 大写 hex 不合法
+			`${"a".repeat(64)}.exe`, // 扩展名不符
+			"https://evil.example.com/x.jpg", // URL
+			`wechat/artifacts/files/${"a".repeat(63)}.jpg`, // 少一位 hex
+			"wechat/artifacts/tmp/x.jpg", // 非 files/ 子路径
+		];
+		const store = new WechatStore(WechatStore.resolveDir(rt));
+		store.putInbox({ msgId: "v19-ok", fromId: ALLOWED, fromNickname: null, text: "合法记录", receivedAt: "2026-01-01T00:00:01.000Z", state: "pending", artifactRef: good });
+		for (const [i, ref] of bad.entries()) {
+			store.putInbox({ msgId: `v19-bad${i}`, fromId: ALLOWED, fromNickname: null, text: `非法记录${i}`, receivedAt: "2026-01-01T00:00:02.000Z", state: "pending", artifactRef: ref });
+		}
+		h = await createRuntimeHostServer(hostServerOpts(dir, cfg, rt));
+		const base = `http://127.0.0.1:${h.info.port}`;
+		const body = await (await fetch(`${base}/v1/wechat/inbox?limit=50`, { headers: { "x-command-token": h.info.token } })).text();
+		const j = JSON.parse(body) as { count: number; messages: { msgId: string; artifactRef?: string }[] };
+		const byId = new Map(j.messages.map((m) => [m.msgId, m.artifactRef]));
+		assert.equal(j.count, 1 + bad.length, "全部记录都在投影里（不因形状门丢记录，只丢字段）");
+		assert.equal(byId.get("v19-ok"), good, "合法相对 artifactRef → 透传");
+		// 单一来源：投影的透传决定必须与注入侧 ARTIFACT_REF_RE 逐条一致
+		assert.equal(ARTIFACT_REF_RE.test(good), true, "注入侧同一正则放行合法值");
+		for (const [i, ref] of bad.entries()) {
+			assert.equal(byId.get(`v19-bad${i}`), undefined, `非法 ref 不透传：${ref.slice(0, 48)}`);
+			assert.equal(ARTIFACT_REF_RE.test(ref), false, `注入侧同一正则同样拒绝：${ref.slice(0, 48)}`);
+			assert.ok(!body.includes(ref), `响应体不含非法值原文：${ref.slice(0, 48)}`);
+		}
+		assert.ok(!body.includes("../") && !body.includes("win.ini") && !body.includes("evil.example.com"), "响应无穿越/盘符/URL 片段");
+	} finally {
+		if (h !== null) await h.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 // ── V10 秘密哨兵（token/aes_key/CDN URL × 文件树+输出+审计+端点）────────
 
 async function v10(): Promise<void> {
@@ -1176,6 +1287,8 @@ try {
 	await test("V17 投影：/v1/wechat/inbox 含相对 artifactRef，无绝对盘符/URL/key", v17);
 	await test("V10 秘密哨兵 0 命中：token/aes_key/CDN URL × 文件树+stdout/stderr+state/审计+端点响应", v10);
 	await test("V11 opt-in OFF 零行为：零 CDN 请求/零目录/parseBatch 等价/注入正文精确等于旧格式", v11);
+	await test("V18 崩溃残留 tmp 清扫（L4-S3）：真崩溃残留 >1h 才清、新鲜/在写/非 tmp 名不删、去重命中也清、files/ 不动", v18);
+	await test("V19 投影 artifactRef 形状门（L4-S4）：合法透传、非法（`..`/盘符/URL/非 sha 名）不透传且与注入侧同一正则", v19);
 } catch (e) {
 	console.error(`主流程异常: ${e instanceof Error ? e.stack : String(e)}`);
 	process.exitCode = 1;

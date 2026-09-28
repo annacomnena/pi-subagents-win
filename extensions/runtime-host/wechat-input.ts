@@ -27,7 +27,9 @@ function atomicRecord(dir: string, rec: InboundRecord & { injectedAt?: string; o
 // M1（0925）附件后缀：只给**路径引用**（绝对路径现解），绝不内联 base64/密文/URL/aes_key（计划 §5.4）。
 // artifactRef 形态由 worker 侧内容寻址命名锁死（`wechat/artifacts/files/<sha256>.<jpg|png>`）——
 // 严格正则兼作路径安全门（拒 `..`/绝对路径/盘符）；形态不符 ⇒ 不追加后缀（回旧格式，fail-safe）。
-const ARTIFACT_REF_RE=/^wechat\/artifacts\/files\/[0-9a-f]{64}\.(jpg|png)$/;
+// L4-S4：**单一形状门**——runtime-host/server.ts 的 /v1/wechat/inbox 投影直接 import 同一个常量
+// （不维护第二份规则），投影端形状不符同样不透传，与「只透传相对路径」承诺对齐。
+export const ARTIFACT_REF_RE=/^wechat\/artifacts\/files\/[0-9a-f]{64}\.(jpg|png)$/;
 function artifactSuffix(runtimeDir:string,ref:string|undefined):string{
  if(typeof ref!=="string"||!ARTIFACT_REF_RE.test(ref))return "";
  const abs=join(runtimeDir,ref); const mime=ref.endsWith(".png")?"image/png":"image/jpeg";

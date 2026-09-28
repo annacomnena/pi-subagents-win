@@ -65,7 +65,7 @@ export interface InboundRecord {
 	injectedAt?: string;
 	/** M1 附件引用（0925）：**相对 runtimeDir** 的路径 `wechat/artifacts/files/<sha256>.<jpg|png>`。
 	 *  只给路径引用——绝不内联 base64/密文/URL/aes_key（注入侧 join(runtimeDir, ref) 现解绝对路径；
-	 *  投影原样透传相对值。旧记录无此键 ⇒ undefined（OFF 零行为）。 */
+	 *  投影经 L4-S4 形状门（wechat-input.ARTIFACT_REF_RE 单一来源）后才透传相对值。旧记录无此键 ⇒ undefined（OFF 零行为）。 */
 	artifactRef?: string;
 }
 

@@ -20,11 +20,15 @@
  *   - `existsSync` 即 sha256 去重（同内容跨消息共享同一文件）；
  *   - 原子写：tmp（`wx` 独占创建，0600，位于 artifacts/ 根、不进 files/）+ rename；失败即 rm tmp；
  *     崩溃残留 tmp 不匹配 `<sha>.<ext>` 名 ⇒ 永不参与去重/引用。
+ *   - L4-S3（0925 复核建议修）：每次 storeArtifact 顺手 `sweepStaleTmp` 删 artifacts 根下
+ *     **>1h** 的 `tmp*.tmp` 崩溃残留（含明文图片）；**只清 tmp、不递归删目录、不动 files/**。
+ *     ⚠️ 边界：这**不是**图片隐私问题的全部——正式产物（`files/*.jpg|png`）仍是明文长期保留，
+ *     其保留期限/容量/清理规则属 **M2 R1**（artifacts GC），本模块刻意不实现。
  *   - M1 不建索引 json / .trash / 配额 GC（推 M2）——删 `artifacts/` 即回 M0，零迁移。
  */
 
 import { createDecipheriv, createHash } from "node:crypto";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 // ── 常数（计划 §3：代码常数非 config；真机冒烟回采 U8 校准）─────────────
@@ -44,6 +48,10 @@ export const ARTIFACT_REQUEST_TIMEOUT_MS = 15_000;
 export const ARTIFACT_BATCH_BUDGET_MS = 30_000;
 /** artifactRef 相对 runtimeDir 的基（记录/投影只存相对路径，注入时 join 现解绝对路径）。 */
 export const ARTIFACT_REL_BASE = "wechat/artifacts/files";
+/** L4-S3：崩溃残留 tmp 的最小滞留时长（>1h 才清；单次写入毫秒级、批预算 30s ⇒ 1h 远超任何在写窗口）。 */
+export const ARTIFACT_TMP_MAX_AGE_MS = 60 * 60 * 1000;
+/** artifacts 根下崩溃残留 tmp 的文件名形状（`tmp<pid>.<base36 时刻>.<随机>.tmp`）。 */
+const ARTIFACT_TMP_NAME_RE = /^tmp.*\.tmp$/;
 
 // ── host allowlist（probe#L144 同款 + 仅 http/https 方案）──────────────
 
@@ -170,6 +178,42 @@ export interface StoredArtifact {
 export type StoreArtifactResult = { ok: true; value: StoredArtifact } | { ok: false; reason: "too-large" | "magic-mismatch" | "write-failed" };
 
 /**
+ * L4-S3 崩溃残留清扫：删 `<artifactsDir>/` **根一层**下超过 `maxAgeMs` 的 `tmp*.tmp` 明文残留。
+ *
+ * 边界（刻意不递归删目录，避免删到正在写的文件）：
+ *   - 只扫 artifacts 根一层、只删匹配 `tmp*.tmp` 的**普通文件**：不碰 `files/` 正式产物，
+ *     也不碰 `inbox/` 等处的 `<文件名>.<pid>.<ts>.tmp`（不以 `tmp` 开头）；
+ *   - mtime 距今 ≤ maxAgeMs（缺省 1h）一律不动 ⇒ **正在写的 tmp 永不被删**（写入毫秒级、
+ *     批预算 30s ≪ 1h；且 storeArtifact 的清扫发生在创建自己的 tmp **之前**）；
+ *   - 单文件 stat/rm 失败只跳过该文件（Windows 被占用句柄 rm 失败不影响主流程）。
+ * never-throw：清扫只是卫生，绝不能让落盘失败（目录不存在 ⇒ 返回 0）。
+ * @returns 实际删除的文件数
+ */
+export function sweepStaleTmp(artifactsDir: string, maxAgeMs: number = ARTIFACT_TMP_MAX_AGE_MS): number {
+	let names: string[];
+	try {
+		names = readdirSync(artifactsDir, { withFileTypes: true })
+			.filter((d) => d.isFile() && ARTIFACT_TMP_NAME_RE.test(d.name))
+			.map((d) => d.name);
+	} catch {
+		return 0; // 目录不存在/不可读 ⇒ 尚无残留
+	}
+	let removed = 0;
+	const now = Date.now();
+	for (const name of names) {
+		const p = join(artifactsDir, name);
+		try {
+			if (now - statSync(p).mtimeMs <= maxAgeMs) continue; // 新鲜（含在写）⇒ 不动
+			rmSync(p, { force: true });
+			removed += 1;
+		} catch {
+			/* 跳过：被占用 / 并发已删 / 权限不足 */
+		}
+	}
+	return removed;
+}
+
+/**
  * 明文 → `files/<sha256>.<ext>`（ext 只由魔数派生）：existsSync 即去重；
  * tmp（`wx` 独占 + 0600）→ rename 原子提交；任何失败即 rm tmp（不留半开文件）。
  * never-throw（IO 失败归一为 write-failed）。
@@ -183,6 +227,9 @@ export function storeArtifact(bytes: Buffer, opts: StoreArtifactOptions): StoreA
 	const relPath = `${relBase}/${sha256}.${ext}`;
 	const filesDir = join(opts.artifactsDir, "files");
 	const target = join(filesDir, `${sha256}.${ext}`);
+	// L4-S3：顺手清扫 >1h 的崩溃残留 tmp（含明文）——刻意放在去重早退**之前**，
+	// 保证「上次崩溃 → 本次同内容重发命中去重」的下次启动同样能清。never-throw。
+	sweepStaleTmp(opts.artifactsDir);
 	if (existsSync(target)) return { ok: true, value: { relPath, sha256, bytes: bytes.length, ext, deduped: true } };
 	let fd = -1;
 	let tmp: string | null = null;
