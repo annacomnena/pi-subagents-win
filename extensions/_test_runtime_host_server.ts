@@ -244,7 +244,7 @@ try {
 					id: newEnvelopeId("msg"), kind: "REPORT", from: "agent://a", to: masterAddress(),
 					subject: "run://tab/tab_s1", sentAt: "2026-09-20T10:06:00.000Z", summary: "pend",
 				}),
-				{ mailboxDir },
+				{ mailboxDir, expectReply: false }, // 0928 P2：本场景断言 journal 尾巴/邮箱计数（run 事件族），显式关闭 ⑧ 期望声明
 			);
 
 			const r = await getJson(base, "/v1/health");

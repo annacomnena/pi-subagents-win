@@ -6,7 +6,7 @@
  * §12.2 检查清单 = 规格原文 8 问（任务书写"七项"系计数偏差，本计划按规格 8 项实现，测试 A8 固化清单）：
  *   1 unhandled frontier diff（实做，装配层直传）
  *   2 mailbox backlog（实做，master 地址 pending > 0）
- *   3 pending request timeout（**恒 unknown**：无 pending-request 账本，不猜——红线条款 9）
+ *   3 pending request timeout（0928 P2：字段缺省 → 恒 unknown；期望账本存在 → open∧overdue 三态可判定）
  *   4 stalled project（实做，frontier.stagnation=true 的项目）
  *   5 ready work + idle owner（**approx**：无 turn 状态载体；true 判定带 approx=no-turn-state 标注）
  *   6 run state != process state（实做，TabDetail.pidAlive===false 且非终态，装配层从 details 取）
@@ -62,6 +62,12 @@ export interface WatchdogInputs {
 	runStateMismatch: { runId: string; phase: string; pidAlive: false }[];
 	/** readLiveness updatedAt 年龄；null = no-liveness → unknown（不猜）。 */
 	heartbeatAgeMs: number | null;
+	/**
+	 * ⑧ 检查 3 载体（0928 P2 加法）：期望账本 open∧overdue 的 requestId。
+	 * **字段缺省（undefined）= 无载体 → 维持 unknown("no-carrier(v1)")**（既有测试零改动）；
+	 * 账本存在 → `[]` = false / 非空 = true（reason 带 overdue=[ids]）。
+	 */
+	overdueRequests?: string[];
 }
 
 export interface WatchdogReport {
@@ -91,8 +97,14 @@ export function evaluateWatchdogChecks(inputs: WatchdogInputs): WatchdogReport {
 			inputs.mailboxBacklogPending > 0
 				? { status: "true", reason: `master pending=${inputs.mailboxBacklogPending}` }
 				: { status: "false", reason: "master pending=0" },
-		// 3：无 pending-request 账本（v1 无载体）→ 恒 unknown（不猜）
-		pending_request_timeout: { status: "unknown", reason: "no-carrier(v1)" },
+		// 3：字段缺省 = 无 pending-request 账本（无载体）→ unknown（不猜）；
+		// 0928 P2 有账本 → open∧overdue 集合可真判定。
+		pending_request_timeout:
+			inputs.overdueRequests === undefined
+				? { status: "unknown", reason: "no-carrier(v1)" }
+				: inputs.overdueRequests.length > 0
+					? { status: "true", reason: `overdue=[${inputs.overdueRequests.join(",")}]` }
+					: { status: "false", reason: "no overdue request" },
 		stalled_project:
 			inputs.stalledProjects.length > 0
 				? { status: "true", reason: `stalled=[${inputs.stalledProjects.join(",")}]` }

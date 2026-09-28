@@ -31,6 +31,7 @@ import type {
 	MessageFrame,
 } from "./protocol.ts";
 import { validateCommandFrame, validateMessageFrame, type Letter } from "./protocol.ts";
+import { declareExpectationSafe, type ExpectReplyOptions } from "./expectations.ts";
 
 // ── 路径 ───────────────────────────────────────────────────────────
 
@@ -51,6 +52,20 @@ export function newMessageId(now: Date = new Date()): EnvelopeId {
 	return newEnvelopeId("msg", now);
 }
 
+/** deliverLetter 投递选项（0928 P2 加法：⑧ 请求—回执期望声明）。 */
+export interface DeliverOptions {
+	mailboxDir?: string;
+	expiresAt?: string;
+	/** 跨进程确定性防重键（F7 claim slot）。 */
+	dedupeId?: string;
+	/**
+	 * ⑧ 期望声明（0928 P2）：`undefined` = 按谓词自动声明（message ∧ requiresAck ∧ !inReplyTo ∧
+	 * from!==to ∧ 落盘成功）；`false` = 显式关；对象 = 覆盖 deadlineAt/expectedType/project。
+	 * 声明 never-throw，绝不影响投递。
+	 */
+	expectReply?: false | ExpectReplyOptions;
+}
+
 /**
  * 投递一帧到目标 logical recipient 的 spool（status=pending）。
  *
@@ -62,7 +77,7 @@ export function newMessageId(now: Date = new Date()): EnvelopeId {
  */
 export function deliverLetter(
 	frame: Deliverable,
-	opts: { mailboxDir?: string; expiresAt?: string; dedupeId?: string } = {},
+	opts: DeliverOptions = {},
 ): { letter: Letter; created: boolean } {
 	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
 	if (frame.frame === "message" && !validateMessageFrame(frame)) {
@@ -92,6 +107,14 @@ export function deliverLetter(
 
 	const letter: Letter = { frame, status: "pending", expiresAt: opts.expiresAt };
 	writeJsonAtomic(path, letter);
+	// ⑧ 声明生产者（0928 P2）：**投递成功点**声明「我在等什么回信」。
+	// 为什么是这里：全仓生产投递只经本函数 → 单一咽喉点使所有真实请求自动入账；
+	// 「派发失败」在本函数里就是抛错/未落盘 → 天然不生成虚假等待；dedupe 输家/已存在
+	//（created=false 路径）根本到不了这里 → first-wins 无第二行。
+	// never-throw：declareExpectationSafe 内部吞掉一切异常，账本 IO 拖不垮投递。
+	if (frame.frame === "message") {
+		declareExpectationSafe({ frame, expectReply: opts.expectReply, mailboxDir });
+	}
 	return { letter, created: true };
 }
 
@@ -99,7 +122,7 @@ export function deliverLetter(
  * 安全投递（event-bus 接线专用，同 emitRuntimeEventOnce 的 safe 纪律）：
  * 任何失败不影响 caller——mailbox 是影子通道，投递失败只返回 false。
  */
-export function deliverLetterSafe(frame: Deliverable, opts: { mailboxDir?: string; expiresAt?: string; dedupeId?: string } = {}): boolean {
+export function deliverLetterSafe(frame: Deliverable, opts: DeliverOptions = {}): boolean {
 	try {
 		deliverLetter(frame, opts);
 		return true;
@@ -109,7 +132,7 @@ export function deliverLetterSafe(frame: Deliverable, opts: { mailboxDir?: strin
 }
 
 /** Command 投递便捷入口（messageId 由 spool 分配）。 */
-export function deliverCommand(frame: CommandFrame, opts: { mailboxDir?: string; expiresAt?: string } = {}): { letter: Letter; created: boolean } {
+export function deliverCommand(frame: CommandFrame, opts: DeliverOptions = {}): { letter: Letter; created: boolean } {
 	return deliverLetter(frame, opts);
 }
 

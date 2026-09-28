@@ -10,6 +10,7 @@
  *   2. `state/master-succession.json`  → master-handoff（readProposal 单记录）
  *   3. `mailbox/<recipient>/*.json`    → escalation / question（pending 信按 frame.kind 过滤）
  *   4. `state/workstreams/*.json`      → blocked（workstream.status === "blocked"）
+ *   5. `state/expectations/open/*.json` → request-timeout（0928 P2 ⑧：now > deadlineAt 的等待回执）
  *
  * 纪律（G1/G2 同款）：
  *   - 全路径注入（stateDir/mailboxDir，同 SnapshotOptions 模式），可单测；
@@ -43,12 +44,13 @@ import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { defaultMailboxDir, listLetters } from "../runtime/mailbox.ts";
 import type { Letter } from "../runtime/protocol.ts";
 import { readProposal } from "../runtime/master-succession.ts";
+import { expectationsRootForStateDir, listOpenExpectations } from "../runtime/expectations.ts";
 import { listWorkstreams } from "../runtime/workstreams.ts";
 
 // ── 契约（§31 v1 形状）────────────────────────────────────────────
 
 export type AttentionSeverity = "critical" | "warning" | "info";
-export type AttentionType = "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked";
+export type AttentionType = "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked" | "request-timeout";
 /** v1 只有 open/resolved（纯派生）；dismissed 归 G4 command executor（§29），永不出现。 */
 export type AttentionStatus = "open" | "resolved";
 
@@ -207,6 +209,41 @@ function pushWorkstreams(stateDir: string, out: Candidate[]): void {
 	}
 }
 
+// ── 第 5 源：⑧ 期望超期（0928 P2；纯读、零写、独立于 autonomy 开关与 kill）──────
+
+/**
+ * 读 `state/expectations/open/` 中 `now > deadlineAt` 的记录 → request-timeout 条目。
+ * 期望关闭（arrived/cancelled）→ 目录换到 closed/ → 条目自然消失（resolved 过滤同理）。
+ * 一 id 一条（dedupeKey = requestId）：同项目多请求互不覆盖。
+ */
+function pushExpectations(stateDir: string, out: Candidate[], now: number): void {
+	const root = expectationsRootForStateDir(stateDir);
+	for (const rec of listOpenExpectations({ root })) {
+		const deadline = Date.parse(rec.deadlineAt);
+		if (!Number.isFinite(deadline) || now <= deadline) continue;
+		out.push({
+			id: `expect:${rec.requestId}`,
+			type: "request-timeout",
+			severity: "warning",
+			title: `请求回执超期：${rec.requestId}`,
+			summary: `expectation overdue: ${rec.requestId} target=${rec.target} deadline=${rec.deadlineAt} project=${rec.projectKey}`,
+			source: rec.target,
+			status: "open",
+			createdAt: rec.declaredAt,
+			dedupeKey: rec.requestId,
+			payload: {
+				requestId: rec.requestId,
+				projectKey: rec.projectKey,
+				projectSource: rec.projectSource,
+				target: rec.target,
+				replyTo: rec.replyTo,
+				deadlineAt: rec.deadlineAt,
+				rev: rec.rev,
+			},
+		});
+	}
+}
+
 // ── 入口（纯函数，永不 throw）─────────────────────────────────────
 
 export function buildAttentionItems(opts: AttentionOptions = {}): AttentionItem[] {
@@ -233,6 +270,11 @@ export function buildAttentionItems(opts: AttentionOptions = {}): AttentionItem[
 	}
 	try {
 		pushWorkstreams(stateDir, out);
+	} catch {
+		/* 段降级 */
+	}
+	try {
+		pushExpectations(stateDir, out, Date.now());
 	} catch {
 		/* 段降级 */
 	}

@@ -5,26 +5,34 @@
  *
  * - 只读调用：collectGlobalView（global-view.ts）/ mailboxBacklog（mailbox.ts，只读计数）/
  *   readLiveness（liveness.ts）/ readKillSwitch / readAutonomyConfig。
- * - 只写自有 namespace：`<runtimeDir>/state/autonomy/{frontier.json, kill-switch.json, audit.jsonl}`
+ * - 只写自有 namespace：`<runtimeDir>/state/autonomy/{frontier.json, kill-switch.json, audit.jsonl,
+ *   wake-gate.json, expectation-notices.json}`
  *   （frontier.json 原子写 tmp+rename，同 timers/mailbox/liveness；audit 追加 best-effort）。
  * - 红线条款 1/3：绝不写 journal / mailbox / tab-runs / timers / recentwork.md / config.json / Wiki；
  *   零 claimLetters/ackLetter/deliverLetter/emitRuntimeEvent 调用（mailbox 只经 mailboxBacklog 只读计数）。
+ * - ⑧ 期望账本（0928 P2）：本层**只读** `state/expectations/`（readExpectationInputs 只读装配），
+ *   **永不写账本**；wake 级 notice ack 只写自有 expectation-notices.json。
  * - 红线条款 10：never-throw 顶层容忍——任何异常收敛为默认返回（frontier:null、watchdog 不唤醒、
  *   gating 视为 inactive），绝不抛给调用方。
  * - v1 无任何调用方注册它（无循环、无注册——计划工程约束 2）；仅测试（temp 目录）与后续 L2 接线使用。
  *   本层不产生任何 wake/注入：Wake Gate 判定由调用层用 evaluateWakeGate（纯）消费返回的 diff。
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "../journal.ts";
 import { collectGlobalView, defaultAgentDir } from "../global-view.ts";
 import { readGraphSnapshot } from "../graph/collect.ts";
 import { toFrontierInput } from "../graph/frontier-input.ts";
 import { mailboxBacklog } from "../mailbox.ts";
+import {
+	expectationsRootForStateDir,
+	listOpenExpectations,
+	noticeAckKey,
+} from "../expectations.ts";
 import { readLiveness } from "../liveness.ts";
 import { masterAddress } from "../address.ts";
 import { readAutonomyConfig } from "./config.ts";
-import { buildFrontier, mapPhaseToProjectState, type FrontierDiff, type FrontierSnapshot, type FrontierSourceSnapshot } from "./frontier.ts";
+import { buildFrontier, mapPhaseToProjectState, type FrontierDiff, type FrontierExpectation, type FrontierSnapshot, type FrontierSourceSnapshot } from "./frontier.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./kill-switch.ts";
 import { evaluateWatchdogChecks, type WatchdogReport } from "./watchdog.ts";
 import type { WakeGateState } from "./wake-gate.ts";
@@ -151,7 +159,14 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 		const masterPending = backlog.filter((b) => b.recipient === masterKey).reduce((s, b) => s + b.pending, 0);
 
 		const prev = readFrontierSnapshot({ stateDir });
-		const { next, diff } = buildFrontier({ snapshot, backlog, prev, now });
+		// ⑧ 期望账本（0928 P2）：账本存在 → 传 open 列表（recordOnly 3→2，⑧ 可进 triggers）；
+		// 不存在 → 不传字段（undefined ⟺ 本进程可见的账本不存在 ⟺ 真 no-carrier，维持 3 条）。
+		// 与 frontier source 选哪条分支（PI_AUTONOMY_FRONTIER_SOURCE）正交——期望账本不经 Graph。
+		const expectations = readExpectationInputs({ stateDir });
+		const overdueRequests = expectations
+			? expectations.filter((e) => now > e.deadlineAt).map((e) => e.requestId).sort()
+			: undefined;
+		const { next, diff } = buildFrontier({ snapshot, backlog, prev, now, ...(expectations ? { expectations } : {}) });
 		writeFrontierSnapshot(next, { stateDir }); // best-effort；失败不影响返回（C4 派生缓存）
 		appendAuditLine(
 			`frontier baseline=${next.baseline} projects=${next.projects.length} triggers=${diff.triggers.length} meaningful=${diff.meaningfulChanges} recordonly=${diff.recordOnly.length}`,
@@ -179,6 +194,9 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 				.filter((d) => d.pidAlive === false && !mapPhaseToProjectState(d.phase).terminal)
 				.map((d) => ({ runId: d.runId, phase: d.phase, pidAlive: false as const })),
 			heartbeatAgeMs,
+			// ⑧ 检查 3 三态化（0928 P2）：账本不存在 → 不传字段（维持 unknown("no-carrier(v1)")）；
+			// 账本存在 → [] = false / 非空 = true reason=overdue=[ids]。
+			...(overdueRequests ? { overdueRequests } : {}),
 		});
 		appendAuditLine(watchdog.auditLine, { stateDir });
 
@@ -258,5 +276,79 @@ export function readAuditTail(opts?: { stateDir?: string; limit?: number }): str
 		return lines.slice(-limit);
 	} catch {
 		return [];
+	}
+}
+
+// ── ⑧ 期望账本接线（0928 P2）：autonomy **只读账本**，只写自有 namespace ────────
+
+interface ExpectationNoticesFile {
+	version: 1;
+	/** `<requestId>:r<rev>` → 已随某次放行的唤醒处理的时刻（ISO）。 */
+	acks: Record<string, string>;
+}
+
+/** 容忍读 wake 级超期 notice ack 表（`state/autonomy/expectation-notices.json`；缺失/坏 → 空集）。 */
+export function readNoticeAckKeys(opts?: { stateDir?: string }): Set<string> {
+	try {
+		const raw = JSON.parse(readFileSync(join(autonomyDir(opts?.stateDir), "expectation-notices.json"), "utf8")) as ExpectationNoticesFile;
+		if (raw?.version !== 1 || typeof raw.acks !== "object" || raw.acks === null) return new Set();
+		return new Set(Object.keys(raw.acks));
+	} catch {
+		return new Set();
+	}
+}
+
+/**
+ * 记录「这些超期 notice 已随一次放行的唤醒被处理」（merge，never-throw，只写自有 namespace）。
+ * at-least-once 边界：crash 于「已放行未 ack」→ 最坏重发一次 notice（方向安全）。
+ */
+export function writeNoticeAckKeys(keys: string[], opts?: { stateDir?: string }): boolean {
+	if (keys.length === 0) return false;
+	try {
+		const dir = autonomyDir(opts?.stateDir);
+		mkdirSync(dir, { recursive: true });
+		const path = join(dir, "expectation-notices.json");
+		let acks: Record<string, string> = {};
+		try {
+			const raw = JSON.parse(readFileSync(path, "utf8")) as ExpectationNoticesFile;
+			if (raw?.version === 1 && typeof raw.acks === "object" && raw.acks !== null) acks = raw.acks;
+		} catch {
+			/* 缺失/坏 → 从空表重建 */
+		}
+		const at = new Date().toISOString();
+		for (const k of keys) if (!acks[k]) acks[k] = at;
+		writeJsonAtomic(path, { version: 1, acks });
+		return true;
+	} catch {
+		return false; // never-throw：ack 失败只是最坏重发一次 notice
+	}
+}
+
+/**
+ * ⑧ 账本 → frontier/watchdog 输入（只读派生，绝不写账本）。
+ * **账本目录不存在 → undefined**（⟺ 真 no-carrier → recordOnly 维持 3 条）；存在 → open 列表
+ *（含 noticeAcked）；坏记录（deadline 不可解析）如实丢弃不猜。
+ */
+export function readExpectationInputs(opts?: { stateDir?: string }): FrontierExpectation[] | undefined {
+	try {
+		const stateDir = opts?.stateDir;
+		const root = expectationsRootForStateDir(stateDir);
+		if (!existsSync(root)) return undefined;
+		const acks = readNoticeAckKeys({ stateDir });
+		const out: FrontierExpectation[] = [];
+		for (const rec of listOpenExpectations({ root })) {
+			const deadlineAt = Date.parse(rec.deadlineAt);
+			if (!Number.isFinite(deadlineAt)) continue;
+			out.push({
+				requestId: rec.requestId,
+				projectKey: rec.projectKey,
+				deadlineAt,
+				rev: rec.rev,
+				noticeAcked: acks.has(noticeAckKey(rec.requestId, rec.rev)),
+			});
+		}
+		return out;
+	} catch {
+		return undefined; // never-throw：读取失败按无载体处理（不猜）
 	}
 }

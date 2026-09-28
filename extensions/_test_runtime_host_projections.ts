@@ -133,7 +133,7 @@ function deliver(
 			sentAt,
 			summary,
 		}),
-		{ mailboxDir },
+		{ mailboxDir, expectReply: false }, // 0928 P2：本测试主体是投影/timeline 契约，显式关闭 ⑧ 期望声明（_test_expectations 覆盖该行为）
 	);
 	return letter.frame.frame === "message" ? letter.frame.id : "";
 }

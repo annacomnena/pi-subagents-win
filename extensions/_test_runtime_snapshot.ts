@@ -118,7 +118,7 @@ try {
 			subject: "run://tab/tab_s1", sentAt: "2026-09-17T19:06:00.000Z", summary: "pend",
 			details: { tabRunId: "tab_s1", status: "completed" },
 		}),
-		{ mailboxDir: MBOX1 },
+		{ mailboxDir: MBOX1, expectReply: false }, // 0928 P2：本场景断言 journal 投影计数，显式关闭 ⑧ 期望声明
 	);
 
 	// ── T1 正常聚合 ─────────────────────────────────────────────────

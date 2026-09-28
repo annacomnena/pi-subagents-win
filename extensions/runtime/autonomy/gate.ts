@@ -21,9 +21,11 @@ import {
 	appendAuditEvent,
 	collectAutonomyInputs,
 	readWakeGateState,
+	writeNoticeAckKeys,
 	writeWakeGateState,
 } from "./collect.ts";
 import type { FrontierDiff } from "./frontier.ts";
+import { noticeAckKey } from "../expectations.ts";
 import { evaluateAutonomyGating, readKillSwitch } from "./kill-switch.ts";
 import { evaluateWakeGate, type WakeGateState } from "./wake-gate.ts";
 
@@ -91,6 +93,16 @@ export function evaluateAutonomyWakeGate(opts?: {
 		const state = readWakeGateState({ stateDir: opts?.stateDir }) ?? { lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: null };
 		const anchored = maintainBatchAnchor(state, diff, now);
 		const decision = evaluateWakeGate({ gating: gating2, diff, state: anchored, cfg: cfg.wakeGate, now });
+		// ⑧ wake 级 ack（0928 P2，r9）：wake 放行后才 ack——本帧 ⑧ 触发对应的期望记为「已处理」，
+		// 此后 frontier 不再为该 (id,rev) 出触发（attention 条目仍在，level 出口）。cooldown 窗内
+		// decision.wake=false → 不 ack → 下一帧触发仍在 → 边沿不丢。红线延续：只写自有命名空间、
+		// IO 只经 collect.ts 窄 helper（本层不 import node:fs）。
+		if (decision.wake) {
+			const ackKeys = diff.triggers
+				.filter((t) => t.rule === "expected_event_timeout" && typeof t.requestId === "string")
+				.map((t) => noticeAckKey(t.requestId!, t.requestRev ?? 0));
+			if (ackKeys.length > 0) writeNoticeAckKeys(ackKeys, { stateDir: opts?.stateDir });
+		}
 		// 任务书目标 4 字面执行：engaged 模式每次判定落一行（含 no-wake）；体积代价见 R5（本批不补轮转）。
 		appendAuditEvent("wake", decision.wake ? "wake" : "no-wake", decision.reason, opts?.stateDir);
 		writeWakeGateState(

@@ -60,6 +60,7 @@ import {
 	type ScopeWakeDecision,
 } from "./runtime/scope.ts";
 import { recordConsumeTick } from "./runtime/scope-consume.ts";
+import { matchAndCloseExpectationSafe, materializeTimeoutNotices } from "./runtime/expectations.ts";
 
 export interface ConsumeOptions {
 	sessionId: string | undefined;
@@ -141,6 +142,11 @@ const auditedPreCutover = new Set<string>();
 export function consumeMailboxOnce(opts: ConsumeOptions): ConsumeReport {
 	const report: ConsumeReport = { owner: null, consumed: [] };
 	try {
+		// ⑧ 超期物化（0928 P2）：每轮对 open∧overdue 的期望落 journal timeout 事件
+		//（claim-then-append 幂等 → 每 (id,rev) 至多一行）。放 owner/cutover 早退**之前**：
+		// 记录面与归属无关；**autonomy 红线禁写 journal**（autonomy/collect.ts 头注释条款 1/3）
+		// → timeout 事件属记录面，由消费侧写者承载；autonomy 只读派生。
+		materializeTimeoutNotices({ mailboxDir: opts.mailboxDir });
 		return consumeMailboxOnceInner(opts);
 	} catch {
 		return report; // 顶层兜底：消费端永不抛
@@ -215,6 +221,13 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			if (!fresh || fresh.sessionId !== opts.sessionId) {
 				reportPush(report, messageId, "skipped", "generation-moved");
 				continue; // 已 claim 的信留给 stale 回收（不丢）
+			}
+			// ⑧ 到达生产者（0928 P2）：claim + fencing 复检通过 = 回信已被请求方真实认领
+			// → 关闭等待（四键匹配，不读 body 不猜内容）。放 preInject 之前：busy/no-injector
+			// 重试与 crash 窗口不制造假超期；already-injected-acked 分支自动覆盖（已走 claim+fencing）；
+			// claim-missed / generation-moved 不关（信留 stale 回收，新 owner 到达时再关）。
+			if (letter.frame.frame === "message" && letter.frame.inReplyTo) {
+				matchAndCloseExpectationSafe({ frame: letter.frame, mailboxDir });
 			}
 			// 统一门（S6：消费端传谁的 recipient 就按谁的归属判；缺省全局逐字节不变，零回归）
 			const key = receiptKeyFor(letter);

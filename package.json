@@ -123,7 +123,8 @@
     "accept:local-master-loop": "node ./scripts/local-master-loop-acceptance.mjs",
     "gui:dev": "node scripts/gui-dev.mjs",
     "gui:build": "npm run build --prefix gui",
-    "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts"
+    "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts",
+    "test:expectations": "node --experimental-strip-types ./extensions/_test_expectations.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

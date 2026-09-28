@@ -14,7 +14,9 @@
  *
  * §25 九条触发规则的 v1 评测范围：
  *   ②③⑤⑨ 实做（对照 prev 的边沿触发）；①（gate awaiting→ok）⑦（timer overdue 0→正）approx 并带 approx 标注；
- *   ④ needs_global / ⑥ risk / ⑧ expected-event 无载体 → record-only，永不进 triggers（红线条款 9：不猜）。
+ *   ④ needs_global / ⑥ risk 无载体 → record-only，永不进 triggers（红线条款 9：不猜）；
+ *   ⑧ expected-event（0928 P2 加载）：账本存在时按 **level**（open∧overdue∧未 ack）进 triggers，
+ *   账本不存在（inputs.expectations === undefined）→ 维持 record-only(no-carrier)（常量本身不改）。
  *
  * meaningful_state_version（§10）：per-project 单调计数，只对九类语义变化 +1（同帧多条去重为 +1）；
  *   age/stale 墙钟文本波动是噪声——本层根本不消费这些展示文本（约束 9：只消费结构化字段），天然不 bump。
@@ -42,7 +44,7 @@ export type FrontierRule =
 	| "needs_user" // ⑤ 实做
 	| "risk_high" // ⑥ record-only（无 risk 载体）
 	| "deadline_urgency" // ⑦ approx：timer overdue 0→正（auto-push timer ≠ 真 deadline，明示近似）
-	| "expected_event_timeout" // ⑧ record-only（无 per-project 期望事件账本，L1A 未决 #2）
+	| "expected_event_timeout" // ⑧（0928 P2）：账本存在时 level 触发；无账本 → record-only(no-carrier)
 	| "stagnation" // ⑨ 实做
 	| "ws_mail_backlog"; // 未消费 ws-mail 到信
 
@@ -51,6 +53,9 @@ export interface FrontierTrigger {
 	project: string;
 	evidence: string;
 	approximate: boolean;
+	/** ⑧（0928 P2 加法）：触发对应的期望主键 + 修订号（wake 级 ack 表按 `<id>:r<rev>` 键）。 */
+	requestId?: string;
+	requestRev?: number;
 }
 
 export type ProjectState = "Working" | "Blocked" | "Completed" | "Failed" | "Cancelled";
@@ -74,6 +79,8 @@ export interface ProjectFrontier {
 	stagnation: boolean;
 	/** ⑦ approx 载体：TabDetail.overdue（repo 级 timer overdue 回填值）。 */
 	overdue: number;
+	/** ⑧ 载体（0928 P2 加法）：该项目全部未关闭超期的期望 id（排序；一 id 一文件，新声明不覆盖旧记录）。 */
+	overdueRequests: string[];
 	/** §10：只对九类语义变化 +1，噪声不 bump。 */
 	meaningfulStateVersion: number;
 }
@@ -126,6 +133,23 @@ export interface FrontierInputs {
 	backlog: { recipient: string; pending: number; claimed: number }[];
 	prev: FrontierSnapshot | null;
 	now: number;
+	/**
+	 * ⑧ 期望账本输入（0928 P2 加法；collect 装配：只含 **open** 记录，ack 表已并入 noticeAcked）。
+	 * `undefined` ⟺ 本进程可见的账本目录不存在 ⟺ 真 no-carrier（recordOnly 维持 3 条）；
+	 * `[]`/列表 = 账本存在（recordOnly 降为 2 条，⑧ 已有载体，可进 triggers）。
+	 */
+	expectations?: readonly FrontierExpectation[];
+}
+
+/** ⑧ 期望输入（纯函数零 IO：collect 读账本后装配）。deadlineAt = epoch ms。 */
+export interface FrontierExpectation {
+	requestId: string;
+	projectKey: string;
+	deadlineAt: number;
+	/** 本轮 deadline 修订号（ack 表键 `<requestId>:r<rev>`）。 */
+	rev: number;
+	/** 本条超期 notice 是否已随一次放行的唤醒被处理（r9：wake 级只报一次）。 */
+	noticeAcked: boolean;
 }
 
 /** ④⑥⑧ 在 v1 无语义载体 → 每帧发出 record-only 标记（永不进 triggers；红线条款 9：不猜）。 */
@@ -203,7 +227,7 @@ function aggregateProject(project: string, tabs: FrontierSourceTab[], attention:
 	const overdue = tabs.reduce((m, t) => Math.max(m, t.overdue), 0);
 	const runs: Record<string, string> = {};
 	for (const t of tabs) runs[t.runId] = t.phase;
-	return { project, state, variant, gate, runs, needsUser, resultMissing, stagnation, overdue };
+	return { project, state, variant, gate, runs, needsUser, resultMissing, stagnation, overdue, overdueRequests: [] };
 }
 
 /**
@@ -222,6 +246,7 @@ function aggregateProject(project: string, tabs: FrontierSourceTab[], attention:
 export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot; diff: FrontierDiff } {
 	const { snapshot, prev, now } = inputs;
 	const baseline = prev === null;
+	const expectations = inputs.expectations;
 
 	// ⑤ 载体：消费快照的「分页前全量投影」（不得读 rows/home——⑤ 触发集合不得是显示排序的函数）
 	// 该投影只含 attention>0 仓的条目：**缺项 = 该仓 attention 为 0**；不得把「键存在」当作「仓存在」
@@ -240,6 +265,19 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	const prevByRepo = new Map<string, ProjectFrontier>();
 	if (prev) for (const p of prev.projects) prevByRepo.set(p.project, p);
 
+	// ⑧（0928 P2）：超期派生只由显式 now + 未关闭期望决定（overdue ⟺ now > deadlineAt）。
+	// 按 projectKey 聚合（一 id 一文件；新声明不写任何既有记录 → 同项目并行请求互不覆盖）。
+	const overdueByProject = new Map<string, string[]>();
+	if (expectations) {
+		for (const e of expectations) {
+			if (!Number.isFinite(e.deadlineAt) || !(now > e.deadlineAt)) continue;
+			const arr = overdueByProject.get(e.projectKey);
+			if (arr) arr.push(e.requestId);
+			else overdueByProject.set(e.projectKey, [e.requestId]);
+		}
+		for (const ids of overdueByProject.values()) ids.sort();
+	}
+
 	const nextCores = new Map<string, ProjectCore>();
 	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0));
 
@@ -252,6 +290,23 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 		}
 	}
 	if (!baseline) {
+		// ⑧ level 触发（0928 P2）：未 ack 就每帧重出（cooldown 窗内 gate 判 no-wake 但 audit 仍落行，
+		// 窗口结束后下一帧触发仍在 → 照常放行 → ack → 停止 → 边沿不丢）；baseline 帧压制全部触发
+		//（重启回放 r10：frontier.json 丢失 → 首帧 baseline → 下一帧补发，延迟 ≤1 tick）。
+		if (expectations) {
+			for (const e of [...expectations].sort((a, b) => a.requestId.localeCompare(b.requestId))) {
+				if (!Number.isFinite(e.deadlineAt) || !(now > e.deadlineAt)) continue;
+				if (e.noticeAcked) continue; // wake 级只报一次（r9）；attention 条目仍在（level 出口）
+				triggers.push({
+					rule: "expected_event_timeout",
+					project: e.projectKey,
+					evidence: `request:${e.requestId}:deadline=${new Date(e.deadlineAt).toISOString()} now=${new Date(now).toISOString()}`,
+					approximate: false,
+					requestId: e.requestId,
+					requestRev: e.rev,
+				});
+			}
+		}
 		const prevKeys = [...prevByRepo.keys()].sort();
 		for (const key of prevKeys) {
 			const pv = prevByRepo.get(key)!;
@@ -296,23 +351,44 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 		}
 	}
 
-	// meaningful_state_version（§10）：只对本帧有语义变化（任一非 record-only 触发）的项目 +1，同帧去重
+	// meaningful_state_version（§10）：只对本帧有语义变化的项目 +1，同帧去重。
+	// ⑧ level 重复触发**不逐帧 bump**（只对「该项目 overdue id 集合相对 prev 有新增」+1）。
 	const triggerCountByRepo = new Map<string, number>();
-	for (const t of triggers) triggerCountByRepo.set(t.project, (triggerCountByRepo.get(t.project) ?? 0) + 1);
+	for (const t of triggers) {
+		if (t.rule === "expected_event_timeout") continue;
+		triggerCountByRepo.set(t.project, (triggerCountByRepo.get(t.project) ?? 0) + 1);
+	}
+	const prevOverdueByRepo = new Map<string, Set<string>>();
+	if (prev) {
+		for (const p of prev.projects) {
+			if (p.overdueRequests && p.overdueRequests.length > 0) prevOverdueByRepo.set(p.project, new Set(p.overdueRequests));
+		}
+	}
 
 	const projects: ProjectFrontier[] = [];
 	for (const key of [...nextCores.keys()].sort()) {
 		const core = nextCores.get(key)!;
 		const pv = prevByRepo.get(key);
-		const version = baseline || !pv ? 1 : pv.meaningfulStateVersion + ((triggerCountByRepo.get(key) ?? 0) > 0 ? 1 : 0);
-		projects.push({ ...core, meaningfulStateVersion: version });
+		const overdueIds = overdueByProject.get(key) ?? [];
+		const prevIds = prevOverdueByRepo.get(key);
+		const newOverdue = prevIds ? overdueIds.some((id) => !prevIds.has(id)) : overdueIds.length > 0;
+		const version =
+			baseline || !pv
+				? 1
+				: pv.meaningfulStateVersion + ((triggerCountByRepo.get(key) ?? 0) > 0 || newOverdue ? 1 : 0);
+		projects.push({ ...core, overdueRequests: overdueIds, meaningfulStateVersion: version });
 	}
 
 	return {
 		next: { asof: now, projects, triggers: [...triggers], baseline },
 		diff: {
 			triggers,
-			recordOnly: [...RECORD_ONLY_NOCARRIER],
+			// ⑧ 条件化（语义诚实而非测试规避）：「no-carrier」的定义就是「本进程可见的账本不存在」。
+			// RECORD_ONLY_NOCARRIER 常量本身不改（既有逐字断言继续成立）；纯函数直调不传字段 = 3 条。
+			recordOnly:
+				expectations === undefined
+					? [...RECORD_ONLY_NOCARRIER]
+					: RECORD_ONLY_NOCARRIER.filter((r) => !r.startsWith("expected_event_timeout:")),
 			meaningfulChanges: triggers.filter((t) => !t.approximate).length,
 		},
 	};
