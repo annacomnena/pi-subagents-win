@@ -72,7 +72,7 @@ if (Test-Path -LiteralPath $attPath) {
 if ($sid) {
 	$holder = @()
 	try {
-		$holder = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like "*$sid*" })
+		$holder = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { [string]$_.CommandLine -and ([string]$_.CommandLine).IndexOf($sid, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
 	} catch { "[process] 扫描失败：$($_.Exception.Message)"; Raise 'WARN' }
 	$state = if ($holder.Count -eq 0) { 'not-running' } elseif ($holder.Count -eq 1) { 'running(1)' } else { "DUP($($holder.Count))" }
 	"[process] sid holders=$($holder.Count) state=$state pids=$(@($holder.ProcessId) -join ',')"
@@ -83,28 +83,38 @@ if ($sid) {
 if (Test-Path -LiteralPath $claimPath) {
 	try {
 		$c = Get-Content -LiteralPath $claimPath -Raw | ConvertFrom-Json
-		$claimPid = $c.pid
-		$alive = $null
-		if ($null -ne $claimPid -and $claimPid -ne '') { $alive = $null -ne (Get-Process -Id $claimPid -ErrorAction SilentlyContinue) }
-		$age = $null
-		try { $age = [int]((Get-Date) - [datetime]$c.spawnAt).TotalSeconds } catch { }
-		$st = if ($null -eq $claimPid -or $claimPid -eq '') { 'pending(pid=null)' } elseif ($alive) { 'held(pid-alive)' } else { 'stale(pid-dead)' }
-		"[claim] claimId=$($c.claimId) sid=$($c.sid) pid=$claimPid ageSec=$age state=$st"
-		if ($st -eq 'pending(pid=null)' -and $age -ne $null -and $age -ge 120) { "[claim] 超 120s 的 pending = 崩溃残留（下次 resume 会按可证死清掉）"; Raise 'WARN' }
-	} catch { "[claim] claim 读取失败：$($_.Exception.Message)"; Raise 'WARN' }
+		if (-not $c -or -not $c.claimId) {
+			# M2 对应态：0 字节 / 假值 / 无 claimId = 损坏（resume 会 phase=error + 非零退出）
+			"[claim] claim 结构无效（0 字节 / 解析成假值 / 无 claimId）= 崩溃残留或损坏 → resume 会按 claim-unreadable 异常 skip 并非零退出"
+			$c = $null
+			Raise 'FAIL'
+		} else {
+			$claimPid = $c.pid
+			$alive = $null
+			if ($null -ne $claimPid -and $claimPid -ne '') { $alive = $null -ne (Get-Process -Id $claimPid -ErrorAction SilentlyContinue) }
+			$age = $null
+			try { $age = [int]((Get-Date) - [datetime]$c.spawnAt).TotalSeconds } catch { }
+			$st = if ($null -eq $claimPid -or $claimPid -eq '') { 'pending(pid=null)' } elseif ($alive) { 'held(pid-alive)' } else { 'stale(pid-dead)' }
+			"[claim] claimId=$($c.claimId) sid=$($c.sid) pid=$claimPid ageSec=$age state=$st"
+			if ($st -eq 'pending(pid=null)' -and $age -ne $null -and $age -ge 120) { "[claim] 超 120s 的 pending = 崩溃残留（下次 resume 会按可证死清掉）"; Raise 'WARN' }
+		}
+	} catch {
+		# M2：claim 不可解析 = resume 会 phase=error + 非零退出 → 这里必须 FAIL（不能只 WARN）
+		"[claim] claim 读取失败/损坏（0 字节、半截 JSON、权限拒绝）：$($_.Exception.Message)"
+		"[claim] → resume 会判 claim-unreadable 异常 skip、退出码非 0（Task Scheduler LastTaskResult 应为失败）"
+		Raise 'FAIL'
+	}
 } else { "[claim] 无 claim（未在 spawn 窗口内 / 已释放）" }
 
 # ── 日志尾 ────────────────────────────────────────────────────────────
 if (Test-Path -LiteralPath $logPath) {
-	$tail = @(Get-Content -LiteralPath $logPath -Tail $LogTail -ErrorAction SilentlyContinue)
+	$tail = @(Get-Content -LiteralPath $logPath -Tail $LogTail -Encoding UTF8 -ErrorAction SilentlyContinue)   # 日志是 UTF-8 无 BOM（含中文 note），不加 -Encoding 会乱码
 	"[log] $logPath（尾 $($tail.Count) 行）"
 	foreach ($l in $tail) { "      $l" }
-	$last = ''
-	if ($tail.Count -gt 0) {
-		$last = $tail[-1]
-		if ($last -match '"phase":"error"') { Raise 'FAIL' }
-		elseif ($last -match '"phase":"skip"') { Raise 'WARN' }
-	}
+	$errLines = @($tail | Where-Object { $_ -match '"phase":"error"' })
+	$skipLines = @($tail | Where-Object { $_ -match '"phase":"skip"' })
+	if ($errLines.Count -gt 0) { "[log] 尾 $($tail.Count) 行内有 $($errLines.Count) 行 phase=error（最后一条：$($errLines[-1])"; Raise 'FAIL' }
+	elseif ($skipLines.Count -gt 0) { "[log] 尾 $($tail.Count) 行内有 $($skipLines.Count) 行 phase=skip（上次为正常/设计内 skip）"; Raise 'WARN' }
 } else { "[log] 日志不存在（两条任务从未跑过）：$logPath"; Raise 'WARN' }
 
 # ── 计划任务 ──────────────────────────────────────────────────────────

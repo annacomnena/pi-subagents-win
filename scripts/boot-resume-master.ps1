@@ -11,13 +11,23 @@
             镜像 daemon-lifecycle 的 stealStaleLock「可证死 / 可证 pid 复用才清 + 重读复核」。
     G2     进程扫描：node.exe 的 CommandLine 含目标 sessionId = 有活持有者；
             CommandLine 不可读 = 不确定（fail-closed）。
-    G3     歧义交互 pi 扫描：裸 / `-c` / `-r` / `--session-dir`，按 owner 文件是否
-           home 项目最新 jsonl 分档，**判不准一律 skip**。
+    G3     歧义交互 pi 扫描：`--session` 参数值先按 pi resolveSessionPath 语义分档（M1：
+           路径含全长 sid / 精确等于 sid / sid 以它开头 = 就是我们；后缀、子串、通配符等
+           无法确证指向别的会话的形态 → 一律 skip），再对裸 / `-c` / `-r` / `--session-dir`
+           按 owner 文件是否 home 项目最新 jsonl 分档，**判不准一律 skip**。
     C      spawn 后 0→20s 轮询：恰好 1 个 holder 才回填 claim.pid 并记 ok；
            >1 = dup-detected（不 kill），0 = spawn-unconfirmed。
 
-  三层任一「不确定」→ 不启动（skip + 落日志 + exit 0）。全程零 kill、零 attach
+  三层任一「不确定」→ 不启动（skip + 落日志）。全程零 kill、零 attach
   （resume 同 sessionId，owner 门天然成立，generation 不变）。
+
+  L4 后修正（plans/0926_boot_autostart_l4_review.md §2 必须修 B1/B2 + 建议修 S1/S2/S3/S7）：
+    M1  G3 的 `--session` 参数值按 pi `dist/main.js::resolveSessionPath` 分档：路径形态比文件名
+        是否含全长 sid、id 形态比精确等值/前缀 ⇒ ours；否则（后缀/子串/通配符/别人的 id）
+        无法确证 → 一律 skip（fail-closed），杜绝「判成可证无害 → 双开双写」。
+    M2  区分「正常 skip」与「异常 skip」：claim 损坏/不可解析/结构无效/判不准、pi 目录类 env
+        覆盖 → phase=error + 可读 note + **exit 1**（Task Scheduler LastTaskResult 必须显示失败）；
+        0 字节/半截 claim 另按文件 mtime≥120s 判崩溃残留后清除（否则永久卡死）。
 
   启动器（照 tab-launch-core.ts::spawnPiTab 姿势）：
     WindowsTerminal.exe 直调优先（Get-AppxPackage 解析）→ 别名仅作 --help 探针后兜底
@@ -29,7 +39,10 @@
 
   目标 sessionId 运行时从 registry/attachments/agent___master_default.json 读（不硬编码）。
 
-  退出码：0 = 成功 / skip-by-design；1 = 失败（launcher / spawn-unconfirmed / dup-detected）；
+  退出码：0 = 成功 / **正常** skip-by-design（已有活持有者、另一次在 spawn 窗口内、交接在途、
+              G3 判定可证无害或判不准的 session-flag…）；
+          1 = 失败（launcher / spawn-unconfirmed / dup-detected，以及 **异常 skip：claim 不可解析、
+              claim 结构无效、claim 判不准、pi 目录类 env 覆盖** —— 无人值守不可静默失效）；
           2 = 脚本内部异常。
   写日志 never-throw；日志 = <runtime>/state/boot-autostart.log（追加式 JSONL）。
 
@@ -80,6 +93,46 @@ function Get-BootEnvScrubKeys {
 	)
 }
 
+# ── S1：字面包含（`-like "*x*"` 是通配符模式，sid 含 [ ] * ? 时会漏判真持有者）────
+function Test-CommandLineHasSid {
+	param([string]$CommandLine, [string]$Sid)
+	if ($null -eq $CommandLine -or -not $Sid) { return $false }
+	return ([string]$CommandLine).IndexOf([string]$Sid, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+# ── M1：`--session` 参数值分档（照 pi dist/main.js::resolveSessionPath 语义）────────
+# 'ours'    = 确定指向我方 session（路径文件名含全长 sid / 精确等值 / sid 以它开头）
+# 'other'   = 可证指向别的会话（路径形态且不含全长 sid ⇒ pi 直接用该文件）
+# 'uncertain' = 判不准（非路径又不是精确等值/前缀：后缀、子串、通配符、空值…）→ 一律 skip
+function Get-SessionTargetVerdict {
+	param([string]$Target, [string]$Sid)
+	$t = ([string]$Target).Trim().Trim('"').Trim("'")
+	if (-not $t -or -not $Sid) { return 'uncertain' }
+	$pathish = ($t.IndexOf('/') -ge 0) -or ($t.IndexOf('\') -ge 0) -or
+		$t.EndsWith('.jsonl', [System.StringComparison]::OrdinalIgnoreCase)
+	if ($pathish) {
+		# 路径形态：pi 原样用该文件；我方文件名恒为 <ts>_<sid>.jsonl（P3/P4 保证）⇒ 含全长 sid 才是「就是我们」
+		if (Test-CommandLineHasSid -CommandLine $t -Sid $Sid) { return 'ours' }
+		return 'other'
+	}
+	# id / 前缀形态：pi 只做 exact 或 startsWith（resolveSessionPath）
+	if ($t.Equals($Sid, [System.StringComparison]::OrdinalIgnoreCase)) { return 'ours' }
+	if ($Sid.StartsWith($t, [System.StringComparison]::OrdinalIgnoreCase)) { return 'ours' }
+	return 'uncertain'
+}
+
+# ── 命令行是否「持有我方 session」（G2 全长 sid / C 层确认共用）────────────────
+function Test-CommandLineHoldsSid {
+	param([string]$CommandLine, [string]$Sid)
+	if (Test-CommandLineHasSid -CommandLine $CommandLine -Sid $Sid) { return $true }
+	$cl = [string]$CommandLine
+	if ($cl -match '--session(?:-id)?(?:\s+|=)("[^"]+"|\S+)') {
+		$target = $Matches[1].Trim('"')
+		return ((Get-SessionTargetVerdict -Target $target -Sid $Sid) -eq 'ours')
+	}
+	return $false
+}
+
 # ── G1 claim 复核/释放（镜像 daemon-lifecycle：可证死/可证复用才清 + 重读复核）────
 function Test-ClaimStale {
 	<#
@@ -88,6 +141,8 @@ function Test-ClaimStale {
 	#>
 	param([string]$Path, [object]$Claim)
 	if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
+	# S2：claim.sid 缺失 = 身份证不出 → 绝不当「可证 pid 复用」（原 `-and` 短路会无证明就清锁）
+	if (-not [string]$Claim.sid) { return 'uncertain' }
 	if ($null -eq $Claim.pid -or $Claim.pid -eq '') {
 		try {
 			$age = ((Get-Date) - [datetime]$Claim.spawnAt).TotalSeconds
@@ -101,7 +156,7 @@ function Test-ClaimStale {
 	if (-not $cp) { return 'stale' }                                  # 可证死
 	if ($null -eq $cp.CommandLine) { return 'uncertain' }             # 身份不可读 = 证不出
 	$claimSid = [string]$Claim.sid
-	if ($claimSid -and $cp.CommandLine -like "*$claimSid*") { return 'held' }  # 活且身份相符
+	if ($claimSid -and (Test-CommandLineHasSid -CommandLine $cp.CommandLine -Sid $claimSid)) { return 'held' }  # 活且身份相符（字面包含，S1）
 	return 'stale'                                                    # pid 复用 = 可证非持有者
 }
 
@@ -208,7 +263,7 @@ function Wait-HolderConfirmation {
 	$found = @()
 	for ($i = 0; $i -lt $Seconds; $i++) {
 		Start-Sleep -Seconds 1
-		try { $found = @(Get-NodeProcessList | Where-Object { $_.CommandLine -like "*$Sid*" }) } catch { $found = @() }
+		try { $found = @(Get-NodeProcessList | Where-Object { Test-CommandLineHoldsSid -CommandLine $_.CommandLine -Sid $Sid }) } catch { $found = @() }
 		if ($found.Count -ge 1) { break }
 	}
 	return $found
@@ -249,6 +304,26 @@ function Invoke-BootResume {
 	if ($DelaySeconds -gt 0) { Start-Sleep -Seconds $DelaySeconds }
 
 	try {
+		# ── S7：pi 目录类 env 覆盖 → 本脚本按默认路径校验出的判据不再成立，判不准不启动 ──
+		$envHits = @()
+		if (-not $RuntimeDir) {
+			$v = [Environment]::GetEnvironmentVariable('PI_RUNTIME_DIR')
+			if ($v -and $v.Trim()) { $envHits += "PI_RUNTIME_DIR=$v" }
+		}
+		if (-not $SessionsDir -or -not $RuntimeDir) {
+			foreach ($k in @('PI_CODING_AGENT_DIR', 'PI_CODING_AGENT_SESSION_DIR', 'PI_SESSIONS_DIR')) {
+				$v = [Environment]::GetEnvironmentVariable($k)
+				if ($v -and $v.Trim()) { $envHits += "$k=$v" }
+			}
+		}
+		if ($envHits.Count -gt 0) {
+			Write-BootLog -LogPath $log -Phase 'error' -Fields @{
+				reason = 'env-override-uncertain'; envKeys = $envHits   # 注意：字段名不可叫 keys（PS 哈希表条目 keys 会遮蔽 .Keys 属性，日志会烂）
+				note = 'pi 目录类 env 覆盖在位，脚本硬编码默认目录得到的 attachment/session 判据不可信 → 判不准不启动（异常 skip，非零退出）'
+			}
+			return 1
+		}
+
 		# ── P1 attachment ────────────────────────────────────────────────
 		if (-not (Test-Path -LiteralPath $attPath)) {
 			Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'no-attachment' }; return 0
@@ -311,19 +386,41 @@ function Invoke-BootResume {
 		}
 
 		# ── G1 claim 锁（已存在：可证死/可证复用才清 + 重读复核）──────────
+		# M2：正常 skip（活持有者 / 另一次在 spawn 窗口内 / 别人刚抢到 wx）→ exit 0；
+		#     异常 skip（claim 不可解析、结构无效、判不准）→ phase=error + 可读 note + exit 1，
+		#     让 Task Scheduler 的 LastTaskResult 显示失败，而不是「成功但什么都没做」。
 		if (Test-Path -LiteralPath $claim) {
 			$c = $null
-			try { $c = Get-Content -LiteralPath $claim -Raw | ConvertFrom-Json } catch {
-				if (Test-Path -LiteralPath $claim) {
-					Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-claim'; detail = 'claim unreadable' }
-					return 0
+			$readErr = $null
+			try { $c = Get-Content -LiteralPath $claim -Raw | ConvertFrom-Json } catch { $readErr = $_.Exception.Message }
+
+			if ($readErr -or -not $c) {
+				# 0 字节 / 半截 JSON / 权限拒绝（读抛异常）/ 解析成假值（false、[]、''、null）
+				$detail = if ($readErr) { "claim unreadable: $readErr" } else { 'claim parses to empty/falsy value (0 byte or non-object)' }
+				$ageSec = $null
+				$statOk = $true
+				try { $ageSec = ((Get-Date) - (Get-Item -LiteralPath $claim).LastWriteTime).TotalSeconds } catch { $statOk = $false }
+				if ($statOk -and $ageSec -ge 120) {
+					# 与「pid=null 且 ≥120s」同语义：≥120s 没人再写它 = 可证崩溃残留 → 清掉继续（否则永久卡死）
+					try {
+						Remove-Item -LiteralPath $claim -Force
+						Write-BootLog -LogPath $log -Phase 'warn' -Fields @{ reason = 'claim-residue-cleared'; detail = $detail; ageSec = [int]$ageSec; note = '损坏 claim 按文件 mtime≥120s 判为崩溃残留并清除，继续防重流程' }
+					} catch {
+						Write-BootLog -LogPath $log -Phase 'error' -Fields @{ reason = 'claim-unreadable'; detail = $detail; clearError = $_.Exception.Message; note = '损坏 claim 清除失败 → 异常 skip，非零退出' }
+						return 1
+					}
+				} else {
+					Write-BootLog -LogPath $log -Phase 'error' -Fields @{
+						reason = 'claim-unreadable'; detail = $detail
+						ageSec = $(if ($statOk) { [int]$ageSec } else { $null })
+						note = 'claim 不可解析（0 字节 / 半截 JSON / 权限拒绝 / 非对象值）= 异常 skip，非零退出；mtime≥120s 后重跑会按崩溃残留清除'
+					}
+					return 1
 				}
-				$c = $null   # 读取期间被清掉 → 视同 absent
-			}
-			if ($c) {
-				if (-not $c.claimId) {
-					Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-claim'; detail = 'claimId missing' }; return 0
-				}
+			} elseif (-not $c.claimId) {
+				Write-BootLog -LogPath $log -Phase 'error' -Fields @{ reason = 'uncertain-claim'; detail = 'claimId missing'; note = 'claim 结构无效（可解析但没有 claimId）= 异常 skip，非零退出' }
+				return 1
+			} else {
 				$state = Test-ClaimStale -Path $claim -Claim $c
 				switch ($state) {
 					'held' {
@@ -333,11 +430,13 @@ function Invoke-BootResume {
 						Write-BootLog -LogPath $log -Phase 'skip' -Fields $f; return 0
 					}
 					'uncertain' {
-						Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-claim'; detail = 'claim pid check inconclusive' }; return 0
+						Write-BootLog -LogPath $log -Phase 'error' -Fields @{ reason = 'uncertain-claim'; detail = 'claim pid check inconclusive'; note = 'claim 持有者身份判不准（CIM 读不出 / claim 缺 sid）= 异常 skip，非零退出' }
+						return 1
 					}
 					'stale' {
 						if (-not (Remove-ClaimIfSame -Path $claim -ClaimId $c.claimId)) {
-							Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-claim'; detail = 'claimId changed on re-read' }; return 0
+							Write-BootLog -LogPath $log -Phase 'error' -Fields @{ reason = 'uncertain-claim'; detail = 'claimId changed on re-read'; note = 'claim 在判定期间被改写 = 判不准，异常 skip，非零退出' }
+							return 1
 						}
 					}
 					default { }   # absent → 继续
@@ -357,7 +456,7 @@ function Invoke-BootResume {
 				return 0
 			}
 		}
-		$holder = @($nodes | Where-Object { $_.CommandLine -like "*$sid*" })
+		$holder = @($nodes | Where-Object { Test-CommandLineHasSid -CommandLine $_.CommandLine -Sid $sid })
 		if ($holder.Count -gt 0) {
 			Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'already-running'; via = 'process'; sid = $sid; pids = @($holder.ProcessId) }
 			return 0
@@ -365,26 +464,35 @@ function Invoke-BootResume {
 
 		# ── G3 歧义交互 pi 扫描（判不准一律 skip）────────────────────────
 		$piProcs = @($nodes | Where-Object {
-				$_.CommandLine -match 'pi-coding-agent' -and $_.CommandLine -match 'cli\.js' -and
-				$_.CommandLine -notmatch '--no-session|--print|--export|--version|--list-models|--tab-run-id|--fork'
+				$_.CommandLine -match 'pi-coding-agent' -and $_.CommandLine -match 'cli\.js'
 			})
 		foreach ($p in $piProcs) {
 			$cl = [string]$p.CommandLine
-			if ($cl -match '--session(?:-id)?\s+("[^"]+"|\S+)') {
+			# ① `--session`/`--session-id`：先按 M1 分档。**必须排在「可证无害形态」剔除表之前**，
+			#    否则 `--session <我方 sid 前缀> --print` 之类会被排除表盖掉 → 判成无害 → 双开双写。
+			if ($cl -match '--session(?:-id)?(?:\s+|=)("[^"]+"|\S+)') {
 				$target = $Matches[1].Trim('"')
-				if ($target -like "*$sid*") {
-					Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'already-running'; via = 'session-flag'; sid = $sid; pid = $p.ProcessId }
+				$verdict = Get-SessionTargetVerdict -Target $target -Sid $sid
+				if ($verdict -eq 'other') { continue }   # 可证指向别的会话
+				if ($verdict -eq 'ours') {
+					Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'already-running'; via = 'session-flag'; sid = $sid; pid = $p.ProcessId; target = $target }
 					return 0
 				}
-				continue   # 指向别的会话 = 可证无害
+				Write-BootLog -LogPath $log -Phase 'skip' -Fields @{
+					reason = 'uncertain-session-flag'; sid = $sid; pid = $p.ProcessId; target = $target
+					note = '--session 参数既不是含全长 sid 的路径、也不是精确等于/前缀于我方 sid（后缀/子串/通配符等无法确证）→ 判不准不启动'
+				}
+				return 0
 			}
+			# ② 无 session 旗标：可证无害形态直接剔除
+			if ($cl -match '--no-session|--print|--export|--version|--list-models|--tab-run-id|--fork') { continue }
 			if ($cl -match '--session-dir') {
 				Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-session-dir'; pid = $p.ProcessId }; return 0
 			}
-			if ($cl -match '(--resume|\s-r)(\s|$)') {
+			if ($cl -match '(--resume|\s-r)(=|\s|$)') {
 				Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-resume-picker'; pid = $p.ProcessId }; return 0
 			}
-			if ($cl -match '(--continue|\s-c)(\s|$)') {
+			if ($cl -match '(--continue|\s-c)(=|\s|$)') {
 				if ($ownerIsNewest) {
 					Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'uncertain-continue'; pid = $p.ProcessId }; return 0
 				}
