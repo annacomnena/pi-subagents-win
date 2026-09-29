@@ -58,6 +58,7 @@ import {
 	normalizeExactPath,
 	RECORD_ONLY_NOCARRIER,
 	type FrontierDiff,
+	type FrontierExpectation,
 	type FrontierSnapshot,
 	type FrontierSourceSnapshot,
 	type FrontierSourceTab,
@@ -659,6 +660,39 @@ check("S11 ④⑥⑧ record-only 逐字 + meaningfulChanges + msv 逐项目相�
 	}
 	const last = FRAMES[FRAMES.length - 1]!;
 	assert.equal(last.rows.filter((r) => r.itemKind === "recordOnly" && r.verdict === "same").length, 3, "recordOnly 行恰 3 条 same");
+});
+
+// S11b（0929 切片 B-2 行为门重开）：⑧ recordOnly 双态。无账本 → 3 条逐字（上方 S1/S11 既有断言）；
+// 有账本（expectations ≠ undefined）→ ⑧ 行被 filter（frontier.ts 条件化 recordOnly）且两路一致；
+// 已超期未 ack → ⑧ 进 triggers（真载体）；acked → 不进（r9 wake 级只报一次）。
+check("S11b ⑧ recordOnly 双态：无账本 3 条；有账本 → ⑧ 被 filter（2 条）+ 超期进 triggers + 两路全等", () => {
+	const w = track(makeWorld("s11b", [{ name: "alpha" }], [{ id: "t_e", repo: "alpha", phase: "working" }]));
+	const f1 = frame(w, null, "s11b@f1");
+	// 无账本（frame() 装配不传 expectations = undefined）：3 条逐字（与 S1/S11 同口径复证）
+	assert.deepEqual(f1.v2.diff.recordOnly, RECORD_ONLY_NOCARRIER, "s11b@f1: 无账本 v2 recordOnly 3 条逐字");
+	assert.deepEqual(f1.g.diff.recordOnly, RECORD_ONLY_NOCARRIER, "s11b@f1: 无账本 graph recordOnly 3 条逐字");
+	// 有账本：传非 undefined expectations（未超期 / 超期未 ack / 超期已 ack 三条）
+	const expectations: FrontierExpectation[] = [
+		{ requestId: "msg_s11b_a", projectKey: "mailbox:agent://s11b", deadlineAt: NOW + HOUR, rev: 0, noticeAcked: false },
+		{ requestId: "msg_s11b_b", projectKey: "mailbox:agent://s11b", deadlineAt: NOW - MIN, rev: 0, noticeAcked: false },
+		{ requestId: "msg_s11b_c", projectKey: "mailbox:agent://s11b", deadlineAt: NOW - MIN, rev: 2, noticeAcked: true },
+	];
+	const v2Ledger = buildFrontier({ snapshot: f1.v2Snap, backlog: [], prev: f1.v2.next, now: NOW + 60_000, expectations });
+	const gLedger = buildFrontier({ snapshot: f1.gIn, backlog: [], prev: f1.g.next, now: NOW + 60_000, expectations });
+	const EXPECTED_2 = RECORD_ONLY_NOCARRIER.filter((r) => !r.startsWith("expected_event_timeout:"));
+	assert.deepEqual(v2Ledger.diff.recordOnly, EXPECTED_2, "有账本 v2 → ⑧ 行被 filter（2 条）");
+	assert.deepEqual(gLedger.diff.recordOnly, EXPECTED_2, "有账本 graph → ⑧ 行被 filter（2 条）");
+	assert.equal(v2Ledger.diff.recordOnly.some((r) => r.startsWith("expected_event_timeout:")), false, "⑧ no-carrier 行不再出现");
+	// 超期未 ack（b）→ ⑧ level 触发；未超期（a）与已 ack（c）不进
+	assert.deepEqual(
+		v2Ledger.diff.triggers.filter((t) => t.rule === "expected_event_timeout").map((t) => t.requestId),
+		["msg_s11b_b"],
+		"仅超期未 ack 的 b 进 ⑧ 触发（带 requestId/requestRev）",
+	);
+	assert.equal(v2Ledger.diff.triggers.find((t) => t.rule === "expected_event_timeout")!.approximate, false, "⑧ 触发 approximate=false（真载体）");
+	// 两路等价（有账本态同样逐字节 canonical 全等）
+	assert.equal(canonicalJson(v2Ledger.next), canonicalJson(gLedger.next), "S11b: 有账本两路 next canonical 全等");
+	assert.equal(canonicalJson(v2Ledger.diff), canonicalJson(gLedger.diff), "S11b: 有账本两路 diff canonical 全等");
 });
 
 // S12 规模 19/20/21/40 仓 + S13 attentionByRepo 键集

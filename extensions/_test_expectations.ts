@@ -76,25 +76,20 @@ import {
 	updateDeadline,
 } from "./runtime/expectations.ts";
 
-// autonomy 接线模块：A10.1 字面量 tripwire（_test_runtime_autonomy.ts 扫 extensions/ 下所有 .ts 是否含
-// 某字面量，allowlist 固定且本测试不在其中）→ 用运行期拼接的动态 import 取同一模块实例
-//（解析 URL 相同 = 同实例，断言语义与静态 import 一致）。
-const frontierMod = await import("./runtime/" + "autonomy/frontier.ts");
-const collectMod = await import("./runtime/" + "autonomy/collect.ts");
-const gateMod = await import("./runtime/" + "autonomy/gate.ts");
-const watchdogMod = await import("./runtime/" + "autonomy/watchdog.ts");
-const { RECORD_ONLY_NOCARRIER, buildFrontier } = frontierMod;
-const {
+// autonomy 接线模块（0929 切片 B-4：改静态 import，去运行期字符串拼接绕过手法）；
+// A10.1 字面量 tripwire 兼容 = _test_runtime_autonomy.ts 排除清单显式登记本文件（非 ALLOW）。
+import { buildFrontier, RECORD_ONLY_NOCARRIER } from "./runtime/autonomy/frontier.ts";
+import {
+	clearKillSwitchAudited,
 	collectAutonomyInputs,
+	engageKillSwitchAudited,
+	readAuditTail,
 	readExpectationInputs,
 	readNoticeAckKeys,
 	writeNoticeAckKeys,
-	readAuditTail,
-	engageKillSwitchAudited,
-	clearKillSwitchAudited,
-} = collectMod;
-const { evaluateAutonomyWakeGate } = gateMod;
-const { evaluateWatchdogChecks } = watchdogMod;
+} from "./runtime/autonomy/collect.ts";
+import { evaluateAutonomyWakeGate } from "./runtime/autonomy/gate.ts";
+import { evaluateWatchdogChecks } from "./runtime/autonomy/watchdog.ts";
 
 // 结构化本地类型（避免在类型位置重复字面量路径）
 interface FrontierExpectation {
@@ -833,10 +828,12 @@ check("G16.2 autonomy 只读面：collect/gate 无 journal 写与投递调用（
 			assert.equal(src.includes(banned), false, `${f} 不得出现 ${banned}`);
 		}
 	}
-	// 本测试文件自身不含该字面量（A10.1 tripwire 兼容：allowlist 不含本文件）——字面量拼接避免自证
+	// 0929 切片 B-4：本文件已改静态 import（字面量合法出现）；A10.1 由排除清单显式登记。
+	// 正向钉死：静态 import 存在 + 无运行期拼接动态 import 残留（拼接字符串避免自证陷阱）。
 	const self = readFileSync(fileURLToPath(import.meta.url), "utf8");
-	const bannedLiteral = "runtime" + "/" + "autonomy";
-	assert.equal(self.includes(bannedLiteral), false, "A10.1 字面量 tripwire 兼容");
+	assert.ok(self.includes('from "./runtime/autonomy/frontier.ts"'), "B-4: 静态 import frontier.ts 在位");
+	const dynImport = "await " + "import(";
+	assert.equal(self.includes(dynImport), false, "B-4: 无运行期动态 import 残留");
 });
 
 // ── 执行 + 汇总 ────────────────────────────────────────────────────

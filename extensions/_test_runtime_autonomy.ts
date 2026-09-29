@@ -64,7 +64,12 @@ import {
 	collectAutonomyInputs,
 	engageKillSwitchAudited,
 	readFrontierSnapshot,
+	readNoticeAckKeys,
 } from "./runtime/autonomy/collect.ts";
+import { evaluateAutonomyWakeGate } from "./runtime/autonomy/gate.ts";
+import { masterAddress } from "./runtime/address.ts";
+import { deliverLetter, newMessageId } from "./runtime/mailbox.ts";
+import { newMessageFrame } from "./runtime/protocol.ts";
 import { normalizeMasterSuccession } from "./runtime/master-auto.ts";
 import { normalizeExactPath as normalizeRecentScope } from "./runtime/recent-scopes.ts";
 import type { GlobalViewSnapshot, HiddenTabEntry, RepoRow, TabDetail } from "./runtime/global-view.ts";
@@ -823,6 +828,9 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				if (p === join(EXT_ROOT, "_test_graph_frontier_input.ts")) continue;
 				// E2.2：影子对照 harness import runtime/autonomy（frontier.ts/collect.ts）字面量 → 排除（ALLOW 不动）
 				if (p === join(EXT_ROOT, "_test_graph_frontier_shadow.ts")) continue;
+				// 0929 切片 B-4：_test_expectations.ts 去运行期字符串拼接、改静态 import runtime/autonomy
+				// → 排除清单显式登记（ALLOW 不动：测试文件非生产接线点）
+				if (p === join(EXT_ROOT, "_test_expectations.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
@@ -885,6 +893,73 @@ check("A11.2 真实 ~/.pi/agent/runtime 下无 state/autonomy/ 新增（测试�
 	const realAfter = existsSync(realAutonomy);
 	assert.equal(realAfter, realBefore, realBefore ? "真实目录原本存在，测试未改变" : "测试不得在真实目录新建 state/autonomy/");
 	if (!realBefore) assert.equal(realAfter, false);
+});
+
+// ════════════════════════════ A12 ⑧ 期望账本语义（0929 切片 B-3 行为门重开）════════════════════════════
+// 命题：⑧ 账本副作用可见（真链 deliverLetter → open 落盘 → frontier 触发/watchdog 可判定/gate 放行）
+// 且 gate 仍 acted=false（放行只影响既有 legacy 唤醒链，不产生任何新动作——不投递、不 spawn）。
+console.log("A12 ⑧ 期望账本语义（副作用可见 + gate acted=false）");
+check("A12.1 真链 deliverLetter → ⑧ 副作用可见 且 gate 仍 acted=false（不实现动作槽）", () => {
+	const root = mkdtempSync(join(tmpdir(), "runtime-autonomy-exp-"));
+	const agentDir = join(root, "agent");
+	const stateDir = join(root, "state");
+	const mailboxDir = join(root, "mailbox"); // 生产布局：dirname(mailboxDir)/state/expectations === stateDir/expectations
+	mkdirSync(agentDir, { recursive: true });
+	const cfgPath = join(root, "autonomy-on.json");
+	writeFileSync(cfgPath, JSON.stringify({ autonomy: { enabled: true } }), "utf8");
+	try {
+		// 生产者 1 真链：deliverLetter 成功点声明（显式已过期 deadline → 下一非 baseline 帧即可派生超期）
+		const req = newMessageFrame({
+			id: newMessageId(new Date(NOW)),
+			kind: "DELEGATION",
+			from: masterAddress(),
+			to: "agent://a12_worker",
+			sentAt: new Date(NOW).toISOString(),
+			summary: "a12 request",
+		});
+		const r = deliverLetter(req, { mailboxDir, expectReply: { deadlineAt: new Date(NOW - 60_000).toISOString() } });
+		assert.equal(r.created, true);
+		assert.ok(existsSync(join(stateDir, "expectations", "open", `${req.id}.json`)), "⑧ open/<requestId>.json 落盘（副作用可见）");
+
+		// 帧1（baseline）：gate 判 record-only no-wake；⑧ 触发被 baseline 压制（防冷启动风暴）
+		const g1 = evaluateAutonomyWakeGate({ stateDir, configPath: cfgPath, agentDir, now: NOW });
+		assert.equal(g1.engaged, true);
+		assert.equal(g1.proceed, false);
+		assert.equal(g1.reason, "record-only");
+
+		// 帧2（非 baseline）：⑧ 副作用可见——frontier level 触发 + recordOnly 降 2 + watchdog 检查 3 可判定
+		const inputs = collectAutonomyInputs({ stateDir, configPath: cfgPath, agentDir, now: NOW + 60_000 });
+		const t = inputs.frontier!.diff.triggers.find((x) => x.rule === "expected_event_timeout");
+		assert.ok(t, "帧2 diff 含 ⑧ expected_event_timeout 触发");
+		assert.equal(t!.requestId, req.id);
+		assert.equal(t!.approximate, false, "⑧ 触发 approximate=false（真载体非猜测）");
+		assert.equal(inputs.frontier!.diff.recordOnly.length, 2, "有账本 → recordOnly 2 条（⑧ 行被 filter）");
+		assert.equal(inputs.watchdog.checks.pending_request_timeout.status, "true", "watchdog 检查 3 可判定（不再 unknown）");
+		assert.ok(inputs.watchdog.checks.pending_request_timeout.reason!.includes(req.id), "检查 3 reason 带 overdue id");
+
+		// 帧3（debounce/cooldown 双窗已过）：gate 放行一次既有 legacy 唤醒链 + wake 级 ack（自有 namespace）
+		const g2 = evaluateAutonomyWakeGate({ stateDir, configPath: cfgPath, agentDir, now: NOW + 120_000 });
+		assert.equal(g2.engaged, true);
+		assert.equal(g2.proceed, true, "⑧ 触发只放行既有 legacy 唤醒链（astra 红线：不宣称唤醒处理者）");
+		assert.equal(g2.reason, "ordinary");
+		assert.ok(readNoticeAckKeys({ stateDir }).has(`${req.id}:r0`), "wake 级 ack 落 expectation-notices.json（自有 namespace）");
+
+		// 语义断言：⑧ 全链路（含 wake=true 放行）不产生任何动作——审计 acted=false 恒真；master 邮箱零新信件
+		const audit = readFileSync(join(stateDir, "autonomy", "audit.jsonl"), "utf8").trim().split("\n");
+		const v2Lines = audit.filter((l) => l.startsWith("ts="));
+		assert.ok(v2Lines.length >= 2, "v2 格式审计行存在（no-wake + wake）");
+		for (const l of v2Lines) assert.match(l, / acted=false$/, "每条 v2 审计行 acted=false 恒真");
+		assert.ok(v2Lines.some((l) => l.includes("cat=wake concl=wake reason=ordinary")), "存在 wake=ordinary 放行行");
+		const masterDir = join(mailboxDir, "agent__master_default");
+		const letters = existsSync(masterDir) ? readdirSync(masterDir).filter((f) => f.endsWith(".json")) : [];
+		assert.equal(letters.length, 0, "gate 放行不产生任何新信件（无动作槽，acted=false 恒真语义）");
+		// 请求信本体在收件人 spool；期望仍 open（超期不关闭，等迟到回信收敛）
+		// （mailboxDirFor 同款消毒：agent://a12_worker → agent___a12_worker）
+		assert.ok(existsSync(join(mailboxDir, "agent___a12_worker", `${req.id}.json`)), "请求信落在收件人 spool");
+		assert.ok(existsSync(join(stateDir, "expectations", "open", `${req.id}.json`)), "超期不关闭（仍 open）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 // ── 清理 + 汇总 ─────────────────────────────────────────────────────
