@@ -2069,6 +2069,9 @@ export default function (pi: ExtensionAPI) {
 		description: "投递请求信并声明⑧回信期望：/send-letter <to> [--subject S] [--body B] [--deadline 30m] [--no-expect]",
 		handler: async (args, ctx) => {
 			if (isSubagent()) {
+				// S2（0929 L4）：拒绝分支也留痕——与 local-master-ensure 的 rejected:subagent 先例同口径。
+				// concl 用受控词表内的 pass（W5 正则冻结 engage|clear|wake|no-wake|pass），细节入 reason。
+				appendAuditEvent("gating", "pass", "send-letter rejected:subagent");
 				ctx.ui.notify("send-letter: 子 agent 会话不可发送请求信（手动运维命令）", "warning");
 				return;
 			}
@@ -2085,9 +2088,13 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (!isObjectAddress(to)) {
+				appendAuditEvent("gating", "pass", "send-letter rejected:bad-address");
 				ctx.ui.notify(`send-letter: to 不是合法 ObjectAddress（agent://… / workstream://… / run://…）：${to}`, "warning");
 				return;
 			}
+			// S1（0929 L4）：消费者可达性提示——@mailbox 消费链目前只接 agent:// 域（mailbox-consumer），
+			// run:///task:///pi:// 等无回信消费者 ⇒ 必然走超期。不阻断（可能是刻意观察），只显式提示。
+			const unreachableTo = !to.startsWith("agent://");
 			const noExpect = parts.includes("--no-expect");
 			// --deadline 解析（s/m/h/d）；缺省不传 → 账本默认 30min
 			let deadlineAt: string | undefined;
@@ -2117,15 +2124,22 @@ export default function (pi: ExtensionAPI) {
 				const r = deliverLetter(frame, {
 					expectReply: noExpect ? false : deadlineAt !== undefined ? { deadlineAt } : undefined,
 				});
-				// 留痕（与 kill/clear 同函数同口径；cat 词表冻结三值，手动运维面归 gating 族）
-				appendAuditEvent("gating", "send-letter", `by=user:${sid?.slice(0, 12) ?? "cli"} to=${to} id=${frame.id} expect=${noExpect ? "off" : "on"}`);
+				// 留痕（与 kill/clear 同函数同口径；cat/concl 均落在 W5 冻结词表内，细节入 reason）
+				appendAuditEvent("gating", "pass", `send-letter by=user:${sid?.slice(0, 12) ?? "cli"} to=${to} id=${frame.id} expect=${noExpect ? "off" : "on"}`);
 				const rec = noExpect ? null : readExpectation(frame.id);
 				const expectLine = noExpect
 					? "期望：--no-expect（不入账本）"
 					: rec
 						? `期望：requestId=${rec.requestId} expectedType=${rec.expectedType} deadline=${rec.deadlineAt} projectKey=${rec.projectKey}`
 						: "期望：未声明（谓词未过或账本不可写——投递不受影响）";
-				ctx.ui.notify(`send-letter ok=${r.created} id=${frame.id} to=${to}\n${expectLine}`, r.created ? "info" : "warning");
+				// S1/S3（0929 L4）：两条易误读路径显式提示。
+				//   S3 自环：to===masterAddress() ⇒ 谓词 from!==to 挡下，不会入账（回执勿读作"在等回信"）。
+				//   S1 无消费者：非 agent:// 域无回信消费者 ⇒ 期望只能走超期。
+				const caveats: string[] = [];
+				if (!noExpect && !rec && to === masterAddress()) caveats.push("警告：to 为自身地址 ⇒ 谓词 from!==to 挡下，未入账本（非\"在等回信\"）");
+				if (!noExpect && unreachableTo) caveats.push(`警告：${to.split("://")[0]}:// 域暂无回信消费者 ⇒ 期望将走超期路径`);
+				const caveatLine = caveats.length > 0 ? "\n" + caveats.join("\n") : "";
+				ctx.ui.notify(`send-letter ok=${r.created} id=${frame.id} to=${to}\n${expectLine}${caveatLine}`, caveats.length > 0 ? "warning" : r.created ? "info" : "warning");
 			} catch (e) {
 				ctx.ui.notify(`send-letter 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
 			}
