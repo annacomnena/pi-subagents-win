@@ -293,11 +293,24 @@ try {
 			const outboxId = "b".repeat(64), store = new WechatStore(join(runtimeDir, "wechat", "receive"));
 			store.putInbox({ msgId: "m2", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
 			assert.equal(extractWechatReply([{ role: "user", content: "no" }], { stateDir, runtimeDir, configPath }).written, false);
-			assert.equal(extractWechatReply([{ role: "user", content: "no" }, { role: "user", content: `dedupe:outbox:${outboxId}` }], { stateDir, runtimeDir, configPath }).written, false);
-			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", content: [{ type: "toolCall" }] }], { stateDir, runtimeDir, configPath }).reason, "no-text");
+			// 0929 修（长会话 marker-not-first 缺陷）：marker 改为从**最近**的 user 消息找。
+			// 旧断言（non-first marker ⇒ false）把 bug 固化为期望行为——长会话下 "第一条 user" 恒为历史首条
+			//（无 marker）⇒ reply-only 路径对已运行多日的会话永久失效且静默（不写审计）。
+			// 新语义：最近一条 user 带 marker 即生效（与 lastNonEmptyAssistantText 的从后往前对齐）。
+			// 注：用独立 outboxId，避开前面断言残留/幂等干扰。
+			const outboxLast = "1".repeat(64);
+			store.putInbox({ msgId: "m2L", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId: outboxLast });
+			assert.equal(extractWechatReply([{ role: "user", content: "no" }, { role: "user", content: `dedupe:outbox:${outboxLast}` }, { role: "assistant", content: [{ type: "text", text: "answer" }] }], { stateDir, runtimeDir, configPath }).written, true, "marker 在最近一条 user ⇒ 应生效（否则长会话永久失效）");
+			// 纯 tool-call 轮在 marker 之后（最近 user 仍带 marker，但无 assistant 文本）⇒ no-text
+			// 注：用独立 outboxId（上一断言已对 outboxId 写过 intent，幂等会把同 id 第二次调用变成 undefined）。
+			const outboxTool = "e".repeat(64);
+			store.putInbox({ msgId: "m2t", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId: outboxTool });
+			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxTool}` }, { role: "assistant", content: [{ type: "toolCall" }] }], { stateDir, runtimeDir, configPath }).reason, "no-text");
 			assert.match(readFileSync(join(stateDir, "wechat-reply-audit.jsonl"), "utf8"), /no-text/);
-			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", stopReason: "length", content: [{ type: "text", text: "x".repeat(4001) }] }], { stateDir, runtimeDir, configPath }).written, true);
-			assert.equal(readReplyIntent(replyIntentDir(stateDir), deriveReplyIntentId(outboxId))!.text, "x".repeat(4000) + "…[截断]");
+			const outboxTrunc = "d".repeat(64);
+			store.putInbox({ msgId: "m2x", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId: outboxTrunc });
+			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${outboxTrunc}` }, { role: "assistant", stopReason: "length", content: [{ type: "text", text: "x".repeat(4001) }] }], { stateDir, runtimeDir, configPath }).written, true);
+			assert.equal(readReplyIntent(replyIntentDir(stateDir), deriveReplyIntentId(outboxTrunc))!.text, "x".repeat(4000) + "…[截断]");
 			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { enabled: false } } } }));
 			const other = "c".repeat(64); store.putInbox({ msgId: "m3", fromId: "human@im.wechat", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId: other });
 			assert.equal(extractWechatReply([{ role: "user", content: `dedupe:outbox:${other}` }, { role: "assistant", content: "reply" }], { stateDir, runtimeDir, configPath }).reason, "reply-disabled");

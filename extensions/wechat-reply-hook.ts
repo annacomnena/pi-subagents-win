@@ -166,8 +166,16 @@ export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}
   // 0924 mode 分支（计划 §6①）：broadcast 只暂存（不看 marker——非微信触发轮同样广播，B1）；
   // flush 在 agent_settled。reply-only 走下方 marker 路径，逐字节原样（计划 §7 B5 红线）。
   if (cfg.mode === "broadcast") { stashWechatBroadcast(messages, deps); return { written: false }; }
-  const first = messages.find((m: any) => m?.role === "user"); if (!first) return { written: false, reason: "marker-not-first" };
-  const match = textOf(first).match(/dedupe:outbox:([0-9a-f]{64})/); if (!match) return { written: false, reason: "marker-not-first" };
+  // 0929 修（长会话 marker-not-first 缺陷）：marker 必须从**最近**的 user 消息里找。
+  // 原实现用 messages.find(⇒首条 user)，在长会话下恒命中历史首条（无 marker）⇒ 静默 return
+  //（不写审计，不可观测）⇒ reply-only 路径对已运行多日的会话永久失效。
+  // 与同文件 lastNonEmptyAssistantText（从后往前）对齐；findLast 优先，兼底手写逆序。
+  const lastUser = typeof (messages as any).findLast === "function"
+   ? (messages as any).findLast((m: any) => m?.role === "user")
+   : [...messages].reverse().find((m: any) => m?.role === "user");
+  if (!lastUser) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
+  const match = textOf(lastUser).match(/dedupe:outbox:([0-9a-f]{64})/);
+  if (!match) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
   const outboxId = match[1]; const rec = new WechatStore(join(runtimeDir, "wechat", "receive")).readInbox(0).find(r => r.outboxId === outboxId);
   if (!rec || rec.state !== "injected") { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "no-inbox-match" }); return { written: false, reason: "no-inbox-match" }; }
   if (rec.fromId.endsWith("@im.bot")) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", msgId: maskWechatOpenId(rec.msgId), from: maskWechatOpenId(rec.fromId), reason: "bot-domain" }); return { written: false, reason: "bot-domain" }; }
