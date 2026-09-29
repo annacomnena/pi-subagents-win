@@ -199,7 +199,7 @@ export interface RuntimeSnapshot {
 // ── GET /v1/attention（attention.ts AttentionItem）─────────────────
 
 export type AttentionSeverity = "critical" | "warning" | "info";
-export type AttentionType = "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked";
+export type AttentionType = "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked" | "request-timeout";
 export type AttentionStatus = "open" | "resolved";
 
 export interface AttentionItem {
@@ -278,7 +278,7 @@ export interface InteractionResponse {
 /** 待决策交互项 = open attention 条目的直投（kind 沿用 attention 词表；不新增审批类型）。 */
 export interface InteractionItem {
 	id: string;
-	kind: "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked";
+	kind: "runtime-risk" | "master-handoff" | "escalation" | "question" | "blocked" | "request-timeout";
 	severity: AttentionSeverity;
 	createdAt: string;
 	title: string;
