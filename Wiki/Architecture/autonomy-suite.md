@@ -2,11 +2,12 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-09-23
+updated: 2026-09-29
 source_paths:
   - extensions/runtime/autonomy/config.ts
-  - extensions/runtime/autonomy/kill-switch.ts
   - extensions/runtime/autonomy/frontier.ts
+  - extensions/runtime/autonomy/kill-switch.ts
+  - extensions/runtime/expectations.ts
   - extensions/runtime/autonomy/wake-gate.ts
   - extensions/runtime/autonomy/watchdog.ts
   - extensions/runtime/autonomy/collect.ts
@@ -31,7 +32,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 - **配置**（`config.ts`）：`config.json` 的 `autonomy` 切片；`DEFAULT_AUTONOMY` 取规格 §27 精确值；`normalizeAutonomy` **严格 `=== true` + 逐字段回落**（fail-closed）；`readAutonomyConfig` 容忍读（缺/坏 JSON → 默认）。
 - **kill-switch**（`kill-switch.ts`）：`readKillSwitch`（容忍读）/ `engageKillSwitch`（原子 tmp+rename）/ `clearKillSwitch`；`evaluateAutonomyGating` 优先级 **kill > enabled > active**。
-- **frontier**（`frontier.ts`，**纯零 IO**）：C5 相位→项目状态映射固化、规格 §25 九规则的 v1 子集、`meaningful_state_version`、`RECORD_ONLY_NOCARRIER`（**每帧无条件输出 ④⑥⑧ 三条 no-carrier 常量**，`frontier.ts:281`——生产路径 `diff.recordOnly` 恒非空）。
+- **frontier**（`frontier.ts`，**纯零 IO**）：C5 相位→项目状态映射固化、规格 §25 九规则的 v1 子集、`meaningful_state_version`、`RECORD_ONLY_NOCARRIER`（④⑥⑧ 三条 no-carrier 常量，`frontier.ts:156`）。**0928 起 ⑧ 行条件化**：`buildFrontier` 仅当 `inputs.expectations === undefined`（账本目录不存在）才输出 3 条，账本存在时 filter 掉 `expected_event_timeout:` 行（`frontier.ts#L387-L391`；常量本身与逐字断言不改）。**0929 起账本有了生产入口**（`/send-letter`，`index.ts#L2068`）——首次有请求入账后 ⑧ 行即从盘面消失、④⑥ 仍恒在，见 [[期望账本（⑧ 请求—回执期望）]]。
 - **wake-gate**（`wake-gate.ts`，**纯**）：`evaluateWakeGate` 四类（gating / debounce 2s / cooldown 15s / bypass）；审计行为纯返回，不落盘。
 - **watchdog**（`watchdog.ts`，**纯**）：`evaluateWatchdogChecks` 八项三态（**3/8 恒 `unknown`**、第 7 项 `null→unknown`，不猜）；`validateWatchdogPlan` **只钳制与封顶、不执行**；`WATCHDOG_HEARTBEAT_STALE_MS = 10m`。
 - **collect**（`collect.ts`，薄 IO 层，**唯一批量 IO 文件**）：`collectAutonomyInputs` 只读聚合 + **只写自有 namespace**（frontier 快照、审计行），顶层 never-throw。

@@ -2,10 +2,11 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-09-25
+updated: 2026-09-29
 source_paths:
   - plans/0923_decisions.md
   - extensions/hotspot/index.ts
+  - extensions/runtime/expectations.ts
 ---
 
 # Wiki 索引
@@ -33,6 +34,7 @@ source_paths:
 - [[Hotspot 工作集]] — v4 短期工作集 projection：采集、衰减、注入门与 lookup（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
 - [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
+- [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点与生产侧入账方现状（`status: current`）
 - [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff，零接线影子）（`status: current`）
 - [[Local Master Ensure（幂等确保）]] — 主会话按 cwd 幂等确保他仓 local master：四层授权 + 零新增权力 + 严格就绪判据 + #A 消费循环注册语义（`status: current`）
 
@@ -50,6 +52,7 @@ source_paths:
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 - [[Wake 回信（round-trip 回执）]]
+- [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
 - [[Local Master Ensure（幂等确保）]]
 
@@ -67,6 +70,7 @@ source_paths:
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
 - [[Wake 回信（round-trip 回执）]]
+- [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
 - [[Local Master Ensure（幂等确保）]]
 
