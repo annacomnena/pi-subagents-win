@@ -59,7 +59,10 @@ import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateStat
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { readAttachment } from "./runtime/registry.ts";
-import { masterAddress } from "./runtime/address.ts";
+import { isObjectAddress, masterAddress, type ObjectAddress } from "./runtime/address.ts";
+import { deliverLetter, newMessageId } from "./runtime/mailbox.ts";
+import { newMessageFrame } from "./runtime/protocol.ts";
+import { readExpectation } from "./runtime/expectations.ts";
 import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
 import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
@@ -2053,6 +2056,79 @@ export default function (pi: ExtensionAPI) {
 				body = "autonomy status: (状态不可读)";
 			}
 			ctx.ui.notify(body, "info");
+		},
+	});
+	// ── /send-letter（0929 M1 切片 A：⑧ 期望账本生产侧入账方——窄请求入口，方案 A1）──
+	// 学术诚实定性（与 /autonomy kill/clear 同款）：用户在交互会话手动键入的运维命令，不新增
+	// LLM 可调 tool；本命令不产生任何自动动作（acted=false 恒真语义不变，只放行既有消费链）。
+	// 薄包装 deliverLetter + newMessageFrame（DELEGATION，requiresAck 由工厂派生恒 true）：
+	// 投递成功点由 mailbox.ts 声明 ⑧ 期望（谓词 message ∧ requiresAck ∧ !inReplyTo ∧ from!==to
+	// 原样，不改）；--no-expect → expectReply:false 显式关；--deadline → 显式覆盖 30min 缺省
+	//（expectations.ts DEFAULT_EXPECT_DEADLINE_MS，跨仓委托过短误报的缓解入口）。
+	pi.registerCommand("send-letter", {
+		description: "投递请求信并声明⑧回信期望：/send-letter <to> [--subject S] [--body B] [--deadline 30m] [--no-expect]",
+		handler: async (args, ctx) => {
+			if (isSubagent()) {
+				ctx.ui.notify("send-letter: 子 agent 会话不可发送请求信（手动运维命令）", "warning");
+				return;
+			}
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const flag = (name: string): string | undefined => {
+				const i = parts.indexOf(name);
+				return i >= 0 ? parts[i + 1] : undefined;
+			};
+			// <to> = 首个非 flag / 非 flag 值 token（/task-create objective 同款解析口径）
+			const flagNames = new Set(["--subject", "--body", "--deadline", "--no-expect"]);
+			const to = parts.find((p, i) => !p.startsWith("--") && !flagNames.has(parts[i - 1] ?? ""));
+			if (!to || to.startsWith("--")) {
+				ctx.ui.notify("用法：/send-letter <to> [--subject S] [--body B] [--deadline 30m] [--no-expect]（S/B/时长均为单 token）", "warning");
+				return;
+			}
+			if (!isObjectAddress(to)) {
+				ctx.ui.notify(`send-letter: to 不是合法 ObjectAddress（agent://… / workstream://… / run://…）：${to}`, "warning");
+				return;
+			}
+			const noExpect = parts.includes("--no-expect");
+			// --deadline 解析（s/m/h/d）；缺省不传 → 账本默认 30min
+			let deadlineAt: string | undefined;
+			const dl = flag("--deadline");
+			if (dl !== undefined) {
+				const m = /^(\d+)(s|m|h|d)$/.exec(dl);
+				if (!m) { ctx.ui.notify("send-letter: --deadline 格式须为 <数字><s|m|h|d>（如 30m / 90s）", "warning"); return; }
+				const unit: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+				deadlineAt = new Date(Date.now() + Number(m[1]) * unit[m[2]]!).toISOString();
+			}
+			if (noExpect && deadlineAt !== undefined) {
+				ctx.ui.notify("send-letter: --no-expect 与 --deadline 互斥（不声明期望即无超期线）", "warning");
+				return;
+			}
+			const sid = durableSessionIdentity(ctx as never);
+			try {
+				const frame = newMessageFrame({
+				id: newMessageId(),
+				kind: "DELEGATION",
+				from: masterAddress(),
+				to: to as ObjectAddress,
+				subject: flag("--subject"),
+				sentAt: new Date().toISOString(),
+				summary: flag("--body") ?? "send-letter request",
+				});
+				// expectReply: false = 显式关；{deadlineAt} = 覆盖缺省；undefined = 按谓词自动（默认 30min）
+				const r = deliverLetter(frame, {
+					expectReply: noExpect ? false : deadlineAt !== undefined ? { deadlineAt } : undefined,
+				});
+				// 留痕（与 kill/clear 同函数同口径；cat 词表冻结三值，手动运维面归 gating 族）
+				appendAuditEvent("gating", "send-letter", `by=user:${sid?.slice(0, 12) ?? "cli"} to=${to} id=${frame.id} expect=${noExpect ? "off" : "on"}`);
+				const rec = noExpect ? null : readExpectation(frame.id);
+				const expectLine = noExpect
+					? "期望：--no-expect（不入账本）"
+					: rec
+						? `期望：requestId=${rec.requestId} expectedType=${rec.expectedType} deadline=${rec.deadlineAt} projectKey=${rec.projectKey}`
+						: "期望：未声明（谓词未过或账本不可写——投递不受影响）";
+				ctx.ui.notify(`send-letter ok=${r.created} id=${frame.id} to=${to}\n${expectLine}`, r.created ? "info" : "warning");
+			} catch (e) {
+				ctx.ui.notify(`send-letter 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+			}
 		},
 	});
 	pi.registerCommand("wechat", {
