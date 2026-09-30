@@ -10,6 +10,7 @@ source_paths:
   - gui/src/main.tsx
   - gui/src/store.ts
   - gui/src/pages/Sidebar.tsx
+  - gui/src/pages/TimelinePage.tsx
   - gui/src/pages/RuntimeOverlay.tsx
 ---
 
@@ -44,7 +45,8 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 
 - **三栏壳**（`gui/src/App.tsx:43-70`）：顶栏 `TopBar` + 左栏 `Sidebar`（常驻）+ 中央 `main`。右侧 Inspector 不存在。断连时顶栏下插警告条；底栏常驻「回执条」显示最近命令。
 - **主路由只有两个 Tab**：`TabId = "chat" | "timeline"`（`gui/src/store.ts:31`），默认 chat。master/workstream/attention/runtime 四状态页**不占主路由**，收进「运行时」全屏覆盖层。
-- **Sidebar 结构**（`gui/src/pages/Sidebar.tsx:24-90`）：264px 宽，折叠 = `w-0 + opacity-0 + pointer-events-none`；自上而下 = 新建会话钮（灰显占位：本地无 create-session 后端）→ `SessionList`（会话列表 + 过滤 Input，常驻）→ 次级导航组（**Timeline 入口**：走既有 `setActiveTab`，再点切回 chat 的 toggle，`aria-current` 显选中态——这是 TimelinePage 的唯一 UI 入口）→ footer 设置钮（打开 RuntimeOverlay）。
+- **Sidebar 结构**（`gui/src/pages/Sidebar.tsx:24-90`）：264px 宽，折叠 = `w-0 + opacity-0 + pointer-events-none`；自上而下 = 新建会话钮（灰显占位：本地无 create-session 后端）→ `SessionList`（会话列表 + 过滤 Input，常驻）→ 次级导航组（**Timeline 入口**：走既有 `setActiveTab`，再点切回 chat 的 toggle，`aria-current` 显选中态 + `shadow-[inset_2px_0_0_0_var(--color-brand)]` 左侧 2px 高亮条——暗色下「当前在时间线」可见；进入 timeline 的入口只有这一处）→ footer 设置钮（打开 RuntimeOverlay）。
+- **TimelinePage 返回契约**（`gui/src/pages/TimelinePage.tsx`）：与 RuntimeOverlay 同口径的三条返回路径——① 页内 Esc（`keydown` 监听 → `setActiveTab("chat")`，useEffect 挂载/卸载随页）② 页头右侧「返回会话」按钮（lucide `ArrowLeft` + 文案，title 标注「也可按 Esc」）③ Sidebar 次级导航 toggle 再点一次。`setActiveTab` 只在 `gui/src/store.ts` 定义，页面不新增状态。
 - **RuntimeOverlay 全屏覆盖层**（`gui/src/pages/RuntimeOverlay.tsx`）：壳 = absolute inset-0 整层替换，z 序 `toast 9999 > dropdown 60 > dialog/tooltip 50 > RuntimeOverlay 30 > composer 20`；左栏 68px 图标轨（≥lg 268px 全栏），五 section = attention / master / workstream / runtime / wechat，`runtimeOverlay` 值即打开并定位的 section，Esc 关闭；微信连接入口**始终渲染**（不按 bind status 探测隐藏），403/401 时页内给启用引导。
 - 全局轮询编排在 `App.tsx`（2s 档 events/attention/health/interactions，6s 档 snapshot/timeline/sessions），任意 Tab 下都活。
 
@@ -59,7 +61,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 - 适配层组件与 variant/tone 映射：`gui/src/ui/index.tsx`（BUTTON_VARIANT_MAP L21-26、BADGE_TONES L83-93）
 - 布局/路由/轮询/TooltipProvider：`gui/src/App.tsx`（TabId L17-22、三栏 L43-70）
 - 暗色常驻：`gui/src/main.tsx:12`
-- 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS L26-32、头部注释 z 序与入口语义）
+- 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/TimelinePage.tsx`（Esc 监听 + 页头返回钮）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS L26-32、头部注释 z 序与入口语义）
 
 ## Links Out
 
