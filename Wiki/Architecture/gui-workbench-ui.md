@@ -12,6 +12,10 @@ source_paths:
   - gui/src/pages/Sidebar.tsx
   - gui/src/pages/TimelinePage.tsx
   - gui/src/pages/RuntimeOverlay.tsx
+  - gui/src/pages/SessionList.tsx
+  - gui/src/workspaceGroup.ts
+  - extensions/runtime-host/session-title.ts
+  - extensions/runtime/transcript.ts
 ---
 
 # GUI 工作台 UI（token / 组件 / 导航）
@@ -51,6 +55,14 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 - **切 Tab = 组件级 remount**（`gui/src/App.tsx:41` 条件渲染）：timeline↔chat 切换时 ChatPage 整树卸载/重挂；行数据在 `store.chatRowsBySession` 缓存不丢，但 DOM 全量重建。大 transcript（2k+ 行）在 `ChatPage.tsx` 采用**分块渲染**：首屏只渲尾部 200 行，贴底时后台分块补齐更早行（回看暂停防跳位，头部占位提示）；切回瞬态（WS 非 down）且行已缓存时跳过 3s 轮询的即时全量 GET。
 - 全局轮询编排在 `App.tsx`（2s 档 events/attention/health/interactions，6s 档 snapshot/timeline/sessions），任意 Tab 下都活。
 
+## 会话列表标题契约（/v1/sessions → 左栏 SessionList）
+
+- **字段**：条目 `title` + `titleSource`（`ledger | first-user | id`），服务端解析链权威产物（`extensions/runtime-host/session-title.ts`）；GUI 只渲染，不自行派生。`titleSource==='ledger'` 同时是「全 tab 组默认折叠」判据（`workspaceGroup.resolveGroupOpen`）；`!=='id'` 时行内显示 title，`'id'` 时灰显 shortId。
+- **P1 ledger**：全局 tab-runs 台账（`~/.pi/agent/tab-runs/<runId>.json` 顶层记录，env `PI_TAB_RUNS_DIR` 覆盖）；同 cwd 桶 + 首条 user 严格前缀匹配 + 派发时间窗（会话不得早于派发 60s）。派发会话首条 user 常以 `<file name="...">` 附件块包装、前缀行在块内 → 匹配前只剥开标签行（`ledgerProbeFirstLine`），与 P2 的整块剥除语义不同。
+- **P2 first-user**：`transcript.ts readHead` 分块头扫描——首读 32KB（取首行头），header 解析成功且未见首条 user 则以 64KB 分块续扫，上限 256KB，命中即提前停（800 会话全扫 ≈200ms）；`firstUserText` 截 8000 字符（需覆盖附件块闭合）。派生前 `stripLeadingAttachmentBlocks` 循环剥开头的 `<file ...>...</file>` / `<system-reminder>...</system-reminder>` 机器注入块（限这两类，防误伤正文 XML）；整条都是附件块 → null 回退 P3。截 24 字符（taskTitleLabel 同款规则独立重实现）。
+- **P3 id**：会话 id 兜底。
+- **结构性降级（正常态，非 bug）**：gc-cleaner 把终态台账记录移入 `_archived/`（解析链只读顶层）→ 历史派发会话的 P1 永久不可达，按链降 P2/P3；新派发会话在台账归档前可命中 P1。
+
 ## Focus 基线
 
 - 全局 reset 仅清 `outline`：`*:focus, *:focus-visible { outline: none !important }`——**不清 box-shadow**，shadcn 组件以 `box-shadow`（`ring-*`）实现 focus-visible 焦点环（`gui/src/index.css:185-191`）。
@@ -63,6 +75,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 - 布局/路由/轮询/TooltipProvider：`gui/src/App.tsx`（TabId L17-22、三栏 L43-70）
 - 暗色常驻：`gui/src/main.tsx:12`
 - 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/TimelinePage.tsx`（Esc 监听 + 页头返回钮）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS L26-32、头部注释 z 序与入口语义）
+- 会话列表标题契约：`extensions/runtime-host/session-title.ts`（解析链 + 附件块剥离）、`extensions/runtime/transcript.ts`（`readHead` 分块扫描常量 `HEAD_READ_BYTES/HEAD_CHUNK_BYTES/HEAD_SCAN_MAX_BYTES`、`FIRST_USER_TEXT_CAP`）、`gui/src/workspaceGroup.ts`（`GROUP_VISIBLE_LIMIT`、`resolveGroupOpen`）
 
 ## Links Out
 

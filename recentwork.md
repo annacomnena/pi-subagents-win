@@ -16,6 +16,7 @@
 
 | Item | Priority | Summary | Dependency | Next action |
 |---|---|---|---|---|
+| 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API |
 | 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） |
 | 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 |
 | 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | —（第四轮补测 + 人工确认已由 **Item 49** 收口） |
