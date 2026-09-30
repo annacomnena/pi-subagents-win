@@ -42,9 +42,9 @@ export function Button({
 
 // ── 2. Card ────────────────────────────────────────────────────────
 
-export function Card({ title, right, children }: { title?: ReactNode; right?: ReactNode; children: ReactNode }) {
+export function Card({ title, right, children, className }: { title?: ReactNode; right?: ReactNode; children: ReactNode; className?: string }) {
 	return (
-		<section className="rounded-lg border border-border bg-surface/60">
+		<section className={`rounded-lg border border-border bg-surface/60 ${className ?? ""}`}>
 			{title !== undefined && (
 				<header className="flex items-center justify-between border-b border-border px-3 py-2">
 					<h2 className="text-xs font-semibold tracking-wide text-foreground-subtle">{title}</h2>

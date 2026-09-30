@@ -246,7 +246,7 @@ export function SessionList() {
 							aria-pressed={sortBy === value}
 							className={`px-1.5 text-ui-sm transition-colors ${
 								sortBy === value
-									? "bg-neutral-200/70 text-foreground"
+									? "bg-tag text-foreground"
 									: "text-foreground-subtle hover:bg-surface-hover"
 							}`}
 						>
@@ -279,8 +279,9 @@ export function SessionList() {
 						return (
 							<Collapsible key={g.key} open={open} onOpenChange={(o) => toggleGroup(g, o)}>
 								{/* 组头（WorkspaceSidebarItem.tsx#L780 同款刻度）：h-8 整行 CollapsibleTrigger；
-									Folder/FolderOpen 16px + basename + 计数 badge（本地 token bg-neutral-200/70，
-									zcode bg-tag 未搬）+ 无 chevron + title=全路径 tooltip；未分组灰显 Inbox */}
+									Folder/FolderOpen 16px + basename + 计数 badge（bg-tag，暗色 #363636；
+									zcode bg-tag 语义 2026-09-30 落地，替代亮色残留 bg-neutral-200/70）
+									+ 无 chevron + title=全路径 tooltip；未分组灰显 Inbox */}
 								<CollapsibleTrigger asChild>
 									<div
 										role="button"
@@ -305,7 +306,7 @@ export function SessionList() {
 												title="该组内有发送失败/过期/被拒消息的会话"
 											/>
 										)}
-										<span className="shrink-0 rounded-full bg-neutral-200/70 px-1.5 text-ui-sm text-foreground-subtle">
+										<span className="shrink-0 rounded-full bg-tag px-1.5 text-ui-sm text-foreground-subtle">
 											{g.count}
 										</span>
 									</div>

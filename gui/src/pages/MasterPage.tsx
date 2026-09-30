@@ -212,7 +212,7 @@ export function MasterPage() {
 				</div>
 
 				{/* 最近交接时间线（滤 master.handoff.*，跨两列占满） */}
-				<Card title={<Term zh="交接时间线" en="master.handoff.*" />}>
+				<Card title={<Term zh="交接时间线" en="master.handoff.*" />} className="xl:col-span-2">
 					{masterTimeline.length === 0 ? (
 						<EmptyState>还没有发生过交接事件</EmptyState>
 					) : (
