@@ -1275,9 +1275,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						count: sessions.length,
 						sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => {
 							const pin = pins.get(s.sessionId);
+							// 契约字段是 titleSource（GUI types.ts 与 SessionList 全 tab 组折叠判据均读它）；
+							// SessionTitle.source 是解析链内部字段名，上线时显式映射，不再直接 spread。
+							const t = titles.get(s.sessionId);
 							return {
 								...s,
-								...(titles.get(s.sessionId) ?? { title: s.sessionId, titleSource: "id" as const }),
+								title: t !== undefined ? t.title : s.sessionId,
+							titleSource: t !== undefined ? t.source : ("id" as const),
 								...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
 								...(pin?.isMaster ? { isMaster: true as const } : {}),
 								...(pin?.isScopeMaster ? { isScopeMaster: true as const } : {}),
