@@ -160,7 +160,7 @@ export function SessionList() {
 					}
 				}}
 				tabIndex={0}
-				className={`group/task-item flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow] ${
+				className={`group/task-item flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow] focus-visible:ring-2 focus-visible:ring-ring/50 ${
 					isActive ? "bg-selected" : "hover:bg-surface-hover"
 				}`}
 			>
@@ -244,7 +244,7 @@ export function SessionList() {
 								saveSortBy(value); // 维度切换落盘 `saw-ws-sort`（机制同 saw-ws-expansion）
 							}}
 							aria-pressed={sortBy === value}
-							className={`px-1.5 text-ui-sm transition-colors ${
+							className={`px-1.5 text-ui-sm transition-colors focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 ${
 								sortBy === value
 									? "bg-tag text-foreground"
 									: "text-foreground-subtle hover:bg-surface-hover"
@@ -287,7 +287,7 @@ export function SessionList() {
 										role="button"
 										tabIndex={0}
 										title={g.tooltip}
-										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-surface-hover"
+										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-ring/50"
 									>
 										{g.ungrouped ? (
 						<Inbox className="size-4 shrink-0 text-foreground-subtlest" />
