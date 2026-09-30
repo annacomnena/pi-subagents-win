@@ -314,10 +314,26 @@ export function ChatPage() {
 	// WS 恢复即停（onopen resync 接管增量）。
 	usePoll(() => {
 		const st = useGui.getState();
-		if (st.chatConn !== "open" && st.chatActiveId !== null) void st.reloadChatSession(st.chatActiveId);
+		if (st.chatConn !== "open" && st.chatActiveId !== null) {
+			// D4：WS 非真断线（connecting/idle 均为切回瞬态）且行已在 store 缓存 → 跳过全量 GET
+			//（每次切回白拉 1-6MB；WS open 后的 resync 增量接管补差）。真断线（"down"）保留 3s 兜底。
+			const cached = st.chatRowsBySession[st.chatActiveId];
+			if (st.chatConn !== "down" && cached !== undefined && cached.length > 0) return;
+			void st.reloadChatSession(st.chatActiveId);
+		}
 	}, 3000);
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
+	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——
+	// 首屏只画尾部 200 行，贴底时分块补齐更早行。2-4k 行全量同步重挂载实测阻塞主线程
+	// 2s+（真机 CDP 复现），分块后切回首帧 ~100ms。hiddenHead = 头部未渲染行数。
+	const HISTORY_CHUNK = 200;
+	const [hiddenHead, setHiddenHead] = useState(() => {
+		const st = useGui.getState();
+		const n = st.chatActiveId !== null ? (st.chatRowsBySession[st.chatActiveId]?.length ?? 0) : 0;
+		return Math.max(0, n - HISTORY_CHUNK);
+	});
+	const visibleRows = hiddenHead > 0 ? rows.slice(hiddenHead) : rows;
 	// Master 禁输入标识 = /v1/sessions masterProtected flag（服务端权威；POST 403 是最后防线）。
 	const activeSession = activeId !== null ? chatSessions.find((s) => s.sessionId === activeId) : undefined;
 	const isMasterSession = activeSession?.masterProtected === true;
@@ -334,6 +350,19 @@ export function ChatPage() {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const messageLayerRef = useRef<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
+
+	// D4：切会话 → 重新定初始裁剪（先于首帧生效）
+	useEffect(() => {
+		const st = useGui.getState();
+		const n = st.chatActiveId !== null ? (st.chatRowsBySession[st.chatActiveId]?.length ?? 0) : 0;
+		setHiddenHead(Math.max(0, n - HISTORY_CHUNK));
+	}, [activeId]);
+	// D4：贴底时分块补齐更早行（离开底部暂停，防阅读位跳动）
+	useEffect(() => {
+		if (hiddenHead === 0 || !atBottom) return;
+		const id = window.setTimeout(() => setHiddenHead((h) => Math.max(0, h - HISTORY_CHUNK)), 0);
+		return () => window.clearTimeout(id);
+	}, [hiddenHead, atBottom]);
 
 	const syncMask = (): void => {
 		const el = scrollRef.current;
@@ -366,10 +395,11 @@ export function ChatPage() {
 	};
 
 	// 贴底锚定：仅在 atBottom 时跟随新行/回执滚动；回看（!atBottom）锁定阅读位
+	// （dep 用 visibleRows：分块补齐也在贴底时重新吸底）
 	useEffect(() => {
 		const el = scrollRef.current;
 		if (el !== null && atBottom) el.scrollTop = el.scrollHeight;
-	}, [rows, outboxEntries, atBottom]);
+	}, [visibleRows, outboxEntries, atBottom]);
 
 	// 切会话 → 重置贴底（先看最新）
 	useEffect(() => {
@@ -417,7 +447,12 @@ export function ChatPage() {
 							</div>
 						) : (
 							<>
-								{rows.map((row) => (
+								{hiddenHead > 0 && (
+									<div className="py-1 text-center text-ui-xs text-foreground-subtlest">
+										正在补齐较早消息（{hiddenHead} 条）…
+									</div>
+								)}
+								{visibleRows.map((row) => (
 									<RowView key={row.rowId} row={row} />
 								))}
 								{/* 发送两段回执：挂 user 气泡下的状态行（mt-1 text-right text-ui-sm） */}

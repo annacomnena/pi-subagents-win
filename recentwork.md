@@ -660,3 +660,5 @@
 0930 GUI 视觉质量改进 L3 实现（S1–S8 八片，b88c531…7659908）→ token 底座补 ring/muted/info + 组件收敛 shadcn + 键盘焦点 + RuntimeOverlay 图标化 + Sidebar Timeline 入口（派发者批准唯一 IA 变化）；计划 `plans/20260930_gui_visual_polish_plan.md`；待人工目检（暗色 dev）
 
 0930 TimelinePage 返回可发现性修复（df70d1b）：Esc + 页内「返回会话」钮 + Sidebar timeline 选中态 2px 高亮条；build 零错误、9 项 test:gui-* 全绿、真机 CDP 四条验证 4/4；更新 `Wiki/Architecture/gui-workbench-ui.md#导航契约`（TimelinePage 返回契约）
+
+0930 Timeline D4 切回延迟诊断+优化：真机 CDP 复现 3721 行会话切回 2.2s（根因=App.tsx:41 条件渲染致 ChatPage 全量重挂载同步渲染，非网络）；ChatPage 分块渲染（首屏 200 行+贴底分块补齐）+ 切回瞬态跳过冗余全量 GET → 首帧 60ms（36x）；build 零错误 + 9 项 test:gui-* 全绿 + 改前/改后实测对比；报告 plans/20260930_timeline_switch_latency_d4.md
