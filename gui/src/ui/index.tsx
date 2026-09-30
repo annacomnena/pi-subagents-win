@@ -123,7 +123,7 @@ export function Toggle({ on, disabled, onChange, labels }: {
 			type="button"
 			disabled={disabled}
 			onClick={() => onChange(!on)}
-			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-ui-xs font-semibold transition-colors disabled:opacity-40 ${
+			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-ui-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-40 ${
 				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-foreground-subtle"
 			}`}
 		>

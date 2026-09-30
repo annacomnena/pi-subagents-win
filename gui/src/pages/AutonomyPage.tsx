@@ -108,9 +108,15 @@ function TriggerRow({ t }: { t: FrontierTrigger }) {
 function FrontierViz() {
 	// undefined=加载中 / null=无快照文件 / FrontierSnapshot=有数据
 	const [snap, setSnap] = useState<FrontierSnapshot | null | undefined>(undefined);
+	const [error, setError] = useState("");
 	const refresh = useCallback(async () => {
 		const r = await api.autonomyFrontier();
-		if (r.ok) setSnap(r.data); // 失败保留旧数据（never-throw 纪律）
+		if (r.ok) {
+			setSnap(r.data);
+			setError("");
+		} else {
+			setError(`读取 frontier 失败 HTTP ${r.status}`);
+		} // 失败保留旧快照；首次失败时显示可恢复错误，避免永久停在加载态。
 	}, []);
 	useEffect(() => {
 		void refresh();
@@ -121,7 +127,7 @@ function FrontierViz() {
 	const title = <Term zh="自主性前沿" en="frontier" hint="autonomy 套件的触发投影：系统据此判断要不要放行唤醒。只读读盘，不重计算。" />;
 
 	if (snap === undefined) {
-		return <Card title={title}><EmptyState>正在加载 frontier 快照…</EmptyState></Card>;
+		return <Card title={title}><EmptyState>{error || "正在加载 frontier 快照…"}</EmptyState></Card>;
 	}
 	if (snap === null) {
 		return (
@@ -137,6 +143,7 @@ function FrontierViz() {
 		<div className="space-y-3">
 			{/* C 快照时效 */}
 			<Card title={title}>
+				{error && <p role="status" className="mb-2 text-ui-xs text-destructive">{error}；显示最近一次快照。</p>}
 				<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-ui-sm">
 					<span className="text-foreground-subtle">快照时间</span>
 					<RelTime at={new Date(snap.asof).toISOString()} className="text-foreground" />
