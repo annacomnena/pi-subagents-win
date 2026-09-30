@@ -111,13 +111,13 @@ export function sortGroups(groups: WorkspaceGroup[]): WorkspaceGroup[] {
 	return [...normal, ...ungrouped];
 }
 
-// ── 会话 rail 三件套 L3：置顶 / 每组最多 6 个 / 全 tab 组默认折叠（纯函数，JSX-free）──
+// ── 会话 rail 三件套 L3：置顶 / 每组最多 3 个 / 全 tab 组默认折叠（纯函数，JSX-free）──
 
 /** 每组默认显示的非置顶会话上限（置顶行不受截断影响，永远可见）。 */
-export const GROUP_VISIBLE_LIMIT = 6;
+export const GROUP_VISIBLE_LIMIT = 3;
 
-/** 组内显示模型（置顶优先 + 6 个截断 + 全 tab 组判定）：
- *  - pinned：组内 isScopeMaster 行（置顶，永远可见，不受 6 个限制）；
+/** 组内显示模型（置顶优先 + 3 个截断 + 全 tab 组判定）：
+ *  - pinned：组内 isScopeMaster 行（置顶，永远可见，不受 3 个限制）；
  *  - visible：非置顶行，收起态最多 GROUP_VISIBLE_LIMIT 个（其余序），展开态全量；
  *  - hiddenCount：被截断隐藏的非置顶行数（0 = 不渲染「还有 N 个」行）；
  *  - allTab：组内会话全部为派发 tab（titleSource==='ledger'）→ 首次加载默认折叠数据源。 */

@@ -280,7 +280,7 @@ assert.equal(basename(null), "");
 assert.equal(cwdLabel(null), "未分组");
 ok("G7 basename/cwdLabel 自 SessionList 迁入后行为不变");
 
-// ── P 段：会话 rail 三件套 L3（置顶 / 每组最多 6 个 / 全 tab 组默认折叠）──
+// ── P 段：会话 rail 三件套 L3（置顶 / 每组最多 3 个 / 全 tab 组默认折叠）──
 const { GROUP_VISIBLE_LIMIT, buildGroupDisplay, resolveGroupOpen } = await import("./workspaceGroup.ts");
 const { loadRailExpand, saveRailExpand, pruneRailExpand, OVERFLOW_KEY, TABGROUP_KEY, MAX_PERSISTED_GROUPS } = await import(
 	"./workspaceRailExpand.ts"
@@ -321,10 +321,10 @@ const raw = (id: string, cwd: string, o: Partial<SessionSummary> = {}): SessionS
 	const d = buildGroupDisplay(g, false);
 	assert.deepEqual(d.pinned.map((s) => s.sessionId), ["a2"]);
 	assert.deepEqual(d.visible.map((s) => s.sessionId), ["a1", "a3", "a4"]); // 其余按现有组内序（mtime 降）
-	assert.equal(d.hiddenCount, 0); // 非置顶 3 个 ≤ 6 → 无「还有 N 个」行
+	assert.equal(d.hiddenCount, 0); // 非置顶 3 个 ≤ 3 → 无「还有 N 个」行
 	ok("P1a 组内 isScopeMaster 行置顶（pinned），其余按现有组内序（visible）");
 }
-// P2 每组最多 6 个：非置顶行默认前 6，超出收进「还有 N 个」；置顶行不受截断影响
+// P2 每组最多 3 个：非置顶行默认前 3，超出收进「还有 N 个」；置顶行不受截断影响
 {
 	const n = 10;
 	const sessions = Array.from({ length: n }, (_, i) => raw(`b${i}`, "c:/r2", { mtimeMs: n - i }));
@@ -340,26 +340,26 @@ const raw = (id: string, cwd: string, o: Partial<SessionSummary> = {}): SessionS
 		hasError: false,
 		sessions,
 	} as WorkspaceGroup;
-	assert.equal(GROUP_VISIBLE_LIMIT, 6, "上限常量 = 6");
+	assert.equal(GROUP_VISIBLE_LIMIT, 3, "上限常量 = 3");
 	const dClosed = buildGroupDisplay(g, false);
 	assert.equal(dClosed.pinned.length, 1, "置顶行 1 个");
-	assert.equal(dClosed.visible.length, 6, "收起态非置顶行 = 前 6（组内现有序）");
-	assert.deepEqual(dClosed.visible.map((s) => s.sessionId), ["b0", "b1", "b2", "b3", "b4", "b5"]);
-	assert.equal(dClosed.hiddenCount, 3, "超出 3 个 → 「还有 3 个 · 展开查看全部」");
+	assert.equal(dClosed.visible.length, 3, "收起态非置顶行 = 前 3（组内现有序）");
+	assert.deepEqual(dClosed.visible.map((s) => s.sessionId), ["b0", "b1", "b2"]);
+	assert.equal(dClosed.hiddenCount, 6, "超出 6 个 → 「还有 6 个 · 展开查看全部」");
 	const dOpen = buildGroupDisplay(g, true);
 	assert.equal(dOpen.visible.length, 9, "展开态非置顶行全量");
-	assert.equal(dOpen.hiddenCount, 3, "展开态 hiddenCount 不变（行文案切「收起」）");
-	ok("P2a 每组最多 6 个（非置顶前 6 + 「还有 N 个」）；展开态全量");
-	// 置顶行不受 6 个截断影响：置顶 2 个 + 非置顶 8 个 → 置顶全显，非置顶前 6
+	assert.equal(dOpen.hiddenCount, 6, "展开态 hiddenCount 不变（行文案切「收起」）");
+	ok("P2a 每组最多 3 个（非置顶前 3 + 「还有 N 个」）；展开态全量");
+	// 置顶行不受 3 个截断影响：置顶 2 个 + 非置顶 8 个 → 置顶全显，非置顶前 3
 	const sessions2 = Array.from({ length: 10 }, (_, i) => raw(`c${i}`, "c:/r3", { mtimeMs: 10 - i }));
 	sessions2[0].isScopeMaster = true;
 	sessions2[5].isScopeMaster = true;
 	const g2 = { ...g, key: "c:/r3", label: "r3", tooltip: "c:/r3", cwd: "c:/r3", count: 10, sessions: sessions2 } as WorkspaceGroup;
 	const d2 = buildGroupDisplay(g2, false);
 	assert.deepEqual(d2.pinned.map((s) => s.sessionId).sort(), ["c0", "c5"], "置顶 2 行永远可见");
-	assert.equal(d2.visible.length, 6);
-	assert.equal(d2.hiddenCount, 2);
-	ok("P2b 置顶行不受 6 个截断影响（2 置顶 + 前 6 非置顶 + 还有 2 个）");
+	assert.equal(d2.visible.length, 3);
+	assert.equal(d2.hiddenCount, 5);
+	ok("P2b 置顶行不受 3 个截断影响（2 置顶 + 前 3 非置顶 + 还有 5 个）");
 }
 // P3 全 tab 组首次加载默认折叠（titleSource==='ledger'）；用户显式展开后以持久化为准
 {

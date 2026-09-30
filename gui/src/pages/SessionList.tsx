@@ -1,6 +1,6 @@
 /**
  * gui/src/pages/SessionList.tsx — 左栏会话列表（ZCode 1:1 复刻 第 3 步 + 按仓库分组会话 L2
- * + 会话 rail 三件套 L3：置顶 / 每组最多 6 个 / 全 tab 组默认折叠）。
+ * + 会话 rail 三件套 L3：置顶 / 每组最多 3 个 / 全 tab 组默认折叠）。
  *
  * 分组渲染（plans/0922_workspace_group_plan.md）：会话列表由扁平 `<ul>` 改为「按 cwd 分组 +
  * radix Collapsible 折叠」；组头 h-8 整行 CollapsibleTrigger（Folder/FolderOpen 16px 随展开态
@@ -18,8 +18,8 @@
  * 纯显示函数在 workspaceGroup：buildGroupDisplay/resolveGroupOpen）：
  *   1) 置顶：全局 master 会话（isMaster）在列表最上方独立「置顶」区（过滤仍适用，与
  *      「过滤后空组整组隐藏」一致）；组内 scope master 行（isScopeMaster）置顶于组内列表
- *      顶部、盾标（masterProtected）旁加「置顶」徽标；置顶行不受 6 个截断影响（永远可见）。
- *   2) 每组最多 6 个：组内非置顶行默认显示前 6（组内现有序），超出收进「还有 N 个 ·
+ *      顶部、盾标（masterProtected）旁加「置顶」徽标；置顶行不受 3 个截断影响（永远可见）。
+ *   2) 每组最多 3 个：组内非置顶行默认显示前 3（组内现有序），超出收进「还有 N 个 ·
  *      展开查看全部」行；展开态 localStorage `saw-ws-overflow`（workspaceRailExpand，
  *      机制同 saw-ws-expansion：true=展开、缺省=收起、prune+500 上限+坏 JSON 容错）。
  *   3) 全 tab 组默认折叠：组内会话全部为派发 tab（titleSource==='ledger'）的组，首次加载
@@ -200,7 +200,7 @@ export function SessionList() {
 							// 组内置顶徽标（scope master 行；L3 三件套 1/3）：盾标旁，subtlest 档不抢标题
 							<span
 								className="flex shrink-0 items-center gap-0.5 text-ui-sm text-foreground-subtlest"
-								title="本仓库的本地 master（scope master）——组内置顶，不受 6 个截断影响"
+								title="本仓库的本地 master（scope master）——组内置顶，不受 3 个截断影响"
 							>
 								<Pin className="size-3" />
 								置顶
@@ -273,7 +273,7 @@ export function SessionList() {
 						// 组展开态：混合组 = saw-ws-expansion（缺省展开）；全 tab 组 = 首次加载默认收起，
 						// 用户显式展开后以 saw-ws-tabgroups 持久化值为准（resolveGroupOpen 纯函数，可测）
 						const open = resolveGroupOpen(g, expansion, tabExpansion);
-						// 组内显示模型（L3 三件套 1/2/3）：置顶行永远可见；非置顶默认前 6；全 tab 组默认收起
+						// 组内显示模型（L3 三件套 1/2/3）：置顶行永远可见；非置顶默认前 3；全 tab 组默认收起
 						const overflowOpen = overflow[g.key] === true;
 						const display = buildGroupDisplay(g, overflowOpen);
 						return (
@@ -313,12 +313,12 @@ export function SessionList() {
 								</CollapsibleTrigger>
 								<CollapsibleContent className="pl-0.5">
 									<ul className="space-y-0.5">
-										{/* 组内置顶行（scope master；L3 三件套 1/3）：永远可见，不受 6 个截断影响 */}
+										{/* 组内置顶行（scope master；L3 三件套 1/3）：永远可见，不受 3 个截断影响 */}
 										{display.pinned.map((s) => renderSessionRow(s, true))}
-										{/* 非置顶行：收起态前 6（组内现有序），展开态全量 */}
+										{/* 非置顶行：收起态前 3（组内现有序），展开态全量 */}
 										{display.visible.map((s) => renderSessionRow(s, false))}
 									</ul>
-									{/* 「还有 N 个 · 展开查看全部」（L3 三件套 2/3）：仅非置顶行超出 6 个时渲染；
+									{/* 「还有 N 个 · 展开查看全部」（L3 三件套 2/3）：仅非置顶行超出 3 个时渲染；
 										展开态持久化 saw-ws-overflow（机制同 saw-ws-expansion） */}
 									{display.hiddenCount > 0 && (
 										<button
