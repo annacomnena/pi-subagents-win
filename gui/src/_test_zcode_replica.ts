@@ -28,7 +28,9 @@ assert.ok(css.includes(".theme-zai-dark"), "index.css 有 .theme-zai-dark 生效
 assert.ok(css.includes("--ui-font-size: 14px"), "14px 基准字号");
 for (const token of [
 	"--color-input-border-focused: var(--color-border-hover)", // zai 主题 focused = border-hover（非 brand）
-	"--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 30%, transparent)",
+	// 2026-09-30 有意分歧（暗色可读性拍板，plans/20260930_gui_visual_polish_plan.md S1）：
+	// subtlest 30%→50%（#161616 上对比 ≈2.2:1→≈4:1）；zcode 原值 30%，复刻纪律让位于可读性
+	"--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 50%, transparent)",
 	"--color-selected: rgba(255, 255, 255, 0.1)",
 	"--color-brand: #ffffff",
 	"--color-trajectory-tool-call: #f59e0b",
@@ -136,7 +138,9 @@ assert.ok(topbar.includes('size="icon-lg"'), "ghost 图标钮 size-8 rounded-lg�
 assert.ok(topbar.includes("待决策") && topbar.includes("上下文压力") && topbar.includes("bg-success"), "Host●/压力/待决策徽标数据字段保留");
 assert.ok(!/CommandCenter|FileTree|gitSummary|UpdateStatus/.test(topbar), "⌘K/文件树/git/更新徽标不渲染");
 const overlay = read("pages/RuntimeOverlay.tsx");
-assert.ok(overlay.includes("absolute inset-0 z-10"), "覆盖层壳 = WorkspaceSettingsLayer 同构");
+// 2026-09-30 同步：0923 2003 遮挡修复已拍板抬到 z-30（plans/0923_gui_ux_fix_plan.md A；
+// RuntimeOverlay 头注），本断言 0923 时漏同步，此处补对（非复刻回退）
+assert.ok(overlay.includes("absolute inset-0 z-30"), "覆盖层壳 = WorkspaceSettingsLayer 同构（0923 起 z-30）");
 assert.ok(overlay.includes("grid-cols-[68px_minmax(0,1fr)]") && overlay.includes("lg:grid-cols-[268px_minmax(0,1fr)]"), "设置层 grid 68px/268px 双态（SettingsPage#L1375）");
 assert.ok(overlay.includes("m-1 w-[calc(100%-0.5rem)] justify-start gap-2 rounded-xl px-1.5"), "返回钮圆角-xl 套件（SettingsPage#L1408）");
 for (const sec of ["AttentionPage", "MasterPage", "WorkstreamPage", "RuntimePage"]) {

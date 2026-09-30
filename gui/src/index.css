@@ -10,8 +10,9 @@
 /* ── 主题底座（ZCode 1:1 复刻 第 1 步）──────────────────────────────────
  * 整表移植 zcode packages/ui/src/styles.css 必需集：token 保 zcode 原名，
  * 值照抄 styles.css（:root 亮色定义 + .theme-zai-dark 生效值，Web 默认暗色口径）。
- * .dark 层不搬（无切换器）；--color-muted/--color-ring 在 zcode 本就未定义，
- * bg-muted / ring-ring / text-muted-foreground 等类为 no-op，照抄保留不补发明 token。 */
+ * .dark 层不搬（无切换器）；zcode 未定义处 2026-09-30 起**有意补齐** ring/muted/
+ * muted-foreground/info 四枚（暗色可读性拍板：焦点环与 badge/kbd/tabs 的 no-op 复活），
+ * 其余 token 仍照抄不发明（见 20260930_gui_visual_polish_plan.md S1）。 */
 
 :root {
 	--ui-font-size: 14px;
@@ -85,6 +86,11 @@
 	--color-toast: var(--color-white);
 	--color-tooltip: var(--color-neutral-100);
 	--color-tooltip-foreground: var(--color-neutral-950);
+	/* 2026-09-30 有意补齐（zcode 未定义；亮色基底仅留定义，暗色一套拍板不变） */
+	--color-ring: rgba(0, 0, 0, 0.35);
+	--color-muted: var(--color-neutral-100);
+	--color-muted-foreground: var(--color-neutral-500);
+	--color-info: var(--color-sky-600);
 }
 
 /* 生效主题：Zai Dark（Web 默认暗色；main.tsx 给 documentElement 常挂 .theme-zai-dark）
@@ -133,7 +139,6 @@
 	--color-interaction-ask-fill: rgba(70, 191, 114, 0.24);
 	--color-foreground: var(--color-neutral-300);
 	--color-foreground-subtle: color-mix(in oklab, var(--color-neutral-300) 60%, transparent);
-	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 30%, transparent);
 	--color-foreground-inverse: #000000;
 	--color-success: #46bf72;
 	--color-success-foreground: #000000;
@@ -145,6 +150,15 @@
 	--color-toast: #2b2b2b;
 	--color-tooltip: #2b2b2b;
 	--color-tooltip-foreground: #f8f8f8;
+	/* 2026-09-30 有意补齐（zcode 未定义；暗色可读性拍板）：
+	 * ring=/50 调制后 ≈25% 白环（badge ring-[3px]、textarea ring-2 生效）；
+	 * muted=背景与卡底之间的抬升档（badge outline hover / Kbd / Tabs 轨道复活）；
+	 * info=真信息蓝（legacy Badge tone=blue 三处调用点）；subtlest 30→50%（≈2.2:1→≈4:1） */
+	--color-ring: rgba(255, 255, 255, 0.5);
+	--color-muted: #242424;
+	--color-muted-foreground: var(--color-neutral-400);
+	--color-info: #38bdf8;
+	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 50%, transparent);
 }
 
 /* ── 全局基线 ─────────────────────────────────────────────────────── */
@@ -168,19 +182,19 @@ body {
 	overflow: hidden;
 }
 
-/* 系统级 focus 高亮复位（styles.css#L119-131 同款） */
+/* 系统级 focus 高亮复位：outline 清零保留 zcode 观感（styles.css#L119-131 同款）；
+ * box-shadow 清零 2026-09-30 移除——shadcn 组件焦点环以 box-shadow（ring-*）实现，
+ * 全局清零会把组件级 focus-visible:ring-* 一并压掉，键盘焦点全不可见（P1-3） */
 *:focus,
 *:focus-visible {
 	outline: none !important;
-	box-shadow: none !important;
-	-webkit-box-shadow: none !important;
 }
 
+/* 高对比模式可访问性下限：恢复系统 outline（forced-colors 下 ring 也不可靠） */
 @media (forced-colors: active) {
 	*:focus,
 	*:focus-visible {
-		outline: none !important;
-		box-shadow: none !important;
+		outline: 2px solid Highlight !important;
 	}
 }
 
