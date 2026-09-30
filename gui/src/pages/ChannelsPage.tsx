@@ -295,15 +295,6 @@ function InputBlock() {
  </div></Card>;
 }
 
-function AutonomySettings() {
-	const [state, setState] = useState<{ enabled: boolean; kill: string; frontier: string | null; wakeGate: string | null } | null>(null);
-	const [error, setError] = useState("");
-	const refresh = useCallback(async () => { try { const r = await fetch("/v1/autonomy/status"); if (r.ok) setState(await r.json()); else setError(`状态读取失败 HTTP ${r.status}`); } catch { setError("状态读取失败"); } }, []);
-	useEffect(() => { void refresh(); }, [refresh]);
-	const toggle = async (enabled: boolean) => { try { const r = await fetch("/v1/autonomy/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }); if (!r.ok) { setError(`写入失败 HTTP ${r.status}`); return; } setError(""); await refresh(); } catch { setError("写入失败"); } };
-	return <Card title="主动性套件"><div className="space-y-2 text-xs"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；当前不执行任何自动动作（不自动派活、不自动重启 worker）。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
-}
-
 export function ChannelsPage() {
 	const [status, setStatus] = useState<WechatBindStatusBody | null>(null);
 	const [disabled, setDisabled] = useState(false);
@@ -439,7 +430,6 @@ export function ChannelsPage() {
 				{/* P2-3（2026-09-30）：导语前置（原位在两张卡之后，叙事顺序颠倒） */}
 				<PageIntro>微信连接</PageIntro>
 				{/* D17：只读回复状态卡在所有配置/授权分支都可见。 */}
-				<AutonomySettings />
 				<ReplyBlock />
 				<Card
 					title={
@@ -472,7 +462,6 @@ export function ChannelsPage() {
 		return (
 			<div className="space-y-3">
 				{/* D17：只读回复状态卡在所有配置/授权分支都可见。 */}
-				<AutonomySettings />
 				<ReplyBlock />
 				<PageIntro>微信连接</PageIntro>
 				<Card title={<Term zh="未获得本机凭据" en="401 unauthorized" />}>
@@ -494,7 +483,6 @@ export function ChannelsPage() {
 
 	return (
 		<div className="space-y-3">
-			<AutonomySettings />
 			<ReplyBlock />
 			<PageIntro>微信连接与消息回复状态</PageIntro>
 

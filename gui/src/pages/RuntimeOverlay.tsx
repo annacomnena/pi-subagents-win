@@ -15,9 +15,10 @@
  */
 
 import { useEffect } from "react";
-import { ArrowLeft, Crown, Inbox, Layers, MessageCircle, Server, type LucideIcon } from "lucide-react";
+import { Activity, ArrowLeft, Crown, Inbox, Layers, MessageCircle, Server, type LucideIcon } from "lucide-react";
 import { useGui, type RuntimeOverlaySection } from "../store";
 import { AttentionPage } from "./AttentionPage";
+import { AutonomyPage } from "./AutonomyPage";
 import { ChannelsPage } from "./ChannelsPage";
 import { MasterPage } from "./MasterPage";
 import { WorkstreamPage } from "./WorkstreamPage";
@@ -30,6 +31,8 @@ const SECTIONS: { id: RuntimeOverlaySection; zh: string; icon: LucideIcon }[] = 
 	{ id: "workstream", zh: "工作流", icon: Layers },
 	{ id: "runtime", zh: "运行时", icon: Server },
 	{ id: "wechat", zh: "微信连接", icon: MessageCircle },
+	// 2026-09-30：第 6 个 section「主动性」（从微信页拆出的独立设置页：开关 + frontier 可视化）
+	{ id: "autonomy", zh: "主动性", icon: Activity },
 ];
 
 export const overlaySectionId = (id: RuntimeOverlaySection): string => `overlay-section-${id}`;
@@ -113,6 +116,8 @@ export function RuntimeOverlay() {
 							{sec.id === "runtime" && <RuntimePage />}
 							{/* 0923 L3 UX 修复：section 始终渲染（未启用/无凭据由 ChannelsPage 页内提示 + 启用按钮） */}
 							{sec.id === "wechat" && <ChannelsPage />}
+							{/* 2026-09-30：主动性独立设置页（开关 + frontier 可视化） */}
+							{sec.id === "autonomy" && <AutonomyPage />}
 						</section>
 					))}
 				</div>
