@@ -48,6 +48,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 - **Sidebar 结构**（`gui/src/pages/Sidebar.tsx:24-90`）：264px 宽，折叠 = `w-0 + opacity-0 + pointer-events-none`；自上而下 = 新建会话钮（灰显占位：本地无 create-session 后端）→ `SessionList`（会话列表 + 过滤 Input，常驻）→ 次级导航组（**Timeline 入口**：走既有 `setActiveTab`，再点切回 chat 的 toggle，`aria-current` 显选中态 + `shadow-[inset_2px_0_0_0_var(--color-brand)]` 左侧 2px 高亮条——暗色下「当前在时间线」可见；进入 timeline 的入口只有这一处）→ footer 设置钮（打开 RuntimeOverlay）。
 - **TimelinePage 返回契约**（`gui/src/pages/TimelinePage.tsx`）：与 RuntimeOverlay 同口径的三条返回路径——① 页内 Esc（`keydown` 监听 → `setActiveTab("chat")`，useEffect 挂载/卸载随页）② 页头右侧「返回会话」按钮（lucide `ArrowLeft` + 文案，title 标注「也可按 Esc」）③ Sidebar 次级导航 toggle 再点一次。`setActiveTab` 只在 `gui/src/store.ts` 定义，页面不新增状态。
 - **RuntimeOverlay 全屏覆盖层**（`gui/src/pages/RuntimeOverlay.tsx`）：壳 = absolute inset-0 整层替换，z 序 `toast 9999 > dropdown 60 > dialog/tooltip 50 > RuntimeOverlay 30 > composer 20`；左栏 68px 图标轨（≥lg 268px 全栏），五 section = attention / master / workstream / runtime / wechat，`runtimeOverlay` 值即打开并定位的 section，Esc 关闭；微信连接入口**始终渲染**（不按 bind status 探测隐藏），403/401 时页内给启用引导。
+- **切 Tab = 组件级 remount**（`gui/src/App.tsx:41` 条件渲染）：timeline↔chat 切换时 ChatPage 整树卸载/重挂；行数据在 `store.chatRowsBySession` 缓存不丢，但 DOM 全量重建。大 transcript（2k+ 行）为此在 `ChatPage.tsx` 做**分块渲染**（D4，`plans/20260930_timeline_switch_latency_d4.md`）：首屏只渲尾部 200 行，贴底时后台分块补齐更早行（回看暂停防跳位，头部占位提示）；切回瞬态（WS 非 down）且行已缓存时跳过 3s 轮询的即时全量 GET。实测 3721 行会话切回首帧 2.2s → 60ms。
 - 全局轮询编排在 `App.tsx`（2s 档 events/attention/health/interactions，6s 档 snapshot/timeline/sessions），任意 Tab 下都活。
 
 ## Focus 基线
