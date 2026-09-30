@@ -656,3 +656,5 @@
 - **Status**：complete
 
 0924 远程输入编码契约修复 → 更新 `Wiki/Architecture/gui-message-pipeline.md#输入编码契约（intake 侧）`；plans：`plans/0924_remote_input_encoding_fix.md` / `_impl.md` / `_review.md`
+
+0930 GUI 视觉质量改进 L3 实现（S1–S8 八片，b88c531…7659908）→ token 底座补 ring/muted/info + 组件收敛 shadcn + 键盘焦点 + RuntimeOverlay 图标化 + Sidebar Timeline 入口（派发者批准唯一 IA 变化）；计划 `plans/20260930_gui_visual_polish_plan.md`；待人工目检（暗色 dev）

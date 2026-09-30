@@ -33,6 +33,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]] — v1 纯函数层 + v2 唤醒总门 / 状态行 / /autonomy 命令已接线（`status: current`）
 - [[Hotspot 工作集]] — v4 短期工作集 projection：采集、衰减、注入门与 lookup（`status: current`）
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
+- [[GUI 工作台 UI（token / 组件 / 导航）]] — 语义 token 体系、shadcn 内核 + 适配层、三栏导航契约（`status: current`）
 - [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
 - [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点与生产侧入账方现状（`status: current`）
 - [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff，零接线影子）（`status: current`）
@@ -51,6 +52,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]]
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
+- [[GUI 工作台 UI（token / 组件 / 导航）]]
 - [[Wake 回信（round-trip 回执）]]
 - [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
@@ -69,6 +71,7 @@ source_paths:
 - [[主动性套件（Autonomy Suite）]]
 - [[Hotspot 工作集]]
 - [[GUI 消息管道与延迟贡献项]]
+- [[GUI 工作台 UI（token / 组件 / 导航）]]
 - [[Wake 回信（round-trip 回执）]]
 - [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
