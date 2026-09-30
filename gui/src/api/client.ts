@@ -32,6 +32,9 @@ export interface FetchOk<T> {
 	data: T;
 	/** 客户端收到响应的时刻（「数据 as-of」横幅用）。 */
 	at: string;
+	/** L2 perf additive：304 命中时为 true——data 是上次 200 缓存的**同一引用**，
+	 *  调用方照常 set() 即可（zustand 选择器 Object.is 同引用 → 零重渲染）。 */
+	notModified?: boolean;
 }
 
 export interface FetchErr {
@@ -48,13 +51,32 @@ export type FetchResult<T> = FetchOk<T> | FetchErr;
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
-/** never-throw fetch：超时/网络错/坏 JSON → {ok:false}。 */
-async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<FetchResult<T>> {
+// ── L2 perf（plans/20260930_gui_perf_diagnosis.md §5 B2）：读投影条件请求（additive）──
+// 后端（server.ts 同名切片）对 /v1/sessions、/v1/snapshot 带 ETag；客户端缓存 (etag, data)，
+// 下次带 If-None-Match：304 → 返回上次 200 的**同一对象引用**（store 零改动：set 同引用
+// → zustand 选择器 Object.is → 零重渲染）；200 → 更新缓存。服务端无 ETag/不支持 304
+// （如旧 host / vite proxy 之外的环境）→ 行为与从前逐字节一致（退化为普通轮询）。
+const etagCache = new Map<string, string>();
+const notModifiedCache = new Map<string, unknown>();
+
+/** never-throw fetch：超时/网络错/坏 JSON → {ok:false}；304 命中 → 上次缓存同一引用。 */
+async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = DEFAULT_TIMEOUT_MS, etagKey?: string): Promise<FetchResult<T>> {
 	const at = new Date().toISOString();
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const res = await fetch(path, { ...init, signal: controller.signal });
+		const inm = etagKey !== undefined ? etagCache.get(etagKey) : undefined;
+		const res = await fetch(path, {
+			...init,
+			signal: controller.signal,
+			...(inm !== undefined ? { headers: { ...(init?.headers as Record<string, string> | undefined), "if-none-match": inm } } : {}),
+		});
+		if (res.status === 304 && etagKey !== undefined) {
+			const cached = notModifiedCache.get(etagKey);
+			if (cached !== undefined) return { ok: true, status: 304, data: cached as T, at, notModified: true };
+			// 防御：无缓存却 304（不应发生）→ 按失败处理（调用方保留旧数据 + markDown 语义）
+			return { ok: false, status: 304, resync: false, at };
+		}
 		let data: unknown = null;
 		try {
 			data = await res.json();
@@ -66,6 +88,17 @@ async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = DEFAUL
 			return { ok: false, status: 409, resync: reason === "cursor-invalid", at };
 		}
 		if (!res.ok) return { ok: false, status: res.status, resync: false, at, body: data ?? undefined };
+		if (etagKey !== undefined) {
+			const etag = res.headers.get("etag");
+			if (etag !== null && etag.length > 0) {
+				etagCache.set(etagKey, etag);
+				notModifiedCache.set(etagKey, data);
+			} else {
+				// 服务端不再回 ETag（如回滚到旧 host）→ 清缓存退化为普通轮询
+				etagCache.delete(etagKey);
+				notModifiedCache.delete(etagKey);
+			}
+		}
 		return { ok: true, status: res.status, data: data as T, at };
 	} catch {
 		return { ok: false, status: 0, resync: false, at };
@@ -95,7 +128,7 @@ function newCommandKey(prefix: string): string {
 export const api = {
 	health: (): Promise<FetchResult<HealthView>> => fetchJson<HealthView>("/v1/health"),
 
-	snapshot: (): Promise<FetchResult<RuntimeSnapshot>> => fetchJson<RuntimeSnapshot>("/v1/snapshot", undefined, 8000),
+	snapshot: (): Promise<FetchResult<RuntimeSnapshot>> => fetchJson<RuntimeSnapshot>("/v1/snapshot", undefined, 8000, "/v1/snapshot"),
 
 	events: (after: string, limit?: number): Promise<FetchResult<EventsResponse>> => {
 		const q = new URLSearchParams({ after });
@@ -175,8 +208,8 @@ export const api = {
 
 	// ── G6-P1：sessions / transcript（只读数据面；WS 增量之外的 HTTP 兜底）──
 
-	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。 */
-	sessions: (): Promise<FetchResult<SessionsBody>> => fetchJson<SessionsBody>("/v1/sessions"),
+	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。L2 perf：条件请求（ETag/304，additive）。 */
+	sessions: (): Promise<FetchResult<SessionsBody>> => fetchJson<SessionsBody>("/v1/sessions", undefined, DEFAULT_TIMEOUT_MS, "/v1/sessions"),
 
 	/** GET /v1/sessions/:id/transcript?after=：首屏全量（after 缺省/0）或增量触及行终态。 */
 	transcript: (sessionId: string, after?: number): Promise<FetchResult<TranscriptBody>> =>
