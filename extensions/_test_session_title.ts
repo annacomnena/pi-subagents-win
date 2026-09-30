@@ -1,6 +1,6 @@
 /**
  * _test_session_title.ts — 会话可读标题解析链测试（runtime-host/session-title.ts +
- * runtime/transcript.ts listPiSessions 头部 32KB 扫描；plans/0922_session_title_research.md §5）。
+ * runtime/transcript.ts listPiSessions 头部分块扫描（上限 256KB）；plans/0922_session_title_research.md §5）。
  *
  * 覆盖：
  *   T1 P2 剥前缀纯函数：跳「根据X进行工作」/##/> 行、markdown 噪音、Item N、(P0)、句尾标点、
@@ -13,8 +13,8 @@
  *   T7 台账容错：坏 JSON / 数组 / 缺字段 / .state.json / .result.json / _archived/ 子目录全 skip，
  *      正常记录仍解析；目录缺失不 throw
  *   T8 PI_TAB_RUNS_DIR env 覆盖 + 缺省路径
- *   T9 listPiSessions.firstUserText：正常抽取；首条 user 越过 8KB 但在 32KB 窗口内；
- *      坏行/半截行容忍；首条 user 超出 32KB → null
+ *   T9 listPiSessions.firstUserText：正常抽取；首条 user 越过 8KB 但分块窗口内；
+ *      坏行/半截行容忍；32KB 后（旧窗口外）分块续扫命中；超出 256KB 窗口 → null
  *   T10 resolveSessionTitles 批量：混合来源各归其位；cwd=null 不做台账探测
  *
  * 运行：npm run test:session-title
@@ -218,7 +218,7 @@ try {
 }
 ok("T8 PI_TAB_RUNS_DIR 覆盖（trim）；空/缺省 → ~/.pi/agent/tab-runs");
 
-// ── T9 listPiSessions.firstUserText（32KB 头部扫描）──────────────
+// ── T9 listPiSessions.firstUserText（分块扫描，上限 256KB）──────────────
 writeSession("t9a_plain.jsonl", CWD_A, "11111111-aaaa-bbbb-cccc-dddddddddddd", [
 	userMsg(`${WF_PREFIX}\n\n首条用户消息正文`),
 	userMsg("第二条 user 不应被取"),
@@ -239,7 +239,7 @@ writeSession("t9b_deep.jsonl", CWD_A, "22222222-aaaa-bbbb-cccc-dddddddddddd", [
 const t9b = listPiSessions(SESSIONS).find((s) => s.sessionId.startsWith("22222222"));
 assert.ok(t9b);
 assert.equal(t9b.firstUserText, "深藏在 20KB 后的首条用户消息");
-ok("T9b 32KB 窗口：首条 user 越过 8KB 仍可抽取");
+ok("T9b 分块窗口：首条 user 越过 8KB 仍可抽取");
 
 // 坏行 + 半截行容忍
 writeSession("t9c_corrupt.jsonl", CWD_A, "33333333-aaaa-bbbb-cccc-dddddddddddd", [
@@ -252,12 +252,19 @@ assert.ok(t9c);
 assert.equal(t9c.firstUserText, "坏行之后的首条用户消息");
 ok("T9c 坏行/半截行 skip，不干扰抽取");
 
-// 首条 user 超出 32KB → null（回退 P3）
-writeSession("t9d_beyond.jsonl", CWD_A, "44444444-aaaa-bbbb-cccc-dddddddddddd", [filler(32768, 1), userMsg("窗口之外")]);
+// 首条 user 恰好落在 32KB 后（旧窗口外、256KB 分块窗口内）：回归派发者实测 40844/88764/38804 字节类场景
+writeSession("t9d_mid.jsonl", CWD_A, "44444444-aaaa-bbbb-cccc-dddddddddddd", [filler(32768, 1), userMsg("32KB 之后的首条用户消息"), filler(8192, 2)]);
 const t9d = listPiSessions(SESSIONS).find((s) => s.sessionId.startsWith("44444444"));
 assert.ok(t9d);
-assert.equal(t9d.firstUserText, null);
-ok("T9d 首条 user 超出 32KB 窗口 → firstUserText=null（优雅降级）");
+assert.equal(t9d.firstUserText, "32KB 之后的首条用户消息");
+ok("T9d 首条 user 在 32KB 后（旧窗口外）→ 分块续扫命中");
+
+// 首条 user 超出 256KB 窗口 → null（回退 P3；窗口上限防大文件全读）
+writeSession("t9e_beyond.jsonl", CWD_A, "eeeeeeee-aaaa-bbbb-cccc-dddddddddddd", [filler(262144, 1), userMsg("窗口之外")]);
+const t9e = listPiSessions(SESSIONS).find((s) => s.sessionId.startsWith("eeeeeeee"));
+assert.ok(t9e);
+assert.equal(t9e.firstUserText, null);
+ok("T9e 首条 user 超出 256KB 窗口 → firstUserText=null（优雅降级）");
 
 // ── T10 resolveSessionTitles 批量 ───────────────────────────────
 writeSession("t10_ledger.jsonl", CWD_A, "55555555-aaaa-bbbb-cccc-dddddddddddd", [userMsg(`${WF_PREFIX}\n\n正文`)]); // P1

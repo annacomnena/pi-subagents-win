@@ -693,7 +693,7 @@ export interface SessionSummary {
 	file: string;
 	sizeBytes: number;
 	mtimeMs: number;
-	/** 头部 32KB 窗口内首条 user 文本（截 2000 字符；会话列表标题解析链 P1 探测 / P2 派生的副产品）。 */
+	/** 头部扫描窗口（上限 256KB）内首条 user 文本（截 8000 字符；会话列表标题解析链 P1 探测 / P2 派生的副产品）。 */
 	firstUserText: string | null;
 }
 
@@ -717,15 +717,22 @@ function sessionFileId(sessionsDir: string, file: string): string | null {
 
 // ── 头部窗口（标题解析链副产品，plans/0922_session_title_research.md §5）──
 
-const HEAD_READ_BYTES = 32768;
-const FIRST_USER_TEXT_CAP = 2000;
+const HEAD_READ_BYTES = 32768; // 首读：取首行头
+const HEAD_CHUNK_BYTES = 65536; // 续扫分块（避免一次性 alloc 大 buffer）
+const HEAD_SCAN_MAX_BYTES = 262144; // 首条 user 扫描窗口上限（256KB；实测首条 user 偏移 p75≈32KB、max≈63KB）
+const FIRST_USER_TEXT_CAP = 8000; // 首条 user 文本上限：需覆盖 <file> 附件块闭合（实测 2.6~4.4KB），供 P1 前缀 / P2 剥块
 
 interface SessionHead {
 	header: Record<string, unknown> | null;
 	firstUserText: string | null;
 }
 
-/** 读头 32KB：首行头 + 顺带扫窗口内首条 user message 文本（tolerant；坏行/半截行 skip，never-throw）。 */
+/**
+ * 分块读头：首读 32KB 取首行头；header 解析成功且窗口内未见首条 user → 以 64KB 分块续扫，
+ * 上限 256KB。找到 header + 首条 user 即提前停止（多数会话在首读/第二块内命中）。
+ * 跨块半截行以 pending 携带（utf8 按块解码拼接，多字节字符跨块亦正确）；
+ * EOF 时 pending 视为完整行，窗口打满时丢弃（与旧 32KB 单次读同语义）。never-throw。
+ */
 function readHead(path: string): SessionHead {
 	let fd: number;
 	try {
@@ -734,26 +741,20 @@ function readHead(path: string): SessionHead {
 		return { header: null, firstUserText: null };
 	}
 	try {
-		const tmp = Buffer.alloc(HEAD_READ_BYTES);
-		const n = readSync(fd, tmp, 0, tmp.length, 0);
-		if (n <= 0) return { header: null, firstUserText: null };
-		const head = tmp.subarray(0, n).toString("utf8");
-		const lines = head.split("\n");
-		// 窗口打满且末尾无换行 → 末段是被截断的半截行，丢弃（完整行不受影响）
-		if (n === tmp.length && !head.endsWith("\n")) lines.pop();
+		const buf = Buffer.alloc(HEAD_CHUNK_BYTES);
 		let header: Record<string, unknown> | null = null;
 		let firstUserText: string | null = null;
-		for (const raw of lines) {
+		const handleLine = (raw: string): void => {
 			const line = raw.trim();
-			if (line.length === 0) continue;
+			if (line.length === 0) return;
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(line);
 			} catch {
-				continue;
+				return;
 			}
 			const entry = asRecord(parsed);
-			if (entry === null) continue;
+			if (entry === null) return;
 			if (header === null) header = entry; // 首个可解析行 = 头（与旧 readHeader 同语义，不校验 type）
 			if (firstUserText === null && entry.type === "message") {
 				const message = asRecord(entry.message);
@@ -764,7 +765,33 @@ function readHead(path: string): SessionHead {
 					}
 				}
 			}
-			if (header !== null && firstUserText !== null) break;
+		};
+		let pending = ""; // 跨块携带的未完成行尾段
+		let offset = 0;
+		for (;;) {
+			const want = Math.min(offset === 0 ? HEAD_READ_BYTES : HEAD_CHUNK_BYTES, buf.length);
+			const n = readSync(fd, buf, 0, want, offset);
+			if (n <= 0) break; // 空文件
+			// 窗口上限：超过 HEAD_SCAN_MAX_BYTES 的字节不扫（跨块截断段视半截行丢弃，
+			// 避免上限后首个完整行（如 user 消息）被误收）
+			const allowed = Math.min(n, HEAD_SCAN_MAX_BYTES - offset);
+			if (allowed <= 0) break;
+			const chunk = pending + buf.subarray(0, allowed).toString("utf8");
+			const windowFull = allowed < n;
+			offset += n;
+			const lines = chunk.split("\n");
+			// 末段完整 ⇔ 块以换行收尾且未触上限；否则为（可能的）半截行
+			const lastComplete = !windowFull && chunk.endsWith("\n");
+			pending = lastComplete ? "" : lines[lines.length - 1];
+			for (const raw of lastComplete ? lines : lines.slice(0, -1)) handleLine(raw);
+			if (header !== null && firstUserText !== null) break; // 提前停
+			if (windowFull) break; // 窗口上限（pending 已弃）
+			if (n < want) {
+				// EOF：末段无换行也是完整行
+				if (pending.trim().length > 0) handleLine(pending);
+				break;
+			}
+			if (header === null) break; // 头都解析不出，续扫无意义
 		}
 		return { header, firstUserText };
 	} catch {
