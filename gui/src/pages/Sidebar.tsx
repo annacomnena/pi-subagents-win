@@ -63,7 +63,9 @@ export function Sidebar() {
 						title={activeTab === "timeline" ? "返回会话" : "时间线：按时间看系统里发生过什么"}
 						onClick={() => setActiveTab(activeTab === "timeline" ? "chat" : "timeline")}
 						className={`w-full justify-start gap-2 rounded-lg px-2 ${
-							activeTab === "timeline" ? "bg-selected text-foreground hover:bg-selected" : "text-foreground-subtle"
+							activeTab === "timeline"
+								? "bg-selected text-foreground hover:bg-selected shadow-[inset_2px_0_0_0_var(--color-brand)]"
+								: "text-foreground-subtle"
 						}`}
 					>
 						<History className="size-4 shrink-0" />

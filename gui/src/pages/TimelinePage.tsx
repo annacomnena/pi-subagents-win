@@ -4,7 +4,8 @@
  * 只渲染 server/client 模板生成的 summary，**不显 raw JSON**。
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { ArrowLeft } from "lucide-react";
 import { useGui } from "../store";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
 import type { TimelineItem } from "../api/types";
@@ -29,6 +30,16 @@ export function TimelinePage() {
 	const timeline = useGui((s) => s.timeline);
 	const timelineEnd = useGui((s) => s.timelineEnd);
 	const loadEarlier = useGui((s) => s.loadEarlierTimeline);
+	const setActiveTab = useGui((s) => s.setActiveTab);
+
+	// Esc 返回（同 RuntimeOverlay 模式；TimelinePage 仅在 activeTab==="timeline" 时挂载，无需判断当前页）
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent): void => {
+			if (event.key === "Escape") setActiveTab("chat");
+		};
+		document.addEventListener("keydown", onKeyDown);
+		return () => document.removeEventListener("keydown", onKeyDown);
+	}, [setActiveTab]);
 	const [loadingEarlier, setLoadingEarlier] = useState(false);
 	const [filterId, setFilterId] = useState("all");
 	const filter = FILTERS.find((f) => f.id === filterId) ?? FILTERS[0];
@@ -43,7 +54,17 @@ export function TimelinePage() {
 
 	return (
 		<div className="space-y-3 p-4">
-			<PageIntro>按时间看系统里发生过什么</PageIntro>
+			<div className="flex items-center justify-between">
+				<PageIntro>按时间看系统里发生过什么</PageIntro>
+				<Button
+					variant="ghost"
+					onClick={() => setActiveTab("chat")}
+					title="返回会话（也可按 Esc）"
+				>
+					<ArrowLeft />
+					返回会话
+				</Button>
+			</div>
 			<div className="flex flex-wrap items-center gap-1.5">
 				<span className="mr-1 text-ui-sm text-foreground-subtle">只看：</span>
 				{FILTERS.map((f) => (
