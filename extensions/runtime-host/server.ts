@@ -1240,7 +1240,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			// authorizeCommand 链（无/错 → 401，同 /v1/commands 面）；opt-in OFF（enabled!==true）→
 			// 5 个绑定端点 403 wechat-disabled（enable/disable 不受闸限制；GUI「微信连接」入口始终渲染）。
 			// token 永不进任何响应。
-			if (u.pathname === "/v1/autonomy/set" || u.pathname === "/v1/autonomy/status") {
+			if (u.pathname === "/v1/autonomy/set" || u.pathname === "/v1/autonomy/status" || u.pathname === "/v1/autonomy/frontier") {
 				if (!authorizeCommand(req)) { respondJson(res, 401, { error: "unauthorized" }); try { req.destroy(); } catch {} return; }
 				if (u.pathname === "/v1/autonomy/set" && req.method === "POST") {
 					let raw = ""; req.setEncoding("utf8");
@@ -1257,6 +1257,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					const cfg = readAutonomyConfig({ configPath }); const kill = readKillSwitch({ stateDir: opts.stateDir });
 					const frontier = readFrontierSnapshot({ stateDir: opts.stateDir }); const gate = readWakeGateState({ stateDir: opts.stateDir });
 					respondJson(res, 200, { enabled: cfg.enabled, kill: kill ? `on (${kill.reason})` : "off", frontier: frontier ? new Date(frontier.asof).toISOString() : null, wakeGate: gate?.lastReason ? `${gate.lastReason} @ ${gate.lastDecisionAt}` : null }); return;
+				}
+				// 2026-09-30 主动性设置页：只读读盘即返回完整 FrontierSnapshot（不重计算）。
+				// 复用 readFrontierSnapshot 容忍读：快照缺失/坏 JSON/字段漂移 → null（区分「无文件」与「0 项目基线帧」；
+				// 授权与 status 同档 authorizeCommand）。不改 /v1/autonomy/status 形状（向后兼容）。
+				if (u.pathname === "/v1/autonomy/frontier" && req.method === "GET") {
+					respondJson(res, 200, readFrontierSnapshot({ stateDir: opts.stateDir })); return;
 				}
 				respondJson(res, 405, { error: "method-not-allowed" }); return;
 			}

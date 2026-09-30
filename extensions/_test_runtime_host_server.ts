@@ -161,6 +161,25 @@ try {
 			assert.equal(set.status, 200); assert.equal((await set.json() as { enabled: boolean }).enabled, true);
 			assert.equal(JSON.parse(readFileSync(autonomyConfigPath, "utf8")).autonomy.enabled, true);
 		}
+		// 2026-09-30 主动性设置页：GET /v1/autonomy/frontier 只读读盘即返回完整快照（不重计算）。
+		{
+			const auth = { "X-Command-Token": h.info.token! };
+			const noAuth = await fetch(`${base}/v1/autonomy/frontier`);
+			assert.equal(noAuth.status, 401);
+			// 无快照 → null（区分「无文件」与「0 项目基线帧」）
+			const empty = await fetch(`${base}/v1/autonomy/frontier`, { headers: auth });
+			assert.equal(empty.status, 200);
+			assert.equal(await empty.json(), null);
+			// 写入一份 frontier.json → 逐字段透传（读盘即返回）
+			const autonomyStateDir = join(D, "state", "autonomy");
+			mkdirSync(autonomyStateDir, { recursive: true });
+			const snap = { asof: 1790732806985, baseline: false, projects: [{ project: "g:/code/greencad", state: "Working", variant: "waiting", gate: "unknown", runs: { tab_x: "waiting" }, needsUser: true, resultMissing: false, stagnation: false, overdue: 0, overdueRequests: [], meaningfulStateVersion: 3 }], triggers: [{ rule: "needs_user", project: "g:/code/greencad", evidence: "needsUser:false→true", approximate: false }] };
+			writeFileSync(join(autonomyStateDir, "frontier.json"), JSON.stringify(snap));
+			const hit = await fetch(`${base}/v1/autonomy/frontier`, { headers: auth });
+			assert.equal(hit.status, 200);
+			assert.deepEqual(await hit.json(), snap);
+			rmSync(join(autonomyStateDir, "frontier.json"), { force: true });
+		}
 		// W3d read-only reply projection: authorize → wechat gate → aggregate only safe fields.
 		{
 			const noAuth = await fetch(`${base}/v1/wechat/reply/status`);
