@@ -428,7 +428,7 @@ function sessionsBodyFingerprint(sessionsDir: string, runsDir: string, registryD
 			if (st.isDirectory()) {
 				if (!scan(full, `${rel}${name}/`, fileFilter)) return false;
 			} else if (fileFilter(name)) {
-				parts.push(`${rel}${name}|${Math.round(st.mtimeMs)}|${st.size}`);
+				parts.push(`${rel}${name}|${st.mtimeMs}|${st.ctimeMs}|${st.size}`);
 			}
 		}
 		return true;
