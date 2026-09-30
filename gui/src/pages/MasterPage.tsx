@@ -8,7 +8,8 @@
 import { useRef, useState } from "react";
 import { acceptHandoff, prepareHandoff, setAutoHandoff, useGui } from "../store";
 import { PROPOSAL_STATUS_ZH, fmtPressurePct, pressurePct, zhStatus } from "../format";
-import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, Toggle, Tooltip, naBadge } from "../ui";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, Toggle, naBadge } from "../ui";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 
 const TRANSFER_DISABLED = "交接执行只能由值守会话发起（值守会话内的 master-transfer 工具链）";
 const PREPARE_HINT = "点一次确认后由 host 按最新心跳压力立即生成交接提案（不伪造压力：无心跳时会被拒绝）";
@@ -168,23 +169,39 @@ export function MasterPage() {
 							</div>
 						)}
 						<div className="mt-3 flex flex-wrap items-center gap-2">
-							<Tooltip text={PREPARE_HINT}>
-								<Button
-									variant={confirmPrepare ? "danger" : "secondary"}
-									disabled={pending}
-									title={pending ? "已有待处理的提案" : undefined}
-									onClick={clickPrepare}
-								>
-									{confirmPrepare ? "确认生成提案？" : "准备交接"}
-								</Button>
+							<Tooltip>
+								<TooltipTrigger asChild>
+									{/* disabled 原生 button 不派发 hover；包裹层承接 Tooltip（ChatPage 同 idiom） */}
+									<span className="inline-flex">
+										<Button
+											variant={confirmPrepare ? "danger" : "secondary"}
+											disabled={pending}
+											title={pending ? "已有待处理的提案" : undefined}
+											onClick={clickPrepare}
+										>
+											{confirmPrepare ? "确认生成提案？" : "准备交接"}
+										</Button>
+									</span>
+								</TooltipTrigger>
+								<TooltipContent>{PREPARE_HINT}</TooltipContent>
 							</Tooltip>
-							<Tooltip text={TRANSFER_DISABLED}>
-								<Button disabled>移交主控</Button>
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<span className="inline-flex">
+										<Button disabled>移交主控</Button>
+									</span>
+								</TooltipTrigger>
+								<TooltipContent>{TRANSFER_DISABLED}</TooltipContent>
 							</Tooltip>
-							<Tooltip text={pending ? "把这份交接提案标记为已接受" : "当前没有待处理的提案，暂时不能接受"}>
-								<Button variant="primary" disabled={!pending} onClick={() => void acceptHandoff()}>
-									接受提案
-								</Button>
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<span className="inline-flex">
+										<Button variant="primary" disabled={!pending} onClick={() => void acceptHandoff()}>
+											接受提案
+										</Button>
+									</span>
+								</TooltipTrigger>
+								<TooltipContent>{pending ? "把这份交接提案标记为已接受" : "当前没有待处理的提案，暂时不能接受"}</TooltipContent>
 							</Tooltip>
 						</div>
 					</Card>
@@ -193,8 +210,11 @@ export function MasterPage() {
 					<Card title={<Term zh="自动交接开关" en="Auto-Handoff" hint={AUTO_HINT} />}>
 						<div className="flex items-center gap-3">
 							{autoHandoff === null ? (
-								<Tooltip text="后端数据未就绪，无法读取真实状态">
-									<span className="cursor-help border-b border-dashed border-border-hover text-sm text-foreground-subtle">状态未知</span>
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<span className="cursor-help border-b border-dashed border-border-hover text-sm text-foreground-subtle">状态未知</span>
+									</TooltipTrigger>
+									<TooltipContent>后端数据未就绪，无法读取真实状态</TooltipContent>
 								</Tooltip>
 							) : (
 								<Badge tone={autoHandoff ? "green" : "gray"} title="来自 snapshot.master.autoHandoff（config.masterSuccession 归一化切片）">

@@ -1,17 +1,28 @@
-/** 手写小组件（≤8 个 + G5.1 人话化微增：Term/ShortId/RelTime/PageIntro，无新依赖）。 */
+/** 手写小组件（G5.1 人话化：Term/ShortId/RelTime/PageIntro + 状态页 Button/Badge/Card 门面）。
+ * 2026-09-30 视觉收敛：Button/Badge/Card 内核换 shadcn 套件（prop API 不变，页内 import 零改动）；
+ * CSS-only Tooltip 删除（Term「?」与 MasterPage 改 radix ui/tooltip，TooltipProvider 已全局挂载）。 */
 
 import { useState, type ReactNode } from "react";
 import { fmtDateTime, fmtRel } from "../format";
+import { cn } from "./lib/utils";
+import { Button as ShadButton } from "./button";
+import { Badge as ShadBadge } from "./badge";
+import { Card as ShadCard, CardAction as ShadCardAction, CardContent as ShadCardContent, CardHeader as ShadCardHeader, CardTitle as ShadCardTitle } from "./card";
+import {
+	Tooltip as RadixTooltip,
+	TooltipContent as RadixTooltipContent,
+	TooltipTrigger as RadixTooltipTrigger,
+} from "./tooltip";
 
-// ── 1. Button ──────────────────────────────────────────────────────
+// ── 1. Button（内核 = shadcn Button；variant 映射保 legacy 四档语义）────────
 
 type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
 
-const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
-	primary: "bg-brand hover:bg-brand/85 text-foreground-inverse border-brand",
-	secondary: "bg-surface-hover hover:bg-selected text-foreground border-border",
-	danger: "bg-destructive hover:bg-destructive/85 text-destructive-foreground border-destructive",
-	ghost: "bg-transparent hover:bg-surface-hover text-foreground-subtle border-transparent",
+const BUTTON_VARIANT_MAP: Record<ButtonVariant, "default" | "secondary" | "destructive" | "ghost"> = {
+	primary: "default",
+	secondary: "secondary",
+	danger: "destructive",
+	ghost: "ghost",
 };
 
 export function Button({
@@ -20,43 +31,52 @@ export function Button({
 	onClick,
 	title,
 	children,
+	className,
+	size = "sm",
 }: {
 	variant?: ButtonVariant;
 	disabled?: boolean;
 	onClick?: () => void;
 	title?: string;
 	children: ReactNode;
+	/** 2026-09-30 新增：尺寸透传（默认 sm=h-6 适配状态页密度；主操作可传 "default"=h-7）。 */
+	size?: "sm" | "default";
+	/** 2026-09-30 新增：class 透传（tailwind-merge 合并，覆盖内核档位）。 */
+	className?: string;
 }) {
 	return (
-		<button
+		<ShadButton
 			type="button"
+			variant={BUTTON_VARIANT_MAP[variant]}
+			size={size}
 			disabled={disabled}
 			title={title}
 			onClick={onClick}
-			className={`inline-flex items-center gap-1 rounded border px-2.5 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${BUTTON_VARIANTS[variant]}`}
+			className={className}
 		>
 			{children}
-		</button>
+		</ShadButton>
 	);
 }
 
-// ── 2. Card ────────────────────────────────────────────────────────
+// ── 2. Card（内核 = shadcn Card size=sm：bg-card 实底替代近透明 surface/60）────
 
 export function Card({ title, right, children, className }: { title?: ReactNode; right?: ReactNode; children: ReactNode; className?: string }) {
 	return (
-		<section className={`rounded-lg border border-border bg-surface/60 ${className ?? ""}`}>
+		<ShadCard size="sm" className={className}>
 			{title !== undefined && (
-				<header className="flex items-center justify-between border-b border-border px-3 py-2">
-					<h2 className="text-xs font-semibold tracking-wide text-foreground-subtle">{title}</h2>
-					{right}
-				</header>
+				<ShadCardHeader className="border-b border-border">
+					{/* 标题：去 tracking-wide（CJK 不宜字距）；text-ui-sm 信息档（P2-8） */}
+					<ShadCardTitle className="text-ui-sm font-medium text-foreground-subtle">{title}</ShadCardTitle>
+					{right !== undefined && <ShadCardAction>{right}</ShadCardAction>}
+				</ShadCardHeader>
 			)}
-			<div className="px-3 py-2">{children}</div>
-		</section>
+			<ShadCardContent className="pt-0">{children}</ShadCardContent>
+		</ShadCard>
 	);
 }
 
-// ── 3. Badge ───────────────────────────────────────────────────────
+// ── 3. Badge（内核 = shadcn Badge 胶囊 h-5 + text-ui-xs；七档 tone 语义保留）──
 
 type BadgeTone = "green" | "red" | "gray" | "yellow" | "blue" | "purple" | "na";
 
@@ -65,19 +85,18 @@ const BADGE_TONES: Record<BadgeTone, string> = {
 	red: "bg-destructive/20 text-destructive border-destructive/60",
 	gray: "bg-surface-hover text-foreground-subtle border-border",
 	yellow: "bg-warning/15 text-warning border-warning/40",
-	blue: "bg-brand/20 text-brand border-brand/60",
+	// 2026-09-30：blue 改指真信息蓝 info（brand 暗色=纯白致「蓝徽章」渲染成白块，P1-2）
+	blue: "bg-info/15 text-info border-info/50",
 	purple: "bg-accent/60 text-foreground border-border",
-	na: "bg-surface text-foreground-subtlest border-border",
+	// na 档 subtlest→subtle（信息分级：缺字段提示是信息不是装饰，P1-4）
+	na: "bg-surface text-foreground-subtle border-border",
 };
 
 export function Badge({ tone = "gray", title, children }: { tone?: BadgeTone; title?: string; children: ReactNode }) {
 	return (
-		<span
-			title={title}
-			className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap ${BADGE_TONES[tone]}`}
-		>
+		<ShadBadge variant="outline" title={title} className={BADGE_TONES[tone]}>
 			{children}
-		</span>
+		</ShadBadge>
 	);
 }
 
@@ -104,7 +123,7 @@ export function Toggle({ on, disabled, onChange, labels }: {
 			type="button"
 			disabled={disabled}
 			onClick={() => onChange(!on)}
-			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-[10px] font-semibold transition-colors disabled:opacity-40 ${
+			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-ui-xs font-semibold transition-colors disabled:opacity-40 ${
 				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-foreground-subtle"
 			}`}
 		>
@@ -114,53 +133,50 @@ export function Toggle({ on, disabled, onChange, labels }: {
 	);
 }
 
-// ── 5. Tooltip（CSS-only；disabled 按钮不触发 hover，需外层 span 承载）──
+// ── 5. EmptyState（2026-09-30：默认色 subtlest→subtle；新增可选 icon）────────
 
-export function Tooltip({ text, children }: { text: string; children: ReactNode }) {
+export function EmptyState({ children, icon }: { children: ReactNode; icon?: ReactNode }) {
 	return (
-		<span className="group relative inline-flex">
+		<div className="flex flex-col items-center gap-2 py-6 text-center text-ui-sm text-foreground-subtle">
+			{icon !== undefined && <span className="text-foreground-subtlest">{icon}</span>}
 			{children}
-			<span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 rounded border border-border bg-background px-2 py-1 text-[10px] whitespace-nowrap text-foreground-subtle opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
-				{text}
-			</span>
-		</span>
+		</div>
 	);
-}
-
-// ── 7. EmptyState ──────────────────────────────────────────────────
-
-export function EmptyState({ children }: { children: ReactNode }) {
-	return <div className="py-6 text-center text-xs text-foreground-subtlest">{children}</div>;
 }
 
 // ── G5.1 人话化微增组件 ────────────────────────────────────────────
 
-/** 术语：中文主词 + 小字英文原词（G5.1 固定术语表）。 */
+/** 术语：中文主词 + 小字英文原词（G5.1 固定术语表）。「?」hint 走 radix Tooltip
+ *  （2026-09-30：CSS-only 版删除；TooltipProvider 已全局挂载，App.tsx）。 */
 export function Term({ zh, en, hint }: { zh: string; en?: string; hint?: string }) {
 	const word = (
 		<span className="inline-flex items-baseline gap-1">
 			{zh}
-			{en && <span className="text-[9px] font-normal tracking-normal text-foreground-subtlest">{en}</span>}
+			{en && <span className="text-ui-xs font-normal tracking-normal text-foreground-subtlest">{en}</span>}
 		</span>
 	);
 	return hint ? (
 		<span className="inline-flex items-center gap-1">
 			{word}
-			<Tooltip text={hint}>
-				<span className="cursor-help rounded-full border border-border px-1 text-[9px] leading-3 text-foreground-subtlest">?</span>
-			</Tooltip>
+			<RadixTooltip>
+				<RadixTooltipTrigger asChild>
+					<span className="cursor-help rounded-full border border-border px-1 text-ui-xs leading-3 text-foreground-subtle">?</span>
+				</RadixTooltipTrigger>
+				<RadixTooltipContent>{hint}</RadixTooltipContent>
+			</RadixTooltip>
 		</span>
 	) : (
 		word
 	);
 }
 
-/** 每页顶部白话导语（≤24 字）。 */
+/** 每页顶部白话导语（≤24 字；信息性 → subtle 档，P1-4）。 */
 export function PageIntro({ children }: { children: ReactNode }) {
-	return <p className="text-xs text-foreground-subtlest">{children}</p>;
+	return <p className="text-ui-sm text-foreground-subtle">{children}</p>;
 }
 
-/** 长 ID 短化：前 12 字符 + 「…」，悬停显全量，点击复制全量（G5.1 规格 4）。 */
+/** 长 ID 短化：前 12 字符 + 「…」，悬停显全量，点击复制全量（G5.1 规格 4）。
+ *  默认色 subtle（ID 是信息）；调用方显式传 text-* 经 tailwind-merge 覆盖。 */
 export function ShortId({ value, chars = 12, className = "" }: { value: string; chars?: number; className?: string }) {
 	const [copied, setCopied] = useState(false);
 	if (!value) return null;
@@ -178,18 +194,19 @@ export function ShortId({ value, chars = 12, className = "" }: { value: string; 
 		<span
 			title={copied ? "已复制全量 ID" : `点击复制全量：${value}`}
 			onClick={copy}
-			className={`cursor-pointer break-all font-mono ${copied ? "text-success" : ""} ${className}`}
+			className={cn("cursor-pointer break-all font-mono text-foreground-subtle", copied && "text-success", className)}
 		>
 			{short}
 		</span>
 	);
 }
 
-/** 相对时间：显示「x 分钟前」，悬停 title 显完整时间（G5.1 规格 3）。 */
+/** 相对时间：显示「x 分钟前」，悬停 title 显完整时间（G5.1 规格 3）。
+ *  默认色 subtle（时间是信息）；调用方显式传 text-* 经 tailwind-merge 覆盖。 */
 export function RelTime({ at, className = "" }: { at: string | null | undefined; className?: string }) {
-	if (!at) return <span className={className}>—</span>;
+	if (!at) return <span className={cn("text-foreground-subtle", className)}>—</span>;
 	return (
-		<span title={fmtDateTime(at)} className={className}>
+		<span title={fmtDateTime(at)} className={cn("text-foreground-subtle", className)}>
 			{fmtRel(at)}
 		</span>
 	);
