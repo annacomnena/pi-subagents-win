@@ -28,6 +28,9 @@
  *   T14 G6-P2 L4：非默认 sessionsDir 可列表可 POST（executor 存在性校验同源）；
  *      /v1/sessions 服务端权威 masterProtected（列表 flag + POST 真 403 同源）；
  *      host 启动扫 pending outbox：超 24h TTL → expired + journal message.expired 回执
+ *   T17 L2 perf：读投影条件请求（additive）——sessions/snapshot ETag + If-None-Match → 304；
+ *      无 INM 旧客户端照常 200 全量；sessions 指纹快路命中/失效（新增文件 → 200 更新）；
+ *      snapshot ETag 排除 generatedAt（状态体稳定可验证）
  *
  * 运行：npm run test:runtime-host-server
  */
@@ -844,6 +847,95 @@ try {
 			assert.equal(rBad.body.error, "invalid-encoding", "400 error=invalid-encoding");
 			assert.deepEqual(readdirSync(obDir).sort(), before, "outbox 目录零新增（拒收不落盘）");
 			assert.deepEqual(existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [], commandsBefore, "commands 状态目录零新增（拒收不落盘）");
+		} finally {
+			await h.close();
+		}
+	}
+
+	// ── T17 L2 perf（plans/20260930_gui_perf_diagnosis.md §5 B1）：读投影条件请求（additive）──
+	// (a) /v1/sessions：200 带 ETag；同 ETag 回传 If-None-Match → 304 空体；不带头 → 200 全量
+	//     （旧客户端兼容）；指纹快路：同内容第二拍命中缓存（body 与首拍逐字节同）；新增会话
+	//     文件 → 指纹失效 → body 更新（count+1）且 ETag 变化。
+	// (b) /v1/snapshot：ETag 排除 generatedAt（相邻两拍 200 的 ETag 相同）→ INM 命中 304；
+	//     无 INM → 200 全量且 body 与首拍仅 generatedAt 差异（状态体稳定可验证）。
+	{
+		const D = mkdtempDir("runtime-host-t17-");
+		DIRS.push(D);
+		const stateDir = join(D, "s");
+		const sessionsDir = join(D, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		const sid1 = "b1111111-2222-3333-4444-555555555555";
+		writeFileSync(join(sessionsDir, `2026-09-30T09-00-00-000Z_${sid1}.jsonl`),
+			`{"type":"session","version":3,"id":"${sid1}","timestamp":"2026-09-30T09:00:00.000Z","cwd":"C:\\ws\\t17"}\n`, "utf8");
+		const h = await createRuntimeHostServer({
+			hostPath: join(D, "host.json"),
+			stateDir,
+			journalPath: join(D, "e.jsonl"),
+			timersDir: join(D, "t"),
+			mailboxDir: join(D, "m"),
+			sessionsDir,
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+
+			// (a) sessions：首次 200 + ETag
+			const r1 = await fetch(`${base}/v1/sessions`);
+			assert.equal(r1.status, 200);
+			const etag1 = r1.headers.get("etag");
+			assert.ok(etag1 && etag1.length > 2, "sessions 200 带 ETag");
+			const body1 = await r1.text();
+			assert.equal((JSON.parse(body1) as { count: number }).count, 1);
+
+			// 指纹快路：同内容第二拍 200，body 逐字节同（缓存命中）且 ETag 同
+			const r2 = await fetch(`${base}/v1/sessions`);
+			assert.equal(r2.status, 200);
+			assert.equal(r2.headers.get("etag"), etag1, "快路命中：ETag 不变");
+			assert.equal(await r2.text(), body1, "快路命中：body 逐字节同");
+
+			// 条件请求：If-None-Match 命中 → 304 空体
+			const r3 = await fetch(`${base}/v1/sessions`, { headers: { "if-none-match": etag1 } });
+			assert.equal(r3.status, 304, `INM 命中 → 304（实际 ${r3.status}）`);
+			assert.equal((await r3.text()).length, 0, "304 空体");
+
+			// 弱校验器前缀 W/ 与列表形式也命中
+			const r3b = await fetch(`${base}/v1/sessions`, { headers: { "if-none-match": `W/${etag1}, "other"` } });
+			assert.equal(r3b.status, 304, "W/ 前缀 + 列表形式命中 304");
+
+			// 旧客户端兼容：不带 INM → 200 全量
+			const r3c = await fetch(`${base}/v1/sessions`, { headers: { "if-none-match": "" } });
+			assert.equal(r3c.status, 200, "空 INM 头 → 200 全量（旧客户端）");
+
+			// 指纹失效：新增会话文件 → count+1、ETag 变化、INM 旧值不再命中
+			const sid2 = "b2222222-2222-3333-4444-555555555555";
+			writeFileSync(join(sessionsDir, `2026-09-30T10-00-00-000Z_${sid2}.jsonl`),
+				`{"type":"session","version":3,"id":"${sid2}","timestamp":"2026-09-30T10:00:00.000Z","cwd":"C:\\ws\\t17"}\n`, "utf8");
+			const r4 = await fetch(`${base}/v1/sessions`, { headers: { "if-none-match": etag1 } });
+			assert.equal(r4.status, 200, "指纹失效 → 不再 304");
+			const etag2 = r4.headers.get("etag");
+			assert.ok(etag2 && etag2 !== etag1, "ETag 随内容变化");
+			const body4 = (await r4.json()) as { count: number };
+			assert.equal(body4.count, 2, "新增会话后 count=2");
+			const r5 = await fetch(`${base}/v1/sessions`, { headers: { "if-none-match": etag2 } });
+			assert.equal(r5.status, 304, "新 ETag 的 INM 命中 304（快路已更新）");
+
+			// (b) snapshot：ETag 排除 generatedAt（相邻两拍 ETag 相同）→ INM 命中 304
+			const s1 = await fetch(`${base}/v1/snapshot`);
+			assert.equal(s1.status, 200);
+			const setag1 = s1.headers.get("etag");
+			assert.ok(setag1, "snapshot 200 带 ETag");
+			const sbody1 = (await s1.json()) as Record<string, unknown>;
+			await new Promise((res) => setTimeout(res, 1100)); // 保证 generatedAt 至少前进一步
+			const s2 = await fetch(`${base}/v1/snapshot`);
+			assert.equal(s2.status, 200);
+			assert.equal(s2.headers.get("etag"), setag1, "generatedAt 不参与 ETag：相邻两拍 ETag 同");
+			const sbody2 = (await s2.json()) as Record<string, unknown>;
+			assert.notEqual(sbody2.generatedAt, sbody1.generatedAt, "但 generatedAt 照常前进（200 全量语义不变）");
+			const { generatedAt: _g1, ...stable1 } = sbody1;
+			const { generatedAt: _g2, ...stable2 } = sbody2;
+			assert.deepEqual(stable2, stable1, "状态体稳定（除 generatedAt 外全同）");
+			const s3 = await fetch(`${base}/v1/snapshot`, { headers: { "if-none-match": setag1 } });
+			assert.equal(s3.status, 304, "snapshot INM 命中 → 304");
+			assert.equal((await s3.text()).length, 0, "snapshot 304 空体");
 		} finally {
 			await h.close();
 		}

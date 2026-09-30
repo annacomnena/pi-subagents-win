@@ -72,7 +72,8 @@
  * **禁** Pi API / extensions/index.ts。
  */
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, type Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,7 +104,7 @@ import {
 	listPiSessions,
 	projectSession,
 } from "../runtime/transcript.ts";
-import { resolveSessionTitles } from "./session-title.ts";
+import { resolveSessionTitles, tabRunsDir } from "./session-title.ts";
 import { computeSessionPinFlags } from "./session-pin.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
@@ -360,6 +361,84 @@ export function buildSnapshotView(
 	return { ...base, runtime: { ...base.runtime, host: { pid: opts.pid, startedAt: opts.startedAt } } };
 }
 
+// ── L2 perf（plans/20260930_gui_perf_diagnosis.md §5 B1）：读投影条件请求支持（additive）──
+// 动因：GUI 6s 档全量轮询 sessions/snapshot 实测 ~104 KB/s 持续带宽 + /v1/sessions 每拍全量
+// 重建 ~313ms（797 会话 readHead×N + 标题解析链）。机制：响应带 ETag（sha1，node:crypto，
+// 零新依赖）；客户端带 If-None-Match 且命中 → 304 空体。**不带该头的旧客户端照常 200 全量**
+// ——完全 additive，契约零变化（304 仅在客户端主动携带 INM 时发生）。
+
+/** ETag（强校验器形式 "<sha1hex>"）。 */
+function sha1Etag(s: string): string {
+	return `"${createHash("sha1").update(s).digest("hex")}"`;
+}
+
+/** If-None-Match 命中判定（支持逗号分隔列表 / W/ 弱前缀 / `*`）。 */
+function matchEtag(req: IncomingMessage, etag: string): boolean {
+	const inm = req.headers["if-none-match"];
+	if (typeof inm !== "string" || inm.length === 0) return false;
+	return inm.split(",").some((raw) => {
+		const t = raw.trim();
+		return t === "*" || t.replace(/^W\//, "") === etag;
+	});
+}
+
+/** 304 空体响应（RFC 9110：304 不得带 body；ETag 头回显允许）。 */
+function respondNotModified(res: ServerResponse, etag: string): void {
+	try {
+		res.writeHead(304, { etag });
+		res.end();
+	} catch {
+		try {
+			res.destroy();
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/**
+ * /v1/sessions 指纹快路的指纹（additive，内部实现细节，不出现在任何响应形状中）。
+ * 覆盖 body 的全部外部输入，缺一即误缓存：
+ *   1. sessions 目录 stat-only 扫描（与 listPiSessions 同构：顶层 + 一层子目录、仅 *.jsonl、
+ *      [rel, mtimeMs, size]）；
+ *   2. 台账目录顶层 *.json（排除 .state.json/.result.json，与 loadTabLedger 读集一致；
+ *      gc-cleaner 移入 _archived/ 表现为顶层条目消失，天然生效）；
+ *   3. registry/attachments 目录（computeSessionPinFlags 的 isMaster/isScopeMaster 输入）；
+ *   4. masterProtected sessionId（getMasterStatus 内存读，调用方拼入返回串）。
+ * 实测 ~20ms/800 会话 vs 全量重建 ~313ms。纯读 never-throw：任何 IO 失败 → null（调用方
+ * 走全量重建路径且该拍不落缓存）。响应 ETag 另算（对最终 JSON 串哈希，含 title 解析结果）。
+ */
+function sessionsBodyFingerprint(sessionsDir: string, runsDir: string, registryDir: string, protectedSid: string | null): string | null {
+	const parts: string[] = [];
+	const scan = (dir: string, rel: string, fileFilter: (name: string) => boolean): boolean => {
+		let entries: string[];
+		try {
+			entries = readdirSync(dir);
+		} catch {
+			return false;
+		}
+		for (const name of entries) {
+			const full = join(dir, name);
+			let st: Stats;
+			try {
+				st = statSync(full);
+			} catch {
+				continue; // 与 listPiSessions 容错一致：扫描间隙消失的条目跳过
+			}
+			if (st.isDirectory()) {
+				if (!scan(full, `${rel}${name}/`, fileFilter)) return false;
+			} else if (fileFilter(name)) {
+				parts.push(`${rel}${name}|${Math.round(st.mtimeMs)}|${st.size}`);
+			}
+		}
+		return true;
+	};
+	if (!scan(sessionsDir, "", (n) => n.endsWith(".jsonl"))) return null;
+	if (!scan(runsDir, "tab-runs/", (n) => n.endsWith(".json") && !n.endsWith(".state.json") && !n.endsWith(".result.json"))) return null;
+	if (!scan(registryDir, "registry-attachments/", () => true)) return null;
+	return `${parts.sort().join("\n")}\n#protected=${protectedSid ?? ""}`;
+}
+
 // ── /v1/events 增量读（raw 透传，服务端无状态）────────────────────
 
 export interface ReadEventsAfterOptions {
@@ -553,9 +632,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 	const stopWechatReply = startWechatReplyWatcher({ runtimeDir: wechatRuntimeDir, configPath, stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 
-	const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
+	const respondJson = (res: ServerResponse, status: number, body: unknown, etag?: string): void => {
 		try {
-			res.writeHead(status, { "content-type": "application/json" });
+			res.writeHead(status, { "content-type": "application/json", ...(etag !== undefined ? { etag } : {}) });
 			res.end(JSON.stringify(body));
 		} catch {
 			try {
@@ -565,6 +644,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			}
 		}
 	};
+
+	// L2 perf：/v1/sessions 指纹快路缓存（server 实例生命周期；单线程无锁；body 串 ~330KB 量级）。
+	let sessionsCache: { fp: string; bodyJson: string; etag: string } | null = null;
 
 	// G4：POST /v1/commands——唯一命令入口（body 异步读取后同步执行、同步回执；never-throw）
 	// G6-P2：认证补强（fail-closed，同 P1 token）：X-Command-Token header（curl/测试等价通道）
@@ -1119,6 +1201,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
+		// L2 perf：snapshot 200 路径的 ETag 附件（304 路径在 case 内提前 return）
+		let snapshotEtag: string | undefined;
 		try {
 			const u = new URL(req.url ?? "/", "http://127.0.0.1");
 			// 第一切片：同源静态托管（GET / + /assets/*；/v1/* 在此返回 false → 走 API 路由，永不 SPA fallback）
@@ -1201,6 +1285,16 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						linksPath: opts.linksPath,
 						configPath: opts.configPath,
 					});
+					{
+						// L2 perf（B1）：ETag 排除 generatedAt —— 响应时间戳非状态（诊断实测相邻调用
+						// 唯一 diff 字段）；其余状态体参与哈希，真实状态变化自然 miss → 200 全量。
+						const stableJson = JSON.stringify({ ...(body as Record<string, unknown>), generatedAt: undefined });
+						snapshotEtag = sha1Etag(stableJson);
+						if (matchEtag(req, snapshotEtag)) {
+							respondNotModified(res, snapshotEtag);
+							return;
+						}
+					}
 					break;
 				case "/v1/events": {
 					const q = u.searchParams;
@@ -1253,43 +1347,81 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				}
 				case "/v1/sessions": {
 					// G6-P1：pi 会话列表（首行头快读，不全读；startedAt 降序）
-					const sessions = listPiSessions(opts.sessionsDir ?? defaultSessionsDir());
-					// 会话可读标题解析链（P1 台账 → P2 首条 user 剥前缀 → P3 shortId 兜底）；
-					// firstUserText 是解析链副产品，仅服务端内部用，不上线（契约只加 title/titleSource）
-					const titles = resolveSessionTitles(sessions, opts.tabRunsDir);
-					// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——与 executor 护栏同源
-					// （getMasterStatus().attachment.sessionId，护栏二同款读法）投影到列表条目；
-					// GUI 不再拿 health 心跳自猜。POST 真 403 仍是最后防线（护栏在 executor）。
-					let protectedSid: string | null = null;
+					// L2 perf（B1）：指纹快路 + 条件请求。指纹命中 → 复用缓存 body 串（免 readHead×N
+					// + 标题解析链，诊断实测 ~313ms → ~20ms/拍）；未命中 → 原路径全量构建并更新缓存。
+					// 响应恒带 ETag；If-None-Match 命中 → 304 空体（旧客户端不带该头 → 照常 200 全量）。
+					const sessDir = opts.sessionsDir ?? defaultSessionsDir();
+					const runsDirFp = opts.tabRunsDir ?? tabRunsDir();
+					const registryDirFp = join(defaultRuntimeDir(), "registry", "attachments");
+					let protectedSidFp: string | null = null;
 					try {
-						protectedSid = getMasterStatus().attachment?.sessionId ?? null;
+						protectedSidFp = getMasterStatus().attachment?.sessionId ?? null;
 					} catch {
-						protectedSid = null;
+						protectedSidFp = null;
 					}
-					// L3 置顶数据源（会话 rail 三件套）：isMaster = 全局 master（与 masterProtected 同源）；
-					// isScopeMaster = 命中某 scope attachment 且该 scope 解码 basename == 会话 cwd basename
-					//（解码失败不标；session-pin.ts 纯读 never-throw；字段 additive，仅 true 挂出）。
-					const pins = computeSessionPinFlags(sessions);
-					body = {
-						version: 1,
-						count: sessions.length,
-						sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => {
-							const pin = pins.get(s.sessionId);
-							// 契约字段是 titleSource（GUI types.ts 与 SessionList 全 tab 组折叠判据均读它）；
-							// SessionTitle.source 是解析链内部字段名，上线时显式映射，不再直接 spread。
-							const t = titles.get(s.sessionId);
-							return {
-								...s,
-								title: t !== undefined ? t.title : s.sessionId,
-							titleSource: t !== undefined ? t.source : ("id" as const),
-								...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
-								...(pin?.isMaster ? { isMaster: true as const } : {}),
-								...(pin?.isScopeMaster ? { isScopeMaster: true as const } : {}),
-							};
-						}),
-						masterProtectedSessionId: protectedSid,
-					};
-					break;
+					const fp = sessionsBodyFingerprint(sessDir, runsDirFp, registryDirFp, protectedSidFp);
+					let bodyJson: string | null = null;
+					let bodyEtag: string | null = null;
+					if (fp !== null && sessionsCache !== null && sessionsCache.fp === fp) {
+						bodyJson = sessionsCache.bodyJson;
+						bodyEtag = sessionsCache.etag;
+					}
+					if (bodyJson === null || bodyEtag === null) {
+							const sessions = listPiSessions(sessDir);
+						// 会话可读标题解析链（P1 台账 → P2 首条 user 剥前缀 → P3 shortId 兜底）；
+						// firstUserText 是解析链副产品，仅服务端内部用，不上线（契约只加 title/titleSource）
+						const titles = resolveSessionTitles(sessions, opts.tabRunsDir);
+						// G6-P2 L4 必修 4：Master 禁输入标识改服务端权威——与 executor 护栏同源
+						// （getMasterStatus().attachment.sessionId，护栏二同款读法）投影到列表条目；
+						// GUI 不再拿 health 心跳自猜。POST 真 403 仍是最后防线（护栏在 executor）。
+						let protectedSid: string | null = null;
+						try {
+							protectedSid = getMasterStatus().attachment?.sessionId ?? null;
+						} catch {
+							protectedSid = null;
+						}
+						// L3 置顶数据源（会话 rail 三件套）：isMaster = 全局 master（与 masterProtected 同源）；
+						// isScopeMaster = 命中某 scope attachment 且该 scope 解码 basename == 会话 cwd basename
+						//（解码失败不标；session-pin.ts 纯读 never-throw；字段 additive，仅 true 挂出）。
+						const pins = computeSessionPinFlags(sessions);
+						body = {
+							version: 1,
+							count: sessions.length,
+							sessions: sessions.map(({ firstUserText: _firstUserText, ...s }) => {
+								const pin = pins.get(s.sessionId);
+								// 契约字段是 titleSource（GUI types.ts 与 SessionList 全 tab 组折叠判据均读它）；
+								// SessionTitle.source 是解析链内部字段名，上线时显式映射，不再直接 spread。
+								const t = titles.get(s.sessionId);
+								return {
+									...s,
+									title: t !== undefined ? t.title : s.sessionId,
+								titleSource: t !== undefined ? t.source : ("id" as const),
+									...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
+									...(pin?.isMaster ? { isMaster: true as const } : {}),
+									...(pin?.isScopeMaster ? { isScopeMaster: true as const } : {}),
+								};
+							}),
+							masterProtectedSessionId: protectedSid,
+						};
+							bodyJson = JSON.stringify(body);
+							bodyEtag = sha1Etag(bodyJson);
+						sessionsCache = fp !== null ? { fp, bodyJson, etag: bodyEtag } : null;
+					}
+					if (matchEtag(req, bodyEtag)) {
+						respondNotModified(res, bodyEtag);
+						return;
+					}
+					try {
+						res.writeHead(200, { "content-type": "application/json", etag: bodyEtag });
+						res.end(bodyJson);
+					} catch {
+						try {
+							res.destroy();
+						} catch {
+							/* ignore */
+						}
+					}
+					return;
 				}
 				default: {
 					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，
@@ -1330,7 +1462,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				body = { error: "internal", message: e instanceof Error ? e.message : String(e) };
 			}
 		}
-		respondJson(res, status, body);
+		respondJson(res, status, body, snapshotEtag);
 	};
 
 	return new Promise((resolvePromise, reject) => {
