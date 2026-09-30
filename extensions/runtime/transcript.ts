@@ -27,6 +27,7 @@
  */
 
 import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync, existsSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -767,6 +768,7 @@ function readHead(path: string): SessionHead {
 			}
 		};
 		let pending = ""; // 跨块携带的未完成行尾段
+		const decoder = new StringDecoder("utf8"); // 保留跨块 UTF-8 多字节字符
 		let offset = 0;
 		for (;;) {
 			const want = Math.min(offset === 0 ? HEAD_READ_BYTES : HEAD_CHUNK_BYTES, buf.length);
@@ -776,7 +778,7 @@ function readHead(path: string): SessionHead {
 			// 避免上限后首个完整行（如 user 消息）被误收）
 			const allowed = Math.min(n, HEAD_SCAN_MAX_BYTES - offset);
 			if (allowed <= 0) break;
-			const chunk = pending + buf.subarray(0, allowed).toString("utf8");
+			const chunk = pending + decoder.write(buf.subarray(0, allowed));
 			const windowFull = allowed < n;
 			offset += n;
 			const lines = chunk.split("\n");

@@ -5,13 +5,13 @@
  *
  * 两个 key（值均为 Record<cwdKey, boolean>，true=展开——与 saw-ws-expansion 的
  * false=收起 相反，因为这两个场景的缺省是「收起」，只有非缺省 true 值得持久化）：
- *   - `saw-ws-overflow`  ：组内「还有 N 个 · 展开查看全部」展开态（每组最多 6 个的截断开关）；
+ *   - `saw-ws-overflow`  ：组内「还有 N 个 · 展开查看全部」展开态（每组最多 3 个的截断开关）；
  *   - `saw-ws-tabgroups` ：全派发 tab 组（titleSource==='ledger'）的用户显式展开态
  *                          （此类组首次加载默认折叠；混合组不写此 key，仍走 saw-ws-expansion）。
  * prune 只保留 true 条目（false/缺省即默认收起，冗余值清理，同 saw-ws-expansion 清冗余 true 的对偶）。
  */
 
-/** 组内 6 个截断的展开开关 key（saw-ws-* 命名族；与 saw-ws-expansion 无存储冲突）。 */
+/** 组内 3 个截断的展开开关 key（saw-ws-* 命名族；与 saw-ws-expansion 无存储冲突）。 */
 export const OVERFLOW_KEY = "saw-ws-overflow";
 /** 全 tab 组用户显式展开态 key。 */
 export const TABGROUP_KEY = "saw-ws-tabgroups";
