@@ -15,7 +15,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, Plus, Square, Wrench } from "lucide-react";
+import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
 import { usePoll } from "../usePoll";
@@ -505,7 +505,11 @@ export function ChatPage() {
 										<div className="flex shrink-0 items-center gap-2">
 											{isMasterSession && (
 												// L3 窄路径：master 不再灰显；Master 会话拒绝远程输入（旧 403）已放宽为本机受信注入。
-												<p className="text-ui-sm text-destructive">Master 会话拒绝远程输入已放宽：经本机受信通道注入（浏览器上下文被注入内容时等于驱动 master）</p>
+												// P2-9（2026-09-30）：非错误说明不用危险红常驻 → subtle 灰字 + 盾图标
+												<p className="flex items-center gap-1 text-ui-sm text-foreground-subtle">
+													<ShieldCheck className="size-3.5 shrink-0" />
+													Master 会话拒绝远程输入已放宽：经本机受信通道注入（浏览器上下文被注入内容时等于驱动 master）
+												</p>
 											)}
 											{/* Stop 钮灰显占位（无 interrupt 命令；zcode 口径 variant=secondary + Square fill-current） */}
 											<Tooltip>

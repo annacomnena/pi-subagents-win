@@ -30,7 +30,7 @@ export function Sidebar() {
 			}`}
 		>
 			{/* aside 本体（WorkspaceSidebar.tsx#L1253-1259） */}
-			<div className="flex h-full flex-col overflow-hidden bg-sidebar">
+			<div className="flex h-full flex-col overflow-hidden border-r border-border bg-sidebar">
 				{/* 顶部动作区（#L1268）：Web 无窗控让位条（拍板：可砍）→ py-3 */}
 				<div className="flex flex-col gap-1 px-2 py-3">
 					{/* 新建会话钮（NewTaskButtonGroup.tsx#L31-45 整条 class；无后端 → 灰显占位） */}

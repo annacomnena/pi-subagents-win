@@ -77,7 +77,7 @@ export function TopBar() {
 
 	return (
 		// header（WorkspaceHeader.tsx#L152-176）：h-12 + border-border/50（草稿态 border-transparent 不做）
-		<header className="@container/workspace-header relative flex w-full shrink-0 h-12 border-b border-border/50">
+		<header className="@container/workspace-header relative flex w-full shrink-0 h-12 border-b border-border/50 bg-header">
 			<div className="flex h-12 flex-1 min-w-0 items-center justify-between gap-2 overflow-hidden p-2 transition-[padding] duration-300">
 				{/* 左：折叠钮 + cwd basename / 活动会话标题 */}
 				<div className="flex min-w-0 items-center gap-2">
