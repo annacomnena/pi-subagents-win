@@ -4,6 +4,7 @@
  */
 
 import { useState } from "react";
+import { Layers } from "lucide-react";
 import { pauseResumeWorkstream, useGui } from "../store";
 import { RUN_STATUS_ZH, TASK_STATUS_ZH, WS_STATUS_ZH, zhStatus } from "../format";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
@@ -34,7 +35,7 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
 }
 
 function Unset() {
-	return <span className="text-foreground-subtlest">未设置</span>;
+	return <span className="text-foreground-subtle">未设置</span>;
 }
 
 export function WorkstreamPage() {
@@ -61,7 +62,7 @@ export function WorkstreamPage() {
 			<div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(220px,1fr)_3fr]">
 				<Card title={<Term zh={`工作流（${workstreams.length}）`} en="Workstream" />}>
 					{workstreams.length === 0 ? (
-						<EmptyState>暂无工作流</EmptyState>
+						<EmptyState icon={<Layers className="size-5" />}>暂无工作流</EmptyState>
 					) : (
 						<ul className="space-y-1">
 							{workstreams.map((w) => (
@@ -69,20 +70,22 @@ export function WorkstreamPage() {
 									<button
 										type="button"
 										onClick={() => setSelectedId(w.id)}
-										className={`w-full rounded px-2 py-1.5 text-left transition-colors ${
-											selected?.id === w.id ? "bg-surface-hover" : "hover:bg-surface"
+										className={`w-full rounded-md px-2 py-1.5 text-left transition-colors ${
+											selected?.id === w.id
+												? "bg-selected text-foreground"
+												: "text-foreground-subtle hover:bg-surface hover:text-foreground"
 										}`}
 									>
 										<div className="flex items-center gap-2">
 											<Badge tone={statusTone(w.status)}>{zhStatus(WS_STATUS_ZH, w.status)}</Badge>
-											<ShortId value={w.id} className="text-[11px] text-foreground-subtle" />
+											<ShortId value={w.id} className="text-ui-sm text-foreground-subtle" />
 											{/* G5.2：卡片直出唤醒/积压微摘要 */}
 											{w.mailboxBacklog.pending > 0 && (
 												<Badge tone="yellow" title="未领信件数（mailbox pending）">信 {w.mailboxBacklog.pending}</Badge>
 											)}
 											{w.wakeState.lastSpawnAt && <Badge tone="blue" title="最近一次被唤醒过">已唤醒</Badge>}
 										</div>
-										<p className="mt-0.5 line-clamp-2 text-[11px] text-foreground-subtle">{w.mission}</p>
+										<p className="mt-0.5 line-clamp-2 text-ui-sm text-foreground-subtle">{w.mission}</p>
 									</button>
 								</li>
 							))}
@@ -100,7 +103,7 @@ export function WorkstreamPage() {
 							title="工作流详情"
 							right={
 								<div className="flex items-center gap-1.5">
-									<ShortId value={selected.id} className="text-[10px] text-foreground-subtle" />
+									<ShortId value={selected.id} className="text-ui-xs text-foreground-subtle" />
 									<Button
 										disabled={selected.status === "paused"}
 										title={selected.status === "paused" ? "已经暂停了，无需重复暂停" : "暂停这个工作流"}
@@ -128,7 +131,7 @@ export function WorkstreamPage() {
 								</DetailRow>
 								<DetailRow label="唤醒策略（事件来了要不要自动开工）">
 									{selected.wakePolicy ? (
-										<span className="text-[11px]">
+										<span className="text-ui-sm">
 											{selected.wakePolicy.enabled ? "已启用" : "已停用"} · 冷却 {selected.wakePolicy.cooldownMs}ms
 											{selected.wakePolicy.debounceMs !== undefined ? ` · 防抖 ${selected.wakePolicy.debounceMs}ms` : ""}
 											{selected.wakePolicy.maxSpawns !== undefined ? ` · 最多 ${selected.wakePolicy.maxSpawns} 次` : ""}
@@ -139,7 +142,7 @@ export function WorkstreamPage() {
 								</DetailRow>
 								<DetailRow label="唤醒状态（最近一次自动开工）">
 									{selected.wakeState.lastSpawnAt ? (
-										<span className="text-[11px]">
+										<span className="text-ui-sm">
 											<RelTime at={selected.wakeState.lastSpawnAt} /> 唤醒
 											{selected.wakeState.lastTabRunId && (
 												<>
@@ -147,24 +150,24 @@ export function WorkstreamPage() {
 													运行 <ShortId value={selected.wakeState.lastTabRunId} />
 												</>
 											)}
-											<span className="ml-2 text-[10px] text-foreground-subtlest">累计唤醒 {selected.wakeState.spawnAt.length} 次</span>
+											<span className="text-ui-xs text-foreground-subtle">累计唤醒 {selected.wakeState.spawnAt.length} 次</span>
 										</span>
 									) : (
-										<span className="text-[11px] text-foreground-subtlest">从未被唤醒过</span>
+										<span className="text-ui-sm text-foreground-subtle">从未被唤醒过</span>
 									)}
 								</DetailRow>
 								<DetailRow label="信箱积压（未领信件）">
 									{selected.mailboxBacklog.pending > 0 || selected.mailboxBacklog.claimed > 0 ? (
-										<span className="text-[11px]">
+										<span className="text-ui-sm">
 											<span className="text-foreground">{selected.mailboxBacklog.pending}</span> 封未领
 											{selected.mailboxBacklog.claimed > 0 && ` · ${selected.mailboxBacklog.claimed} 封处理中`}
 										</span>
 									) : (
-										<span className="text-[11px] text-foreground-subtlest">0 封（无积压）</span>
+										<span className="text-ui-sm text-foreground-subtle">0 封（无积压）</span>
 									)}
 								</DetailRow>
 								<DetailRow label="工作区">
-									{selected.workspaceRef ? <span className="font-mono text-[11px] break-all">{selected.workspaceRef}</span> : <Unset />}
+									{selected.workspaceRef ? <span className="font-mono text-ui-sm break-all">{selected.workspaceRef}</span> : <Unset />}
 								</DetailRow>
 								<DetailRow label="创建 / 更新时间">
 									<RelTime at={selected.createdAt} /> / <RelTime at={selected.updatedAt} />
@@ -177,7 +180,7 @@ export function WorkstreamPage() {
 								{wsTasks.length === 0 ? (
 									<EmptyState>暂无关联任务</EmptyState>
 								) : (
-									<ul className="space-y-1 text-[11px]">
+									<ul className="space-y-1 text-ui-sm">
 										{wsTasks.map((t) => (
 											<li key={t.id} className="flex items-start gap-2">
 												<Badge tone={t.status === "completed" ? "green" : t.status === "failed" ? "red" : "gray"}>
@@ -196,7 +199,7 @@ export function WorkstreamPage() {
 								{wsRuns.length === 0 ? (
 									<EmptyState>暂无关联运行（按任务选择器匹配出的记录为空）</EmptyState>
 								) : (
-									<ul className="space-y-1 text-[11px]">
+									<ul className="space-y-1 text-ui-sm">
 										{wsRuns.map((r) => (
 											<li key={r.subject} className="flex items-start gap-2">
 												<Badge tone={r.status === "completed" ? "green" : r.status === "failed" ? "red" : r.status === "running" ? "blue" : "gray"}>
