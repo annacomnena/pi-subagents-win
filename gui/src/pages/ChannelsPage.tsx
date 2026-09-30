@@ -77,12 +77,12 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 				<img src={dataUrl} alt="微信登录二维码" className="h-48 w-48 rounded border border-border bg-white" />
 			) : (
 				<div className="space-y-2 rounded border border-border bg-surface p-3">
-					<p className="text-[10px] text-foreground-subtlest">
+					<p className="text-ui-xs text-foreground-subtle">
 						{image === null ? (loading ? "正在加载二维码…" : "等待二维码数据…") : `二维码取图失败（回退为 URL）：${image.error ?? "未知原因"}`}
 					</p>
 					{url !== null && (
 						<div className="flex items-center gap-2">
-							<span className="min-w-0 break-all font-mono text-[10px] text-foreground" title={url}>
+							<span className="min-w-0 break-all font-mono text-ui-xs text-foreground" title={url}>
 								{url}
 							</span>
 							<Button variant="ghost" onClick={() => copy(url)}>
@@ -97,7 +97,7 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 					href={url}
 					target="_blank"
 					rel="noreferrer"
-					className="text-[11px] text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+					className="text-ui-sm text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
 				>
 					在浏览器里打开该图片 URL 后扫码
 				</a>
@@ -237,7 +237,7 @@ function ReceiveBlock() {
 					<p className="text-xs text-destructive">{worker.lastError ?? "bot_token 已失效"}：请解绑后重新扫码绑定（worker 已停止轮询，不会风暴重试）。</p>
 				)}
 				{worker?.status === "uncertain" && worker.lastError !== null && (
-					<p className="text-xs text-yellow-600">{worker.lastError}</p>
+					<p className="text-xs text-warning">{worker.lastError}</p>
 				)}
 				{worker !== null && worker.enabled && (
 					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
@@ -254,7 +254,7 @@ function ReceiveBlock() {
 					<ul className="space-y-1.5">
 						{inbox.messages.map((m) => (
 							<li key={m.msgId} className="rounded border border-border bg-surface p-2">
-								<div className="flex flex-wrap items-center gap-2 text-[11px] text-foreground-subtle">
+								<div className="flex flex-wrap items-center gap-2 text-ui-sm text-foreground-subtle">
 									<span className="font-mono">{m.msgId}</span>
 									<span>{m.nickname ?? m.from}</span>
 									<RelTime at={m.receivedAt} />
@@ -270,8 +270,8 @@ function ReceiveBlock() {
 						))}
 					</ul>
 				)}
-				{quarantine !== null && quarantine.count > 0 && <section className="border-t border-border pt-2"><h4 className="text-xs font-medium">被拒/未处理（{quarantine.count}）</h4><p className="text-[10px]">这些条目没有进入会话；加入白名单或绑定本人后会重新评估，不是永久终态。</p><ul>{quarantine.entries.map((e, i) => <li key={`${e.msgId}-${i}`} className="text-[11px]">{e.reason} · {e.at} · {e.msgId ?? "—"}</li>)}</ul></section>}
-				<p className="text-[10px] leading-relaxed text-foreground-subtlest">
+				{quarantine !== null && quarantine.count > 0 && <section className="border-t border-border pt-2"><h4 className="text-xs font-medium">被拒/未处理（{quarantine.count}）</h4><p className="text-ui-xs">这些条目没有进入会话；加入白名单或绑定本人后会重新评估，不是永久终态。</p><ul>{quarantine.entries.map((e, i) => <li key={`${e.msgId}-${i}`} className="text-ui-sm">{e.reason} · {e.at} · {e.msgId ?? "—"}</li>)}</ul></section>}
+				<p className="text-ui-xs leading-relaxed text-foreground-subtle">
 					W1 只收不投：收到的消息仅持久化在本机私有 inbox 并在此只读展示（发送者 ID 前缀脱敏、正文截断）。
 				</p>
 			</div>
@@ -291,7 +291,7 @@ function InputBlock() {
  <Toggle on={status?.enabled===true} onChange={v=>void save({enabled:v})} labels={["关闭","开启"]}/>
  <div><p className="text-xs font-medium">白名单</p>{(status?.allowFrom.length??0)===0?<p className="text-xs text-destructive">未配置 = 拒绝所有（fail-closed）</p>:<ul>{status?.allowFrom.map(item=><li key={item.id}>{item.masked}<Button variant="ghost" onClick={()=>void save({remove:[item.id]})}>删除</Button></li>)}</ul>}</div>
  <div><p className="text-xs font-medium">最近发送者</p>{senders.map(s=><div key={s.fromId} className="flex gap-2 text-xs"><span>{s.fromId.slice(0,6)}…{s.fromId.slice(-4)} {s.fromNicknameMasked??""} · {s.lastAt} · {s.msgCount} 条</span>{s.allowlisted?<Badge tone="green">已允许</Badge>:<Button variant="secondary" onClick={()=>void save({add:[s.fromId]})}>允许</Button>}</div>)}</div>
- <p className="text-xs">为什么没进来：<span className={status?.masterAlive?"text-green-600":"text-destructive"}>{status?.masterAlive?"master 在线":"master 离线"}</span> · {status?.lastDecision??"暂无判定"} ({status?.lastReason??"—"}) · <RelTime at={status?.lastAt??null}/>{status?.masterAlive===false&&"；先 /gui open"}</p>
+ <p className="text-xs">为什么没进来：<span className={status?.masterAlive?"text-success":"text-destructive"}>{status?.masterAlive?"master 在线":"master 离线"}</span> · {status?.lastDecision??"暂无判定"} ({status?.lastReason??"—"}) · <RelTime at={status?.lastAt??null}/>{status?.masterAlive===false&&"；先 /gui open"}</p>
  </div></Card>;
 }
 
@@ -301,7 +301,7 @@ function AutonomySettings() {
 	const refresh = useCallback(async () => { try { const r = await fetch("/v1/autonomy/status"); if (r.ok) setState(await r.json()); else setError(`状态读取失败 HTTP ${r.status}`); } catch { setError("状态读取失败"); } }, []);
 	useEffect(() => { void refresh(); }, [refresh]);
 	const toggle = async (enabled: boolean) => { try { const r = await fetch("/v1/autonomy/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }); if (!r.ok) { setError(`写入失败 HTTP ${r.status}`); return; } setError(""); await refresh(); } catch { setError("写入失败"); } };
-	return <Card title="主动性套件"><div className="space-y-2 text-xs"><label className="flex gap-2"><input type="checkbox" checked={state?.enabled ?? false} disabled={!state} onChange={e => void toggle(e.target.checked)} />启用主动性套件</label><p>开启后启用总门（可压制唤醒）+ 写审计/快照；当前不执行任何自动动作（不自动派活、不自动重启 worker）。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
+	return <Card title="主动性套件"><div className="space-y-2 text-xs"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；当前不执行任何自动动作（不自动派活、不自动重启 worker）。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
 }
 
 export function ChannelsPage() {
@@ -436,10 +436,11 @@ export function ChannelsPage() {
 	if (disabled) {
 		return (
 			<div className="space-y-3">
+				{/* P2-3（2026-09-30）：导语前置（原位在两张卡之后，叙事顺序颠倒） */}
+				<PageIntro>微信连接</PageIntro>
 				{/* D17：只读回复状态卡在所有配置/授权分支都可见。 */}
 				<AutonomySettings />
 				<ReplyBlock />
-				<PageIntro>微信连接</PageIntro>
 				<Card
 					title={
 						<Term
@@ -520,7 +521,7 @@ export function ChannelsPage() {
 						<p className="text-xs text-foreground-subtle">
 							{uiState === "scanned" ? "已扫码，请在**手机端**点「确认登录」…" : "等待扫码：请用**手机微信**扫描下方二维码"}
 							{expiresIn !== null && (
-								<span className="text-foreground-subtlest">（约 {expiresIn}s 内有效）</span>
+								<span className="text-foreground-subtle">（约 {expiresIn}s 内有效）</span>
 							)}
 						</p>
 						<QrBlock image={qrImage} url={qrUrl} loading={qrImage === null} />
@@ -530,7 +531,7 @@ export function ChannelsPage() {
 									href={qrUrl}
 									target="_blank"
 									rel="noreferrer"
-									className="text-[11px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+									className="text-ui-sm font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
 								>
 									在手机微信里打开
 								</a>
@@ -553,7 +554,7 @@ export function ChannelsPage() {
 							<dt className="text-foreground-subtle">机器人 ID</dt>
 							<dd className="text-foreground">{status?.botIdPresent ? "已取到（存在）" : "无"}</dd>
 						</dl>
-						<p className="text-[11px] text-foreground-subtlest">
+						<p className="text-ui-sm text-foreground-subtle">
 							凭据存于本机 runtime 目录（0600 尽力；Windows 仅尽力）；token 永不进浏览器/日志，解绑即删除。
 						</p>
 						<div className="flex gap-2">
@@ -595,14 +596,14 @@ export function ChannelsPage() {
 
 			{/* 7 项真网待测只读提示条（本切片只覆盖绑定链路；未知项不得当事实引用） */}
 			<Card title={<Term zh="真网待测" en="pending probes" hint="绑定链路之外的 7 个协议未知项，需真机微信测量" />}>
-				<ul className="list-disc space-y-1 pl-4 text-[11px] leading-relaxed text-foreground-subtle">
+				<ul className="list-disc space-y-1 pl-4 text-ui-sm leading-relaxed text-foreground-subtle">
 					{PENDING_MEASURES.map(([no, text]) => (
 						<li key={no}>
 							<span className="font-mono text-foreground">{no}</span> {text}
 						</li>
 					))}
 				</ul>
-				<p className="mt-2 text-[10px] leading-relaxed text-foreground-subtlest">
+				<p className="mt-2 text-ui-xs leading-relaxed text-foreground-subtle">
 					测法与回传格式见 <span className="font-mono">plans/0923_wechat_ilink_probe_checklist.md</span> 步骤③.①–⑦
 					（绑定完成后续切片用探针脚本测量；输出不含 token 原文）。
 				</p>
