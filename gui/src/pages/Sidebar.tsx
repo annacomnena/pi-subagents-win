@@ -3,12 +3,12 @@
  * NewTaskButtonGroup + WorkspaceSidebarFooter，class 串照抄锚 §2.a）。
  *
  * 结构 1:1：顶部动作区（新建钮[灰显占位：无 create-session 后端]）+ 会话列表（SessionList，
- * 含过滤 Input）+ footer（只留设置钮，头像行/次级导航不渲染——拍板 1）。
+ * 含过滤 Input）+ 次级导航组（Timeline 入口，2026-09-30 派发者批准加入）+ footer（设置钮）。
  * 容器：264px 宽 / 折叠 = width→0 + opacity-0 + pointer-events-none（duration-200 ease-out）。
  * [无后端支撑]=不渲染项：分组 Tabs、置顶/归档区、拖拽排序、搜索按钮、工作流行、手机活跃标。
  */
 
-import { MessageCirclePlus, Settings } from "lucide-react";
+import { History, MessageCirclePlus, Settings } from "lucide-react";
 import { useGui } from "../store";
 import { SessionList } from "./SessionList";
 import { Button } from "../ui/button";
@@ -17,6 +17,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 export function Sidebar() {
 	const collapsed = useGui((s) => s.sidebarCollapsed);
 	const setRuntimeOverlay = useGui((s) => s.setRuntimeOverlay);
+	// 次级导航组（0922 S4 设计位；2026-09-30 派发者批准加入 Timeline 入口）
+	const activeTab = useGui((s) => s.activeTab);
+	const setActiveTab = useGui((s) => s.setActiveTab);
 
 	return (
 		// 容器（WorkspaceShellLayout.tsx#L1539-1541）：宽度变量固定 264px；折叠 → w-0 + opacity-0
@@ -48,6 +51,25 @@ export function Sidebar() {
 				</div>
 				{/* 会话列表（过滤 Input + ul space-y-0.5 + 三段式会话项） */}
 				<SessionList />
+				{/* 次级导航组（0922：下半 = 时间线 / 运行时入口）：Timeline 入口走既有 setActiveTab
+				 * （TabId 已收窄 chat|timeline）；再点一次切回 Chat（toggle，aria-current 显选中态）。
+				 * 运行时入口 = 下方 footer 设置钮（现状不变）。2026-09-30 派发者批准，本次唯一 IA 变化。 */}
+				<nav className="flex shrink-0 flex-col gap-0.5 px-2 pt-1" aria-label="次级导航">
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						aria-current={activeTab === "timeline" ? "page" : undefined}
+						title={activeTab === "timeline" ? "返回会话" : "时间线：按时间看系统里发生过什么"}
+						onClick={() => setActiveTab(activeTab === "timeline" ? "chat" : "timeline")}
+						className={`w-full justify-start gap-2 rounded-lg px-2 ${
+							activeTab === "timeline" ? "bg-selected text-foreground hover:bg-selected" : "text-foreground-subtle"
+						}`}
+					>
+						<History className="size-4 shrink-0" />
+						<span className="text-ui-base">时间线</span>
+					</Button>
+				</nav>
 				{/* footer（WorkspaceSidebarFooter.tsx#L217）：头像行不渲染，只留设置钮 → RuntimeOverlay */}
 				<footer className="flex shrink-0 flex-col gap-2.5 px-4 pt-2 pb-4">
 					<div className="flex shrink-0 items-center justify-end gap-1.5">

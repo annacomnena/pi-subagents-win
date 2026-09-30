@@ -15,7 +15,7 @@
  */
 
 import { useEffect } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Crown, Inbox, Layers, MessageCircle, Server, type LucideIcon } from "lucide-react";
 import { useGui, type RuntimeOverlaySection } from "../store";
 import { AttentionPage } from "./AttentionPage";
 import { ChannelsPage } from "./ChannelsPage";
@@ -24,12 +24,12 @@ import { WorkstreamPage } from "./WorkstreamPage";
 import { RuntimePage } from "./RuntimePage";
 import { Button } from "../ui/button";
 
-const SECTIONS: { id: RuntimeOverlaySection; zh: string }[] = [
-	{ id: "attention", zh: "需要关注" },
-	{ id: "master", zh: "主控" },
-	{ id: "workstream", zh: "工作流" },
-	{ id: "runtime", zh: "运行时" },
-	{ id: "wechat", zh: "微信连接" },
+const SECTIONS: { id: RuntimeOverlaySection; zh: string; icon: LucideIcon }[] = [
+	{ id: "attention", zh: "需要关注", icon: Inbox },
+	{ id: "master", zh: "主控", icon: Crown },
+	{ id: "workstream", zh: "工作流", icon: Layers },
+	{ id: "runtime", zh: "运行时", icon: Server },
+	{ id: "wechat", zh: "微信连接", icon: MessageCircle },
 ];
 
 export const overlaySectionId = (id: RuntimeOverlaySection): string => `overlay-section-${id}`;
@@ -86,7 +86,9 @@ export function RuntimeOverlay() {
 										: "text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
 								}`}
 							>
-								<span className="truncate text-ui-base">{sec.zh}</span>
+								 {/* 2026-09-30：窄栅（<lg）左栏 68px 只放图标，文本 ≥lg 才显示（P1-5「需…」截断修复） */}
+								<sec.icon className="size-4 shrink-0" />
+								<span className="hidden truncate text-ui-base lg:inline">{sec.zh}</span>
 							</Button>
 						))}
 					</div>

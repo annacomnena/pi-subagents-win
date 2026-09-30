@@ -42,31 +42,31 @@ export function TimelinePage() {
 	};
 
 	return (
-		<div className="space-y-3">
+		<div className="space-y-3 p-4">
 			<PageIntro>按时间看系统里发生过什么</PageIntro>
 			<div className="flex flex-wrap items-center gap-1.5">
-				<span className="mr-1 text-xs text-foreground-subtle">只看：</span>
+				<span className="mr-1 text-ui-sm text-foreground-subtle">只看：</span>
 				{FILTERS.map((f) => (
 					<button
 						key={f.id}
 						type="button"
 						onClick={() => setFilterId(f.id)}
-						className={`rounded border px-2 py-0.5 text-[11px] transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 ${
+						className={`rounded-md border px-2 py-0.5 text-ui-xs transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 ${
 							filterId === f.id
 								? "border-border-hover bg-surface-hover text-foreground"
-								: "border-border text-foreground-subtle hover:text-foreground-subtle"
+								: "border-border text-foreground-subtle hover:text-foreground"
 						}`}
 					>
 						{f.label}
 					</button>
 				))}
-				<span className="ml-auto text-[10px] text-foreground-subtlest">共载入 {timeline.length} 条 · 2 秒增量刷新 · 6 秒全量刷新</span>
+				<span className="ml-auto text-ui-xs text-foreground-subtle">共载入 {timeline.length} 条 · 2 秒增量刷新 · 6 秒全量刷新</span>
 				{!timelineEnd ? (
 					<Button variant="ghost" disabled={loadingEarlier} onClick={onLoadEarlier} title="按 before= 排他上界向历史翻页（每页 200 条）">
 						{loadingEarlier ? "加载中…" : "加载更早"}
 					</Button>
 				) : (
-					<span className="text-[10px] text-foreground-subtlest">已到最早</span>
+					<span className="text-ui-xs text-foreground-subtle">已到最早</span>
 				)}
 			</div>
 
@@ -77,16 +77,16 @@ export function TimelinePage() {
 					<ul className="divide-y divide-border">
 						{items.map((t) => (
 							<li key={t.id} className="flex items-start gap-2 py-1.5 text-xs">
-								<RelTime at={t.at} className="w-20 shrink-0 text-[10px] text-foreground-subtlest" />
+								<RelTime at={t.at} className="w-20 shrink-0 text-ui-xs text-foreground-subtle" />
 								<span className="mt-0.5 shrink-0">{kindBadge(t)}</span>
 								<span className="min-w-0">
 									<span className="text-foreground">{t.summary}</span>
 									{t.actor && (
-										<span className="ml-2 text-[10px] text-foreground-subtle">
+										<span className="ml-2 text-ui-xs text-foreground-subtle">
 											执行者 <ShortId value={t.actor} />
 										</span>
 									)}
-									{t.source && <span className="ml-2 font-mono text-[10px] text-foreground-subtlest">{t.source}</span>}
+									{t.source && <span className="ml-2 font-mono text-ui-xs text-foreground-subtle">{t.source}</span>}
 								</span>
 							</li>
 						))}
