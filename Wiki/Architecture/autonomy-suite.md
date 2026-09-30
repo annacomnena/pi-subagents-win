@@ -2,7 +2,7 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-09-29
+updated: 2026-09-30
 source_paths:
   - extensions/runtime/autonomy/config.ts
   - extensions/runtime/autonomy/frontier.ts
@@ -15,6 +15,11 @@ source_paths:
   - extensions/runtime/wake.ts
   - extensions/master-tools.ts
   - extensions/index.ts
+  - extensions/runtime-host/autonomy-config.ts
+  - extensions/runtime-host/server.ts
+  - gui/src/pages/AutonomyPage.tsx
+  - gui/src/pages/RuntimeOverlay.tsx
+  - gui/src/api/client.ts
   - extensions/_test_runtime_autonomy.ts
   - extensions/_test_autonomy_wiring.ts
   - extensions/_test_register_graph.ts
@@ -81,12 +86,21 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - TUI `/autonomy on|off|status`（保留 `kill|clear`）；子 agent 会话拦截（与 kill/clear 对齐）+ 翻转留审计行
 - HTTP `GET /v1/autonomy/status`（**D17a 四要素**：enabled / kill / frontier 快照时间 / wake-gate 最近判定）+ `POST /v1/autonomy/set`（鉴权沿用 `authorizeCommand`，未认证 401）
 - GUI 设置区「主动性套件」卡片 + **诚实文案**："当前不执行任何自动动作"
+- HTTP 只读 `GET /v1/autonomy/frontier`（见下节）
+
+### GUI 落点（RuntimeOverlay 第 6 section + frontier 读端点）
+
+- **`GET /v1/autonomy/frontier`（只读）**（`extensions/runtime-host/server.ts:1264`）：与 status/set 同一授权档（`authorizeCommand`，未认证 401）；只调 `readFrontierSnapshot({ stateDir })`——**读盘即返回完整 `FrontierSnapshot`，不重计算、零写入**；快照缺失/坏 JSON/字段漂移 → `200 null`（客户端据此区分「无文件」与「0 项目基线帧」）；仅 GET，其余方法 405。`/v1/autonomy/status` 形状未改（向后兼容）。
+- **GUI 第 6 section**：`RuntimeOverlaySection` 六值 union（`gui/src/store.ts:38`：attention/master/workstream/runtime/wechat/**autonomy**），`RuntimeOverlay` SECTIONS 表新增「主动性」（Activity 图标，`gui/src/pages/RuntimeOverlay.tsx:28-35`），`runtimeOverlay === "autonomy"` 打开即定位该 section；覆盖层页内容 = `gui/src/pages/AutonomyPage.tsx`：
+  - `AutonomySettings`（总门开关）——**自微信连接页（ChannelsPage）整体迁出**，ChannelsPage 零引用；开关行为/API 逐字不变（`GET /v1/autonomy/status` + `POST /v1/autonomy/set`）。迁出后卡片不再位于任何带 401/403 早退分支的页内 → 默认配置与未认证/无权限各态下开关均可见（D17 可达性由此结构性保证，非逐分支补钉）。仍保留诚实文案「当前不执行任何自动动作」与 `awayMode`「未实现（保留字段），不提供开关」。
+  - `FrontierViz`（frontier 可视化，`api.autonomyFrontier()`，**5s 轮询**，`gui/src/api/client.ts:147`）三块：**C 快照时效**（`asof` 相对时间 + `baseline` 首帧徽标 + 项目/触发计数）、**A 项目状态矩阵**（每项目 state+variant / needsUser 高亮 / gate / resultMissing / stagnation / overdue / runs 明细）、**B 触发记录表**（rule/project/evidence，`approximate` 降透明度 + 「近似」徽标）。状态语义：`snap===undefined` 加载中、`null` → 「快照尚未生成（autonomy 未启用，或尚未完成首次 tick）」；读失败显示可恢复错误、保留最近快照（不留永久加载态）；`gate:"unknown"` 呈中性「未知」（与 watchdog 3/8 恒 unknown 同款“不猜”语义）。零图表库（Badge/Card 手写）。
 
 ### A3 awayMode 空壳
 `autonomy.awayMode.enabled` 被解析但**无任何生产消费者** ⇒ 保留字段但 GUI 明确标注"未实现（保留字段）"，且**不提供开关**（不让界面出现按了没反应的按钮）。
 
-### L4 收口抓到的 D17 违背（值得记）
-`AutonomySettings` 原先**只在最终 return 渲染**，而 ChannelsPage 有 `disabled`(403)/`unauthorized`(401) 两个提前 return ⇒ **默认配置下开关完全不可见**（服务端端点本身没问题，是 GUI 挂载位置把它埋进 wechat 闸后）。已提到两个早退分支顶部。**教训**：D17 的验收必须覆盖"默认配置 + 各错误态"，只看正常态会漏。
+### GUI 挂载位置约束（D17 可达性）
+
+开关必须挂在**不受错误态早退影响**的位置：若把 `AutonomySettings` 放进带 `disabled`(403)/`unauthorized`(401) 提前 return 的页，卡片会被埋在闸后、默认配置下不可见（端点本身没问题，是挂载位置遮蔽）。现组件位于独立的 `AutonomyPage`（无任何早退分支），因此默认配置 + 各错误态下开关均可见；**验收口径**：D17 可达性须覆盖「默认配置 + 各错误态」，只看正常态会漏。
 
 ## Evidence
 
@@ -97,6 +111,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
   - `npm run smoke:extension-load` → extension load OK；`_test_runtime_wake.ts`/`_test_runtime_master_control.ts`（含 masterStatusLogic 文案 parity）/`_test_local_master.ts`/register-graph 本体全绿。
   - tab 内独立 L4 审查：`plans/0923_autonomy_suite_v2_review.md`（**PASS-WITH-MUST-FIX，must-fix 0**；残余风险 5 条见 Open Questions）。
   - v2 计划/实现：`plans/0923_autonomy_suite_v2_plan.md`（7 裁定 D-A~D-H + 接线点清单）、`plans/0923_autonomy_suite_v2_impl.md`（逐文件行段 + 偏差 8 条，其中偏差 1 修正了原计划对空盘面二帧 reason 的错误预期：实为 `record-only` 非 `no-meaningful-change`）。
+- GUI 落点（2026-09-30）：`gui/src/pages/AutonomyPage.tsx`（AutonomySettings + FrontierViz）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS 六值）、`gui/src/store.ts:38`、`gui/src/api/client.ts:147`（`autonomyFrontier`）、`extensions/runtime-host/server.ts:1243-1267`（frontier 路由）；提交 `d321c50`（只读 frontier 端点）、`6ee8191`（覆盖层第 6 section + AutonomySettings 迁出微信页）、`661c8f2`（FrontierViz）、`39e6677`（读失败不留加载态 + Toggle focus 环）。
 
 ## Links Out
 
