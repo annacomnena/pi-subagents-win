@@ -497,3 +497,58 @@ export interface WechatToggleBody {
 	error?: string;
 	message?: string;
 }
+
+// ── 2026-09-30 主动性设置页：GET /v1/autonomy/frontier（frontier.ts FrontierSnapshot 手抄）──
+
+/** frontier.ts GateStatus（global-view 同源）："unknown" 为常态 = 无载体不猜（非异常）。 */
+export type AutonomyGateStatus = "awaiting" | "ok" | "unknown";
+
+/** frontier.ts FrontierRule（§25 九规则 + ws_mail_backlog）。 */
+export type FrontierRule =
+	| "blocked_to_ready"
+	| "working_to_completed"
+	| "working_to_failed"
+	| "needs_global"
+	| "needs_user"
+	| "risk_high"
+	| "deadline_urgency"
+	| "expected_event_timeout"
+	| "stagnation"
+	| "ws_mail_backlog";
+
+/** frontier.ts ProjectState（C5 相位→项目派生态）。 */
+export type FrontierProjectState = "Working" | "Blocked" | "Completed" | "Failed" | "Cancelled";
+
+/** frontier.ts FrontierTrigger。 */
+export interface FrontierTrigger {
+	rule: FrontierRule;
+	project: string;
+	evidence: string;
+	approximate: boolean;
+	requestId?: string;
+	requestRev?: number;
+}
+
+/** frontier.ts ProjectFrontier（单 repo 聚合）。 */
+export interface ProjectFrontier {
+	project: string;
+	state: FrontierProjectState;
+	variant: string | null;
+	gate: AutonomyGateStatus;
+	runs: Record<string, string>;
+	needsUser: boolean;
+	resultMissing: boolean;
+	stagnation: boolean;
+	overdue: number;
+	overdueRequests: string[];
+	meaningfulStateVersion: number;
+}
+
+/** GET /v1/autonomy/frontier 完整快照（读盘即返回；快照缺失 → null）。 */
+export interface FrontierSnapshot {
+	asof: number;
+	projects: ProjectFrontier[];
+	triggers: FrontierTrigger[];
+	/** true = 首帧（prev=null）：只建基线，不算触发（防冷启动风暴）。 */
+	baseline: boolean;
+}

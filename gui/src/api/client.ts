@@ -11,6 +11,7 @@ import type {
 	CommandFrameInput,
 	CommandOutcomeBody,
 	EventsResponse,
+	FrontierSnapshot,
 	HealthView,
 	InteractionsResponse,
 	RuntimeSnapshot,
@@ -141,6 +142,9 @@ export const api = {
 
 	/** G6-P3：待决策交互投影（pendingInteractions 思想；open attention 直投 + response 语义）。 */
 	interactions: (): Promise<FetchResult<InteractionsResponse>> => fetchJson<InteractionsResponse>("/v1/interactions"),
+
+	/** 2026-09-30 主动性设置页：GET /v1/autonomy/frontier（完整 FrontierSnapshot；快照缺失 → null）。 */
+	autonomyFrontier: (): Promise<FetchResult<FrontierSnapshot | null>> => fetchJson<FrontierSnapshot | null>("/v1/autonomy/frontier"),
 
 	/** limit 尾窗 + G5.2 before=（排他上界历史翻页；undefined/空串 = 不启用）。 */
 	timeline: (limit = 200, before?: string): Promise<FetchResult<TimelineResponse>> =>
