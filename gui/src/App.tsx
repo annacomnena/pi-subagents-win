@@ -34,7 +34,10 @@ export default function App() {
 	usePoll(() => useGui.getState().pollAttention(), 2000);
 	usePoll(() => useGui.getState().pollInteractions(), 2000); // G6-P3：待决策徽标 + proposal 卡直连
 	usePoll(() => useGui.getState().pollSnapshot(), 6000);
-	usePoll(() => useGui.getState().pollTimeline(), 6000);
+	// L2 perf（plans/20260930_gui_perf_diagnosis.md §5 B3）：timeline 全量尾窗（97KB/拍）仅
+	// 消费方在场时拉——TimelinePage（主路由）+ MasterPage（覆盖层 master 段）。store.timeline
+	// 另有 2s events 轮询 + WS journal 持续供数（不空屏）；门控打开时 usePoll 立即补一拍。
+	usePoll(() => useGui.getState().pollTimeline(), 6000, activeTab === "timeline" || runtimeOverlay === "master");
 	// 会话为主重构 S2：sessions 轮询自 ChatPage 上移 App（第七路）——左栏会话列表常驻后徽标/状态槽任意页都活
 	usePoll(() => useGui.getState().pollChatSessions(), 6000);
 
