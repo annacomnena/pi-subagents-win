@@ -4,8 +4,13 @@
  * 优先级（逐级回退，全链 never-throw）：
  *   P1 ledger     — 全局 tab-runs 台账（`~/.pi/agent/tab-runs/<runId>.json`，env PI_TAB_RUNS_DIR
  *                   覆盖）：record.cwd 同桶 + 会话首条 user 严格前缀匹配 + 派发时间窗 → record.title。
+ *                   派发会话首条 user 常以 `<file name=...>...</file>` 附件块包装，前缀行在块内
+ *                   （首行被开标签行遮住）→ 前缀匹配前先剥开标签行（ledgerProbeFirstLine，
+ *                   与 P2 的整块剥除 stripLeadingAttachmentBlocks 语义不同）。
  *   P2 first-user — 首条 user 文本剥前缀（launch.ts taskTitleLabel 同款规则独立重实现）：
- *                   跳 `##`/`>`/「根据X进行工作」前缀行，取首个有意义行，去 markdown 噪音，截 24 字符。
+ *                   先跳过开头的 `<file ...>...</file>` / `<system-reminder>...</system-reminder>`
+ *                   机器注入块，再跳 `##`/`>`/「根据X进行工作」前缀行，取首个有意义行，
+ *                   去 markdown 噪音，截 24 字符；整条都是附件块 → null（回退 P3）。
  *   P3 id         — 会话 id 兜底（GUI 灰显 shortId）。
  *
  * 纪律：台账探测 / 桶名 / 前缀形状按 tab-runs.ts・launch.ts 语义**独立重实现**——
@@ -108,9 +113,21 @@ export function loadTabLedger(runsDir: string): TabLedgerEntry[] {
 	return out;
 }
 
-/** 首条 user 首行必须是完整派发前缀（或其后接空白）。禁止 taskId 子串匹配，避免 T7 命中 T70/正文。 */
+/**
+ * P1 前缀判定的首行：包装派发会话的开头是 `<file name="...">` 开标签行，
+ * 派发前缀在附件块**内**（首行之后）——只剥开标签行、不剥整块（整块剥除是 P2 的语义，
+ * 会把前缀行一并剥掉）。非 file 开头 → 原样取首个非空行。
+ */
+function ledgerProbeFirstLine(firstUserText: string): string {
+	let t = firstUserText;
+	const openTag = /^\s*<file\b[^>]*>/i.exec(t);
+	if (openTag !== null) t = t.slice(openTag[0].length);
+	return t.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+}
+
+/** 首行必须是完整派发前缀（或其后接空白）。禁止 taskId 子串匹配，避免 T7 命中 T70/正文。 */
 function hasLedgerPrefix(entry: TabLedgerEntry, firstUserText: string): boolean {
-	const firstLine = firstUserText.split(/\r?\n/)[0].trim();
+	const firstLine = ledgerProbeFirstLine(firstUserText);
 	const prefix = modePrefixLike(entry.taskId, entry.mode);
 	return firstLine === prefix || (firstLine.startsWith(prefix) && /^\s/.test(firstLine.slice(prefix.length)));
 }
@@ -136,15 +153,42 @@ function pickLedgerTitle(cwd: string | null, firstUserText: string | null, start
 
 // ── P2：首条 user 剥前缀（taskTitleLabel 同款，独立重实现）────────
 
+// ── 机器注入 XML 附件块剥离（P1 前缀 / P2 派生共用）─────────────
+
+/** 已闭合的领头附件块：`<file name="...">...</file>` / `<system-reminder>...</system-reminder>`。 */
+const LEADING_CLOSED_BLOCK = /^\s*<(file|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/i;
+/** 领头开标签但到文本尾无闭合（firstUserText 截断上限所致）：整段视附件。 */
+const LEADING_UNCLOSED_BLOCK = /^\s*<(file|system-reminder)\b[^>]*>[\s\S]*$/i;
+
+/**
+ * 循环剥离开头的 `<file ...>...</file>` / `<system-reminder>...</system-reminder>` 块，
+ * 返回其后正文。开标签在头但无闭合（2000/8000 字符截断把闭合截掉）→ 返回空串
+ * （整条都是附件 → 调用方回退 P3）。限制在这两类已知机器注入块，避免误伤用户
+ * 正文里合法的其它 XML。
+ */
+export function stripLeadingAttachmentBlocks(text: string): string {
+	let t = text;
+	for (;;) {
+		const closed = LEADING_CLOSED_BLOCK.exec(t);
+		if (closed !== null) {
+			t = t.slice(closed[0].length);
+			continue;
+		}
+		return LEADING_UNCLOSED_BLOCK.test(t) ? "" : t;
+	}
+}
+
 /**
  * launch.ts taskTitleLabel 的 prompt 分支同款规则（独立实现）：
- * 跳过 `##`/`>`/「根据X进行工作」行，取首个有意义行，去 markdown 噪音 / `Item N` /
- * `(P0)` / 句尾标点，截 24 字符；无有意义行 → null（回退 P3）。
+ * 先剥开头机器注入附件块（整条都是附件块 → null 回退 P3），再跳 `##`/`>`/「根据X进行工作」
+ * 行，取首个有意义行，去 markdown 噪音 / `Item N` / `(P0)` / 句尾标点，截 24 字符。
  */
 export function deriveTitleFromFirstUserText(text: string | null): string | null {
 	if (text === null) return null;
+	const body = stripLeadingAttachmentBlocks(text).trim();
+	if (body.length === 0) return null;
 	const firstLine =
-		text
+		body
 			.split(/\r?\n/)
 			.map((l) => l.trim())
 			.find((l) => l && !/^(##|>|根据workflow进行工作|根据research进行工作|根据execute进行工作|根据adaptive进行工作)/.test(l)) ?? "";

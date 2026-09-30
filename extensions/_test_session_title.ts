@@ -16,6 +16,8 @@
  *   T9 listPiSessions.firstUserText：正常抽取；首条 user 越过 8KB 但分块窗口内；
  *      坏行/半截行容忍；32KB 后（旧窗口外）分块续扫命中；超出 256KB 窗口 → null
  *   T10 resolveSessionTitles 批量：混合来源各归其位；cwd=null 不做台账探测
+ *   T11 机器注入附件块剥离：P2 跳 `<file>` 块取后正文 / 整条附件 → null / 截断无闭合 → null /
+ *      多块循环（+`<system-reminder>`）/ P1 前缀在附件块内（开标签行遮首行）→ 剥开标签行后命中台账
  *
  * 运行：npm run test:session-title
  */
@@ -107,6 +109,43 @@ for (const prompt of [
 	assert.equal(deriveTitleFromFirstUserText(prompt), taskTitleLabel(undefined, prompt));
 }
 ok("T1f P2 剥前缀与 launch.taskTitleLabel prompt 分支逐例对照一致");
+
+// ── T11 机器注入附件块剥离（<file>/<system-reminder>；P1 前缀 / P2 派生共用）──
+// 派发会话首条 user 被 <file name="..."> 附件块包装：P2 取块后正文
+const fileWrapped = `<file name="C:\\Users\\x\\launch-prompts\\pi-launch-tab_aaa.md">\n内层行\n</file>\n\nTask: 读附件块后取标题`;
+assert.equal(deriveTitleFromFirstUserText(fileWrapped), "Task: 读附件块后取标题");
+ok("T11a P2 跳过开头 <file> 附件块，取其后正文");
+
+// 整条消息都是附件块 → null（回退 P3）
+assert.equal(deriveTitleFromFirstUserText(`<file name="a.md">\n正文\n</file>`), null);
+ok("T11b 整条消息是 <file> 块 → null（P3）");
+
+// 领头开标签但无闭合（firstUserText 字符截断把闭合截掉）→ 整段视附件
+assert.equal(deriveTitleFromFirstUserText(`<file name="a.md">\n` + "x".repeat(50)), null);
+ok("T11c 领头 <file> 无闭合（截断）→ null（P3）");
+
+// 多个连续块（<file> + <system-reminder>）循环剥到真正文
+const multiWrapped = `<file name="a.md">\n内层\n</file>\n\n<system-reminder>\n缓存\n</system-reminder>\n\n真正任务正文行`;
+assert.equal(deriveTitleFromFirstUserText(multiWrapped), "真正任务正文行");
+ok("T11d 多块循环剥离（<file> + <system-reminder>）");
+
+// P1：前缀行在 <file> 附件块内（首行被开标签行遮住）→ 剥开标签行后命中台账
+// （修复前 hasLedgerPrefix 首行 = <file name=...> 永不命中）
+const runs11 = tmp("session-title-runs-");
+writeLedger(runs11, {
+	id: "tab_ccc",
+	taskId: "G6-V",
+	mode: "adaptive",
+	title: "repoA-G6-V-附件包装",
+	cwd: CWD_A,
+	dispatchedAt: "2026-09-22T09:59:00Z",
+});
+const s11 = resolveSessionTitle(
+	{ sessionId: "sid-11", cwd: CWD_A, startedAt: "2026-09-22T10:00:00Z", firstUserText: `<file name="C:\\x\\p.md">\n根据adaptive进行工作G6-V\n\n正文\n</file>` },
+	loadTabLedger(runs11),
+);
+assert.deepEqual(s11, { title: "repoA-G6-V-附件包装", source: "ledger" });
+ok("T11e P1 前缀行在 <file> 块内 → 剥开标签行后命中台账");
 
 // ── T2 P1 台账命中（前缀匹配）────────────────────────────────────
 const runs1 = tmp("session-title-runs-");
