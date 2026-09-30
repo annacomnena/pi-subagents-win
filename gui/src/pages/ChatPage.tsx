@@ -357,6 +357,11 @@ export function ChatPage() {
 		const n = st.chatActiveId !== null ? (st.chatRowsBySession[st.chatActiveId]?.length ?? 0) : 0;
 		setHiddenHead(Math.max(0, n - HISTORY_CHUNK));
 	}, [activeId]);
+	// 全量 resync 可能缩短 transcript；夹紧裁剪游标，避免 slice 越界后旧的回看状态永久卡住。
+	useEffect(() => {
+		const maxHiddenHead = Math.max(0, rows.length - HISTORY_CHUNK);
+		if (hiddenHead > maxHiddenHead) setHiddenHead(maxHiddenHead);
+	}, [hiddenHead, rows.length]);
 	// D4：贴底时分块补齐更早行（离开底部暂停，防阅读位跳动）
 	useEffect(() => {
 		if (hiddenHead === 0 || !atBottom) return;
