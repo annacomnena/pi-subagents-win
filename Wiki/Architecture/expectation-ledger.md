@@ -2,21 +2,25 @@
 title: 期望账本（⑧ 请求—回执期望）
 kind: concept
 status: current
-updated: 2026-09-29
+updated: 2026-10-02
 source_paths:
   - extensions/runtime/expectations.ts#L335-L338
   - extensions/runtime/expectations.ts#L344-L390
+  - extensions/runtime/expectations.ts#L197-L214
   - extensions/runtime/mailbox.ts#L110-L117
-  - extensions/mailbox-consumer.ts#L225-L230
-  - extensions/mailbox-consumer.ts#L149
-  - extensions/runtime/autonomy/collect.ts#L332-L353
+  - extensions/mailbox-consumer.ts#L232-L237
+  - extensions/mailbox-consumer.ts#L156
+  - extensions/mailbox-consumer.ts#L65-L70
+  - extensions/runtime/autonomy/collect.ts#L341-L363
   - extensions/runtime/autonomy/frontier.ts#L387-L391
+  - extensions/runtime/graph/collect.ts#L97-L109
+  - extensions/runtime/graph/types.ts#L88-L97
+  - extensions/runtime/graph/project.ts#L191-L233
   - extensions/runtime-host/attention.ts#L219-L244
   - extensions/runtime/adapters/tab-run.ts#L97-L103
   - extensions/event-bus.ts#L257-L258
   - extensions/index.ts#L2061-L2115
   - extensions/_test_expectations.ts
-updated: 2026-09-29
 ---
 
 # 期望账本（⑧ 请求—回执期望）
@@ -44,10 +48,10 @@ expectReply !== false
 | 角色 | 落点 | 时机 |
 |---|---|---|
 | **声明** | `mailbox.ts#L110-L117` → `declareExpectationSafe`（`expectations.ts#L344`，全仓唯一生产调用点） | 落盘成功后、返回 `created:true` 前；never-throw |
-| **到达** | `mailbox-consumer.ts#L225-L230` → `matchAndCloseExpectationSafe` | claim + F16 fencing 复检通过后、`preInject` 之前；四键匹配（`inReplyTo/from/kind/to`），不读 body |
-| **超期事件** | `mailbox-consumer.ts#L149` `materializeTimeoutNotices` | 每消费轮次；claim-then-append，每 `(id,rev)` 至多一行；超期**不关闭**期望 |
+| **到达** | `mailbox-consumer.ts#L232-L237` → `matchAndCloseExpectationSafe` | claim + F16 fencing 复检通过后、`preInject` 之前；四键匹配（`inReplyTo/from/kind/to`），不读 body |
+| **超期事件** | `mailbox-consumer.ts#L156` `materializeTimeoutNotices` | 每消费轮次；claim-then-append，每 `(id,rev)` 至多一行；超期**不关闭**期望 |
 
-读取面三条：`collect.ts#L332-L353 readExpectationInputs`（**账本目录不存在 → `undefined`**）→ frontier 触发 + watchdog `overdueRequests`；`attention.ts#L219 pushExpectations` → `request-timeout` 条目（纯读，独立于 autonomy 开关）；账本自读。frontier 的 ⑧ record-only 条件化：`expectations === undefined` 才保留 `expected_event_timeout:record-only(no-carrier)` 行（`frontier.ts#L387-L391`；常量本身 `RECORD_ONLY_NOCARRIER` 不改）。
+读取面四条：`collect.ts#L341-L363 readExpectationInputs`（**账本目录不存在 → `undefined`**）→ frontier 触发 + watchdog `overdueRequests`；`attention.ts#L219 pushExpectations` → `request-timeout` 条目（纯读，独立于 autonomy 开关）；**Graph 只读投影**（`graph/collect.ts#L97-L109` 装配 `openExpectations` → project 节点 `nextExpectedEventType/Deadline`，见 [[Work Graph 只读关系面]]——纯投影，**frontier ⑧ 输入不变**，仍走本条第一读取面）；账本自读。frontier 的 ⑧ record-only 条件化：`expectations === undefined` 才保留 `expected_event_timeout:record-only(no-carrier)` 行（`frontier.ts#L387-L391`；常量本身 `RECORD_ONLY_NOCARRIER` 不改）。
 
 ## 生产侧现状
 
@@ -92,5 +96,5 @@ expectReply !== false
 ## Open Questions
 
 - **生产请求方缺口**（L4 阻断项 B1）：需补一个真实调用点，或明确标注「仅 acceptance harness / 手写脚本可达」；在补齐前「frontier ⑧ 获真载体」应读作**能力已就绪、生产数据面未接通**。
-- **v2-b 三型事件的语义审批文书**与**行为门重开**（A10.1 allowlist tripwire / `_test_graph_frontier_shadow` / `_test_runtime_autonomy` 补 ⑧ 断言）尚未执行（L4 阻断项 B2）。
+- ~~**v2-b 三型事件的语义审批文书**与**行为门重开**（A10.1 allowlist tripwire / `_test_graph_frontier_shadow` / `_test_runtime_autonomy` 补 ⑧ 断言）尚未执行（L4 阻断项 B2）~~ **已闭合（0929）**：语义审批 = `plans/0929_p2_sliceC_v2b_semantic_RULING.md`（批 `project.expected_event_{set,arrived,timeout}` 三型、明确排除其余六型）；行为门重开 = 切片 B `f09ab1e`（见「生产侧现状」）。
 - gate `ack` 只等于「放行过一次 wake」，**不等于该请求被处置**；scope 域无到达生产者；pre-cutover 回信不关期望（既定接受项）。

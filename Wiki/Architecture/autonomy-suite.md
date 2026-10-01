@@ -2,7 +2,7 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-10-01
+updated: 2026-10-02
 source_paths:
   - extensions/runtime/autonomy/config.ts::normalizeAutonomy
   - extensions/runtime/autonomy/frontier.ts
@@ -11,6 +11,7 @@ source_paths:
   - extensions/runtime/autonomy/wake-gate.ts
   - extensions/runtime/autonomy/watchdog.ts
   - extensions/runtime/autonomy/collect.ts
+  - extensions/mailbox-consumer.ts#L65-L70
   - extensions/runtime/autonomy/gate.ts
   - extensions/runtime/autonomy/action/policy.ts::decide
   - extensions/runtime/autonomy/action/policy.ts::BUDGET
@@ -61,7 +62,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
   - enabled 模式 **fail-closed**：collect 失败 → gating inactive → wake-gate no-wake 压制；装配层自身崩溃 → **fail-open** 走 legacy（"autonomy 永不破坏唤醒循环"；二者不对称，D-E/R7 已文档化于代码注释）。
   - 返回 `AutonomyGateDecision { engaged, proceed, reason }`；`maintainBatchAnchor`（导出纯函数）维护 debounce 锚点：diff 有内容且 `batchFirstSeenAt===null` → 置 now；diff 全空 → 重置 null（**生产路径休眠分支**——recordOnly 恒非空，由 W4.4 单测直测钉死）。
   - 本层不直接 import `node:fs`（"批量 IO 只在 collect.ts"的 v1 约束延续）。
-- **唤醒总门落点**（`wake.ts:evaluateWakes`）：owner 门（L93）之后、ws 遍历之前，+1 import +3 行：`evaluateAutonomyWakeGate({ stateDir, configPath: opts.autonomyConfigPath, now })`，`engaged && !proceed` → `return []`（claim 前短路，`evaluateOne`/`claimLetters` 零改动）。`WakeOptions` + test-only `autonomyConfigPath`（仿 `now`/`inFlightWindowMs` 先例；生产不传）。**`mailbox-consumer.ts`/`registry.ts`/`scope.ts`/dispatch 侧零改动**（消费点经 `evaluateWakes` 自动带门）。
+- **唤醒总门落点**（`wake.ts:evaluateWakes`）：owner 门（L93）之后、ws 遍历之前，+1 import +3 行：`evaluateAutonomyWakeGate({ stateDir, configPath: opts.autonomyConfigPath, now })`，`engaged && !proceed` → `return []`（claim 前短路，`evaluateOne`/`claimLetters` 零改动）。`WakeOptions` + test-only `autonomyConfigPath`（仿 `now`/`inFlightWindowMs` 先例；生产不传）。**v2 接线当时 `mailbox-consumer.ts`/`registry.ts`/`scope.ts`/dispatch 侧零改动**（消费点经 `evaluateWakes` 自动带门）；后续变化仅 `mailbox-consumer.ts` 模块顶层的 frontier 源缺省注入一行（见「接线落点与边界」）。
 - **collect.ts 新 IO/审计 helper**（全部 never-throw，只写自有 namespace）：
   - `readWakeGateState`：容忍读 `state/autonomy/wake-gate.json` → null（缺失/坏 JSON/字段漂移）。
   - `writeWakeGateState`：原子 tmp+rename，返回是否实际写盘。
@@ -93,6 +94,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 ## 接线落点与边界（v2 已接线形态）
 
 - **总门**：`wake.ts:evaluateWakes` 顶层（套件级门，不是 ws 级；cutover off / non-owner 提前返回不触本层——省 IO）。per-repo scope wake（`scope.ts`/`mailbox-consumer.ts` 平行接线面）**未接**，列后续。
+- **frontier 数据源缺省（2026-10-02 起）**：`collectAutonomyInputs` 的 snapshot 分支由 `PI_AUTONOMY_FRONTIER_SOURCE` 单点二选一（collect 层判定：值 `graph` 才走 Graph，缺省/其它值 = v2）；**生产进程缺省 = graph**——`mailbox-consumer.ts#L70` 模块顶层在进程未预设该 env 时注入 `"graph"`（外部预设非空值优先，逃生舱保留；daemon 不跑 `evaluateWakes`，注入无效）。单行 revert 即回缺省 v2、无状态迁移。契约与测试证据见 [[Work Graph 只读关系面]]「E2.3 契约」。
 - **可见性**：master-status 条件增量行 + `/autonomy status` 全字段回显（gating 三元组、frontier meta、wake-gate 最近判定、audit 尾 5 行）。watchdog **不展示**（3/8 恒 unknown，数据源缺口未补，D-D）。
 - **审计**：`state/autonomy/audit.jsonl`，两类格式共存（v1 无 ts 前缀诊断行 + v2 `ts=…` 五字段行）。per-reason 进程内去重仅用于 `cat=gating`（kill 压制行内容恒定、gate-error 防 30s tick 刷屏）；`cat=wake` **每次判定落一行**（含 no-wake）；`cat=kill` 来自 `/autonomy kill/clear`。
 - **enabled 模式预期语义（R4）**：frontier 不消费 ws-mail 到信（`backlog` 只透传）→ ws-mail 到信不构成 frontier 触发 → 启用后 wake-gate 常态 no-wake（`record-only`）会压制本会 fire 的 legacy ws 唤醒；恢复 legacy 的正道 = **移除 config.json 的 autonomy 键**（kill 是压制而非恢复；clear 后需 frontier 出现真触发才放行）。

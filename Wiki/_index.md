@@ -2,7 +2,7 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-10-01
+updated: 2026-10-02
 source_paths:
   - plans/0923_decisions.md
   - extensions/hotspot/index.ts
@@ -35,8 +35,8 @@ source_paths:
 - [[GUI 消息管道与延迟贡献项]] — 消息不及时的逐项归因 + pi core 限制（`status: current`）
 - [[GUI 工作台 UI（token / 组件 / 导航）]] — 语义 token 体系、shadcn 内核 + 适配层、三栏导航契约（`status: current`）
 - [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
-- [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点与生产侧入账方现状（`status: current`）
-- [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff，零接线影子）（`status: current`）
+- [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点、生产侧入账方现状与读取面（含 Graph 只读投影）（`status: current`）
+- [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff；快照 v2，含⑧期望投影；E2.3 起接线、生产缺省 graph 源）（`status: current`）
 - [[Local Master Ensure（幂等确保）]] — 主会话按 cwd 幂等确保他仓 local master：四层授权 + 零新增权力 + 严格就绪判据 + #A 消费循环注册语义（`status: current`）
 
 ## Links Out
