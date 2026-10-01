@@ -27,6 +27,7 @@ import { normalizeExactPath } from "../recent-scopes.ts";
 import { listTasks, listWorkstreams } from "../workstreams.ts";
 import { defaultTabRunsDir, listTabDispatches, readTabResultFile, readTabState } from "../../tab-runs.ts";
 import { classifyDispatch, collectTimerByRepo, readGateStatus, reduceTabCarrier, type GateStatus, type TabNote } from "../frontier-carriers.ts";
+import { listOpenExpectations } from "../expectations.ts";
 import { normalizeRepoKey } from "./edges.ts";
 import { projectGraph } from "./project.ts";
 import { GRAPH_SNAPSHOT_VERSION, type GraphInput, type GraphRunCarrier, type GraphSnapshot } from "./types.ts";
@@ -93,6 +94,19 @@ export function collectGraphInput(opts?: CollectGraphOptions): GraphInput {
 		if (Object.keys(refs.runCarriers).length > 0) input.runCarriers = refs.runCarriers;
 		if (Object.keys(refs.projectAttention).length > 0) input.projectAttention = refs.projectAttention;
 		if (refs.history.length > 0) input.history = refs.history;
+		// ⑧ 期望账本 open 期望 → project 节点 next_expected_event（只读；never-throw，listOpenExpectations 内部容忍）。
+		const openExpectations = listOpenExpectations({ stateDir });
+		if (openExpectations.length > 0) {
+			input.openExpectations = openExpectations
+				.map((rec) => ({
+					project: rec.project,
+					expectedType: rec.expectedType,
+					deadlineAt: Date.parse(rec.deadlineAt),
+					requestId: rec.requestId,
+				}))
+				.filter((e) => Number.isFinite(e.deadlineAt)); // 坏 deadline 丢弃不猜
+			if (input.openExpectations.length === 0) delete input.openExpectations;
+		}
 		if (opts?.asof !== undefined) input.asof = opts.asof;
 		return input;
 	} catch {

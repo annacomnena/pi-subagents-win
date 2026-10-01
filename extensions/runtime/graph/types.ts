@@ -81,6 +81,21 @@ export interface GraphRunCarrier {
 	pidAlive: boolean | null;
 }
 
+/**
+ * ⑧ 期望账本 open 期望的只读引用（collect 层 `listOpenExpectations` 装配；缺 → 无 next_expected_event）。
+ * 纯投影输入：不写账本、不消费；project 为 null（未归因 / mailbox: 键）→ 不映射任何 project 节点。
+ */
+export interface GraphExpectationRef {
+	/** 归一化 repoPath（normalizeRepoKey 口径，同 normalizeExactPath）；未归因 → null。 */
+	project: string | null;
+	/** 预期回信 kind（→ project 节点 `nextExpectedEventType`）。 */
+	expectedType: string;
+	/** deadline（epoch ms；→ project 节点 `nextExpectedEventDeadline`）。 */
+	deadlineAt: number;
+	/** 请求主键（审计溯源，不参与语义比较）。 */
+	requestId: string;
+}
+
 export interface GraphProjectView {
 	/** 归一化 repoPath（normalizeRepoKey 口径，同 recent-scopes normalizeExactPath）。 */
 	project: string;
@@ -89,7 +104,7 @@ export interface GraphProjectView {
 }
 
 export interface GraphSnapshot {
-	version: 1;
+	version: 2;
 	/** journal 最后有效 seq（diff 游标）。 */
 	headSeq: number;
 	logEpoch: string;
@@ -139,6 +154,8 @@ export interface GraphInput {
 	projectAttention?: Record<string, number>;
 	/** subject（run://tab/<id>）→ carrier（只读引用共享归约，可选；缺 → 对应字段 null）。 */
 	runCarriers?: Record<string, GraphRunCarrier>;
+	/** ⑧ 期望账本 open 期望（只读引用；可选；缺 → project 节点无 next_expected_event 字段值）。 */
+	openExpectations?: GraphExpectationRef[];
 	/** hidden tab 观测载体的原始输入（project 层纯透传；**不参与 frontier 输入**）。 */
 	history?: { id: string; reason: string }[];
 	/** 诊断时间戳（ms）；缺省不发出。 */
@@ -147,7 +164,7 @@ export interface GraphInput {
 
 // ── 冻结常量 ───────────────────────────────────────────────────────
 
-export const GRAPH_SNAPSHOT_VERSION = 1 as const;
+export const GRAPH_SNAPSHOT_VERSION = 2 as const;
 
 /** Graph 认识的 journal 事件词表 = projector.ts 冻结的 run 五型（L1 §1）。 */
 export const GRAPH_RUN_EVENT_TYPES: readonly string[] = [
@@ -156,6 +173,17 @@ export const GRAPH_RUN_EVENT_TYPES: readonly string[] = [
 	"run.completed",
 	"run.failed",
 	"run.cancelled",
+];
+
+/**
+ * ⑧ 期望事件词表（v2-b 三型；`expectations.ts` 常量同体）：进 Graph 词表 → 不记
+ * `skipped.unknownEventTypes`（前向兼容改为「已知项目级事件」）。仅识别不产 run 节点
+ *（非 run:// 寻址）；project 节点 `nextExpectedEvent*` 由 `openExpectations`（账本）装配。
+ */
+export const GRAPH_EXPECTED_EVENT_TYPES: readonly string[] = [
+	"project.expected_event_set",
+	"project.expected_event_arrived",
+	"project.expected_event_timeout",
 ];
 
 /** terminal 优先不回退的状态（projector.ts#L153-L155 同口径）。 */

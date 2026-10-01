@@ -32,7 +32,7 @@ import { writeTabDispatch } from "./tab-runs.ts";
 import { collectGraphInput, readGraphSnapshot } from "./runtime/graph/collect.ts";
 import { diffGraph } from "./runtime/graph/diff.ts";
 import { isPathShapedRef, normalizeRepoKey, projectGraph } from "./runtime/graph/project.ts";
-import type { GraphInput, GraphNode } from "./runtime/graph/types.ts";
+import type { GraphInput, GraphNode, GraphRunCarrier } from "./runtime/graph/types.ts";
 
 // ── 辅助 ───────────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ try {
 		assert.deepEqual(s.edges, []);
 		assert.deepEqual(s.projects, []);
 		assert.equal(s.headSeq, 0);
-		assert.equal(s.version, 1);
+		assert.equal(s.version, 2);
 		assert.deepEqual(s.skipped, { badLines: 0, unknownEventTypes: [] });
 		// 缺省 masters = [master_default]（plan §3）：恰一个 master 节点、无边
 		const sDefault = projectGraph(gi());
@@ -315,7 +315,7 @@ try {
 			assert.equal(projectGraph(ci).nodes.find((n) => n.kind === "run")!.status, "completed");
 			// 手构期望快照（替换原恒等断言 readGraphSnapshot ≡ projectGraph∘collectGraphInput）：显式固化 collect→project 完整装配结果
 			const expectedSnapshot = {
-				version: 1,
+				version: 2,
 				headSeq: 2,
 				logEpoch: scan.logEpoch,
 				nodes: [
@@ -325,7 +325,7 @@ try {
 						kind: "run",
 						label: tabRunAddress("tab_r"),
 						status: "completed",
-						attrs: { executionKind: "tab", externalTaskId: "9001", mode: "workflow", title: "t-tab_r", phase: null, project: null },
+						attrs: { executionKind: "tab", externalTaskId: "9001", mode: "workflow", title: "t-tab_r", phase: null, project: null, gate: null, needsHuman: null, staleOver: null, overdue: null, pidAlive: null },
 						firstSeq: 1,
 						lastSeq: 2,
 					},
@@ -357,8 +357,145 @@ try {
 		}
 	});
 
-	assert.equal(passed, 13, `应跑满 13 组，实际 ${passed}`);
-	console.log("_test_runtime_graph: 13/13 组通过");
+	check("T14 carrier 五字段进 diff 面（§C6 盲区1：双写进节点 → changedNodes 可见）", () => {
+		const subj = tabRunAddress("tab_car");
+		const repo = "C:\\Repo\\Car";
+		const mk = (c: GraphRunCarrier) => projectGraph(gi({
+			journal: entriesOf([dispatchEnv("tab_car", 1)]),
+			runProjects: { [subj]: repo },
+			runPhases: { [subj]: "working" },
+			runCarriers: { [subj]: c },
+		}));
+		const baseC: GraphRunCarrier = { gate: "ok", needsHuman: false, staleOver: false, overdue: 0, pidAlive: true };
+		const base = mk(baseC);
+		const baseRun = base.nodes.find((n) => n.id === subj)!;
+		// 五字段已双写进节点 attrs（缺→null 不猜的既成模式）
+		assert.deepEqual(
+			{ gate: baseRun.attrs.gate, needsHuman: baseRun.attrs.needsHuman, staleOver: baseRun.attrs.staleOver, overdue: baseRun.attrs.overdue, pidAlive: baseRun.attrs.pidAlive },
+			{ gate: "ok", needsHuman: false, staleOver: false, overdue: 0, pidAlive: true },
+		);
+		// sinceSeq=0 → 节点新鲜；未变 → 不误报
+		assert.equal(diffGraph(base, base, 0).changedNodes.length, 0);
+		// 逐一翻转每个 carrier 字段 → changedNodes 捕获
+		const flips: Record<string, Partial<GraphRunCarrier>> = {
+			gate: { gate: "awaiting" },
+			needsHuman: { needsHuman: true },
+			staleOver: { staleOver: true },
+			overdue: { overdue: 7 },
+			pidAlive: { pidAlive: false },
+		};
+		for (const [f, patch] of Object.entries(flips)) {
+			const next = mk({ ...baseC, ...patch });
+			const d = diffGraph(base, next, 0);
+			const ids = d.changedNodes.map((n) => n.id).sort();
+			assert.ok(ids.includes(subj), `carrier ${f} 变化 → run 节点 ${subj} 在 changedNodes（§C6 盲区1 闭合）`);
+		}
+	});
+
+	check("T15 project 节点派生字段（status / needs_user / active_children）", () => {
+		const subjA = tabRunAddress("tab_pA");
+		const subjB = tabRunAddress("tab_pB");
+		const repo = "C:\\Repo\\Proj";
+		const snap = projectGraph(gi({
+			journal: entriesOf([dispatchEnv("tab_pA", 1), dispatchEnv("tab_pB", 2)]),
+			runProjects: { [subjA]: repo, [subjB]: repo },
+			runPhases: { [subjA]: "working", [subjB]: "waiting" },
+			runCarriers: {
+				[subjA]: { gate: "ok", needsHuman: true, staleOver: false, overdue: 0, pidAlive: true },
+				[subjB]: { gate: "awaiting", needsHuman: false, staleOver: false, overdue: 0, pidAlive: null },
+			},
+			projectAttention: { [repo]: 1 },
+		}));
+		const pNode = snap.nodes.find((n) => n.kind === "project")!;
+		assert.ok(pNode, "project 节点存在");
+		assert.equal(pNode.status, "Working", "非终态任一 → Working（同 frontier aggregateProject 裁定）");
+		assert.equal(pNode.attrs.needsUser, true, "needsHuman ∨ gate=awaiting ∨ attention>0");
+		assert.equal(pNode.attrs.activeRunning, 1, "working(1) 计 running");
+		assert.equal(pNode.attrs.activeWaiting, 1, "waiting(1) 计 waiting");
+
+		// 全终态 → Failed 优先（同 frontier 优先级）
+		const subjC = tabRunAddress("tab_pC");
+		const subjD = tabRunAddress("tab_pD");
+		const repo2 = "C:\\Repo\\Done";
+		const snap2 = projectGraph(gi({
+			journal: entriesOf([
+				dispatchEnv("tab_pC", 1), terminalEnv("tab_pC", "completed", 2),
+				dispatchEnv("tab_pD", 3), terminalEnv("tab_pD", "failed", 4),
+			]),
+			runProjects: { [subjC]: repo2, [subjD]: repo2 },
+			runPhases: { [subjC]: "completed", [subjD]: "failed" },
+		}));
+		const pNode2 = snap2.nodes.find((n) => n.kind === "project")!;
+		assert.equal(pNode2.status, "Failed", "全终态 → Failed 优先");
+		assert.equal(pNode2.attrs.activeRunning, 0);
+		assert.equal(pNode2.attrs.activeWaiting, 0);
+		assert.equal(pNode2.attrs.needsUser, false, "无 carrier + attention 0 → needsUser false");
+
+		// diff：未变不误报
+		assert.equal(diffGraph(snap, snap, 0).changedNodes.length, 0, "未变不误报");
+	});
+
+	check("T16 next_expected_event（词表 + 节点字段 + diff）", () => {
+		const subj = tabRunAddress("tab_ex");
+		const repo = "C:\\Repo\\Expect";
+		const setEnv = newEventEnvelope({
+			type: "project.expected_event_set",
+			source: masterAddress(),
+			subject: "workstream://ws_1",
+			at: iso(1),
+			dedupeKey: "expected_set:req1:r0",
+			payload: { requestId: "req1", project: repo, expectedType: "RESULT", deadlineAt: iso(100) },
+		});
+		const base = projectGraph(gi({
+			journal: entriesOf([dispatchEnv("tab_ex", 2), setEnv]),
+			runProjects: { [subj]: repo },
+			runPhases: { [subj]: "working" },
+			openExpectations: [{ project: repo, expectedType: "RESULT", deadlineAt: Date.parse(iso(100)), requestId: "req1" }],
+		}));
+		// 词表：expected_event_set 被识别（不进 unknown）
+		assert.deepEqual(base.skipped.unknownEventTypes, []);
+		// 节点字段：next_expected_event {type, timeout}（扁平化）
+		const pNode = base.nodes.find((n) => n.kind === "project")!;
+		assert.equal(pNode.attrs.nextExpectedEventType, "RESULT");
+		assert.equal(pNode.attrs.nextExpectedEventDeadline, Date.parse(iso(100)));
+
+		// diff：open 期望清空（回信到达→关闭）→ 节点字段变化被捕获
+		const arrived = projectGraph(gi({
+			journal: entriesOf([dispatchEnv("tab_ex", 2), setEnv]),
+			runProjects: { [subj]: repo },
+			runPhases: { [subj]: "working" },
+		}));
+		const d = diffGraph(base, arrived, 0);
+		assert.equal(d.changedNodes.length, 1, "期望关闭 → project 节点 changedNodes 捕获");
+		assert.equal(d.changedNodes[0].kind, "project");
+		assert.equal(d.changedNodes[0].attrs.nextExpectedEventType, null);
+		assert.equal(d.changedNodes[0].attrs.nextExpectedEventDeadline, null);
+
+		// 最早 deadline 选择：两个 open 期望取更早者
+		const two = projectGraph(gi({
+			journal: entriesOf([dispatchEnv("tab_ex", 2)]),
+			runProjects: { [subj]: repo },
+			runPhases: { [subj]: "working" },
+			openExpectations: [
+				{ project: repo, expectedType: "RESULT", deadlineAt: Date.parse(iso(200)), requestId: "req2" },
+				{ project: repo, expectedType: "ACK", deadlineAt: Date.parse(iso(150)), requestId: "req3" },
+			],
+		}));
+		const pNode2 = two.nodes.find((n) => n.kind === "project")!;
+		assert.equal(pNode2.attrs.nextExpectedEventType, "ACK", "取最早 deadline 的期望");
+		assert.equal(pNode2.attrs.nextExpectedEventDeadline, Date.parse(iso(150)));
+
+		// 无 run/workstream/attention 的 project 也由 open expectation 载体创建节点。
+		const expectationOnly = projectGraph(gi({
+			openExpectations: [{ project: "C:\\Repo\\ExpectationOnly", expectedType: "RESULT", deadlineAt: Date.parse(iso(300)), requestId: "req-only" }],
+		}));
+		const onlyNode = expectationOnly.nodes.find((n) => n.kind === "project")!;
+		assert.ok(onlyNode, "open expectation 是 project 节点的有效载体");
+		assert.equal(onlyNode.attrs.nextExpectedEventType, "RESULT");
+	});
+
+	assert.equal(passed, 16, `应跑满 16 组，实际 ${passed}`);
+	console.log("_test_runtime_graph: 16/16 组通过");
 } finally {
 	rmSync(ENV_DIR, { recursive: true, force: true });
 	rmSync(TAB_DIR, { recursive: true, force: true });

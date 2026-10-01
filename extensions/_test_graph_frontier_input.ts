@@ -69,7 +69,7 @@ function mkView(project: string, attention: number, runs: GraphRunRef[]): GraphP
 }
 function mkSnap(projects: GraphProjectView[], over: Partial<GraphSnapshot> = {}): GraphSnapshot {
 	return {
-		version: 1,
+		version: 2,
 		headSeq: 0,
 		logEpoch: "",
 		nodes: [],

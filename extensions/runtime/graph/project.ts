@@ -16,6 +16,7 @@ import type { RuntimeRunStatus } from "../objects.ts";
 import { cmp, deriveEdges, isPathShapedRef, normalizeRepoKey, projectNodeId } from "./edges.ts";
 import {
 	GRAPH_DEFAULT_MASTERS,
+	GRAPH_EXPECTED_EVENT_TYPES,
 	GRAPH_RUN_EVENT_TYPES,
 	GRAPH_SNAPSHOT_VERSION,
 	GRAPH_TERMINAL_RUN_STATUSES,
@@ -75,6 +76,26 @@ function terminalStatusFromType(type: string): RuntimeRunStatus | null {
 	return (GRAPH_TERMINAL_RUN_STATUSES as readonly string[]).includes(suffix) ? (suffix as RuntimeRunStatus) : null;
 }
 
+// C5 相位 → 项目态（与 autonomy/frontier.ts::mapPhaseToProjectState 逐字同体）。
+// graph 模块禁 import autonomy（A10.1 allowlist 不扩）→ 本地双写；测试 tripwire 防漂移。
+// 语义：非终态任一 → Working；全终态 → Failed > Cancelled > Completed；无 run → Working。
+const C5_TERMINAL_PHASES = new Set(["completed", "failed", "cancelled"]);
+/** phase 是否终态（completed/failed/cancelled）；null → 非终态（不猜）。 */
+export function phaseIsTerminal(phase: string | null): boolean {
+	return phase !== null && C5_TERMINAL_PHASES.has(phase);
+}
+/** 由 run phase 集合派生 project 级 status（同 frontier aggregateProject 的状态裁定）。 */
+export function projectStatusFromPhases(phases: (string | null)[]): string {
+	const nonTerm = phases.filter((p) => !phaseIsTerminal(p));
+	if (nonTerm.length > 0) return "Working";
+	if (phases.length > 0) {
+		if (phases.includes("failed")) return "Failed";
+		if (phases.includes("cancelled")) return "Cancelled";
+		return "Completed";
+	}
+	return "Working";
+}
+
 export function runIdFromSubject(subject: string): string {
 	return subject.startsWith("run://tab/") ? subject.slice("run://tab/".length) : subject;
 }
@@ -118,7 +139,10 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 		if (entry.seq > headSeq) headSeq = entry.seq;
 
 		if (!GRAPH_RUN_EVENT_TYPES.includes(envelope.type)) {
-			unknownTypes.add(envelope.type); // 前向兼容：不投影、不抛
+			// ⑧ 期望事件：进词表 → 识别（不记 unknown）；不产 run 节点（非 run:// 寻址）。
+			if (!GRAPH_EXPECTED_EVENT_TYPES.includes(envelope.type)) {
+				unknownTypes.add(envelope.type); // 前向兼容：不投影、不抛
+			}
 			continue;
 		}
 		const subject = envelope.subject;
@@ -163,12 +187,50 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 		if (isPathShapedRef(ws.workspaceRef)) projectKeys.add(normalizeRepoKey(ws.workspaceRef!));
 	}
 	for (const k of attentionByProject.keys()) projectKeys.add(k);
+	// ⑧ open expectation 是 project 级载体本身；即使当前没有 run/attention/workstream，也须能投影出 project 节点。
+	for (const e of input.openExpectations ?? []) {
+		if (e.project !== null) projectKeys.add(normalizeRepoKey(e.project));
+	}
 
 	const phaseOf = (subject: string): string | null => input.runPhases?.[subject] ?? null;
 	const projectOf = (subject: string): string | null => {
 		const raw = input.runProjects?.[subject];
 		return isPathShapedRef(raw) ? normalizeRepoKey(raw!) : null;
 	};
+
+	// 项目 → run 视图（E2 翻转输入 + ② project 节点派生共用；提前到节点段前）。
+	const runsByProject = new Map<string, GraphRunRef[]>();
+	for (const acc of runs.values()) {
+		const project = projectOf(acc.subject);
+		if (!project) continue;
+		const carrier = input.runCarriers?.[acc.subject];
+		const ref: GraphRunRef = {
+			runId: runIdFromSubject(acc.subject),
+			subject: acc.subject,
+			status: acc.status,
+			phase: phaseOf(acc.subject),
+			externalTaskId: acc.externalTaskId ?? undefined,
+			project,
+			// E2.0：carrier 缺失 → null（不猜）
+			gate: carrier?.gate ?? null,
+			needsHuman: carrier?.needsHuman ?? null,
+			staleOver: carrier?.staleOver ?? null,
+			overdue: carrier?.overdue ?? null,
+			pidAlive: carrier?.pidAlive ?? null,
+		};
+		const arr = runsByProject.get(project);
+		if (arr) arr.push(ref);
+		else runsByProject.set(project, [ref]);
+	}
+
+	// ⑧ 期望账本 → 每 project 的 next_expected_event（最早 deadline 的 open 期望；不猜）
+	const nextExpectedByProject = new Map<string, { type: string; deadline: number }>();
+	for (const e of input.openExpectations ?? []) {
+		if (e.project === null) continue; // 未归因（mailbox: 键）→ 无 project 节点
+		const key = normalizeRepoKey(e.project);
+		const cur = nextExpectedByProject.get(key);
+		if (!cur || e.deadlineAt < cur.deadline) nextExpectedByProject.set(key, { type: e.expectedType, deadline: e.deadlineAt });
+	}
 
 	// ── 节点 ──────────────────────────────────────────────────────
 	const nodes: GraphNode[] = [];
@@ -198,6 +260,8 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 		});
 	}
 	for (const acc of runs.values()) {
+		// ① carrier 五字段双写进节点 attrs（与 attention/phase/status 同模式）→ diffGraph 可见（§C6 盲区1）。
+		const carrier = input.runCarriers?.[acc.subject];
 		nodes.push({
 			id: acc.subject,
 			kind: "run",
@@ -210,18 +274,42 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 				title: acc.title,
 				phase: phaseOf(acc.subject),
 				project: projectOf(acc.subject),
+				gate: carrier?.gate ?? null,
+				needsHuman: carrier?.needsHuman ?? null,
+				staleOver: carrier?.staleOver ?? null,
+				overdue: carrier?.overdue ?? null,
+				pidAlive: carrier?.pidAlive ?? null,
 			},
 			firstSeq: acc.firstSeq,
 			lastSeq: acc.lastSeq,
 		});
 	}
 	for (const key of projectKeys) {
+		// ② project 级「只缺投影」字段：派生规则与 frontier 一致（不引入第二套语义）。
+		const projRuns = runsByProject.get(key) ?? [];
+		const attention = attentionByProject.get(key) ?? 0;
+		const phases = projRuns.map((r) => r.phase);
+		const status = projectStatusFromPhases(phases);
+		const needsUser = projRuns.some((r) => r.needsHuman === true || r.gate === "awaiting") || attention > 0;
+		const activeRuns = projRuns.filter((r) => !phaseIsTerminal(r.phase));
+		const activeWaiting = activeRuns.filter((r) => r.phase === "waiting").length;
+		const activeRunning = activeRuns.length - activeWaiting;
+		const ne = nextExpectedByProject.get(key);
 		nodes.push({
 			id: projectNodeId(key),
 			kind: "project",
 			label: key,
-			status: null,
-			attrs: { repoPath: key, attention: attentionByProject.get(key) ?? null },
+			status,
+			attrs: {
+				repoPath: key,
+				attention: attentionByProject.get(key) ?? null,
+				needsUser,
+				activeRunning,
+				activeWaiting,
+				// next_expected_event {type,timeout} 扁平化（attrs 仅接受标量）；无 open 期望 → 双 null。
+				nextExpectedEventType: ne?.type ?? null,
+				nextExpectedEventDeadline: ne?.deadline ?? null,
+			},
 			firstSeq: 0,
 			lastSeq: 0,
 		});
@@ -236,29 +324,7 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 	});
 
 	// ── 项目视图（E2 翻转输入）─────────────────────────────────────
-	const runsByProject = new Map<string, GraphRunRef[]>();
-	for (const acc of runs.values()) {
-		const project = projectOf(acc.subject);
-		if (!project) continue;
-		const carrier = input.runCarriers?.[acc.subject];
-		const ref: GraphRunRef = {
-			runId: runIdFromSubject(acc.subject),
-			subject: acc.subject,
-			status: acc.status,
-			phase: phaseOf(acc.subject),
-			externalTaskId: acc.externalTaskId ?? undefined,
-			project,
-			// E2.0：carrier 缺失 → null（不猜）
-			gate: carrier?.gate ?? null,
-			needsHuman: carrier?.needsHuman ?? null,
-			staleOver: carrier?.staleOver ?? null,
-			overdue: carrier?.overdue ?? null,
-			pidAlive: carrier?.pidAlive ?? null,
-		};
-		const arr = runsByProject.get(project);
-		if (arr) arr.push(ref);
-		else runsByProject.set(project, [ref]);
-	}
+	// runsByProject 已在节点段前装配（project 节点派生与视图共用同一 run 集）。
 	const projects: GraphProjectView[] = [...projectKeys].sort(cmp).map((project) => ({
 		project,
 		attention: attentionByProject.get(project) ?? 0,
