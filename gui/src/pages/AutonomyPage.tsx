@@ -35,7 +35,7 @@ function AutonomySettings() {
 	const refresh = useCallback(async () => { try { const r = await fetch("/v1/autonomy/status"); if (r.ok) setState(await r.json()); else setError(`状态读取失败 HTTP ${r.status}`); } catch { setError("状态读取失败"); } }, []);
 	useEffect(() => { void refresh(); }, [refresh]);
 	const toggle = async (enabled: boolean) => { try { const r = await fetch("/v1/autonomy/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }); if (!r.ok) { setError(`写入失败 HTTP ${r.status}`); return; } setError(""); await refresh(); } catch { setError("写入失败"); } };
-	return <Card title="主动性套件"><div className="space-y-2 text-xs"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；当前不执行任何自动动作（不自动派活、不自动重启 worker）。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
+	return <Card title="主动性套件"><div className="space-y-2 text-xs"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；开启动作开关后仅执行可回滚动作（诊断报告 + 本地通知信），不自动派活、不自动重启 worker。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
 }
 
 // ── frontier 可视化（C 时效 / A 项目矩阵 / B 触发记录）──────────────────────────
@@ -182,7 +182,7 @@ function FrontierViz() {
 export function AutonomyPage() {
 	return (
 		<div className="space-y-3">
-			<PageIntro>主动性套件：总门开关 + 自主性前沿（frontier）状态。当前不执行任何自动动作。</PageIntro>
+			<PageIntro>主动性套件：总门开关 + 自主性前沿（frontier）状态。开启动作开关后仅执行可回滚动作（诊断报告 + 本地通知信），不自动派活、不自动重启 worker。</PageIntro>
 			<AutonomySettings />
 			<FrontierViz />
 		</div>
