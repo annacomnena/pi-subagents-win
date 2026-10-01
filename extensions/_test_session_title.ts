@@ -147,6 +147,34 @@ const s11 = resolveSessionTitle(
 assert.deepEqual(s11, { title: "repoA-G6-V-附件包装", source: "ledger" });
 ok("T11e P1 前缀行在 <file> 块内 → 剥开标签行后命中台账");
 
+// ── T12 recent-working-set 注入块剥离（hotspot 注入恒追加在消息末尾）──
+// T12a: <file> 块 + 末尾 <recent-working-set> 块 → 不得含标签，回退 P3 id
+{
+	const txt = `<file name="x">inner</file>\n\n<recent-working-set>\n- a.ts\n</recent-working-set>`;
+	const r = deriveTitleFromFirstUserText(txt);
+	assert.ok(r === null || !r.includes("recent-working-set"), `T12a: title 不得含 recent-working-set（got: ${r}）`);
+	// 整条剥后为空 → null（回退 P3）
+	assert.equal(r, null);
+	const full = resolveSessionTitle({ sessionId: "sid-t12a", cwd: CWD_A, firstUserText: txt }, []);
+	assert.equal(full.source, "id");
+	assert.equal(full.title, "sid-t12a");
+}
+ok("T12a <file> + 末尾 <recent-working-set> → title 不含标签，回退 P3 id");
+
+// T12b: 派发前缀行 + 空行 + <recent-working-set> 块 → 不得把标签当 title
+{
+	const txt = `根据execute进行工作T1\n\n<recent-working-set>\n- b.ts\n- c.ts\n</recent-working-set>`;
+	const r = deriveTitleFromFirstUserText(txt);
+	assert.ok(r === null || !r.includes("recent-working-set"), `T12b: title 不得含 recent-working-set（got: ${r}）`);
+	// 剥掉末尾块后，首行是派发前缀行（被跳过）→ 无有意义行 → null
+	assert.equal(r, null);
+	// 若台账有命中则可走 P1（此处验证 P2 不产出标签）
+	const full = resolveSessionTitle({ sessionId: "sid-t12b", cwd: CWD_A, firstUserText: txt }, []);
+	assert.equal(full.source, "id");
+	assert.equal(full.title, "sid-t12b");
+}
+ok("T12b 派发前缀行 + 末尾 <recent-working-set> → title 不含标签");
+
 // ── T2 P1 台账命中（前缀匹配）────────────────────────────────────
 const runs1 = tmp("session-title-runs-");
 writeLedger(runs1, {

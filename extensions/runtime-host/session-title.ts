@@ -155,10 +155,12 @@ function pickLedgerTitle(cwd: string | null, firstUserText: string | null, start
 
 // ── 机器注入 XML 附件块剥离（P1 前缀 / P2 派生共用）─────────────
 
-/** 已闭合的领头附件块：`<file name="...">...</file>` / `<system-reminder>...</system-reminder>`。 */
-const LEADING_CLOSED_BLOCK = /^\s*<(file|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/i;
+/** 已闭合的领头附件块：`<file name="...">...</file>` / `<system-reminder>...</system-reminder>` / `<recent-working-set>...</recent-working-set>`。 */
+const LEADING_CLOSED_BLOCK = /^\s*<(file|system-reminder|recent-working-set)\b[^>]*>[\s\S]*?<\/\1>/i;
 /** 领头开标签但到文本尾无闭合（firstUserText 截断上限所致）：整段视附件。 */
-const LEADING_UNCLOSED_BLOCK = /^\s*<(file|system-reminder)\b[^>]*>[\s\S]*$/i;
+const LEADING_UNCLOSED_BLOCK = /^\s*<(file|system-reminder|recent-working-set)\b[^>]*>[\s\S]*$/i;
+/** 尾部追加的 `<recent-working-set>…</recent-working-set>` 块（hotspot 注入恒在消息末尾）。 */
+const TRAILING_RECENT_WORKING_SET = /\s*<recent-working-set\b[^>]*>[\s\S]*?<\/recent-working-set>\s*$/i;
 
 /**
  * 循环剥离开头的 `<file ...>...</file>` / `<system-reminder>...</system-reminder>` 块，
@@ -185,7 +187,12 @@ export function stripLeadingAttachmentBlocks(text: string): string {
  */
 export function deriveTitleFromFirstUserText(text: string | null): string | null {
 	if (text === null) return null;
-	const body = stripLeadingAttachmentBlocks(text).trim();
+	// 防御：剥掉末尾的 <recent-working-set> 块（hotspot 注入恒追加在消息末尾），
+	// 确保标签本身永远不会成为 title 首行。
+	let text2 = text;
+	const trailingMatch = TRAILING_RECENT_WORKING_SET.exec(text2);
+	if (trailingMatch !== null) text2 = text2.slice(0, trailingMatch.index);
+	const body = stripLeadingAttachmentBlocks(text2).trim();
 	if (body.length === 0) return null;
 	const firstLine =
 		body
