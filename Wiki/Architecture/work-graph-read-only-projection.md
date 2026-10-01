@@ -2,7 +2,7 @@
 title: Work Graph 只读关系面
 kind: concept
 status: current
-updated: 2026-09-24
+updated: 2026-10-02
 source_paths:
   - extensions/runtime/graph/types.ts#L16-L150
   - extensions/runtime/graph/edges.ts#L22-L44
@@ -23,6 +23,8 @@ source_paths:
   - extensions/_test_graph_frontier_shadow.ts#L775-L815
   - extensions/runtime/autonomy/collect.ts#L104-L124
   - extensions/runtime/autonomy/collect.ts#L142-L148
+  - extensions/runtime/autonomy/collect.ts#L24-L25
+  - extensions/runtime/autonomy/collect.ts#L153-L156
   - extensions/_test_graph_frontier_shadow.ts#L800-L1000
   - extensions/runtime/graph/index.ts#L7-L11
   - extensions/_test_runtime_graph.ts#L87-L358
@@ -101,7 +103,7 @@ E2.0 把 frontier 消费的载体补齐到 Graph 只读投影，并把 carrier �
 
 ### E2.1 契约：`toFrontierInput` 适配器（Graph → frontier 输入，零接线）
 
-E2.1 新增**纯函数** `toFrontierInput(snap, {now})`（`graph/frontier-input.ts#L55`）：把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`（`autonomy/frontier.ts#L116`，其 `FrontierSourceTab` `#L103`），为 E2.2 影子对照冻结输入契约。**零生产接线**：`frontier-input.ts` 不被任何生产文件 import，只被 `_test_graph_frontier_input.ts` 消费（`extensions/index.ts`/`graph/index.ts` 未加导出面）；`autonomy/frontier.ts` 仅做**类型放宽**（`FrontierInputs.snapshot` 改结构化接口 `#L124`，`buildFrontier` 算法体与 v2 调用点零改）。
+E2.1 新增**纯函数** `toFrontierInput(snap, {now})`（`graph/frontier-input.ts#L55`）：把 `GraphSnapshot` 投影为 `FrontierSourceSnapshot`（`autonomy/frontier.ts#L116`，其 `FrontierSourceTab` `#L103`），为 E2.2 影子对照冻结输入契约。**零生产接线（E2.1 阶段快照，已被 E2.3 超越）**：`frontier-input.ts` 当时不被任何生产文件 import，只被 `_test_graph_frontier_input.ts` 消费（`extensions/index.ts`/`graph/index.ts` 未加导出面）；**E2.3 起已由 `extensions/runtime/autonomy/collect.ts#L24-L25` 条件 import（env `PI_AUTONOMY_FRONTIER_SOURCE==="graph"` 才走，缺省仍 v2，见下方 E2.3 契约）**；`autonomy/frontier.ts` 仅做**类型放宽**（`FrontierInputs.snapshot` 改结构化接口 `#L124`，`buildFrontier` 算法体与 v2 调用点零改）。
 
 契约（`frontier-input.ts#L16-L76`）：
 
