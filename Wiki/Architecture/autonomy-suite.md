@@ -2,9 +2,9 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-09-30
+updated: 2026-10-01
 source_paths:
-  - extensions/runtime/autonomy/config.ts
+  - extensions/runtime/autonomy/config.ts::normalizeAutonomy
   - extensions/runtime/autonomy/frontier.ts
   - extensions/runtime/autonomy/kill-switch.ts
   - extensions/runtime/expectations.ts
@@ -12,7 +12,18 @@ source_paths:
   - extensions/runtime/autonomy/watchdog.ts
   - extensions/runtime/autonomy/collect.ts
   - extensions/runtime/autonomy/gate.ts
-  - extensions/runtime/wake.ts
+  - extensions/runtime/autonomy/action/policy.ts::decide
+  - extensions/runtime/autonomy/action/policy.ts::BUDGET
+  - extensions/runtime/autonomy/action/breaker.ts::readBreaker
+  - extensions/runtime/autonomy/action/ledger.ts::appendActionEvent
+  - extensions/runtime/autonomy/action/gitguard.ts::discoverRepoRoot
+  - extensions/runtime/autonomy/action/gitguard.ts::gitPrecheck
+  - extensions/runtime/autonomy/action/classes/report.ts::diagnosticReportClass
+  - extensions/runtime/autonomy/action/run.ts::runAutonomyActions
+  - extensions/runtime/autonomy/action/run.ts::undoAction
+  - extensions/runtime/autonomy/action/run.ts::summarizeActionsStatus
+  - extensions/runtime/autonomy/action/replay.ts::queryActionsUndo
+  - extensions/runtime/wake.ts#L111-L116
   - extensions/master-tools.ts
   - extensions/index.ts
   - extensions/runtime-host/autonomy-config.ts
@@ -64,6 +75,21 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **注册快照**（`_test_register_graph.ts`）：commands +`autonomy`（纯机械追加）；同批修复存量漂移（tools 与 commands 均补 `global-view`，0923 首阶段注册未同步快照所致）。
 - **默认关闭零行为**（硬约束）：config 无 `autonomy` 键时 `evaluateWakes` 输出与 legacy 期望同构 + `state/autonomy/` 零新文件 + masterStatusLogic 无 `autonomy:` 行（W1/W1b 端到端）；生产默认路径唯一额外成本 = 每 tick 一次包根 `config.json` 读。
 
+### 动作面（actions）P1：默认关闭的可回滚动作子系统
+
+子系统 `extensions/runtime/autonomy/action/`，让 autonomy 具备**可回滚的最小动作能力**（P1 唯一动作类 = `diagnostic-report` 只读诊断报告）。语义纪律与 wake 面相反：**动作面全链 fail-closed**——任何 unknown / 读失败 / 异常一律拒绝（区别于 wake 面 fail-open 与 kill-switch 容忍读：**观察面容忍、动作面 fail-closed**）。
+
+- **默认关闭（硬约束）**：总入口 `runAutonomyActions` 挂在 `wake.ts:evaluateWakes` 的 autonomy gate 块后（+1 import +1 个 never-throw 调用，`wake.ts#L111-L116`）；门 = **双层合取** `cfg.enabled===true && cfg.actions?.enabled===true`（`run.ts::runAutonomyActions`；config 切片 `actions:{enabled}` 严格 `===true` 归一，`config.ts::normalizeAutonomy`）。默认（无 `actions` 键）⇒ 除一次 config 读外**零 IO、零新文件**；W1c 断言此时 `evaluateWakes` 完整序列化输出与 legacy **逐字节同构** + `state/autonomy/actions*` 零新文件。动作只写自有 namespace `<stateDir>/autonomy/actions/**`，不搭 legacy 唤醒 spawn 通道（结构性防火墙）。
+- **动作类与效应面边界**：白名单 `ACTION_CLASS_ALLOWLIST={diagnostic-report}` × `TRIGGER_ALLOWLIST={working_to_failed, stagnation}`（approximate trigger 一律不动手，`policy.ts`）。效应面**仅** `<stateDir>/autonomy/actions/reports/`（`classes/report.ts::diagnosticReportClass.allowedPrefixes`）；`withinSurface` 目录前缀判定在 policy 层与 TOCTOU 复验各查一次，越界 = DENY(namespace-escape)。效应只创建/覆盖写、**永不 unlink 既有文件** ⇒ `deletedFiles` 恒 `[]`，非空 = 违规 → 立即熔断冻结。
+- **许可判据（三工程纪律，取代环境隔离路线）**：可回滚判据 = **git 版本管理做好 + 文件夹分好 + 不删除原有文件**（D4 裁定：隔离路线被否决，spec `plans/20261001_autonomy_actionable_design.md` §6.3），机械执行在 `gitguard.ts`：仓根默认 `git rev-parse --show-toplevel` 自动发现（发现失败 = null = fail-closed 拒绝，调用方不需显式传）；动作前 `git status --porcelain` 记基线，动作后 porcelain **逐项比对**，任何新条目 = 违规 → 回退 + 熔断冻结；tracked 文件路径（P3 才出现）前置 dirty 即 DENY，且 autonomy **不代人 commit**。
+- **决策树 L0–L3**（`policy.ts::decide`，纯零 IO，输入由 run.ts 从 fail-closed 读装配）：L0 总门（actionsEnabled / kill 在场 / breaker 可读且未 trip / isOwner）→ L1 白名单（trigger × class 双在册 + 非 approximate）→ L2 可回滚四要件（closure/snapshot/rollback/postverify/lease，unknown 一律 false → DENY）→ L3 预算熔断；verdict ∈ `AUTO_EXEC | SKIP | DENY | HUMAN`（HUMAN 仅作上层呈现，P1 无 HUMAN 出口——永久交人的 trigger 在白名单外已被 DENY 拦截）。
+- **预算/熔断常量**（`policy.ts::BUDGET`，**硬编码不可经 config 放大**，config 只许收紧）：每 tick 新动作 1、全局在途 1（串行化 ⇒ 回退归因无歧义）、滚动 1h ≤2、同 trigger×class×project 连败 2 停、rule:project 1h 去重 → SKIP(cooldown)、单动作读 ≤256KB、墙钟 ≤5s、frontier 快照逾 2 tick → TOCTOU SKIP(stale)。计数持久化 `state/autonomy/actions/breaker.json`（原子 tmp+rename）：**文件不存在 = 首次零计数（合法起点）；存在但损坏/形状漂移 = 读不到 = 拒绝动作**（防崩溃清零刷额度）；**失败尝试也占额度**。五类「可回滚承诺被证伪」→ `tripBreaker`（tripped+frozen，拒绝一切后续动作），仅人工 `clearActionsBreaker` 可解（非 autonomy 自主）。
+- **账本**：动作事件**只进** `state/autonomy/actions/actions.jsonl`（append mode **0600** + **~1MB 两代 rename 轮转**，`ledger.ts`），**audit.jsonl 零污染**——W5 冻结行格式与 W6「单次评估恰 3 行」体积基线一字不动；账本写不进 = 不留无审计的动作（emit 失败 → 拒绝）。事件 kind：`attempted` / `precheck`（L0–L3 逐项实判）/ `executed`（effect + rollbackHandle）/ `postverified` / `rolled_back` / `rollback_failed` / `frozen` / `rejected` / `skipped`；`POLICY_VERSION=actions-v1`。
+- **事务包裹与回退**（`run.ts::runOneAction`）：attempted → 快照落盘（`actions/snaps/<id>/`，原字节/权限/存在性）→ precheck → **TOCTOU 最后入口复验**（重读 frontier 快照时效 + 目录前缀 + breaker 复读 + 预算复验）→ 原子写 effect → executed → postverify 回读比对；失配 → 按快照回退 + 回退后复验（复验失败 = 熔断冻结）；git 后置 porcelain 一致才 `postverified`。`undoAction(id)` 按账本快照句柄做动作级回退——无句柄 / 快照不可读 = 如实报 + 熔断（不猜）。
+- **回放三问**（`replay.ts`，纯只读 never-throw）：① 做了什么 `queryActionsWhat`（ts ≥ since，kind ∈ {attempted, executed}）；② 为什么 `queryActionsWhy`（首事件 trigger + intent + policyVersion）；③ 能不能撤 `queryActionsUndo`（终态 = 已撤 / 不可撤已冻结 / 可撤（快照 meta.json 全可读）/ 无法保证可撤 / 未知终态）。
+- **可见性**：`/autonomy status` 尾行 = `summarizeActionsStatus()`（never-throw ≤5 行；未启用且无记录 → 单行 `actions: disabled/无记录`；否则 `actions: enabled=… breaker=…` + 最近一条动作，`index.ts#L2046-L2056`）。
+- **测试基线**：`npm run test:autonomy-actions`（`_test_runtime_autonomy_actions.ts`）**63 checks**（决策树矩阵 / 事务四行 / git 前后置 / 熔断预算 / 回退 / 回放三问）；`_test_runtime_autonomy.ts` **60 checks**；`_test_autonomy_wiring.ts` **15 checks**（含 W1c 默认关逐字节同构 + `state/autonomy/actions*` 零新文件断言）。
+
 ## 接线落点与边界（v2 已接线形态）
 
 - **总门**：`wake.ts:evaluateWakes` 顶层（套件级门，不是 ws 级；cutover off / non-owner 提前返回不触本层——省 IO）。per-repo scope wake（`scope.ts`/`mailbox-consumer.ts` 平行接线面）**未接**，列后续。
@@ -110,6 +136,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
   - `npx tsx extensions/_test_autonomy_wiring.ts`（新，W1/W1b/W2.1–W2.5/W3/W4.1–W4.4/W5/W6）→ **all 14 checks passed**；W1 默认关闭端到端（显式注入 temp no-key config，不依赖包根现状——R10）、W2 kill 演练两层断言（evaluateWakes 层只断返回值；gate 层 temp agentDir 断 reason：首帧 `record-only`）、W5 五字段行格式 + 消毒 + never-throw、W6 单次完整评估 = frontier 1 + watchdog 1 + `cat=wake` 恰 1（3 行基线）。
   - `npm run smoke:extension-load` → extension load OK；`_test_runtime_wake.ts`/`_test_runtime_master_control.ts`（含 masterStatusLogic 文案 parity）/`_test_local_master.ts`/register-graph 本体全绿。
   - tab 内独立 L4 审查：`plans/0923_autonomy_suite_v2_review.md`（**PASS-WITH-MUST-FIX，must-fix 0**；残余风险 5 条见 Open Questions）。
+- 动作面 P1（2026-10-01 实测）：`npx tsx extensions/_test_runtime_autonomy_actions.ts` → **all 63 checks passed**；`npx tsx extensions/_test_runtime_autonomy.ts` → **all 60 checks passed**；`_test_autonomy_wiring.ts` 15 checks（W1c 默认关逐字节同构 + actions 零新文件断言）。源码：`extensions/runtime/autonomy/action/{policy,breaker,ledger,gitguard,run,replay}.ts` + `action/classes/report.ts`；接线 `extensions/runtime/wake.ts#L111-L116`；`/autonomy status` 尾行 `extensions/index.ts#L2046-L2056`；config 切片 `extensions/runtime/autonomy/config.ts::normalizeAutonomy`；npm script `package.json::test:autonomy-actions`。
   - v2 计划/实现：`plans/0923_autonomy_suite_v2_plan.md`（7 裁定 D-A~D-H + 接线点清单）、`plans/0923_autonomy_suite_v2_impl.md`（逐文件行段 + 偏差 8 条，其中偏差 1 修正了原计划对空盘面二帧 reason 的错误预期：实为 `record-only` 非 `no-meaningful-change`）。
 - GUI 落点（2026-09-30）：`gui/src/pages/AutonomyPage.tsx`（AutonomySettings + FrontierViz）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS 六值）、`gui/src/store.ts:38`、`gui/src/api/client.ts:147`（`autonomyFrontier`）、`extensions/runtime-host/server.ts:1243-1267`（frontier 路由）；提交 `d321c50`（只读 frontier 端点）、`6ee8191`（覆盖层第 6 section + AutonomySettings 迁出微信页）、`661c8f2`（FrontierViz）、`39e6677`（读失败不留加载态 + Toggle focus 环）。
 
@@ -128,4 +155,4 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **envelope.priority 队列仍 pending**（L1-B 未决 3，独立接线面）。
 - `no-meaningful-change` 分支在 collect 生产路径休眠（recordOnly 恒非空，frontier.ts:281）；`maintainBatchAnchor` 的"全空 diff 重置"分支同源休眠（W4.4 单测覆盖）。
 - frontier 不消费 ws-mail 到信（R4，见"接线落点与边界"）；debounce 2s / cooldown 15s 在 30s tick 下近似 inert（R6；事件驱动/缩短 interval 后续）。
-- 审计 `concl` 参数当前为普通 `string`，依赖内部调用者传固定常量（L4 残余风险 5：可收窄为字面量联合类型或消毒强化契约）。
+- ~~审计 `concl` 参数当前为普通 `string`，依赖内部调用者传固定常量（L4 残余风险 5：可收窄为字面量联合类型或消毒强化契约）~~ **已解决**：`appendAuditEvent` 的 `concl` 已收窄为 7 值字面量联合 `AuditConcl`（`engage|clear|wake|no-wake|pass|enable|disable`，`collect.ts::AuditConcl`），全仓调用点与发射值不变，W5 冻结行格式正则不受影响。
