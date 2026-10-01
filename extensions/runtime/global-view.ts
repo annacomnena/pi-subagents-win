@@ -359,7 +359,7 @@ export function collectGlobalView(opts: GlobalViewOptions = {}): GlobalViewSnaps
 				let repoPath = rec.cwd;
 				try { repoPath = findRepoRoot(rec.cwd, repoCache); } catch { /* keep cwd */ }
 				runToRepo.set(rec.id, repoPath);
-				const note = classifyDispatch(rec, runsDir);
+				const note = classifyDispatch(rec, runsDir, now);
 				const atMs = toMs(note.at) ?? 0;
 				if (note.hiddenKind === "orphaned") {
 					orphaned++; noResult++;

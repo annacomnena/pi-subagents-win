@@ -151,7 +151,7 @@ function readTabRunRefs(runsDir: string, sessionsRoot: string, timersDir: string
 		try {
 			const repoPath = d.cwd ? findRepoRoot(d.cwd, cache) : d.cwd;
 			runToRepo.set(d.id, repoPath);
-			notes.set(d.id, classifyDispatch(d, runsDir));
+			notes.set(d.id, classifyDispatch(d, runsDir, now));
 		} catch {
 			continue; // 单条坏 → 跳过（不炸整体）
 		}

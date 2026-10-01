@@ -300,7 +300,7 @@ export function probeSessionFile(
  */
 export function classifyTabStatus(
 	probe: SessionProbe | null,
-	opts?: { hasResult?: boolean; graceMs?: number; dispatchedAt?: string },
+	opts?: { hasResult?: boolean; graceMs?: number; dispatchedAt?: string; now?: number },
 ): TabStatus {
 	if (opts?.hasResult) {
 		// 显式结果文件优先：终态由结果文件给出（本函数不读文件，仅标记）
@@ -320,7 +320,7 @@ export function classifyTabStatus(
 		// P1-1：无匹配且超过 grace 宽限 → orphaned（标签页早夭/从未附着，收敛到可重派）
 		const dispatchedMs = opts?.dispatchedAt ? Date.parse(opts.dispatchedAt) : NaN;
 		const graceMs = opts?.graceMs ?? 5 * 60_000;
-		const now = Date.now();
+		const now = opts?.now ?? Date.now();
 		if (!Number.isNaN(dispatchedMs) && now > dispatchedMs + graceMs) {
 			return {
 				phase: "orphaned",
@@ -810,8 +810,9 @@ export function composeTabStatus(opts: {
 	/** P1-1：orphaned grace 判定所需（由 buildTabStatusView 透传 dispatch.dispatchedAt）。 */
 	dispatchedAt?: string;
 	graceMs?: number;
+	now?: number;
 }): TabStatusView {
-	const { runId, dispatch, state, result, probe, dispatchedAt, graceMs } = opts;
+	const { runId, dispatch, state, result, probe, dispatchedAt, graceMs, now } = opts;
 
 	// 1) 显式结果：唯一工作流终态来源
 	if (result) {
@@ -851,7 +852,7 @@ export function composeTabStatus(opts: {
 	}
 
 	// 3) JSONL 探活（保守；无匹配时按 dispatchedAt+grace 收敛 orphaned）
-	const status = classifyTabStatus(probe, { dispatchedAt, graceMs });
+	const status = classifyTabStatus(probe, { dispatchedAt, graceMs, now });
 	return {
 		runId,
 		dispatch,

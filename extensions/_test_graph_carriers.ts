@@ -53,7 +53,7 @@ const state = (id: string, phase: string, terminal: boolean, atMs: number, extra
 	write(join(runsDir, `${id}.state.json`), { id, phase, turn: "working", terminal, lastActivityAt: iso(atMs), ...extra });
 
 // ── fixture ────────────────────────────────────────────────────────
-const FAR_PAST = new Date(Date.now() - 100 * HOUR).toISOString();
+const FAR_PAST = iso(NOW - 100 * HOUR);
 const recs: TabDispatchRecord[] = [
 	{ id: "w_stale", version: 1, taskId: "A1", mode: "workflow", cwd: repoA, dispatchedAt: iso(NOW - 3 * HOUR), dispatchStatus: "dispatched" },
 	{ id: "p_probe", version: 1, taskId: "PT1", mode: "workflow", cwd: repoB, dispatchedAt: iso(NOW - 3 * HOUR), dispatchStatus: "dispatched" },
@@ -132,7 +132,7 @@ function legacyBuildTabDetail(rec: TabDispatchRecord, rDir: string, sRoot: strin
 		let resultMissing = !result;
 		let reclaim: string = "pending";
 		try {
-			const view = composeTabStatus({ runId: rec.id, dispatch: rec, state: st, result, probe, dispatchedAt: rec.dispatchedAt });
+			const view = composeTabStatus({ runId: rec.id, dispatch: rec, state: st, result, probe, dispatchedAt: rec.dispatchedAt, now });
 			phase = view.phase; terminal = view.terminal; resultMissing = view.resultMissing;
 			reclaim = classifyForReclaim(view);
 		} catch { /* keep */ }
@@ -304,7 +304,7 @@ try {
 		// runToRepo = 装配层内部的 dispatch runId→repo（mail timer 的 run 名若不在账本则不映射）
 		const agg = collectTimerByRepo(timersDir, NOW, new Map(recs.map((r) => [r.id, r.cwd])));
 		for (const rec of recs) {
-			const note = classifyDispatch(rec, runsDir);
+			const note = classifyDispatch(rec, runsDir, NOW);
 			if (note.hiddenKind !== null) continue;
 			const gk = normalizeExactPath(rec.cwd);
 			let gate = gateCache.get(gk) ?? readGateStatus(rec.cwd, warnings);
@@ -318,7 +318,7 @@ try {
 			assert.equal(actual!.overdue, agg.byRepo.get(gk)?.overdue ?? 0, `overdue 回填不一致: ${rec.id}`);
 		}
 		// details 数量 = 可见 tab 数
-		const visible = recs.filter((r) => classifyDispatch(r, runsDir).hiddenKind === null).length;
+		const visible = recs.filter((r) => classifyDispatch(r, runsDir, NOW).hiddenKind === null).length;
 		assert.equal(snap.details.length, visible);
 	});
 

@@ -136,7 +136,7 @@ export function readGateStatus(repoPath: string, warnings: string[]): GateStatus
 export interface TabNote { phase: string; active: boolean; attention: boolean; hiddenKind: "orphaned" | "terminal" | null; noResult: boolean; at: string }
 
 /** 单条 dispatch 的可见性/attention 分流（visible = hiddenKind===null）。 */
-export function classifyDispatch(rec: TabDispatchRecord, runsDir: string): TabNote {
+export function classifyDispatch(rec: TabDispatchRecord, runsDir: string, now?: number): TabNote {
 	const at = rec.dispatchedAt;
 	try {
 		const result = readTabResultFile(runsDir, rec.id);
@@ -155,7 +155,7 @@ export function classifyDispatch(rec: TabDispatchRecord, runsDir: string): TabNo
 			const att = state.phase === "attached" || state.phase === "working" || state.phase === "waiting";
 			return { phase: state.phase, active: att, attention: state.phase === "working" || state.phase === "waiting" ? false : att, hiddenKind: null, noResult: true, at: state.lastActivityAt ?? at };
 		}
-		const st = classifyTabStatus(null, { dispatchedAt: rec.dispatchedAt });
+		const st = classifyTabStatus(null, { dispatchedAt: rec.dispatchedAt, now });
 		if (st.phase === "orphaned") return { phase: "orphaned", active: false, attention: false, hiddenKind: "orphaned", noResult: true, at };
 		return { phase: st.phase, active: true, attention: st.phase === "unconfirmed", hiddenKind: null, noResult: true, at };
 	} catch {
@@ -253,7 +253,7 @@ export function reduceTabCarrier(input: TabCarrierInput): TabDetail | null {
 		let resultMissing = !result;
 		let reclaim: string = "pending";
 		try {
-			const view = composeTabStatus({ runId: rec.id, dispatch: rec, state, result, probe, dispatchedAt: rec.dispatchedAt });
+			const view = composeTabStatus({ runId: rec.id, dispatch: rec, state, result, probe, dispatchedAt: rec.dispatchedAt, now });
 			phase = view.phase; terminal = view.terminal; resultMissing = view.resultMissing;
 			reclaim = classifyForReclaim(view);
 		} catch { /* 保持 state/result 直读值 */ }
