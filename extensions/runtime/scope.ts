@@ -271,7 +271,7 @@ function describeLetter(letter: Letter): WakeLetter {
  * 返回 fileId（= spool 文件名去 .json，F7 命名不变量：文件名恒等于 messageId，
  * message/command 皆然）供定向 claim。
  */
-function listScopeWakeLetters(addr: ObjectAddress, mailboxDir: string): Array<{ fileId: string; letter: Letter }> {
+function listScopeWakeLetters(addr: ObjectAddress, mailboxDir: string, now: number, reclaimAfterMs: number = 10 * 60 * 1000): Array<{ fileId: string; letter: Letter }> {
 	const dir = mailboxDirFor(addr, mailboxDir);
 	if (!existsSync(dir)) return [];
 	const out: Array<{ fileId: string; letter: Letter }> = [];
@@ -279,7 +279,15 @@ function listScopeWakeLetters(addr: ObjectAddress, mailboxDir: string): Array<{ 
 		if (!f.endsWith(".json")) continue;
 		try {
 			const letter = JSON.parse(readFileSync(join(dir, f), "utf8")) as Letter;
-			if (letter.status !== "pending") continue;
+			if (letter.status === "pending") {
+				// pending：可唤醒
+			} else if (letter.status === "claimed" && letter.claimedAt) {
+				// stale claimed：上轮 spawn 失败留 claimed，超 reclaimAfterMs 才可重新唤醒（防重复唤醒）
+				const age = now - Date.parse(letter.claimedAt);
+				if (!(Number.isFinite(age) && age > reclaimAfterMs)) continue;
+			} else {
+				continue; // delivered / acked / expired：不纳入
+			}
 			if (!isScopeWakeLetter(letter)) continue; // REPORT 形态：不是它的信，只读不 claim
 			out.push({ fileId: f.slice(0, -".json".length), letter });
 		} catch {
@@ -341,7 +349,7 @@ export function evaluateScopeWake(opts: ScopeWakeOptions): ScopeWakeDecision {
 
 	let wake: Array<{ fileId: string; letter: Letter }>;
 	try {
-		wake = listScopeWakeLetters(addr, opts.mailboxDir ?? defaultMailboxDir());
+		wake = listScopeWakeLetters(addr, opts.mailboxDir ?? defaultMailboxDir(), now);
 	} catch {
 		return { scope: opts.scope, fire: false, reason: "no-mail", letters: [], repoCwd: repoCwdOf(att) };
 	}

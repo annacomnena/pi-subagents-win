@@ -469,6 +469,49 @@ const lastSuppression = (): Record<string, unknown> | null => {
 	assert.equal(d3.reason, "not-owner");
 }
 
+
+// U5b — stale claimed reclaim 可达性（bug ② 修复验证）
+// ════════════════════════════════════════════════════════════════════════
+{
+	const repoStale = mkGitRepo('repoStaleReclaim');
+	const scopeStale = localMasterScope(repoStale.cwd);
+	const addrStale = localMasterAddress(scopeStale);
+	silentScopeGenesis('sess-stale', repoStale.cwd);
+	assert.equal(readAttachment(addrStale)!.sessionId, 'sess-stale', '前置：scope owner 在位');
+
+	// 投一条 wake 命令 → 第一次 evaluateScopeWake 会 claim
+	deliverCommand(wakeCommand(addrStale, 'stale-1', { note: '测试 stale reclaim' }));
+	const d1 = evaluateScopeWake({ sessionId: 'sess-stale', scope: scopeStale });
+	assert.equal(d1.fire, true, 'U5b: 首次 fire（claim pending 信）');
+	assert.equal(d1.letters.length, 1);
+
+	// 此时信已 claimed（fresh）→ 不得再次 fire（防重复唤醒）
+	const d2 = evaluateScopeWake({ sessionId: 'sess-stale', scope: scopeStale });
+	assert.equal(d2.fire, false, 'U5b: fresh claimed → fire=false（防重复唤醒）');
+	assert.equal(d2.reason, 'no-mail', 'fresh claimed 不可达（no-mail）');
+
+	// 拨钟：claimed 超过 10min → stale reclaim 可达
+	// 直接改写信文件的 claimedAt 为 11min 前（使 listScopeWakeLetters 和 claimLetters 同口径判 stale）
+	const dirStale0 = mailboxDirFor(addrStale);
+	const files0 = readdirSync(dirStale0).filter((f) => f.endsWith('.json'));
+	const letterFile0 = join(dirStale0, files0[0]!);
+	const letterObj0 = JSON.parse(readFileSync(letterFile0, 'utf8')) as Letter;
+	letterObj0.claimedAt = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+	writeFileSync(letterFile0, JSON.stringify(letterObj0), 'utf8');
+	const d3b = evaluateScopeWake({ sessionId: 'sess-stale', scope: scopeStale });
+	assert.equal(d3b.fire, true, 'U5b: stale claimed（>10min）→ fire=true');
+	assert.equal(d3b.letters.length, 1, 'stale 信被重新领取');
+
+	// 验证 claimedAt 已更新（claimLetters 原子重领）
+	const dirStale = mailboxDirFor(addrStale);
+	const files = readdirSync(dirStale).filter((f) => f.endsWith('.json'));
+	const letterNow = JSON.parse(readFileSync(join(dirStale, files[0]!), 'utf8')) as Letter;
+	assert.equal(letterNow.status, 'claimed');
+	assert.ok(letterNow.claimedAt, 'claimedAt 已更新');
+	const claimedAtMs = Date.parse(letterNow.claimedAt!);
+	assert.ok(Math.abs(claimedAtMs - Date.now()) < 60_000, 'claimedAt 更新为当前时间（非 stale 时刻）');
+}
+
 // ════════════════════════════════════════════════════════════════════
 // U6 — registerScopeWakeLoop（S4）
 // ════════════════════════════════════════════════════════════════════
