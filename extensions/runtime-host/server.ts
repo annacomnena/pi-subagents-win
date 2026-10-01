@@ -26,7 +26,9 @@
  *   - `GET /v1/timeline?limit=<opt>`（G3）journal 全事件 + 状态条目 + 溯源 enrichment
  *     （timeline.ts 纯函数；at 升序尾部 N 条，默认 200，拍板②）。
  *     与 /v1/events 分工正交（G2 research ④）：events = 低延迟增量，attention/timeline = 首屏全量 + 轮询。
- *   - `POST /v1/commands`（G4）：**唯一命令入口**（mailbox 命令信不消费）。同步执行、
+ *   - `POST /v1/commands`（G4）：**唯一 HTTP 命令入口**（mailbox 命令信由
+ *     `extensions/mailbox-consumer.ts` 的专属链消费——仅 master_default 域、fencing claim 链，
+ *     不经本端点）。同步执行、
  *     同步回执；业务全在 runtime/command-executor.ts 纯库（本文件只做薄绑定）；方法门
  *     放宽仅此路径（GET 全放行 + POST 仅 /v1/commands，其余 405）。G6-P2 起 fail-closed
  *     token 认证（X-Command-Token header / Cookie sw_host_token，同 P1 token 面；无/错 → 401）。
