@@ -62,6 +62,13 @@ import {
 import { recordConsumeTick } from "./runtime/scope-consume.ts";
 import { matchAndCloseExpectationSafe, materializeTimeoutNotices } from "./runtime/expectations.ts";
 
+// ── 打开 graph frontier 源（20261002_graph_completion ③；eval A3：flag 无人设置，生产实跑 v2）──
+// 生产唤醒链 evaluateWakes → evaluateAutonomyWakeGate → collectAutonomyInputs 在本进程（pi 扩展宿主，
+// 本文件由 index.ts 注册）执行；daemon/server.ts 不跑 evaluateWakes，故在 daemon 注入无效。
+// 单点开关保持 E2.3「缺省 v2」逃生舱语义：仅当进程未显式设置时默认 graph——环境已设（如 "v2"）
+// 不覆盖；revert 本行即回缺省 v2，无状态迁移（frontier.json 两版 schema 兼容、prev 不清空）。
+if (!process.env.PI_AUTONOMY_FRONTIER_SOURCE) process.env.PI_AUTONOMY_FRONTIER_SOURCE = "graph";
+
 export interface ConsumeOptions {
 	sessionId: string | undefined;
 	recipient?: ObjectAddress;

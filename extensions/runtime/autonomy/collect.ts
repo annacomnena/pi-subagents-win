@@ -161,7 +161,9 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 		const prev = readFrontierSnapshot({ stateDir });
 		// ⑧ 期望账本（0928 P2）：账本存在 → 传 open 列表（recordOnly 3→2，⑧ 可进 triggers）；
 		// 不存在 → 不传字段（undefined ⟺ 本进程可见的账本不存在 ⟺ 真 no-carrier，维持 3 条）。
-		// 与 frontier source 选哪条分支（PI_AUTONOMY_FRONTIER_SOURCE）正交——期望账本不经 Graph。
+		// 与 frontier source 选哪条分支（PI_AUTONOMY_FRONTIER_SOURCE）正交：frontier ⑧ 触发走本层
+		// readExpectationInputs；Graph 侧（graph/collect.ts）另只读装配 open 期望进 project 节点
+		// next_expected_event 投影（纯投影，不改 frontier 语义、不写账本、不动 protocol.ts）。
 		const expectations = readExpectationInputs({ stateDir });
 		const overdueRequests = expectations
 			? expectations.filter((e) => now > e.deadlineAt).map((e) => e.requestId).sort()
