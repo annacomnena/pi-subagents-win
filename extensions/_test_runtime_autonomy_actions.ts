@@ -54,6 +54,7 @@ import {
 import { gitPostcheck, gitPorcelain, gitPrecheck } from "./runtime/autonomy/action/gitguard.ts";
 import { diagnosticReportClass, type FileSnapshot } from "./runtime/autonomy/action/classes/report.ts";
 import { runAutonomyActions, summarizeActionsStatus, undoAction } from "./runtime/autonomy/action/run.ts";
+import { queryActionsWhat, queryActionsWhy, queryActionsUndo } from "./runtime/autonomy/action/replay.ts";
 import { writeFrontierSnapshot } from "./runtime/autonomy/collect.ts";
 import { attachMaster } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
@@ -819,7 +820,7 @@ check("config 归一：actions 严格 === true；缺键/垃圾 = false", () => {
 
 // ════════════════════════════ never-throw IO 故障注入 ════════════════════════════
 console.log("never-throw IO 故障注入（拒绝且不抛 + 账本/状态如实）");
-check("IO：ledger 追加失败（actions.jsonl 为目录 ⇒ EISDIR）⇒ 不抛 + 账本如实（[]）", () => {
+check("IO：ledger 追加失败（actions.jsonl 为目录 ⇒ EISDIR）⇒ 不抛 + 拒绝 + 无 effect + 无 postverified", () => {
 	const { root, state, cfgOn } = freshState("io-ledger");
 	try {
 		// 使 actions.jsonl 成为目录 ⇒ appendFileSync EISDIR ⇒ 追加失败（never-throw 收敛）
@@ -835,6 +836,11 @@ check("IO：ledger 追加失败（actions.jsonl 为目录 ⇒ EISDIR）⇒ 不�
 		assert.equal(threw, false, "不抛（never-throw）");
 		// 账本如实：actions.jsonl 是目录，读不到有效事件（不猜）
 		assert.deepEqual(readActionsTail({ stateDir: state, limit: 5 }), [], "账本不可读 → []（如实）");
+		// fail-closed：账本写不进 ⇒ 拒绝动作 ⇒ 无 effect（不留无审计的动作）
+		const reports = join(state, "autonomy", "actions", "reports");
+		assert.equal(readdirSyncSafe(reports).filter((f) => f.endsWith(".md")).length, 0, "无报告产出（fail-closed 拒绝）");
+		// 无 postverified 终态（账本不可读 ⇒ 无事件 ⇒ 无 postverified）
+		assert.equal(readActionsTail({ stateDir: state, limit: 5 }).some((e) => e.kind === "postverified"), false, "无 postverified 终态");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -924,10 +930,10 @@ check("IO：gitspawn 失败（PATH 空 ⇒ git 不可达）⇒ 自动发现失�
 });
 
 // ════════════════════════════ 回放三问（§3.2 验收口径）════════════════════════
-console.log("回放三问（做了什么 / 为什么 / 能不能撤）");
+console.log("回放三问（做了什么 / 为什么 / 能不能撤）— 调用生产 replay 函数");
 const T_YESTERDAY = NOW - 24 * 3_600_000;
 const T_TODAY = NOW;
-check("回放①「做了什么」：按 ts 过滤 kind ∈ {attempted, executed}", () => {
+check("回放①「做了什么」：queryActionsWhat 按 ts 过滤 kind ∈ {attempted, executed}", () => {
 	const { root, state } = freshState("replay-what");
 	try {
 		const mk = (id: string, kind: string, ts: number): ActionEvent => ({
@@ -941,24 +947,17 @@ check("回放①「做了什么」：按 ts 过滤 kind ∈ {attempted, executed
 		appendActionEvent(mk("act_B", "attempted", T_TODAY), state);
 		appendActionEvent(mk("act_B", "executed", T_TODAY + 1000), state);
 		appendActionEvent(mk("act_B", "postverified", T_TODAY + 2000), state);
-		const all = readActionsTail({ stateDir: state, limit: 100 });
 		// 昨天窗口 = A 的 attempted+executed（不含 B）
-		const didYest = all.filter((e) => {
-			const t = Date.parse(e.ts);
-			return t >= T_YESTERDAY - 1000 && t < T_TODAY - 1000 && (e.kind === "attempted" || e.kind === "executed");
-		});
-		assert.deepEqual(didYest.map((e) => e.id).sort(), ["act_A", "act_A"], "昨天窗口 = A 的 attempted+executed");
+		const didYest = queryActionsWhat(state, T_YESTERDAY - 1000).filter((w) => Date.parse(w.ts) < T_TODAY - 1000);
+		assert.deepEqual(didYest.map((w) => w.id).sort(), ["act_A", "act_A"], "昨天窗口 = A 的 attempted+executed");
 		// 今天窗口 = B 的 attempted+executed（不含 postverified）
-		const didToday = all.filter((e) => {
-			const t = Date.parse(e.ts);
-			return t >= T_TODAY - 1000 && (e.kind === "attempted" || e.kind === "executed");
-		});
-		assert.deepEqual(didToday.map((e) => e.id).sort(), ["act_B", "act_B"], "今天窗口 = B 的 attempted+executed（不含 postverified）");
+		const didToday = queryActionsWhat(state, T_TODAY - 1000);
+		assert.deepEqual(didToday.map((w) => w.id).sort(), ["act_B", "act_B"], "今天窗口 = B 的 attempted+executed（不含 postverified）");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
-check("回放②「为什么」：trigger(rule+project+evidence) + intent + policyVersion 齐全", () => {
+check("回放②「为什么」：queryActionsWhy 取 trigger(rule+project+evidence) + intent + policyVersion", () => {
 	const { root, state } = freshState("replay-why");
 	try {
 		const ev: ActionEvent = {
@@ -967,19 +966,20 @@ check("回放②「为什么」：trigger(rule+project+evidence) + intent + poli
 			actionClass: "diagnostic-report", intent: "collect stagnation evidence for repo:W",
 		};
 		appendActionEvent(ev, state);
-		const got = readActionEvents("act_W", { stateDir: state })[0]!;
+		const got = queryActionsWhy(state, "act_W");
+		assert.notEqual(got, null, "有返回");
 		// trigger 三维齐全
-		assert.equal(got.trigger.rule, "stagnation");
-		assert.equal(got.trigger.project, "repo:W");
-		assert.equal(got.trigger.evidence, "run:r2:stagnation");
+		assert.equal(got!.trigger.rule, "stagnation");
+		assert.equal(got!.trigger.project, "repo:W");
+		assert.equal(got!.trigger.evidence, "run:r2:stagnation");
 		// intent + policyVersion 齐全
-		assert.equal(got.intent, "collect stagnation evidence for repo:W");
-		assert.equal(got.policyVersion, "actions-v1");
+		assert.equal(got!.intent, "collect stagnation evidence for repo:W");
+		assert.equal(got!.policyVersion, "actions-v1");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
-check("回放③「能不能撤」：三终态 + 快照缺失 → 无法保证可撤（不猜）", () => {
+check("回放③「能不能撤」：queryActionsUndo 三终态 + 快照缺失 → 无法保证可撤（不猜）", () => {
 	const { root, state } = freshState("replay-undo");
 	try {
 		const mk = (id: string, kind: string, extra?: Partial<ActionEvent>): ActionEvent => ({
@@ -999,21 +999,10 @@ check("回放③「能不能撤」：三终态 + 快照缺失 → 无法保证�
 		// ④ postverified + 快照缺失 → 无法保证可撤（不猜）
 		appendActionEvent(mk("act_U4", "postverified", { rollbackHandle: { type: "restore-files", snapshots: [join(state, "no-snap")], validUntil: null, deletedFiles: [] } }), state);
 
-		const canUndo = (id: string): string => {
-			const latest = readLatestAction(id, { stateDir: state })!;
-			if (latest.kind === "rolled_back") return "已撤";
-			if (latest.kind === "rollback_failed") return "不可撤，已冻结";
-			if (latest.kind === "postverified") {
-				const snaps = latest.rollbackHandle?.snapshots ?? [];
-				const readable = snaps.length > 0 && snaps.every((s) => existsSync(join(s, "meta.json")));
-				return readable ? "可撤" : "无法保证可撤（快照缺失/不可读）";
-			}
-			return "未知终态";
-		};
-		assert.equal(canUndo("act_U1"), "可撤", "postverified + 快照可读 → 可撤");
-		assert.equal(canUndo("act_U2"), "已撤", "rolled_back → 已撤");
-		assert.equal(canUndo("act_U3"), "不可撤，已冻结", "rollback_failed → 不可撤已冻结");
-		assert.equal(canUndo("act_U4"), "无法保证可撤（快照缺失/不可读）", "postverified + 快照缺失 → 无法保证可撤（不猜）");
+		assert.equal(queryActionsUndo(state, "act_U1").status, "可撤", "postverified + 快照可读 → 可撤");
+		assert.equal(queryActionsUndo(state, "act_U2").status, "已撤", "rolled_back → 已撤");
+		assert.equal(queryActionsUndo(state, "act_U3").status, "不可撤，已冻结", "rollback_failed → 不可撤已冻结");
+		assert.equal(queryActionsUndo(state, "act_U4").status, "无法保证可撤（快照缺失/不可读）", "postverified + 快照缺失 → 无法保证可撤（不猜）");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

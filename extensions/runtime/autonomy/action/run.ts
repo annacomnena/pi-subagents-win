@@ -133,8 +133,8 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	const dedupKey = `${t.rule}:${t.project}`; // 去重键
 	const triggerRef = { rule: t.rule, project: t.project, evidence: t.evidence, approximate: t.approximate };
 
-	const emit = (kind: ActionKind, extra?: Partial<ActionEvent>): void => {
-		appendActionEvent(
+	const emit = (kind: ActionKind, extra?: Partial<ActionEvent>): boolean => {
+		return appendActionEvent(
 			{
 				v: 1, id, kind, ts: new Date(now).toISOString(), policyVersion: POLICY_VERSION,
 				trigger: triggerRef, actionClass, ...extra,
@@ -217,8 +217,10 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 		return "denied";
 	}
 
-	// ── 事务开始 ──
-	emit("attempted", { intent: `collect ${t.rule} evidence for ${t.project}` });
+	// ── 事务开始（fail-closed：账本写不进 = 审计无法保证 ⇒ 拒绝，不留无审计的动作）──
+	if (!emit("attempted", { intent: `collect ${t.rule} evidence for ${t.project}` })) {
+		return "denied";
+	}
 
 	// 快照（原字节/权限/存在性）→ 落盘为回退句柄数据源
 	const snapFile = diagnosticReportClass.snapshot(targetPath);
