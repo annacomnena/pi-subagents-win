@@ -257,8 +257,15 @@ export function writeWakeGateState(state: WakeGateState, opts?: { stateDir?: str
  * 与 v1 的 appendAuditLine（无 ts 前缀的行）共写同一 audit.jsonl，两格式共存（计划文档化）。
  * acted 恒 false：v2 无任何自动动作（kill/clear 是用户手动运维命令，学术诚实定性）。
  * reason 消毒（换行/制表符 → 空格，截断 200，空 → "-"）保护行式格式；never-throw。
+ * concl 词表（D7-b 收窄，2026-10-01）：全仓 10 个生产调用点恰 7 值——
+ *   gate.ts: engage 无关（kill engage/clear 在 index.ts）；wake 面 wake|no-wake；gating 面
+ *   pass|no-wake；开关/绑定面 enable|disable（index.ts:2005/:2171）。W5 冻结正则
+ *   （_test_autonomy_wiring.ts:330）覆盖前 5 值，enable/disable 为既有生产发射值，收窄不改变
+ *   任何发射值与运行时行为。
  */
-export function appendAuditEvent(cat: "gating" | "wake" | "kill", concl: string, reason: string, stateDir?: string): void {
+export type AuditConcl = "engage" | "clear" | "wake" | "no-wake" | "pass" | "enable" | "disable";
+
+export function appendAuditEvent(cat: "gating" | "wake" | "kill", concl: AuditConcl, reason: string, stateDir?: string): void {
 	try {
 		const safe = reason.replace(/[\r\n\t]+/g, " ").trim().slice(0, 200) || "-";
 		appendAuditLine(`ts=${new Date().toISOString()} cat=${cat} concl=${concl} reason=${safe} acted=false`, { stateDir });
