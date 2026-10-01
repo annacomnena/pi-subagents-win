@@ -85,7 +85,7 @@ export type RunOneOutcome = "started" | "denied" | "skipped";
 export function runAutonomyActions(opts: RunActionsOpts): void {
 	try {
 		const cfg = readAutonomyConfig({ configPath: opts.configPath });
-		if (cfg.actions?.enabled !== true) return; // 默认关闭零行为（双层合取，独立于 autonomy.enabled）
+		if (cfg.enabled !== true || cfg.actions?.enabled !== true) return; // 双层合取；任一未严格开启即零行为
 
 		const now = opts.now ?? Date.now();
 		const stateDir = opts.stateDir;
