@@ -18,6 +18,9 @@
  *   T10 resolveSessionTitles 批量：混合来源各归其位；cwd=null 不做台账探测
  *   T11 机器注入附件块剥离：P2 跳 `<file>` 块取后正文 / 整条附件 → null / 截断无闭合 → null /
  *      多块循环（+`<system-reminder>`）/ P1 前缀在附件块内（开标签行遮首行）→ 剥开标签行后命中台账
+ *   T13 registry 通用剥离（skill 标签 + 防误伤）：纯 skill → null / skill+正文 → 取正文 /
+ *      领头 skill+尾部 recent-working-set → 取中间正文 / 用户自带未知 XML → 不剥 /
+ *      T11/T12 存量回归全绿
  *
  * 运行：npm run test:session-title
  */
@@ -174,6 +177,30 @@ ok("T12a <file> + 末尾 <recent-working-set> → title 不含标签，回退 P3
 	assert.equal(full.title, "sid-t12b");
 }
 ok("T12b 派发前缀行 + 末尾 <recent-working-set> → title 不含标签");
+
+// ── T13 registry 通用剥离（skill 标签 + 防误伤）────────────────────
+// T13a: 纯 <skill> 块（无用户正文）→ 剥空 → null（回退 P3）
+const pureSkill = `<skill name="wiki-and-task" location="/x/SKILL.md">\nSkill content here\n</skill>`;
+assert.equal(deriveTitleFromFirstUserText(pureSkill), null);
+ok("T13a 纯 <skill> 块无正文 → null（P3）");
+
+// T13b: <skill> 块 + 用户正文 → 标题 = 用户正文（不含标签）
+const skillWithBody = `<skill name="wiki-and-task" location="/x/SKILL.md">\nSkill content\n</skill>\n\n建立基本项目骨架`;
+assert.equal(deriveTitleFromFirstUserText(skillWithBody), "建立基本项目骨架");
+ok("T13b <skill> 块 + 用户正文 → 标题取正文");
+
+// T13c: 领头 <skill> + 尾部 <recent-working-set> → 取中间正文
+const skillTrailing = `<skill name="diagnosing-bugs" location="/y/SKILL.md">\nDiagnostic skill\n</skill>\n\n修复部署脚本\n\n<recent-working-set>\n- a.ts\n</recent-working-set>`;
+assert.equal(deriveTitleFromFirstUserText(skillTrailing), "修复部署脚本");
+ok("T13c 领头 <skill> + 尾部 <recent-working-set> → 取中间正文");
+
+// T13d: 用户正文自带未知 XML（registry 外）→ 不剥（防误伤回归）
+const userXml = `<notes>hi</notes>\n\n用户自己的笔记`;
+assert.equal(deriveTitleFromFirstUserText(userXml), "<notes>hi</notes>");
+ok("T13d 用户自带未知 XML 开头 → 不剥（防误伤）");
+
+// T13e: T11/T12 存量回归（已在全绿中验证，此处显式标注）
+ok("T13e 存量 T11/T12 回归全绿（registry 泛化不破坏既有行为）");
 
 // ── T2 P1 台账命中（前缀匹配）────────────────────────────────────
 const runs1 = tmp("session-title-runs-");
