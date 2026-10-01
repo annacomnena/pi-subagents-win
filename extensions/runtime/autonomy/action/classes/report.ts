@@ -105,13 +105,17 @@ export const diagnosticReportClass = {
 		try {
 			if (snap.existed) {
 				if (snap.bytes === null) return { ok: false, deletedFiles: [], reason: "snapshot-bytes-missing" };
-				writeFileSync(snap.path, snap.bytes);
-				if (snap.mode !== null) {
-					try {
-						chmodSync(snap.path, snap.mode);
-					} catch {
-						/* 权限恢复 best-effort（Windows 语义不足） */
-					}
+				const tmp = `${snap.path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.rollback.tmp`;
+				try {
+					writeFileSync(tmp, snap.bytes);
+					renameSync(tmp, snap.path);
+				} finally {
+					try { unlinkSync(tmp); } catch { /* rename 后临时文件已不存在 */ }
+				}
+				if (snap.mode !== null) chmodSync(snap.path, snap.mode);
+				const restored = diagnosticReportClass.snapshot(snap.path);
+				if (!restored || !restored.existed || !restored.bytes?.equals(snap.bytes) || restored.mode !== snap.mode) {
+					return { ok: false, deletedFiles: [], reason: "rollback-reverify-mismatch" };
 				}
 				return { ok: true, deletedFiles: [] };
 			}
