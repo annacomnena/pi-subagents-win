@@ -22,6 +22,11 @@ export interface AutonomyConfig {
 	enabled: boolean;
 	/** 与 config.masterSuccession.auto 物理分离（C6）：只认 autonomy.awayMode 切片。 */
 	awayMode: { enabled: boolean };
+	/**
+	 * P1 可回滚动作面开关（独立于 autonomy.enabled，双层合取）：严格 === true 才开。
+	 * 缺省/垃圾 = false = 零行为（除一次 config 读外零 IO、零新文件）。
+	 */
+	actions: { enabled: boolean };
 	/** §16 watchdog_policy：default/min/max/max_override_duration。独立常量（C8），不与 local-master 10min 心跳判据互引。 */
 	watchdog: {
 		defaultIntervalMs: number;
@@ -47,6 +52,7 @@ export function defaultAutonomyConfig(): AutonomyConfig {
 	return {
 		enabled: false,
 		awayMode: { enabled: false },
+		actions: { enabled: false },
 		watchdog: {
 			defaultIntervalMs: 10 * 60_000, // §27 default_interval: 10m
 			minIntervalMs: 2 * 60_000, // §27 min_interval: 2m
@@ -83,12 +89,14 @@ export function normalizeAutonomy(raw: unknown): AutonomyConfig {
 	const slice = (k: string): Record<string, unknown> =>
 		typeof o[k] === "object" && o[k] !== null ? (o[k] as Record<string, unknown>) : {};
 	const away = slice("awayMode");
+	const acts = slice("actions");
 	const wd = slice("watchdog");
 	const sr = slice("strategicReview");
 	const wg = slice("wakeGate");
 	return {
 		enabled: o.enabled === true,
 		awayMode: { enabled: away.enabled === true },
+		actions: { enabled: acts.enabled === true },
 		watchdog: {
 			defaultIntervalMs: posNum(wd.defaultIntervalMs, d.watchdog.defaultIntervalMs),
 			minIntervalMs: posNum(wd.minIntervalMs, d.watchdog.minIntervalMs),

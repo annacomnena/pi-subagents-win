@@ -31,6 +31,7 @@ import {
 } from "./mailbox.ts";
 import { defaultTabRunsDir, readTabDispatch } from "../tab-runs.ts";
 import { evaluateAutonomyWakeGate } from "./autonomy/gate.ts";
+import { runAutonomyActions } from "./autonomy/action/run.ts";
 import {
 	auditWorkstreamOp,
 	listWorkstreams,
@@ -107,6 +108,11 @@ export function evaluateWakes(opts: WakeOptions): WakeDecision[] {
 	// enabled!==true → 完全旁路（零行为零写盘）；enabled → kill/collect fail-closed 压制 legacy fire。
 	const autonomyGate = evaluateAutonomyWakeGate({ stateDir, configPath: opts.autonomyConfigPath, now });
 	if (autonomyGate.engaged && !autonomyGate.proceed) return [];
+	// P1 可回滚动作面（设计 D2 批准）：autonomy gate 块后 +1 个 never-throw 调用。
+	// actions.enabled 默认 false ⇒ 除一次 config 读外零 IO、零新文件（独立 fail-closed，
+	// 与 wake 面 fail-open 不混淆）；不搭 legacy 唤醒 spawn 通道（§1.4 结构性防火墙）；
+	// 只写自有 namespace <stateDir>/autonomy/actions/**。
+	runAutonomyActions({ stateDir, configPath: opts.autonomyConfigPath, sessionId: opts.sessionId, now });
 	const decisions: WakeDecision[] = [];
 
 	for (const ws of listWorkstreams(stateDir)) {

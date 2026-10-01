@@ -151,6 +151,31 @@ check("W1b masterStatusLogic 纯净默认态无 autonomy 行（逐字节不变�
 		rmSync(rt.root, { recursive: true, force: true });
 	}
 });
+check("W1c P1 actions 默认关：evaluateWakes 输出与现状同构 + state/autonomy/actions* 零新文件", () => {
+	// P1：no-key config（autonomy 未启用 ⇒ actions 必然未启用，双层合取）→
+	// evaluateWakes 输出与 legacy 逐字节同构，且动作子系统零 IO（无 actions* 新文件）。
+	const rt = freshRuntime("w1c");
+	const T = T0;
+	try {
+		setCutover(true, "w1c-test");
+		attachMaster({ sessionId: "sess-W1c" });
+		const ws = createWorkstream({
+			stateDir: rt.state, session: "sess-W1c", mission: "W1c actions 默认关",
+			wakePolicy: { enabled: true, cooldownMs: 60_000 },
+		});
+		deliverLetter(wsLetter(ws.id, "run://tab/tab_w1c", T - 5_000), { mailboxDir: rt.mailbox });
+		const d = evaluateWakes({ stateDir: rt.state, mailboxDir: rt.mailbox, runsDir: rt.runs, sessionId: "sess-W1c", now: T, autonomyConfigPath: cfgOff });
+		// 输出与现状（W1 legacy fire）逐字节同构
+		assert.equal(d.length, 1);
+		assert.equal(d[0].fire, true, "legacy fire 不被压制");
+		assert.equal(d[0].letters.length, 1, "letters 同构");
+		assert.ok(d[0].prompt!.includes(ws.id) && d[0].prompt!.includes("tab-finish") && d[0].prompt!.includes("timer"), "prompt 与 legacy 同构");
+		// state/autonomy/actions* 零新文件（actions 默认关零 IO）
+		assert.equal(existsSync(join(rt.state, "autonomy", "actions")), false, "state/autonomy/actions* 零新文件");
+	} finally {
+		rmSync(rt.root, { recursive: true, force: true });
+	}
+});
 
 // ════════════════════════════ W2 kill 演练五步（两层断言）════════════════════
 console.log("W2 kill 演练（两层断言）");

@@ -124,7 +124,8 @@
     "gui:dev": "node scripts/gui-dev.mjs",
     "gui:build": "npm run build --prefix gui",
     "test:message-outbox": "node --experimental-strip-types ./extensions/_test_message_outbox.ts",
-    "test:expectations": "node --experimental-strip-types ./extensions/_test_expectations.ts"
+    "test:expectations": "node --experimental-strip-types ./extensions/_test_expectations.ts",
+    "test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

@@ -58,6 +58,7 @@ import {
 import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
+import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { isObjectAddress, masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { deliverLetter, newMessageId } from "./runtime/mailbox.ts";
@@ -2042,6 +2043,7 @@ export default function (pi: ExtensionAPI) {
 				const frontier = readFrontierSnapshot();
 				const gate = readWakeGateState();
 				const tail = readAuditTail({ limit: 5 });
+				const actionsLines = summarizeActionsStatus(); // P1 动作面尾行（never-throw，≤5 行）
 				const iso = (t: number): string => new Date(t).toISOString().slice(0, 19);
 				body = [
 					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（切换：/autonomy on|off，或 GUI 设置区的「主动性套件」开关）`,
@@ -2051,6 +2053,7 @@ export default function (pi: ExtensionAPI) {
 					`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
 					`audit (最近 ${tail.length} 行):`,
 					...(tail.length ? tail.map((l) => `  ${l}`) : ["  (空)"]),
+					...actionsLines,
 				].join("\n");
 			} catch {
 				body = "autonomy status: (状态不可读)";

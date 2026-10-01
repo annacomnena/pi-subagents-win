@@ -831,6 +831,8 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// 0929 切片 B-4：_test_expectations.ts 去运行期字符串拼接、改静态 import runtime/autonomy
 				// → 排除清单显式登记（ALLOW 不动：测试文件非生产接线点）
 				if (p === join(EXT_ROOT, "_test_expectations.ts")) continue;
+				// P1（20261001）：动作面测试 import runtime/autonomy/action/** 字面量 → 排除（ALLOW 不动）
+				if (p === join(EXT_ROOT, "_test_runtime_autonomy_actions.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
@@ -845,6 +847,22 @@ check("A10.1b wake.ts 接线存在性（字面量盲区堵漏）", () => {
 		readFileSync(join(EXT_ROOT, "runtime", "wake.ts"), "utf8").includes('"./autonomy/gate.ts"'),
 		"wake.ts 必须 import \"./autonomy/gate.ts\"（v2 接线）",
 	);
+});
+check("A10.1c wake.ts P1 动作面接线存在性（action/run.ts，字面量盲区堵漏）", () => {
+	// P1（20261001）：wake.ts 在 autonomy gate 块后 +1 个 never-throw 动作调用。
+	// 相对 import 写作 "./autonomy/action/run.ts"，不含字面量 "runtime/autonomy" → 字面量
+	// tripwire 天然盲区；用正向断言钉死（被静默拆除时红）。
+	assert.ok(
+		readFileSync(join(EXT_ROOT, "runtime", "wake.ts"), "utf8").includes('"./autonomy/action/run.ts"'),
+		"wake.ts 必须 import \"./autonomy/action/run.ts\"（P1 动作面接线）",
+	);
+});
+check("A10.1d config 归一含 actions 切片（严格 === true；缺省/垃圾 = false 零行为）", () => {
+	// P1：autonomy.actions 切片独立于 autonomy.enabled（双层合取）；严格 === true 才开。
+	assert.equal(defaultAutonomyConfig().actions.enabled, false, "默认 actions.enabled=false");
+	assert.equal(normalizeAutonomy({ enabled: true, actions: { enabled: true } }).actions.enabled, true, "严格 true");
+	assert.equal(normalizeAutonomy({ enabled: true }).actions.enabled, false, "缺键 = false");
+	assert.equal(normalizeAutonomy({ enabled: true, actions: { enabled: "yes" } }).actions.enabled, false, "非严格 true 回落 false");
 });
 check("A10.2 config.json 无 autonomy 键 → readAutonomyConfig 全默认（零侵入：无注册无循环无读盘）", () => {
 	const p = join(cfgRoot, "nokey2.json");
