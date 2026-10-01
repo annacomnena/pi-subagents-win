@@ -24,7 +24,9 @@ import { readAutonomyConfig } from "../config.ts";
 import { readKillSwitch } from "../kill-switch.ts";
 import { readFrontierSnapshot } from "../collect.ts";
 import type { FrontierSnapshot, FrontierTrigger } from "../frontier.ts";
-import { BUDGET, TRIGGER_ALLOWLIST, decide, type PolicyContext } from "./policy.ts";
+import { BUDGET, ACTION_CLASS_ALLOWLIST, TRIGGER_ALLOWLIST, decide, type PolicyContext } from "./policy.ts";
+import { getClass } from "./registry.ts";
+import type { ActionClass } from "./classes/types.ts";
 import {
 	checkBudget,
 	clearBreaker,
@@ -45,7 +47,6 @@ import {
 	type ActionKind,
 } from "./ledger.ts";
 import { discoverRepoRoot, gitPostcheck, gitPrecheck } from "./gitguard.ts";
-import { diagnosticReportClass } from "./classes/report.ts";
 
 export interface RunActionsOpts {
 	stateDir?: string;
@@ -96,15 +97,18 @@ export function runAutonomyActions(opts: RunActionsOpts): void {
 		const snap = readFrontierSnapshot({ stateDir });
 		if (!snap) return; // 无快照 → 无触发 → 无动作
 
-		// 候选触发（allowlist 内；§4）
-		const candidates = snap.triggers.filter((t) => TRIGGER_ALLOWLIST.has(t.rule));
-		if (candidates.length === 0) return;
+		// 候选 = trigger × class（allowlist 双维；§4）。maxNewPerTick=1 ⇒ 同一 incident 的
+		// report/notify 分两 tick 落（≤30s 间隔；见阶段二要点 ②）。
+		const candidateTriggers = snap.triggers.filter((t) => TRIGGER_ALLOWLIST.has(t.rule));
+		if (candidateTriggers.length === 0) return;
 
 		const ctx: RunActionsOpts & { now: number; frontier: FrontierSnapshot } = { ...opts, now, frontier: snap };
-		for (const t of candidates) {
-			const outcome = runOneAction(t, ctx);
-			if (outcome === "started") break; // 每 tick 最多 1 个新动作（budget）达成
-			// denied / skipped → 继续下一候选（其自身判据独立）
+		for (const t of candidateTriggers) {
+			for (const clsName of ACTION_CLASS_ALLOWLIST) {
+				const outcome = runOneAction(t, clsName, ctx);
+				if (outcome === "started") return; // 每 tick 最多 1 个新动作（budget）达成
+				// denied / skipped → 继续下一候选（其自身判据独立）
+			}
 		}
 	} catch {
 		/* never-throw 总包裹：动作面任何异常不得影响唤醒循环 */
@@ -123,14 +127,26 @@ interface RunOneCtx {
 /**
  * 执行单个动作（事务包裹；never-throw）。返回 started（占 1/tick 额度）/ denied / skipped。
  */
-function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
+function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): RunOneOutcome {
 	const { now, sessionId, frontier } = ctx;
 	const stateDir = ctx.stateDir;
 	const id = newActionId(now);
 	const tickId = tickIdOf(now);
-	const actionClass = diagnosticReportClass.name;
-	const failKey = `${t.rule}:${actionClass}:${t.project}`; // 连败三元组
-	const dedupKey = `${t.rule}:${t.project}`; // 去重键
+	const cls = getClass(actionClass);
+	if (!cls) {
+		// 防御性：L1 白名单已拦 class-not-allowed；此处双保险（未注册 = fail-closed）
+		appendActionEvent(
+			{
+				v: 1, id, kind: "rejected", ts: new Date(now).toISOString(), policyVersion: POLICY_VERSION,
+				trigger: { rule: t.rule, project: t.project, evidence: t.evidence, approximate: t.approximate },
+				actionClass, reason: "class-not-registered",
+			},
+			stateDir,
+		);
+		return "denied";
+	}
+	const failKey = `${t.rule}:${actionClass}:${t.project}`; // 连败三元组（已含 class，不动）
+	const dedupKey = `${t.rule}:${actionClass}:${t.project}`; // 去重键（阶段二：加 class 段，防同 incident 两 class 互饿）
 	const triggerRef = { rule: t.rule, project: t.project, evidence: t.evidence, approximate: t.approximate };
 
 	const emit = (kind: ActionKind, extra?: Partial<ActionEvent>): boolean => {
@@ -161,8 +177,8 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 
 	// ── 效应面注册 + 目录前缀（§A ① 文件夹分好）──
 	const root = sd(stateDir);
-	const targetPath = diagnosticReportClass.targetPath(root, t.project, now);
-	const closure = diagnosticReportClass.withinSurface(root, targetPath);
+	const targetPath = cls.targetPath(root, t.project, now);
+	const closure = cls.withinSurface(root, targetPath);
 
 	// ── L0–L3 决策树（第一遍）──
 	// P1 报告类的 snapshot/rollback/postverify/lease 为结构保证（注册即成立）；
@@ -218,12 +234,15 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	}
 
 	// ── 事务开始（fail-closed：账本写不进 = 审计无法保证 ⇒ 拒绝，不留无审计的动作）──
-	if (!emit("attempted", { intent: `collect ${t.rule} evidence for ${t.project}` })) {
+	const intent = actionClass === "notify-local-master"
+		? `notify scope master (${t.rule}) for ${t.project}`
+		: `collect ${t.rule} evidence for ${t.project}`;
+	if (!emit("attempted", { intent })) {
 		return "denied";
 	}
 
 	// 快照（原字节/权限/存在性）→ 落盘为回退句柄数据源
-	const snapFile = diagnosticReportClass.snapshot(targetPath);
+	const snapFile = cls.snapshot(targetPath);
 	if (snapFile === null) {
 		emit("rejected", { reason: "no-snapshot" });
 		return "denied";
@@ -238,14 +257,14 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	emit("precheck", {
 		precheck: {
 			L0: { actionsEnabled: true, kill: kill === null, breakerReadable: true, breakerTripped: breaker.tripped || breaker.frozen, owner: isOwner },
-			L1: { triggerAllowed: TRIGGER_ALLOWLIST.has(t.rule), classAllowed: true, notApproximate: !t.approximate },
+			L1: { triggerAllowed: TRIGGER_ALLOWLIST.has(t.rule), classAllowed: ACTION_CLASS_ALLOWLIST.has(actionClass), notApproximate: !t.approximate },
 			L2: { closure, snapshot: true, rollback: true, postverify: true, lease: true, snapshotRef: snapRef, effectPath: targetPath },
 			L3: { inFlight: breaker.inFlight, newThisTick: budget.newThisTick, startedInLast1h: budget.startedInLast1h, consecFail: consec, dedupHit: dedup },
 		},
 	});
 
 	// ── TOCTOU 最后入口复核（effect 前重验 L0–L3；§1.2 执行段）──
-	const recheck = toctouRecheck(ctx, tickId, now, stateDir, targetPath);
+	const recheck = toctouRecheck(ctx, tickId, now, stateDir, targetPath, cls);
 	if (!recheck.ok) {
 		emit(recheck.kind === "stale" ? "skipped" : "rejected", { reason: recheck.reason });
 		return recheck.kind === "stale" ? "skipped" : "denied";
@@ -255,8 +274,8 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	writeBreaker(recordStart(readBreaker(stateDir) ?? breaker, tickId, now, dedupKey), stateDir);
 
 	// ── effect（原子写）──
-	const content = buildReportContent(t, ctx);
-	const eff = diagnosticReportClass.effect(targetPath, content);
+	const content = cls.buildContent({ project: t.project, trigger: triggerRef, now, frontier });
+	const eff = cls.effect(targetPath, content);
 	if (eff === null) {
 		const b = readBreaker(stateDir) ?? breaker;
 		writeBreaker(recordFailure(b, failKey, now), stateDir);
@@ -279,10 +298,10 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	});
 
 	// ── postverify（回读比对）──
-	const pv = diagnosticReportClass.postverify(targetPath, content);
+	const pv = cls.postverify(targetPath, content);
 	if (pv !== "match") {
 		// 失配 → 回退 + 复验
-		const rb = diagnosticReportClass.rollback(snapFile);
+		const rb = cls.rollback(snapFile);
 		if (!rb.ok) {
 			const b = readBreaker(stateDir) ?? breaker;
 			writeBreaker(tripBreaker({ ...b, inFlight: Math.max(0, b.inFlight - 1) }, now), stateDir);
@@ -292,7 +311,7 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 		}
 		// 回退后复验：应与快照一致（存在 → 字节相等；不存在 → 确实不存在）
 		const reverifyOk = snapFile.existed
-			? snapFile.bytes !== null && diagnosticReportClass.postverify(targetPath, snapFile.bytes.toString("utf8")) === "match"
+			? snapFile.bytes !== null && cls.postverify(targetPath, snapFile.bytes.toString("utf8")) === "match"
 			: !existsSync(targetPath);
 		if (!reverifyOk) {
 			const b = readBreaker(stateDir) ?? breaker;
@@ -311,7 +330,7 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 		const post = gitPostcheck(repoRoot, gitBaseline, { tracked: false });
 		if (!post.ok) {
 			// 越界/新增 git 条目 = 违规 → 回退 + 熔断 + 冻结（越界清单落账本）
-			diagnosticReportClass.rollback(snapFile);
+			cls.rollback(snapFile);
 			const b = readBreaker(stateDir) ?? breaker;
 			writeBreaker(tripBreaker({ ...b, inFlight: Math.max(0, b.inFlight - 1) }, now), stateDir);
 			emit("rollback_failed", { reason: `git-post:${post.reason}:${(post.newEntries ?? []).join("|")}` });
@@ -338,6 +357,7 @@ function toctouRecheck(
 	now: number,
 	stateDir: string | undefined,
 	targetPath: string,
+	cls: ActionClass,
 ): { ok: boolean; kind?: "stale" | "deny"; reason: string } {
 	// ① frontier 快照时效：重读快照，now - asof 越过 2 tick ⇒ stale（asof = 快照逻辑时间，可测）
 	const snap = readFrontierSnapshot({ stateDir });
@@ -346,7 +366,7 @@ function toctouRecheck(
 	}
 	// ② 目录前缀复验（§A ① 文件夹分好；effect 路径越界 = namespace-escape，TOCTOU 也查）
 	const root = sd(stateDir);
-	if (!diagnosticReportClass.withinSurface(root, targetPath)) {
+	if (!cls.withinSurface(root, targetPath)) {
 		return { ok: false, kind: "deny", reason: "race-detected(namespace-escape)" };
 	}
 	const b = readBreaker(stateDir);
@@ -370,35 +390,6 @@ function storeSnapshot(id: string, snap: { path: string; existed: boolean; mode:
 	}
 }
 
-/** 报告内容（汇总失败/停滞证据：trigger + frontier 项目态 + 只读定性）。 */
-function buildReportContent(t: FrontierTrigger, ctx: RunOneCtx): string {
-	const project = ctx.frontier.projects.find((p) => p.project === t.project);
-	const lines: string[] = [
-		"# Autonomy Diagnostic Report",
-		"",
-		`> 自动生成的**只读**诊断报告（autonomy 动作面，policyVersion=${POLICY_VERSION}）。`,
-		"> 学术诚实：本报告只记录观察，**不触发**任何修复 / 重试 / 派活。",
-		"",
-		`- **trigger**: \`${t.rule}\``,
-		`- **project**: \`${t.project}\``,
-		`- **evidence**: ${t.evidence}`,
-		`- **approximate**: ${t.approximate}`,
-		`- **generated_at**: ${new Date(ctx.now).toISOString()}`,
-		"",
-	];
-	if (project) {
-		lines.push("## 项目状态（frontier 快照）");
-		lines.push(`- state: ${project.state}${project.variant ? ` (${project.variant})` : ""}`);
-		lines.push(`- needs_user: ${project.needsUser}`);
-		lines.push(`- stagnation: ${project.stagnation}`);
-		lines.push(`- result_missing: ${project.resultMissing}`);
-		lines.push(`- visible_runs: ${Object.keys(project.runs).length}`);
-		lines.push("");
-	}
-	lines.push("_（无更多可安全自动化的处置；后续动作需人裁决。）_");
-	return lines.join("\n");
-}
-
 // ── 对外测试/运维入口 ────────────────────────────────────────────────────
 
 /**
@@ -411,6 +402,15 @@ export function undoAction(id: string, opts: { stateDir?: string; now?: number }
 	const events = readActionEvents(id, { stateDir });
 	const triggerRef = events[0]?.trigger ?? { rule: "?", project: "?", evidence: "?", approximate: false };
 	const actionClass = events[0]?.actionClass ?? "diagnostic-report";
+	const cls = getClass(actionClass);
+	if (!cls) {
+		// 未注册 class（理论不发生；防御性）→ 无法保证可撤 → 如实报 + 熔断（不猜）
+		const b = readBreaker(stateDir);
+		if (b) writeBreaker(tripBreaker(b, now), stateDir);
+		emit("rollback_failed", "class-not-registered");
+		emit("frozen", "class-not-registered");
+		return { ok: false, reason: "class-not-registered" };
+	}
 
 	const emit = (kind: ActionKind, reason?: string): void => {
 		appendActionEvent(
@@ -453,7 +453,7 @@ export function undoAction(id: string, opts: { stateDir?: string; now?: number }
 			bytes = null;
 		}
 	}
-	const rb = diagnosticReportClass.rollback({ path: meta.path, existed: meta.existed, mode: meta.mode, bytes });
+	const rb = cls.rollback({ path: meta.path, existed: meta.existed, mode: meta.mode, bytes });
 	if (!rb.ok) {
 		const b = readBreaker(stateDir);
 		if (b) writeBreaker(tripBreaker(b, now), stateDir);

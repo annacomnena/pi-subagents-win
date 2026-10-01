@@ -15,8 +15,8 @@
  * 对其余动作类（写文件 / git commit）原文继续有效。
  */
 
-/** v1 动作类白名单（§4：首版只开 diagnostic-report）。 */
-export const ACTION_CLASS_ALLOWLIST: ReadonlySet<string> = new Set(["diagnostic-report"]);
+/** 动作类白名单（§4）：P1 = diagnostic-report；阶段二 + notify-local-master（两 class 并存）。 */
+export const ACTION_CLASS_ALLOWLIST: ReadonlySet<string> = new Set(["diagnostic-report", "notify-local-master"]);
 
 /** v1 trigger 白名单（§4：working_to_failed + stagnation；两个 approximate trigger 不动手）。 */
 export const TRIGGER_ALLOWLIST: ReadonlySet<string> = new Set(["working_to_failed", "stagnation"]);

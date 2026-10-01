@@ -1,5 +1,5 @@
 /**
- * runtime/autonomy/action/classes/report.ts — diagnostic-report 动作类（P1 唯一动作类）。
+ * runtime/autonomy/action/classes/report.ts — diagnostic-report 动作类（P1 动作类）。
  *
  * 效应面（§1.3 / 计划 P1）：**仅 `<stateDir>/autonomy/actions/reports/` 子目录**（自有
  * namespace 内、最低风险）。动作 = 汇总失败/停滞证据 → 原子写报告文件；事务包裹：
@@ -13,25 +13,47 @@
  *     自创文件（撤销自身效应），不计入 deletedFiles。
  *
  * 本模块只做单文件事务原语；预算/熔断/账本/编排由 run.ts 承担。全部 IO never-throw。
+ * FileSnapshot / EffectResult / ActionClass 迁至 types.ts（单一事实源，避免循环 import）；
+ * 此处 re-export FileSnapshot/EffectResult 保持既有 import 路径（测试）可用。
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { POLICY_VERSION } from "../ledger.ts";
+import type { BuildContentArgs, EffectResult, FileSnapshot, ActionClass } from "./types.ts";
 
-/** 文件快照（原字节/权限/存在性）——回退句柄的数据源。 */
-export interface FileSnapshot {
-	path: string;
-	existed: boolean;
-	mode: number | null;
-	bytes: Buffer | null;
+export type { EffectResult, FileSnapshot };
+
+/** 报告正文（汇总失败/停滞证据：trigger + frontier 项目态 + 只读定性）。 */
+function buildReportBody(args: BuildContentArgs): string {
+	const { project, trigger: t, now, frontier } = args;
+	const proj = frontier.projects.find((p) => p.project === t.project);
+	const lines: string[] = [
+		"# Autonomy Diagnostic Report",
+		"",
+		`> 自动生成的**只读**诊断报告（autonomy 动作面，policyVersion=${POLICY_VERSION}）。`,
+		"> 学术诚实：本报告只记录观察，**不触发**任何修复 / 重试 / 派活。",
+		"",
+		`- **trigger**: \`${t.rule}\``,
+		`- **project**: \`${t.project}\``,
+		`- **evidence**: ${t.evidence}`,
+		`- **approximate**: ${t.approximate}`,
+		`- **generated_at**: ${new Date(now).toISOString()}`,
+		"",
+	];
+	if (proj) {
+		lines.push("## 项目状态（frontier 快照）");
+		lines.push(`- state: ${proj.state}${proj.variant ? ` (${proj.variant})` : ""}`);
+		lines.push(`- needs_user: ${proj.needsUser}`);
+		lines.push(`- stagnation: ${proj.stagnation}`);
+		lines.push(`- result_missing: ${proj.resultMissing}`);
+		lines.push(`- visible_runs: ${Object.keys(proj.runs).length}`);
+		lines.push("");
+	}
+	lines.push("_（无更多可安全自动化的处置；后续动作需人裁决。）_");
+	return lines.join("\n");
 }
 
-export interface EffectResult {
-	bytes: number;
-	/** 本次效应删除的文件清单（只增不删：本类恒 []；非空 = 违规 → 熔断）。 */
-	deletedFiles: string[];
-}
-
-export const diagnosticReportClass = {
+export const diagnosticReportClass: ActionClass = {
 	name: "diagnostic-report" as const,
 
 	/**
@@ -55,9 +77,12 @@ export const diagnosticReportClass = {
 		const prefix = join(stateDir, "autonomy", "actions", "reports");
 		const rel = relative(prefix, path);
 		if (rel === "") return false; // 目录本身，非其内文件
-		if (rel.startsWith("..") || rel.startsWith("/" ) || rel.startsWith("\\")) return false;
+		if (rel.startsWith("..") || rel.startsWith("/") || rel.startsWith("\\")) return false;
 		return true;
 	},
+
+	/** 报告正文（只读诊断；不触发修复/重试/派活）。 */
+	buildContent: (args: BuildContentArgs): string => buildReportBody(args),
 
 	/** 快照（原字节/权限/存在性；never-throw；读失败 = null = 无快照 → fail-closed）。 */
 	snapshot: (path: string): FileSnapshot | null => {
