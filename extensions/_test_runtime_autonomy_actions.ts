@@ -474,6 +474,29 @@ check("gitPrecheck fail-closed：非 git 仓 → git-unknown → DENY", () => {
 	}
 });
 
+/**
+ * 造一个真 git 仓，stateDir 在仓内，且 frontier 已 commit（state/ 成为 tracked 且 clean）。
+ * 这样 action effect 写入的报告 = 仓内**新未跟踪**条目（porcelain 新增），可被后置逐项比对检出。
+ * 自建自毁 tmp 仓；不碰本仓工作区（A11 隔离先例）。
+ */
+function makeGitRepoWithState(label: string, rule: string, project: string, asof: number): { repo: string; root: string; state: string; cfgOn: string } {
+	const root = mkdtempSync(join(tmpdir(), `autonomy-actions-gitstate-${label}-`));
+	const repo = root; // 仓根 = temp 根
+	spawnSync("git", ["init", "-q"], { cwd: repo });
+	spawnSync("git", ["config", "user.email", "t@t.t"], { cwd: repo });
+	spawnSync("git", ["config", "user.name", "t"], { cwd: repo });
+	writeFileSync(join(repo, "tracked.txt"), "v1\n", "utf8");
+	const state = join(repo, "state");
+	process.env.PI_RUNTIME_DIR = root;
+	// 预置有效 frontier 并 commit（使 state/ tracked 且 clean；报告写入才会产生 NEW untracked 条目）
+	writeFrontier(state, rule, project, asof);
+	spawnSync("git", ["add", "-A"], { cwd: repo });
+	spawnSync("git", ["commit", "-q", "-m", "init-with-state"], { cwd: repo });
+	const cfgOn = join(root, "actions-on.json");
+	writeFileSync(cfgOn, JSON.stringify({ autonomy: { enabled: true, actions: { enabled: true } } }), "utf8");
+	return { repo, root, state, cfgOn };
+}
+
 // ════════════════════════════ 事务正路径（run 编排）════════════════════════
 console.log("事务正路径（run 编排：attempted→precheck→executed→postverified）");
 check("正路径：四行齐全 + §3.2 schema + 报告落盘 + precheck 逐项判定", () => {
@@ -699,6 +722,56 @@ check("git 纪律集成：P1 报告在仓外 ⇒ 前后 porcelain 一致 ⇒ pos
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+check("git 违规冻结集成：effect 在仓内产生新未跟踪文件 ⇒ postcheck 失配 → 回退 + 熔断 + frozen + 账本如实", () => {
+	// stateDir 在仓内 + frontier 已 commit（clean）⇒ 报告写入 = 仓内新未跟踪条目（porcelain 新增）
+	const { repo, root, state, cfgOn } = makeGitRepoWithState("viol-untracked", "working_to_failed", "repo:V1", NOW);
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t, repoRoot: repo });
+		const events = readActionsTail({ stateDir: state, limit: 50 });
+		assert.ok(events.length > 0, "账本有事件");
+		const id = events[0]!.id;
+		const kinds = readActionEvents(id, { stateDir: state }).map((e) => e.kind);
+		assert.ok(kinds.includes("executed"), "effect 已执行");
+		assert.ok(kinds.includes("rollback_failed"), "postcheck 失配 → rollback_failed 落账");
+		assert.ok(kinds.includes("frozen"), "frozen 落账");
+		// 越界清单如实落账（git-post 原因含 porcelain 新增条目）
+		const rf = events.find((e) => e.kind === "rollback_failed");
+		assert.ok(rf!.reason!.includes("git-post"), `rollback_failed 原因含 git-post：${rf!.reason}`);
+		assert.ok(rf!.reason!.includes("porcelain-new-entry"), `原因含 porcelain-new-entry：${rf!.reason}`);
+		// breaker tripped + frozen（熔断 + 冻结）
+		const br = readBreaker(state)!;
+		assert.equal(br.tripped, true, "breaker tripped");
+		assert.equal(br.frozen, true, "breaker frozen");
+		// 回退后报告文件应被删除（恢复原状：原不存在）
+		const reports = join(state, "autonomy", "actions", "reports");
+		assert.equal(readdirSyncSafe(reports).filter((f) => f.endsWith(".md")).length, 0, "回退后报告已删（存在性恢复）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("git tracked 分支集成：前置脏 → DENY(workspace-dirty)；前置净 → DENY(tracked-needs-commit，不代人 commit)", () => {
+	// 前置脏：tracked 文件被改（未提交）→ gitPrecheck(tracked) 必 DENY(workspace-dirty)
+	const dirty = makeGitRepo("int-tracked-dirty");
+	try {
+		writeFileSync(join(dirty, "tracked.txt"), "MODIFIED\n", "utf8");
+		const rDirty = gitPrecheck(dirty, { tracked: true });
+		assert.equal(rDirty.ok, false);
+		assert.equal(rDirty.reason, "workspace-dirty", "前置脏 → DENY(workspace-dirty)");
+	} finally {
+		rmSync(dirty, { recursive: true, force: true });
+	}
+	// 前置净：tracked 文件 clean → autonomy 不代人 commit ⇒ DENY(tracked-needs-commit)
+	const clean = makeGitRepo("int-tracked-clean");
+	try {
+		const rClean = gitPrecheck(clean, { tracked: true });
+		assert.equal(rClean.ok, false);
+		assert.match(rClean.reason!, /tracked-needs-commit/, "前置净 → DENY(tracked-needs-commit)");
+	} finally {
+		rmSync(clean, { recursive: true, force: true });
+	}
+});
 check("summarizeActionsStatus：无动作 → 「disabled/无记录」；有动作 → 最近+breaker", () => {
 	const { root, state, cfgOff } = freshState("status-none");
 	try {
@@ -739,6 +812,208 @@ check("config 归一：actions 严格 === true；缺键/垃圾 = false", () => {
 		assert.equal(readAutonomyConfig({ configPath: p }).actions.enabled, false, "非严格 true 回落 false");
 		writeFileSync(p, JSON.stringify({ autonomy: { enabled: true } }), "utf8");
 		assert.equal(readAutonomyConfig({ configPath: p }).actions.enabled, false, "缺键 = false");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ════════════════════════════ never-throw IO 故障注入 ════════════════════════════
+console.log("never-throw IO 故障注入（拒绝且不抛 + 账本/状态如实）");
+check("IO：ledger 追加失败（actions.jsonl 为目录 ⇒ EISDIR）⇒ 不抛 + 账本如实（[]）", () => {
+	const { root, state, cfgOn } = freshState("io-ledger");
+	try {
+		// 使 actions.jsonl 成为目录 ⇒ appendFileSync EISDIR ⇒ 追加失败（never-throw 收敛）
+		mkdirSync(join(state, "autonomy", "actions", "actions.jsonl"), { recursive: true });
+		const sid = ownerSession();
+		writeFrontier(state, "working_to_failed", "repo:IL", NOW);
+		let threw = false;
+		try {
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		} catch {
+			threw = true;
+		}
+		assert.equal(threw, false, "不抛（never-throw）");
+		// 账本如实：actions.jsonl 是目录，读不到有效事件（不猜）
+		assert.deepEqual(readActionsTail({ stateDir: state, limit: 5 }), [], "账本不可读 → []（如实）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("IO：breaker 读失败（损坏）⇒ DENY(breaker-unreadable) 且不抛 + 无 effect", () => {
+	const { root, state, cfgOn } = freshState("io-breaker");
+	try {
+		// 损坏 breaker.json ⇒ readBreaker null ⇒ fail-closed DENY
+		mkdirSync(join(state, "autonomy", "actions"), { recursive: true });
+		writeFileSync(join(state, "autonomy", "actions", "breaker.json"), "{corrupt", "utf8");
+		const sid = ownerSession();
+		writeFrontier(state, "working_to_failed", "repo:IB", NOW);
+		let threw = false;
+		try {
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		} catch {
+			threw = true;
+		}
+		assert.equal(threw, false, "不抛");
+		assert.ok(anyReason(state, "breaker-unreadable"), "DENY(breaker-unreadable) 落账");
+		assert.equal(readdirSyncSafe(join(state, "autonomy", "actions", "reports")).length, 0, "无报告产出（未执行 effect）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("IO：快照读失败（target 为目录 ⇒ readFileSync EISDIR）⇒ DENY(no-snapshot) 且不抛", () => {
+	const { root, state, cfgOn } = freshState("io-snap");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		// 使 target 路径成为目录 ⇒ snapshot readFileSync EISDIR ⇒ null ⇒ DENY(no-snapshot)
+		const target = diagnosticReportClass.targetPath(state, "repo:IS", t);
+		mkdirSync(target, { recursive: true });
+		writeFrontier(state, "working_to_failed", "repo:IS", t);
+		let threw = false;
+		try {
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		} catch {
+			threw = true;
+		}
+		assert.equal(threw, false, "不抛");
+		assert.ok(anyReason(state, "no-snapshot"), "DENY(no-snapshot) 落账");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("IO：报告目录不可写（reports 为文件 ⇒ 原子写 mkdir 失败）⇒ DENY(effect-failed) 且不抛", () => {
+	const { root, state, cfgOn } = freshState("io-repdir");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		// 使 reports 成为一个文件 ⇒ effect 的 mkdirSync(dirname) 失败 ⇒ null ⇒ DENY(effect-failed)
+		mkdirSync(join(state, "autonomy", "actions"), { recursive: true });
+		writeFileSync(join(state, "autonomy", "actions", "reports"), "block", "utf8");
+		writeFrontier(state, "working_to_failed", "repo:IR", t);
+		let threw = false;
+		try {
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		} catch {
+			threw = true;
+		}
+		assert.equal(threw, false, "不抛");
+		assert.ok(anyReason(state, "effect-failed"), "DENY(effect-failed) 落账");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("IO：gitspawn 失败（PATH 空 ⇒ git 不可达）⇒ 自动发现失败 ⇒ DENY(git-repo-not-found) 且不抛", () => {
+	const { root, state, cfgOn } = freshState("io-git");
+	const origPath = process.env.PATH;
+	try {
+		process.env.PATH = ""; // git 不可达 ⇒ spawnSync ENOENT ⇒ discoverRepoRoot null ⇒ fail-closed DENY
+		const sid = ownerSession();
+		writeFrontier(state, "working_to_failed", "repo:IG", NOW);
+		let threw = false;
+		try {
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		} catch {
+			threw = true;
+		}
+		assert.equal(threw, false, "不抛");
+		assert.ok(anyReason(state, "git-repo-not-found(fail-closed)"), "DENY(git-repo-not-found) 落账");
+	} finally {
+		process.env.PATH = origPath; // 恢复 PATH（防污染后续测试）
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ════════════════════════════ 回放三问（§3.2 验收口径）════════════════════════
+console.log("回放三问（做了什么 / 为什么 / 能不能撤）");
+const T_YESTERDAY = NOW - 24 * 3_600_000;
+const T_TODAY = NOW;
+check("回放①「做了什么」：按 ts 过滤 kind ∈ {attempted, executed}", () => {
+	const { root, state } = freshState("replay-what");
+	try {
+		const mk = (id: string, kind: string, ts: number): ActionEvent => ({
+			v: 1, id, kind: kind as ActionKind, ts: new Date(ts).toISOString(), policyVersion: POLICY_VERSION,
+			trigger: { rule: "working_to_failed", project: "p", evidence: "e", approximate: false },
+			actionClass: "diagnostic-report",
+		});
+		// 动作 A（昨天）：attempted + executed；动作 B（今天）：attempted + executed + postverified
+		appendActionEvent(mk("act_A", "attempted", T_YESTERDAY), state);
+		appendActionEvent(mk("act_A", "executed", T_YESTERDAY + 1000), state);
+		appendActionEvent(mk("act_B", "attempted", T_TODAY), state);
+		appendActionEvent(mk("act_B", "executed", T_TODAY + 1000), state);
+		appendActionEvent(mk("act_B", "postverified", T_TODAY + 2000), state);
+		const all = readActionsTail({ stateDir: state, limit: 100 });
+		// 昨天窗口 = A 的 attempted+executed（不含 B）
+		const didYest = all.filter((e) => {
+			const t = Date.parse(e.ts);
+			return t >= T_YESTERDAY - 1000 && t < T_TODAY - 1000 && (e.kind === "attempted" || e.kind === "executed");
+		});
+		assert.deepEqual(didYest.map((e) => e.id).sort(), ["act_A", "act_A"], "昨天窗口 = A 的 attempted+executed");
+		// 今天窗口 = B 的 attempted+executed（不含 postverified）
+		const didToday = all.filter((e) => {
+			const t = Date.parse(e.ts);
+			return t >= T_TODAY - 1000 && (e.kind === "attempted" || e.kind === "executed");
+		});
+		assert.deepEqual(didToday.map((e) => e.id).sort(), ["act_B", "act_B"], "今天窗口 = B 的 attempted+executed（不含 postverified）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("回放②「为什么」：trigger(rule+project+evidence) + intent + policyVersion 齐全", () => {
+	const { root, state } = freshState("replay-why");
+	try {
+		const ev: ActionEvent = {
+			v: 1, id: "act_W", kind: "attempted", ts: new Date(NOW).toISOString(), policyVersion: POLICY_VERSION,
+			trigger: { rule: "stagnation", project: "repo:W", evidence: "run:r2:stagnation", approximate: false },
+			actionClass: "diagnostic-report", intent: "collect stagnation evidence for repo:W",
+		};
+		appendActionEvent(ev, state);
+		const got = readActionEvents("act_W", { stateDir: state })[0]!;
+		// trigger 三维齐全
+		assert.equal(got.trigger.rule, "stagnation");
+		assert.equal(got.trigger.project, "repo:W");
+		assert.equal(got.trigger.evidence, "run:r2:stagnation");
+		// intent + policyVersion 齐全
+		assert.equal(got.intent, "collect stagnation evidence for repo:W");
+		assert.equal(got.policyVersion, "actions-v1");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+check("回放③「能不能撤」：三终态 + 快照缺失 → 无法保证可撤（不猜）", () => {
+	const { root, state } = freshState("replay-undo");
+	try {
+		const mk = (id: string, kind: string, extra?: Partial<ActionEvent>): ActionEvent => ({
+			v: 1, id, kind: kind as ActionKind, ts: new Date(NOW).toISOString(), policyVersion: POLICY_VERSION,
+			trigger: { rule: "working_to_failed", project: "p", evidence: "e", approximate: false },
+			actionClass: "diagnostic-report", ...extra,
+		});
+		// ① postverified + 真实可读快照 → 可撤
+		const snap1 = join(state, "autonomy", "actions", "snaps", "act_U1");
+		mkdirSync(snap1, { recursive: true });
+		writeFileSync(join(snap1, "meta.json"), JSON.stringify({ path: "/x", existed: false, mode: null }), "utf8");
+		appendActionEvent(mk("act_U1", "postverified", { rollbackHandle: { type: "restore-files", snapshots: [snap1], validUntil: null, deletedFiles: [] } }), state);
+		// ② rolled_back → 已撤
+		appendActionEvent(mk("act_U2", "rolled_back"), state);
+		// ③ rollback_failed → 不可撤，已冻结
+		appendActionEvent(mk("act_U3", "rollback_failed"), state);
+		// ④ postverified + 快照缺失 → 无法保证可撤（不猜）
+		appendActionEvent(mk("act_U4", "postverified", { rollbackHandle: { type: "restore-files", snapshots: [join(state, "no-snap")], validUntil: null, deletedFiles: [] } }), state);
+
+		const canUndo = (id: string): string => {
+			const latest = readLatestAction(id, { stateDir: state })!;
+			if (latest.kind === "rolled_back") return "已撤";
+			if (latest.kind === "rollback_failed") return "不可撤，已冻结";
+			if (latest.kind === "postverified") {
+				const snaps = latest.rollbackHandle?.snapshots ?? [];
+				const readable = snaps.length > 0 && snaps.every((s) => existsSync(join(s, "meta.json")));
+				return readable ? "可撤" : "无法保证可撤（快照缺失/不可读）";
+			}
+			return "未知终态";
+		};
+		assert.equal(canUndo("act_U1"), "可撤", "postverified + 快照可读 → 可撤");
+		assert.equal(canUndo("act_U2"), "已撤", "rolled_back → 已撤");
+		assert.equal(canUndo("act_U3"), "不可撤，已冻结", "rollback_failed → 不可撤已冻结");
+		assert.equal(canUndo("act_U4"), "无法保证可撤（快照缺失/不可读）", "postverified + 快照缺失 → 无法保证可撤（不猜）");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

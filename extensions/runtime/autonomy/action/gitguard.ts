@@ -32,6 +32,22 @@ export function gitPorcelain(repoRoot: string): string[] | null {
 	}
 }
 
+/**
+ * 默认路径自动发现仓根（§6.3 / 计划 P1 返修）：`git rev-parse --show-toplevel`（spawnSync，
+ * cwd = 进程 cwd）。调用方（wake.ts）无需显式传 repoRoot。never-throw；
+ * 发现失败（非 git 仓 / git 缺失 / 超时 / 空输出）= null = 读不到 = fail-closed 拒绝。
+ */
+export function discoverRepoRoot(): string | null {
+	try {
+		const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5_000 });
+		if (r.error || r.status !== 0) return null;
+		const top = (r.stdout ?? "").trim();
+		return top.length > 0 ? top : null;
+	} catch {
+		return null;
+	}
+}
+
 export interface GitPreResult {
 	ok: boolean;
 	reason?: string;

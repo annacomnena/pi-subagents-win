@@ -44,7 +44,7 @@ import {
 	type ActionEvent,
 	type ActionKind,
 } from "./ledger.ts";
-import { gitPostcheck, gitPrecheck } from "./gitguard.ts";
+import { discoverRepoRoot, gitPostcheck, gitPrecheck } from "./gitguard.ts";
 import { diagnosticReportClass } from "./classes/report.ts";
 
 export interface RunActionsOpts {
@@ -53,7 +53,9 @@ export interface RunActionsOpts {
 	sessionId: string | undefined;
 	/** fake clock（毫秒，测试用；缺省 Date.now()）。 */
 	now?: number;
-	/** git 纪律检查的目标仓根（§A ③）；缺省 = 不查 git（P1 报告在 state/ 仓外，由目录前缀+只增不删兜底）。 */
+	/** git 纪律检查的目标仓根（§A ③ / §6.3）；缺省 = 自动发现（`git rev-parse --show-toplevel`，
+	 *  cwd = 进程 cwd）；发现失败 / `git status` 读失败 ⇒ fail-closed DENY（「读不到 = 拒绝」）。
+	 *  调用方（wake.ts）无需显式传。 */
 	repoRoot?: string;
 }
 
@@ -197,15 +199,22 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 		return "skipped"; // HUMAN 仅上层呈现，非许可（P1 无 HUMAN 出口）
 	}
 
-	// ── git 纪律前置（§A ③）：repoRoot 提供时检查 ──
+	// ── git 纪律前置（§A ③ / §6.3）：默认路径自动发现仓根；读不到 = fail-closed DENY ──
+	// repoRoot 缺省时 `git rev-parse --show-toplevel`（cwd = 进程 cwd）自动发现；
+	// 发现失败 / `git status` 读失败 ⇒ DENY（§6.3「读不到 = 拒绝」；调用方无需显式传）。
+	const repoRoot = ctx.repoRoot ?? discoverRepoRoot();
 	let gitBaseline: string[] | null = null;
-	if (ctx.repoRoot) {
-		const pre = gitPrecheck(ctx.repoRoot, { tracked: false }); // P1 报告 = untracked/仓外
+	if (repoRoot) {
+		const pre = gitPrecheck(repoRoot, { tracked: false }); // P1 报告 = untracked/仓外
 		if (!pre.ok) {
 			emit("rejected", { reason: `git-pre:${pre.reason}` });
 			return "denied";
 		}
 		gitBaseline = pre.baseline ?? null;
+	} else {
+		// 发现失败 = 读不到 git 仓 = fail-closed DENY（§6.3）
+		emit("rejected", { reason: "git-repo-not-found(fail-closed)" });
+		return "denied";
 	}
 
 	// ── 事务开始 ──
@@ -296,8 +305,8 @@ function runOneAction(t: FrontierTrigger, ctx: RunOneCtx): RunOneOutcome {
 	}
 
 	// ── git 纪律后置（§A ③）：untracked ⇒ porcelain 逐项一致 ──
-	if (ctx.repoRoot && gitBaseline !== null) {
-		const post = gitPostcheck(ctx.repoRoot, gitBaseline, { tracked: false });
+	if (repoRoot && gitBaseline !== null) {
+		const post = gitPostcheck(repoRoot, gitBaseline, { tracked: false });
 		if (!post.ok) {
 			// 越界/新增 git 条目 = 违规 → 回退 + 熔断 + 冻结（越界清单落账本）
 			diagnosticReportClass.rollback(snapFile);
