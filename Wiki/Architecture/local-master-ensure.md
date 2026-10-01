@@ -2,7 +2,7 @@
 title: Local Master Ensure（幂等确保）
 kind: concept
 status: current
-updated: 2026-09-25
+updated: 2026-10-01
 source_paths:
   - extensions/runtime/local-master-launch.ts
   - extensions/master-tools.ts
@@ -11,6 +11,10 @@ source_paths:
   - extensions/mailbox-consumer.ts
   - extensions/event-bus.ts
   - extensions/_test_local_master_launch.ts
+  - extensions/runtime/scope.ts#listScopeWakeLetters
+  - extensions/runtime/scope.ts#evaluateScopeWake
+  - extensions/runtime/mailbox.ts#claimLetters
+  - extensions/_test_local_master.ts
 ---
 
 # Local Master Ensure（幂等确保）
@@ -88,7 +92,7 @@ source_paths:
 
 ## #A：scope 消费循环注册语义（重要，含"手动 attach 不注册"）
 
-1. **注册点唯一** = `mailbox-consumer.ts::registerScopeWakeLoop()`（`:503`），`pi.on("session_start")` 处理块内 `setInterval(tick, 30s)`（`:557`）；全仓生产侧接线**仅** `index.ts:1945` 一处。tick → `evaluateScopeWake` → claim → spawn 唤醒 tab → ack。`consumeMailboxOnce()` 的 recipient 恒 `masterAddress()`（`mailbox-consumer.ts:151`，只吃 `master_default` 域）——**scope 信箱的唯一写消费端就是这个 tick**。
+1. **注册点唯一** = `mailbox-consumer.ts::registerScopeWakeLoop()`（`:503`），`pi.on("session_start")` 处理块内 `setInterval(tick, 30s)`（`:557`）；全仓生产侧接线**仅** `index.ts:1945` 一处。tick → `evaluateScopeWake` → claim → spawn 唤醒 tab → ack。`consumeMailboxOnce()` 的 recipient 恒 `masterAddress()`（`mailbox-consumer.ts:151`，只吃 `master_default` 域）——**scope 信箱的唯一写消费端就是这个 tick**。**wake 信 claim 生命周期（长期契约）**：`listScopeWakeLetters`（`scope.ts:274`）列出 `pending` + **stale claimed**（`claimedAt` 年龄 > `reclaimAfterMs`，缺省 10min，与 `mailbox.ts::claimLetters` 同口径；`now` 由 `evaluateScopeWake` 的 `opts.now` 透传；fresh claimed 排除防重复唤醒，`delivered`/`acked`/`expired` 不纳入）——spawn 失败残留的 claimed wake 信因此在 reclaimAfterMs 后重新可达，实际重领仍由 `claimLetters` 原子完成，不会永久不可达。
 2. **认领 ⟺ 注册（同一 `session_start` 处理块内）**：无 attachment → `silentScopeGenesis(sid, cwd)`（`:537`）；有 owner 且非本会话 → `takeoverStaleScopeOwner(sid, cwd)`（`:540`，判据 = liveness 身份严格匹配 **且** pid 死；`no-liveness`/`identity-mismatch`/pid 活 → skip）；随后 `if (!att || att.sessionId !== sid) return;`（`:553`，**不注册**）→ 否则 `setInterval`（`:557`）。即认领成功 ⟹ 注册；严谨的逆表述是"**本会话是 owner ⟺ 注册**"（在位 owner 的第二次 `session_start` 也会注册而本轮并未新认领）。
 3. **`triggerOwnershipRecheck()` 只补注册全局 watcher**：`event-bus.ts:121` 实现体只有 `startWatch?.()`（全局 result watcher），**从不触碰** `registerScopeWakeLoop`；`consumeMailboxOnce` 也不消费 `agent://master_local_*`。
 4. **手动 `/master-attach --local` 不经过 `session_start` → 不注册消费循环**（工具 `master-tools.ts:521`、slash `index.ts:2125` 成功后都只调 `triggerOwnershipRecheck()`；L4 独立验证成立）。限定：若同一进程此后再次触发 `session_start`（resume/新会话）会在那时补注册——所以"收不到信"精确指 **attach 之后到下一个 `session_start` 之间（通常即整个会话生命周期）**。
@@ -112,6 +116,8 @@ source_paths:
 - `extensions/index.ts` — slash `/local-master-ensure`(:2194，解析走 `parseLocalMasterEnsureArgs`、审计 `ensure:slash`)、spawn 通道 `ensureLocalMasterTab`(:2494)、`registerMasterTools` 注入(:2529)、scope 消费循环唯一接线(:1945)。
 - `extensions/runner-argv.ts:20-L27` — `DEFAULT_EXCLUDE_TOOLS` 含 `"local-master-ensure"`。
 - `extensions/mailbox-consumer.ts` — `registerScopeWakeLoop`(:503)、genesis(:537)/takeover(:540)/owner 判定(:553)/注册(:557)；`consumeMailboxOnceInner` recipient 恒 `masterAddress()`(:151)。
+- `extensions/runtime/scope.ts` — `listScopeWakeLetters`(:274，pending + stale claimed > `reclaimAfterMs` 缺省 10min，fresh claimed 与 delivered/acked/expired 不纳入)、`evaluateScopeWake`(:331，`opts.now` 透传 `now`)；`extensions/runtime/mailbox.ts:213` — `claimLetters`（同 `reclaimAfterMs ?? 10*60*1000` 口径，原子重领）。
+- 测试 `extensions/_test_local_master.ts` U5b（:473 起，script `npm run test:local-master`）— 首次 fire → fresh claimed 不重复唤醒 → `claimedAt` 拨至 11min 前 → stale reclaim 再次 fire、重领后 `claimedAt` 更新为当前时间。
 - `extensions/event-bus.ts:121` — `triggerOwnershipRecheck()` 只 `startWatch?.()`（全局 watcher）；`extensions/master-tools.ts:521`、`extensions/index.ts:2125` — `master-attach` 成功只调它。
 - 测试 `extensions/_test_local_master_launch.ts`（script `npm run test:local-master-ensure`）— **23 组断言块全绿**（2026-09-25 复跑）：四层逐层拒绝 / `already-running` 幂等 / invalid-cwd 零写 / in-flight F–F4（含 `windowEndsAt` first-wins、fail-closed）/ ready 与 stalled 不猜 / claim 观测 H / #A J1–J3 / 审计六字段 / K 组双入口 + 注册点静态耦合 / L 组 slash 解析 4 例。L4 变异 4/4 被捕获（`plans/0924_local_master_ensure_l4_review.md`，本地 gitignored）。
 - 提交：`0586030`（feat，7 files）+ `f5a9b90`（fix：L4-M1 slash 参数解析 + S1/S2/S3/S4/S5/S7，3 files）。

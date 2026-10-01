@@ -2,7 +2,7 @@
 title: GUI 工作台 UI（token / 组件 / 导航）
 kind: architecture
 status: current
-updated: 2026-09-30
+updated: 2026-10-01
 source_paths:
   - gui/src/index.css
   - gui/src/ui/index.tsx
@@ -18,6 +18,8 @@ source_paths:
   - gui/src/pages/AutonomyPage.tsx
   - extensions/runtime-host/session-title.ts
   - extensions/runtime/transcript.ts
+  - extensions/hotspot/inject.ts
+  - extensions/_test_session_title.ts
 ---
 
 # GUI 工作台 UI（token / 组件 / 导航）
@@ -61,7 +63,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 
 - **字段**：条目 `title` + `titleSource`（`ledger | first-user | id`），服务端解析链权威产物（`extensions/runtime-host/session-title.ts`）；GUI 只渲染，不自行派生。`titleSource==='ledger'` 同时是「全 tab 组默认折叠」判据（`workspaceGroup.resolveGroupOpen`）；`!=='id'` 时行内显示 title，`'id'` 时灰显 shortId。
 - **P1 ledger**：全局 tab-runs 台账（`~/.pi/agent/tab-runs/<runId>.json` 顶层记录，env `PI_TAB_RUNS_DIR` 覆盖）；同 cwd 桶 + 首条 user 严格前缀匹配 + 派发时间窗（会话不得早于派发 60s）。派发会话首条 user 常以 `<file name="...">` 附件块包装、前缀行在块内 → 匹配前只剥开标签行（`ledgerProbeFirstLine`），与 P2 的整块剥除语义不同。
-- **P2 first-user**：`transcript.ts readHead` 分块头扫描——首读 32KB（取首行头），header 解析成功且未见首条 user 则以 64KB 分块续扫，上限 256KB，命中即提前停（800 会话全扫 ≈200ms）；跨块半截行以 `pending` 携带、跨块多字节字符由 `StringDecoder("utf8")` 解码（普通 `toString("utf8")` 会在块边界把多字节字符烧成 `U+FFFD`）；窗口打满后首个被截断的完整行视半截行丢弃。`firstUserText` 截 8000 字符（需覆盖附件块闭合）。派生前 `stripLeadingAttachmentBlocks` 循环剥开头的 `<file ...>...</file>` / `<system-reminder>...</system-reminder>` 机器注入块（限这两类，防误伤正文 XML）；整条都是附件块 → null 回退 P3。截 24 字符（taskTitleLabel 同款规则独立重实现）。
+- **P2 first-user**：`transcript.ts readHead` 分块头扫描——首读 32KB（取首行头），header 解析成功且未见首条 user 则以 64KB 分块续扫，上限 256KB，命中即提前停（800 会话全扫 ≈200ms）；跨块半截行以 `pending` 携带、跨块多字节字符由 `StringDecoder("utf8")` 解码（普通 `toString("utf8")` 会在块边界把多字节字符烧成 `U+FFFD`）；窗口打满后首个被截断的完整行视半截行丢弃。`firstUserText` 截 8000 字符（需覆盖附件块闭合）。派生前先剥**正文末尾**完整的 `<recent-working-set>…</recent-working-set>` 块（hotspot 注入恒追加在首条 user 消息末尾，`inject.ts` 返回 `text: \`${text}\n\n${sel.block}\``），再由 `stripLeadingAttachmentBlocks` 循环剥开头机器注入块，白名单**三类**：`<file ...>...</file>` / `<system-reminder>...</system-reminder>` / `<recent-working-set>...</recent-working-set>`（限这三类，防误伤正文其它 XML；开标签在头但无闭合 → 整段视附件返回空串）；剥空 → null 回退 P3。截 24 字符（taskTitleLabel 同款规则独立重实现）。
 - **P3 id**：会话 id 兜底。
 - **行数上限（与标题契约同屏）**：每组非置顶可见行默认 3（`workspaceGroup.ts` 的 `GROUP_VISIBLE_LIMIT = 3`），超出收进「还有 N 个 · 展开查看全部」行；置顶行豁免不计、展开态持久化 `saw-ws-overflow`（`workspaceRailExpand.ts` 统一读写 localStorage）。
 - **结构性降级（正常态，非 bug）**：gc-cleaner 把终态台账记录移入 `_archived/`（解析链只读顶层）→ 历史派发会话的 P1 永久不可达，按链降 P2/P3；新派发会话在台账归档前可命中 P1。
@@ -78,7 +80,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 - 布局/路由/轮询/TooltipProvider：`gui/src/App.tsx`（TabId L17-22、三栏 L43-70）
 - 暗色常驻：`gui/src/main.tsx:12`
 - 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/TimelinePage.tsx`（Esc 监听 + 页头返回钮）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS L26-32、头部注释 z 序与入口语义）
-- 会话列表标题契约：`extensions/runtime-host/session-title.ts`（解析链 + 附件块剥离）、`extensions/runtime/transcript.ts`（`readHead` 分块扫描常量 `HEAD_READ_BYTES/HEAD_CHUNK_BYTES/HEAD_SCAN_MAX_BYTES`、`StringDecoder` 跨块解码、`FIRST_USER_TEXT_CAP`）、`gui/src/workspaceGroup.ts`（`GROUP_VISIBLE_LIMIT = 3`、`resolveGroupOpen`）、`gui/src/workspaceRailExpand.ts`（`saw-ws-overflow` 展开态）、`extensions/runtime-host/server.ts:1404`（`titleSource` 字段下发）
+- 会话列表标题契约：`extensions/runtime-host/session-title.ts`（解析链 + 三类领头机器注入块白名单剥离 `LEADING_CLOSED_BLOCK/LEADING_UNCLOSED_BLOCK` + 尾部 `<recent-working-set>` 剥离 `TRAILING_RECENT_WORKING_SET`、剥空回退 P3）、`extensions/hotspot/inject.ts`（注入恒 `text: ${text}\n\n${sel.block}` 追加在首条 user 消息末尾）、测试 `extensions/_test_session_title.ts`（T12a/T12b：尾部 recent-working-set 块 → title 不含标签、回退 P3，`npm run test:session-title`）、`extensions/runtime/transcript.ts`（`readHead` 分块扫描常量 `HEAD_READ_BYTES/HEAD_CHUNK_BYTES/HEAD_SCAN_MAX_BYTES`、`StringDecoder` 跨块解码、`FIRST_USER_TEXT_CAP`）、`gui/src/workspaceGroup.ts`（`GROUP_VISIBLE_LIMIT = 3`、`resolveGroupOpen`）、`gui/src/workspaceRailExpand.ts`（`saw-ws-overflow` 展开态）、`extensions/runtime-host/server.ts:1404`（`titleSource` 字段下发）
 - 覆盖层六 section 与主动性入口：`gui/src/store.ts:38`（`RuntimeOverlaySection` union）、`gui/src/pages/RuntimeOverlay.tsx:28-35`（SECTIONS 表）、`gui/src/pages/AutonomyPage.tsx`
 - 轮询门控与条件请求：`gui/src/App.tsx:32-42`（timeline `usePoll` 第三参门控）
 - 提交：`ffdef07`（会话列表标题契约节）、`b619edb`（StringDecoder 跨块 UTF-8 + 注释同步）、`eef10cb`（每组可见行 6→3）、`6ee8191`（覆盖层第 6 section + AutonomySettings 迁出微信页）。
