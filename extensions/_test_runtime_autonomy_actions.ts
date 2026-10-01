@@ -53,6 +53,11 @@ import {
 } from "./runtime/autonomy/action/ledger.ts";
 import { gitPostcheck, gitPorcelain, gitPrecheck } from "./runtime/autonomy/action/gitguard.ts";
 import { diagnosticReportClass, type FileSnapshot } from "./runtime/autonomy/action/classes/report.ts";
+import { notifyLocalMasterClass, resolveNotifyTarget } from "./runtime/autonomy/action/classes/notify.ts";
+import { getActionClassRegistry, getClass } from "./runtime/autonomy/action/registry.ts";
+import { localMasterAddress, localMasterScope } from "./runtime/scope.ts";
+import { defaultMailboxDir } from "./runtime/mailbox.ts";
+import { engageKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { runAutonomyActions, summarizeActionsStatus, undoAction } from "./runtime/autonomy/action/run.ts";
 import { queryActionsWhat, queryActionsWhy, queryActionsUndo } from "./runtime/autonomy/action/replay.ts";
 import { writeFrontierSnapshot } from "./runtime/autonomy/collect.ts";
@@ -801,7 +806,7 @@ check("预算常量硬编码（设计 §2；不可经 config 放大）", () => {
 	assert.equal(BUDGET.maxReadBytes, 256 * 1024);
 	assert.equal(BUDGET.maxWallClockMs, 5000);
 	assert.equal(TRIGGER_ALLOWLIST.size, 2);
-	assert.equal(ACTION_CLASS_ALLOWLIST.size, 1);
+	assert.equal(ACTION_CLASS_ALLOWLIST.size, 2); // 阶段二：diagnostic-report + notify-local-master
 });
 check("config 归一：actions 严格 === true；缺键/垃圾 = false", () => {
 	const { root, state } = freshState("cfg-norm");
@@ -926,6 +931,240 @@ check("IO：gitspawn 失败（PATH 空 ⇒ git 不可达）⇒ 自动发现失�
 	} finally {
 		process.env.PATH = origPath; // 恢复 PATH（防污染后续测试）
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ════════════════════════════ notify-local-master（阶段二：只发信不写文件 + 可回滚论证）════════════════════════
+console.log("notify-local-master（阶段二：只发信不写文件 + 可回滚论证）");
+
+/** 递归列目录所有**文件**的绝对路径（目录本身不计）。never-throw。 */
+function listFilesRecursive(dir: string): string[] {
+	const out: string[] = [];
+	let entries: import("node:fs").Dirent[] = [];
+	try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+	for (const e of entries) {
+		const full = join(dir, e.name);
+		if (e.isDirectory()) out.push(...listFilesRecursive(full));
+		else out.push(full);
+	}
+	return out;
+}
+
+/** 预置 report 的 dedupKey（含 class 段）命中冷却 ⇒ 编排时 report SKIP(cooldown) ⇒ notify 得以单独执行。 */
+function seedReportCooldown(state: string, rule: string, project: string, at: number): void {
+	const b = readBreaker(state) ?? defaultBreakerState(at);
+	b.dedup[`${rule}:diagnostic-report:${project}`] = new Date(at).toISOString();
+	writeBreaker(b, state);
+}
+
+/** 取某 state 下 notify 动作的 id（账本中首个 actionClass=notify-local-master 事件）。 */
+function notifyActionId(state: string): string {
+	const ev = readActionsTail({ stateDir: state, limit: 50 }).find((e) => e.actionClass === "notify-local-master");
+	return ev?.id ?? "";
+}
+
+const NT_PROJECT = "c:/tmp/autonomy-stage2-probe"; // 无主仓路径 ⇒ notify 信投到无 owner 的 scope，零 wake 风险
+
+check("allowlist：notify-local-master 在册（两 class 并存）+ 注册表可取 + 未注册 fail-closed", () => {
+	assert.equal(ACTION_CLASS_ALLOWLIST.has("notify-local-master"), true, "notify 在白名单");
+	assert.equal(ACTION_CLASS_ALLOWLIST.has("diagnostic-report"), true, "report 仍在白名单");
+	assert.equal(getActionClassRegistry()["notify-local-master"]?.name, "notify-local-master", "注册表可取");
+	assert.equal(getClass("notify-local-master")?.name, "notify-local-master");
+	assert.equal(getClass("nonexistent-class"), null, "未注册 = null（fail-closed）");
+});
+
+check("scope 解析 fail-closed：project 非路径 → {ok:false}（不猜）；有效路径 → scope master 地址", () => {
+	const bad = resolveNotifyTarget("mailbox:agent___master_default", NOW);
+	assert.equal(bad.ok, false, "非路径 project → 拒绝");
+	assert.match((bad as { reason: string }).reason, /not-a-path/);
+	const good = resolveNotifyTarget(NT_PROJECT, NOW);
+	assert.equal(good.ok, true, "有效路径 → ok");
+	assert.equal(good.target.to, localMasterAddress(localMasterScope(NT_PROJECT)), "to = localMasterAddress(localMasterScope)");
+	assert.ok(good.target.messageId.startsWith("msg_"), "messageId 为 msg_ 前缀");
+});
+
+check("信件效应面：effect = 恰一个信件文件（deliverLetter 落盘）+ 帧字段（requiresAck:false/subject 非 run://tab/）", () => {
+	const { root, state } = freshState("nt-surface");
+	try {
+		const path = notifyLocalMasterClass.targetPath(state, NT_PROJECT, NOW);
+		assert.ok(path.length > 0, "有效目标路径");
+		const content = notifyLocalMasterClass.buildContent({
+			project: NT_PROJECT,
+			trigger: { rule: "working_to_failed", project: NT_PROJECT, evidence: "run:r1:wtf", approximate: false },
+			now: NOW, frontier: { asof: NOW, baseline: false, projects: [], triggers: [] } as never,
+		});
+		const eff = notifyLocalMasterClass.effect(path, content);
+		assert.ok(eff !== null, "effect 成功");
+		assert.deepEqual(eff!.deletedFiles, [], "只发信：effect 不删任何既有文件");
+		assert.ok(existsSync(path), "信件文件落盘");
+		const letter = JSON.parse(readFileSync(path, "utf8"));
+		assert.equal(letter.status, "pending", "status=pending");
+		assert.equal(letter.frame.requiresAck, false, "requiresAck:false");
+		assert.equal(letter.frame.from, "agent://autonomy-actions", "from 标明动作来源");
+		assert.equal(letter.frame.to, localMasterAddress(localMasterScope(NT_PROJECT)), "to = scope master");
+		assert.ok(!String(letter.frame.subject).startsWith("run://tab/"), "subject 不以 run://tab/ 开头");
+		assert.ok(String(letter.frame.body.summary).length > 0, "body.summary 非空");
+		// withinSurface：面内 / 同 mailbox 基目录内 / 越出 mailbox = 越界 / 空 = 越界
+		assert.equal(notifyLocalMasterClass.withinSurface(state, path), true, "面内");
+		assert.equal(notifyLocalMasterClass.withinSurface(state, join(defaultMailboxDir(), "other-recipient", "x.json")), true, "同 mailbox 基目录内");
+		assert.equal(notifyLocalMasterClass.withinSurface(state, join(state, "autonomy", "actions", "reports", "x.md")), false, "越出 mailbox = 越界");
+		assert.equal(notifyLocalMasterClass.withinSurface(state, ""), false, "空/哨兵 = 越界（fail-closed）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("只发信不写文件：mailbox 下恰一信件 + expectation 目录未建 + 无 claims slot（机械保证）", () => {
+	const { root, state } = freshState("nt-nowrite");
+	try {
+		const path = notifyLocalMasterClass.targetPath(state, NT_PROJECT, NOW);
+		const content = notifyLocalMasterClass.buildContent({
+			project: NT_PROJECT,
+			trigger: { rule: "working_to_failed", project: NT_PROJECT, evidence: "e", approximate: false },
+			now: NOW, frontier: { asof: NOW, baseline: false, projects: [], triggers: [] } as never,
+		});
+		notifyLocalMasterClass.effect(path, content);
+		// ① mailbox 下恰一个文件（信件本身）
+		const mailboxFiles = listFilesRecursive(defaultMailboxDir());
+		assert.equal(mailboxFiles.length, 1, "mailbox 下恰一个文件");
+		assert.equal(mailboxFiles[0], path, "该文件 = 信件本身");
+		// ② expectation 账本零写入（expectReply:false ⇒ shouldDeclareExpectation 短路）
+		assert.equal(existsSync(join(root, "state", "expectations")), false, "expectation 目录未创建");
+		// ③ claims slot 零写入（不传 dedupeId）
+		const claimsDir = join(root, "claims");
+		const claimSlots = existsSync(claimsDir) ? listFilesRecursive(claimsDir).filter((f) => f.includes("mailbox-")) : [];
+		assert.deepEqual(claimSlots, [], "无 claims slot");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("编排正路径：trigger×class 候选枚举（report 冷却跳过 → notify 投递四行）+ dedupKey 含 class", () => {
+	const { root, state, cfgOn } = freshState("nt-run");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t); // report 冷却 ⇒ notify 单独执行
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		const events = readActionsTail({ stateDir: state, limit: 50 });
+		assert.ok(events.some((e) => e.kind === "skipped" && e.reason === "cooldown" && e.actionClass === "diagnostic-report"), "report SKIP(cooldown)");
+		const notifyEvents = events.filter((e) => e.actionClass === "notify-local-master");
+		assert.deepEqual(notifyEvents.map((e) => e.kind), ["attempted", "precheck", "executed", "postverified"], "notify 四行齐全");
+		// 恰一个信件落盘
+		assert.equal(listFilesRecursive(defaultMailboxDir()).length, 1, "恰一个信件文件");
+		// dedupKey 含 class 段（notify 的）
+		const br = readBreaker(state)!;
+		assert.ok(br.dedup[`working_to_failed:notify-local-master:${NT_PROJECT}`], "notify dedupKey 含 class 段已写入");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("dedupKey 含 class 段：同 trigger 的 report/notify 冷却键独立（不互饿）", () => {
+	const { root, state, cfgOn } = freshState("nt-dedup");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		const br = readBreaker(state)!;
+		const reportKey = `working_to_failed:diagnostic-report:${NT_PROJECT}`;
+		const notifyKey = `working_to_failed:notify-local-master:${NT_PROJECT}`;
+		assert.notEqual(reportKey, notifyKey, "两 class 冷却键不同");
+		assert.ok(br.dedup[reportKey], "report 冷却键在");
+		assert.ok(br.dedup[notifyKey], "notify 冷却键在");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("pending 窗回滚：notify 信件 pending ⇒ undoAction 删除自创信件 + rolled_back（可回滚窗口）", () => {
+	const { root, state, cfgOn } = freshState("nt-undo-pending");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		const id = notifyActionId(state);
+		assert.ok(id, "拿到 notify 动作 id");
+		const letterPath = notifyLocalMasterClass.targetPath(state, NT_PROJECT, t);
+		assert.equal(existsSync(letterPath), true, "信件存在");
+		assert.equal(JSON.parse(readFileSync(letterPath, "utf8")).status, "pending", "pending 状态（可回滚窗口）");
+		const r = undoAction(id, { stateDir: state, now: t + 1000 });
+		assert.equal(r.ok, true, "undo 成功");
+		assert.equal(existsSync(letterPath), false, "自创信件已删除（恢复非存在）");
+		assert.ok(kindsOf(id, state).includes("rolled_back"), "账本出现 rolled_back");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("claim 后处置：信件被消费（status=claimed）⇒ 文件级可删但「已送达」= D1 显式不可回退例外（不熔断/不冻结）", () => {
+	const { root, state, cfgOn } = freshState("nt-claim");
+	try {
+		const sid = ownerSession();
+		const t = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t });
+		const id = notifyActionId(state);
+		const letterPath = notifyLocalMasterClass.targetPath(state, NT_PROJECT, t);
+		// 模拟消费端 claim（状态改写：信息已可达）
+		const letter = JSON.parse(readFileSync(letterPath, "utf8"));
+		letter.status = "claimed";
+		writeFileSync(letterPath, JSON.stringify(letter), "utf8");
+		// 文件级回退（删除自创信件）成功；但「通知已送达」= D1 显式不可回退例外，非「可回滚承诺被证伪」
+		const r = undoAction(id, { stateDir: state, now: t + 1000 });
+		assert.equal(r.ok, true, "文件级回退成功");
+		assert.equal(existsSync(letterPath), false, "信件文件已删");
+		assert.ok(kindsOf(id, state).includes("rolled_back"), "rolled_back 如实记账");
+		// 关键：claim 后回退 NOT 触发熔断/冻结（D1 例外，非违规）
+		const br = readBreaker(state)!;
+		assert.equal(br.tripped, false, "claim 后回退不熔断（D1 例外）");
+		assert.equal(br.frozen, false, "claim 后回退不冻结（D1 例外）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("拒绝路径照旧：非 owner / kill / breaker-tripped ⇒ notify 亦 DENY（无信件产出）", () => {
+	// 非 owner
+	{
+		const { root, state, cfgOn } = freshState("nt-noowner");
+		try {
+			ownerSession();
+			writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: "intruder-session", now: NOW });
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "非 owner：无信件");
+			assert.ok(anyReason(state, "not-owner"), "DENY(not-owner) 落账");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
+	// kill
+	{
+		const { root, state, cfgOn } = freshState("nt-kill");
+		try {
+			const sid = ownerSession();
+			engageKillSwitch({ reason: "test", by: "t" }, { stateDir: state });
+			writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "kill：无信件");
+			assert.ok(anyReason(state, "kill-engaged"), "DENY(kill-engaged) 落账");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
+	// breaker tripped
+	{
+		const { root, state, cfgOn } = freshState("nt-trip");
+		try {
+			const sid = ownerSession();
+			writeBreaker(tripBreaker(readBreaker(state) ?? defaultBreakerState(NOW), NOW), state);
+			writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "breaker-tripped：无信件");
+			assert.ok(anyReason(state, "breaker-tripped"), "DENY(breaker-tripped) 落账");
+		} finally { rmSync(root, { recursive: true, force: true }); }
 	}
 });
 
