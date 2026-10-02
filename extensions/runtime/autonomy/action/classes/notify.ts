@@ -16,7 +16,7 @@
  *    的 scope master：`localMasterAddress(localMasterScope(projectPath))`；
  *  - **project 非路径 / scope 解析失败 ⇒ fail-closed**（targetPath 返回哨兵 "" ⇒
  *    withinSurface false ⇒ closure=false ⇒ DENY(surface-open)）；
- *  - 目标 scope **无 owner 也可投递**（信留 pending 由 backlog 计数；不替它消费）；
+ *  - 目标 scope **无 owner 不可投递**（方案 A：发信前查 scope owner，无主/死主 → DENY）；
  *    **绝不消费/ack 他人 mailbox**（红线不变，只 deliver）。
  *
  * 「可回滚」定位（详见 impl 报告论证节）：messageId 全新 ⇒ 快照 = 不存在；回退 = 删除自创
@@ -31,7 +31,9 @@ import { join, relative } from "node:path";
 import type { ObjectAddress } from "../../../address.ts";
 import { defaultMailboxDir, deliverLetter, mailboxDirFor } from "../../../mailbox.ts";
 import type { MessageFrame } from "../../../protocol.ts";
-import { localMasterAddress, localMasterScope } from "../../../scope.ts";
+import { judgeScopeOwnerStale, localMasterAddress, localMasterScope } from "../../../scope.ts";
+import { readAttachment } from "../../../registry.ts";
+import { readScopeLiveness } from "../../../liveness.ts";
 import type { BuildContentArgs, EffectResult, FileSnapshot, ActionClass } from "./types.ts";
 
 /** 发件地址（标明动作来源；agent:// 单段，非 run://tab/，scope wake 链不认领）。 */
@@ -136,6 +138,29 @@ export const notifyLocalMasterClass: ActionClass = {
 			},
 		};
 		return JSON.stringify(frame);
+	},
+
+	/**
+	 * 方案 A：发信前查目标 scope owner（fail-closed）。
+	 * ① readAttachment 读不到（无 owner，含读失败不可区分）→ "ownerless"（DENY scope-ownerless）
+	 * ② attachment 在位 + judgeScopeOwnerStale verdict === "stale"（liveness 匹配 + pid 死）→ "stale"（DENY scope-owner-stale）
+	 * ③ liveness 缺失 / 身份不匹配（verdict skip）/ pid 活（verdict alive）→ "ok"（放行；保守度与现状一致）
+	 * ④ IO 异常 → "ownerless"（fail-closed，DENY 投递；与读不到 owner 同处理）
+	 */
+	ownerCheck: (project: string, opts: { stateDir?: string }): "ok" | "ownerless" | "stale" | "unknown" => {
+		try {
+			const scope = localMasterScope(project);
+			if (!scope) return "ownerless";
+			const addr = localMasterAddress(scope);
+			const att = readAttachment(addr);
+			if (!att) return "ownerless";
+			const liveness = readScopeLiveness(scope, opts.stateDir);
+			const verdict = judgeScopeOwnerStale(att, liveness);
+			if (verdict.verdict === "stale") return "stale";
+			return "ok"; // alive / skip（liveness 缺失/身份不匹配）→ 放行
+		} catch {
+			return "ownerless"; // fail-closed：读取异常按读不到 owner 处理，禁止投递
+		}
 	},
 
 	/** 快照（原字节/权限/存在性；信件为新文件 ⇒ existed:false）。never-throw。 */

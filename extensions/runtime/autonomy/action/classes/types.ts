@@ -54,4 +54,11 @@ export interface ActionClass {
 	postverify(path: string, expected: string): "match" | "mismatch" | "unknown";
 	/** 回退（按快照恢复；never-throw；失败 = {ok:false} → 熔断 + 冻结）。 */
 	rollback(snap: FileSnapshot): { ok: boolean; deletedFiles: string[]; reason?: string };
+	/**
+	 * 可选 hook：发信前查目标 scope owner（方案 A；仅 notify 实现）。
+	 * 返回 "ok"（有 owner，放行）/ "ownerless"（无 owner，DENY scope-ownerless）/
+	 * "stale"（owner 死，DENY scope-owner-stale）/ "unknown"（hook 缺失/未实现，policy 层 fail-closed DENY）。
+	 * report 类不实现（= 无此 hook，policy 层对非 notify 类填 "n/a" 忽略）。
+	 */
+	ownerCheck?(project: string, opts: { stateDir?: string }): "ok" | "ownerless" | "stale" | "unknown";
 }

@@ -18,8 +18,24 @@
 /** 动作类白名单（§4）：P1 = diagnostic-report；阶段二 + notify-local-master（两 class 并存）。 */
 export const ACTION_CLASS_ALLOWLIST: ReadonlySet<string> = new Set(["diagnostic-report", "notify-local-master"]);
 
-/** v1 trigger 白名单（§4：working_to_failed + stagnation；两个 approximate trigger 不动手）。 */
-export const TRIGGER_ALLOWLIST: ReadonlySet<string> = new Set(["working_to_failed", "stagnation"]);
+/**
+ * trigger → 允许的动作类集合（逐规则映射，替代「单 trigger 白名单 × 全 class 白名单」笛卡尔积）。
+ * 扩容（2026-10-02 OQ-1 防护 + trigger 扩容）：
+ *   ③ working_to_failed / ⑨ stagnation → 诊断报告 + 通知（现状不变）
+ *   ⑤ needs_user → 仅 notify（语义 = 系统声明需要人，交人 = 通知 scope master；
+ *      诊断记录需求已由 ③⑨⑧ 覆盖，不给 ⑤ 额外面）
+ *   ⑧ expected_event_timeout → 仅诊断报告（设计 §4 诊断类第二成员 + eval「仅诊断类」；
+ *      ⑧ 是 level 触发，映射 notify 会放大信件面）
+ */
+export const TRIGGER_CLASS_MAP: Readonly<Record<string, readonly string[]>> = {
+	working_to_failed: ["diagnostic-report", "notify-local-master"],
+	stagnation: ["diagnostic-report", "notify-local-master"],
+	needs_user: ["notify-local-master"],
+	expected_event_timeout: ["diagnostic-report"],
+};
+
+/** v1 trigger 白名单（由 TRIGGER_CLASS_MAP 派生；对外导出兼容）。 */
+export const TRIGGER_ALLOWLIST: ReadonlySet<string> = new Set(Object.keys(TRIGGER_CLASS_MAP));
 
 /**
  * 预算/熔断常量（设计 §2，试运行保守值；D6 固化；**硬编码不可经 config 放大**）。
@@ -70,9 +86,12 @@ export interface PolicyContext {
 	breakerReadable: boolean;
 	breakerTripped: boolean;
 	isOwner: boolean;
-	// ── L1 白名单（trigger × 动作类，双维度都要在册）──
+	// ── L1 白名单（trigger 在映射 ∧ class ∈ map[rule] ∧ class ∈ 全局白名单）──
 	trigger: TriggerRef;
 	actionClass: string;
+	// ── L1.5 notify scope-owner 门（方案 A：发信前查目标 scope owner；仅 notify 生效）──
+	// "ok"=有 owner 放行；其余状态（含 unknown/n/a）均由 notify 分支 fail-closed DENY
+	notifyScopeOwner: "ok" | "ownerless" | "stale" | "unknown" | "n/a";
 	// ── L2 可回滚四要件（快照/句柄/验证 + 封闭 + 独占；unknown 一律 false → DENY）──
 	closure: boolean;
 	snapshot: boolean;
@@ -94,11 +113,11 @@ export type PolicyVerdict =
 	| { kind: "HUMAN"; reason: string };
 
 /**
- * 许可判定决策树（纯；§1.2）。按 L0→L1→L2→L3 顺序短路；未知即拒绝（fail-closed）。
+ * 许可判定决策树（纯；§1.2）。按 L0→L1→L1.5→L2→L3 顺序短路；未知即拒绝（fail-closed）。
  * 返回 AUTO_EXEC | SKIP(reason) | DENY(reason) | HUMAN(reason)。
  *
- * 注意：HUMAN 仅作上层呈现，不是许可结果（§1.2 第 1 层注释）——P1 无 HUMAN 出口
- * （needs_user 等永久交人的 trigger 已在 TRIGGER_ALLOWLIST 外被 DENY 拦截）。
+ * 注意：HUMAN 仅作上层呈现，不是许可结果（§1.2 第 1 层注释）——无 HUMAN 出口
+ *（needs_user 已进 TRIGGER_CLASS_MAP 映射，由 L1.5 scope-owner 门管控，不再被白名单拦截）。
  */
 export function decide(ctx: PolicyContext): PolicyVerdict {
 	// ── L0 总门（fail-closed；读不到 = 拒绝）──
@@ -108,10 +127,19 @@ export function decide(ctx: PolicyContext): PolicyVerdict {
 	if (ctx.breakerTripped) return { kind: "DENY", reason: "breaker-tripped" };
 	if (!ctx.isOwner) return { kind: "DENY", reason: "not-owner" };
 
-	// ── L1 白名单（trigger × class 双维度在册；approximate 一律不动手）──
-	if (!TRIGGER_ALLOWLIST.has(ctx.trigger.rule)) return { kind: "DENY", reason: "trigger-not-allowed" };
+	// ── L1 白名单（trigger 在映射 ∧ class ∈ map[rule] ∧ class ∈ 全局白名单；approximate 一律不动手）──
+	const classesForRule = TRIGGER_CLASS_MAP[ctx.trigger.rule];
+	if (!classesForRule) return { kind: "DENY", reason: "trigger-not-allowed" };
+	if (!classesForRule.includes(ctx.actionClass)) return { kind: "DENY", reason: "class-not-allowed" };
 	if (!ACTION_CLASS_ALLOWLIST.has(ctx.actionClass)) return { kind: "DENY", reason: "class-not-allowed" };
 	if (ctx.trigger.approximate) return { kind: "DENY", reason: "approximate-trigger" };
+
+	// ── L1.5 notify scope-owner 门（方案 A：发信前查目标 scope owner；仅 notify 生效；report 类 "n/a" 忽略）──
+	if (ctx.actionClass === "notify-local-master" && ctx.notifyScopeOwner !== "ok") {
+		if (ctx.notifyScopeOwner === "ownerless") return { kind: "DENY", reason: "scope-ownerless" };
+		if (ctx.notifyScopeOwner === "stale") return { kind: "DENY", reason: "scope-owner-stale" };
+		return { kind: "DENY", reason: "scope-owner-unknown" };
+	}
 
 	// ── L2 可回滚四要件（任一 unknown/false → DENY；不「存疑放行」）──
 	if (!ctx.closure) return { kind: "DENY", reason: "surface-open" };

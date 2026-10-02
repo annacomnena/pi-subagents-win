@@ -27,6 +27,7 @@ import {
 	BUDGET,
 	decide,
 	TRIGGER_ALLOWLIST,
+	TRIGGER_CLASS_MAP,
 	type PolicyContext,
 } from "./runtime/autonomy/action/policy.ts";
 import {
@@ -61,7 +62,8 @@ import { engageKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { runAutonomyActions, summarizeActionsStatus, undoAction } from "./runtime/autonomy/action/run.ts";
 import { queryActionsWhat, queryActionsWhy, queryActionsUndo } from "./runtime/autonomy/action/replay.ts";
 import { writeFrontierSnapshot } from "./runtime/autonomy/collect.ts";
-import { attachMaster } from "./runtime/registry.ts";
+import { attachMaster, readAttachment } from "./runtime/registry.ts";
+import { writeScopeLiveness } from "./runtime/liveness.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 
@@ -136,6 +138,7 @@ function autoCtx(over: Partial<PolicyContext> = {}): PolicyContext {
 		actionsEnabled: true, killPresent: false, breakerReadable: true, breakerTripped: false, isOwner: true,
 		trigger: { rule: "working_to_failed", project: "repo:X", evidence: "run:r1:working→failed", approximate: false },
 		actionClass: "diagnostic-report",
+		notifyScopeOwner: "n/a",
 		closure: true, snapshot: true, rollback: true, postverify: true, lease: true,
 		inFlight: 0, newThisTick: 0, startedInLast1h: 0, consecutiveFailures: 0, dedupHit: false,
 		...over,
@@ -163,13 +166,49 @@ check("L0 非 owner → DENY(not-owner)", () => {
 	assert.deepEqual(decide(autoCtx({ isOwner: false })), { kind: "DENY", reason: "not-owner" });
 });
 check("L1 trigger 不在册 → DENY(trigger-not-allowed)", () => {
+	// blocked_to_ready 不在 TRIGGER_CLASS_MAP（① approx，永不动手）
 	assert.deepEqual(
-		decide(autoCtx({ trigger: { rule: "needs_user", project: "p", evidence: "e", approximate: false } })),
+		decide(autoCtx({ trigger: { rule: "blocked_to_ready", project: "p", evidence: "e", approximate: false } })),
 		{ kind: "DENY", reason: "trigger-not-allowed" },
 	);
 });
 check("L1 class 不在册 → DENY(class-not-allowed)", () => {
 	assert.deepEqual(decide(autoCtx({ actionClass: "dispatch-isolated" })), { kind: "DENY", reason: "class-not-allowed" });
+});
+check("L1 映射：needs_user + report → DENY(class-not-allowed)（⑤ 仅 notify）", () => {
+	assert.deepEqual(
+		decide(autoCtx({ trigger: { rule: "needs_user", project: "p", evidence: "e", approximate: false }, actionClass: "diagnostic-report", notifyScopeOwner: "n/a" })),
+		{ kind: "DENY", reason: "class-not-allowed" },
+	);
+});
+check("L1.5 notify scope-owner：unknown/n/a DENY，ok 放行", () => {
+	const mkNotify = (notifyScopeOwner: PolicyContext["notifyScopeOwner"]) =>
+		decide(autoCtx({ actionClass: "notify-local-master", notifyScopeOwner }));
+	assert.deepEqual(mkNotify("unknown"), { kind: "DENY", reason: "scope-owner-unknown" });
+	assert.deepEqual(mkNotify("n/a"), { kind: "DENY", reason: "scope-owner-unknown" });
+	assert.deepEqual(mkNotify("ok"), { kind: "AUTO_EXEC" });
+});
+check("L1 映射：expected_event_timeout + notify → DENY(class-not-allowed)（⑧ 仅 report）", () => {
+	assert.deepEqual(
+		decide(autoCtx({ trigger: { rule: "expected_event_timeout", project: "p", evidence: "e", approximate: false }, actionClass: "notify-local-master", notifyScopeOwner: "ok" })),
+		{ kind: "DENY", reason: "class-not-allowed" },
+	);
+});
+check("映射矩阵：4 rule × 2 class 逐格 allowed/DENY", () => {
+	const mk = (rule: string, cls: string, owner: "ok" | "n/a") =>
+		decide(autoCtx({ trigger: { rule: rule as never, project: "p", evidence: "e", approximate: false }, actionClass: cls, notifyScopeOwner: owner }));
+	// working_to_failed: report ✓, notify ✓
+	assert.deepEqual(mk("working_to_failed", "diagnostic-report", "n/a"), { kind: "AUTO_EXEC" });
+	assert.deepEqual(mk("working_to_failed", "notify-local-master", "ok"), { kind: "AUTO_EXEC" });
+	// stagnation: report ✓, notify ✓
+	assert.deepEqual(mk("stagnation", "diagnostic-report", "n/a"), { kind: "AUTO_EXEC" });
+	assert.deepEqual(mk("stagnation", "notify-local-master", "ok"), { kind: "AUTO_EXEC" });
+	// needs_user: notify ✓, report ✗
+	assert.deepEqual(mk("needs_user", "notify-local-master", "ok"), { kind: "AUTO_EXEC" });
+	assert.deepEqual(mk("needs_user", "diagnostic-report", "n/a"), { kind: "DENY", reason: "class-not-allowed" });
+	// expected_event_timeout: report ✓, notify ✗
+	assert.deepEqual(mk("expected_event_timeout", "diagnostic-report", "n/a"), { kind: "AUTO_EXEC" });
+	assert.deepEqual(mk("expected_event_timeout", "notify-local-master", "ok"), { kind: "DENY", reason: "class-not-allowed" });
 });
 check("L1 approximate trigger → DENY(approximate-trigger)", () => {
 	// 用在册规则（stagnation）+ approximate:true 隔离测该判据（实际 frontier 中 stagnation 恒 non-approx，
@@ -805,8 +844,8 @@ check("预算常量硬编码（设计 §2；不可经 config 放大）", () => {
 	assert.equal(BUDGET.consecFailLimit, 2);
 	assert.equal(BUDGET.maxReadBytes, 256 * 1024);
 	assert.equal(BUDGET.maxWallClockMs, 5000);
-	assert.equal(TRIGGER_ALLOWLIST.size, 2);
-	assert.equal(ACTION_CLASS_ALLOWLIST.size, 2); // 阶段二：diagnostic-report + notify-local-master
+	assert.equal(TRIGGER_ALLOWLIST.size, 4); // 扩容：working_to_failed + stagnation + needs_user + expected_event_timeout
+	assert.equal(ACTION_CLASS_ALLOWLIST.size, 2); // diagnostic-report + notify-local-master
 });
 check("config 归一：actions 严格 === true；缺键/垃圾 = false", () => {
 	const { root, state } = freshState("cfg-norm");
@@ -1043,6 +1082,7 @@ check("编排正路径：trigger×class 候选枚举（report 冷却跳过 → n
 	const { root, state, cfgOn } = freshState("nt-run");
 	try {
 		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) }); // 方案 A：attach scope owner
 		const t = NOW;
 		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t); // report 冷却 ⇒ notify 单独执行
 		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
@@ -1065,6 +1105,7 @@ check("dedupKey 含 class 段：同 trigger 的 report/notify 冷却键独立（
 	const { root, state, cfgOn } = freshState("nt-dedup");
 	try {
 		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) }); // 方案 A
 		const t = NOW;
 		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
 		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
@@ -1084,6 +1125,7 @@ check("pending 窗回滚：notify 信件 pending ⇒ undoAction 删除自创信�
 	const { root, state, cfgOn } = freshState("nt-undo-pending");
 	try {
 		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) }); // 方案 A
 		const t = NOW;
 		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
 		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
@@ -1106,6 +1148,7 @@ check("claim 后处置：信件被消费（status=claimed）⇒ 文件级可删�
 	const { root, state, cfgOn } = freshState("nt-claim");
 	try {
 		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) }); // 方案 A
 		const t = NOW;
 		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t);
 		writeFrontier(state, "working_to_failed", NT_PROJECT, t);
@@ -1165,6 +1208,259 @@ check("拒绝路径照旧：非 owner / kill / breaker-tripped ⇒ notify 亦 DE
 			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "breaker-tripped：无信件");
 			assert.ok(anyReason(state, "breaker-tripped"), "DENY(breaker-tripped) 落账");
 		} finally { rmSync(root, { recursive: true, force: true }); }
+	}
+});
+
+// ════════════════════════════ 方案 A：notify scope-owner 门（OQ-1 效应 C 关闭）════════════════════════
+console.log("方案 A：notify scope-owner 门（发信前查 scope owner）");
+
+check("方案 A：ownerCheck 直测 — 无 owner → ownerless；有 owner → ok；stale → stale", () => {
+	const { root, state } = freshState("a-ownercheck");
+	try {
+		// 无 owner
+		assert.equal(notifyLocalMasterClass.ownerCheck!(NT_PROJECT, { stateDir: state }), "ownerless");
+		// 有 owner（alive：无 liveness → skip → ok）
+		const sid = "sess-OC";
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+		assert.equal(notifyLocalMasterClass.ownerCheck!(NT_PROJECT, { stateDir: state }), "ok");
+		// stale（写 liveness 匹配 sessionId/generation + 死 pid）
+		const scope = localMasterScope(NT_PROJECT);
+		const att = readAttachment(localMasterAddress(scope))!;
+		writeScopeLiveness({ scopeKey: scope, sessionId: sid, generation: att.generation, pid: 999999999 }, { stateDir: state });
+		assert.equal(notifyLocalMasterClass.ownerCheck!(NT_PROJECT, { stateDir: state }), "stale");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("方案 A：notify + 无 scope owner → DENY(scope-ownerless) + mailbox 零信件", () => {
+	const { root, state, cfgOn } = freshState("a-ownerless");
+	try {
+		const sid = ownerSession(); // 全局 master owner（L0 isOwner 通过）
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, NOW); // report 冷却 ⇒ notify 单独执行
+		// 不 attach scope owner ⇒ ownerCheck 返回 "ownerless" ⇒ DENY
+		writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		assert.ok(anyReason(state, "scope-ownerless"), "DENY(scope-ownerless) 落账");
+		assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "mailbox 零信件");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("方案 A：notify + scope owner 在位 → 正常执行（四行 + 信件落盘）", () => {
+	const { root, state, cfgOn } = freshState("a-owner-ok");
+	try {
+		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, NOW); // report 冷却 ⇒ notify 单独执行
+		writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		const events = readActionsTail({ stateDir: state, limit: 50 });
+		const notifyEvents = events.filter((e) => e.actionClass === "notify-local-master");
+		assert.deepEqual(notifyEvents.map((e) => e.kind), ["attempted", "precheck", "executed", "postverified"], "notify 四行齐全");
+		assert.equal(listFilesRecursive(defaultMailboxDir()).length, 1, "恰一个信件");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("方案 A：notify + scope owner stale（pid 死）→ DENY(scope-owner-stale) + mailbox 零信件", () => {
+	const { root, state, cfgOn } = freshState("a-stale");
+	try {
+		const sid = ownerSession();
+		const scope = localMasterScope(NT_PROJECT);
+		const addr = localMasterAddress(scope);
+		attachMaster({ sessionId: sid, agent: addr });
+		const att = readAttachment(addr)!;
+		writeScopeLiveness({ scopeKey: scope, sessionId: sid, generation: att.generation, pid: 999999999 }, { stateDir: state });
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, NOW); // report 冷却 ⇒ notify 单独执行
+		writeFrontier(state, "working_to_failed", NT_PROJECT, NOW);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		assert.ok(anyReason(state, "scope-owner-stale"), "DENY(scope-owner-stale) 落账");
+		assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "mailbox 零信件");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("方案 A：report 类不受 owner 字段影响（\"n/a\" 忽略）", () => {
+	// report 类的 notifyScopeOwner = "n/a"，policy 层对非 notify 类忽略此字段
+	assert.deepEqual(
+		decide(autoCtx({ actionClass: "diagnostic-report", notifyScopeOwner: "n/a" })),
+		{ kind: "AUTO_EXEC" },
+	);
+	// 即使填 "ownerless" 也不影响 report（policy 只在 actionClass===notify 时检查）
+	assert.deepEqual(
+		decide(autoCtx({ actionClass: "diagnostic-report", notifyScopeOwner: "ownerless" as never })),
+		{ kind: "AUTO_EXEC" },
+	);
+});
+
+// ════════════════════════════ 方案 C：疑似回声标记（OQ-1 短环 B 可见化）════════════════════════
+console.log("方案 C：疑似回声标记（同 project 1h 内已有 executed notify）");
+
+check("方案 C：notify 后 1h 内同 project 再动作 → 事件行 suspectedEcho=true", () => {
+	const { root, state, cfgOn } = freshState("c-echo");
+	try {
+		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+		// 第一次：notify 执行成功（executed 落账）
+		const t1 = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t1); // report 冷却 ⇒ notify 单独执行
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t1);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+		const firstNotify = readActionsTail({ stateDir: state, limit: 50 }).find((e) => e.actionClass === "notify-local-master" && e.kind === "executed");
+		assert.ok(firstNotify, "第一次 notify 已 executed");
+		assert.equal(firstNotify?.suspectedEcho, undefined, "第一次无回声标记");
+		// 第二次：同 project 1h 内 report（新 tick；report 冷却已过因为 t2 超出 1h 窗）
+		const t2 = t1 + BUDGET.hourMs + 60_000;
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t2);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t2 });
+		const secondReport = readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.actionClass === "diagnostic-report" && Date.parse(e.ts) >= t2);
+		assert.ok(secondReport.length > 0, "第二次 report 有事件");
+		// 注意：t2 超出 1h 窗，notify 在 t1，t2-t1 > 1h ⇒ 无回声标记
+		// 要测回声标记，需要在 1h 内再触发，但 1h 内 report 冷却会命中
+		// 改用：第一次 notify，第二次在 1h 内用 needs_user（只映射 notify，无 report 冷却问题）
+		// 实际上，回声标记的判据是「同 project 1h 内已有 executed notify」
+		// 所以第二次动作（无论 report 还是 notify）只要在 1h 内就应该有标记
+		// 但 1h 内 report 冷却会命中（dedupKey 1h 窗）⇒ report SKIP(cooldown)
+		// 所以用 needs_user 触发（只映射 notify，且 dedupKey 不同）
+		const t3 = t1 + 60_000; // 1h 内，新 tick
+		writeFrontier(state, "needs_user", NT_PROJECT, t3);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t3 });
+		const thirdNotify = readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.actionClass === "notify-local-master" && Date.parse(e.ts) >= t3);
+		assert.ok(thirdNotify.length > 0, "第三次 notify 有事件");
+		assert.ok(thirdNotify.every((e) => e.suspectedEcho === true), "第三次 notify 全部事件行 suspectedEcho=true");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("方案 C：异 project / 超 1h 窗口 → 无回声标记", () => {
+	// 异 project
+	{
+		const { root, state, cfgOn } = freshState("c-echo-diffproj");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+			const t1 = NOW;
+			writeFrontier(state, "working_to_failed", NT_PROJECT, t1);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+			// 异 project 的动作
+			const OTHER = "c:/tmp/autonomy-other-probe";
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(OTHER)) });
+			const t2 = t1 + 60_000;
+			writeFrontier(state, "working_to_failed", OTHER, t2);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t2 });
+			const otherEvents = readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.trigger.project === OTHER && e.actionClass === "diagnostic-report");
+			assert.ok(otherEvents.length > 0, "异 project 有事件");
+			assert.ok(otherEvents.every((e) => e.suspectedEcho === undefined), "异 project 无回声标记");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+	// 超 1h 窗口
+	{
+		const { root, state, cfgOn } = freshState("c-echo-old");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+			const t1 = NOW;
+			writeFrontier(state, "working_to_failed", NT_PROJECT, t1);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+			// 超 1h 后
+			const t2 = t1 + BUDGET.hourMs + 60_000;
+			writeFrontier(state, "working_to_failed", NT_PROJECT, t2);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t2 });
+			const oldEvents = readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.actionClass === "diagnostic-report" && Date.parse(e.ts) >= t2);
+			assert.ok(oldEvents.length > 0, "超 1h 有事件");
+			assert.ok(oldEvents.every((e) => e.suspectedEcho === undefined), "超 1h 无回声标记");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+});
+
+check("方案 C：status recent 行含 ⚠echo 标注", () => {
+	const { root, state, cfgOn } = freshState("c-echo-status");
+	try {
+		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+		// 第一次：notify 执行（report 冷却）
+		const t1 = NOW;
+		seedReportCooldown(state, "working_to_failed", NT_PROJECT, t1);
+		writeFrontier(state, "working_to_failed", NT_PROJECT, t1);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+		// 第二次：needs_user 触发 notify（1h 内，有 echo 标记）
+		const t2 = t1 + 60_000;
+		writeFrontier(state, "needs_user", NT_PROJECT, t2);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t2 });
+		// status 的 recent 行应含 ⚠echo
+		const lines = summarizeActionsStatus({ stateDir: state, configPath: cfgOn });
+		const recentLine = lines.find((l) => l.includes("recent:"));
+		assert.ok(recentLine, "有 recent 行");
+		assert.ok(recentLine!.includes("⚠echo"), `recent 行含 ⚠echo：${recentLine}`);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ════════════════════════════ 防循环（⑤⑧ 扩容后）════════════════════════
+console.log("防循环（⑤⑧ 扩容后：⑧ 永不产信 / ⑤ 永不产无主信 / level 触发有界）");
+
+check("⑧ 防循环：expected_event_timeout → 只产 report（无 notify）→ 再 tick → skipped(cooldown)", () => {
+	const { root, state, cfgOn } = freshState("loop-8");
+	try {
+		const sid = ownerSession();
+		// ⑧ 映射只有 diagnostic-report（无 notify）
+		const t1 = NOW;
+		writeFrontier(state, "expected_event_timeout", "repo:ET", t1);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+		// 只产 report（账本无 notify-local-master 事件）
+		const events1 = readActionsTail({ stateDir: state, limit: 50 });
+		assert.ok(events1.some((e) => e.actionClass === "diagnostic-report" && e.kind === "executed"), "⑧ 产 report");
+		assert.ok(!events1.some((e) => e.actionClass === "notify-local-master"), "⑧ 无 notify 事件");
+		// 再 tick → skipped(cooldown)
+		const t2 = t1 + 60_000; // 新 tick
+		writeFrontier(state, "expected_event_timeout", "repo:ET", t2);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t2 });
+		const events2 = readActionsTail({ stateDir: state, limit: 50 });
+		assert.ok(events2.some((e) => e.actionClass === "diagnostic-report" && e.kind === "skipped" && e.reason === "cooldown"), "⑧ 第二次 → skipped(cooldown)");
+		// 全程无 notify 事件
+		assert.ok(!events2.some((e) => e.actionClass === "notify-local-master"), "全程无 notify");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("⑤ 防循环：needs_user → 只产 notify（无 report）+ scope owner 在位", () => {
+	const { root, state, cfgOn } = freshState("loop-5");
+	try {
+		const sid = ownerSession();
+		attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+		const t1 = NOW;
+		writeFrontier(state, "needs_user", NT_PROJECT, t1);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: t1 });
+		const events = readActionsTail({ stateDir: state, limit: 50 });
+		assert.ok(events.some((e) => e.actionClass === "notify-local-master" && e.kind === "executed"), "⑤ 产 notify");
+		assert.ok(!events.some((e) => e.actionClass === "diagnostic-report"), "⑤ 无 report 事件");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+check("⑤ 防循环：needs_user + 无 scope owner → DENY(scope-ownerless)（永不产无主信）", () => {
+	const { root, state, cfgOn } = freshState("loop-5-ownerless");
+	try {
+		const sid = ownerSession();
+		// 不 attach scope owner
+		writeFrontier(state, "needs_user", NT_PROJECT, NOW);
+		runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+		assert.ok(anyReason(state, "scope-ownerless"), "DENY(scope-ownerless) 落账");
+		assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "mailbox 零信件（永不产无主信）");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 

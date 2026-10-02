@@ -56,6 +56,8 @@ export interface ActionEvent {
 	rollbackHandle?: { type: string; snapshots: string[]; validUntil: string | null; deletedFiles: string[] };
 	/** rejected / skipped / frozen 的原因。 */
 	reason?: string;
+	/** 疑似回声标记（方案 C：同 project 1h 内已有 executed notify；只标记不改判定）。 */
+	suspectedEcho?: true;
 }
 
 function ledgerPath(stateDir?: string): string {
@@ -123,4 +125,29 @@ export function readActionEvents(id: string, opts?: { stateDir?: string }): Acti
 export function readLatestAction(id: string, opts?: { stateDir?: string }): ActionEvent | null {
 	const evs = readActionEvents(id, opts);
 	return evs.length > 0 ? evs[evs.length - 1]! : null;
+}
+
+/**
+ * 只读 helper：扫 actions.jsonl 尾部，查同 project 是否存在 executed notify-local-master 事件
+ * 且 ts 在 windowMs 内（方案 C 回声判据）。never-throw。
+ */
+export function hasRecentNotifyForProject(
+	project: string,
+	opts: { stateDir?: string; now: number; windowMs: number },
+): boolean {
+	try {
+		const events = readActionsTail({ stateDir: opts.stateDir, limit: 200 });
+		for (let i = events.length - 1; i >= 0; i--) {
+			const e = events[i]!;
+			if (e.actionClass !== "notify-local-master") continue;
+			if (e.kind !== "executed") continue;
+			if (e.trigger.project !== project) continue;
+			const ts = Date.parse(e.ts);
+			const age = opts.now - ts;
+			if (Number.isFinite(ts) && age >= 0 && age < opts.windowMs) return true;
+		}
+		return false;
+	} catch {
+		return false; // never-throw
+	}
 }

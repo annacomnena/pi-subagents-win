@@ -24,7 +24,7 @@ import { readAutonomyConfig } from "../config.ts";
 import { readKillSwitch } from "../kill-switch.ts";
 import { readFrontierSnapshot } from "../collect.ts";
 import type { FrontierSnapshot, FrontierTrigger } from "../frontier.ts";
-import { BUDGET, ACTION_CLASS_ALLOWLIST, TRIGGER_ALLOWLIST, decide, type PolicyContext } from "./policy.ts";
+import { BUDGET, ACTION_CLASS_ALLOWLIST, TRIGGER_ALLOWLIST, TRIGGER_CLASS_MAP, decide, type PolicyContext } from "./policy.ts";
 import { getClass } from "./registry.ts";
 import type { ActionClass } from "./classes/types.ts";
 import {
@@ -43,6 +43,7 @@ import {
 	appendActionEvent,
 	readActionsTail,
 	readActionEvents,
+	hasRecentNotifyForProject,
 	type ActionEvent,
 	type ActionKind,
 } from "./ledger.ts";
@@ -104,7 +105,9 @@ export function runAutonomyActions(opts: RunActionsOpts): void {
 
 		const ctx: RunActionsOpts & { now: number; frontier: FrontierSnapshot } = { ...opts, now, frontier: snap };
 		for (const t of candidateTriggers) {
-			for (const clsName of ACTION_CLASS_ALLOWLIST) {
+			// 按 TRIGGER_CLASS_MAP[rule] 枚举（保持 set 插入序 report→notify；「同 incident 两 class 分 tick 落」不变）
+			const classesForRule = TRIGGER_CLASS_MAP[t.rule] ?? [];
+			for (const clsName of classesForRule) {
 				const outcome = runOneAction(t, clsName, ctx);
 				if (outcome === "started") return; // 每 tick 最多 1 个新动作（budget）达成
 				// denied / skipped → 继续下一候选（其自身判据独立）
@@ -149,11 +152,16 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 	const dedupKey = `${t.rule}:${actionClass}:${t.project}`; // 去重键（阶段二：加 class 段，防同 incident 两 class 互饿）
 	const triggerRef = { rule: t.rule, project: t.project, evidence: t.evidence, approximate: t.approximate };
 
+	// ── 方案 C：疑似回声标记（同 project 1h 内已有 executed notify → 本次全部事件行附标记）──
+	const suspectedEcho = hasRecentNotifyForProject(t.project, { stateDir, now, windowMs: BUDGET.hourMs });
+
 	const emit = (kind: ActionKind, extra?: Partial<ActionEvent>): boolean => {
 		return appendActionEvent(
 			{
 				v: 1, id, kind, ts: new Date(now).toISOString(), policyVersion: POLICY_VERSION,
-				trigger: triggerRef, actionClass, ...extra,
+				trigger: triggerRef, actionClass,
+				...(suspectedEcho ? { suspectedEcho: true as const } : {}),
+				...extra,
 			},
 			stateDir,
 		);
@@ -183,6 +191,12 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 	// ── L0–L3 决策树（第一遍）──
 	// P1 报告类的 snapshot/rollback/postverify/lease 为结构保证（注册即成立）；
 	// 实际快照在 effect 前生成，若失败则在下方转 rejected(no-snapshot)。
+	// ── 方案 A：notify scope-owner 门（发信前查目标 scope owner；report 类 = "n/a" 忽略）──
+	const notifyScopeOwner: "ok" | "ownerless" | "stale" | "unknown" | "n/a" =
+		actionClass === "notify-local-master"
+			? (cls.ownerCheck ? cls.ownerCheck(t.project, { stateDir }) : "unknown")
+			: "n/a";
+
 	const pctx: PolicyContext = {
 		actionsEnabled: true, // 已在 runAutonomyActions 门确认
 		killPresent: kill !== null,
@@ -191,6 +205,7 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 		isOwner,
 		trigger: triggerRef,
 		actionClass,
+		notifyScopeOwner,
 		closure,
 		snapshot: true,
 		rollback: true,
@@ -257,7 +272,7 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 	emit("precheck", {
 		precheck: {
 			L0: { actionsEnabled: true, kill: kill === null, breakerReadable: true, breakerTripped: breaker.tripped || breaker.frozen, owner: isOwner },
-			L1: { triggerAllowed: TRIGGER_ALLOWLIST.has(t.rule), classAllowed: ACTION_CLASS_ALLOWLIST.has(actionClass), notApproximate: !t.approximate },
+			L1: { triggerAllowed: TRIGGER_ALLOWLIST.has(t.rule), classAllowed: (TRIGGER_CLASS_MAP[t.rule] ?? []).includes(actionClass) && ACTION_CLASS_ALLOWLIST.has(actionClass), notApproximate: !t.approximate },
 			L2: { closure, snapshot: true, rollback: true, postverify: true, lease: true, snapshotRef: snapRef, effectPath: targetPath },
 			L3: { inFlight: breaker.inFlight, newThisTick: budget.newThisTick, startedInLast1h: budget.startedInLast1h, consecFail: consec, dedupHit: dedup },
 		},
@@ -492,7 +507,8 @@ export function summarizeActionsStatus(opts?: { stateDir?: string; configPath?: 
 		lines.push(`actions: enabled=${enabled ? "on" : "off"} breaker=${tripped === null ? "unreadable" : tripped ? "TRIPPED/FRZ" : "ok"}`);
 		if (recent.length > 0) {
 			const r = recent[0]!;
-			lines.push(`  recent: ${r.actionClass} ${r.id} ${r.kind} @${r.ts.slice(0, 19)}${r.reason ? ` (${r.reason})` : ""}`);
+			const echoTag = r.suspectedEcho ? " ⚠echo" : "";
+			lines.push(`  recent: ${r.actionClass} ${r.id} ${r.kind} @${r.ts.slice(0, 19)}${r.reason ? ` (${r.reason})` : ""}${echoTag}`);
 		}
 		return lines.slice(0, 5);
 	} catch {
