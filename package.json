@@ -128,6 +128,8 @@
     "test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "0.99.1",
+    "typebox": "1.3.27",
     "usearch": "2.26.0"
   }
 }
