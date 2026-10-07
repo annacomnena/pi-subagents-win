@@ -66,6 +66,11 @@ Both delegate work to a separate pi process, but they are different tools for di
 pi install /path/to/pi-subagents-win
 ```
 
+> **新机器部署 / 升级（2026-10-06）：**
+> 1. 备份 zip 不含 `node_modules` —— 新机器/解包后必须 `npm install`（daemon 依赖 `@earendil-works/pi-tui`、`typebox` 走 registry 解析，**不要再手工 symlink 指向 pi 内嵌副本**）。
+> 2. 升级后验证：`node --experimental-strip-types extensions/runtime-host/server.ts` 起一下看 health（或直接看 `runtimeDir/daemon-stderr.log`）。
+> 3. 启动失败先看 `runtimeDir/daemon-stderr.log`（daemon spawn 的 stderr 已落盘，不再被 `stdio:"ignore"` 吞掉）。
+
 The package is a pi extension (`pi.extensions` → `./extensions/index.ts`) with a bundled skill (`pi.skills` → `./skills`).
 
 **Runtime requirement:** the WeChat remote-command channel (`/wechat …`, `/reload`, `/model` … sent from WeChat) dispatches its internal `/wechat-remote-run` command via `sendUserMessage(…, { expandPromptTemplates: true })`, which requires a **runtime `pi` ≥ 0.87**. Older runtimes (e.g. the 0.80.x line) hard-code that option to `false`, so the internal command text would fall into the conversation instead of being dispatched. Unit tests are unaffected (they use fakes).
