@@ -86,13 +86,18 @@ function defaultSpawnWorker(o: { workerPath: string; runtimeDir: string; configP
 	// 若 worker 用 windowsHide:false，Windows 会为它 alloc 一个新控制台 → **用户看到一个终端窗口**。
 	// 差异仅两处（规格 §2）：不 detached（daemon 活着时 worker 随叫随收）、不 unref（持有 ChildProcess
 	// 句柄监听 exit 做退避重启）。env 只加 PI_RUNTIME_DIR + config 路径——**绝无凭据**。
+	// stderr 落盘（2026-10-06 与 daemon spawn 同根因）：此前 stdio:"ignore" 静默吞掉 worker
+	// 启动失败（如 ERR_MODULE_NOT_FOUND），改为 append fd 指向 runtimeDir/channel-worker-stderr.log。
+	mkdirSync(o.runtimeDir, { recursive: true });
+	const stderrFd = openSync(join(o.runtimeDir, "channel-worker-stderr.log"), "a");
 	traceSpawn("console-child", `channel-wechat worker spawn exec=${process.execPath} worker=${o.workerPath}`);
 	const child: ChildProcess = spawn(process.execPath, ["--experimental-strip-types", o.workerPath], {
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", stderrFd],
 		windowsHide: true,
 		cwd: dirname(o.workerPath),
 		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir, PI_CHANNEL_WECHAT_CONFIG: o.configPath },
 	});
+	closeSync(stderrFd);
 	return {
 		...(typeof child.pid === "number" ? { pid: child.pid } : {}),
 		kill: () => {

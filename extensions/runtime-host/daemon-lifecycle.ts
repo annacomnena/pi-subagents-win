@@ -21,7 +21,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -158,14 +158,22 @@ function defaultSpawnDaemon(o: { serverPath: string; runtimeDir: string }): Daem
 	// `channel-supervisor.ts` 的 worker spawn 也必须 windowsHide:true（否则 daemon 无控制台时
 	// worker 会自己 alloc 一个窗口）。
 	// unref：pi 退出不连带杀 daemon。
+	// stderr 落盘（2026-10-06 诊断根治）：此前 stdio:"ignore" 把启动失败（如
+	// ERR_MODULE_NOT_FOUND——依赖未声明、机器换环境 symlink 断链）全部静默吞掉，
+	// 5 次 ensure spawn 全灭无痕。改 append 打开 runtimeDir/daemon-stderr.log 的真文件 fd
+	// 传给子进程（父会话退出后子进程仍可写），spawn 后父进程 close 自己的 fd。
+	mkdirSync(o.runtimeDir, { recursive: true });
+	const stderrFd = openSync(join(o.runtimeDir, "daemon-stderr.log"), "a");
 	traceSpawn("console-child", `runtime-daemon spawn exec=${process.execPath} server=${o.serverPath}`);
 	const child = spawn(process.execPath, ["--experimental-strip-types", o.serverPath], {
 		detached: true,
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", stderrFd],
 		windowsHide: true,
 		cwd: dirname(o.serverPath),
 		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir },
 	});
+	closeSync(stderrFd);
+	child.on("exit", (code, sig) => traceSpawn("console-child", `daemon exit code=${code} sig=${sig}`));
 	child.unref();
 	return {
 		pid: child.pid,
