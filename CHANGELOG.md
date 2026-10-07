@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0] — 2026-10-06 (版本跃迁：0.6.0 → 0.7.0，覆盖 2026-09-23 后 182 个提交；起因为 iCloud 备份停在 v0.6.0-20260923，版本号未 bump 导致 182 提交未触发新备份)
+
+- **autonomy 主动性套件**：global master 主动性套件 v1（纯函数层）+ P1 最小可回滚动作（diagnostic-report + 全套 harness）+ P2 v2-b 期望账本（frontier ⑧ 获真载体）+ 阶段二 notify-local-master 真机验证（actions.jsonl 9 行 + 真发信）+ Graph 补齐（carrier 进 diff + 4 字段 + graph 源）+ OQ-1 防护（owner 检查 + suspectedEcho）+ trigger 扩至 4 条（TRIGGER_CLASS_MAP）。
+- **3495/3496 影像双分发 P0 核验 PASS**（6/6 项）与 S8 既有失败修复（时钟注入贯通 5 文件）。
+- **GUI 与微信**：视觉优化 8 片 / Timeline 可用性 / 延迟 36× / 会话名可读 / 每组截断 3 / ETag+轮询门控 / 主动性设置页 + frontier 可视化；微信通道修复 + broadcast、入站图片附件 M1 真机验收。
+- **GreenCAD Blender 后端**：主插件零改动的 GreenCADSync 独立插件经验（P0–P5，153 tests，14 端点）落地期间的本仓支撑改动。
+- **工程**：`scripts/merge-pending-acceptance.sh`（pending-acceptance → dev 预演只余 5 文档冲突）；Wiki 多页按源码校准。
+- **备份**：本条对应 `subagent-win-v0.7.0-20261006.zip`（薄，无 config.json）与 `subagent-win-v0.7.0-full-20261006.zip`（含 config.json），落 `iCloudDrive/vibecoding/pi/`。
+
 ## [Unreleased] — 2026-09-28 (微信**入站图片附件 M1 真机验收通过** + 文档收尾；实现 `6ae8e0d` + L4 建议修 `972e29f`，本条目为纯文档提交)
 
 - **真机验收证据链（2026-09-28，权威）**：启用 `channels.wechat.artifact.enabled = true`（**免重启**——`worker.ts#L179` 每批 `readArtifactGate()` 重读仓库根 `config.json`，生效时延 ≤ 一个长轮询周期 ≈≤95.3s，实测 ≤95s）→ 用户发图 → worker CDN 下载 + AES-128-ECB 解密 → 落盘 `~/.pi/agent/runtime/wechat/artifacts/files/18aac6b930d75f083…daad2.jpg`（**46,499 字节**、魔数 **`FFD8FF`**（`FFE1` baseline）、SOF **1200×2670**、目录恰 1 文件 = 内容寻址去重）→ inbox 记录 `text:""` + 相对 `artifactRef` + `state:"injected"` → outbox 正文 `[微信 o9cq80…chat] 〔附件：<绝对路径> (image/jpeg, 46499B)〕`（delivered，审计 `accepted/injected`）。
