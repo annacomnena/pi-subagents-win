@@ -93,15 +93,39 @@ if (!IN_HOOKS_THREAD) {
 	register(import.meta.url, import.meta.url);
 }
 
-/** resolve hook：仅拦截两个宿主裸 specifier，映射到宿主 node_modules 内的真实文件。 */
+const HOST_AGENT_SPEC = "@earendil-works/pi-coding-agent";
+
+/**
+ * pi-coding-agent 包根定位：它是宿主包（非内嵌）。hostNmDir 通常是其包内嵌
+ * node_modules（…/pi-coding-agent/node_modules）→ 包根 = 其父目录；
+ * 透传来的扁平 node_modules 则包在该目录内。两种都试。
+ */
+function findAgentPackage(hostNmDir) {
+	const rel = join("@earendil-works", "pi-coding-agent");
+	for (const nmDir of [dirname(dirname(hostNmDir)), hostNmDir]) {
+		const pkgDir = join(nmDir, rel);
+		try {
+			if (existsSync(join(pkgDir, "package.json"))) return { root: safeRealpath(pkgDir), nmDir };
+		} catch { /* 下一个 */ }
+	}
+	return null;
+}
+
+/** resolve hook：仅拦截三个宿主裸 specifier，映射到宿主安装内的真实文件。 */
 export async function resolve(specifier, context, nextResolve) {
-	if (specifier !== "@earendil-works/pi-tui" && specifier !== "typebox") {
+	if (specifier !== "@earendil-works/pi-tui" && specifier !== "typebox" && specifier !== HOST_AGENT_SPEC) {
 		return nextResolve(specifier, context);
 	}
 	const { dir, via } = findHostNodeModules();
 	let file;
 	try {
+		if (specifier === HOST_AGENT_SPEC) {
+			const found = findAgentPackage(dir);
+		if (!found) throw new Error(`宿主目录 ${dir}（来源 ${via}）附近找不到 pi-coding-agent 包根`);
+		file = resolveEntry(found.nmDir, specifier);
+	} else {
 		file = resolveEntry(dir, specifier);
+	}
 	} catch (e) {
 		throw new Error(
 			`pi-deps-loader: 宿主目录 ${dir}（来源 ${via}）内无法解析 "${specifier}"：${e instanceof Error ? e.message : String(e)}`,
