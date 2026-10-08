@@ -129,5 +129,9 @@
   },
   "dependencies": {
     "usearch": "2.26.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   }
 }
