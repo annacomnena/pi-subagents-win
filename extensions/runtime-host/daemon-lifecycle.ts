@@ -21,9 +21,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	classifyHost,
 	isProcessAlive,
@@ -147,8 +147,7 @@ export interface DaemonSpawnHandle {
 }
 
 function defaultSpawnDaemon(o: { serverPath: string; runtimeDir: string }): DaemonSpawnHandle {
-	// §2.1：detached:true（DETACHED_PROCESS）→ daemon 活过派生它的 WT 标签页/窗口关闭。
-	// windowsHide 必须 **true**（CREATE_NO_WINDOW）——**2026-09-24 真机对照实测推翻旧注释**：
+	// §2.1：detached:true（DETACHED_PROCESS）→ daemon 活过派生它的 WT 标签页/窗口关闭。	// windowsHide 必须 **true**（CREATE_NO_WINDOW）——**2026-09-24 真机对照实测推翻旧注释**：
 	//   旧注释称“DETACHED_PROCESS 与 CREATE_NO_WINDOW 不可叠用”；实测（EnumWindows 枚举可见窗口）：
 	//     A `detached:true + windowsHide:true`  → **不出现窗口** + 父进程退出后 **存活**（两条件均满足）
 	//     B `detached:true + windowsHide:false` → **出现窗口**（Win11 把新控制台交给 Windows Terminal，
@@ -164,13 +163,19 @@ function defaultSpawnDaemon(o: { serverPath: string; runtimeDir: string }): Daem
 	// 传给子进程（父会话退出后子进程仍可写），spawn 后父进程 close 自己的 fd。
 	mkdirSync(o.runtimeDir, { recursive: true });
 	const stderrFd = openSync(join(o.runtimeDir, "daemon-stderr.log"), "a");
-	traceSpawn("console-child", `runtime-daemon spawn exec=${process.execPath} server=${o.serverPath}`);
-	const child = spawn(process.execPath, ["--experimental-strip-types", o.serverPath], {
+	// 宿主包解析（2026-10-08 peerDeps 修正）：daemon 裸跑无 pi loader，pi-tui/typebox
+	// （peerDependencies "*"，宿主提供）靠 --import resolve hook 映射到宿主内嵌副本。
+	// --import 在入口求值前执行；与 --experimental-strip-types 顺序无关（均为 node 前置 flag）。
+	const loaderPath = join(dirname(o.serverPath), "pi-deps-loader.mjs");
+	const loaderUrl = pathToFileURL(loaderPath).href; // Windows 裸路径不是合法 ESM specifier，必须 file:// URL
+	const hostNm = computeHostNodeModules();
+	traceSpawn("console-child", `runtime-daemon spawn exec=${process.execPath} server=${o.serverPath} loader=${loaderPath} hostNodeModules=${hostNm.dir || "(empty)"} via=${hostNm.via}`);
+	const child = spawn(process.execPath, ["--experimental-strip-types", "--import", loaderUrl, o.serverPath], {
 		detached: true,
 		stdio: ["ignore", "ignore", stderrFd],
 		windowsHide: true,
 		cwd: dirname(o.serverPath),
-		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir },
+		env: { ...process.env, PI_RUNTIME_DIR: o.runtimeDir, PI_HOST_NODE_MODULES: hostNm.dir },
 	});
 	closeSync(stderrFd);
 	child.on("exit", (code, sig) => traceSpawn("console-child", `daemon exit code=${code} sig=${sig}`));
@@ -211,6 +216,40 @@ export interface DaemonEnsureResult {
 	pid: number | null;
 	port: number | null;
 	error?: string;
+}
+
+/**
+ * 父进程侧计算宿主 node_modules 绝对路径（daemon 无 pi loader，裸 ESM 靠它解析
+ * peerDeps 的 pi-tui/typebox；loader 文件 pi-deps-loader.mjs 优先读 env）。
+ * 顺序：① 透传 process.env.PI_HOST_NODE_MODULES；② 定位 pi-coding-agent 包根（本仓
+ * node_modules junction 优先，其次当前 node 可执行文件同级的全局 node_modules 树）
+ * 取其包内 node_modules；③ 定位不到 → 空字符串（loader 自行走 walk-up / 报错降级）。
+ * 不能用 require.resolve：pi-coding-agent 的 exports["."] 只有 import 条件（无 require），
+ * CJS 解析必抛 ERR_PACKAGE_PATH_NOT_EXPORTED。
+ */
+export function computeHostNodeModules(): { dir: string; via: string } {
+	const passthrough = process.env.PI_HOST_NODE_MODULES;
+	if (passthrough) {
+		// realpath 必做：若 env 给的是 junction 路径，daemon 加载宿主 pi-tui 后，pi-tui 自己的
+		// 依赖（marked 等）会沿 junction 所在树（而非真实 nvm 树）找 node_modules 而失败。
+		try { return { dir: realpathSync(passthrough), via: "env passthrough (realpath)" }; } catch { return { dir: passthrough, via: "env passthrough" }; }
+	}
+	const thisFile = fileURLToPath(import.meta.url);
+	const repoRoot = dirname(dirname(dirname(thisFile))); // extensions/runtime-host/ → 仓根
+	const candidates = [
+		join(repoRoot, "node_modules", "@earendil-works", "pi-coding-agent"),
+		join(dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent"),
+	];
+	for (const c of candidates) {
+		try {
+			if (!existsSync(join(c, "package.json"))) continue;
+			const dir = join(realpathSync(c), "node_modules"); // 包**内嵌** node_modules（pi-tui/typebox 所在）
+			return { dir, via: `pi-coding-agent 包根 ${c}（realpath）→ ${dir}` };
+		} catch {
+			/* 试下一个候选 */
+		}
+	}
+	return { dir: "", via: "unresolved（loader 走 walk-up/报错降级）" };
 }
 
 /** 同源静态 GUI 地址（daemon 自托管 gui/dist，无 vite）。 */

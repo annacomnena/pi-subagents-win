@@ -86,6 +86,10 @@ function defaultSpawnWorker(o: { workerPath: string; runtimeDir: string; configP
 	// 若 worker 用 windowsHide:false，Windows 会为它 alloc 一个新控制台 → **用户看到一个终端窗口**。
 	// 差异仅两处（规格 §2）：不 detached（daemon 活着时 worker 随叫随收）、不 unref（持有 ChildProcess
 	// 句柄监听 exit 做退避重启）。env 只加 PI_RUNTIME_DIR + config 路径——**绝无凭据**。
+	// 宿主包 resolve hook（2026-10-08）：**不需要**——worker 入口 channel-wechat/index.ts 及其
+	// import 图（channel-wechat/*、runtime/journal、liveness、master-injection、wechat-bind）
+	// 均不 import pi-tui/typebox/pi-coding-agent（全仓 grep 核验）。若未来 worker 图引入宿主包，
+	// 需同法加 --import pi-deps-loader.mjs + PI_HOST_NODE_MODULES。
 	// stderr 落盘（2026-10-06 与 daemon spawn 同根因）：此前 stdio:"ignore" 静默吞掉 worker
 	// 启动失败（如 ERR_MODULE_NOT_FOUND），改为 append fd 指向 runtimeDir/channel-worker-stderr.log。
 	mkdirSync(o.runtimeDir, { recursive: true });
