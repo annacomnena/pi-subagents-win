@@ -7,6 +7,7 @@
 - **GUI 与微信**：视觉优化 8 片 / Timeline 可用性 / 延迟 36× / 会话名可读 / 每组截断 3 / ETag+轮询门控 / 主动性设置页 + frontier 可视化；微信通道修复 + broadcast、入站图片附件 M1 真机验收。
 - **GreenCAD Blender 后端**：主插件零改动的 GreenCADSync 独立插件经验（P0–P5，153 tests，14 端点）落地期间的本仓支撑改动。
 - **工程**：`scripts/merge-pending-acceptance.sh`（pending-acceptance → dev 预演只余 5 文档冲突）；Wiki 多页按源码校准。
+- **文档**：README 补写至 v0.7.0 完整状态（新增 §8–§13：runtime daemon / master 工具族 / 微信通道 / autonomy+期望账本 / work graph 实验态 / 审批门状态；配置、账本、环境变量、文件地图表对齐源码；修正版本头与 plans/ 死链）。
 - **备份**：本条对应 `subagent-win-v0.7.0-20261006.zip`（薄，无 config.json）与 `subagent-win-v0.7.0-full-20261006.zip`（含 config.json），落 `iCloudDrive/vibecoding/pi/`。
 
 ## [Unreleased] — 2026-09-28 (微信**入站图片附件 M1 真机验收通过** + 文档收尾；实现 `6ae8e0d` + L4 建议修 `972e29f`，本条目为纯文档提交)

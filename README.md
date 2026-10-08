@@ -2,7 +2,7 @@
 
 Windows-native subagent orchestration for [pi](https://github.com/earendil-works/pi-coding-agent): role agents for delegation, visible parallel tabs for long-running work, and a full ultra-long task infrastructure (tab reclaim, auto-push timers, an event bus, and active reporting) on top of it.
 
-**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.3.0
+**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.7.0
 
 ---
 
@@ -15,6 +15,10 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Run hours-long pipelines unattended**: spawn visible tabs, let them report back, auto-advance with timers, reclaim results, launch the next batch.
 - **Spend quota you already own**: point role agents at local CLI harnesses (Claude Code / Codex / Agy / AtomCode / ZCode / MimoCode) — subscriptions, free tiers, discounted dedicated-tool billing, and plans that can't be reverse-proxied into an API all become usable as subagent workers (§4).
 - **Scale reasoning on hard problems** with trace-fusion (§7): three independent read-only diagnosis rollouts on the same task, auto-collected and fused — the agent can self-trigger it when a problem looks underdetermined.
+- **Control it from your phone**: an opt-in WeChat channel — inbound text + image attachments, outbound reply/broadcast, tiered remote slash commands — fail-closed end to end (§10).
+- **Observe & steer locally**: a resident runtime daemon + local web console (GUI), default OFF, loopback-only (§8, §14).
+- **Manage long-lived "master" sessions**: a gated family of master tools — the agent can never take over / hand off / switch on its own (§9).
+- **Let the master watch for you** (optional): an autonomy suite + expectation ledger — default: zero automatic action (§11).
 
 ### Architecture
 
@@ -63,7 +67,11 @@ Both delegate work to a separate pi process, but they are different tools for di
 ## 2. Quick Start
 
 ```bash
+# from a local path
 pi install /path/to/pi-subagents-win
+
+# or from git — pi supports npm: / git: / URL / local package sources
+pi install git:github.com/annacomnena/pi-subagents-win
 ```
 
 > **新机器部署 / 升级（2026-10-08 修订，peerDeps 修正）：**
@@ -72,7 +80,7 @@ pi install /path/to/pi-subagents-win
 > 3. 手工 symlink/junction 指向 pi 内嵌副本 **一律不再需要（已废除）**——测试与 daemon 均走 resolve hook 自举，无需仓内任何宿主包副本；编辑器类型提示如需解析宿主包，可临时建 junction（dev-only，不提交，`npm install` 会剪掉它，届时重建即可）。
 > 4. 启动失败先看 `runtimeDir/daemon-stderr.log`（daemon spawn 的 stderr 已落盘；loader 找不到宿主包时也会在这里报清晰错误）。
 
-The package is a pi extension (`pi.extensions` → `./extensions/index.ts`) with a bundled skill (`pi.skills` → `./skills`).
+The package is a pi extension (`pi.extensions` → `./extensions/index.ts`) with a bundled skill (`pi.skills` → `./skills` — the `workflow-orchestrator` skill).
 
 **Runtime requirement:** the WeChat remote-command channel (`/wechat …`, `/reload`, `/model` … sent from WeChat) dispatches its internal `/wechat-remote-run` command via `sendUserMessage(…, { expandPromptTemplates: true })`, which requires a **runtime `pi` ≥ 0.87**. Older runtimes (e.g. the 0.80.x line) hard-code that option to `false`, so the internal command text would fall into the conversation instead of being dispatched. Unit tests are unaffected (they use fakes).
 
@@ -138,7 +146,7 @@ Retryable failures (`USAGE_CAP`, `RATE_LIMIT`, `AUTH`, `TIMEOUT`, `PROVIDER`) wa
 
 ## 4. External CLI agents — spend quota you already own (CLI backends)
 
-Every role agent (`searcher` / `planner` / `implementer` / `code-reviewer` / `consultant`) can be pointed at a **local CLI harness** instead of an API model. The subagent then runs inside Claude Code / Codex CLI / Agy / AtomCode / ZCode / MimoCode and bills against **quota you may already own** — a subscription, a free tier, or a dedicated-tool plan with preferential rates — instead of per-token API credits. Each CLI also brings its own quota pool, so provider outages and rate limits stop being single points of failure.
+Every role agent (`searcher` / `planner` / `plan-reviewer` / `implementer` / `code-reviewer` / `consultant`) can be pointed at a **local CLI harness** instead of an API model. The subagent then runs inside Claude Code / Codex CLI / Agy / AtomCode / ZCode / MimoCode and bills against **quota you may already own** — a subscription, a free tier, or a dedicated-tool plan with preferential rates — instead of per-token API credits. Each CLI also brings its own quota pool, so provider outages and rate limits stop being single points of failure.
 
 ### Why this matters for your wallet
 
@@ -247,7 +255,7 @@ Chain: **L1 search → L2 plan → L3 implement → L4 review → L5 Wiki wrap-u
 
 Lite discipline (all six enforced):
 1. **Sync/parallel only** — async `status` returns a 500-char preview, not enough for handoffs.
-2. **Handoffs land on disk** — >30-line artifacts go to `plans/` or Wiki; the reply carries the path + ≤10-line summary.
+2. **Handoffs land on disk** — >30-line artifacts go to plans/ or Wiki; the reply carries the path + ≤10-line summary.
 3. **Retrieved facts** still carry code location + Wiki section reference + calibration status.
 4. **Searcher dispatch mode** (serial/parallel) applies to L1 unchanged.
 5. **L4 is never skipped** — independent `general` process, reviews the `git diff`; never self-review.
@@ -366,7 +374,7 @@ The result is always a short basename-style key (no `/`, no spaces) → parseabl
 
 **Power boundary (v1 exclusions)**: no succession/transfer, no stale/heartbeat re-attach, no auto master selection, no `workstream --cwd`. A lost owner simply means the scope stays owned-but-inactive until the attachment is manually cleared.
 
-**Known limitation (Q2)**: the scope key is a basename — two *different* repos with the same name on different drives/paths (e.g. `D:\proj` and `E:\proj`) collide into one scope. Worktrees vs. same-named plain repos are distinguished by the `-worktree` suffix; cross-drive same-name repos are not (accepted in v1).
+**Known limitation (Q2)**: the scope key is a basename — two *different* repos with the same name on different drives/paths (for example, same-named repositories on different drives) collide into one scope. Worktrees vs. same-named plain repos are distinguished by the `-worktree` suffix; cross-drive same-name repos are not (accepted in v1).
 
 ---
 
@@ -418,32 +426,144 @@ Fusion/consultant arbitration/targeted probes/promotion are v0.4 (model-judgment
 
 ---
 
-## 8. UI Integration
+## 8. Runtime Daemon & Local Control Plane (runtime-host)
+
+The runtime daemon is a **resident local control plane** for your pi sessions — an ordinary detached node process, **not a network service** (loopback-only; see the 安全边界 section below). It is the **prerequisite for the local GUI** (§14): the web console is served by the daemon itself.
+
+- **Lifecycle** — spawned detached (survives the closing of the tab that started it); single-instance identity via `host.json` + nonce challenge; a dead zombie or orphan lock after a reboot is **rebuilt under the lock automatically** (only when the lock holder is provably dead — live locks are never force-removed, and no pid is ever blind-killed).
+- **Discovery** — binds `127.0.0.1:0` (dynamic port); the actual pid / port / token / instance id are written to `~/.pi/agent/runtime/host.json` (0600); clients discover it there. `host.json` is a hint, not a lock.
+- **Surface** — read-only projection endpoints (`/v1/health`, `/v1/snapshot`, `/v1/events`, `/v1/attention`, `/v1/interactions`, `/v1/timeline`, `/v1/sessions` + transcript) and **exactly one** write endpoint `POST /v1/commands` (token-authenticated; missing/wrong token → 401, fail-closed), plus a WebSocket event stream for live frames.
+- **Troubleshooting** — daemon stderr is captured to `~/.pi/agent/runtime/daemon-stderr.log`; when anything on the daemon misbehaves, start there.
+- **Commands** — `/runtime-host start|stop|status|restart [--force]`. `restart` is fail-closed stepwise (stop → bounded wait for lock release → spawn) and its report always states three consequences: the new pid/port, **the GUI cookie is invalidated** (re-run `/gui open`), and the wechat worker is respawned by the new daemon (if receive is enabled).
+- **Fail-closed when absent** — with the daemon not running, shared control writes are rejected with a clear error; normal conversation, tools, and subagents are unaffected. Opt-in, zero-intrusion: never start it and you get the vanilla pi experience.
+- **Design direction** (partially shipped): three layers — Client Plane (TUI / GUI / WeChat) → Runtime Daemon (communication fabric: events, leases, projections) → agent workers (crash-isolated processes). The shipped slice today is the daemon itself (lifecycle, identity, read projections, the command endpoint); the write-side migration proceeds gate by gate. The planned G0 ten-round validation has **not** been completed, so daemon lifetime claims should not be read as a full G0 pass.
+
+## 9. Master Tool Family & Local Master
+
+Long-lived "master" sessions — the global `agent://master_default` and the per-repo local masters (`agent://master_local_<scope>`, §6.7) — are managed by a family of **11 tools** (most with same-name slash commands). **Positioning (hard rule, embedded in every tool description): call only when the user explicitly asks; the agent must never decide on its own to take over (attach) / hand off (detach/transfer) / switch (cutover).**
+
+| Tool | Responsibility | Who may call it |
+|---|---|---|
+| `master-status` | Master ownership: attachment / resolver / cutover / mailbox backlog + this repo's local ownership line (+ a conditional autonomy line, §11). Read-only. | Any session |
+| `master-pressure` | Reads the current master session's context-window pressure (read-only; feeds the succession proposal line). | Any session |
+| `master-handoff` | Generates the handoff-package markdown (read-only assembly; writes to disk, never injects). | Any session |
+| `master-attach` | Explicitly takes over the logical master — genesis / token handoff / `forceStale` (requires `confirm` double-check). Repo sessions hold **local**, home sessions hold **global** (the home guard rejects everything else). | Subagents refused |
+| `master-detach` | Hands over the master and issues a handoff token. | Owner only; subagents refused |
+| `master-cutover` | Master on/off switch for consumer-side takeover (turning it on requires an existing attach). | Subagents refused |
+| `master-transfer` | One-click succession transaction: fresh handoff package → token → spawn successor → successor takes over (gen+1). On spawn failure the old master **stays** owner; no retry. | Owner only; subagents refused |
+| `master-transfer-confirm` | Successor session confirms the takeover (validates gen+1 + owner; lands the transaction). | Successor session |
+| `master-dispatch` | Master dispatches one **visible** task tab — same ledger / reclaim chain as `launch-tabs`; journal source recorded as `agent://master_default`. | Main session or the current global master owner; task tabs & subagents hard-blocked |
+| `local-master-ensure` | **Idempotent ensure** that the target repo's local master is alive: live owner → zero action; otherwise opens a **visible** tab and lets the new session's own `session_start` path claim the scope (this tool never attaches on your behalf — **zero new authority**). Strict readiness judgment: insufficient evidence → `stalled`, never guessed. | Main session or global master owner (four-layer gate: identity / eligibility / parameter surface / directive) |
+| `global-view` | Read-only global work view (tabs / timers / mailboxes / plans / last); does not consume, does not archive. | Any session |
+
+**Slash equivalents:** `/master-status` · `/master-attach [token] [--force-stale --confirm] [--local]` · `/master-cutover on|off` · `/master-transfer [--local] [reason]` · `/master-detach [reason]` · `/master-handoff [repoRoot]` · `/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]` · `/global-view [--history] [--page N] | /global-view inbox`.
+
+**Succession switches:** `/master-succession on|off` (master switch, default **on**: at the pressure proposal line the master offers a succession proposal) and `/master-auto-handoff on|off` (automatic handoff, default **off**, strictly opt-in: at turn end, if 8 safety gates pass, the master performs exactly the same one-click transfer; on failure the old master is retained, at most one attempt per generation).
+
+**Wake round-trip discipline:** tabs spawned by the wake chain have **no letter-sending tool** — after handling an incoming `requiresAck` message they must reply with a `kind=RESULT` receipt via `deliverLetter` (the recipe is embedded in the spawn prompt); command frames never require a reply.
+
+## 10. WeChat Channel (iLink)
+
+The WeChat channel is a **Client Plane** endpoint: long-polling against the WeChat iLink bot API (HTTP timeout > 90 s), **no public webhook**, running in a supervised worker process (kept out of the daemon's event loop). Receive, inbound input, image artifacts, and remote commands are individually opt-in and fail-closed: their respective gates require the JSON literal `true`. The reply switch has a separate compatibility default documented below.
+
+**Config family** — `channels.wechat.*` in `config.json` (top level):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Channel master switch (bind / receive / reply all depend on it) |
+| `receive.enabled` | `false` | Inbound receive (long-poll worker: private-chat text into a durable inbox) |
+| `input.enabled` | `false` | Inject inbound private-chat text into the current master owner session |
+| `input.allowFrom` | `[]` | OpenID allowlist — **empty = reject all**; server-side only (a nickname / message body / request body can never grant permission) |
+| `reply.enabled` | `true` | Outbound reply master switch (`false` stops both modes) |
+| `reply.mode` | `"reply-only"` | `"broadcast"` must be enabled **explicitly** (default = legacy reply-only behavior) |
+| `reply.sessionScope` | `"owner"` | Which session may produce broadcasts (`owner` \| `main` \| `any`) |
+| `reply.allowOut` | `[]` | Outbound broadcast subscription set; recipients = bound owner ∪ `allowOut`; **config-file only** (no HTTP write surface) |
+| `artifact.enabled` | `false` | Inbound **image** attachments (requires the JSON literal `true`); **restart-free** — re-read on every poll batch, effective within ≈95 s |
+| `remoteCommands.enabled` | `false` | Remote slash-command bypass (below) |
+
+**Inbound:**
+- **Text** — private chat only (group messages are quarantined at the parser). Injection requires **six fail-closed conditions** to hold at once: opt-in, allowlist hit, private chat, master process alive (tick-level session heartbeat — an idle master counts as alive), target = current owner **and** matching generation, and a sanitized audit line (`state/wechat-input-audit.jsonl`: no body / no token / no full openid). A denied record is terminal — adding to the allowlist later does not re-deliver old messages.
+- **Images (opt-in `artifact.enabled`)** — the worker downloads (CDN host-suffix allowlist + `redirect: manual`, ≤3 hops, each hop re-checked) → decrypts (AES-128-ECB, `base64(hex32)` key format) → stores content-addressed at `<runtimeDir>/wechat/artifacts/files/<sha256>.jpg|png` (8 MB/file, one image per message). The injected body only appends a `〔附件：<absolute path> (mime, bytes)〕` suffix — no base64 / URL / key in the body. The model reads the image with pi's built-in `read` tool, which **requires a multimodal session model** (`input` includes `image`) and a separate text message to trigger the read. Inbound voice and file downloads are **not implemented**; those message types remain quarantined.
+
+**Outbound:**
+- **Reply** — sent to the triggering `to_user_id` (real-device verified: no `context_token` needed).
+- **Broadcast** (`reply.mode="broadcast"`) — after each settled turn of the global master session, the last non-empty assistant message goes to the authorized recipients. **Per-recipient `client_id` is mandatory**: the server dedupes by `client_id` (verified on real devices — the same id sent twice is delivered only once), so a shared id would make recipients swallow each other's messages.
+
+**Remote slash commands** (opt-in `remoteCommands.enabled`): messages starting with `/` are consumed **before** they reach the LLM (zero transcript pollution) and classified into a three-tier whitelist:
+- **safe** (e.g. `/wechat status`) — executed directly;
+- **sensitive** (e.g. `/reload`, `/compact`, `/model <provider/id>`, `/thinking <level>`, `/wechat on|off`) — executed directly + audit line (no second confirmation, by explicit user ruling);
+- **danger** (shell shapes `!cmd` / `;` / `|` / `&` / `$(…)` / backtick, file-write / session-destruct surfaces) — **always rejected**;
+- **unknown** `/xxx` → **explicitly rejected — never falls back to plain-text injection**.
+
+**Secret hygiene:** `bot_token` never enters logs / GUI / WS / argv; credentials are stored 0600 under `<runtimeDir>/wechat/`; all outbound network goes only to the iLink base URL + allow-listed attachment CDN hosts. Binding (QR) is done from the GUI "WeChat" section, which is always rendered (with an in-page "enable" affordance while the channel is off).
+
+## 11. Autonomy Suite & Expectation Ledger
+
+**Autonomy suite** — moves the global master from "passively waits for instructions" to "proactively derives + explicit actions".
+- **Default: zero automatic action.** The whole suite is opt-in — `config.json "autonomy": {"enabled": true}` (strict `=== true`, per-field fail-closed normalization). When off, wake-loop behavior is byte-identical to the legacy path and `state/autonomy/` creates no new files.
+- **Switches** — `/autonomy on|off|status|kill [reason]|clear` (manual operations commands; subagent sessions blocked; every flip leaves an audit line) + a GUI settings card. `kill` is the in-suite fire switch (suppresses the wake gate); stopping the legacy wake itself is `/master-cutover off`.
+- **When enabled** — each tick collects a *frontier* (project-level state map); a **wake gate** (gating / 2 s debounce / 15 s cooldown) decides whether the existing wake chain is allowed to proceed. v2 only gates and records — it never acts.
+- **Action surface (separately default-OFF)** — `autonomy.actions.enabled === true` opens a **rollback-only** action subsystem. Two action classes today: `diagnostic-report` (effect confined to its own namespace) and `notify-local-master` (exactly **one new letter file** in the target scope master's mailbox — deliver only, never consume/ack anyone else's mailbox). The whole chain is **fail-closed** (any unknown / read failure / exception → refuse), with hard-coded budgets (1 new action per tick, ≤2/hour rolling, per-trigger dedupe) and a persistent circuit breaker (a falsified rollback promise freezes everything until manual clear), plus a git porcelain pre/post guard (any new dirty entry → rollback + freeze). It **never auto-dispatches work and never auto-restarts workers**.
+- **Where the evidence lives** — `state/autonomy/`: `audit.jsonl` (structured decision lines), the frontier snapshot, the wake-gate state, and `actions/actions.jsonl` (per-action ledger: attempted / precheck / executed / postverified / rolled_back / …, 0600, ~1 MB two-generation rotation). `/autonomy status` prints the summary; the GUI shows a live frontier visualization.
+
+**Expectation ledger (⑧ request → reply expectation)** — the requester declares *what reply it is waiting for* at the moment of successful delivery; the consumer chain closes the wait when the matching reply arrives (four-key match, body never read); timeouts are derived from an explicit `now` at read time — **no timers, no background process**.
+- SoT: `~/.pi/agent/runtime/state/expectations/{open,closed}/<requestId>.json` (one file per request); the journal receives only 3 additive events (`project.expected_event_{set,arrived,timeout}`). Default deadline 30 min, overridable per letter.
+- **Production entry point** — `/send-letter <to> [--subject S] [--body B] [--deadline 30m] [--no-expect]` (manual operations command; subagent sessions blocked; rejections are audited).
+- **Read surfaces** — the autonomy frontier trigger (`expected_event_timeout`), the watchdog overdue check, attention entries (`request-timeout`), and the read-only work-graph projection (§12). The autonomy suite is **read-only** on this ledger; the writer is the consumer chain.
+
+## 12. Work Graph — Read-only Projection (experimental)
+
+> **Status: experimental / internal.** A read-only relationship surface — **not a user-facing feature** (no tool or command exposes it directly); safe to ignore.
+
+A pure-library projection over the four existing objects (**Master / Workstream / Task / Run**) plus the expectation ledger's open list:
+- **Reference-style edges only** (task→workstream, run→task/subject/workstream, workstream→project), derived from existing carriers — it does not invent `depends_on` / `blocks` / `requires`.
+- **Pure projection, zero write paths** — a projector / evaluator over the existing sources of truth, not a replacement for any of them (the tab-runs state machine and the timeline keep their jobs).
+- `diff(since)` for change tracking; snapshot schema v2 (run carrier fields, derived project fields, next expected event).
+- **Wiring status** — introduced as a **shadow run** (zero production wiring, revertible with a single commit); since 2026-10-02 it serves as the **autonomy frontier data source** behind a single-point switch (`PI_AUTONOMY_FRONTIER_SOURCE`; production default `graph`, an externally pre-set non-empty value wins — the escape hatch). A 34-frame shadow comparison proved the graph-derived frontier input canonical-equal to the legacy path (zero unexplained differences).
+
+## 13. Approval Gate — planned, not shipped in v0.7.0
+
+A unified approval gate (one gate shared by the TUI / GUI / WeChat surfaces) is **designed and decided, but not implemented**:
+- priority `deny > ask > auto`; **floor actions are never approvable on any surface** (root / system-directory deletion, privilege escalation, reading or exfiltrating keys, payments / deploys, direct writes to the shared ledger);
+- `ask` may be approved once remotely (WeChat); `always` is only a **scoped + TTL-bounded + revocable lease** requiring one local second confirmation — a "confirm" typed in WeChat **never** constitutes a second factor;
+- headless / no-UI defaults to **fail-closed** (parked pending, waiting for local confirmation); timeout = deny; silence ≠ consent.
+
+**Boundary with shipped behavior:** the GUI → master injection path (§14) and the wechat input allowlist (§10) are **explicitly opened narrow channels with their own gates** — they are not the (not-yet-shipped) approval gate. The residual-risk paragraph in the 安全边界 section applies to them.
+
+## 14. UI Integration
 
 - **Async task panel** — opencode-style widget above the editor: running background jobs (`agent: task (runId · age)`), recently completed (✓/✗); footer status `subagents: N running`; completion toasts.
 - **Windows toasts** — subagent start/end, async completion, tab completion, tab reports. Toggle with `/notify on|off` or `config.json: notifications`.
-- **Web Console (dev form)** — `gui/` + `npm run gui:dev` (vite dev server proxying `/v1` to the runtime-host). Opt-in auto-start: `/gui on` (writes `config.json: "gui": {"autoStart": true}` + starts host/vite detached if not already running) · `/gui off` · `/gui status` · `/gui open` (opens `http://localhost:5173` in your browser). 微信回复状态为只读展示；关闭请在 TUI 执行 `/wechat reply off`（GUI 不写此开关）。`vite` 是**开发服务器**——静态 `dist` 托管后续再做。
-- **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/sub-presets` (save/load named subagent-model snapshots across 5 slots, e.g. night-time cheap models or local-only fallback), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/runs`, `/tabs`, `/timers`, `/links`, `/agents`.
+- **Web Console (local GUI)** — default **OFF**. Production form: the runtime daemon (§8) serves the built `gui/dist` itself (no vite in production); dev form: `npm run gui:dev` (vite dev server proxying `/v1` to the daemon).
+  - `/gui on` (writes `config.json: "gui": {"autoStart": true}` + starts the daemon detached if not already running) · `/gui off` (stops auto-start; a running daemon is **not** killed — that is `/runtime-host stop`) · `/gui status` · `/gui open`.
+  - **Credentials**: `/gui open` mints a one-time short-lived OTT (`POST /v1/bootstrap`, host token, loopback connections only) which the browser exchanges for a derived `HttpOnly; SameSite=Strict` cookie — `sw_gui_token = HMAC-SHA256(key="pi:gui-cookie:v1", msg=hostToken)`. The browser never holds the host token itself; 12h true ceiling; `/v1/bootstrap` rejects the derived cookie (no self-renewal); `/gui off` → next request 403 + cookie cleared.
+  - **Shape**: three-pane workbench — top bar, persistent left rail (session list + timeline entry), central route with two tabs (chat / timeline) — plus a full-screen runtime overlay with six sections (attention / master / workstream / runtime / wechat / autonomy). 微信回复状态为只读展示；关闭请在 TUI 执行 `/wechat reply off`（GUI 不写此开关）。
+- **Garbage collection** — `/gc` (alias) / `/subagent-gc [maxAgeHours=48]`: frees module-level memory caches, archives terminal tab-run files past 48 h (pass `0` for all terminal) into `tab-runs/_archived/`, sweeps dead timers and stale session heartbeats, cleans up old `subagent-runs` artifacts, optionally triggers V8 GC, and prints before/after memory deltas.
+- **Config commands** — `/sub-models` (interactive model/fallback/thinking), `/sub-presets` (save/load named subagent-model snapshots across 5 slots, e.g. night-time cheap models or local-only fallback), `/codex-headers` (per-provider Codex request-header compat for reverse proxies), `/searcher-mode auto|serial|parallel`, `/notify on|off`, `/agents`, `/runs`, `/tabs`, `/timers`, `/links`, `/today-usage` (daily token totals across all sessions + subagents), `/lite` (§5), `/launch` (§5). Master / wechat / autonomy / runtime commands are documented in their own sections (§8–§11).
 
 ---
 
-## 9. Configuration & Runtime State
+## 15. Configuration & Runtime State
 
 ### config.json (copy from `config.example.json`)
 
 ```json
 {
-  "models": { "searcher": "provider/id", "planner": "…", "implementer": "…", "code-reviewer": "…", "consultant": "…" },
+  "models": { "searcher": "provider/id", "planner": "…", "plan-reviewer": "…", "implementer": "…", "code-reviewer": "…", "consultant": "…" },
   "fallbackModels": { "searcher": ["provider/id2"] },
   "thinking": { "searcher": "low", "planner": "high" },
   "notifications": true,
   "searcherMode": "auto",
   "liteMode": "off",
-  "traceFusionLoop": { "mode": "diagnose", "maxWallClockPerLaneMin": 45, "maxActiveRuns": 1 }
+  "traceFusionLoop": { "mode": "diagnose", "maxWallClockPerLaneMin": 45, "maxActiveRuns": 1 },
+  "gui": { "autoStart": false },
+  "masterSuccession": { "enabled": true, "auto": false },
+  "autonomy": { "enabled": false },
+  "channels": { "wechat": { "enabled": false } }
 }
 ```
 
-`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §5); tiers are projected live from `models`, no separate tier table. `traceFusionLoop`: see §7 — `mode` `diagnose|implement`, `workerModel`, `maxWallClockPerLaneMin` (nudge + timedOut semantics), `maxActiveRuns` (v1: 1), `provisioning` (junction/copy/command for implement-mode worktrees).
+`searcherMode`: `auto|serial|parallel` searcher dispatch discipline. `liteMode`: `off|on|auto` — lightweight in-session workflow chain (see §5); tiers are projected live from `models`, no separate tier table. `traceFusionLoop`: see §7 — `mode` `diagnose|implement`, `workerModel`, `maxWallClockPerLaneMin` (nudge + timedOut semantics), `maxActiveRuns` (v1: 1), `provisioning` (junction/copy/command for implement-mode worktrees). `gui.autoStart`: see §14 (default off). `masterSuccession`: see §9 — succession master switch (default on) + auto handoff (default off). `autonomy`: see §11 (strict `=== true`, default off). `channels.wechat`: see §10 (fully opt-in, fail-closed).
 
 Model selection priority: (1) configured default + fallback chain; (2) override only when the chain is exhausted, the user names a model, or the default is clearly unsuitable; (3) prefer normal `provider/id` — never switch to an external CLI unless configured or user-requested.
 
@@ -457,10 +577,16 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `reports/<id>.json` | tab → main active reports |
 | `links.jsonl` | provenance log (who spawned what) |
 | `trace-fusion-runs/<runId>/` | trace-fusion run artifacts (meta, lanes/{A,B,C}, collect, cross-test, logs) |
+| `runtime/host.json` | daemon discovery: pid / port / token / instance id (0600; §8) |
+| `runtime/daemon-stderr.log` | daemon stderr capture — first stop for daemon troubleshooting |
+| `runtime/events.jsonl` | runtime journal (append-only event envelopes, seq-ordered) |
+| `runtime/state/` | master registry (attachments / cutover), scope liveness, `expectations/{open,closed}/` (§11), `autonomy/` audit + action ledger (§11), `work-graph/` read-only cache (§12), `master-injections.jsonl` (GUI injection audit, bodyless), `wechat-input-audit.jsonl`, `local-master-ensure-audit.jsonl`, `message-outbox/` |
 | `trust.json` | pre-granted trusted paths (e.g. worktree root for implement mode) |
-| `hotspot/<wsid>/` | v4 ephemeral working set: `events/*.jsonl` shards, `snapshot.json`, `log.jsonl` (see §9.5) |
+| `hotspot/<wsid>/` | v4 ephemeral working set: `events/*.jsonl` shards, `snapshot.json`, `log.jsonl` (see §15.5) |
 | `state/wechat-reply/<id>.json` | 微信出站回复意图及终态（pending/sent/failed/unknown；包含私有正文，仅本机状态目录） |
 | `state/wechat-reply-audit.jsonl` | 微信回复脱敏审计（无正文/token/完整 openid）；开关 `/wechat reply on|off`，GUI 仅只读计数 |
+
+_Excerpt — the state layout grows with the feature set; everything lives under `~/.pi/agent/` (overridable via `PI_CODING_AGENT_DIR`), never inside the repo._
 
 ### Environment variables
 
@@ -469,72 +595,17 @@ Model selection priority: (1) configured default + fallback chain; (2) override 
 | `PI_TAB_RUN_ID` | set on launched tabs (reclaim identity); cleared for subagents |
 | `PI_TAB_RUNS_DIR` | tab ledger dir override |
 | `PI_SUBAGENT` | set on subagent processes (they never own tabs/timers, never open tabs) |
-| `PI_HOTSPOT_ENABLED` | `0`/`false` disables the hotspot working set entirely — collection/injection/tool/command all unregister (default on; see §9.5) |
+| `PI_HOTSPOT_ENABLED` | `0`/`false` disables the hotspot working set entirely — collection/injection/tool/command all unregister (default on; see §15.5) |
+| `PI_RUNTIME_DIR` | runtime state dir override (default `~/.pi/agent/runtime`) |
+| `PI_CODING_AGENT_DIR` | agent dir override (default `~/.pi/agent`) — root of the ledgers above |
+| `PI_CHANNEL_WECHAT_CONFIG` | wechat `config.json` path (injected by the daemon's worker supervisor) |
+| `PI_AUTONOMY_FRONTIER_SOURCE` | autonomy frontier data source: `graph` vs legacy (an externally pre-set non-empty value wins; §11/§12) |
 
----
+_Excerpt — see `extensions/` sources for the full set._
 
-## 安全边界：不要把 runtime 暴露到公网
+### 15.5 Hotspot working set (v4 — ephemeral projection)
 
-runtime-host / daemon 是**本机**控制面，不是网络服务。以下红线不接受例外：
-
-- daemon 只 bind `127.0.0.1`（动态端口，`host.json` 做发现）。不要改绑 `0.0.0.0`。
-- `host.json` 里的 host token 是**本机信任**：同机任何能读该文件（0600，当前用户）的进程都可连。拿到 token = 拿到全部读投影 + 唯一写端点 `POST /v1/commands`。
-- 禁止把端口带到公网：SSH `-L/-R` 端口转发、nginx/Caddy 等反向代理、公网域名、容器 `-p` 端口映射、云主机安全组放行，一律不做。跨站坏 `Origin` 会被服务端拒绝，但这只是纵深，不是暴露的理由。
-- 需要远程访问时走既定通道（微信网关、VPN/内网穿透到**你的人**而不是到端口），而不是暴露 HTTP。
-- token 泄漏等于把 runtime 交给对方：轮换 = 删 `host.json` + 重启 daemon（新 token），并检查 `master-injections.jsonl` 与 journal 有无异常注入。
-- 公网暴露会同时暴露两样东西：全部会话内容（转写/事件/注意力投影）与工具执行能力（命令入口直达工作流状态与会话注入）。
-- 残余风险（已接受，`/gui on` 即显式接受）：本机 GUI 经受信通道可注入 master 会话——浏览器上下文一旦被注入内容（如转写里的恶意文本诱导复制/点击），等于直接驱动 master；审批门尚在建设中。缓解：GUI 缺省 OFF（`/gui on` 显式启用才存在该通道）、一次性 OTT 换 `HttpOnly; SameSite=Strict` 派生凭据 cookie（`sw_gui_token = HMAC-SHA256(key="pi:gui-cookie:v1", msg=hostToken)`，浏览器不持 host token 本体）、每次 master 注入记 `state/master-injections.jsonl` 审计行（无正文）。诚实说明：该 cookie 是作用域化凭据（只解锁命令面 + WS 流；`Max-Age=43200`/12h；`/v1/bootstrap` 不认它故无自续期，12h 为真上限；`/gui off` 后浏览器下一次请求即 403 并被清除；重启轮换 host token 即失效；被盗=12h 窗口命令面能力；纯 http 下无 `Secure` 可用；本机持 token 进程用 `curl -b sw_host_token=` 以 cookie 呈现过门属预期行为，不是漏洞）。**该 cookie 不按端口隔离**：cookie 按 host 而非端口回传，`127.0.0.1` 上**任意端口**的本机服务都可能收到它（这正是把本体换成派生凭据的动机——本体泄漏=全权，派生泄漏=12h 窗口命令面）；`/gui off` 同样切断 WS 面（派生 cookie 握手 fail-closed 401）。
-
----
-
-## 10. Knowledge Management (project document system)
-
-The workflow ships a full documentation system for long-lived repos. **Five separate document families — don't confuse them:**
-
-| Family | Where | Purpose | Written by |
-|--------|-------|---------|------------|
-| **Wiki** | `Wiki/{Concepts,Modules,Architecture,Decisions,Workflows}/` | durable cross-task facts, `status: current`, `source_paths` + Evidence | searcher (proactively maintained) |
-| **Hotspot working set** | `~/.pi/agent/hotspot/<wsid>/` (outside the repo) | v4 ephemeral projection: task/workstream → recently read/written/tested files (12h half-life, 48h/72h TTL; losable, rebuildable — see §9.5) | runtime collector (automatic) |
-| **Plans** | `plans/` | per-task implementation plans & research notes | planner; research mode |
-| **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log (`Item NN` entries) | implementer / reviewer |
-| **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (wiki-and-task templates) |
-
-### 10.1 Wiki — durable knowledge
-
-- Theme pages only (a topic = one page with sections), `status: current`, `source_paths` + Evidence.
-- **Hard rule: task findings NEVER go to Wiki** — they live in replies or `plans/*_research.md`.
-- `wiki-nav` tool: `tree` / `around` / `find` / `keywords` / `path` / `rebuild` (progressive navigation, no need to read whole indexes). Optional semantic term expansion via `~/.pi/agent/embeddings.json` (see `examples/embeddings.json`).
-- After any Wiki page change: `wiki-nav rebuild` regenerates `_navigation.json` / `_search.json` / `_keywords.json`.
-
-### 10.2 Timeline / recentwork
-
-- `Item NN` = the repo timeline/task identifier when that file exists — **not** a GitHub issue.
-- `recentwork.md` rows: what changed, paths, status. The launcher/runner may be wired to the task board server (wiki-and-task).
-
-### 10.3 Changelog
-
-- Month-based release history (`changelog.md` quick nav + `changelog/YYYY/YYYY-MM.md`), per wiki-and-task templates.
-- Distinct from this package's own `CHANGELOG.md` (package release log — see §11).
-
-### 10.4 How documents flow in a workflow run
-
-```text
-search ──► Wiki verify/update (searcher)
-   │          plans/ research notes (if oversized)
-   ▼
-plan ──► plans/<date_topic>.md (planner)
-   ▼
-implement/review ──► recentwork.md row (progress)
-   │          hotspot: tool calls collected to the working set along the way (v4, automatic)
-   ▼
-Wiki wrap-up (stage 5) ──► update the corresponding theme page; may be "none"
-                        ──► no hotspot action here: the working set was collected live;
-                            the next session recovers it via inject gate / `hotspot` lookup (§9.5)
-```
-
-### 9.5 Hotspot working set (v4 — ephemeral projection)
-
-Hotspot answers one question: **"which files was this task/workstream touching just now?"** It is a *cache, not memory*: **losable** (deleting all hotspot data loses no knowledge), **rebuildable** (re-accumulates from fresh tool activity), **non-authoritative** (heat ≠ importance or correctness), **short-lived** (12h half-life, 48h/72h TTL), **non-blocking** (every failure path is silent; coding/Master/Timeline/Wiki run normally without it). "What happened" belongs to Timeline/recentwork, "what we know" belongs to Wiki — Hotspot holds neither. Design: `plans/0924_hotspot_v4_ephemeral_working_set.md`.
+Hotspot answers one question: **"which files was this task/workstream touching just now?"** It is a *cache, not memory*: **losable** (deleting all hotspot data loses no knowledge), **rebuildable** (re-accumulates from fresh tool activity), **non-authoritative** (heat ≠ importance or correctness), **short-lived** (12h half-life, 48h/72h TTL), **non-blocking** (every failure path is silent; coding/Master/Timeline/Wiki run normally without it). "What happened" belongs to Timeline/recentwork, "what we know" belongs to Wiki — Hotspot holds neither.
 
 **Storage** — all under `<agentDir = PI_CODING_AGENT_DIR ?? ~/.pi/agent>/hotspot/<wsid>/`, never inside the repo (no `.gitignore` edits, no runtime state in the worktree):
 
@@ -555,55 +626,167 @@ log.jsonl          # inject/lookup decision log
 - **`/hotspot`** — read-only diagnostics: identity, parameters, entries with score/kind/age/TTL, injection switch state, storage summary.
 - **Kill switch** — `PI_HOTSPOT_ENABLED=0` (default on): collection/injection/tool/command all unregister; everything else keeps working.
 
-**v2 retirement** — `Wiki/_hotspot.md` + `Wiki/_hotspot.trash.jsonl` are the only remaining copies of the v2 routing cache; v4 never reads, writes, or deletes them (deliberately left untouched). Rolling back to v2 = `git revert 8a9f09a` (the old files are intact, so the revert restores the old behavior wholesale). Once rollback is off the table, retire them for good: back them up out of the repo and drop the now-dead `state/`/trash `.gitignore` rules (old-implementation exit strategy, v3 plan §12-4).
+**v2 retirement** — `Wiki/_hotspot.md` + `Wiki/_hotspot.trash.jsonl` are the only remaining copies of the v2 routing cache; v4 never reads, writes, or deletes them (deliberately left untouched). Rolling back to v2 = `git revert 8a9f09a` (the old files are intact, so the revert restores the old behavior wholesale). Once rollback is off the table, retire them for good: back them up out of the repo and drop the now-dead `state/`/trash `.gitignore` rules (old-implementation exit strategy).
 
 ---
 
-## 11. Development
+## 安全边界：不要把 runtime 暴露到公网
+
+runtime-host / daemon 是**本机**控制面，不是网络服务。以下红线不接受例外：
+
+- daemon 只 bind `127.0.0.1`（动态端口，`host.json` 做发现）。不要改绑 `0.0.0.0`。
+- `host.json` 里的 host token 是**本机信任**：同机任何能读该文件（0600，当前用户）的进程都可连。拿到 token = 拿到全部读投影 + 唯一写端点 `POST /v1/commands`。
+- 禁止把端口带到公网：SSH `-L/-R` 端口转发、nginx/Caddy 等反向代理、公网域名、容器 `-p` 端口映射、云主机安全组放行，一律不做。跨站坏 `Origin` 会被服务端拒绝，但这只是纵深，不是暴露的理由。
+- 需要远程访问时走既定通道（微信网关、VPN/内网穿透到**你的人**而不是到端口），而不是暴露 HTTP。
+- token 泄漏等于把 runtime 交给对方：轮换 = 删 `host.json` + 重启 daemon（新 token），并检查 `master-injections.jsonl` 与 journal 有无异常注入。
+- 公网暴露会同时暴露两样东西：全部会话内容（转写/事件/注意力投影）与工具执行能力（命令入口直达工作流状态与会话注入）。
+- 残余风险（已接受，`/gui on` 即显式接受）：本机 GUI 经受信通道可注入 master 会话——浏览器上下文一旦被注入内容（如转写里的恶意文本诱导复制/点击），等于直接驱动 master；审批门尚在建设中。缓解：GUI 缺省 OFF（`/gui on` 显式启用才存在该通道）、一次性 OTT 换 `HttpOnly; SameSite=Strict` 派生凭据 cookie（`sw_gui_token = HMAC-SHA256(key="pi:gui-cookie:v1", msg=hostToken)`，浏览器不持 host token 本体）、每次 master 注入记 `state/master-injections.jsonl` 审计行（无正文）。诚实说明：该 cookie 是作用域化凭据（只解锁命令面 + WS 流；`Max-Age=43200`/12h；`/v1/bootstrap` 不认它故无自续期，12h 为真上限；`/gui off` 后浏览器下一次请求即 403 并被清除；重启轮换 host token 即失效；被盗=12h 窗口命令面能力；纯 http 下无 `Secure` 可用；本机持 token 进程用 `curl -b sw_host_token=` 以 cookie 呈现过门属预期行为，不是漏洞）。**该 cookie 不按端口隔离**：cookie 按 host 而非端口回传，`127.0.0.1` 上**任意端口**的本机服务都可能收到它（这正是把本体换成派生凭据的动机——本体泄漏=全权，派生泄漏=12h 窗口命令面）；`/gui off` 同样切断 WS 面（派生 cookie 握手 fail-closed 401）。
+
+---
+
+## 16. Knowledge Management (project document system)
+
+The workflow ships a full documentation system for long-lived repos. **Five separate document families — don't confuse them:**
+
+| Family | Where | Purpose | Written by |
+|--------|-------|---------|------------|
+| **Wiki** | `Wiki/{Concepts,Modules,Architecture,Decisions,Workflows}/` | durable cross-task facts, `status: current`, `source_paths` + Evidence | searcher (proactively maintained) |
+| **Hotspot working set** | `~/.pi/agent/hotspot/<wsid>/` (outside the repo) | v4 ephemeral projection: task/workstream → recently read/written/tested files (12h half-life, 48h/72h TTL; losable, rebuildable — see §15.5) | runtime collector (automatic) |
+| **Plans** | `plans/` | per-task implementation plans & research notes | planner; research mode |
+| **Timeline / recentwork** | `recentwork.md` or `Timeline/current.md` | task progress log | implementer / reviewer |
+| **Changelog** | `changelog.md` + `changelog/YYYY/YYYY-MM.md` | monthly release history | release time (bundled templates) |
+
+### 16.1 Wiki — durable knowledge
+
+- Theme pages only (a topic = one page with sections), `status: current`, `source_paths` + Evidence.
+- **Hard rule: task findings NEVER go to Wiki** — they live in replies or research notes under `plans/`.
+- `wiki-nav` tool: `tree` / `around` / `find` / `keywords` / `path` / `rebuild` (progressive navigation, no need to read whole indexes). Optional semantic term expansion via `~/.pi/agent/embeddings.json` (see `examples/embeddings.json`).
+- After any Wiki page change: `wiki-nav rebuild` regenerates `_navigation.json` / `_search.json` / `_keywords.json`.
+
+### 16.2 Timeline / recentwork
+
+- Timeline entries are repository-local progress identifiers, not GitHub issues.
+- `recentwork.md` rows: what changed, paths, status. The launcher/runner may be wired to an external task-board server (optional integration).
+
+### 16.3 Changelog
+
+- Month-based release history (`changelog.md` quick nav + `changelog/YYYY/YYYY-MM.md`), per bundled templates.
+- Distinct from this package's own `CHANGELOG.md` (package release log — see §17).
+
+### 16.4 How documents flow in a workflow run
+
+```text
+search ──► Wiki verify/update (searcher)
+   │          plans/ research notes (if oversized)
+   ▼
+plan ──► plans/<topic>.md (planner)
+   ▼
+implement/review ──► recentwork.md row (progress)
+   │          hotspot: tool calls collected to the working set along the way (v4, automatic)
+   ▼
+Wiki wrap-up (stage 5) ──► update the corresponding theme page; may be "none"
+                        ──► no hotspot action here: the working set was collected live;
+                            the next session recovers it via inject gate / `hotspot` lookup (§15.5)
+```
+
+---
+
+## 17. Development
 
 ### Tests
 
+There is **no aggregate `npm test` script** — each suite runs as its own `package.json` script (80+ of them), all via `node --experimental-strip-types` with the repo's `pi-deps-loader.mjs` resolve hook. Representative suites (excerpt):
+
 ```bash
-npm run test:tab-runs
-npm run test:tab-runs-runtime
-npm run test:timers
-npm run test:timers-runtime
+# core orchestration
+npm run test:launch
+npm run test:tab-runs            # tab ledger pure functions
+npm run test:tab-runs-runtime    # tab lifecycle + tab-finish/report/status/reclaim
+npm run test:timers              # timer pure functions
+npm run test:timers-runtime      # scheduler + set/cancel/list-timers
 npm run test:async-panel
-npm run test:links
+npm run test:links               # provenance
 npm run test:event-bus
 npm run test:report
-npm run test:launch
 npm run test:external-cli
-npm run smoke:reclaim-loop      # full loop (dispatch → timer → finish → reclaim)
-npm run smoke:real-tab          # real pi process (needs network/model)
-npm run test:trace-fusion-git   # trace-fusion: git primitives (worktree, snapshot, normalization)
-npm run test:trace-fusion-launch    # dispatch orchestration (implement + diagnose branches)
-npm run test:trace-fusion-collect   # authoritative artifact collection
-npm run test:trace-fusion-crosstest # cross-test matrix + diagnose skip report
+npm run test:lite-mode
+npm run test:gc-cleaner          # /gc runtime cleanup
+npm run smoke:reclaim-loop       # full loop (dispatch → timer → finish → reclaim)
+npm run smoke:real-tab           # real pi process (needs network/model)
+
+# trace-fusion (§7)
+npm run test:trace-fusion-git    # git primitives (worktree, snapshot, normalization)
+npm run test:trace-fusion-launch # dispatch orchestration (implement + diagnose branches)
+npm run test:trace-fusion-collect  # authoritative artifact collection
+npm run test:trace-fusion-crosstest  # cross-test matrix + diagnose skip report
 npm run test:trace-fusion-supervisor # auto-collect decision matrix + claim idempotency
-npm run test:trace-worker       # worker identity/profile/guard
-npm run test:register-graph     # tool/command registration snapshot
-npm run test:hotspot            # hotspot v4 working set (decay/collect/store/inject/lookup, incl. adversarial escaping)
+npm run test:trace-worker        # worker identity/profile/guard
+npm run test:register-graph      # tool/command registration snapshot
+
+# runtime daemon & GUI (§8, §14)
+npm run test:runtime-host-server # HTTP endpoints (read projections + /v1/commands)
+npm run test:runtime-host-ws     # WebSocket event stream
+npm run test:runtime-core        # protocol / journal / registry / consumer / cutover
+npm run test:runtime-protocol
+npm run test:runtime-mailbox
+npm run test:runtime-registry
+npm run test:runtime-consumer
+npm run test:runtime-cutover
+npm run test:gui-autostart       # /gui on|off|status|open
+npm run test:gui-master-unlock   # narrow GUI→master injection path + scoped cookie
+npm run test:gui-daemon-lifecycle
+
+# master & local master (§9)
+npm run test:runtime-master-control   # attach/detach/status/cutover logic
+npm run test:runtime-master-transfer  # one-click succession transaction
+npm run test:runtime-master-pressure  # context-window pressure gauge
+npm run test:runtime-master-succession
+npm run test:runtime-master-auto      # S3 auto handoff (8 safety gates)
+npm run test:master-dispatch
+npm run test:master-home-guard
+npm run test:local-master            # scope genesis / stale takeover / wake loop
+npm run test:local-master-ensure     # idempotent ensure (23 assertion groups)
+npm run test:runtime-wake
+npm run test:scope-stale-takeover
+npm run accept:local-master-loop     # acceptance harness
+
+# wechat channel (§10)
+npm run test:wechat-reply
+npm run test:wechat-broadcast
+npm run test:wechat-outbound-auth
+npm run test:wechat-artifact         # inbound image M1 (download/decrypt/store/inject)
+npm run test:wechat-remote-command   # tiered whitelist classification
+
+# autonomy & expectation ledger (§11)
+npm run test:autonomy-actions        # decision tree / transaction / breaker / replay (87 checks)
+npm run test:expectations            # declare / 4-key match / timeout / restart replay
+npm run test:message-outbox
+
+# hotspot (§15.5)
+npm run test:hotspot                 # decay/collect/store/inject/lookup, incl. adversarial escaping
 ```
 
-### extensions/ file map
+The full script list is in `package.json`.
 
-| File | Responsibility |
-|---|---|
-| `index.ts` | tool/command registration, subagent runner, launch-tabs, `/launch` |
-| `tab-runs.ts` | tab reclaim pure functions (ledger, probe, classify, compose) |
-| `tab-runs-runtime.ts` | tab lifecycle telemetry, `tab-finish`, `tab-report`, `tab-status`, `reclaim-tabs`, `/tabs` |
-| `timers.ts` | timer pure functions (validation, due/late, CAS claim, mailbox) |
-| `lite-mode.ts` | `/lite` on\|auto\|off + lite-chain system-prompt injection (tier projection from `models`; zero injection when off) |
-| `timers-runtime.ts` | timer scheduler + `set/cancel/list-timers`, `/timers` |
-| `async-panel.ts` | background-subagent TUI panel |
-| `event-bus.ts` | fs.watch completion detection (main session) |
-| `report.ts` | tab → main active-report channel |
-| `links.ts` | provenance log |
-| `external-cli.ts` | Claude/Codex/Agy/AtomCode/ZCode spawn runners |
-| `codex-headers.ts`, `notify-windows.ts`, `launch.ts`, `wiki-nav.ts`, `wiki-semantic.ts` | supporting modules |
-| `trace-fusion/` | trace-fusion-loop: `types`/`config` (mode, defaults), `git` (worktree/patch primitives), `snapshot` (synthetic base), `worktrees` (lane provisioning), `trust` (pre-grant), `worker-prompt` (implement/diagnose contracts), `launch-workers` (run orchestration + lane timers), `artifacts` (authoritative collect, dirty-baseline check), `cross-test` (eval-tree matrix / diagnose skip report), `supervisor` (auto-collect decisions, claim), `collect-cli` (background collection worker), `clean` (worktree disposal) |
-| `trace-worker.ts`, `capabilities.ts`, `identity.ts`, `runner-argv.ts`, `tab-launch-core.ts` | trace lane identity/tool isolation, capability matrix, pi argv builder, single-tab spawn primitive |
+### extensions/ file map (excerpt)
+
+The extension is **255 `.ts` files** in total; the table below groups the key ones. `_test_*` / `_smoke_*` files (run via the `package.json` scripts above) are omitted.
+
+| Area | Files | Responsibility |
+|---|---|---|
+| Registration hub | `index.ts` | All tool/slash registration: `subagent-win`, `launch-tabs`, `trace-fusion`, master / wechat / autonomy / `send-letter` / `global-view` / workstream / task / runtime-host / gc commands, subagent runner, `/launch` |
+| Tab infra | `tab-runs.ts`, `tab-runs-runtime.ts` | tab reclaim pure functions (ledger, probe, classify, compose) / tab lifecycle, `tab-finish`, `tab-report`, `tab-status`, `reclaim-tabs`, `/tabs` |
+| Timers | `timers.ts`, `timers-runtime.ts` | timer pure functions (validation, due/late, CAS claim, mailbox, session heartbeat) / scheduler + `set/cancel/list-timers`, `/timers` |
+| In-session workflow | `lite-mode.ts`, `launch.ts`, `launch-workflow.ts` | `/lite` on\|auto\|off + tier projection / `/launch` parsing + workflow discipline block |
+| UI & misc | `async-panel.ts`, `async-result-watcher.ts`, `event-bus.ts`, `report.ts`, `links.ts`, `no-poll.ts`, `notify-windows.ts`, `model-presets.ts`, `capabilities.ts`, `identity.ts`, `runner-argv.ts`, `tab-launch-core.ts`, `spawn-trace.ts`, `wiki-nav.ts`, `wiki-semantic.ts`, `gc-cleaner.ts`, `session-hooks.ts`, `injection-gate.ts`, `outbox-bridge.ts`, `external-cli.ts`, `codex-headers.ts` | TUI panel / fs.watch completion / active reports / provenance / Windows toasts / `/sub-presets` / capability matrix / pi argv builder / single-tab spawn / wiki navigation / GC / master hook wiring / master injection gate / outbox → session bridge / CLI backend runners / Codex header compat |
+| Master family | `master-tools.ts` | the 11 master tools of §9 (gates, USER_DIRECTIVE descriptions) |
+| Mailbox & wake | `mailbox-consumer.ts`, `wechat-reply-hook.ts`, `wechat-command-consumer.ts`, `gui-autostart.ts` | master mailbox consumption + scope wake-loop registration / wechat reply+broadcast hooks / remote slash-command consumer / `/gui` + daemon ensure |
+| `runtime/` (65 files) | `address`, `ids`, `envelope`, `protocol`, `journal`, `journal-seq` (addressing, frames, journal) · `registry` (attachments, cutover) · `master-control`, `master-home-guard`, `master-injection`, `master-pressure`, `master-succession`, `master-transfer`, `master-auto`, `local-master-launch` (master logic, §9) · `mailbox`, `message-outbox`, `receipts`, `wake`, `scope`, `scope-consume` (mailbox & wake) · `expectations` (§11) · `global-view`, `frontier-carriers`, `recent-scopes` (read projections) · `transcript`, `stream-gen`, `snapshot`, `projector`, `hydrate`, `objects` (session projections) · `liveness`, `state-store`, `resolver`, `consumer-scan`, `command-executor` · `adapters/` (session-lifecycle, tab-run) · `autonomy/` (v1 pure functions + `action/` rollback-only subsystem, §11) · `graph/` (work graph read-only projection, §12) |
+| `runtime-host/` (19 files) | `server.ts` (HTTP: read projections + the single `POST /v1/commands`) · `daemon-lifecycle.ts` (detached spawn / restart, `daemon-stderr.log`) · `discovery.ts` (`host.json` + `classifyHost`) · `identity.ts` (nonce challenge) · `ws.ts` (RFC6455 text frames) · `commands.ts` (strict body decoding, UTF-8/GB18030 fail-closed) · `snapshot`, `timeline`, `attention`, `interactions` (projection builders) · `session-title`, `session-pin` (session-list contract) · `wechat-bind`, `wechat-input`, `wechat-reply`, `wechat-outbound-auth` (wechat endpoints, §10) · `channel-supervisor.ts` (supervised wechat worker) · `autonomy-config.ts`, `static.ts`, `pi-deps-loader.mjs` |
+| `channel-wechat/` (7 files) | `client` (long-poll) · `parser` (shape-tolerant; quarantine with sanitized shape signatures) · `store` (inbox + quarantine, dedupe-first) · `worker` (the long-poll loop) · `send` (outbound, per-recipient client ids) · `artifact` (image download + decrypt + content-addressed store) · `index` (wiring) |
+| `hotspot/` (11 files) | `types` / `decay` / `store` / `collect` / `workset` / `inject` / `tool` / `command` / `log` / `index` — the v4 working set of §15.5 |
+| `trace-fusion/` (14 files) | `types`/`config` (mode, defaults), `git` (worktree/patch primitives), `snapshot` (synthetic base), `worktrees` (lane provisioning), `trust` (pre-grant), `worker-prompt` (implement/diagnose contracts), `launch-workers` (run orchestration + lane timers), `artifacts` (authoritative collect, dirty-baseline check), `cross-test` (eval-tree matrix / diagnose skip report), `supervisor` (auto-collect decisions, claim), `collect-cli` (background collection worker), `clean` (worktree disposal) |
+| `gui/` (separate npm package) | vite + React front end: `src/pages/` (Chat / Timeline / SessionList / Sidebar / TopBar + the six-section RuntimeOverlay incl. Autonomy and WeChat channels), `src/ui/` (shadcn kernel + thin adapter layer, zero-dependency Markdown renderer), `src/api/` (client with ETag conditional requests), `store.ts` (zustand) |
 
 ### How the event layer works
 
@@ -611,13 +794,13 @@ File system is the bus: ledgers under `~/.pi/agent/` are the shared state; `fs.w
 
 ---
 
-## 12. FAQ / Known limits
+## 18. FAQ / Known limits
 
 - **Async subagents die with the session.** `async: true` runs in a child process of your pi session; closing/restarting it kills them. For work that must survive, use tabs.
 - **Stall timeout** is per-process inactivity; it cannot detect a "busy but wrong" loop.
 - **Windows `fs.watch`** can miss events on large/network directories — the 5–10s tick fallback covers this.
-- **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as pi-flow-external). See §4 for wiring them as role-agent backends.
-- **Two changelogs:** the project's `changelog.md` (wiki-and-task monthly history) vs this package's `CHANGELOG.md` (release log).
+- **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as those CLIs themselves). See §4 for wiring them as role-agent backends.
+- **Two changelogs:** the project's `changelog.md` (monthly project history) vs this package's `CHANGELOG.md` (release log).
 - **trace-fusion diagnose vs implement:** diagnose never runs commands in your repo (evidence claims are reviewed, not rerun); implement gives real build/test evidence but costs 10GB+ disk per run on large repos — clean with `/trace-fusion-clean` when done. Lane reads/writes inside gitignored paths are not visible to the dirty-baseline check (documented residual risk).
 
 ---
