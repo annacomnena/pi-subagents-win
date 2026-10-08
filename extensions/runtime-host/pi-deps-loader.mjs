@@ -17,14 +17,19 @@
  * 纯 JS、无副作用 import（只 import node: 内置），可被 --import 与 hooks 线程复用。
  */
 import { register } from "node:module";
+import { isMainThread } from "node:worker_threads";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOST_PACKAGES = ["@earendil-works/pi-tui", "typebox"];
 
-/** 本文件在 hooks 线程内被再次加载时不得重复 register（env 标记 + 继承）。 */
-const IN_HOOKS_THREAD = process.env.__PI_DEPS_LOADER_HOOKS === "1";
+/**
+ * 本文件在 hooks 线程内被再次加载时不得重复 register。
+ * 不能用 env 标记：env 会经 spawn 继承进子进程，导致子进程误判自己是 hooks 线程
+ * 而跳过 register（2026-10-08 实测：测试父进程带 --import → 子 daemon 全灭）。
+ * isMainThread 只区分线程不跨进程泄漏；globalThis 亦然（每进程/线程独立）。
+ */
 
 function findHostNodeModules() {
 	// ① env（父进程 spawn 时传入；父进程侧已 realpath，这里再兜一层防 junction 路径）
@@ -41,10 +46,18 @@ function findHostNodeModules() {
 		if (parent === dir) break;
 		dir = parent;
 	}
-	// ③ 找不到 → 明确报错（进 daemon-stderr.log）
+	// ③ 当前 node 可执行文件相邻的全局 node_modules 树（pi 通常与其 node 同目录安装；
+	// daemon/测试都跑在这个 node 上时命中；与 daemon-lifecycle computeHostNodeModules ② 同源）
+	try {
+		const adjacent = join(
+			dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent", "node_modules",
+		);
+		if (hostCoversAll(adjacent)) return { dir: safeRealpath(adjacent), via: `exec-adjacent: ${adjacent}` };
+	} catch { /* 掉到报错 */ }
+	// ④ 找不到 → 明确报错（进 daemon-stderr.log）
 	throw new Error(
 		`pi-deps-loader: 找不到宿主 node_modules（需同时包含 ${HOST_PACKAGES.join("、")}）。` +
-			` 已尝试 ① env PI_HOST_NODE_MODULES=${fromEnv || "(空)"} ② 自 ${fileURLToPath(import.meta.url)} 向上 10 层。` +
+			` 已尝试 ① env PI_HOST_NODE_MODULES=${fromEnv || "(空)"} ② 自 ${fileURLToPath(import.meta.url)} 向上 10 层 ③ ${dirname(process.execPath)} 相邻全局树。` +
 			` 修复：spawn 时传 PI_HOST_NODE_MODULES=<pi 安装的 node_modules 绝对路径>，` +
 			` 或确认 pi 已安装（node_modules/@earendil-works/pi-coding-agent/node_modules 内嵌这两个包）。`,
 	);
@@ -88,8 +101,8 @@ function resolveEntry(nmDir, spec) {
 	return join(pkgDir, rel);
 }
 
-if (!IN_HOOKS_THREAD) {
-	process.env.__PI_DEPS_LOADER_HOOKS = "1";
+if (isMainThread && !globalThis.__piDepsLoaderRegistered) {
+	globalThis.__piDepsLoaderRegistered = true;
 	register(import.meta.url, import.meta.url);
 }
 
@@ -102,7 +115,7 @@ const HOST_AGENT_SPEC = "@earendil-works/pi-coding-agent";
  */
 function findAgentPackage(hostNmDir) {
 	const rel = join("@earendil-works", "pi-coding-agent");
-	for (const nmDir of [dirname(dirname(hostNmDir)), hostNmDir]) {
+	for (const nmDir of [dirname(dirname(dirname(hostNmDir))), hostNmDir]) {
 		const pkgDir = join(nmDir, rel);
 		try {
 			if (existsSync(join(pkgDir, "package.json"))) return { root: safeRealpath(pkgDir), nmDir };
