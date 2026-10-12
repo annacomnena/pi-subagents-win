@@ -29,7 +29,7 @@ source_paths:
 - **同会话重复认领**：无 token/forceStale 时只刷新 `lastHeartbeatAt`，**不 bump gen**（幂等）。
 - **接管僵尸**：`/master-attach --local --force-stale --confirm`（工具：`local:true, forceStale:true, confirm:true`）。`forceStale` 判据是 `lastHeartbeatAt` 年龄 > 10 分钟；**scope 侧该字段冻结在 attach 时刻**（`registry.ts` 注释明示"stale 判定由调用方完成"）⇒ 对 local 该判据**恒成立**，即"双确认下的无条件接管"。这是**有意接受**的边界：门控靠"仅用户指令可调 + `--confirm` 二次确认"，与 global 的 forceStale 同构。
 - **可见性**：`master-status`（工具与 `/master-status` 命令共用 `masterStatusLogic`）输出 `local: <addr> owner=<sid12> gen=N liveness=<alive|stale|skip:reason|no-liveness>`；拿不到 liveness 一律如实写 `no-liveness`，**不猜**。
-- **liveness 来源**：`<runtimeDir>/state/scope-liveness/<scope>.json`（pid + sessionId + generation + updatedAt），判活走 `process.kill(pid, 0)`。
+- **liveness 来源**：`<runtimeDir>/state/scope-liveness/<scope>.json`（pid + sessionId + generation + updatedAt），判活走 `process.kill(pid, 0)`。**与全局 master 的会话心跳（`timers/sessions/<sid>.json`）是两套互不相干的机制**：local 不依赖也不写会话心跳，故 2026-10-12 的「标签页 owner 写心跳」修复不涉及 local（见 [[Master 在线判据与远程输入门]]）。
 - **认领路径与消费循环注册的耦合（2026-09-25 补，源码直读 + L4 独立验证）**：scope 信箱的消费循环**只**在 `session_start` 处理块里注册（`mailbox-consumer.ts::registerScopeWakeLoop`，接线全仓仅 `index.ts:1945` 一处），且**认领成功 ⟺ 注册**（同一处理块内）；`triggerOwnershipRecheck()` 只补注册**全局** result watcher。⇒ **手动 `/master-attach --local` 不经过 `session_start` → 不注册 scope 消费循环**（工具 `master-tools.ts:521`、slash `index.ts:2125` 成功后都只调 `triggerOwnershipRecheck()`）——该会话默认收不到本仓信箱的信，直到下一个 `session_start`。详见 [[Local Master Ensure（幂等确保）]] §#A。
 
 ## 已知缺口（记录，未修）
@@ -52,12 +52,14 @@ source_paths:
 
 - [[Local Master Ensure（幂等确保）]]
 - [[Runtime Daemon 架构]]
+- [[Master 在线判据与远程输入门]]
 - [[Wiki 索引]]
 
 ## Backlinks
 
 - [[Local Master Ensure（幂等确保）]]
 - [[Wiki 索引]]
+- [[Master 在线判据与远程输入门]]
 
 ## Open Questions
 

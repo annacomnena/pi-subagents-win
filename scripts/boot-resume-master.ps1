@@ -11,6 +11,8 @@
             镜像 daemon-lifecycle 的 stealStaleLock「可证死 / 可证 pid 复用才清 + 重读复核」。
     G2     进程扫描：node.exe 的 CommandLine 含目标 sessionId = 有活持有者；
             CommandLine 不可读 = 不确定（fail-closed）。
+    G2.5   心跳新鲜（2026-10-12 B/C）：`timers/sessions/<sid>.json` 新鲜（<30s 且写于本次开机后）
+            = 已有常驻 owner（标签页 master / 常驻后继命令行不含 sid，G2/G3 失明）→ skip:already-running。
     G3     歧义交互 pi 扫描：`--session` 参数值先按 pi resolveSessionPath 语义分档（M1：
            路径含全长 sid / 精确等于 sid / sid 以它开头 = 就是我们；后缀、子串、通配符等
            无法确证指向别的会话的形态 → 一律 skip），再对裸 / `-c` / `-r` / `--session-dir`
@@ -460,6 +462,27 @@ function Invoke-BootResume {
 		if ($holder.Count -gt 0) {
 			Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'already-running'; via = 'process'; sid = $sid; pids = @($holder.ProcessId) }
 			return 0
+		}
+
+		# ── G2.5 心跳新鲜 = 已运行（2026-10-12 B/C）──────────────────────
+		# 标签页 master 与 C 之后的常驻后继，命令行都不含自身 sid（无 --session），G2/G3 均失明。
+		# B（标签页 owner 写心跳）与 C（后继为主会话自写心跳）之后，`timers/sessions/<sid>.json`
+		# 的新鲜度是覆盖所有常驻形态的通用判据：新鲜 = 已有 owner 在运行 → skip（防双开双写）。
+		# 仅认写于本次开机之后的心跳：否则快速重启会读到上次运行的残留心跳 → 误 skip（master 不恢复）。
+		$hbFile = Join-Path $homePath (Join-Path '.pi\agent\timers\sessions' ([uri]::EscapeDataString($sid) + '.json'))
+		$hb = $null
+		try { if (Test-Path -LiteralPath $hbFile) { $hb = Get-Content -LiteralPath $hbFile -Raw | ConvertFrom-Json } } catch { $hb = $null }
+		if ($hb -and $hb.lastActiveAt) {
+			$hbAge = $null
+			try { $hbAge = ((Get-Date) - [datetime]$hb.lastActiveAt).TotalSeconds } catch { $hbAge = $null }
+			$uptimeMs = [double][Environment]::TickCount
+			if ($uptimeMs -lt 0) { $uptimeMs += 4294967296 }   # 罕见 32 位溢出（uptime > 24.9 天）修正
+			$afterBoot = $true
+			try { $afterBoot = (Get-Item -LiteralPath $hbFile).LastWriteTime -ge (Get-Date).AddMilliseconds(-$uptimeMs) } catch { $afterBoot = $true }
+			if ($null -ne $hbAge -and $hbAge -lt 30 -and $afterBoot) {
+				Write-BootLog -LogPath $log -Phase 'skip' -Fields @{ reason = 'already-running'; via = 'heartbeat'; sid = $sid; ageSec = [int]$hbAge }
+				return 0
+			}
 		}
 
 		# ── G3 歧义交互 pi 扫描（判不准一律 skip）────────────────────────

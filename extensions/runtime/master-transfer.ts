@@ -17,7 +17,7 @@ import { defaultJournalPath, defaultRuntimeDir, emitRuntimeEventOnce } from "./j
 import { buildHandoff } from "./hydrate.ts";
 import { issueMasterHandoffToken } from "./master-control.ts";
 import { adoptTransfer, completeProposalForTransfer } from "./master-succession.ts";
-import { clearTransferWindow, readAttachment, setTransferWindow } from "./registry.ts";
+import { clearTransferWindow, readAttachment, readTransferWindow, setTransferWindow } from "./registry.ts";
 
 export type TransferStatus = "initiated" | "spawned" | "attached" | "completed" | "failed";
 
@@ -29,6 +29,7 @@ export interface TransferRecord {
 	agentAddress?: ObjectAddress;
 	token: string;
 	handoffPath: string;
+	/** 后继关联 id（2026-10-12 C 后不再是 tab runId）：不透明标识，仅供回报/溯源展示，无反查。 */
 	successorRunId?: string;
 	status: TransferStatus;
 	reason?: string;
@@ -42,13 +43,16 @@ export interface TransferRecord {
 	tokenConsumedAt?: string;
 }
 
-/** spawn 后继的实现由调用方注入；抛错即 spawn 失败。 */
+/** spawn 后继的实现由调用方注入；抛错即 spawn 失败。返回值 `successorRunId` 是后继关联 id
+ *（不透明；线上 `index.ts::spawnSuccessor` 返回 `succ_<transferId>`，不再是 tab runId）。 */
 export type SpawnSuccessor = (args: {
 	transferId: string;
 	title: string;
 	prompt: string;
 	sessionId: string;
 	cwd?: string;
+	/** 交接主体地址（global 或 local）；spawn 失败事件的审计归属用它，缺省回退 masterAddress()。 */
+	agent?: ObjectAddress;
 }) => { successorRunId: string };
 
 export interface TransferOptions {
@@ -114,6 +118,72 @@ function emitTransferEvent(
 
 function newTransferId(): string {
 	return `tr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 异步 spawn 失败（child `error`）落盘事件（2026-10-12 C-fail-1）。
+ *
+ * 审计归属随交接主体走：`agent ?? masterAddress()`——local 交接记 local 地址，与
+ * `emitTransferEvent` 的 0924 L3-fix（`record.agentAddress ?? masterAddress()`）一致；
+ * 缺省/未传时回退 global `masterAddress()`（保持 global 行为逐字不变）。
+ * 独立 dedupe 键（`:post-spawn`）：不得抢占 transferMaster 失败回退路径的
+ * `master.handoff.failed:<transferId>`（launcher-unhealthy 路径两者同发，同键会把带 record
+ * 状态的正典事件过滤掉）。
+ */
+export function emitPostSpawnFailureEvent(
+	input: { transferId: string; sessionId?: string; error: string; agent?: ObjectAddress },
+	journalPath?: string,
+): void {
+	const agent = input.agent ?? masterAddress();
+	emitRuntimeEventOnce(
+		newEventEnvelope({
+			type: "master.handoff.failed",
+			source: agent,
+			subject: agent,
+			payload: { transferId: input.transferId, fromSession: input.sessionId, phase: "post-spawn", error: input.error },
+			dedupeKey: `master.handoff.failed:${input.transferId}:post-spawn`,
+		}),
+		journalPath ?? defaultJournalPath(),
+	);
+}
+
+/**
+ * 异步 spawn 失败（child `error`）的失败化收尾（2026-10-12 nice-to-have #3）。
+ *
+ * `transferMaster` 已在 spawn 返回成功后落 `status="spawned"` 记录 + transfer 窗口；
+ * 子进程随后异步报错时若不收尾，record 停在 `spawned`、窗口残留至 TTL 24h。
+ * 后果不只是卫生问题：`scripts/boot-resume-master.ps1` 的 P2 见窗口 `createdAt < 24h`
+ * 即 `skip: transfer-in-flight` —— 重启后 master 也不恢复（微信/网页远程输入离线）。
+ *
+ * 因此：①best-effort 把 record 由 `spawned` 收尾为既有词表里的 `failed`；②best-effort 清
+ * 该 agent 的 transfer 窗口；③**必发**失败事件（复用 `emitPostSpawnFailureEvent`，归属
+ * 语义同 M1：`agent ?? masterAddress()`）。
+ *
+ * fail-safe：①②清理 never-throw —— 任一步失败只影响清理自身，绝不吞掉③的失败事件。
+ * 成功路径不经过本函数，故正常交接的窗口语义零变化。
+ */
+export function failTransferPostSpawn(
+	input: { transferId: string; sessionId?: string; error: string; agent?: ObjectAddress },
+	opts: TransferOptions = {},
+): void {
+	const agent = input.agent ?? masterAddress();
+	// ① record：仅 spawned→failed（不覆盖已 completed/failed 的终态）；读/写失败不阻断。
+	try {
+		const record = readTransferRecord(input.transferId, opts.stateDir);
+		if (record && record.status === "spawned") {
+			record.status = "failed";
+			record.error = input.error;
+			record.updatedAt = new Date().toISOString();
+			writeRecordAtomic(recordPath(input.transferId, opts.stateDir), record);
+		}
+	} catch { /* 清理失败不阻断（不吞失败事件） */ }
+	// ② 窗口：agent 级单槽；仅当窗口仍属于本次 transfer 时才清——若期间又发起了一次新交接，
+	// 窗口已被新 transferId 覆盖，清它会破坏新交接的 stale/forceStale 抑制。
+	try {
+		if (readTransferWindow(agent)?.transferId === input.transferId) clearTransferWindow(agent);
+	} catch { /* 清理失败不阻断 */ }
+	// ③ 失败事件：清理成败不改变「交接失败」事实，必须落盘。
+	emitPostSpawnFailureEvent(input, opts.journalPath);
 }
 
 /**
@@ -183,6 +253,7 @@ export type TransferResult =
 	| {
 			ok: true;
 			transferId: string;
+			/** 后继关联 id（不透明；**不是** tab runId——后继以非标签页常驻会话启动）。 */
 			successorRunId: string;
 			token: string;
 			handoffPath: string;
@@ -240,6 +311,9 @@ export function transferMaster(
 			title: buildMasterSuccessorTitle(record.transferId, att.generation + 1, record.reason),
 			prompt,
 			sessionId: input.sessionId,
+			// 2026-10-12 M1-fix：把交接主体地址传给 spawn，异步失败事件据此归属
+			//（local 交接不再被误记为 global；global 值与本字段引入前一致）。
+			agent: master,
 			...(input.repoRoot ? { cwd: input.repoRoot } : {}),
 		});
 		record.successorRunId = spawned.successorRunId;

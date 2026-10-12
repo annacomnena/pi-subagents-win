@@ -8,6 +8,14 @@
  *   confirm 握手：后继凭真 token attach（gen+1）→ confirm completed
  *   confirm 坏路径：未知 id / 会话错配 / 重复确认
  *
+ * 2026-10-12 L4 M1-fix 回归：
+ *   transferMaster 把交接主体 agent 传给 spawn（global→global / local→local，反例）
+ *   emitPostSpawnFailureEvent 失败事件审计归属（缺省回退 global / local 记 local）
+ *
+ * 2026-10-12 L4 nice-to-have #3：异步 spawn 失败收尾
+ *   failTransferPostSpawn：record spawned→failed + 清该 agent 窗口（global/local 反例）
+ *   成功路径零变化 + 晚到失败不误清新交接窗口（竞态守卫）
+ *
  * 运行：npm run test:runtime-master-transfer
  */
 
@@ -29,11 +37,14 @@ import {
 	buildMasterSuccessorTitle,
 	buildSuccessorPrompt,
 	confirmTransferAttach,
+	emitPostSpawnFailureEvent,
+	failTransferPostSpawn,
 	readTransferRecord,
 	transferMaster,
 } from "./runtime/master-transfer.ts";
-import { readAttachment } from "./runtime/registry.ts";
+import { attachMaster, readAttachment, readTransferWindow } from "./runtime/registry.ts";
 import { masterAddress } from "./runtime/address.ts";
+import { localMasterAddress, localMasterScope } from "./runtime/scope.ts";
 import { listRuntimeEnvelopes } from "./runtime/journal.ts";
 
 let n = 0;
@@ -181,6 +192,128 @@ let token = "";
 	assert.equal(r.ok, true);
 	assert.match(title, /^master-\d{4}-\d{4}-影像-tile-缓存$/);
 	ok("transferMaster 用可读标题 spawn 后继");
+}
+
+// ⑩ M1-fix：交接主体地址确实传给 spawn（修复前 spawn 入参无 agent 字段）
+{
+	// global（缺省 agent）：spawn 收到全局 masterAddress()
+	let capturedGlobal: string | undefined;
+	const r = transferMaster({
+		sessionId: "sess_succ_1",
+		spawn: (args) => { capturedGlobal = args.agent; return { successorRunId: "run_m1_g" }; },
+	});
+	assert.equal(r.ok, true);
+	assert.equal(capturedGlobal, masterAddress());
+	ok("M1 global：spawn 收到 global 地址");
+}
+{
+	// local（反例）：spawn 收到 local 地址（≠ global），修复前两者都拿不到 agent
+	const localAddr = localMasterAddress(localMasterScope(join(HOME, "m1-probe-repo")));
+	attachMaster({ sessionId: "sess_local_m1", agent: localAddr, detail: "m1-probe" });
+	let capturedLocal: string | undefined;
+	const r = transferMaster({
+		sessionId: "sess_local_m1",
+		agent: localAddr,
+		spawn: (args) => { capturedLocal = args.agent; return { successorRunId: "run_m1_l" }; },
+	});
+	assert.equal(r.ok, true);
+	assert.equal(capturedLocal, localAddr);
+	assert.notEqual(capturedLocal, masterAddress());
+	ok("M1 local：spawn 收到 local 地址（≠ global，反例）");
+}
+
+// ⑪ M1-fix：异步 spawn 失败事件的审计归属（index.ts onSpawnError 现走本函数）
+{
+	const failedOf = (id: string) => listRuntimeEnvelopes<{ payload?: { transferId?: string } }>()
+		.envelopes.filter((e) => e.type === "master.handoff.failed" && e.payload?.transferId === id);
+	// 缺省（global）：source/subject = global，行为与修复前一致
+	emitPostSpawnFailureEvent({ transferId: "tr_m1_global", sessionId: "sess_m1_g", error: "boom" });
+	const g = failedOf("tr_m1_global");
+	assert.equal(g.length, 1);
+	assert.equal(g[0].source, masterAddress());
+	assert.equal(g[0].subject, masterAddress());
+	ok("M1 失败事件（缺省）：source/subject = global");
+	// local（反例）：source/subject = local，不再被误记为 global
+	const localAddr = localMasterAddress(localMasterScope(join(HOME, "m1-evt-repo")));
+	emitPostSpawnFailureEvent({ transferId: "tr_m1_local", sessionId: "sess_m1_l", error: "boom", agent: localAddr });
+	const l = failedOf("tr_m1_local");
+	assert.equal(l.length, 1);
+	assert.equal(l[0].source, localAddr);
+	assert.equal(l[0].subject, localAddr);
+	assert.notEqual(l[0].subject, masterAddress());
+	ok("M1 失败事件（local）：source/subject = local（反例）");
+}
+
+// ⑫ nice-to-have #3：异步 spawn 失败 → record spawned→failed + 该 agent 窗口清除（global）
+{
+	const GOWNER = readAttachment(masterAddress())!.sessionId;
+	const r = transferMaster({ sessionId: GOWNER, reason: "n3-global", spawn: fakeSpawn("run_n3_g") });
+	assert.equal(r.ok, true);
+	if (!r.ok) throw new Error("unreachable");
+	assert.equal(readTransferRecord(r.transferId)?.status, "spawned");
+	assert.equal(readTransferWindow(masterAddress())?.transferId, r.transferId);
+	failTransferPostSpawn({ transferId: r.transferId, sessionId: GOWNER, error: "async boom g" });
+	assert.equal(readTransferRecord(r.transferId)?.status, "failed", "N3 global：record 收尾 failed");
+	assert.equal(readTransferRecord(r.transferId)?.error, "async boom g");
+	assert.equal(readTransferWindow(masterAddress()), null, "N3 global：窗口已清除");
+	const ev = listRuntimeEnvelopes<{ payload?: { transferId?: string } }>()
+		.envelopes.filter((e) => e.type === "master.handoff.failed" && e.payload?.transferId === r.transferId);
+	assert.equal(ev.length, 1, "N3 global：失败事件落盘一次");
+	assert.equal(ev[0].source, masterAddress());
+	assert.equal(ev[0].subject, masterAddress());
+	ok("N3 global：异步失败→record failed + 窗口清除 + 事件归属 global");
+}
+
+// ⑬ nice-to-have #3（local 反例）：清的是 local agent 的窗口，不误伤 global 窗口
+{
+	// 先在 global 占一个在途窗口（用于验证 local 清理不跨 agent）
+	const GOWNER = readAttachment(masterAddress())!.sessionId;
+	const g = transferMaster({ sessionId: GOWNER, reason: "n3-guard", spawn: fakeSpawn("run_n3_guard") });
+	assert.equal(g.ok, true);
+	if (!g.ok) throw new Error("unreachable");
+	const localAddr = localMasterAddress(localMasterScope(join(HOME, "n3-probe-repo")));
+	const LSID = "sess_local_n3";
+	attachMaster({ sessionId: LSID, agent: localAddr, detail: "n3-probe" });
+	const l = transferMaster({ sessionId: LSID, agent: localAddr, spawn: fakeSpawn("run_n3_l") });
+	assert.equal(l.ok, true);
+	if (!l.ok) throw new Error("unreachable");
+	assert.equal(readTransferWindow(localAddr)?.transferId, l.transferId);
+	failTransferPostSpawn({ transferId: l.transferId, sessionId: LSID, error: "async boom l", agent: localAddr });
+	assert.equal(readTransferWindow(localAddr), null, "N3 local：local 窗口已清除（反例）");
+	assert.equal(readTransferWindow(masterAddress())?.transferId, g.transferId, "N3 local 清理不误伤 global 窗口");
+	assert.equal(readTransferRecord(l.transferId)?.status, "failed");
+	const ev = listRuntimeEnvelopes<{ payload?: { transferId?: string } }>()
+		.envelopes.filter((e) => e.type === "master.handoff.failed" && e.payload?.transferId === l.transferId);
+	assert.equal(ev.length, 1);
+	assert.equal(ev[0].source, localAddr);
+	assert.notEqual(ev[0].subject, masterAddress());
+	ok("N3 local（反例）：清 local 窗口 + 不误伤 global + 事件归属 local");
+}
+
+// ⑭ nice-to-have #3 回归：成功路径零变化（不经过 failTransferPostSpawn → 窗口保留、停 spawned）
+{
+	const GOWNER = readAttachment(masterAddress())!.sessionId;
+	const r = transferMaster({ sessionId: GOWNER, reason: "n3-success", spawn: fakeSpawn("run_n3_ok") });
+	assert.equal(r.ok, true);
+	if (!r.ok) throw new Error("unreachable");
+	assert.equal(readTransferRecord(r.transferId)?.status, "spawned", "N3 成功：record 仍 spawned");
+	assert.equal(readTransferWindow(masterAddress())?.transferId, r.transferId, "N3 成功：窗口按原语义保留");
+	ok("N3 成功路径回归：record 停 spawned + 窗口保留（零变化）");
+}
+
+// ⑮ nice-to-have #3 竞态守卫：旧 transfer 的晚到失败不得清新 transfer 的窗口
+{
+	const GOWNER = readAttachment(masterAddress())!.sessionId;
+	const a = transferMaster({ sessionId: GOWNER, reason: "n3-a", spawn: fakeSpawn("run_a") });
+	const b = transferMaster({ sessionId: GOWNER, reason: "n3-b", spawn: fakeSpawn("run_b") });
+	assert.equal(a.ok, true);
+	assert.equal(b.ok, true);
+	if (!a.ok || !b.ok) throw new Error("unreachable");
+	assert.equal(readTransferWindow(masterAddress())?.transferId, b.transferId, "窗口已被新交接覆盖");
+	failTransferPostSpawn({ transferId: a.transferId, sessionId: GOWNER, error: "late boom a" });
+	assert.equal(readTransferWindow(masterAddress())?.transferId, b.transferId, "N3 竞态：不清新交接窗口");
+	assert.equal(readTransferRecord(a.transferId)?.status, "failed", "N3 竞态：旧 record 仍收尾 failed");
+	ok("N3 竞态守卫：晚到失败不误清新交接窗口");
 }
 
 console.log(`\n# pass ${n}`);

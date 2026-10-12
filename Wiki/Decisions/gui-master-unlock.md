@@ -50,6 +50,7 @@ source_paths:
 - **不是** `state/master-liveness.json`（该文件只在 `agent_end` 写，用于压力/续任语义）；混为一会得出「空闲 master 收不到消息」的**错误结论**。
 - **实测**（2026-09-24 00:06）：master 空闲时经 GUI 窄路径注入（cookie `sw_gui_token` + Origin 同端口 + 目标 = 当前 owner）→ HTTP 200 `accepted`，随后回执 `receipts/outbox_*.json` 的 `by = outbox-bridge:<master sessionId>` ⇒ **master 自己的桥把消息消费并注入成 followUp**（空闲会话被拉起来处理）。
 - ⇒ 剩下的缺口只有一种：**没有任何进程持有该会话（TUI 关闭）** ⇒ 需 G1（无头 worker 续写同一 session 文件），仍未实现。
+- **2026-10-12 补（B）**：标签页会话（`--tab-run-id`）**恰为全局 attachment owner** 时也开始写心跳，否则 master 是标签页时 `masterAlive` 恒 false（现网「微信持续离线」的根因）——判据函数、四个消费点、B 的语义与 local master 有意不写，详见 [[Master 在线判据与远程输入门]]。
 
 ## Key Symbols
 
@@ -72,12 +73,16 @@ source_paths:
 ## Links Out
 
 - [[Runtime Daemon 架构]]
+- [[Master 在线判据与远程输入门]]
+- [[Master 交接继任者形态]]
 - [[Wiki 索引]]
 
 ## Backlinks
 
 - [[Wiki 索引]]
 - [[微信 iLink 通道]]
+- [[Master 在线判据与远程输入门]]
+- [[Master 交接继任者形态]]
 
 ## Open Questions
 

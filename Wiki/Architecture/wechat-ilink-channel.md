@@ -122,7 +122,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 1. 显式 opt-in（`channels.wechat.input`，缺省 false ⇒ 关掉即零行为变化，见 D7）
 2. 发送者 openid 命中**服务端 allowlist**（昵称 / 正文 / 请求体**不得**决定权限，D1）
 3. **仅私聊**；群消息一律拒
-4. master **进程活着**——判据是 **tick 级 session heartbeat**（`extensions/timers.ts::sessionAlive`，`<timersDir>/<sessionId>.json` 的 `lastActiveAt`，grace 15s；空闲也算活）。**不是** `state/master-liveness.json`（该文件 `agent_end` 写、用于压力/续任）。见 [[GUI 解锁 Master]] 的「注入门判据（实测澄清，2026-09-24）」
+4. master **进程活着**——判据是 **tick 级 session heartbeat**（`extensions/timers.ts::sessionAlive`，`<timersDir>/<sessionId>.json` 的 `lastActiveAt`，grace 15s；空闲也算活）。**不是** `state/master-liveness.json`（该文件 `agent_end` 写、用于压力/续任）。见 [[GUI 解锁 Master]] 的「注入门判据（实测澄清，2026-09-24）」与 [[Master 在线判据与远程输入门]]。**2026-10-12 起**：标签页会话恰为全局 master owner 时也写心跳（B 修复，工作区未提交）；此前标签页 master 恒判 `master-offline`（现网根因）。
 5. 目标 == **当前 owner** 且 **generation 一致**（沿用 GUI 窄路径同一 fence）
 6. **脱敏审计** + 单条一次批（复用 D1 的 `ask` 档）
 
@@ -566,11 +566,13 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 ## Links Out
 
 - [[审批门策略]]
+- [[Master 在线判据与远程输入门]]
 - [[Wiki 索引]]
 
 ## Backlinks
 
 - [[Wiki 索引]]
+- [[Master 在线判据与远程输入门]]
 
 ## Open Questions
 

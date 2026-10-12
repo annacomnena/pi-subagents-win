@@ -88,6 +88,8 @@ source_paths:
 
 ### spawn 形状（可见 tab）
 
+> 对比：**global** master 交接的继任者已改为**非标签页常驻会话**（2026-10-12 C，见 [[Master 交接继任者形态]]）；本能力（local-master-ensure）**有意保留可见 tab** —— 其语义就是「开一个可见 tab 去认领 local」，**不受 C 影响**。
+
 `index.ts:2494` `ensureLocalMasterTab`：`findWindowsTerminal`/`findPiCli`（缺席在生成 runId **之前**返回 error，零账本）→ `newTabRunId` → 账本 `dispatch`（`mode:"execute"`、taskId `lms-<scope>`）→ link `local-master=<scope>` → `spawnPiTab`（**可见 WT tab**、`cwd=目标仓`、prompt 物化；异步失败回写 `launch_failed`）。**不设 `PI_SUBAGENT`、不传 `--no-session`**（否则结构上无法 attach），prompt 是常驻 master bootstrap、**不经** `buildWorkflowTabPrompt` 的一次性纪律包装。可见性本身是安全特性：用户看得见新开了什么。
 
 ## #A：scope 消费循环注册语义（重要，含"手动 attach 不注册"）
@@ -126,12 +128,15 @@ source_paths:
 
 - [[Local Master 认领与接管]]
 - [[Wake 回信（round-trip 回执）]]
+- [[Master 交接继任者形态]]
+- [[Master 在线判据与远程输入门]]
 - [[Wiki 索引]]
 
 ## Backlinks
 
 - [[Local Master 认领与接管]]
 - [[Wake 回信（round-trip 回执）]]
+- [[Master 交接继任者形态]]
 - [[Wiki 索引]]
 
 ## Open Questions

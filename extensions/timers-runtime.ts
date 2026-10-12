@@ -18,6 +18,8 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { recordLink, sessionIdentity } from "./links.ts";
 import { getCurrentSessionId, getTabRunId, isSubagent, setCurrentSessionId } from "./identity.ts";
+import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
+import { readAttachment } from "./runtime/registry.ts";
 import {
 	MAX_PENDING_TIMERS,
 	cancelTimerFile,
@@ -210,10 +212,14 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 			try {
 				// 身份每次 tick 惰性解析：flag 就绪后标签页才能扫自己的邮箱
 				const tabRunId = getTabRunId();
+				const sid = getCurrentSessionId();
 				if (tabRunId) {
+					// B（2026-10-12）：标签页若恰为全局 attachment owner，也写心跳——
+					// 否则 master 是标签页时 masterAlive 恒 false（微信/GUI 注入门拒发）。
+					// 只对 owner 写：非 owner 标签页不得污染心跳目录。
+					if (sid && isCurrentAttachmentOwner(sid)) touchSessionHeartbeat(timersDir, sid);
 					pumpDueTimers(pi, timersDir, { tabRunId, runsDir: opts?.runsDir });
 				} else {
-					const sid = getCurrentSessionId();
 					if (sid) touchSessionHeartbeat(timersDir, sid); // 会话活性信号（所有权门槛依据）
 					pumpDueTimers(pi, timersDir, { cwd: process.cwd(), sessionId: sid, runsDir: opts?.runsDir });
 				}
@@ -540,6 +546,25 @@ export function registerTimers(pi: ExtensionAPI, opts?: { timersDir?: string; ru
 	});
 
 	return cleanup;
+}
+
+/**
+ * B（2026-10-12）：本会话是否就是「全局 master attachment」的当前 owner。
+ *
+ * 这是标签页分支写心跳的唯一判据（只对 owner 写，避免非 owner 标签页污染心跳目录）。
+ * 线上读 `readAttachment(masterAddress())`；`read` 参数仅为测试注入（纯函数、无 IO）。
+ * tolerant：缺 sid / 读失败 → false（回退「标签页不写心跳」的旧行为）。
+ */
+export function isCurrentAttachmentOwner(
+	sessionId: string | undefined,
+	read: (agent?: ObjectAddress) => { sessionId: string } | null = readAttachment,
+): boolean {
+	if (!sessionId) return false;
+	try {
+		return read(masterAddress())?.sessionId === sessionId;
+	} catch {
+		return false; // 读失败 → 不写（回退当前行为）
+	}
 }
 
 /** 供 /timers 或调试使用：当前进程拥有的 timer 目录。 */

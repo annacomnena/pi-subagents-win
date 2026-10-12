@@ -21,6 +21,7 @@ source_paths:
 - 写侧五本账迁移顺序与切换/回滚：见本地定稿计划 §6（页面内不复制全文）。
 - G0 闸口：存活 + 身份（`scripts/verify-runtime-g0.ps1` §8 设计）；G1 闸口：无头接续。停止条件与交付门见定稿计划 §8–§10。
 - 第一切片（已落地）：detached 生命周期 + 静态托管 + 单实例身份；写侧完全不动。
+- **开机自启**：daemon 由计划任务 `pi-runtime-host-boot` 在登录时拉起（与恢复 master 会话的 `pi-master-resume-boot` 成对）；自启链、防双开与冷启窗口见 [[Master 开机自启与防双开]]。
 
 ## Key Symbols
 
@@ -75,6 +76,7 @@ ode.exe` 的 WT 窗口）。
 
 ## Links Out
 
+- [[Master 开机自启与防双开]]
 - [[Wiki 索引]]
 
 ## Backlinks
@@ -83,6 +85,7 @@ ode.exe` 的 WT 窗口）。
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
 - [[Local Master 认领与接管]]
+- [[Master 开机自启与防双开]]
 
 ## Open Questions
 

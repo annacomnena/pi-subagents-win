@@ -2,7 +2,7 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-10-02
+updated: 2026-10-12
 source_paths:
   - plans/0923_decisions.md
   - extensions/hotspot/index.ts
@@ -24,6 +24,7 @@ source_paths:
 - [[Runtime Daemon 存活机制]] — 切片一已验证的存活/身份机制（`status: current`）
 - [[GUI 解锁 Master]] — 本机受信 GUI 注入 master 的三证据合取窄路径 + B 案凭据作用域化（`status: current`）
 - [[Local Master 认领与接管]] — local/global 认领合同、僵尸接管、已知缺口（`status: current`）
+- [[Master 交接继任者形态]] — 继任者改为非标签页常驻会话（能力档/自启/心跳自写）+ 异步失败收尾（`status: current`）
 
 ### 架构（Architecture）
 
@@ -38,6 +39,8 @@ source_paths:
 - [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点、生产侧入账方现状与读取面（含 Graph 只读投影）（`status: current`）
 - [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff；快照 v2，含⑧期望投影；E2.3 起接线、生产缺省 graph 源）（`status: current`）
 - [[Local Master Ensure（幂等确保）]] — 主会话按 cwd 幂等确保他仓 local master：四层授权 + 零新增权力 + 严格就绪判据 + #A 消费循环注册语义（`status: current`）
+- [[Master 在线判据与远程输入门]] — 会话心跳（`sessionAlive` 15s）为唯一在线门、四消费点、标签页 master 盲区与 B 修复（`status: current`）
+- [[Master 开机自启与防双开]] — `pi-runtime-host-boot`/`pi-master-resume-boot` 与 boot-resume P1–P6/G1–G3、G2.5 心跳判据、P2 transfer-window 24h（`status: current`）
 
 ## Links Out
 
@@ -46,6 +49,7 @@ source_paths:
 - [[Runtime Daemon 存活机制]]
 - [[GUI 解锁 Master]]
 - [[Local Master 认领与接管]]
+- [[Master 交接继任者形态]]
 - [[Runtime Daemon 架构]]
 - [[统一审批门架构]]
 - [[微信 iLink 通道]]
@@ -57,6 +61,8 @@ source_paths:
 - [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
 - [[Local Master Ensure（幂等确保）]]
+- [[Master 在线判据与远程输入门]]
+- [[Master 开机自启与防双开]]
 
 ## Backlinks
 
@@ -76,6 +82,9 @@ source_paths:
 - [[期望账本（⑧ 请求—回执期望）]]
 - [[Work Graph 只读关系面]]
 - [[Local Master Ensure（幂等确保）]]
+- [[Master 在线判据与远程输入门]]
+- [[Master 交接继任者形态]]
+- [[Master 开机自启与防双开]]
 
 ## Open Questions
 
