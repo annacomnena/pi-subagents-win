@@ -39,8 +39,9 @@ export const STALE_NO_PROGRESS_MS = 45 * 60 * 1000;
 export const SUMMARY_TRUNCATE_CHARS = 120;
 /** 探活抽尾行数上限：lastStopReason/摘要只在 visible/active tab 上探。 */
 export const MAX_PROBE_TAIL_LINES = 40;
-/** 跨仓 recentwork.md 读取上限 64KB（超→该仓 gate=unknown）。 */
-export const MAX_GATE_BYTES = 64 * 1024;
+/** 跨仓 `recentwork.md` 的 **`Active Tasks` 区段**读取上限（超 → 该仓 gate=unknown）。
+ *  2026-10-12：语义由「整文件」改为「区段」，上限 64KB → 256KB（旧值使常见仓永久 unknown，见 readGateStatus 注）。 */
+export const MAX_GATE_BYTES = 256 * 1024;
 
 export function warn(out: string[], msg: string): void { if (out.length < 20) out.push(msg); }
 
@@ -97,35 +98,71 @@ export function findRepoRoot(cwd: string, cache: Map<string, string>): string {
 
 // ── 闸口状态 / 可见性分流 ──────────────────────────────────────────
 
-/** 跨仓闸口状态：awaiting=等人工动作 | ok=表中有行但无等人工 | unknown=缺文件/超限/表头漂移/解析异常 */
+/** 跨仓闸口状态：awaiting=等人工动作 | ok=表中有行但无等人工 | unknown=缺文件/区段超限/表头漂移/解析异常 */
 export type GateStatus = "awaiting" | "ok" | "unknown";
 
 /**
- * 只读各仓 `<repo>/recentwork.md` 的 `## Active Tasks` → `### Task Index` 表
- * + `**Status**` 行，判定等人工动作证据。任一触发→该仓 gate=unknown：
- * 文件缺失 / 超 64KB / 表头漂移 / 解析异常。单仓异常由调用方记 warnings。
+ * `## Active Tasks` 区段标题别名（方言并集）：英文（本仓）`## Active Tasks`；
+ * 中文（GreenCAD 等）`## 待办事项 (Todo)`。
+ */
+const GATE_ACTIVE_HEADING = /^##\s+(?:Active Tasks|待办事项)/;
+/** 索引表标题别名：`### Task Index` / `### 任务简报索引`。 */
+const GATE_INDEX_HEADING = /^###\s+(?:Task Index|任务简报索引)/;
+/** 索引表头列名别名（每一组**任一**命中即算该列在位）。 */
+const GATE_HEADER_COLS: ReadonlyArray<readonly string[]> = [
+	["item", "编号"],
+	["priority", "优先级", "评级"],
+	["summary", "简报", "一句话说明", "摘要"],
+];
+/** 状态行标记：`**Status**`（英）/ `**状态**`（中）。 */
+const GATE_STATUS_LINE = /\*\*\s*(?:Status|状态)\s*\*\*/;
+/** 「等人工」词（英中并集，只在区段内匹配）。 */
+const GATE_AWAITING =
+	/(?:waiting|awaiting|needs?-?human|等人工|需人工|待人工|待用户|待验收|待实机|待宿主|待复测|挂账)/i;
+
+/**
+ * 只读各仓 `<repo>/recentwork.md` 的 **`## Active Tasks` 区段**（含 `### Task Index` 表与 `**Status**` 行），
+ * 判定「等人工动作」证据。方言并集见上方常量——英文表头与 GreenCAD 的中文表头都能解析。
+ *
+ * `unknown` 情形（单仓异常由调用方记 warnings）：
+ *   文件缺失 / **`Active Tasks` 区段**超 `MAX_GATE_BYTES` / 缺索引表标题 / 表头漂移 / 解析异常。
+ *
+ * 2026-10-12 修复（“套件瞎了一只眼”）：
+ *   - 上限**只作用于 `Active Tasks` 区段**，不再作用于整文件。旧实现按整文件卡 64KB，
+ *     使 recentwork 自然膨胀的仓（GreenCAD 214KB、本仓 100KB+）**永久降级 `unknown`**，
+ *     于是 gate 类触发（`blocked_to_ready`、“gate=awaiting → needs_user”）**永不触发**、
+ *     actions 自 10-08 起零产出。上限抬到 256KB（区段级），仅当区段病态膨胀时才降级。
+ *   - 旧实现只认英文表头（`## Active Tasks` / `### Task Index` / `Item|Priority|Summary`），
+ *     中文方言仓因此永久 `unknown`；现并集两种方言。
+ *   - `readFileSync` 本来就是整文件读（上限不是省内存手段），故区段化**不增加**读取成本。
  */
 export function readGateStatus(repoPath: string, warnings: string[]): GateStatus {
 	try {
 		const f = join(repoPath, "recentwork.md");
 		if (!existsSync(f)) return "unknown";
-		try {
-			if (statSync(f).size > MAX_GATE_BYTES) { warn(warnings, `gate 超 64KB 降级 unknown: ${basename(repoPath)}`); return "unknown"; }
-		} catch { return "unknown"; }
 		let text: string;
 		try { text = readFileSync(f, "utf8"); } catch { return "unknown"; }
-		let inActive = false; let sawIndex = false; let colsOk = false; let awaiting = false;
-		for (const line of text.split("\n")) {
-			if (/^##\s+Active Tasks/.test(line)) { inActive = true; continue; }
-			if (inActive && /^##\s+/.test(line)) break;
-			if (!inActive) continue;
-			if (/\*\*Status\*\*/.test(line) && /(waiting|等人工|awaiting|needs?-?human|需人工)/i.test(line)) awaiting = true;
-			if (/^###\s+Task Index/.test(line)) { sawIndex = true; continue; }
+		// 切出 Active Tasks 区段（到下一个 `## ` 为止）；区段缺失 → unknown
+		const lines = text.split("\n");
+		const start = lines.findIndex((l) => GATE_ACTIVE_HEADING.test(l));
+		if (start < 0) return "unknown";
+		let end = lines.length;
+		for (let i = start + 1; i < lines.length; i++) {
+			if (/^##\s+/.test(lines[i] ?? "")) { end = i; break; }
+		}
+		const section = lines.slice(start, end).join("\n");
+		if (section.length > MAX_GATE_BYTES) {
+			warn(warnings, `gate 区段超 ${Math.round(MAX_GATE_BYTES / 1024)}KB 降级 unknown: ${basename(repoPath)}`);
+			return "unknown";
+		}
+		let sawIndex = false; let colsOk = false; let awaiting = false;
+		for (const line of section.split("\n")) {
+			if (GATE_INDEX_HEADING.test(line)) { sawIndex = true; continue; }
+			if (GATE_STATUS_LINE.test(line) && GATE_AWAITING.test(line)) awaiting = true;
 			if (sawIndex && !colsOk && line.includes("|")) {
 				const h = line.toLowerCase();
-				if (h.includes("item") && h.includes("priority") && h.includes("summary")) colsOk = true;
-				else { warn(warnings, `gate 表头漂移降级 unknown: ${basename(repoPath)}`); return "unknown"; }
-				continue;
+				colsOk = GATE_HEADER_COLS.every((alias) => alias.some((a) => h.includes(a.toLowerCase())));
+				if (!colsOk) { warn(warnings, `gate 表头漂移降级 unknown: ${basename(repoPath)}`); return "unknown"; }
 			}
 		}
 		if (!sawIndex || !colsOk) return "unknown";

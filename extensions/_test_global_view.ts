@@ -201,8 +201,10 @@ for (const r of [repoC, repoD, repoE, repoF]) mkdirSync(join(r, ".git"), { recur
 // repoC：有表 + Status waiting → gate=awaiting
 writeFileSync(join(repoC, "recentwork.md"),
 	`# recent\n\n## Active Tasks\n\n### Task Index\n\n| Item | Priority | Summary | Dependency | Next action |\n| R1 | P0 | demo | none | wait human |\n\n**Status**：waiting（等人工确认）\n`, "utf8");
-// repoE：超 64KB → unknown
-writeFileSync(join(repoE, "recentwork.md"), "x".repeat(70 * 1024), "utf8");
+// repoE：Active Tasks **区段**超 256KB → unknown（2026-10-12 语义：上限作用在区段、非整文件）
+writeFileSync(join(repoE, "recentwork.md"),
+	"# recent\n\n## Active Tasks\n\n### Task Index\n\n| Item | Priority | Summary |\n|---|---|---|\n" +
+		"| E1 | P1 | filler |\n".repeat(Math.ceil((256 * 1024) / 20) + 500), "utf8");
 // repoF：表头漂移 → unknown
 writeFileSync(join(repoF, "recentwork.md"),
 	`# recent\n\n## Active Tasks\n\n### Task Index\n\n| Foo | Bar | Baz |\n| a | b | c |\n`, "utf8");
@@ -277,8 +279,8 @@ assert.equal(ftab.gate, "unknown", "表头漂移 → unknown");
 assert.equal(ftab.stale, "unknown", "无 state.lastActivityAt → unknown（不拿 mtime 冒充）");
 assert.equal(ftab.taskId, "F1");
 const gtab = byId(snapA, "g_tab");
-assert.equal(gtab.gate, "unknown", "超 64KB → unknown");
-assert.ok(snapA.warnings.some((w) => w.includes("64KB")), "超大记 warnings");
+assert.equal(gtab.gate, "unknown", "Active 区段超上限 → unknown");
+assert.ok(snapA.warnings.some((w) => w.includes("区段超 256KB")), "区段超限记 warnings");
 // 跨仓缺失不污染他仓行
 assert.equal(byId(snapA, "w_stale").gate, "awaiting", "repoD 缺失不污染 repoC");
 // 行置顶：repoC（等人工）在无异常仓 repoE 之前
