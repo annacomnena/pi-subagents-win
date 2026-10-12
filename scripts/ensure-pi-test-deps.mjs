@@ -30,6 +30,12 @@ const packages = [
 	["@earendil-works/pi-coding-agent", piCodingAgent],
 	["@earendil-works/pi-tui", join(piNestedModules, "@earendil-works", "pi-tui")],
 	["typebox", join(piNestedModules, "typebox")],
+	// pi-tui 的运行时依赖：Node 从 junction 路径（<repo>/node_modules/@earendil-works/pi-tui/…）
+	// 向上解析裸 specifier，不会走进 pi 安装树的 nested node_modules，故同样需要包叶子 junction。
+	// 缺失时的现象：`ERR_MODULE_NOT_FOUND: Cannot find package 'marked' imported from
+	// <repo>/node_modules/@earendil-works/pi-tui/dist/index.js`（导入 index.ts 的测试全红）。
+	["marked", join(piNestedModules, "marked")],
+	["get-east-asian-width", join(piNestedModules, "get-east-asian-width")],
 ];
 
 function canonical(path) {

@@ -67,7 +67,7 @@ import { readExpectation } from "./runtime/expectations.ts";
 import { formatNotHomeDirMessage } from "./runtime/master-home-guard.ts";
 import { readSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "./runtime/master-auto.ts";
-import type { SpawnSuccessor } from "./runtime/master-transfer.ts";
+import { failTransferPostSpawn, type SpawnSuccessor } from "./runtime/master-transfer.ts";
 import { emitRuntimeEventOnce } from "./runtime/journal.ts";
 import { tabDispatchToRuntimeEvent } from "./runtime/adapters/tab-run.ts";
 import { bindAsyncPanelUi, notifyAsyncCompletion, refreshAsyncPanel, registerAsyncPanel } from "./async-panel.ts";
@@ -123,6 +123,7 @@ import {
 	buildWorkflowTabPrompt,
 	launchTaskTitle,
 	parseLaunchRequest,
+	sanitizeWtTitle,
 	spawnPiTab,
 	type LaunchMode,
 } from "./launch.ts";
@@ -2522,40 +2523,46 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// reload/会话切换/退出前清理全部后台资源（旧实例的 interval/watcher 必须停止）
-	// 后继 spawn 通道（wt.exe + spawnPiTab + 失败写 launch_failed）：master-transfer 工具与
-	// S3 自动交接共用同一闭包（M3 内联实现原样提取，零逻辑变化）
-	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId, cwd: requestedCwd }) => {
+	// 后继 spawn 通道（wt.exe + spawnPiTab）：master-transfer 工具与 S3 自动交接共用同一闭包。
+	// 2026-10-12 C：后继改为「非标签页常驻会话」形态（不生成 tab runId / 不写 tab-runs 账本 /
+	// 不带 --tab-run-id / clearTabIdentity 清掉继承的标签页身份 env），使后继 isMainSession()===true
+	// （心跳自写、GUI 自启、能力档 main 全部生效）。否则标签页老 master 的 PI_TAB_RUN_ID 会被
+	// 子进程继承，后继仍被判为 tab，C 等于没做。
+	const spawnSuccessor: SpawnSuccessor = ({ transferId, title, prompt, sessionId, cwd: requestedCwd, agent }) => {
+		// 2026-10-12 M1-fix：失败事件的审计归属随交接主体走（local 交接过 local 地址，
+		// global/未传时回退 global masterAddress()）——见 failTransferPostSpawn。
 		const wtPath = findWindowsTerminal();
 		if (!wtPath) throw new Error("master-transfer: no wt.exe");
 		const piCli = findPiCli();
-		const runId = newTabRunId();
-		const taskId = `transfer-${transferId.slice(3, 9)}`;
 		// home 守卫配套（0923）：global successor 一律在 home 启动，否则后继 attach 必被拒绝。
 		const cwd = requestedCwd ?? homedir();
 		if (!cwd) throw new Error("master-transfer: 无法确定 home 目录，拒绝 spawn 后继（旧主仍是 owner）");
-		const runsDir = defaultTabRunsDir();
-		const dispatch: TabDispatchRecord = {
-			id: runId, version: 1, taskId, mode: "execute", title, cwd,
-			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
-		};
-		writeTabDispatch(runsDir, dispatch);
-		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
-		recordLink({ sessionId, kind: "tab", targetId: runId, detail: `transfer=${transferId}` });
 		const result = spawnPiTab({
-			wtPath, piCli, cwd, title, prompt, tabRunId: runId, runsDir,
+			wtPath, piCli, cwd, prompt,
+			// 标题过 wt 风险字符消毒（reason 可能含 %/;/引号并进 --title；旧路径无防护）
+			title: sanitizeWtTitle(title),
+			clearTabIdentity: true,
+			// C-fail-1：去掉 tab-runs 账本后，**异步** spawn 失败（child error）的落点改为
+			// journal 事件 + stderr（同步 preflight 失败仍走下方 throw → transferMaster 落 failed）。
 			onSpawnError: (err) => {
-				const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
-				writeTabDispatch(runsDir, failed);
-				emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
+				console.error(`[master-transfer] successor spawn error (transfer=${transferId}): ${err.message}`);
+				// 2026-10-12 nice-to-have #3：异步失败化收尾（record spawned→failed + 清 transfer
+				// 窗口），否则 boot-resume P2 见窗口残留会 skip: transfer-in-flight（master 不恢复）。
+				// fail-safe：failTransferPostSpawn 内部清理 never-throw，失败事件必发。
+				try {
+					failTransferPostSpawn({
+						transferId,
+						sessionId,
+						error: err.message,
+						...(agent ? { agent } : {}),
+					});
+				} catch { /* 事件写入失败不阻断（stderr 已留痕） */ }
 			},
 		});
-		if (result.error) {
-			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: result.error };
-			writeTabDispatch(runsDir, failed);
-			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-			throw new Error(result.error);
-		}
-		return { successorRunId: runId };
+		if (result.error) throw new Error(result.error);
+		// 仅作回报用的不透明关联 id——不再是 tab runId（后继不进入 tab-runs 账本）。
+		// 全部消费方仅作文本/结构化展示，无反查（master-tools / master-auto / session-hooks）。
+		return { successorRunId: `succ_${transferId}` };
 	};
 
 	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）；
@@ -2696,7 +2703,11 @@ export default function (pi: ExtensionAPI) {
 			lines.push(`[searcher-mode=parallel] 所有 searcher 优先并发派发（parallel tasks 数组），除非搜索方向之间有严格依赖。`);
 		}
 		// lite 轻量工作流模式（逻辑在 lite-mode.ts；off 时零注入）
-		lines.push(...litePromptLines(cfg));
+		// **仅主会话注入**（2026-10-12）：lite 链是主会话专属能力（capabilities 矩阵：workflow-tab 的 lite=false，
+		// 且其 agent 白名单不含 `general`）。旧写法无条件注入，会把「改用单一 general 走全程」泄漏给任务 tab /
+		// local master，诱导它们去派白名单外的 `general`（已实现过一次，见 local-master-launch 启动语的纠正段）。
+		// 与 NO_POLL_DISCIPLINE 同款处理：非主会话不注入主会话专属纪律，由各自的 onboarding 语承担。
+		if (isMainSession()) lines.push(...litePromptLines(cfg));
 		lines.push("Note: When dispatching the searcher, ask it to query `Wiki/` by keyword first, jump straight to code via each page's `source_paths` (e.g. `file#L49` / `file::Symbol`, no grep guessing), cross-check with codegraph, and PROACTIVELY maintain theme pages — update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a durable, source-verified cross-task theme is absent. Require each returned fact to carry a code location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a 'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
 		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");

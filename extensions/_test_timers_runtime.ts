@@ -2,8 +2,17 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pumpDueTimers } from "./timers-runtime.ts";
-import { readTimerFile, sweepTerminalTimers, validateTimerRecord, writeTimerAtomic, type TimerRecord } from "./timers.ts";
+import { pumpDueTimers, isCurrentAttachmentOwner } from "./timers-runtime.ts";
+import {
+	readTimerFile,
+	sweepTerminalTimers,
+	validateTimerRecord,
+	writeTimerAtomic,
+	SESSION_HEARTBEAT_GRACE_MS,
+	sessionHeartbeatPath,
+	type TimerRecord,
+} from "./timers.ts";
+import { attachMaster } from "./runtime/registry.ts";
 import { readTabResultFile, writeJsonAtomic, writeTabState } from "./tab-runs.ts";
 
 // P0-1：隔离进程环境（PI_SUBAGENT=1 时 pumpDueTimers 的调用方身份语义会被测试污染）
@@ -415,13 +424,25 @@ function makeTimer(overrides: Record<string, unknown>) {
 //  || 链：空串视为未设置 → 落默认目录 → 读到终态 → skipped；
 //  ?? 链：空串是有效目录 → 读 `<空串>/tab_x.result.json` 失败 → 照常开火 fired → 本断言必红。
 // 故「实现改回 ?? 时必红」是本测试杀伤力的直接证明。
+//
+// 2026-10-12 测试卫生修复：T7 的语义是「空串 → 回退默认目录」，而 defaultTabRunsDir() 的
+// 默认目录 = homedir()/.pi/agent/tab-runs。修复前它落在真实 ~/.pi/agent/tab-runs/：每跑一次
+// 都写一份 tab_guard_T7_<ts>.result.json，被**正在运行的主会话 event-bus** 看到后又写
+// tab_guard_T7_<ts>.notified 并注入幻影 completed task=T7 事件（用户已见多次）。
+// 现把进程 homedir 重定向到隔离临时目录（os.homedir 在 Windows 读 USERPROFILE、类 Unix 读 HOME，
+// 均在 defaultTabRunsDir 调用时求值）→ 默认目录被隔离，断言语义逐字不变。
 {
 	const TAB = `tab_guard_T7_${Date.now().toString(36)}`; // 唯一 id，避免与真实 tab-runs 冲突
 	const { defaultTabRunsDir } = await import("./tab-runs.ts");
-	const defDir = defaultTabRunsDir();
-	const resultPath = join(defDir, `${TAB}.result.json`);
-	const preExisting = existsSync(resultPath) ? readFileSync(resultPath, "utf8") : null;
+	const homeDir = mkdtempSync(join(tmpdir(), "timers-guard-t7-home-"));
+	const prevProfile = process.env.USERPROFILE;
+	const prevHome = process.env.HOME;
+	process.env.USERPROFILE = homeDir;
+	process.env.HOME = homeDir;
 	try {
+		const defDir = defaultTabRunsDir();
+		assert.ok(defDir.startsWith(homeDir), `默认 tab-runs 必须落在隔离 home（绝不得碰真实目录）：${defDir}`);
+		const resultPath = join(defDir, `${TAB}.result.json`);
 		// fixture：默认目录预置合法终态 result（result-only，不依赖 state）
 		writeJsonAtomic(resultPath, {
 			id: TAB, taskId: "T7", status: "completed", finishedAt: new Date().toISOString(),
@@ -441,9 +462,10 @@ function makeTimer(overrides: Record<string, unknown>) {
 			delete process.env.PI_TAB_RUNS_DIR;
 		}
 	} finally {
-		// 恢复默认目录现场：原本存在则还原内容，否则删除我们写入的文件
-		if (preExisting !== null) writeJsonAtomic(resultPath, JSON.parse(preExisting));
-		else if (existsSync(resultPath)) rmSync(resultPath, { force: true });
+		// 恢复 homedir 现场并清理隔离 home（含预置 result；真实目录全程零写入）
+		if (prevProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevProfile;
+		if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+		rmSync(homeDir, { recursive: true, force: true });
 	}
 }
 
@@ -469,6 +491,130 @@ function makeTimer(overrides: Record<string, unknown>) {
 	assert.equal(readTimerFile(tdir, b.id), null, "超龄终态记录应被清理");
 
 	rmSync(tdir, { recursive: true, force: true });
+}
+
+// ── 2026-10-12 B：标签页 master 也写心跳（T-B1..T-B4）────────────────
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+async function waitForFile(p: string, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (existsSync(p)) return true;
+		await sleep(100);
+	}
+	return existsSync(p);
+}
+
+/** registerTimers 用的假 pi：只捕获 session_start handler（不启动真实工具/命令副作用）。 */
+function makeSchedulerPi() {
+	const handlers: Array<(evt: unknown, ctx: unknown) => void> = [];
+	const pi = {
+		on: (evt: string, h: (e: unknown, c: unknown) => void) => {
+			if (evt === "session_start") handlers.push(h);
+		},
+		registerTool: () => {},
+		registerCommand: () => {},
+		sendUserMessage: () => {},
+	};
+	return { pi, handlers };
+}
+
+// T-B1：isCurrentAttachmentOwner 纯函数（注入 read，不依赖磁盘）
+{
+	const SID = "01b10000-0000-4111-8222-000000000001";
+	assert.equal(isCurrentAttachmentOwner(SID, () => ({ sessionId: SID })), true, "owner sid → true");
+	assert.equal(isCurrentAttachmentOwner(SID, () => ({ sessionId: "other" })), false, "非 owner sid → false");
+	assert.equal(isCurrentAttachmentOwner(SID, () => null), false, "无 attachment → false");
+	assert.equal(isCurrentAttachmentOwner(undefined, () => ({ sessionId: SID })), false, "无 sid → false");
+	assert.equal(isCurrentAttachmentOwner(SID, () => { throw new Error("boom"); }), false, "read 抛错 → false（tolerant）");
+
+	// T-B1b：默认 readAttachment 接线（隔离 PI_RUNTIME_DIR）
+	const rdir = mkdtempSync(join(tmpdir(), "timers-owner-registry-"));
+	const prevRt = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = rdir;
+	try {
+		const att = attachMaster({ sessionId: SID });
+		assert.equal(att.ok, true, `attachMaster 应成功（隔离目录）: ${JSON.stringify(att)}`);
+		assert.equal(isCurrentAttachmentOwner(SID), true, "默认 readAttachment 应读到 owner");
+		assert.equal(isCurrentAttachmentOwner("01b10000-0000-4111-8222-deadbeefdead"), false);
+	} finally {
+		if (prevRt === undefined) delete process.env.PI_RUNTIME_DIR; else process.env.PI_RUNTIME_DIR = prevRt;
+		rmSync(rdir, { recursive: true, force: true });
+	}
+}
+
+// T-B2：标签页若恰为全局 attachment owner → 每个 tick 写心跳（B 的核心）
+{
+	const tdir = mkdtempSync(join(tmpdir(), "timers-hb-owner-"));
+	const rdir = mkdtempSync(join(tmpdir(), "timers-hb-owner-rt-"));
+	const SID = "01b20000-0000-4111-8222-000000000002";
+	const prevRt = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = rdir;
+	const { registerTimers } = await import("./timers-runtime.ts");
+	const { pi, handlers } = makeSchedulerPi();
+	process.env.PI_TAB_RUN_ID = "tab_hb_owner";
+	let cleanup: (() => void) | undefined;
+	try {
+		assert.equal(attachMaster({ sessionId: SID }).ok, true, "fixture：owner = SID");
+		cleanup = registerTimers(pi as never, { timersDir: tdir });
+		assert.equal(handlers.length, 1, "应注册一个 session_start handler");
+		handlers[0]!({}, { sessionManager: { sessionId: SID } });
+		const hb = sessionHeartbeatPath(tdir, SID);
+		assert.ok(await waitForFile(hb, 4000), `标签页 owner 应在 boot tick 后写心跳: ${hb}`);
+		const raw = JSON.parse(readFileSync(hb, "utf8")) as { lastActiveAt?: string };
+		assert.ok(raw.lastActiveAt, "心跳必须含 lastActiveAt");
+		assert.ok(Date.now() - Date.parse(raw.lastActiveAt!) < SESSION_HEARTBEAT_GRACE_MS, "心跳必须新鲜（< grace）");
+	} finally {
+		cleanup?.();
+		delete process.env.PI_TAB_RUN_ID;
+		if (prevRt === undefined) delete process.env.PI_RUNTIME_DIR; else process.env.PI_RUNTIME_DIR = prevRt;
+		rmSync(tdir, { recursive: true, force: true });
+		rmSync(rdir, { recursive: true, force: true });
+	}
+}
+
+// T-B3（反向回归）：非 owner 标签页不得写心跳（防「所有 tab 都写」的退化解）
+{
+	const tdir = mkdtempSync(join(tmpdir(), "timers-hb-nonowner-"));
+	const rdir = mkdtempSync(join(tmpdir(), "timers-hb-nonowner-rt-"));
+	const OWNER = "01b30000-0000-4111-8222-000000000003";
+	const ME = "01b30000-0000-4111-8222-0000000000ff";
+	const prevRt = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = rdir;
+	const { registerTimers } = await import("./timers-runtime.ts");
+	const { pi, handlers } = makeSchedulerPi();
+	process.env.PI_TAB_RUN_ID = "tab_hb_nonowner";
+	let cleanup: (() => void) | undefined;
+	try {
+		assert.equal(attachMaster({ sessionId: OWNER }).ok, true, "fixture：owner = 另一个 sid");
+		cleanup = registerTimers(pi as never, { timersDir: tdir });
+		handlers[0]!({}, { sessionManager: { sessionId: ME } });
+		await sleep(2200); // ≥ STARTUP_FIRE_DELAY_MS(1500) + 裕度
+		assert.equal(existsSync(sessionHeartbeatPath(tdir, ME)), false, "非 owner 标签页不得写心跳");
+		assert.equal(existsSync(sessionHeartbeatPath(tdir, OWNER)), false, "不得替别人写心跳");
+	} finally {
+		cleanup?.();
+		delete process.env.PI_TAB_RUN_ID;
+		if (prevRt === undefined) delete process.env.PI_RUNTIME_DIR; else process.env.PI_RUNTIME_DIR = prevRt;
+		rmSync(tdir, { recursive: true, force: true });
+		rmSync(rdir, { recursive: true, force: true });
+	}
+}
+
+// T-B4（回归）：非标签页主会话行为不变（else 分支照旧写心跳，与 attachment 无关）
+{
+	const tdir = mkdtempSync(join(tmpdir(), "timers-hb-main-"));
+	const SID = "01b40000-0000-4111-8222-000000000004";
+	delete process.env.PI_TAB_RUN_ID;
+	const { registerTimers } = await import("./timers-runtime.ts");
+	const { pi, handlers } = makeSchedulerPi();
+	const cleanup = registerTimers(pi as never, { timersDir: tdir });
+	try {
+		handlers[0]!({}, { sessionManager: { sessionId: SID } });
+		assert.ok(await waitForFile(sessionHeartbeatPath(tdir, SID), 4000), "非标签页会话应照旧写心跳");
+	} finally {
+		cleanup?.();
+		rmSync(tdir, { recursive: true, force: true });
+	}
 }
 
 // ── 清理 ──────────────────────────────────────────────────────────

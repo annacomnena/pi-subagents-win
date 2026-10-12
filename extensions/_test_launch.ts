@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import cp, { execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
@@ -23,6 +24,28 @@ import {
 	workflowDisciplineBlock,
 	wtPromptArg,
 } from "./launch.ts";
+import { buildTabSpawnEnv } from "./tab-launch-core.ts";
+import { getTabRunId, isMainSession } from "./identity.ts";
+
+// ── 2026-10-12 测试卫生修复：child_process.spawn/spawnSync/execFileSync 模块级拦截 ──
+// ESM 具名导入是快照：只改 cp.x 不会影响 launch.ts/tab-launch-core.ts 已捕获的绑定。
+// syncBuiltinESMExports() 才会把补丁同步回已导入绑定（先例：_test_graph_frontier_shadow.ts
+// 对 os.homedir 的同款手法）。拦截 spawn 是「绝不再真开 Windows Terminal 标签」的兜底。
+const ORIG_CHILD_PROCESS = {
+	spawn: cp.spawn,
+	spawnSync: cp.spawnSync,
+	execFileSync: cp.execFileSync,
+};
+function restoreChildProcess(): void {
+	cp.spawn = ORIG_CHILD_PROCESS.spawn;
+	cp.spawnSync = ORIG_CHILD_PROCESS.spawnSync;
+	cp.execFileSync = ORIG_CHILD_PROCESS.execFileSync;
+	syncBuiltinESMExports();
+}
+const IDENTITY_ENV_KEYS = [
+	"PI_TAB_RUN_ID", "PI_TAB_RUNS_DIR", "PI_SESSION_PROFILE", "PI_TRACE_RUN_ID",
+	"PI_TRACE_LANE", "PI_SESSION_ID", "PI_SESSION_FILE", "PI_SUBAGENT",
+] as const;
 
 const orchestration = parseLaunchRequest("你来并行启动这三个任务");
 assert.deepEqual(orchestration, {
@@ -245,6 +268,135 @@ const argvTab = buildWindowsTerminalArgs("t", "p", {
 assert.ok(argvTab.includes("--tab-run-id") && argvTab.includes("tab_abc_1"), "应传 --tab-run-id");
 assert.ok(argvTab.indexOf("--tab-run-id") < argvTab.indexOf("p"), "flag 应在 prompt 之前");
 
+// ── 2026-10-12 C：常驻后继的 spawn env（clearTabIdentity 必须清掉继承的标签页身份）──
+// 杀手断言：若去掉 clearTabIdentity 分支（或退回 `env: undefined`），父进程的
+// PI_TAB_RUN_ID 会被子进程继承 → 后继 getTabRunId() 非空 → 仍被判为 tab（C 落空）。
+{
+	const baseEnv = {
+		PATH: "C:/x",
+		KEEP: "1",
+		PI_TAB_RUN_ID: "tab_old_master",
+		PI_TAB_RUNS_DIR: "C:/runs",
+		PI_SESSION_PROFILE: "trace-worker",
+		PI_TRACE_RUN_ID: "tfl_old",
+		PI_TRACE_LANE: "A",
+		PI_SESSION_ID: "sid-old",
+		PI_SESSION_FILE: "C:/sessions/old.jsonl",
+		PI_SUBAGENT: "1",
+	};
+
+	// 缺省（旧行为）：undefined = 继承父 env，零行为变化
+	assert.equal(buildTabSpawnEnv(baseEnv, {}), undefined, "缺省必须继承父 env（历史行为）");
+
+	// clearTabIdentity：身份类变量全清，其余保留
+	const cleared = buildTabSpawnEnv(baseEnv, { clearTabIdentity: true });
+	assert.ok(cleared, "clearTabIdentity 必须显式传 env（覆盖默认继承）");
+	for (const k of [
+		"PI_TAB_RUN_ID", "PI_TAB_RUNS_DIR", "PI_SESSION_PROFILE",
+		"PI_TRACE_RUN_ID", "PI_TRACE_LANE", "PI_SESSION_ID", "PI_SESSION_FILE", "PI_SUBAGENT",
+	]) {
+		assert.equal(cleared[k], undefined, `${k} 必须被清空（否则后继身份泄漏）`);
+	}
+	assert.equal(cleared.PATH, "C:/x", "非身份 env 必须保留");
+	assert.equal(cleared.KEEP, "1", "非身份 env 必须保留");
+	assert.equal("PI_TAB_RUN_ID" in cleared, false, "删除而非置 undefined（防 Node env 序列化歧义）");
+
+	// 有 tabRunId 时按原语义注入身份（历史行为逐字不变）
+	const tabEnv = buildTabSpawnEnv(baseEnv, {
+		tabRunId: "tab_new", runsDir: "rd", sessionProfile: "sp", traceRunId: "tfl2", traceLane: "B",
+	});
+	assert.equal(tabEnv?.PI_TAB_RUN_ID, "tab_new");
+	assert.equal(tabEnv?.PI_TAB_RUNS_DIR, "rd");
+	assert.equal(tabEnv?.PI_SESSION_PROFILE, "sp");
+	assert.equal(tabEnv?.PI_TRACE_RUN_ID, "tfl2");
+	assert.equal(tabEnv?.PI_TRACE_LANE, "B");
+	assert.equal(tabEnv?.PATH, "C:/x");
+	// 显式派发身份优先于 clearTabIdentity（同传时以 tabRunId 为准）
+	assert.equal(buildTabSpawnEnv(baseEnv, { tabRunId: "tab_new", clearTabIdentity: true })?.PI_TAB_RUN_ID, "tab_new");
+
+	// C 的另一半：后继 argv 不得带 --tab-run-id
+	const succArgv = buildWindowsTerminalArgs("t", "p", { cwd: ".", piCli: "cli.js", execPath: "node.exe" });
+	assert.equal(succArgv.includes("--tab-run-id"), false, "常驻后继 argv 不得含 --tab-run-id");
+
+	// 身份联动（§5③）：把 clearTabIdentity 的 8 个身份键从当前 env 清除后起会话 →
+	// getTabRunId() 空 / isMainSession() 真；反证：回溢 PI_TAB_RUN_ID → 又成 tab（C 的失败模式）。
+	// （测试进程本身可能带 PI_SUBAGENT=1，必须按 clearTabIdentity 清单整体清理才可判 isMainSession）
+	const identityKeys = [
+		"PI_TAB_RUN_ID", "PI_TAB_RUNS_DIR", "PI_SESSION_PROFILE", "PI_TRACE_RUN_ID",
+		"PI_TRACE_LANE", "PI_SESSION_ID", "PI_SESSION_FILE", "PI_SUBAGENT",
+	] as const;
+	const savedEnv: Record<string, string | undefined> = {};
+	for (const k of identityKeys) savedEnv[k] = process.env[k];
+	try {
+		for (const k of identityKeys) delete process.env[k];
+		assert.equal(getTabRunId(), undefined, "身份已清 → getTabRunId() 为空");
+		assert.equal(isMainSession(), true, "身份已清 → isMainSession() 为真（C 的目标）");
+		process.env.PI_TAB_RUN_ID = "tab_old_master";
+		assert.equal(getTabRunId(), "tab_old_master", "反证：继承父 env → getTabRunId() 非空");
+		assert.equal(isMainSession(), false, "反证：继承父 env → 仍是 tab（C 落空）");
+	} finally {
+		for (const k of identityKeys) {
+			if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]!;
+		}
+	}
+}
+
+// ── 2026-10-12 测试卫生修复 C-real：拦截 child_process.spawn，断言「真实 spawn 入参」──
+// 把上面纯函数断言升级为真实 spawn 入参断言：clearTabIdentity 传给子进程的 env 必须先清
+// 8 个身份键（否则常驻后继继承父标签页身份 → C 落空）；有 tabRunId 时按原样注入。
+{
+	const cap: Array<{ exe: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+	// 探针恒成功 → 别名健康 → 必然走到真实 spawn（无需 AppX 回退）。
+	cp.spawnSync = (() => ({ status: 0, stdout: "", stderr: "" })) as unknown as typeof cp.spawnSync;
+	cp.spawn = ((exe: string, args: string[], opts: { env?: NodeJS.ProcessEnv }) => {
+		cap.push({ exe, args, env: opts?.env });
+		return { on() {}, unref() {} };
+	}) as unknown as typeof cp.spawn;
+	syncBuiltinESMExports();
+
+	const saved: Record<string, string | undefined> = {};
+	for (const k of IDENTITY_ENV_KEYS) {
+		saved[k] = process.env[k];
+		process.env[k] = `seed-${k}`; // 父进程（标签页）身份：必须被子进程 env 丢弃
+	}
+	const prevKeep = process.env.PI_TEST_KEEP;
+	process.env.PI_TEST_KEEP = "keep-me";
+	_resetLauncherCache();
+	try {
+		// ① clearTabIdentity：真实 spawn env 不含 8 身份键，非身份 env 保留
+		const res = spawnPiTab({
+			wtPath: process.execPath, piCli: process.execPath, execPath: process.execPath,
+			cwd: process.cwd(), title: "spawn-env-clear", prompt: "hi", clearTabIdentity: true,
+		});
+		assert.equal(res.error, undefined, `健康别名路径应成功派发：${res.error}`);
+		assert.equal(cap.length, 1, "clearTabIdentity 应真实 spawn 一次");
+		const env0 = cap[0]!.env;
+		assert.ok(env0, "clearTabIdentity 必须显式传 env（覆盖 Node 默认继承）");
+		for (const k of IDENTITY_ENV_KEYS) {
+			assert.equal(k in env0!, false, `${k} 不得出现在真实 spawn env（身份泄漏）`);
+		}
+		assert.equal(env0.PI_TEST_KEEP, "keep-me", "非身份 env 必须原样保留");
+
+		// ② 有 tabRunId：真实 spawn env 按原语义注入派发身份（历史行为不变）
+		_resetLauncherCache();
+		const res2 = spawnPiTab({
+			wtPath: process.execPath, piCli: process.execPath, execPath: process.execPath,
+			cwd: process.cwd(), title: "spawn-env-tab", prompt: "hi", tabRunId: "tab_real_1", runsDir: "C:/runs",
+		});
+		assert.equal(res2.error, undefined, `tabRunId 路径应成功派发：${res2.error}`);
+		assert.equal(cap.length, 2, "tabRunId 应真实 spawn 第二次");
+		assert.equal(cap[1]!.env?.PI_TAB_RUN_ID, "tab_real_1");
+		assert.equal(cap[1]!.env?.PI_TAB_RUNS_DIR, "C:/runs");
+	} finally {
+		if (prevKeep === undefined) delete process.env.PI_TEST_KEEP; else process.env.PI_TEST_KEEP = prevKeep;
+		for (const k of IDENTITY_ENV_KEYS) {
+			if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]!;
+		}
+		restoreChildProcess();
+		_resetLauncherCache();
+	}
+}
+
 // ── wt 命令行 prompt 物化：换行/引号/分号 prompt 不直接上 wt 命令行（防多开无用 tab）──
 {
 	// 多行 prompt（workflow 派发的常态）→ 物化为 @file，命令行上无换行
@@ -344,21 +496,41 @@ _resetLauncherCache();
 const bad = healthyLauncher("C:/no/such/wt.exe");
 assert.ok(bad === null || typeof bad.exe === "string", "全坏时返回 null 或可用项，不抛");
 _resetLauncherCache();
-// fail-closed 回归（2026-09-23 缺 import 事故）：合法 pre-flight 参数 + 双启动器全坏
-// → 必须返回 error（不抛、不开窗）。走到 traceSpawn 行即验证 import 存活。
+// fail-closed 回归（2026-09-23 缺 import 事故；2026-10-12 测试卫生修复）：
+// 合法 pre-flight 参数 + 双启动器真坏 → 必须 fail-closed 返回 error（不抛、不开窗）。
+// 修复前缺陷：PI_WT_APPS_DIR 只短路目录扫描，resolveDirectTerminalExe 的 Get-AppxPackage
+// 回退仍命中真实 WindowsTerminal.exe → healthyLauncher 返回 direct → 真的 spawn
+// （piCli=node.exe → 弹出 “MZ” SyntaxError 崩溃窗口）。
+// 现改为「真坏 + 双重拦截」：spawnSync 探针恒 false（别名坏）+ execFileSync 恒抛（AppX
+// 回退坏）→ resolveDirectTerminalExe() 返回 null；同时把 child_process.spawn 换成记录桩，
+// 即使解析意外成功也绝不真开窗。
 _resetLauncherCache();
+const cap: Array<{ exe: string; args: string[] }> = [];
+cp.spawnSync = (() => ({ status: 1, error: new Error("stub-probe-fail"), stdout: "", stderr: "" })) as unknown as typeof cp.spawnSync;
+cp.execFileSync = (() => { throw new Error("stub-appx-package-unavailable"); }) as unknown as typeof cp.execFileSync;
+cp.spawn = ((exe: string, args: string[]) => {
+	cap.push({ exe, args });
+	return { on() {}, unref() {} };
+}) as unknown as typeof cp.spawn;
+syncBuiltinESMExports();
 process.env.PI_WT_APPS_DIR = "C:/no/such/apps";
-const doomed = spawnPiTab({
-  // 存在但不可执行的文件：过 pre-flight existsSync，但 --help 探针必失败
-  wtPath: new URL("../package.json", import.meta.url).pathname.replace(/^\//, ""),
-  piCli: process.execPath,
-  cwd: process.cwd(),
-  title: "doomed",
-  prompt: "hi",
-});
-delete process.env.PI_WT_APPS_DIR;
-_resetLauncherCache();
+let doomed: ReturnType<typeof spawnPiTab>;
+try {
+	doomed = spawnPiTab({
+		// 存在但不可执行的文件：过 pre-flight existsSync，但 --help 探针必失败
+		wtPath: new URL("../package.json", import.meta.url).pathname.replace(/^\//, ""),
+		piCli: process.execPath,
+		cwd: process.cwd(),
+		title: "doomed",
+		prompt: "hi",
+	});
+} finally {
+	delete process.env.PI_WT_APPS_DIR;
+	restoreChildProcess();
+	_resetLauncherCache();
+}
 assert.ok(doomed.error && doomed.error.length > 0, `双坏应 fail closed：${doomed.error}`);
+assert.equal(cap.length, 0, "fail-closed 路径绝不得 spawn（拦截 child_process.spawn 为证）");
 }
 
 console.log("launch tests passed");

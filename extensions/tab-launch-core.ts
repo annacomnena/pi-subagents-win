@@ -18,7 +18,7 @@
  */
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { traceSpawn } from "./spawn-trace.ts";
@@ -106,16 +106,55 @@ function compareVer(a: number[], b: number[]): number {
 
 let cachedLauncher: { exe: string; kind: "alias" | "direct" } | null = null;
 
+/** 启动器健康探测（**静默 + 零进程执行**）。
+ *
+ * 为何**不能**用执行探针（`--help`）：本机实测 2026-10-12，`wt.exe --help` 会**弹出可见的
+ * wt 帮助窗口**（用户实测）；而 `WindowsTerminal.exe` 是 GUI 程序、`--help` 不同步退出
+ * （转交运行实例后 lingering）。启动器探活必须对用户完全静默。
+ *
+ * 为何**不能**用 `existsSync`/`statSync`：`%LOCALAPPDATA%\Microsoft\WindowsApps` 受保护，
+ * 对别名 stat 得 EACCES → 会把健康启动器判死（本机实测，见 20261012 修复）。
+ *
+ * 采用**只读元数据**判据（不解析 reparse 目标，故绕过 EACCES）：
+ *   ① 后缀必须是 `.exe`（剔除"存在但不是启动器"的误传，如 `package.json`）；
+ *   ② `lstatSync` 可读（目录项存在；**lstat 不解析目标**，本机实测 OK）；
+ *   ③ 若是链接/别名：`readlinkSync` 取目标路径 + 目标必须存在 —— 这同时拓住
+ *      "包已卸载 / 更新中"的**坏别名**（= 老 `--help` 探针要抓的那一类）；
+ *      若不是链接（普通 exe）：lstat 存在即可信。
+ * 本函数**不执行任何进程**，因此结构上不可能弹窗。 */
+export function probeLauncherSilent(exePath: string): boolean {
+	if (!/\.exe$/i.test(exePath)) return false;
+	try {
+		lstatSync(exePath);
+	} catch {
+		return false;
+	}
+	try {
+		const target = readlinkSync(exePath);
+		return target.length > 0 && existsSync(target);
+	} catch (err) {
+		// **只有 EINVAL**（“不是符号链接/别名”＝普通 exe）可直接信任——lstat 已证目录项存在。
+		// 其它错误码（EACCES / EPERM / ELOOP / ENOTDIR / 损坏的 reparse 等）**一律 fail closed**：
+		// 不得当作“健康”放行，交给直调回退。（独立 L4 delta 复核 must-fix #1：
+		// 旧写法把 readlink 的所有错误都当作“普通文件”，对链接读取异常会误放行。）
+		return (err as NodeJS.ErrnoException | null)?.code === "EINVAL";
+	}
+}
+
 /** 解析可用启动器（缓存）。返回 null = 别名与直调均不可用，调用方 fail closed。
  *
- * 非对称探针策略（实测依据）：别名必须过 `--help` 探针（坏别名 exit 1 零输出，
- * 健康别名毫秒级返回）；直调路径**不探**——它来自 Get-AppxPackage 包注册表
- * （系统真相源）+ existsSync 双重确认，而 WindowsTerminal.exe 是 GUI 程序，
- * `--help` 不同步退出（转交运行实例后 lingering），同步探针必超时误杀。
+ * 非对称探针策略（实测依据）：
+ *  - 别名：走 `probeLauncherSilent`（只读元数据，静默零副作用）。**不得**改回 `--help`
+ *    执行探针——它会弹窗（见上），也不要改回 `existsSync`——它会因 EACCES 误判；
+ *  - 直调：**不探**——它来自 Get-AppxPackage 包注册表（系统真相源）+ existsSync 双重确认，
+ *    而 WindowsTerminal.exe 是 GUI 程序，`--help` 不同步退出（同步探针必超时误杀）。
  * 直调的真实可用性已由端到端实测背书（PROBE3_OK audit）。 */
 export function healthyLauncher(wtPath: string): { exe: string; kind: "alias" | "direct" } | null {
 	if (cachedLauncher) return cachedLauncher;
-	if (existsSync(wtPath) && probeWtHelp(wtPath)) {
+	// 注意：**不得**用 `existsSync(wtPath)`（受保护目录 EACCES → 误判死，2026-10-12 事故），
+	// 也**不得**用 `probeWtHelp(wtPath)`（`wt --help` 会弹可见窗，同日用户实测）。
+	// 唯一允许的是下面这一个静默、零进程的探测。
+	if (probeLauncherSilent(wtPath)) {
 		cachedLauncher = { exe: wtPath, kind: "alias" };
 		return cachedLauncher;
 	}
@@ -277,8 +316,15 @@ export interface TabLaunchOptions {
 	 * 早期调用点不传该字段，故必须可选（否则 preflight 拿到 undefined 直接拒发）。
 	 */
 	execPath?: string;
-	/** 异步 spawn 失败（child error 事件）回调，用于回写 launch_failed 账本。 */
+	/** 异步 spawn 失败（child error 事件）回调：调用方用于回写失败账本/事件（派发用）。 */
 	onSpawnError?: (err: Error) => void;
+	/**
+	 * C（2026-10-12）：清空从父进程继承的「标签页/会话身份类」env，使子进程成为
+	 * 非标签页常驻会话。仅在无 tabRunId 时有意义（有 tabRunId 时身份就是本次派发）。
+	 * 背景：tabRunId 缺省时旧代码传 `env: undefined` → Node spawn 继承父 process.env；
+	 * 若父进程本身是标签页 master，其 PI_TAB_RUN_ID 会被后继继承 → 后继仍被判为 tab。
+	 */
+	clearTabIdentity?: boolean;
 }
 
 export interface TabSpawnResult {
@@ -286,6 +332,60 @@ export interface TabSpawnResult {
 	prompt: string;
 	model?: string;
 	error?: string;
+}
+
+/**
+ * `clearTabIdentity` 要清空的 env 名单：身份类变量的全量集（对齐
+ * `scripts/boot-resume-master.ps1::Get-BootEnvScrubKeys` 的身份子集，「只删不加」，
+ * 故意不含 PI_PROVIDER/PI_MODEL 等配置类变量——后继应继承用户的运行环境）。
+ */
+const TAB_IDENTITY_ENV_KEYS = [
+	"PI_TAB_RUN_ID",
+	"PI_TAB_RUNS_DIR",
+	"PI_SESSION_PROFILE",
+	"PI_TRACE_RUN_ID",
+	"PI_TRACE_LANE",
+	"PI_SESSION_ID",
+	"PI_SESSION_FILE",
+	"PI_SUBAGENT",
+] as const;
+
+export interface TabSpawnEnvOptions {
+	tabRunId?: string;
+	runsDir?: string;
+	sessionProfile?: string;
+	traceRunId?: string;
+	traceLane?: string;
+	clearTabIdentity?: boolean;
+}
+
+/**
+ * 构造传给 wt.exe 的 env（2026-10-12 C 抽出为纯函数，spawn 副作用可单测）：
+ *
+ *   - 有 tabRunId：注入本次派发身份 `{...baseEnv, PI_TAB_RUN_ID, PI_TAB_RUNS_DIR, ...trace}`
+ *     （与抽出前的内联逻辑逐字等价）；
+ *   - 无 tabRunId 且 clearTabIdentity：返回 baseEnv 副本并**删除**身份类变量（显式传 env
+ *     以覆盖 Node spawn 的「undefined = 继承父 env」默认）；
+ *   - 其余：undefined（继承父 env，历史行为不变）。
+ */
+export function buildTabSpawnEnv(
+	baseEnv: NodeJS.ProcessEnv,
+	opts: TabSpawnEnvOptions,
+): NodeJS.ProcessEnv | undefined {
+	if (opts.tabRunId) {
+		return {
+			...baseEnv,
+			PI_TAB_RUN_ID: opts.tabRunId,
+			PI_TAB_RUNS_DIR: opts.runsDir,
+			...(opts.sessionProfile ? { PI_SESSION_PROFILE: opts.sessionProfile } : {}),
+			...(opts.traceRunId ? { PI_TRACE_RUN_ID: opts.traceRunId } : {}),
+			...(opts.traceLane ? { PI_TRACE_LANE: opts.traceLane } : {}),
+		};
+	}
+	if (!opts.clearTabIdentity) return undefined;
+	const env: NodeJS.ProcessEnv = { ...baseEnv };
+	for (const k of TAB_IDENTITY_ENV_KEYS) delete env[k];
+	return env;
 }
 
 /**
@@ -301,7 +401,11 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 	// 执行失败只剩空框。本层 spawn(wt) 只要 wt.exe 起来就算成功，new-tab 的死活无从得知，
 	// 故非法参数必须在 spawn 前拦截，直接回 error 走上层 markFailed（launch_failed 账本），
 	// 不弹空窗、不留永远 dispatched 的幽灵记录。
-	if (!existsSync(wtPath)) return { title, prompt, model, error: `preflight: wt not found: ${wtPath}` };
+	// 注意：wt 路径**不做** existsSync 探测。它来自 findWindowsTerminal() 的 `where wt.exe`，
+	// 在多机上命中的是 %LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe（AppExecLink/别名），
+	// 而该目录受保护：非提权进程 stat 得到 EACCES，existsSync 返回 **false**（本机实测），
+	// 于是这条 preflight 会把健康启动器判死 → **所有标签页 spawn 全废**（含 master 继任者）。
+	// 真伪由下方 healthyLauncher() 的**执行探活**判定（fail-closed 语义不变：不可用仍回 error）。
 	if (!existsSync(piCli)) return { title, prompt, model, error: `preflight: pi CLI not found: ${piCli}` };
 	if (!existsSync(cwd)) return { title, prompt, model, error: `preflight: cwd not found: ${cwd}` };
 	const nodeExecPath = options.execPath ?? process.execPath;
@@ -338,16 +442,16 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程。
 			// review 修正（Luna critical）：session profile 同步注入 env——factory 阶段
 			// CLI flag 尚未就绪，只有 env 能保证 profile 在扩展初始化时即生效。
-			env: tabRunId
-				? {
-					...process.env,
-					PI_TAB_RUN_ID: tabRunId,
-					PI_TAB_RUNS_DIR: runsDir,
-					...(options.sessionProfile ? { PI_SESSION_PROFILE: options.sessionProfile } : {}),
-					...(options.traceRunId ? { PI_TRACE_RUN_ID: options.traceRunId } : {}),
-					...(options.traceLane ? { PI_TRACE_LANE: options.traceLane } : {}),
-				}
-				: undefined,
+			// C（2026-10-12）：常驻后继形态（无 tabRunId + clearTabIdentity）走纯函数构造
+			// 的「身份已清」env，覆盖 Node spawn 的默认父 env 继承。
+			env: buildTabSpawnEnv(process.env, {
+				tabRunId,
+				runsDir,
+				sessionProfile: options.sessionProfile,
+				traceRunId: options.traceRunId,
+				traceLane: options.traceLane,
+				clearTabIdentity: options.clearTabIdentity,
+			}),
 		});
 		child.on("error", (err: Error) => {
 			// 同步 try/catch 只覆盖 spawn 本身的异常；异步 error（如 wt.exe 立即退出）也回写账本

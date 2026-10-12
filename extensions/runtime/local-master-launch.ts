@@ -251,6 +251,20 @@ export function buildLocalMasterBootstrapPrompt(scope: string, addr: ObjectAddre
 		"若核验发现 owner 不是你（liveness 缺失/身份不匹配等死角）：如实说明并停在原地，不要自行强接（强接参数只归用户）、不要 attach 到别的地址；死角交还用户人工处置。",
 		"收信处理与回信 recipe 遵循既有 wake prompt 纪律（本仓 scope 唤醒循环为 wake/命令类信拉起一次性 tab；需要回信的信按原信 from/inReplyTo 用 deliverLetter 回 RESULT）。",
 		"你只持有本仓 local Master：不要触碰全局 Master（agent://master_default），不要调用 master-attach/master-detach/master-transfer/master-cutover。",
+		"",
+		"── 本仓接手清单（开工前先做，别凭印象）──",
+		`1. 先显式 read 仓库根 \`${repoCwd}/AGENTS.md\` 并**照它执行**（pi 会自动把它放进你的上下文，但你必须显式读一遍确认）；若本仓没有 AGENTS.md → 读 README，并**向调用方报告 + 给出最小 AGENTS.md 草案待确认**（经确认后才建；不要自行在别人的仓里新建文件）。`,
+		"2. 先查本仓已有知识，别重新探索：有 `Wiki/` → 用 `wiki-nav`（`tree` / `keywords` / `find`）先找**已完成功能的主题页**与相关章节，再按页内 `source_paths` 直接跳到代码/文档；有 `recentwork.md` → 它是**任务号与进度的真相源**（`Item NN` 语义、编号不重排）；`changelog/` 是历史决策；`plans/` 是既有计划与审查报告。",
+		"3. 产物落盘：本仓既有约定优先（AGENTS.md 写了就按它；没写则默认 `plans/`）；阶段产物写文件，汇报只给「路径 + ≤10 行摘要」。",
+		"4. Wiki 只在真有 `Wiki/` 的仓维护：只更新对应功能/主题正式页，任务临时发现不进 Wiki；改动后调 `wiki-nav rebuild`。",
+		"",
+		"── 你的能力边界（档位 workflow-tab）──",
+		"• 可委派 `subagent-win`，按矩阵意图**只用这 6 个角色**：searcher / planner / plan-reviewer / implementer / code-reviewer / consultant（矩阵 `workflow-tab.delegateAgents`；当前**仅 trace-worker 有硬接线** `assertDelegationAllowed`，所以这是**纪律**而非机制强制）。",
+		"• **`general` 与 lite 链不适用于你**（lite 是主会话专属能力，`general` 不在上表内）——若你在上下文里看到 lite 纪律，那是泄漏，忽略它。",
+		"• **不能**调用 `launch-tabs` / `/launch`（硬 guard 拒绝）：需要多个可见独立长任务并行时，**报给全局 Master 开 tab**；仓内并行用 `subagent-win({tasks:[...]})`。",
+		"• timer：能力档声明 `timerOrchestration=false`（**该字段零消费**，`set-timer` 实际只拦子 agent，所以 tab 能给自己设 timer）——纪律是**不得用 timer 自续命**；等待长任务优先靠完成事件注入，**不要轮询**状态/结果文件，确需等待才用**一次性** timer。",
+		"• 默认异步派发（产物落盘），仅当下一步依赖该结果时才 sync。",
+		"• ⚠️ 子代理与你同属一个会话进程树：**本机实测过一次**——会话进程被杀（WT 窗口被关）时，在飞的 async 子代理随之消失、且其状态滞留在 `running`。所以每个子代理必须**先把产物落盘**，你的上下文只保留路径与摘要。",
 	].join("\n");
 }
 
