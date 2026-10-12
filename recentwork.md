@@ -9,58 +9,66 @@
 - Each task appears once.
 - `Status` 是进度唯一真相源；Wiki 只记已验证的耐久事实。
 - Commit hash 取自 `git log --oneline` 真实值。
+- **Active 区段瘦身（三档）**：主动性套件 gate 只读 `## Active Tasks` 区段（上限 256KB），故 Active 只留「后续马上会用到」的详情。先问「后续会不会马上用到」：
+  - **详细保留** → 条目整条留在 `## Active Tasks`：当前在做，或后续任务马上要引用它的文件/接口/结论。
+  - **简略占位** → Active 只留 Task Index 一行（`详情` 列给指针：`## Archived Tasks` 锚点 / `plans/` 文件 / commit hash），详细段落整段搬进 `## Archived Tasks`。
+  - **全清** → 详情搬进 `## Archived Tasks`，Active 连索引行也不留；仅当既非在做、也无人引用。
+  - 命中任一判据 ⇒ **至少「简略占位」，不得全清**：① 未完成条目在 `Dependency` / `Next action` / `Status` / 承接里提到它；② 其产物被活跃代码或近期计划引用（可 grep `extensions/`、`scripts/`、`Wiki/`）；③ 最近仍被改动/讨论。
+  - 保守项：`Status` 为 `active` / `waiting`（未完成、待人工）的条目默认「详细保留」——`**Status**` 行含「待…/waiting」者是跨仓 gate 判 `awaiting` 的唯一证据，整条移出会使 gate 静默降级 `ok`。
+  - 搬运纪律：编号不复用、不重编号；每条只出现一次；内容原样搬运（不改写、不丢细节）；归档落点固定为本仓 `## Archived Tasks`（不另建 changelog/ 目录）。
 
 ## Active Tasks
 
 ### Task Index
 
-| Item | Priority | Summary | Dependency | Next action |
-|---|---|---|---|---|
-| 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API |
-| 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） |
-| 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 |
-| 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | —（第四轮补测 + 人工确认已由 **Item 49** 收口） |
-| 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） |
-| 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） |
-| 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） |
-| 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） |
-| 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） |
-| 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） |
-| 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） |
-| 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） |
-| 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） |
-| 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） |
-| 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） |
-| 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） |
-| 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） |
-| 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） |
-| 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 |
-| 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 |
-| 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 |
-| 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 |
-| 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） |
-| 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） |
-| 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） |
-| 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 |
-| 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed |
-| 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ **C1 Broker 已完成** | none | C2 pi 工具 → C3 skill（C1 已入库 `0470527`） |
-| 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 |
-| 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` |
-| 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） |
-| 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） |
-| 34 | P0 | **微信端到端已打通**（真机消息正确解析并落 inbox；W2c owner 默认准入待 L4）+ 待办：热点层 v4 重做 | none | 见下「交接状态」 |
-| 33 | P0 | **微信接收真正打通**：真机消息形状对齐（message_id 数字/from_user_id/text_item.text/group_id） | none | quarantine 在 GUI 可见（当前盲区） |
-| 32 | P1 | autonomy 开关界面可达（D17）+ **前置修 R4**（ws-mail 到信成为 frontier 触发，已实现 `3d8409f`） | none | A4 `/wechat on|off|status`；audit 轮转（R5） |
-| 31 | P1 | 修 daemon 弹终端窗口（spawn 形状 windowsHide:false → true，含 worker 连带修） | none | —（已完成） |
-| 30 | P2 | `/runtime-host restart [--force]`（用户提出；已实现 `1743061`） | none | worker-only restart（可选，SKIP） |
-| 29 | P1 | 微信输入 W2b：GUI 开关 + 白名单（hash id 可维护）+ 「为什么没进来」反馈（已实现 `18ba74d`） | Item 28 | 真机验证被**平台侧**阻塞（消息不进长轮询队列）→ 待用户核对推送/webhook 配置 |
-| 28 | P1 | 微信输入 W2（私聊文本注入 master，D15 六条件，已实现 `168fed1`） | Item 25 | W2b：GUI 开关 + 白名单（从最近发送者一键添加）+ 「为什么没进来」反馈 |
-| 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） |
-| 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） |
-| 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current |
-| 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki |
-| 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 |
+| Item | Priority | Summary | Dependency | Next action | 详情 |
+|---|---|---|---|---|---|
+| 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API | — |
+| 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） | 本区 |
+| 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 | 本区 |
+| 48 | P1 | 微信媒体探针 Phase ③ 收尾（入站 type 矩阵 + 嵌套形状 + `base64(hex32)` key + 解密/魔数 6/6 + P5 两段式；`6a72b19`+`9f52a4a`+`d724f6a`） | Item 5 | —（第四轮补测 + 人工确认已由 **Item 49** 收口） | [↓](#item-48) |
+| 47 | P1 | local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活；双入口四层授权 + 零新增权力 + 七态；`0586030`+`f5a9b90`） | Item 13 | —（已完成 + 文档收尾） | [↓](#item-47) |
+| 46 | P1 | 微信远程斜杠命令旁路（`/xxx` 进 LLM 前被消费端拿下 → `consumed`，分级白名单 + 归一化防绕过 + 注入点 fail-closed；`488e942`+`ebb9e04`） | Item 36 | —（已完成 + 文档收尾） | [↓](#item-46) |
+| 45 | P1 | 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast；`0a2b292`+`0337aac`） | Item 36 | —（已完成 + 文档收尾） | [↓](#item-45) |
+| 44 | P1 | G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in；`22e398a`+`f89abdb`） | Item 43 | —（**G-B 全部完成**） | [↓](#item-44) |
+| 43 | P1 | E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`，623 行全 same，`de84baa`+`154bf8d`） | Item 42 | —（已完成） | [↓](#item-43) |
+| 42 | P1 | E2.1 Graph→frontier 输入适配器 `toFrontierInput`（零接线，R4 单一口径，`b59ee68`+`513623c`） | Item 40 | —（已完成） | [↓](#item-42) |
+| 41 | P0 | G-A：修 frontier ⑤ 的 GUI 分页耦合 latent bug（页外漏检 + 排名假边沿；P0 证据 `cd061cc`，修复 `93f8447`+`fae1aa2`） | none | —（已完成） | [↓](#item-41) |
+| 40 | P1 | E2.0 Graph 载体对齐 + 共享 carrier 归约抽取（`7672771`+`ed5278a`+`c7b977a`） | Item 39 | —（已完成） | [↓](#item-40) |
+| 39 | P1 | E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线影子，`d54c09b`+`97ef7e2`） | none | —（已完成） | [↓](#item-39) |
+| 38 | P1 | wake round-trip 回信（wake/spawn prompt 带 deliverLetter RESULT 回原信 from，修法 A，`f299758`） | bug #4（`msg_muf5tqq8_8mbtg4`） | —（已完成） | [↓](#item-38) |
+| 36 | P1 | 微信出站回复 W3a–W3d（已完成） | Item 34 | —（文档收尾完成） | [↓](#item-36) |
+| 37 | P1 | local Master 自动交接（`master-transfer --local`，含安全级跨 scope token 修复，已实现 `b0ff266`） | none | —（已完成） | [↓](#item-37) |
+| 35 | P1 | 热点层 v4 重做（短期工作集 projection，已实现 `8a9f09a`） | none | —（文档收尾完成） | [↓](#item-35) |
+| 12 | P2 | global-view phase 2 探测深度增强（已完成） | none | —（已完成 `70c8aa3`） | [↓](#item-12) |
+| 13 | P1 | Local Master 可得性修复（工具/命令可设 local；僵尸可显式接管） | none | 已完成 `5b56ecf`；待裁定自动回收兜底判据 | [↓](#item-13) |
+| 14 | P1 | 微信扫码连接页 v1（绑定/解绑/状态，已实现 `8ee843d`） | none | 真网扫码测量 7 项 | [↓](#item-14) |
+| 15 | P2 | 主动性套件 v1（纯函数层，已实现 `3922ef4`，未接线） | none | v2：接线到 master 工具/唤醒路径 + 审计落点 | [↓](#item-15) |
+| 16 | P1 | GUI 三毛病修复（遮挡/markdown/不及时，已实现 `6d4ba67`） | none | 人工目视确认；markdown 渲染器补入库回归测试 | [↓](#item-16) |
+| 17 | P2 | markdown 回归测试入库 + 围栏收紧（已实现 `911c397`） | none | —（已完成） | [↓](#item-17) |
+| 18 | P1 | outbox 事件唤醒（延迟 5s→9ms/≤200ms，已实现 `e7475e3`） | none | mailbox-consumer 10s tick 是否同样事件化（需先解前置门复用） | [↓](#item-18) |
+| 19 | P2 | set-timer target schema 恒拒修复（已实现） | none | —（已完成） | [↓](#item-19) |
+| 20 | P3 | hotspot pending 队列误写仓库根 state/（待修） | none | 改路径推导至 agentDir；去掉临时 .gitignore 止血 | 本区 |
+| 21 | P1 | dead 僵尸/孤儿锁重建（修重启后 GUI 起不来，已实现 `e262eb8`） | none | L4 复核结论；坏锁不可解析仍 fail-closed | [↓](#item-21) |
+| 22 | P1 | ComputerUse 立项：C0 探针通过（含 SetValue 抢焦点证伪）→ **C1 Broker 已完成** | none | C2 pi 工具 → C3 skill（C1 已入库 `0470527`） | 本区 |
+| 23 | P2 | 主动性套件 v2 接线（已实现 `1972aac`，无自动动作） | none | R5 审计轮转；enabled=true 语义裁定 | [↓](#item-23) |
+| 24 | P1 | 微信页 opt-in UX 修复（已实现 `5bfd258`） | none | 补 TUI `/wechat on/off/status` | [↓](#item-24) |
+| 26 | P1 | 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底，已实现 `88ba26a`） | none | —（已完成；根因是主会话诊断 curl 按 cp936 编码请求体） | [↓](#item-26) |
+| 25 | P1 | 微信 iLink 接收 W1（长轮询 worker + 游标/去重/私有 inbox + GUI 可见，**已实现待提交**） | Item 14 | 提交 → 派 W2（注入 master，D15 六条件） | [↓](#item-25) |
+| 34 | P0 | **微信端到端已打通**（真机消息正确解析并落 inbox；W2c owner 默认准入待 L4）+ 待办：热点层 v4 重做 | none | 见下「交接状态」 | [↓](#item-34) |
+| 33 | P0 | **微信接收真正打通**：真机消息形状对齐（message_id 数字/from_user_id/text_item.text/group_id） | none | quarantine 在 GUI 可见（当前盲区） | [↓](#item-33) |
+| 32 | P1 | autonomy 开关界面可达（D17）+ **前置修 R4**（ws-mail 到信成为 frontier 触发，已实现 `3d8409f`） | none | A4 `/wechat on|off|status`；audit 轮转（R5） | [↓](#item-32) |
+| 31 | P1 | 修 daemon 弹终端窗口（spawn 形状 windowsHide:false → true，含 worker 连带修） | none | —（已完成） | [↓](#item-31) |
+| 30 | P2 | `/runtime-host restart [--force]`（用户提出；已实现 `1743061`） | none | worker-only restart（可选，SKIP） | [↓](#item-30) |
+| 29 | P1 | 微信输入 W2b：GUI 开关 + 白名单（hash id 可维护）+ 「为什么没进来」反馈（已实现 `18ba74d`） | Item 28 | 真机验证被**平台侧**阻塞（消息不进长轮询队列）→ 待用户核对推送/webhook 配置 | [↓](#item-29) |
+| 28 | P1 | 微信输入 W2（私聊文本注入 master，D15 六条件，已实现 `168fed1`） | Item 25 | W2b：GUI 开关 + 白名单（从最近发送者一键添加）+ 「为什么没进来」反馈 | [↓](#item-28) |
+| 27 | P3 | `_test_message_outbox.ts` 双进程 CAS 断言偶发失败（L4 实跑命中 1 次；主会话连跑 3 次均过） | none | 判性质：真竞态 vs 测试抖动；给该断言加确定化（重试/显式同步） | — |
+| 11 | P2 | 仓库记忆层建立（双层记忆 + hotspot 修复，已完成） | none | —（已完成，无） | [↓](#item-11) |
+| 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
+| 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
+| 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
 
+<a id="item-50"></a>
 ### Item 50 - M1 入站图片附件：真机验收通过 + 文档收尾
 
 - **日期**：2026-09-28
@@ -75,6 +83,7 @@
 - **Commit**：实现 `6ae8e0d`（feat M1）+ `972e29f`（S3/S4）；本次文档收尾 commit 见 CHANGELOG 同 Item 行
 - **Verification**：落盘文件属性/魔数/SOF 尺寸实测、inbox/outbox/审计三处正文逐字段比对、transcript 中 `read` 调用与 `test-9f3a` 复述、`models.json` `input` 含 `image` 均本机实查；纪律 = 只 `git add` Wiki/recentwork/CHANGELOG 三个具体文件（不碰生产代码、不碰 `scripts/boot-*`）。
 
+<a id="item-49"></a>
 ### Item 49 - 微信媒体探针第四轮出站补测 + 人工确认收口（Phase ③ 最终定稿）
 
 - **日期**：2026-09-25
@@ -91,6 +100,85 @@
 - **Commit**：`56e5088`（第四轮探针观测面）；本次文档收尾 commit 见 CHANGELOG 同 Item 行
 - **Verification**：`measure.jsonl` `kind=send_dedup{textLen:4001, ret:0}` ×3 + `kind=media_probe.stage=send messageIdPresent:true` 与报告 §11 时间线一致；四条人工判定原话已原文入档（§11.5）；纪律 = 零生产代码、零探针脚本改动，`git add` 只含 Wiki/recentwork/CHANGELOG 三个具体文件。
 
+<a id="item-22"></a>
+### Item 22 - ComputerUse（CUA）立项：C0 可行性探针通过 → C1 开工
+
+- **日期**：2026-09-23
+- **一句话**：把 iCloud 的 CUA 设计文集（8 篇）落成工程：先做 C0 可行性探针（Windows UIA 能否不抢焦点地观察+动作），得出**关键证伪**后立项新包 `pi-packages/computer-use`，C1（pwsh 常驻 Broker 守护进程）已开工。
+- **涉及模块**：新包 `C:/Users/Annacomnena/pi-packages/computer-use`（独立仓库；`bin/cua-broker.ps1`、`roadmap.md`、`reports/`）
+- **产物**：本地 `plans/20260923_cua_c0_probe.md`（C0 结论 + 实测输出）、`plans/.cua-probe/`（探针脚本，已拷为新包 `probe-seed/`）
+- **Wiki**：无（新包自带 README/roadmap；本仓 Wiki 不承载其设计）
+- **Priority**：P1（新方向）
+- **Status**：C0 complete；**C1 complete**（tab 3001，workflow 六阶段走齐 + 独立 code-reviewer L4 两轮；e2e 24 PASS/0 FAIL/1 WARN）；C2 待开工
+- **Commit**：新包 `0470527`（本仓仅此记录）
+- **Verification（C1 实测结论）**：`bin/cua-broker.ps1`（989 行）pwsh7 常驻 Broker + stdio JSON 行协议（ping/observe/act/capture/diff/lease）；三档动作焦点回执 **wm_settext=none（不抢）/ setvalue=steals（实测）/ invoke=may_steal（实测在本环境 steals）**；非幂等动作抛错即 `dispatched_unknown`（不自动重试）；常驻复用 walk 118.6→63.7ms、client_rt 161→67ms。未决：PS5.1 回退未实跑、单实例 Notepad 目标选择依附用户进程、其它控件类型 focus 未穷举。
+- **Commit**：—（新包未提交；本仓仅此记录）
+- **Verification（C0 实测结论）**：传输选型 = **PowerShell + System.Windows.Automation 常驻进程**（冷启动太贵⇒必须常驻；Python/node-ffi-napi 出局）；**`ValuePattern.SetValue` 被证伪会抢前台焦点**（干净基线、两窗口复现；`WM_SETTEXT` 已证不抢、`Invoke` 未决）；树 22–26 节点/62–122ms、扁平化 ≈600–750 tokens/窗；字段级 diff 可行但**主键须改用 RuntimeId**；截屏证实。⇒ 动作能力必须分三档 + 内建 FG 断言器。
+
+<a id="item-20"></a>
+### Item 20 - hotspot 工具 pending 队列误写仓库根 state/（待修）
+
+- **日期**：2026-09-23
+- **一句话**：`hotspot` 工具把待办队列写到 **CWD 的 `state/hotspot-pending.jsonl`**（应在 agentDir），在仓库里留下 `state/` 目录并污染工作树。
+- **涉及模块**：`extensions/hotspot/**`（路径推导处）
+- **产物**：无（现场证据：`state/hotspot-pending.jsonl`，已临时加入 `.gitignore` 止血）
+- **Wiki**：无
+- **Priority**：P3
+- **Status**：active（待修）
+- **Commit**：—
+- **Verification**：修后断言 pending 队列落在 agentDir（`~/.pi/agent/...`）；仓库根不再出现 `state/`。
+
+<a id="item-10"></a>
+### Item 10 - GUI 扫码连接微信切片（v1 绑定/解绑/状态）
+
+- **日期**：2026-09-23
+- **一句话**：设计完成、协议已源码验证、待实现（v1 只做扫码绑定 + 解绑 + 状态显示，不做消息收发）。
+- **涉及模块**：`gui/src/pages/ChannelsPage.tsx`（新，拟）、`extensions/runtime-host/wechat-bind.ts`（拟）、`extensions/runtime-host/server.ts`
+- **产物**：`plans/0923_wechat_gui_bind_plan.md`（本地 gitignored）
+- **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
+- **Priority**：P1
+- **Status**：planning/active（尚未实现）
+- **Commit**：`c54c378`（协议契约 + 切片设计）
+
+<a id="item-6"></a>
+### Item 6 - 本机 GUI 解锁 master 切片
+
+- **日期**：2026-09-23
+- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已实现并提交（bootstrap OTT + 窄口护栏 + B 案凭据作用域化）；**仅剩端到端 GUI 注入的人工验收**未做。
+- **涉及模块**：`extensions/runtime/master-injection.ts`（新增）、`extensions/runtime/command-executor.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/ws.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`、`gui/src/**`
+- **Commit**：`00202cb`（切片 + B 案 + 两轮 must-fix）；`c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为同域历史提交，不含本通道代码。
+- **Wiki**：[[GUI 解锁 Master]]（`status: draft`）
+- **Priority**：P1
+- **Status**：active（代码完整，人工验收待补）
+- **Verification**：四轮独立 L4 逐轮收敛（PASS-WITH-MUST-FIX → PASS → 发现并修掉 `/v1/challenge` 预言机与 `/gui off` WS 缺口 → 聚焦复验 PASS）；**仍待人工**：开启 GUI 后注入一条消息，看占用锁/审计行/`master-offline` 文案的端到端表现。。当前真实状态：B 案（浏览器凭据作用域化，`sw_gui_token`）**已决策、未实现**；must-fix（M1–M3）**已实现、独立 L4 复核进行中结论未定**；通道代码仍仅在未提交工作树。
+
+<a id="item-5"></a>
+### Item 5 - 微信 iLink 探针
+
+- **日期**：2026-09-23
+- **一句话**：独立真网实验探针落地，login/listen/reply/send/typing/status 六命令就绪，七项未知项待真网测量。
+- **涉及模块**：`scripts/wechat-ilink-probe.mjs`
+- **Commit**：`658306e`
+- **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
+- **Priority**：P1
+- **Status**：waiting（待真网测量）
+- **Verification**：`node scripts/wechat-ilink-probe.mjs status`；真网七项对照本地 `plans/0923_wechat_ilink_probe_checklist.md`
+
+<a id="item-4"></a>
+### Item 4 - runtime daemon 切片一
+
+- **日期**：2026-09-23
+- **一句话**：detached 生命周期 + 静态托管 + 单实例身份落地；关闭发起 tab 后 daemon 存活已实测，G0 完整 10/10 待实测。
+- **涉及模块**：`extensions/runtime-host/daemon-lifecycle.ts`、`extensions/runtime-host/static.ts`、`extensions/runtime-host/identity.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/discovery.ts`、`scripts/verify-runtime-g0.ps1`
+- **Commit**：`bdb6674`
+- **Wiki**：[[Runtime Daemon 存活机制]]（`status: current`）、[[Runtime Daemon 架构]]（`status: draft`）
+- **Priority**：P0
+- **Status**：active（G0 十轮待跑）
+- **Verification**：`scripts/verify-runtime-g0.ps1` save/check + 人工窗口/进程树核对；已验证部分见 Wiki Evidence
+
+## Archived Tasks
+
+<a id="item-48"></a>
 ### Item 48 - 微信媒体探针 Phase ③ 收尾（入站媒体与附件规格真机定稿）
 
 - **日期**：2026-09-25
@@ -105,6 +193,7 @@
 - **Commit**：`6a72b19`（探针 M0 实验子命令）+ `9f52a4a`（附件提取按真机实测形状 + 全类型签名 + 短跑）+ `d724f6a`（AES key 格式诊断 + 真机解密落盘 + `--replay-seq` 只读重放）；文档收尾 commit 见 CHANGELOG 同 Item 行
 - **Verification**：`key-format.json` `conclusion{decryptOk:"6/6", magicOk:"6/6", winningSchemes:{"base64(hex32)":6}, magics:{jpeg:2,pdf:2,silk:2}}` 与报告 §10 交叉一致；`items.jsonl` 43 行覆盖 type 1/2/3/4 四类签名；stub 回归 35/35 PASS（key/URL/token 泄漏 grep 0）；纪律复核 = 零 `sendmessage`、零上传、零生产代码改动、`git add` 只含具体文档文件。
 
+<a id="item-47"></a>
 ### Item 47 - local-master-ensure（主会话按 cwd 幂等确保他仓 local master 存活）
 
 - **日期**：2026-09-25
@@ -118,6 +207,7 @@
 - **Commit**：`0586030`（feat：主会话按 cwd 幂等确保他仓 local master 存活，7 files）+ `f5a9b90`（fix：L4 必须修 M1 slash 参数解析纯函数 + 建议修 S1 fail-closed/S2 `windowEndsAt` 落盘/S3/S4/S5/S7，3 files）
 - **Verification**：`_test_local_master_launch.ts` **23 组断言块全绿**（2026-09-25 文档轮复跑 exit=0，含 F3/F4、H claim 观测、J1/J2 #A、K 静态耦合、L 解析 4 例）；L4 独立复核 `PASS-with-fixes`（4/4 变异被捕获；M1 已修，S1–S5/S7 已闭环，S6 端到端真 spawn 手测留人工）；文档轮 `check_repo_wiki.py` OK（16 页）+ `wiki-nav rebuild`。
 
+<a id="item-46"></a>
 ### Item 46 - 微信远程斜杠命令旁路（`/xxx` → `consumed`，分级白名单 + 防绕过 + fail-closed）
 
 - **日期**：2026-09-25
@@ -130,6 +220,7 @@
 - **Commit**：`488e942`（feat：旁路 + 白名单分级 + 未知命令显式拒绝，9 files）+ `ebb9e04`（fix：L4 必须修 M1 归一化防绕过 + M2 注入点 fail-closed + S1–S6，8 files）
 - **Verification**：`_test_wechat_remote_command.ts` **22 组断言块全绿**（BYPASS_MATRIX 15 条 T14 分类 / T15 端到端零原文派发零 outbox / T16 注入门 ×3 轮 + T17 冷启动 + T18 S1 / T19 S2 / T20 S3）；回归 10/10（`_test_wechat_reply` 22 / `_test_wechat_broadcast` 18 / `_test_wechat_input` 14 / `input_set` / `message_outbox` / `outbox_latency` / `_test_wechat_receive` 7 / `_test_wechat_bind` 12 / `_test_runtime_host_server` / `check-extension-load`）；变异测试（还原 M1、关 M2 门）→ exit 1；L4 `plans/0924_wechat_remote_command_l4_review.md` **PASS-with-fixes**（2 必须修 M1/M2 + 6 建议修 S1–S6 全部采纳闭环）。
 
+<a id="item-45"></a>
 ### Item 45 - 微信出站广播（master 会话 → 全部已知私聊，`reply.mode` 缺省 broadcast）
 
 - **日期**：2026-09-24
@@ -142,6 +233,7 @@
 - **Commit**：`0a2b292`（feat：出站广播，11 files）+ `0337aac`（fix：L4 必须修 M1 reply-only 回滚止发 + 建议修 S1–S5，4 files）
 - **Verification**：`_test_wechat_broadcast.ts` **18 组断言块全绿**（含 M1 回滚止发 fetch=0、S5 的 TTL 先于 connected 门序 + 真实 `readAttachment(masterAddress())` 缺省路径 + `currentSid=undefined`）；`_test_wechat_reply.ts` **22 组旧路径红线原样**；`_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server` 回归全绿；L4 `plans/0924_wechat_broadcast_l4_review.md` **PASS-with-fixes**（1 必须修 + 5 建议修全部采纳闭环）。
 
+<a id="item-44"></a>
 ### Item 44 - G-B 收口：E2.3 单点翻转（`PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2 opt-in）
 
 - **日期**：2026-09-24
@@ -154,6 +246,7 @@
 - **Commit**：`22e398a`（E2.3 单点翻转：env `PI_AUTONOMY_FRONTIER_SOURCE`，缺省 v2，显式三路径）+ `f89abdb`（L4 必须修：v2 分支保留原调用形状，`agentDir` 仅在 graph 分支派生）
 - **Verification**：`_test_graph_frontier_shadow.ts` **28 checks，exit 0，`frames=33 rows=623 same=623 unexplained=0 explained=0`**（S18 缺省=v2 等价，含写出 `frontier.json` 原始文本 + watchdog/audit 可观测 / S19 graph 等价 + `runs` 序指纹 + 原始文本键序差异仅 `runId` vs `rankDetail` / S20 decoy `PI_TAB_RUNS_DIR` 防护 / S21a 非 graph 值=v2 / S21b enabled=false 零行为 / **S22 `agentDir` 未传：v2 源码形状 + 异常边界归 `collectGlobalView`** / **S23 graph flag `pidAlive=false` 的 `runStateMismatch` 端到端**）；`E22_REVERSE_SELFTEST=1` **29 checks**、`unexplained=1`（判别力有效）；**删 `tabRunsDir:` 行实验 → exit 1 / S19+S20+S23 FAIL**（漏传被有效捕获）；`_test_runtime_autonomy.ts` 57（A10.1 ALLOW 仍恰 3、A11.2 零新文件）/ `_test_graph_frontier_input.ts` 15/15 / `_test_frontier_attention_window.ts` 18 / `_test_runtime_graph.ts` 13/13 / `_test_graph_carriers.ts` 5/5（golden 未变）+ `test:global-view`/`test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_3_l4_review.md` **PASS-with-fixes**（1 必须修 + 建议修已闭环）。
 
+<a id="item-43"></a>
 ### Item 43 - E2.2 影子对照 harness（O-B schema，双硬门 `unexplained=0 且 explained=0`）
 
 - **日期**：2026-09-24
@@ -166,6 +259,7 @@
 - **Commit**：`de84baa`（E2.2 影子对照 harness：O-B schema + 两路装配 + S1–S17 + 双硬门）+ `154bf8d`（L4 必须修/建议修：S8a 固定时钟 + trigger `groupByKey` 不折叠 + S16 输入分叉断言 + `E22_REVERSE_SELFTEST` 反向自检）
 - **Verification**：`_test_graph_frontier_shadow.ts` **21 checks，exit 0，`frames=33 rows=623 same=623 triggerRows=10 unexplained=0 explained=0`**（双硬门 + 全 33 帧 `next`/`diff` canonical 全等）；**篡改反向实验 exit 1 / `unexplained=15 explained=0`**（graph-only attention 0 化被 O-B + canonical 捕获 → 非恒真假绿）；`E22_REVERSE_SELFTEST=1` 自检报 `unexplained=1`（判别力有效）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_frontier_input.ts` 15/15；`_test_frontier_attention_window.ts` 18；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`test:global-view` + `test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；L4 `plans/0924_graph_E2_2_l4_review.md` **PASS-with-fixes**（1 必须修 + 3 建议修已闭环）。
 
+<a id="item-42"></a>
 ### Item 42 - E2.1 Graph → frontier 输入适配器（`toFrontierInput`，零接线）
 
 - **日期**：2026-09-24
@@ -178,6 +272,7 @@
 - **Commit**：`b59ee68`（E2.1 适配器，零接线，R4 单一口径 + attention 全量等价）+ `513623c`（L4 必须修/建议修：T9 固定时钟 + T8 零路径转换守卫扩白名单 + 重复 runId tie-break）
 - **Verification**：`_test_graph_frontier_input.ts` **15/15**（T1–T15；T9 双路径结构等价：帧0 `JSON.stringify` 严格全等、帧1 canonical 全等且含非 mailbox 边沿 `working_to_completed`/`stagnation`/`needs_user`，端到端覆盖 `staleOver=true`/`needsHuman=true`/`pidAlive=false`）；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_runtime_graph.ts` 13/13；`_test_graph_carriers.ts` 5/5（golden 未变）；`_test_frontier_attention_window.ts` 18；`test:global-view` + `test:runtime-projector`/`workstream`/`snapshot`/`tab-runs`/`runtime-wake`/`local-master` 全绿；`test:register-graph` 因外部依赖预备冲突失败（`CONFLICT @earendil-works/pi-coding-agent`，非断言失败），直跑 `_test_register_graph.ts` 通过；L4 `plans/0924_graph_E2_1_l4_review.md` **PASS-with-fixes**（2 必须修 + 3 建议修已闭环）。
 
+<a id="item-41"></a>
 ### Item 41 - G-A：frontier ⑤ 语义修复（消费分页前全量 attention，修 GUI 分页耦合 latent bug）
 
 - **日期**：2026-09-24
@@ -190,6 +285,7 @@
 - **Commit**：`cd061cc`（P0 反例测试，断言 buggy 行为）+ `93f8447`（生产修复）+ `fae1aa2`（L4 必须修/建议修：M2 双向切换 + msv/Σ 不变量 + normalizer tripwire + 缺项=0 注释）
 - **Verification**：P0 反例四档数字（19/20/21/40 仓：页外漏检 `0/0/1/20`、假边沿 `0/0/1/1`）→ 修复后全部归零（`_test_frontier_attention_window.ts` 18/18：P0 十条翻转 + N1-N4 + M1/M2/M3 + K1）；`test:global-view` M1 byte-identical + Σ 三路径；`_test_runtime_autonomy.ts` 57 checks（A10.1 ALLOW 仍恰 3）；`_test_graph_carriers.ts` 5/5（T5 golden 仅加性新增 `attentionByRepo` 一个键）；`_test_runtime_graph.ts` 13/13 + runtime-projector/workstream/snapshot/tab-runs/wake/local-master 全绿；L4 `plans/0924_attention_semantics_fix_l4_review.md` **PASS-with-fixes**（1 必须修 M2 已闭环）。
 
+<a id="item-40"></a>
 ### Item 40 - E2.0 Graph 载体对齐 + 共享 carrier 归约抽取
 
 - **日期**：2026-09-24
@@ -202,6 +298,7 @@
 - **Commit**：`7672771`（抽 frontier-carriers 共享归约，行为保持）+ `ed5278a`（Graph 载体对齐 + 只读缓存）+ `c7b977a`（L4 建议修：缓存版本校验 + tmp 防冲突 + warning 序注释 + golden 入库）
 - **Verification**：行为保持由 **pre/post golden 逐字节复现** + `_test_graph_carriers.ts` 5/5（legacy oracle 双跑 4 组 + 全量 golden 入库）证明；`_test_runtime_graph.ts` 13/13；`_test_runtime_autonomy.ts` 57 checks（A10.1 allowlist 仍恰好 3）；回归 6×npm（`test:global-view`/`runtime-projector`/`runtime-workstream`/`runtime-snapshot`/`tab-runs`/`runtime-wake` + `local-master`）全绿；L4 审查 PASS。
 
+<a id="item-39"></a>
 ### Item 39 - E1 Work Graph 只读关系面 MVP（四对象注册 + 引用式边 + diff，零接线）
 
 - **日期**：2026-09-24
@@ -214,6 +311,7 @@
 - **Commit**：`d54c09b`（E1 MVP）+ `97ef7e2`（L4 建议修）
 - **Verification**：`_test_runtime_graph.ts` 13/13 组绿（T9 10_000 事件 ~15ms / 预算 2000ms；含病态事件 Graph≡projector 等价断言）；回归 `test:runtime-projector` / `test:runtime-workstream` / `test:runtime-snapshot` / `test:tab-runs` 全绿 + `_test_runtime_autonomy.ts` 57 checks 绿；L4 审查 PASS。
 
+<a id="item-38"></a>
 ### Item 38 - wake round-trip 回信（wake spawn prompt 带 deliverLetter RESULT 回信）
 
 - **日期**：2026-09-24
@@ -226,6 +324,7 @@
 - **Commit**：`f299758`（基线 `ad72cd4`）
 - **Verification**：recipe 本机实测跑通（隔离 `PI_RUNTIME_DIR`、未污染真实 mailbox；回执信 `kind=RESULT / inReplyTo=原信 messageId / to=agent://master_default`）；`test:runtime-wake` / `test:local-master` / `test:runtime-mailbox` / `test:mailbox-command-consume` 全绿 + `test:scope-stale-takeover` 绿；`_test_autonomy_wiring` W2.3 为基线既有（`git stash` 后复现，与本改动无关）。
 
+<a id="item-37"></a>
 ### Item 37 - local Master 自动交接（`master-transfer --local`）
 
 - **日期**：2026-09-24
@@ -240,6 +339,7 @@
 - **其它 must-fix**：local 后继 prompt 带 `local:true`+同地址；home→local fail-closed（与 `master-attach --local` 不冲突）；local transfer 不碰 global succession（字节不变）；四要素回报（旧/新 sid12+gen、token 消费时刻）；transfer-window marker 抑制 reclaim/takeover（humanCancel 越过）。
 - **残余**：窗口 marker TTL 24h；多 daemon 并发假设（当前为单 daemon 迁移）；global 路径行为有源码变化（签名/record/spawn cwd）但 12 项回归绿。
 
+<a id="item-36"></a>
 ### Item 36 - 微信出站回复 W3a–W3d
 
 - **日期**：2026-09-24
@@ -250,6 +350,7 @@
 - **Commit**：`a282848`（W3a 协议底座） / `d4b3ebf`（W3b 触发与意图） / `b9b6726`（W3c daemon 发送与审计） / `aab6bf6`（W3d 只读端点 + GUI + Wiki/文档）
 - **Verification**：按 W3d 实跑记录执行回归；真机校准确认 HTTP 200 + `{message_id}`、无 `ret`/`errcode`/`errmsg`；client_id 去重未定论，文本长度上限/429/回声未验证；本轮未发送真机消息。
 
+<a id="item-35"></a>
 ### Item 35 - 热点层 v4 重做（短期工作集 projection）
 
 - **日期**：2026-09-24
@@ -264,6 +365,7 @@
 - **L4 教训**：① 注入块字段必须在写入端拒绝非法路径，并在渲染端共享转义（控制字符压平、尖括号全角化），防存储/旧分片内容伪造标签或行；② 不能只审查主渲染函数，lookup 工具与 `/hotspot` 诊断是渲染旁路，必须使用同一 `esc()` 并对三条输出路径分别回归。
 - **退役边界**：`Wiki/_hotspot.md` 与 `_hotspot.trash.jsonl` 保留为 v2 唯一副本；v4 不读写删除。回退为 `git revert 8a9f09a`；确认不再回退后再按旧计划备份移出并清理 `.gitignore` 遗留规则。
 
+<a id="item-34"></a>
 ### Item 34 - 交接状态（2026-09-24，compaction 不可用 → 自动交接新会话）
 
 **微信链路（P0，已打通）**
@@ -279,6 +381,7 @@
 
 **其它待办**：worker 成功时未清陈旧 `lastError`；微信真网 7 项已测 4 项（空批推进/响应形状/长轮询时长/消息形状），余 5 项待测；W3 出站回复（待用户定）。
 
+<a id="item-33"></a>
 ### Item 33 - 微信接收真正打通：真机消息形状对齐
 
 - **日期**：2026-09-24
@@ -291,6 +394,7 @@
 - **Verification**：用真机形状构造用例实测（文本→正确解析 / 群消息→拒收 / 图片→quarantine 不误当文本）；smoke + W1 7 组 + W2 13 组回归全绿。
 - **教训**：① 未知形状解析必须把**脱敏形状签名**写进 quarantine（本次靠它一次定位）；② **quarantine 必须可见**——GUI 只读 inbox ⇒ 用户看不到被拒记录，是真实 UX 盲区（已列后续项）。
 
+<a id="item-32"></a>
 ### Item 32 - autonomy 开关界面可达（D17）+ 前置修 R4
 
 - **日期**：2026-09-24
@@ -305,6 +409,7 @@
 - **L4 抓到的 D17 违背（已修）**：GUI 卡片原先只在最终 return 渲染 ⇒ 默认配置（wechat 403）与未授权（401）两个早退分支下**开关完全不可见**。教训：D17 验收必须覆盖"默认配置 + 各错误态"。
 - **残余**：R5 audit 无轮转（~1MB/天）；`enabled=true` 时长期 pending 到信是否导致 trigger 重复（L4 已列为观察项）；config 写入无锁（与 setWechatEnabled 同款先例）。
 
+<a id="item-31"></a>
 ### Item 31 - 修 daemon 必定弹终端窗口（spawn 形状更正 + worker 连带修）
 
 - **日期**：2026-09-24
@@ -317,6 +422,7 @@
 - **触发**：本轮 `/runtime-host restart` 测试（它重新 spawn 了 daemon）让旧形状的问题暴露出来。
 - **教训**：`windowsHide`/`detached` 兼容性必须按"本进程 + 其子进程"两层分别实测，不能靠历史注释外推。
 
+<a id="item-30"></a>
 ### Item 30 - `/runtime-host restart [--force]`（用户提出）
 
 - **日期**：2026-09-24
@@ -330,6 +436,7 @@
 - **Verification**：单测 5 组 PASS（第 6 组可选 worker-only restart 如实 SKIP）；smoke + 3 个回归测试全绿；**真实重启实测**：旧 pid=195936 port=53872 → 新 pid=254488 port=51984、`/v1/health` 200、回报含 cookie 失效提示。
 - **未做**：worker-only restart（可选）；`restart --force extra`/`-f` 落到用法提示（fail-closed）。
 
+<a id="item-29"></a>
 ### Item 29 - 微信输入 W2b（界面开关 + 白名单 + 未生效反馈）+ 真机接收被平台侧阻塞
 
 - **日期**：2026-09-24
@@ -344,6 +451,7 @@
 - **⚠️ 真机接收被平台侧阻塞（未解）**：两个受控探针（随机 UIN / **固定 UIN**，均空游标起步、唯一消费者）各 6 次 poll 全 `msgs:[]`，HTTP 200 且服务端接受并推进游标 ⇒ **本机实现无缺陷**，但该 bot 的消息**不进长轮询队列**。用户侧现象：曾收到 bot 自动回复"暂无法连接openclaw"（说明有东西在应答），该回复消失后长轮询仍恒空。**待用户在平台侧核对**：①「消息推送/Webhook/回调 URL」是否配置（应清空才能走长轮询）②绑定的 `bot_type=3` 与所聊 bot 是否同一个 ③是否需先建立会话。详见 Wiki 微信页「判定实验」节。
 - **旁**：`input.enabled=true` 且白名单为空时，期间收到的消息会被标 `rejected`（终态）——已在 Wiki 写明操作顺序。
 
+<a id="item-28"></a>
 ### Item 28 - 微信输入 W2（私聊文本注入当前 master owner）
 
 - **日期**：2026-09-24
@@ -358,6 +466,7 @@
 - **L4 三轮轨迹**：首轮抓到 **MF1 非 BMP msgId 命名分歧 → 重复注入**（实跑证据）/ MF2 denied 无界重审（~17k 行/天）/ MF3 注入正文含不可信昵称 / MF4 `timersDir` 未透传 → **注入门静默失效**；修复轮 4 项代码全改对但改坏测试且未写报告；主会话重写测试后收敛 PASS。
 - **已知残余**：群消息无法独立识别（靠 openid 白名单兜住）；denied 终态 ⇒ 事后加白名单不补投旧消息；真网 7 项未测。
 
+<a id="item-26"></a>
 ### Item 26 - 远程输入中文 U+FFFD 乱码修复（严格 UTF-8 + GB18030 兜底）
 
 - **日期**：2026-09-24
@@ -370,6 +479,7 @@
 - **Commit**：`88ba26a`
 - **Verification**：合法 UTF-8（含 BOM/emoji/原文 U+FFFD）逐字节等于旧行为；GBK 中文正确恢复；双非法 → 400 且 outbox 与 state/commands 零新增；runtime-commands / runtime-host-server / runtime-host-ws / message-outbox / gui-chat-guard / smoke 全 PASS。
 
+<a id="item-25"></a>
 ### Item 25 - 微信 iLink 接收 W1（只收不投：长轮询 + 游标/去重/私有 inbox + GUI 可见）
 
 - **日期**：2026-09-24
@@ -384,6 +494,7 @@
 - **教训（EB-004）**：agent 超时失败时工作树可能停在**中间态**（半写代码），此时跑会 spawn 子进程的测试会挂死——本次实测挂 **6 小时**（两棵进程树未退出）；已给该测试加 180s 硬看门狗。
 - **旁发现（Item 27）**：L4 实跑时 `_test_message_outbox.ts` 的“恰一个 CAS 赢家”断言失败 1 次（两进程均 claimed）；主会话连跑 3 次均过 ⇒ 竞争敏感，待判真竞态/测试抖动。
 
+<a id="item-24"></a>
 ### Item 24 - 微信连接页 opt-in UX 修复（入口不可发现/不可启用）
 
 - **日期**：2026-09-23
@@ -396,6 +507,7 @@
 - **Commit**：`5bfd258`
 - **Verification**：smoke OK；`_test_wechat_bind.ts` 12 组断言（新增 T12：无 token 401／开关幂等／写盘保留其它字段／status 403↔200／写失败 500）；gui tsc + vite build 成功。
 
+<a id="item-23"></a>
 ### Item 23 - 主动性套件 v2 接线（可观察/可开关/可审计，不自动动手）
 
 - **日期**：2026-09-23
@@ -408,20 +520,7 @@
 - **Commit**：`1972aac`
 - **Verification**：`_test_autonomy_wiring.ts` 14 项 + `_test_runtime_autonomy.ts` 56 项 + `_test_register_graph.ts` 全绿 + smoke OK；tab 内独立 L4 PASS。未决：R4（enabled=true 预期语义，ws-mail 不触发）、R5（审计文件无轮转）、watchdog #3/#8 数据源缺口。
 
-### Item 22 - ComputerUse（CUA）立项：C0 可行性探针通过 → C1 开工
-
-- **日期**：2026-09-23
-- **一句话**：把 iCloud 的 CUA 设计文集（8 篇）落成工程：先做 C0 可行性探针（Windows UIA 能否不抢焦点地观察+动作），得出**关键证伪**后立项新包 `pi-packages/computer-use`，C1（pwsh 常驻 Broker 守护进程）已开工。
-- **涉及模块**：新包 `C:/Users/Annacomnena/pi-packages/computer-use`（独立仓库；`bin/cua-broker.ps1`、`roadmap.md`、`reports/`）
-- **产物**：本地 `plans/20260923_cua_c0_probe.md`（C0 结论 + 实测输出）、`plans/.cua-probe/`（探针脚本，已拷为新包 `probe-seed/`）
-- **Wiki**：无（新包自带 README/roadmap；本仓 Wiki 不承载其设计）
-- **Priority**：P1（新方向）
-- **Status**：C0 complete；**C1 complete**（tab 3001，workflow 六阶段走齐 + 独立 code-reviewer L4 两轮；e2e 24 PASS/0 FAIL/1 WARN）；C2 待开工
-- **Commit**：新包 `0470527`（本仓仅此记录）
-- **Verification（C1 实测结论）**：`bin/cua-broker.ps1`（989 行）pwsh7 常驻 Broker + stdio JSON 行协议（ping/observe/act/capture/diff/lease）；三档动作焦点回执 **wm_settext=none（不抢）/ setvalue=steals（实测）/ invoke=may_steal（实测在本环境 steals）**；非幂等动作抛错即 `dispatched_unknown`（不自动重试）；常驻复用 walk 118.6→63.7ms、client_rt 161→67ms。未决：PS5.1 回退未实跑、单实例 Notepad 目标选择依附用户进程、其它控件类型 focus 未穷举。
-- **Commit**：—（新包未提交；本仓仅此记录）
-- **Verification（C0 实测结论）**：传输选型 = **PowerShell + System.Windows.Automation 常驻进程**（冷启动太贵⇒必须常驻；Python/node-ffi-napi 出局）；**`ValuePattern.SetValue` 被证伪会抢前台焦点**（干净基线、两窗口复现；`WM_SETTEXT` 已证不抢、`Invoke` 未决）；树 22–26 节点/62–122ms、扁平化 ≈600–750 tokens/窗；字段级 diff 可行但**主键须改用 RuntimeId**；截屏证实。⇒ 动作能力必须分三档 + 内建 FG 断言器。
-
+<a id="item-21"></a>
 ### Item 21 - dead 僵尸 host.json / 孤儿锁重建（修「重启后 GUI 永远起不来」）
 
 - **日期**：2026-09-23
@@ -434,18 +533,7 @@
 - **Commit**：`e262eb8`
 - **Verification**：L4 独立复核 `plans/0923_daemon_dead_rebuild_review.md` **PASS**（真退出的死 pid 端到端复现 A 孤儿锁→重建 / B 活锁→fail-closed / C 活 handoff→fail-closed；实测真实 runtime 目录 mtime 未变；确认 `stealStaleLock` 只 rm 锁+重新 wx 取锁、绝不 kill、并对清抢后二次抢锁串行化）。`npx tsx extensions/_test_ensure_dead_rebuild.ts` 五夹具全过（dead 无锁→重建、dead+孤儿锁→重建、stale→uncertain spawn=0、runtimeId 不符→uncertain spawn=0、dead+活锁→fail-closed 且锁/host.json 未动）；smoke OK；daemon-lifecycle/gui-autostart/runtime-host-server 相邻测试全过。
 
-### Item 20 - hotspot 工具 pending 队列误写仓库根 state/（待修）
-
-- **日期**：2026-09-23
-- **一句话**：`hotspot` 工具把待办队列写到 **CWD 的 `state/hotspot-pending.jsonl`**（应在 agentDir），在仓库里留下 `state/` 目录并污染工作树。
-- **涉及模块**：`extensions/hotspot/**`（路径推导处）
-- **产物**：无（现场证据：`state/hotspot-pending.jsonl`，已临时加入 `.gitignore` 止血）
-- **Wiki**：无
-- **Priority**：P3
-- **Status**：active（待修）
-- **Commit**：—
-- **Verification**：修后断言 pending 队列落在 agentDir（`~/.pi/agent/...`）；仓库根不再出现 `state/`。
-
+<a id="item-19"></a>
 ### Item 19 - set-timer 的 target 参数 schema 恒拒修复
 
 - **日期**：2026-09-23
@@ -458,6 +546,7 @@
 - **Commit**：`9960ed9`
 - **Verification**：`npx tsx extensions/_test_timers_target_compat.ts` 通过 + `npm run smoke:extension-load` OK。
 
+<a id="item-18"></a>
 ### Item 18 - outbox 事件唤醒（消息入会话延迟 5s → 9ms/≤200ms）
 
 - **日期**：2026-09-23
@@ -470,6 +559,7 @@
 - **Commit**：`e7475e3`
 - **Verification**：探针 `npx tsx extensions/_test_outbox_latency.ts`（前后 67ms→9ms、不重复断言 `injectedCount===1`）；`_test_message_outbox.ts` 通过（含 crash-window 重投幂等）；smoke OK；独立 L4 复核通过。未动 `mailbox-consumer.ts`（master 域 mailbox 消费，独立路径）。
 
+<a id="item-17"></a>
 ### Item 17 - markdown 渲染器回归测试入库 + 围栏闭合收紧
 
 - **日期**：2026-09-23
@@ -482,6 +572,7 @@
 - **Commit**：`911c397`
 - **Verification**：`node gui/tests/markdown.test.mjs` 33/33；`cd gui && npx tsc --noEmit` 0 错误 + `vite build` 成功；反例验证（故意破坏链接协议白名单 → 测试必红 → 改回）。
 
+<a id="item-16"></a>
 ### Item 16 - GUI 三毛病修复（设置层遮挡 / markdown 渲染 / 消息不及时）
 
 - **日期**：2026-09-23
@@ -494,6 +585,7 @@
 - **Commit**：`6d4ba67`
 - **Verification**：`cd gui && npx tsc --noEmit` 0 错误 + `vite build` 成功（JS gzip 129.65 kB，持平）；27 例 XSS/兼容实测（临时脚本）；tab 内独立 L4 通过并修掉 resync 竞态。**待人工**：打开 GUI 目视确认遮挡消失 + markdown 渲染 + 更新及时性。
 
+<a id="item-15"></a>
 ### Item 15 - global master 主动性套件 v1（纯函数层，未接线）
 
 - **日期**：2026-09-23
@@ -506,6 +598,7 @@
 - **Commit**：`3922ef4`
 - **Verification**：`npx tsx extensions/_test_runtime_autonomy.ts` 55 项断言全绿 + `npm run smoke:extension-load` OK；tab 内独立 L4 PASS（must-fix 0）；回滚 = 删两个新路径。
 
+<a id="item-14"></a>
 ### Item 14 - 微信扫码连接页 v1（绑定/解绑/状态）
 
 - **日期**：2026-09-23
@@ -518,6 +611,7 @@
 - **Commit**：`8ee843d`
 - **Verification**：`npm run smoke:extension-load` OK；`npx tsx extensions/_test_wechat_bind.ts` 11 组断言全过；`gui` tsc --noEmit + vite build 成功。L4 已修两项实问题（QR 代理跨源 SSRF、轮询故障热循环）。**待用户扫码**做真网测量。
 
+<a id="item-13"></a>
 ### Item 13 - Local Master 可得性修复（工具/命令可设 local + status 可见）
 
 - **日期**：2026-09-23
@@ -530,6 +624,7 @@
 - **Commit**：`5b56ecf`
 - **Verification**：`npx tsx extensions/_test_local_master.ts`（U1-U9/E1-E5/L1-L7）+ `npm run smoke:extension-load`；L4 核对真实 registry/scope-liveness/attachments-backup 零污染。已知缺口（自动回收在 no-liveness 时恒 skip；回执不含被顶掉的 owner）写入 Wiki 页"已知缺口"节待裁定。
 
+<a id="item-12"></a>
 ### Item 12 - global-view phase 2 探测深度增强
 
 - **日期**：2026-09-23
@@ -540,52 +635,7 @@
 - **Status**：complete（待提交后随分支推送）
 - **Commit**：`70c8aa3`
 
-### Item 10 - GUI 扫码连接微信切片（v1 绑定/解绑/状态）
-
-- **日期**：2026-09-23
-- **一句话**：设计完成、协议已源码验证、待实现（v1 只做扫码绑定 + 解绑 + 状态显示，不做消息收发）。
-- **涉及模块**：`gui/src/pages/ChannelsPage.tsx`（新，拟）、`extensions/runtime-host/wechat-bind.ts`（拟）、`extensions/runtime-host/server.ts`
-- **产物**：`plans/0923_wechat_gui_bind_plan.md`（本地 gitignored）
-- **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
-- **Priority**：P1
-- **Status**：planning/active（尚未实现）
-- **Commit**：`c54c378`（协议契约 + 切片设计）
-
-### Item 6 - 本机 GUI 解锁 master 切片
-
-- **日期**：2026-09-23
-- **一句话**：本机受信 GUI → 活着的 master 进程注入通道已实现并提交（bootstrap OTT + 窄口护栏 + B 案凭据作用域化）；**仅剩端到端 GUI 注入的人工验收**未做。
-- **涉及模块**：`extensions/runtime/master-injection.ts`（新增）、`extensions/runtime/command-executor.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/ws.ts`、`extensions/runtime-host/commands.ts`、`extensions/gui-autostart.ts`、`gui/src/**`
-- **Commit**：`00202cb`（切片 + B 案 + 两轮 must-fix）；`c3f69c5`（GUI autostart opt-in）、`c3003d5`（空壳 WT 修复）为同域历史提交，不含本通道代码。
-- **Wiki**：[[GUI 解锁 Master]]（`status: draft`）
-- **Priority**：P1
-- **Status**：active（代码完整，人工验收待补）
-- **Verification**：四轮独立 L4 逐轮收敛（PASS-WITH-MUST-FIX → PASS → 发现并修掉 `/v1/challenge` 预言机与 `/gui off` WS 缺口 → 聚焦复验 PASS）；**仍待人工**：开启 GUI 后注入一条消息，看占用锁/审计行/`master-offline` 文案的端到端表现。。当前真实状态：B 案（浏览器凭据作用域化，`sw_gui_token`）**已决策、未实现**；must-fix（M1–M3）**已实现、独立 L4 复核进行中结论未定**；通道代码仍仅在未提交工作树。
-
-### Item 5 - 微信 iLink 探针
-
-- **日期**：2026-09-23
-- **一句话**：独立真网实验探针落地，login/listen/reply/send/typing/status 六命令就绪，七项未知项待真网测量。
-- **涉及模块**：`scripts/wechat-ilink-probe.mjs`
-- **Commit**：`658306e`
-- **Wiki**：[[微信 iLink 通道]]（`status: proposed`）
-- **Priority**：P1
-- **Status**：waiting（待真网测量）
-- **Verification**：`node scripts/wechat-ilink-probe.mjs status`；真网七项对照本地 `plans/0923_wechat_ilink_probe_checklist.md`
-
-### Item 4 - runtime daemon 切片一
-
-- **日期**：2026-09-23
-- **一句话**：detached 生命周期 + 静态托管 + 单实例身份落地；关闭发起 tab 后 daemon 存活已实测，G0 完整 10/10 待实测。
-- **涉及模块**：`extensions/runtime-host/daemon-lifecycle.ts`、`extensions/runtime-host/static.ts`、`extensions/runtime-host/identity.ts`、`extensions/runtime-host/server.ts`、`extensions/runtime-host/discovery.ts`、`scripts/verify-runtime-g0.ps1`
-- **Commit**：`bdb6674`
-- **Wiki**：[[Runtime Daemon 存活机制]]（`status: current`）、[[Runtime Daemon 架构]]（`status: draft`）
-- **Priority**：P0
-- **Status**：active（G0 十轮待跑）
-- **Verification**：`scripts/verify-runtime-g0.ps1` save/check + 人工窗口/进程树核对；已验证部分见 Wiki Evidence
-
-## Archived Tasks
-
+<a id="item-11"></a>
 ### Item 11 - 仓库记忆层建立
 
 - **日期**：2026-09-23
@@ -596,6 +646,7 @@
 - **Status**：complete
 - **Verification**：`check_repo_wiki.py` OK + `wiki-nav rebuild`；独立 L4 复核本地 `plans/0923_memory_layer_review.md`（PASS-WITH-MUST-FIX，5 项已修）
 
+<a id="item-9"></a>
 ### Item 9 - Hermes 审批机制侦察
 
 - **日期**：2026-09-23
@@ -606,6 +657,7 @@
 - **Status**：complete
 - **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
+<a id="item-8"></a>
 ### Item 8 - openclaw 安全模型侦察
 
 - **日期**：2026-09-23
@@ -616,6 +668,7 @@
 - **Status**：complete
 - **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
+<a id="item-7"></a>
 ### Item 7 - opencode 权限/服务信任侦察
 
 - **日期**：2026-09-23
@@ -626,6 +679,7 @@
 - **Status**：complete
 - **Commit**：`e473804`（产物=本地 recon（gitignored）+ Wiki 对照表）
 
+<a id="item-3"></a>
 ### Item 3 - runtime 卫生三连
 
 - **日期**：2026-09-23
@@ -636,6 +690,7 @@
 - **Priority**：P2
 - **Status**：complete
 
+<a id="item-2"></a>
 ### Item 2 - async 终态只投派发者 + async 专用注册谓词
 
 - **日期**：2026-09-23
@@ -646,6 +701,7 @@
 - **Priority**：P1
 - **Status**：complete
 
+<a id="item-1"></a>
 ### Item 1 - 0.6.0 release
 
 - **日期**：2026-09-23（发布提交 `c59e92f` 前）
