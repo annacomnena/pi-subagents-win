@@ -66,6 +66,8 @@ export interface RunExternalCliParams {
 	cwd?: string;
 	agentName?: string;
 	onUpdate?: (status: string, text: string) => void;
+	/** 直接 kill 支持：子进程 spawn 成功回调（登记 pid + 命令 marker）。 */
+	onChildSpawn?: (info: { pid: number; marker: string }) => void;
 }
 
 export const EXTERNAL_CLI_PREFIX = "cli:";
@@ -690,6 +692,7 @@ async function runZcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 
 	const outcome = await spawnStreaming({
 		backend: "zcode",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args,
 		cwd: ctx.cwd,
@@ -755,6 +758,7 @@ async function runMimo(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	let eventError: string | undefined;
 	const outcome = await spawnStreaming({
 		backend: "mimo",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args: buildMimoArgs(taskPrompt, ctx.cwd),
 		cwd: ctx.cwd,
@@ -797,6 +801,8 @@ interface StreamRunOptions {
 	onJsonLine?: (event: Record<string, unknown>) => void;
 	/** Accumulate raw stdout (plain-output backends such as agy and AtomCode). */
 	captureStdout?: boolean;
+	/** 直接 kill 支持：子进程 spawn 成功回调。 */
+	onChildSpawn?: (info: { pid: number; marker: string }) => void;
 }
 
 interface StreamRunOutcome {
@@ -821,6 +827,10 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 			detached: !isWin,
 			windowsHide: true,
 		});
+		// 直接 kill 支持：登记外部 CLI 子进程 pid + 命令 marker（供 action=kill 校验）。
+		if (child.pid && opts.onChildSpawn) {
+			try { opts.onChildSpawn({ pid: child.pid, marker: opts.command }); } catch { /* 登记失败不阻塞派发 */ }
+		}
 
 		const stderrBuffer = createBoundedBuffer(MAX_STDERR_CHARS);
 		let stdout = "";
@@ -1061,6 +1071,7 @@ async function runClaude(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const args = buildClaudeArgs(ctx.systemPrompt, ctx.thinking);
 	const outcome = await spawnStreaming({
 		backend: "claude",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args,
 		stdinText: ctx.task,
@@ -1104,6 +1115,7 @@ async function runCodex(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const args = buildCodexArgs(ctx.systemPrompt, ctx.thinking);
 	const outcome = await spawnStreaming({
 		backend: "codex",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args,
 		stdinText: ctx.task,
@@ -1151,6 +1163,7 @@ async function runAgy(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 
 	const outcome = await spawnStreaming({
 		backend: "agy",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args,
 		cwd: ctx.cwd,
@@ -1182,6 +1195,7 @@ async function runAtomcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> 
 	const taskPrompt = promptParts.join("\n\n");
 	const outcome = await spawnStreaming({
 		backend: "atomcode",
+		onChildSpawn: ctx.onChildSpawn,
 		command: ctx.command,
 		args: buildAtomcodeArgs(taskPrompt),
 		cwd: ctx.cwd,

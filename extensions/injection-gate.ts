@@ -21,7 +21,7 @@ import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
 import { claimInjection, confirmInjection } from "./runtime/receipts.ts";
 
-export type InjectionPath = "legacy-eventbus" | "legacy-reports" | "mailbox-consumer";
+export type InjectionPath = "legacy-eventbus" | "legacy-reports" | "mailbox-consumer" | "steer-channel";
 
 export interface InjectionContext {
 	key: string;

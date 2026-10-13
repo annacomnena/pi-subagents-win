@@ -548,6 +548,12 @@ let transferId5 = "";
 // 长期直接 import 验证）；命令 handler 的 config 读写走模块级 readConfig/writeConfig（无注入
 // 缝），故先备份真实 config.json，finally 恢复原字节。before_agent_start 的 pending reminder
 // 门禁回归（review 必须项 1）复用同一 factory 注册的真实 hook。
+// 隔离修正（1013 修红）：config.json 是 .gitignore 的用户私有运行配置（.gitignore:2），本测既不
+// 拥有也不重置它的 masterSuccession 切片——而本块 ①②③⑦ 的断言语义是「切片缺失 → 归一化补
+// 缺省 enabled=true / auto=false」。一旦开发者真实配置里 auto=true（/master-auto-handoff on 或
+// 历史被 kill 的 run 未及回滚），line 607「auto 缺省补全不被篡改」就成了对不可控外部状态的依赖
+// （实测红：actual=true）。故进入命令序列前显式把切片置为「缺省」（删 key），跑完 finally 仍原
+// 字节恢复；断言强度不变，且不再受本地配置漂移影响。
 {
 	const testDir = dirname(fileURLToPath(import.meta.url));
 	const cfgPath = join(testDir, "..", "config.json");
@@ -560,6 +566,12 @@ let transferId5 = "";
 	delete process.env.PI_SUBAGENT;
 	delete process.env.PI_SESSION_PROFILE;
 	try {
+		// 预置「缺省切片」前置态（见 T19 头注释）：删 key 走 normalizeMasterSuccession 补缺省路径。
+		// 必须在 await import 之前写盘——虽然 index.ts 的 readConfig 是惰性调用（handler/hook 触发时），
+		// 显式排序可避免未来任何顶层读取把旧切片带进 factory。
+		const baselineCfg: Record<string, unknown> = backup ? JSON.parse(backup) : {};
+		delete baselineCfg.masterSuccession;
+		writeFileSync(cfgPath, JSON.stringify(baselineCfg, null, 2));
 		const indexMod = await import("./index.ts");
 		const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
 		const hooks = new Map<string, Array<(ev: unknown, ctx: unknown) => unknown>>();
@@ -594,7 +606,7 @@ let transferId5 = "";
 		const backupObj: Record<string, unknown> = backup ? JSON.parse(backup) : {};
 		const ms = (r: Record<string, unknown>) => r.masterSuccession as { enabled: boolean; auto: boolean; proposalPercent: number; autoPercent: number };
 
-		// ① 无参调用：回显当前状态（真实 config 无 masterSuccession 切片 → 归一化 enabled=true）
+		// ① 无参调用：回显当前状态（切片已由本块预置删除 → 归一化 enabled=true）
 		await run("master-succession", "");
 		assert.ok(notices[notices.length - 1].includes("succession 当前：on"), "无参回显 on");
 		assert.ok(notices[notices.length - 1].includes("/master-succession on|off"), "无参带用法");

@@ -45,6 +45,8 @@ import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
 import { readWechatConfigPath, setWechatReplyConfig, setWechatReplyMode, setWechatEnabled } from "./runtime-host/wechat-bind.ts";
 import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
+import { registerSteerConsumer } from "./steer-consumer.ts";
+import { registerSteerTools } from "./steer-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { localAgentFromCwd, localMasterEnsureGate, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import {
@@ -129,10 +131,23 @@ import {
 } from "./launch.ts";
 import { launchWorkflowTab, masterDispatchLaunch } from "./launch-workflow.ts";
 import { runSystemGc } from "./gc-cleaner.ts";
+import {
+	applyKillOutcome,
+	clearRunProcess,
+	DEFAULT_RUNS_DIR,
+	formatRunList,
+	killAsyncRun,
+	listAsyncRunSummaries,
+	registerRunProcess,
+	touchRunActivity,
+	type ChildSpawnInfo,
+} from "./subagent-kill.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
-const RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
+// 修 2（1013）：runs 目录口径统一在 subagent-kill.ts 的 DEFAULT_RUNS_DIR（启动时读一次
+// PI_SUBAGENT_RUNS_DIR），测试可 env 隔离到临时目录；此处不再二份硬编码。
+const RUNS_DIR = DEFAULT_RUNS_DIR;
 const MAX_CONCURRENCY = 50;
 /** 默认子 agent 超时：10 分钟（600 秒）。单次调用可通过 timeoutMs 覆盖。 */
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -242,8 +257,15 @@ function configPath(): string {
 
 function readConfig(): AgentConfig {
 	try {
-		const parsed = JSON.parse(readFileSync(configPath(), "utf8")) as Partial<AgentConfig>;
+		// 修 1（1013）：config.json 是含未枚举顶层键的用户私有配置（真实文件有 10 键：另有
+		// gui / channels / autonomy），而 writeConfig 是整对象 JSON.stringify 覆写。故这里必须
+		// 「保留所有未枚举顶层键」：先展开解析结果，再用归一化后的枚举键覆盖 —— 未知顶层键
+		// 原样透传，后续任何一次 writeConfig 都不再抹掉 gui（/gui on autoStart）/ channels / autonomy。
+		// 类型取舍：AgentConfig 不引入索引签名（保持枚举键严格检查，写错键名仍报错）；未枚举键
+		// 靠对象展开在运行时透传（对象展开不触发 excess property check，无需放宽类型）。
+		const parsed = JSON.parse(readFileSync(configPath(), "utf8")) as Partial<AgentConfig> & Record<string, unknown>;
 		return {
+			...parsed,
 			models: parsed.models ?? {},
 			fallbackModels: parsed.fallbackModels ?? {},
 			thinking: parsed.thinking ?? {},
@@ -901,6 +923,7 @@ async function runSingle(
 			cwd: workingDirectory,
 			agentName: agent?.name,
 			onUpdate,
+			onChildSpawn: opts?.onChildSpawn,
 		});
 		return externalResultToSubagentResult(ext, agent?.name);
 	}
@@ -958,6 +981,10 @@ async function runSingle(
 				PI_TRACE_LANE: "",
 			},
 		});
+		// 直接 kill 支持：spawn 成功即登记 pid + 命令行 marker（marker 用 argv[0] = PI CLI 脚本路径）。
+		if (child.pid && opts?.onChildSpawn) {
+			try { opts.onChildSpawn({ pid: child.pid, marker: argv[0] ?? process.execPath }); } catch { /* 登记失败不阻塞派发 */ }
+		}
 
 		const result: SubagentResult = {
 			status: "failed",
@@ -1277,6 +1304,8 @@ async function runWithFallback(
 export interface RunDispatchOptions extends RunnerToolsOptions {
 	/** Working directory / git worktree for this dispatch. */
 	cwd?: string;
+	/** 子进程 spawn 成功回调：登记 pid + 命令行 marker，供 action=kill 的归属/身份校验。 */
+	onChildSpawn?: (info: ChildSpawnInfo) => void;
 }
 
 interface TaskInput {
@@ -1394,7 +1423,9 @@ async function runParallel(
 
 // ── 用量记录 ────────────────────────────────────────────────────────────
 
-const USAGE_DIR = join(homedir(), ".pi", "agent", "subagent-usage");
+// 测试隔离（1013）：PI_SUBAGENT_USAGE_DIR 可把用量账本改道到临时目录（同 PI_SUBAGENT_RUNS_DIR 模式）；
+// 生产未设该 env → 原 ~/.pi/agent/subagent-usage 语义逐字节不变。模块加载时读一次。
+const USAGE_DIR = process.env.PI_SUBAGENT_USAGE_DIR ?? join(homedir(), ".pi", "agent", "subagent-usage");
 const DEFAULT_SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
 
 interface DayBounds {
@@ -1637,10 +1668,18 @@ interface AsyncRunRecord {
 	/** L3：dispatch 时解析的 effective model（override ?? agent default），供 status 的 Model: 行展示。 */
 	model?: string;
 	task: string;
-	status: "running" | "completed" | "failed";
+	status: "running" | "completed" | "failed" | "cancelled";
 	result?: SubagentResult;
 	startedAt: string;
 	cwd?: string;
+	/** 直接 kill 支持：登记的子进程 pid + 身份基线与脉搏（见 subagent-kill.ts）。 */
+	pid?: number;
+	pidRecordedAt?: string;
+	pidCmdMarker?: string;
+	lastActivity?: string;
+	killedAt?: string;
+	killedBy?: string;
+	killReason?: string;
 }
 
 function listAsyncRuns(): AsyncRunRecord[] {
@@ -1650,6 +1689,24 @@ function listAsyncRuns(): AsyncRunRecord[] {
 		.map((f) => { try { return JSON.parse(readFileSync(join(RUNS_DIR, f), "utf8")) as AsyncRunRecord; } catch { return null; } })
 		.filter((r): r is AsyncRunRecord => r !== null)
 		.sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""));
+}
+
+/** 本会话派发的 async run（status 缺省目标 / kill 缺省目标的共同判定，按入参顺序取第一个）。 */
+function resolveSessionRun(runs: AsyncRunRecord[]): AsyncRunRecord | undefined {
+	const myIds = new Set([sessionScopeKey(), getCurrentSessionId()].filter((v): v is string => Boolean(v)));
+	let links: ReturnType<typeof listLinks> = [];
+	try { links = listLinks(); } catch { links = []; }
+	const dispatcherOf = (runId: string): string | undefined => {
+		for (const link of links) {
+			if (link.kind !== "async" || link.targetId !== runId) continue;
+			if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+		}
+		return undefined;
+	};
+	return runs.filter((r) => {
+		const d = dispatcherOf(r.id);
+		return d !== undefined && myIds.has(d);
+	})[0];
 }
 
 // ── 可搜索选择器（TUI）────────────────────────────────────────────
@@ -1839,6 +1896,11 @@ export default function (pi: ExtensionAPI) {
 	// 计时器：主会话与 tab 保持既有计时能力；子 agent 既不注册也不消费
 	// （registerTimers 内按身份做纵深隔离，spawn argv 亦从工具表排除）。
 	collect(registerTimers(pi));
+
+	// 立即插入消息（2026-10-12 steer 通道）：Master 侧工具（tab-steer/steer-status + sweep）
+	// 与标签页侧常驻消费者（fs.watch + tick，只消费自己目录）。子 agent 已在上方 early-return。
+	collect(registerSteerTools(pi));
+	collect(registerSteerConsumer(pi));
 
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
 	collect(registerAsyncPanel(pi));
@@ -2891,6 +2953,8 @@ export default function (pi: ExtensionAPI) {
 			"并行: { tasks: [{agent, task, model?, cwd?}, ...], concurrency?, async? }（缺省异步：立返 runId 列表，靠 action=status 收割；显式 async:false 才阻塞等待全部结果；concurrency 仅同步路径有效，异步 fan-out 忽略不限流）",
 			"异步: { agent, task, model?, cwd? }（**缺省就是异步**，仍是无头 subagent；本轮就要结果才显式 async: false 走同步）",
 			"查状态: { action: \"status\", runId? }（async subagent 的 runId 只能用这里查询）",
+			"列出/终止: { action: \"list\" } 列出全部 async runs（runId/agent/状态/pid/启动/lastActivity，卡住的 run 会看到 idle 很大）；{ action: \"kill\", runId } （或 action:\"cancel\"）直接终止该 run 的整棵进程树并落成 cancelled，无需手工找 PID；kill 缺省取本会话唯一的 running run。",
+			"安全语义: kill 只杀该 runId 登记过的 pid 及其子树，并向 OS 核对进程启动时间+命令行（防 pid 被重用后误杀）；run 已终态/已 cancelled 时幂等返回不报错。",
 			"不要对 async subagent 使用 tab-status、reclaim-tabs、tab-finish 或 set-timer。",
 			"【async 决策准则】缺省即异步（非阻塞，返回 runId，产物落盘 plans/，靠完成事件/async-result-watcher/status 收割）；只有结果本轮马上要用（下一步依赖、L4 复核）才显式 async: false 同步等待；同批独立任务用 tasks: [...] 并行（并行缺省同样异步，显式 async:false 才阻塞）。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
 			"model 可覆盖该 agent 默认模型（仅本次调用）；优先 provider/id，如 Zhipu/glm-5.2；也接受 glm-5.2 / glm5.2 等短名。",
@@ -2914,8 +2978,9 @@ export default function (pi: ExtensionAPI) {
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3；仅 async:false 同步路径有效，异步 fan-out 忽略）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行（单发与并行 tasks 均适用）；**缺省 true（非阻塞，返回 runId 后靠完成事件/status 收割）**，只有本轮就要结果时才显式传 false 走同步等待" })),
-			action: Type.Optional(Type.String({ description: "status" })),
-			runId: Type.Optional(Type.String({ description: "异步 run id" })),
+			action: Type.Optional(Type.String({ description: "status | list | kill（kill/cancel：按 runId 终止整棵进程树；list：列出 async runs 含 pid/lastActivity）" })),
+			runId: Type.Optional(Type.String({ description: "异步 run id（action=status/kill 用；kill 缺省取本会话唯一的 running run）" })),
+			reason: Type.Optional(Type.String({ description: "action=kill 的终止原因（写入 run json 的 killReason，便于审计）" })),
 			systemPrompt: Type.Optional(Type.String()),
 			model: Type.Optional(Type.String({
 				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode（使用 CLI 默认模型）",
@@ -2943,6 +3008,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (args.action === "status") {
 				return new Text(`${title} ${theme.fg("muted", "status")}${args.runId ? " " + theme.fg("dim", args.runId) : ""}`, 0, 0);
+			}
+			if (args.action === "kill" || args.action === "cancel") {
+				return new Text(`${title} ${theme.fg("error", "kill")}${args.runId ? " " + theme.fg("dim", args.runId) : ""}`, 0, 0);
+			}
+			if (args.action === "list") {
+				return new Text(`${title} ${theme.fg("muted", "list")}`, 0, 0);
 			}
 			if (args.async) {
 				const agentDef = args.agent ? agents.find((a) => a.name === args.agent) ?? null : null;
@@ -3235,6 +3306,30 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// 直接 kill 支持（2026-10-13）：list 看谁卡住；kill/cancel 按 runId 树杀（见 subagent-kill.ts）。
+			if (p.action === "list") {
+				return { content: [{ type: "text", text: formatRunList(listAsyncRunSummaries(RUNS_DIR)) }] };
+			}
+
+			if (p.action === "kill" || p.action === "cancel") {
+				let targetRunId: string | undefined = typeof p.runId === "string" && p.runId ? p.runId : undefined;
+				if (!targetRunId) {
+					// 便捷路径：本会话的 running run 恰好一个时直接杀，免得翻 runId；多个时必须显式指定（防错杀）。
+					const running = listAsyncRuns().filter((r) => r.status === "running");
+					const mine = running.filter((r) => resolveSessionRun([r]) !== undefined);
+					if (mine.length === 0) {
+						return { content: [{ type: "text", text: `No running async run for this session. Use subagent-win({ action: "list" }) to see runs, then pass runId.` }], isError: true };
+					}
+					if (mine.length > 1) {
+						return { content: [{ type: "text", text: `Multiple running runs for this session; pass runId explicitly:\n` + mine.map((r) => `  ${r.id}  [${r.agent ?? "-"}]`).join("\n") }], isError: true };
+					}
+					targetRunId = mine[0].id;
+				}
+				const killRes = await killAsyncRun({ runId: targetRunId, runsDir: RUNS_DIR, reason: typeof p.reason === "string" ? p.reason : undefined });
+				if (killRes.ok) refreshAsyncPanel();
+				return { content: [{ type: "text", text: killRes.message }], isError: !killRes.ok };
+			}
+
 			// L3 parallel 缺省异步（2026-09-23）：p.async !== false（缺省/true）时每个 subtask 走与单发
 			// 完全同构的异步派发——写 RUNS_DIR 记录（status running + startedAt + resolveSubagentCwd）+
 			// recordLink（kind async + sessionIdentity）+ 刷新 panel，然后 .then 回写终态；立返 runId 列表。
@@ -3263,12 +3358,17 @@ export default function (pi: ExtensionAPI) {
 					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined };
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
-					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, undefined, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools }).then((result) => {
+					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, () => touchRunActivity(runId), {
+						cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools,
+						onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
+					}).then((result) => {
 						record.status = result.status; record.result = result;
+						applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 						recordUsage(agentDef?.name, result);
+						clearRunProcess(runId);
 						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 						refreshAsyncPanel();
-						notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: t.task ?? "", status: result.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
+						notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: t.task ?? "", status: record.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
 					});
 					asyncLines.push(`${runId} [${label}] running`);
 				});
@@ -3340,13 +3440,18 @@ export default function (pi: ExtensionAPI) {
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
-				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, undefined, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools }).then((result) => {
+				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, () => touchRunActivity(runId), {
+					cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools,
+					onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
+				}).then((result) => {
 					record.status = result.status; record.result = result;
+					applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 					recordUsage(agentDef?.name, result);
+					clearRunProcess(runId);
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 					// 方案 B：完成时刷新面板 + toast 通知
 					refreshAsyncPanel();
-					notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: p.task ?? "", status: result.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
+					notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: p.task ?? "", status: record.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
 				});
 				return { content: [{ type: "text", text: `Async run started: ${runId}\nCheck with: subagent-win({ action: "status", runId: "${runId}" })` }] };
 			}

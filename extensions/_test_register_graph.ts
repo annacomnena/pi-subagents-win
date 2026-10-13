@@ -86,12 +86,15 @@ for (const n of flagNames) console.log(`  ${n}`);
 // 2026-09-19 master 工具组 8 个（attach/cutover/detach/dispatch/handoff/
 // pressure/status/transfer/transfer-confirm——Phase 5.5 S1）。
 // 2026-09-23：修复存量快照漂移（补 global-view，master-tools.ts 注册）；Task 2006 v2 autonomy 不动 tools（无新增 tool，D-I）。
+// 2026-10-12：steer 通道（立即插入消息 M1）新增 2 tool——tab-steer / steer-status（steer-runtime.ts）。
+// 同批修复存量漂移（补 local-master-ensure，index.ts 0923 后注册的本地 master 工具，此前被 tool 断言漏项遮挡）。
 assert.deepEqual(toolNames, [
 	"cancel-timer",
 	"global-view",
 	"hotspot",
 	"launch-tabs",
 	"list-timers",
+	"local-master-ensure",
 	"master-attach",
 	"master-cutover",
 	"master-detach",
@@ -103,10 +106,12 @@ assert.deepEqual(toolNames, [
 	"master-transfer-confirm",
 	"reclaim-tabs",
 	"set-timer",
+	"steer-status",
 	"subagent-win",
 	"tab-finish",
 	"tab-report",
 	"tab-status",
+	"tab-steer",
 	"trace-fusion",
 	"wiki-nav",
 ]);
@@ -119,6 +124,7 @@ assert.deepEqual(toolNames, [
 // 2026-09-24 补 /wechat（D17 opt-in 开关界面可达）与 /master-transfer（local 自动交接 D17）；
 // 2026-09-23 Task 2006 v2 autonomy 补 /autonomy（手动运维命令 status/kill/clear，D-I）；
 // 同批修复 commands 存量漂移（补 /global-view，index.ts 0923 首阶段注册，与 tools global-view 同批漂移）；
+// 同批修复存量漂移（补 /local-master-ensure、/send-letter、/wechat-remote-run——三者均为此前被 tool 断言失败遮挡的既有注册，与本次 steer 通道无关）；
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
 // （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
 assert.deepEqual(commandNames, [
@@ -132,6 +138,7 @@ assert.deepEqual(commandNames, [
 	"launch",
 	"links",
 	"lite",
+	"local-master-ensure",
 	"master-attach",
 	"master-auto-handoff",
 	"master-cutover",
@@ -144,6 +151,7 @@ assert.deepEqual(commandNames, [
 	"runs",
 	"runtime-host",
 	"searcher-mode",
+	"send-letter",
 	"sub-models",
 	"sub-presets",
 	"subagent-gc",
@@ -157,6 +165,7 @@ assert.deepEqual(commandNames, [
 	"trace-fusion-loop",
 	"trace-fusion-status",
 	"wechat",
+	"wechat-remote-run",
 	"workstream",
 	"workstream-create",
 	"workstream-link",

@@ -3,6 +3,7 @@
  *
  * 每次派发（launch-tabs / async subagent / set-timer）追加一行到
  * ~/.pi/agent/links.jsonl：{ sessionId, kind, targetId, detail, at }。
+ * env PI_LINKS_PATH 可整条改道（测试隔离；未设 → 真实路径）。
  * 记录「哪个会话唤起了哪些任务/对话」，供 /links 查看与编排溯源。
  *
  * 文件即总线：跨进程共享，追加式 JSONL，崩溃安全（每行独立、append 原子）。
@@ -30,8 +31,11 @@ export interface LinkRecord {
 	pid: number;
 }
 
-export function defaultLinksPath(agentDir: string = join(homedir(), ".pi", "agent")): string {
-	return join(agentDir, "links.jsonl");
+export function defaultLinksPath(agentDir?: string): string {
+	// 测试隔离（1013）：PI_LINKS_PATH 显式覆盖整条账本路径（同 PI_SUBAGENT_RUNS_DIR 模式）。
+	// 生产未设该 env → 原 ~/.pi/agent/links.jsonl 语义逐字节不变；显式传 agentDir 的调用方优先。
+	if (agentDir) return join(agentDir, "links.jsonl");
+	return process.env.PI_LINKS_PATH ?? join(homedir(), ".pi", "agent", "links.jsonl");
 }
 
 /**

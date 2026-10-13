@@ -8,6 +8,7 @@
  * - 使用 Microsoft.Windows.Shell.RunDialog 作为 AppID（系统内置，无需注册）
  * - XML 以 PowerShell 单引号字符串内联传入，$ 不会展开
  * - 只需 XML 转义（&<>"'），无需 PS 变量转义
+ * - env `PI_NOTIFY_DISABLE=1` 整机静默（测试隔离；见 windowsToastDisabled）
  */
 
 import { execFile } from "node:child_process";
@@ -35,10 +36,20 @@ export interface NotifyOptions {
 }
 
 /**
+ * 硬静默开关：env `PI_NOTIFY_DISABLE=1` → 完全不弹窗、不派生 powershell、不落 spawn 取证。
+ * 供测试隔离（跑测试不得产生用户可见通知）；生产未设该 env 时语义逐字节不变。
+ */
+export function windowsToastDisabled(): boolean {
+	return process.env.PI_NOTIFY_DISABLE === "1";
+}
+
+/**
  * 发送 Windows Toast 通知。
  * 使用内联 XML 字符串 + 系统 AppID，无需提前注册。
  */
 export function sendWindowsToast(opts: NotifyOptions): void {
+	// 静默必须在最前：连 spawn-trace 的 toast 行都不落，便于用 trace 反证「零 toast 派生」。
+	if (windowsToastDisabled()) return;
 	if (!IS_WINDOWS) return;
 
 	const { title, body, duration = "short" } = opts;
