@@ -124,6 +124,8 @@ subagent-win({ action: "status", runId: "run_xxx" })
 
 The async task panel (TUI widget + status bar + completion toast) shows running background jobs; `/runs` lists recent ones.
 
+A stuck async run can be inspected and stopped without hunting PIDs: `subagent-win({ action: "list" })` shows each run's `runId`/status/pid/`idle` pulse, and `subagent-win({ action: "kill", runId })` (alias `cancel`) kills that run's process tree and marks it `cancelled`. See `Wiki/Architecture/async-run-control.md` for the two safety checks (recorded pid + start-time/command-line verification), idempotency, and known limits.
+
 ### 3.2 Consultant — user-named model evaluation
 
 When the user names a model ("请glm来评估一下", "请gpt5.6看看截图"), dispatch `agent: "consultant"` with that model as a per-call `model` override. Short aliases expand from `~/.pi/agent/models.json`. The consultant answers from that model's perspective; screenshot paths go in the `task` (it reads images with `read`).
@@ -375,6 +377,10 @@ The result is always a short basename-style key (no `/`, no spaces) → parseabl
 **Power boundary (v1 exclusions)**: no succession/transfer, no stale/heartbeat re-attach, no auto master selection, no `workstream --cwd`. A lost owner simply means the scope stays owned-but-inactive until the attachment is manually cleared.
 
 **Known limitation (Q2)**: the scope key is a basename — two *different* repos with the same name on different drives/paths (for example, same-named repositories on different drives) collide into one scope. Worktrees vs. same-named plain repos are distinguished by the `-worktree` suffix; cross-drive same-name repos are not (accepted in v1).
+
+### 6.8 Immediate message injection — `tab-steer`
+
+`tab-steer({ tabRunId, message, mode: "steer" })` inserts a message into a **running** tab immediately: it is delivered after the current assistant turn's tool calls return and before the next model request (not a timer). Receipts are read back with `steer-status({ tabRunId })` (`pending | delivered | aborted | failed | undelivered`). This channel is **separate from `timers/mail/`** — timers are delayed delivery, steer is immediate delivery; do not mix them. A session stuck inside a never-returning tool cannot be reached by `steer`; for that case use `mode: "abort"`, which aborts the current run (including killing a hung tool process tree), waits for the target to go idle, and only then sends the message — use it only when `steer` cannot be delivered (hung tool). See `Wiki/Architecture/steer-channel.md` for the file layout, scope rules, the `delivered ≠ applied` caveat, known limits, and the manual acceptance checklist.
 
 ---
 

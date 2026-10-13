@@ -2,7 +2,7 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-10-12
+updated: 2026-10-13
 source_paths:
   - plans/0923_decisions.md
   - extensions/hotspot/index.ts
@@ -41,6 +41,8 @@ source_paths:
 - [[Local Master Ensure（幂等确保）]] — 主会话按 cwd 幂等确保他仓 local master：四层授权 + 零新增权力 + 严格就绪判据 + #A 消费循环注册语义（`status: current`）
 - [[Master 在线判据与远程输入门]] — 会话心跳（`sessionAlive` 15s）为唯一在线门、四消费点、标签页 master 盲区与 B 修复（`status: current`）
 - [[Master 开机自启与防双开]] — `pi-runtime-host-boot`/`pi-master-resume-boot` 与 boot-resume P1–P6/G1–G3、G2.5 心跳判据、P2 transfer-window 24h（`status: current`）
+- [[Steer 通道（立即插入消息）]] — Master → 运行中 tab 的立即投递：steer/abort 两档、落盘回执状态机、写前守卫与 scope、已知限制 NF-1（`status: current`）
+- [[异步 Run 控制面（list / kill）]] — async subagent 的观察与终止：list 脉搏、整棵进程树 kill、双重安全校验、幂等终态（`status: current`）
 
 ## Links Out
 
@@ -63,6 +65,8 @@ source_paths:
 - [[Local Master Ensure（幂等确保）]]
 - [[Master 在线判据与远程输入门]]
 - [[Master 开机自启与防双开]]
+- [[Steer 通道（立即插入消息）]]
+- [[异步 Run 控制面（list / kill）]]
 
 ## Backlinks
 
@@ -85,6 +89,8 @@ source_paths:
 - [[Master 在线判据与远程输入门]]
 - [[Master 交接继任者形态]]
 - [[Master 开机自启与防双开]]
+- [[Steer 通道（立即插入消息）]]
+- [[异步 Run 控制面（list / kill）]]
 
 ## Open Questions
 
