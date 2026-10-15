@@ -9,7 +9,7 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -182,40 +182,96 @@ const WORKFLOW_SKILL_ROOT = join(PKG_DIR, "skills");
 const WORKFLOW_SKILL_FILE = join(WORKFLOW_SKILL_ROOT, "workflow-orchestrator", "SKILL.md");
 
 // ── pi CLI 路径探测 ────────────────────────────────────────────────
+// 2026-10-16 加固（00:19:13 会话崩溃根因）：`npm install --global @earendil-works/pi-coding-agent`
+// 安装窗口内包目录 / where shim 处于中间态 ⇒ 全部候选瞬时缺失 ⇒ 旧实现立即 throw
+// 拖垮整个会话；且旧候选不认 nvm4w 符号链接（C:\nvm4w\nodejs ≠ 版本目录）。
+// 加固：① nvm4w/版本目录感知候选（process.execPath 的 realpath + where shim 目录反推）
+//   ② 瞬时缺失重试（3 次、间隔 ~500ms，同步等待，仅失败路径阻塞）
+//   ③ 失败抛**可操作的普通错误**（列出试过的路径 + PI_CLI_PATH 提示）；
+//   ④ runSingle 等调用方 catch 后转结构化失败，不冒泡崩溃会话。
 
 let cachedPiCli: string | null = null;
 
-function findPiCli(): string {
-	if (cachedPiCli && existsSync(cachedPiCli)) return cachedPiCli;
+/** 同步 ~ms 睡眠：仅用于 findPiCli 失败重试路径（保持同步，不改十余个调用点签名）。 */
+function syncSleepMs(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * 构建 pi CLI 候选列表（nvm4w / 版本目录感知）：
+ *  - 脚本旁 dist/cli.js（argv[1] 与上一级）
+ *  - node 目录全局包目录：process.execPath 与其 realpath 各一份
+ *    （nvm4w 的 C:\nvm4w\nodejs 是指向版本目录的 junction，realpath 落到
+ *    AppData\Local\nvm\vXX\... 后反推全局包路径）
+ *  - `where pi` shim 反推：shim 所在目录的全局包目录 + shim 内容里解析出的 cli.js 路径
+ */
+export function piCliCandidates(): string[] {
+	const cands: string[] = [];
+	const piDir = dirname(process.argv[1] ?? "");
+	cands.push(join(piDir, "dist", "cli.js"));
+	cands.push(join(piDir, "..", "dist", "cli.js"));
+	const nodeDirs = new Set<string>([dirname(process.execPath)]);
+	try { nodeDirs.add(dirname(realpathSync(process.execPath))); } catch { /* ignore */ }
+	for (const nd of nodeDirs) cands.push(join(nd, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"));
+	try {
+		const which = execFileSync("where", ["pi"], { encoding: "utf8", shell: true }).split("\n")[0].trim();
+		if (which) {
+			cands.push(join(dirname(which), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"));
+			try {
+				const content = readFileSync(which, "utf8");
+				const match = content.match(/node\s+"?([^"\s]+dist[\\/]cli\.js)"?/);
+				if (match) cands.push(match[1]);
+			} catch { /* ignore */ }
+		}
+	} catch { /* where 不可用 / 无 shim */ }
+	return cands;
+}
+
+/**
+ * 核心探测：在候选列表中找第一个存在的路径。
+ * 瞬时缺失（npm install --global 窗口等）→ 间隔 retryDelayMs 再试，共 attempts 次。
+ * 始终缺失 → 抛可操作的普通错误（列出试过的全部路径 + PI_CLI_PATH 提示），
+ * 由调用方（runSingle 等）catch 转结构化失败。
+ */
+export function resolvePiCliFrom(
+	candidates: string[],
+	opts: { attempts?: number; retryDelayMs?: number; exists?: (p: string) => boolean } = {},
+): string {
+	const attempts = Math.max(1, Math.trunc(opts.attempts ?? 3));
+	const delay = Math.max(0, Math.trunc(opts.retryDelayMs ?? 500));
+	const exists = opts.exists ?? existsSync;
+	const tried: string[] = [];
+	const seen = new Set<string>();
+	for (let i = 0; i < attempts; i++) {
+		if (i > 0) syncSleepMs(delay);
+		for (const c of candidates) {
+			const r = resolve(c);
+			if (!seen.has(r)) { seen.add(r); tried.push(r); }
+			if (exists(r)) return r;
+		}
+	}
+	throw new Error(
+		`Cannot find pi CLI（${attempts} attempts, ${delay}ms interval）tried: ${tried.join(", ")}; ` +
+		`set PI_CLI_PATH to the full path of pi-coding-agent/dist/cli.js. ` +
+		`If you are mid npm install --global @earendil-works/pi-coding-agent, the install is incomplete — retry once it finishes.`,
+	);
+}
+
+export function findPiCli(): string {
 	const env = process.env.PI_CLI_PATH;
 	if (env && existsSync(env)) {
 		cachedPiCli = resolve(env);
 		return cachedPiCli;
 	}
-	const piDir = dirname(process.argv[1] ?? "");
-	const candidates = [
-		join(piDir, "dist", "cli.js"),
-		join(piDir, "..", "dist", "cli.js"),
-		join(dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
-	];
-	for (const c of candidates) {
-		if (existsSync(c)) {
-			cachedPiCli = resolve(c);
-			return cachedPiCli;
-		}
+	if (cachedPiCli && existsSync(cachedPiCli)) {
+		cachedPiCli = resolve(cachedPiCli);
+		return cachedPiCli;
 	}
-	try {
-		const which = execFileSync("where", ["pi"], { encoding: "utf8", shell: true }).split("\n")[0].trim();
-		if (which && existsSync(which)) {
-			const content = readFileSync(which, "utf8");
-			const match = content.match(/node\s+"?([^"\s]+dist[\\/]cli\.js)"?/);
-			if (match && existsSync(match[1])) {
-				cachedPiCli = resolve(match[1]);
-				return cachedPiCli;
-			}
-		}
-	} catch { /* ignore */ }
-	throw new Error("Cannot find pi CLI. Set PI_CLI_PATH env var.");
+	// PI_CLI_PATH 已设但缺失 → 也计入尝试清单（一并重试，报错时可见）。
+	const extra = env ? [env] : [];
+	const path = resolvePiCliFrom([...extra, ...piCliCandidates()], { attempts: 3, retryDelayMs: 500 });
+	cachedPiCli = path;
+	return path;
 }
 
 let cachedWtPath: string | null | undefined = undefined;
@@ -976,7 +1032,25 @@ async function runSingle(
 		return externalResultToSubagentResult(ext, agent?.name);
 	}
 
-	const cliPath = findPiCli();
+	// 2026-10-16 加固：pi CLI 瞬时缺失（npm install --global 窗口）不得冒泡崩溃会话——
+	// catch 后转结构化失败（findPiCli 错误文本可操作：列出试过的路径 + PI_CLI_PATH 提示）。
+	let cliPath: string;
+	try {
+		cliPath = findPiCli();
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		onUpdate?.("⛔ pi CLI 未找到", msg);
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: `pi CLI not found: ${msg}`,
+			agent: agent?.name,
+			requestedModel: resolvedModel,
+		};
+	}
 	// 保留项目 AGENTS.md / CLAUDE.md 注入（勿加 --no-context-files）。
 	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
 	// 同时排除 launch-tabs 与 timer 管理工具：子 agent 只执行工作，
