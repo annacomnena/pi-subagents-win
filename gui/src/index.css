@@ -56,6 +56,10 @@
 	/* 浮层深度（§5：环 + 低语影；卡片仍扁平，浮层只此一套阴影语言） */
 	--shadow-overlay: 0 0 0 1px var(--color-border), 0 4px 24px rgba(20, 20, 19, 0.28);
 
+	/* §3.2 chip 规范的「提亮基色」（亮色层 = 近黑：tone 与它混合 → 加深）。
+	 * 单一实现放 .tone-chip，避免 5 个 tone × 2 主题各抄一遍颜色公式。 */
+	--color-chip-fg-base: var(--color-brand-ink);
+
 	--animated-gradient-text-strong: rgba(20, 20, 19, 1);
 	--animated-gradient-text-soft: rgba(20, 20, 19, 0.22);
 	--color-background: #f5f4ed; /* Parchment 羊皮纸（非纯白） */
@@ -122,6 +126,21 @@
 	--color-info: #2d70ab;
 }
 
+/* ── §3.2 chip 规范（5 个 tone 共用的唯一实现）───────────────────────
+ * 底 = color-mix(tone 12%, card)；字 = color-mix(tone 70%, 提亮基色)；环 = tone 50%。
+ * 提亮基色：暗色层 = ivory（提亮），亮色层 = ink（加深）——两向都使字与底对比增强，
+ * 即 §3.2 所称的「提亮版」。自算对比度（§6 口径）：
+ *   暗色 5.58–6.55（§6 表 tone chip 行）／亮色 6.45–7.14 → 全部 ≥4.5:1。
+ * 用「非分层(unlayered)」规则定义，故可覆盖 Tailwind utilities 层里的 border-transparent 等。
+ * 用法：class="tone-chip [--chip-tone:var(--color-success)]"。
+ * 为什么不用 bg-success/20 + text-success（旧写法）：实测仅 3.64–4.43:1，不达 AA（§6 硬门）。 */
+.tone-chip {
+	--chip-tone: var(--color-foreground-subtle);
+	background-color: color-mix(in oklab, var(--chip-tone) 12%, var(--color-card));
+	border-color: color-mix(in oklab, var(--chip-tone) 50%, transparent);
+	color: color-mix(in oklab, var(--chip-tone) 70%, var(--color-chip-fg-base));
+}
+
 /* ── 生效主题：暖纸暗色（Web 默认暗色；main.tsx 给 documentElement 常挂 .theme-warm-dark）
  * 值 = §3.1/§3.2 暖暗表。品牌基础色两层同值；半透明档用 color-mix 保 alpha（行末附
  * 合成到 #141413 的等值 hex）；不透明表面/文字档按 §3 权威 hex 直写——§3.1 表里的
@@ -141,6 +160,8 @@
 	--color-brand-olive: #5f6b4f;
 	--color-brand-focus: #3898ec;
 	--color-surface-warm: var(--color-brand-sand);
+	/* §3.2 chip 提亮基色（暗色层）→ ivory：tone 与它混合 → 提亮 */
+	--color-chip-fg-base: var(--color-brand-ivory);
 
 	--animated-gradient-text-strong: rgba(250, 249, 245, 1);
 	--animated-gradient-text-soft: rgba(250, 249, 245, 0.22);

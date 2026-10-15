@@ -310,9 +310,9 @@ export function ToastMessageView({
   return (
     <div
       className={cn(
-        "rounded-2xl border bg-toast/60 text-ui-base shadow-lg backdrop-blur-xl transition-[transform,opacity] duration-200 ease-[cubic-bezier(0.77,0,0.175,1)] motion-reduce:transform-none motion-reduce:transition-opacity",
+        "rounded-2xl border bg-toast/60 text-ui-base shadow-overlay backdrop-blur-xl transition-[transform,opacity] duration-200 ease-[cubic-bezier(0.77,0,0.175,1)] motion-reduce:transform-none motion-reduce:transition-opacity",
         isUpdate
-          ? "origin-bottom-left w-[min(300px,calc(100vw-1rem))] max-w-[min(300px,calc(100vw-1rem))] border-popover-border text-foreground shadow-lg"
+          ? "origin-bottom-left w-[min(300px,calc(100vw-1rem))] max-w-[min(300px,calc(100vw-1rem))] border-popover-border text-foreground shadow-overlay"
           : isNotice
             ? "w-[min(536px,calc(100vw-2rem))] border-border text-foreground"
             : "border-border px-4 py-3 text-foreground whitespace-pre-line",

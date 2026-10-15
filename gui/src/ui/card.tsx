@@ -34,8 +34,13 @@ function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
 }
 
 function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
+  // §7 B-3：标题层允许 text-ui-lg + 衬线（全库唯一允许衬线处，对应 §4「≥20px」口径的卡片主标题档）。
   return (
-    <div data-slot="card-title" className={cn("text-ui-base font-medium", className)} {...props} />
+    <div
+      data-slot="card-title"
+      className={cn("font-display text-ui-lg font-medium tracking-normal", className)}
+      {...props}
+    />
   );
 }
 

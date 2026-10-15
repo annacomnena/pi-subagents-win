@@ -66,8 +66,9 @@ export function Card({ title, right, children, className }: { title?: ReactNode;
 		<ShadCard size="sm" className={className}>
 			{title !== undefined && (
 				<ShadCardHeader className="border-b border-border">
-					{/* 标题：去 tracking-wide（CJK 不宜字距）；text-ui-sm 信息档（P2-8） */}
-					<ShadCardTitle className="text-ui-sm font-medium text-foreground-subtle">{title}</ShadCardTitle>
+					{/* 标题：去 tracking-wide（CJK 不宜字距）；§7 B-9 建议升 ui-lg + 衬线——
+					 * 对应 §4「唯一可用衬线的档」；色保持 subtle（标题是分区信息，不是主表述）。 */}
+					<ShadCardTitle className="font-display text-ui-lg font-medium text-foreground-subtle">{title}</ShadCardTitle>
 					{right !== undefined && <ShadCardAction>{right}</ShadCardAction>}
 				</ShadCardHeader>
 			)}
@@ -77,19 +78,23 @@ export function Card({ title, right, children, className }: { title?: ReactNode;
 }
 
 // ── 3. Badge（内核 = shadcn Badge 胶囊 h-5 + text-ui-xs；七档 tone 语义保留）──
+// §3.2 chip 规范（S2 落地）：底 mix(tone 12%, card)、字 mix(tone 70%, 提亮基色)、环 tone 50%。
+// 实现集中在 index.css 的 .tone-chip（暗色 5.58–6.55:1 / 亮色 6.45–7.14:1，均 ≥4.5）。
+// 旧写法 `bg-<tone>/20 + text-<tone>` 实测只有 3.64–4.43:1，不达 AA（§6 硬门）——已废除。
 
 type BadgeTone = "green" | "red" | "gray" | "yellow" | "blue" | "purple" | "na";
 
 const BADGE_TONES: Record<BadgeTone, string> = {
-	green: "bg-success/20 text-success border-success/60",
-	red: "bg-destructive/20 text-destructive border-destructive/60",
-	gray: "bg-surface-hover text-foreground-subtle border-border",
-	yellow: "bg-warning/15 text-warning border-warning/40",
-	// 2026-09-30：blue 改指真信息蓝 info（brand 暗色=纯白致「蓝徽章」渲染成白块，P1-2）
-	blue: "bg-info/15 text-info border-info/50",
-	purple: "bg-accent/60 text-foreground border-border",
+	green: "tone-chip [--chip-tone:var(--color-success)]",
+	red: "tone-chip [--chip-tone:var(--color-destructive)]",
+	gray: "tone-chip [--chip-tone:var(--color-foreground-subtle)]",
+	yellow: "tone-chip [--chip-tone:var(--color-warning)]",
+	// blue → 真信息蓝 info（brand 暗色=纯白致「蓝徽章」渲染成白块，P1-2）
+	blue: "tone-chip [--chip-tone:var(--color-info)]",
+	// purple → accent wash（§7 B-9①：不再用 bg-accent/60 实底；走 chip 公式的陶土档）
+	purple: "tone-chip [--chip-tone:var(--color-accent)]",
 	// na 档 subtlest→subtle（信息分级：缺字段提示是信息不是装饰，P1-4）
-	na: "bg-surface text-foreground-subtle border-border",
+	na: "tone-chip [--chip-tone:var(--color-foreground-subtle)]",
 };
 
 export function Badge({ tone = "gray", title, children }: { tone?: BadgeTone; title?: string; children: ReactNode }) {
@@ -123,12 +128,12 @@ export function Toggle({ on, disabled, onChange, labels }: {
 			type="button"
 			disabled={disabled}
 			onClick={() => onChange(!on)}
-			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-ui-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-40 ${
-				on ? "border-success/60 bg-success/20 text-success" : "border-border bg-surface-hover text-foreground-subtle"
+			className={`inline-flex items-center rounded-full border px-1 py-0.5 text-ui-xs font-semibold transition-colors disabled:opacity-40 ${
+				on ? "border-accent bg-accent text-accent-foreground" : "border-border bg-surface-hover text-foreground-subtle"
 			}`}
 		>
 			<span className={`rounded-full px-1.5 py-0.5 ${on ? "" : "bg-surface text-foreground"}`}>{offLabel}</span>
-			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-success text-success-foreground" : ""}`}>{onLabel}</span>
+			<span className={`rounded-full px-1.5 py-0.5 ${on ? "bg-accent-foreground text-accent" : ""}`}>{onLabel}</span>
 		</button>
 	);
 }
@@ -138,7 +143,8 @@ export function Toggle({ on, disabled, onChange, labels }: {
 export function EmptyState({ children, icon }: { children: ReactNode; icon?: ReactNode }) {
 	return (
 		<div className="flex flex-col items-center gap-2 py-6 text-center text-ui-sm text-foreground-subtle">
-			{icon !== undefined && <span className="text-foreground-subtlest">{icon}</span>}
+			{/* §7 B-9④：icon 色 subtlest→subtle（图标是信息，不是纯装饰） */}
+			{icon !== undefined && <span className="text-foreground-subtle">{icon}</span>}
 			{children}
 		</div>
 	);
