@@ -196,22 +196,6 @@ function mintToken(): string {
 }
 
 /**
- * 测试专用 seam（**唯一用途**：确定性复现「两个接管者同时判定僵锁」这个窄竞态窗口）。
- * 生产代码永不设置它。这是必要的：实测证明「顺序调用」与「多进程撞窗口」都无法稳定复现
- * 该竞态（TTL 会挡住顺序第二次；撞窗口概率过低），故只能显式注入。
- */
-let __claimReapTestHook: (() => void) | undefined;
-/** 仅供测试：设置在「判定僵锁」与「实际接管」之间执行的钩子。 */
-export function __setClaimReapTestHook(h: (() => void) | undefined): void {
-	__claimReapTestHook = h;
-}
-
-/** CAS 锁的 TTL：赢家若在写终态前崩溃，超此龄的锁被视为僵锁（可被接管），避免永久卡死。 */
-export function reapLockTtlMs(): number {
-	return intEnv("PI_SUBAGENT_ZOMBIE_LOCK_TTL_MS", 5 * 60 * 1000);
-}
-
-/**
  * 跨进程「恰好一次」CAS：用 `.reaped` 文件的**排他创建**（`wx`）判定归属。
  *
  * 审查 M2 明确：read-check-write 与普通 rename **都不是 CAS**。本函数用
@@ -227,7 +211,7 @@ export function claimReap(
 	runsDir: string,
 	id: string,
 	meta: { reason: ZombieReason; pid?: number; at: string },
-	opts: { now?: () => number } = {},
+	opts: { now?: () => number; force?: boolean } = {},
 ): boolean {
 	if (!existsSync(runsDir)) mkdirSync(runsDir, { recursive: true });
 	const lockPath = join(runsDir, `${id}.reaped`);
@@ -237,87 +221,37 @@ export function claimReap(
 	} catch (e) {
 		if ((e as { code?: string }).code !== "EEXIST") throw e;
 	}
-	// 已存在：判定是否为僵锁（赢家崩溃）。需要**接管**。
+	// 已存在：说明该 run 已被认领过（`.reaped` 持久存在）。
 	//
-	// ## 为什么不用「move-aside + 核对 + 放回」（三代实现的教训）
-	//  1. `rmSync + writeFileSync(wx)`：两步间可删他人新锁 ⇒ 双赢家。
-	//  2. 仅 `renameSync(lock→graveyard)` 视为原子 ⇒ 仍双赢家：A 可能移走 B 刚建的新锁。
-	//  3. 加 token 核对 + 「放回」⇒ **仍双赢家**（L4 三轮反例，Windows 实测确认）：
-	//     A 核对失败后用 rename 放回，而 **Windows 上 rename 会覆盖已存在目标**
-	//     ⇒ 抹掉第三方 C 刚建的新锁 ⇒ B、C 都曾返回 true。
-	//  根因：rename/move 语义**不是 no-clobber**，且核对与移动之间存在 TOCTOU。
+	// ## 为什么不「接管」过期锁（四代实现的教训；L4 四轮全部推翻）
+	// 我先后试了 4 种「接管过期锁」的实现，每一种都被 L4 找到真实双赢家反例：
+	//   1. `rmSync + writeFileSync(wx)`：两步间可删他人新锁。
+	//   2. 仅 `renameSync` 移走：A 可能移走 B 刚建的新锁（路径存在即成功）。
+	//   3. + token 核对 +「放回」：Windows 上 rename **会覆盖**已存在目标 ⇒ 抹掉第三方锁（实测确认）。
+	//   4. 独立 `.reaping` 接管锁 + TTL：**TTL 会回收仍在工作的接管锁** ⇒ 双赢家
+	//      （L4 给出可复现时序：owner 暂停超过 TTL 后另一个接管者也会成功）。
+	// **根本原因**：「过期无主文件」无法安全实现 owner 回收 —— 这需要 **fencing**（fencing token /
+	// 带所有权校验的释放），而单进程外的纯文件系统原语给不出。L4 明确建议：
+	//   「Prefer a supported lock/lease primitive with fencing generation and ownership-checked
+	//    release, **or simplify to permanent `wx` claim (accept crash-stuck marker and provide
+	//    explicit/manual stale recovery)**. Do not claim "exactly one" with expiring ownerless files.」
 	//
-	// ## 本实现（第 4 代）：独立的 `wx` 接管锁
-	// 接管本身用**排他创建** `.reaping` 做 CAS（OS 保证恰好一个创建者），完全不靠 rename：
-	//   - `wx` 创建 `.reaping` 失败 ⇒ 别人正在接管 ⇒ 认输（不双赢）。
-	//   - 赢家再核对「原锁 token 是否仍是最初读到的那枚」；变了 ⇒ 别人已换过锁 ⇒ 认输。
-	//   - 核对通过才替换锁文件（先删后 wx 建）。**绝不覆盖别人的锁**。
-	// 残留窗口（诚实声明）：赢家若在「建 `.reaping` → 完成替换」之间崩溃，`.reaping` 会残留，
-	// 使该 run 后续接管被挡。用同 TTL 兜底清除（属**单一层级**的降级，远低于前几代的概率）。
-	const takeoverPath = join(runsDir, `.${id}.reaping`);
-	const observedToken = (() => {
-		try {
-			const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { at?: string; token?: string };
-			return { token: typeof raw.token === "string" ? raw.token : undefined, at: raw.at };
-		} catch {
-			return null;
-		}
-	})();
-	if (observedToken === null) return false; // 锁不可读 ⇒ 保守不接管
-
-	// TTL 判定（在读锁之后做，避免无谓的接管锁创建）
-	{
-		const atMs = Date.parse(String(observedToken.at ?? ""));
-		const nowMs = opts.now?.() ?? Date.now();
-		const age = Number.isFinite(atMs) ? nowMs - atMs : Number.POSITIVE_INFINITY;
-		if (age < reapLockTtlMs()) return false; // 别人的活锁 ⇒ 正常短路
-	}
-
-	// 测试 seam：在「判定僵锁」与「实际取得接管锁」之间
-	__claimReapTestHook?.();
-
-	// CAS：排他创建接管锁
-	const nowMs2 = opts.now?.() ?? Date.now();
+	// ## 本实现（第 5 代）：持久 claim + 显式人工恢复
+	// - `.reaped` 是**永久** claim：`wx` 创建即赢，永不被自动回收（⇒ 真正的「至多一个自动赢家」）。
+	// - 赢家崩溃停在 claim 后、终态前 ⇒ 该 run 需**人工/显式**恢复（`reapZombie(id, {force:true})`），
+	//   与 L4 建议一致。**不自动回收** ⇒ 不会双赢家。
+	// - 真正的安全兜底是**终态写入本身幂等**（见 `reapZombie` 的写前重读 + 终态短路）：
+	//   即便两次 claim 竞态都走到写终态，两者也会写出**语义相同**的 `failed(zombie)`，
+	//   且第二次会因「已非 running」而短路。（这是「下游幂等」，不用于掩盖双赢家——
+	//   L4 正确指出它不能替代 fencing；此处我们**已经放弃了 exactly-one 声明**。）
+	if (opts.force !== true) return false; // 非 force：永久 claim ⇒ 认输（不接管、不双赢）
+	// 显式 force 恢复（人工运维路径）：持有者已知该 claim 是僵的
 	try {
-		writeFileSync(takeoverPath, JSON.stringify({ at: meta.at, pid: process.pid }), { flag: "wx" });
-	} catch (e) {
-		if ((e as { code?: string }).code !== "EEXIST") return false;
-		// 接管锁已存在：可能是别人正在接管，也可能是**崩溃残留**
-		try {
-			const t = JSON.parse(readFileSync(takeoverPath, "utf8")) as { at?: string };
-			const tMs = Date.parse(String(t.at ?? ""));
-			const tAge = Number.isFinite(tMs) ? nowMs2 - tMs : Number.POSITIVE_INFINITY;
-			if (tAge < reapLockTtlMs()) return false; // 别人正在接管 ⇒ 认输
-			// 残留（崩溃）：TTL 超龄 ⇒ 清除后重试一次（单一层级降级）
-			rmSync(takeoverPath, { force: true });
-			writeFileSync(takeoverPath, JSON.stringify({ at: meta.at, pid: process.pid }), { flag: "wx" });
-		} catch {
-			return false; // 无法取得接管锁 ⇒ 保守认输
-		}
-	}
-
-	try {
-		// 赢下接管锁后再核对：原锁是否仍是最初读到的那枚（防「别人已换过」）
-		let cur: { token?: string } = {};
-		try {
-			cur = JSON.parse(readFileSync(lockPath, "utf8")) as { token?: string };
-		} catch {
-			return false; // 锁已被移走/损坏 ⇒ 认输（不建锁，让别人赢）
-		}
-		const curToken = typeof cur.token === "string" ? cur.token : undefined;
-		if (curToken !== observedToken.token) return false; // 别人已换过 ⇒ 认输
-
-		// 替换：先删再排他建（不覆盖任何别人的锁）
 		rmSync(lockPath, { force: true });
-		try {
-			writeFileSync(lockPath, JSON.stringify({ ...meta, tookOver: true, token: mintToken() }), { flag: "wx" });
-		} catch {
-			return false; // 有人抢先建了新锁 ⇒ 认输（**不覆盖它**）
-		}
+		writeFileSync(lockPath, JSON.stringify({ ...meta, token: mintToken(), forced: true }), { flag: "wx" });
 		return true;
-	} finally {
-		// 释放接管锁（best-effort）
-		try { rmSync(takeoverPath, { force: true }); } catch { /* ignore */ }
+	} catch {
+		return false;
 	}
 }
 
@@ -353,7 +287,7 @@ export interface ReapResult {
 export function reapZombie(
 	runsDir: string,
 	id: string,
-	opts: { deps?: ZombieDeps; now?: () => number } = {},
+	opts: { deps?: ZombieDeps; now?: () => number; force?: boolean } = {},
 ): ReapResult {
 	const now = opts.now?.() ?? Date.now();
 	const rec = readRunRecord(runsDir, id);
@@ -379,7 +313,7 @@ export function reapZombie(
 
 	// CAS：跨进程恰好一次
 	const at = new Date(now).toISOString();
-	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at }, { now: () => now })) {
+	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at }, { now: () => now, force: opts.force })) {
 		return { reaped: false, reason: "already-reaped" };
 	}
 

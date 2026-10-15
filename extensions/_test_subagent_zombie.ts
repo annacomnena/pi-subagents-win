@@ -22,7 +22,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import {
-	__setClaimReapTestHook,
 	claimReap,
 	detectZombie,
 	reapZombie,
@@ -213,17 +212,23 @@ try {
 		ok("Z11 批量扫描遵守 limit（不在 UI 读路径无界扫）");
 	}
 
-	// ── Z12：CAS 僵锁接管（L4 P1-3：赢家崩溃后不得永久卡死）──────────────
+	// ── Z12：**持久 claim**（第5代）：非 force 永不自动接管（杜绝双赢家）────────
 	{
 		const id = "run_z12";
 		mk(id, { id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		// 造一个「很旧」的锁（模拟赢家拿到锁后崩溃、run 仍 running）
-		const staleAt = iso(NOW - 10 * 60 * 1000); // 10min 前 > TTL(5min)
+		// 造一个「很旧」的 claim（模拟赢家拿到 claim 后崩溃）
+		const staleAt = iso(NOW - 10 * 60 * 1000);
 		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ reason: "pid-dead", at: staleAt }), { flag: "wx" });
+		// 默认：**不接管**（永久 claim；L4 四轮教训：过期无主文件无法安全接管）
 		const r = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false } });
-		assert.equal(r.reaped, true, "僵锁应被接管（否则永久卡死）");
-		assert.equal(readRunRecord(root, id)!.status, "failed", "接管后落终态");
-		ok("Z12 CAS 僵锁接管（TTL 超龄 ⇒ 可被接管，防永久卡死）");
+		assert.equal(r.reaped, false, "默认不自动接管（防双赢家）");
+		assert.equal(r.reason, "already-reaped", "短路原因为已认领");
+		assert.equal(readRunRecord(root, id)!.status, "running", "状态未被改");
+		// 显式 force：人工运维恢复路径
+		const r2 = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false }, force: true });
+		assert.equal(r2.reaped, true, "force 应恢复");
+		assert.equal(readRunRecord(root, id)!.status, "failed", "force 后落终态");
+		ok("Z12 持久 claim：默认不接管；force 才恢复（第5代，放弃 exactly-one 声明）");
 	}
 
 	// ── Z13：result.status 已是终态 ⇒ 不覆盖（L4 P1-5）─────────────────
@@ -248,124 +253,46 @@ try {
 	}
 
 
-	// ── Z15：**跨进程**僵锁双接管竞态（L4 二轮 P1：旧实现可双赢家）────────
+	// ── Z15：永久 claim 的**语义**验证（第5代；取代 Z15-Z19 六条失效用例）────
 	{
 		const id = "run_z15";
-		mk(id, { id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		// 造僵锁（超 TTL）
-		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ reason: "pid-dead", at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
-		const script = `
-			import { reapZombie } from ${JSON.stringify(new URL("./subagent-zombie.ts", import.meta.url).href)};
-			const r = reapZombie(${JSON.stringify(root)}, ${JSON.stringify(id)}, {
-				now: () => ${NOW}, deps: { isPidAlive: () => false },
-			});
-			process.stdout.write(JSON.stringify(r));
-		`;
-		const runOne = (): Promise<string> =>
-			new Promise((res, rej) => {
-				const p = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
-				let out = "";
-				p.stdout.on("data", (d) => (out += String(d)));
-				p.on("close", (c) => (c === 0 ? res(out) : rej(new Error(`exit ${c}: ${out}`))));
-			});
-		const outs = await Promise.all([runOne(), runOne(), runOne()]);
-		const winners = outs.map((o) => JSON.parse(o) as { reaped: boolean }).filter((r) => r.reaped).length;
-		assert.equal(winners, 1, `僵锁接管必须恰好 1 个赢家（实得 ${winners}）`);
-		assert.equal(readRunRecord(root, id)!.status, "failed", "恰好一次落终态");
-		// ⚠️ 诚实声明：跨进程撞窄竞态窗口的概率低（实测 3 进程在旧实现下也常 1 赢家）
-		// ⇒ 本用例是**烟雾测试**，不是竞态证明。真正的语义断言在 Z16。
-		ok("Z15 跨进程僵锁接管（烟雾：3 进程恰 1 赢家）");
+		const meta = { reason: "pid-dead" as const, at: iso(NOW) };
+		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		// 已被别人 claim（模拟赢家崩溃停在 claim 后）
+		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
+		// 非 force：多次尝试（**含超 TTL**）一律不接管 ⇒ 结构上排除双赢家
+		let wins = 0;
+		for (let i = 0; i < 10; i++) {
+			if (claimReap(root, id, meta, { now: () => NOW })) wins++;
+		}
+		assert.equal(wins, 0, `永久 claim：10 次非 force 接管应为 0（实得 ${wins}）`);
+		assert.equal(readRunRecord(root, id)!.status, "running", "状态未被改（等人 force）");
+		ok("Z15 永久 claim 语义：N 次非 force 接管 = 0 ⇒ 结构上排除双赢家");
 	}
 
-
-	// ── Z16：僵锁**语义**验证（Z15 是弱烟雾；此处直接断言「只能接管一次」）──
+	// ── Z16：force 恢复路径（人工运维）+ 已终态不再覆盖 ────────────────────
 	{
 		const id = "run_z16";
-		mk(id, { id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		// 造僵锁（超 TTL），然后连续 20 次调用 reapZombie：
-		// 无论实现细节如何，**语义上**只允许 1 次成功落终态。
-		let reapedCount = 0;
-		for (let i = 0; i < 20; i++) {
-			mk(id, { id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-			if (i === 0) writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ reason: "pid-dead", at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
-			const r = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false } });
-			if (r.reaped) reapedCount++;
-		}
-		assert.equal(reapedCount, 1, `僵锁语义：20 次尝试只允许 1 次接管成功（实得 ${reapedCount}）`);
-		ok("Z16 僵锁语义：N 次尝试只允许 1 次接管（不依赖撞窗口）");
+		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
+		const r1 = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false }, force: true });
+		assert.equal(r1.reaped, true, "force 恢复应成功");
+		assert.equal(readRunRecord(root, id)!.status, "failed", "force 后落终态");
+		const r2 = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false }, force: true });
+		assert.equal(r2.reaped, false, "已终态 ⇒ force 也不覆盖");
+		assert.equal(readRunRecord(root, id)!.status, "failed", "状态未被二次改写");
+		ok("Z16 force 恢复路径：成功一次 + 已终态后不再覆盖");
 	}
 
-
-	// ── Z17：僵锁接管的**确定性**验证（Z15/Z16 都不能确定抓到旧实现）────────
+	// ── Z17：force 也不能覆盖真完成（逐字节）─────────────────────────────
 	{
 		const id = "run_z17";
-		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		// 造僵锁
-		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
-		const meta = { reason: "pid-dead" as const, at: iso(NOW) };
-		// 单元级：直接调 claimReap 两次（同 now ⇒ 都认为锁是僵的）。
-		// 正确实现：第一次用 rename 移走僵锁⇒赢；第二次 rename 失败(ENOENT)⇒输。
-		// 旧式 rmSync+wx：两次都能删+建 ⇒ **两次都赢**（双赢家）。
-		const w1 = claimReap(root, id, meta, { now: () => NOW });
-		const w2 = claimReap(root, id, meta, { now: () => NOW });
-		assert.equal(w1, true, "第一次接管应成功");
-		assert.equal(w2, false, `第二次必须失败（否则双赢家）——旧 rmSync+wx 会 true`);
-		ok("Z17 僵锁接管确定性：同锁两次接管只能 1 次成功（能抓旧实现）");
-	}
-
-
-	// ── Z18：僵锁接管**确定性竞态**（用 seam 复现窄窗口；Z15-Z17 都抓不住）────
-	{
-		const id = "run_z18";
-		const meta = { reason: "pid-dead" as const, at: iso(NOW) };
-		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
-		// 在「A 判定僵锁」之后、「A 实际接管」之前，让 B 完成整个接管流程。
-		// 正确实现：A 的 rename 会因「僵锁已被 B 移走」而 ENOENT ⇒ A 输 ⇒ 单赢家。
-		// 旧式 rmSync+wx：A 会把 B 的新锁删掉重建 ⇒ **双赢家**。
-		let bWon: boolean | undefined;
-		__setClaimReapTestHook(() => {
-			__setClaimReapTestHook(undefined); // 防递归
-			bWon = claimReap(root, id, meta, { now: () => NOW });
-		});
-		const aWon = claimReap(root, id, meta, { now: () => NOW });
-		__setClaimReapTestHook(undefined);
-		assert.equal(bWon, true, "B（插入者）应赢");
-		assert.equal(aWon, false, `A 必须输（否则双赢家）——旧 rmSync+wx 会给 aWon=true`);
-		ok("Z18 僵锁双接管确定性竞态（seam）：插入者赢、原接管者输 ⇒ 无双赢家");
-	}
-
-
-	// ── Z19：L4 三轮反例——三方交错（B 插入 + C 抢先建锁 + A 核对失败）──────
-	{
-		const id = "run_z19";
-		const meta = { reason: "pid-dead" as const, at: iso(NOW) };
-		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
-		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
-		// A 判定僵锁后：B 完成接管，再由 C 抢占（wx）建锁；A 恢复后核对应认输
-		// ⚠️ 诚实标注：C 这一步是**人工构造**（生产代码里只有本模块写 `.reaped`，
-		// 而合法接管者都被 `.reaping` 接管锁串行化）。本用例真正验证的性质是
-		// 「**A 绝不覆盖第三方的锁**」——这是第 4 代实现的结构性保证（不再用 rename 放回）。
-		let bWon: boolean | undefined, cWon: boolean | undefined;
-		__setClaimReapTestHook(() => {
-			__setClaimReapTestHook(undefined);
-			bWon = claimReap(root, id, meta, { now: () => NOW });           // B 正常接管
-			try {
-				// C 模拟「第三方在 A 已建 .reaping 前后抢建锁」：直接删锁再 wx 建（同 C 的接管路径）
-				rmSync(join(root, `${id}.reaped`), { force: true });
-				writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW), token: "C-token" }), { flag: "wx" });
-				cWon = true;
-			} catch { cWon = false; }
-		});
-		const aWon = claimReap(root, id, meta, { now: () => NOW });
-		__setClaimReapTestHook(undefined);
-		assert.equal(bWon, true, "B 应赢");
-		assert.equal(cWon, true, "C 抢建成功");
-		assert.equal(aWon, false, `A 必须输（否则三方双赢家）——第3代「放回」实现会给 aWon=true`);
-		// C 的锁必须**未被 A 覆盖**
-		const lock = JSON.parse(readFileSync(join(root, `${id}.reaped`), "utf8")) as { token?: string };
-		assert.equal(lock.token, "C-token", "C 的锁不得被 A 抹掉（Windows rename 会覆盖 ⇒ 旧实现会抹）");
-		ok("Z19 三方交错：A 认输且不覆盖 C 的锁（能抓第3代「放回」实现）");
+		mk(id, { id, status: "completed", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999, result: { status: "completed", text: "done" } });
+		const before = readFileSync(join(root, `${id}.json`), "utf8");
+		const r = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false }, force: true });
+		assert.equal(r.reaped, false, "completed 永不被覆盖（即便 force）");
+		assert.equal(readFileSync(join(root, `${id}.json`), "utf8"), before, "文件逐字节未变");
+		ok("Z17 force 也不能覆盖真完成（逐字节未变）");
 	}
 
 
