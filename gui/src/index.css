@@ -223,7 +223,9 @@
 	--color-muted-foreground: var(--color-foreground-subtle);
 	--color-tag: var(--color-hover); /* 补缺（zcode 未定义/冷灰）→ 暖抬升档 */
 	--color-toast: var(--color-panel); /* 补缺（zcode 未定义/冷灰）→ 暖浮层底 */
-	--color-tooltip: color-mix(in oklab, var(--color-surface-warm) 22%, transparent); /* 补缺：暖浮层 #2a2825 */
+	--color-tooltip: #2a2825; /* 暖浮层底（**不透明**）：浮层可能棰在任意内容上（含暖沙用户气泡 #e8e6dc），
+	 * 半透明会使 tooltip-foreground 在浅底上崩到 1.19:1（_test_contrast 实拦）。
+	 * 与 @theme / .theme-warm-light 同值——之前这里误写成 22% 半透明，与 S1 注释意图不符。 */
 	--color-tooltip-foreground: var(--color-foreground-strong);
 	--color-interaction-ask-surface: color-mix(in oklab, var(--color-brand-terracotta) 22%, var(--color-brand-ink)); /* 陶土 wash #37251e */
 	--color-interaction-ask-foreground: var(--color-brand-ivory); /* 暖白字（实测 13.2:1） */

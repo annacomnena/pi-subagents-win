@@ -130,7 +130,8 @@
     "test:message-outbox": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_message_outbox.ts",
     "test:expectations": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_expectations.ts",
     "test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts",
-    "test:gate-dialects": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_gate_dialects.ts"
+    "test:gate-dialects": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_gate_dialects.ts",
+    "test:gui-contrast": "node --experimental-strip-types ./gui/src/_test_contrast.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
