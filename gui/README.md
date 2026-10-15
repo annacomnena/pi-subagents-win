@@ -3,6 +3,33 @@
 vite + react + ts + tailwind v4 + zustand 的浏览器工作台，经 **vite dev proxy** 同源访问
 runtime-host（`/v1/*` 转发，server 零改动：无 CORS、不托管 dist）。
 
+## 视觉体系：Anthropic 暖纸（2026-10-15 起）
+
+界面为 **Anthropic 暖纸体系**：暖炭底 + 暖灰字 + **单一陶土重音**（`#c96442`）+ 环状边框分层
++ **衬线只在 ≥20px 标题**。不再是 ZCode「Zai Dark」1:1 复刻。（S1–S6c 已全量切完：token 底座、
+shadcn 套件、门面、12 页面、圆角与焦点收敛。）
+
+**权威文档（改 UI 前先读）**：
+
+| 文档 | 角色 |
+|---|---|
+| `plans/20261015_gui_anthropic_style_guide.md` | **数值权威**：§3 设计 token 值表、§3.5 圆角 px↔class 映射表、§4 字阶、§6 对比度实测表、§7 逐文件改动清单 |
+| `plans/20261015_gui_anthropic_refactor_instructions.md` | 执行切片 S1–S7 + 铁律（红线文件清单）+ 验收清单 |
+| `index.html` 配套原型（**不在本仓**，在派发方手上）| **观感参照** |
+
+> ⚠️ 原型 `index.html` **未入库**（仓内 `gui/index.html` 是 vite 入口，不是原型）——只看本仓时，
+> 以指导文档 §3/§3.5 的数值为准即可。两者冲突时：**数值听指导文档，观感听原型**。
+
+**硬门（改配色必须复算）**：正文/元信息/徽章 ≥ **4.5:1**；大字与图标 ≥ **3:1**。
+暗/亮两主题各 4 个实际表面（`bg-background` / `bg-sidebar` / `bg-panel` / `bg-card`）逐对核。
+最新独立复核（L4，从 `dist` 实际 CSS 常量重算）：**102 对全通过**。
+
+**两条易错点**（已踩过）：
+1. **圆角 px ≠ 类名直觉**：Tailwind v4 实测 `rounded-md` = **6px**、`rounded-lg` = **8px**。
+   一律查 §3.5 映射表，不要靠直觉写类名。
+2. **主题是双层的**：`@theme`（亮基底）+ `.theme-warm-dark` / `.theme-warm-light`（生效层）。
+   改 token 必须三层同改，否则某主题下静默失效。
+
 ## ⚠️ import 惯例分叉（勿互相「修正」）
 
 **gui/ 内所有 import 不带 `.ts` / `.tsx` 扩展名**（vite/esbuild bundler resolution 硬要求）。
@@ -38,6 +65,10 @@ src/api/types.ts    version:1 冻结契约手抄（勿跨 package import server 
 src/api/client.ts   fetch never-throw + 6 端点封装；409 → resync 信号
 src/store.ts        zustand：数据 + nextCursor + connection + activeTab + autoHandoff 本地态
 src/usePoll.ts      分档轮询（2s 增量 / 5-10s 全量）；visibilitychange 暂停
-src/ui/             手写小组件（≤8 个，无 shadcn/radix）
-src/pages/          Master / Workstream / Attention / Timeline / Runtime
+src/index.css       主题底座：@theme 亮基底 + .theme-warm-dark / .theme-warm-light + .tone-chip
+src/ui/             shadcn 套件（14 件）+ 门面（Button/Badge/Card/Toggle/EmptyState/Term/ShortId/RelTime）
+src/pages/          顶栏/侧栏+会话列表/聊天 · 覆盖层（Master / Workstream / Attention / Runtime / Channels / Autonomy / Timeline / RuntimeOverlay）
 ```
+
+主题测试门禁：`npm run test:gui-theme-contract`（token 值 + 冷灰零残留 + WCAG 自算）；
+布局冒烟：`npm run test:gui-zcode-replica`。
