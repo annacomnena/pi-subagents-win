@@ -72,7 +72,7 @@ export function TimelinePage() {
 						key={f.id}
 						type="button"
 						onClick={() => setFilterId(f.id)}
-						className={`rounded-md border px-2 py-0.5 text-ui-xs transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 ${
+						className={`rounded-md border px-2 py-0.5 text-ui-xs transition-colors ${
 							filterId === f.id
 								? "border-border-hover bg-selected text-foreground"
 								: "border-border text-foreground-subtle hover:bg-hover hover:text-foreground"

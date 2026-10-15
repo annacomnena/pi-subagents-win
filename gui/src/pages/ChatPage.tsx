@@ -180,7 +180,7 @@ function ToolCallRowView({ row }: { row: Extract<TranscriptRow, { kind: "toolCal
 				data-zcode-tool-stream-animate="true"
 			>
 				{/* 摘要行（ToolSummaryRow.tsx canToggle 分支 + ToolLayout.tsx#L165-176）：图标刻意不转 */}
-				<CollapsibleTrigger className="group/tool-summary inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-input-border-focused">
+				<CollapsibleTrigger className="group/tool-summary inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base transition-colors">
 					<span className="shrink-0 text-foreground-subtlest [&_svg]:text-foreground-subtlest">
 						<Wrench className="size-3.5" />
 					</span>
