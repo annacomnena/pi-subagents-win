@@ -362,7 +362,7 @@ export function ToastMessageView({
           ) : (
             <Info className="size-4 shrink-0 text-foreground-subtle" aria-hidden="true" />
           )}
-          <div className="flex min-w-0 flex-[1_0_0] items-start gap-4 py-3 text-sm">
+          <div className="flex min-w-0 flex-[1_0_0] items-start gap-4 py-3 text-ui-base">
             <div className="min-w-0 flex-1 leading-5">
               <div className="text-foreground">{displayTitle}</div>
               {displayBody ? (

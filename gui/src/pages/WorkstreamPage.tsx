@@ -121,7 +121,7 @@ export function WorkstreamPage() {
 								</div>
 							}
 						>
-							<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+							<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 								<DetailRow label="使命（要做的事）">{selected.mission}</DetailRow>
 								<DetailRow label="状态">
 									<Badge tone={statusTone(selected.status)}>{zhStatus(WS_STATUS_ZH, selected.status)}</Badge>

@@ -35,7 +35,7 @@ function AutonomySettings() {
 	const refresh = useCallback(async () => { try { const r = await fetch("/v1/autonomy/status"); if (r.ok) setState(await r.json()); else setError(`状态读取失败 HTTP ${r.status}`); } catch { setError("状态读取失败"); } }, []);
 	useEffect(() => { void refresh(); }, [refresh]);
 	const toggle = async (enabled: boolean) => { try { const r = await fetch("/v1/autonomy/set", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }); if (!r.ok) { setError(`写入失败 HTTP ${r.status}`); return; } setError(""); await refresh(); } catch { setError("写入失败"); } };
-	return <Card title="主动性套件"><div className="space-y-2 text-xs"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；开启动作开关后仅执行可回滚动作（诊断报告 + 本地通知信），不自动派活、不自动重启 worker。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
+	return <Card title="主动性套件"><div className="space-y-2 text-ui-sm"><div className="flex items-center gap-2"><Toggle on={state?.enabled ?? false} disabled={!state} onChange={(v) => void toggle(v)} labels={["关","开"]} />启用主动性套件</div><p>开启后启用总门（可压制唤醒）+ 写审计/快照；开启动作开关后仅执行可回滚动作（诊断报告 + 本地通知信），不自动派活、不自动重启 worker。</p><p>状态：enabled={state?.enabled ? "on" : "off"} · kill={state?.kill ?? "—"} · frontier={state?.frontier ?? "(none)"} · wake-gate={state?.wakeGate ?? "(never)"}</p><p>awayMode：未实现（保留字段），不提供开关。</p>{error && <p className="text-destructive">{error}</p>}</div></Card>;
 }
 
 // ── frontier 可视化（C 时效 / A 项目矩阵 / B 触发记录）──────────────────────────
@@ -64,11 +64,13 @@ function GateBadge({ gate }: { gate: AutonomyGateStatus }) {
 	return <Badge tone="na" title="gate 未知/未定：无载体，不猜（常态非异常，同 watchdog 3/8 恒 unknown 语义）">gate 未知</Badge>;
 }
 
-/** A 项目状态矩阵：一行一项目；needsUser 高亮（暖色描边/底），一眼看出哪个卡住/需要人。 */
+/** A 项目状态矩阵：一行一项目；needsUser 高亮（暖色描边/底），一眼看出哪个卡住/需要人。
+ * §7 A-14：needsUser = 人需要介入 = 品牌动作 → accent wash（不再用 warning 警示色，
+ * 避免「人介入」被读成「出错了」）。 */
 function ProjectRow({ p }: { p: ProjectFrontier }) {
 	const runs = Object.entries(p.runs);
 	return (
-		<div className={`rounded-md border p-2.5 ${p.needsUser ? "border-warning/50 bg-warning/5" : "border-border bg-surface"}`}>
+		<div className={`rounded-lg border p-2.5 ${p.needsUser ? "tone-chip [--chip-tone:var(--color-accent)]" : "border-border bg-card"}`}>
 			<div className="flex flex-wrap items-center gap-1.5">
 				<Badge tone={STATE_TONE[p.state]}>{STATE_LABEL[p.state]}</Badge>
 				{p.variant !== null && <Badge tone="gray" title="C5 变体标注（waiting/orphaned/resultMissing）">{p.variant}</Badge>}
@@ -92,10 +94,11 @@ function ProjectRow({ p }: { p: ProjectFrontier }) {
 	);
 }
 
-/** B 触发记录表：rule/project/evidence；approximate 视觉区分（降透明度 + 「近似」徽标）。 */
+/** B 触发记录表：rule/project/evidence；approximate 视觉区分（§7 A-14：虚线边框而非变色，
+ * 不改颜色语义 → 不把「近似」误读为「错误」）。 */
 function TriggerRow({ t }: { t: FrontierTrigger }) {
 	return (
-		<div className={`flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-b border-border py-1.5 text-ui-sm last:border-b-0 ${t.approximate ? "opacity-65" : ""}`}>
+		<div className={`flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-b border-border py-1.5 text-ui-sm last:border-b-0 ${t.approximate ? "border-dashed" : ""}`}>
 			<span className="font-mono text-foreground">{t.rule}</span>
 			<span className="min-w-0 break-all font-mono text-ui-xs text-foreground-subtle">{t.project}</span>
 			<span className="text-ui-xs text-foreground-subtle">{t.evidence}</span>

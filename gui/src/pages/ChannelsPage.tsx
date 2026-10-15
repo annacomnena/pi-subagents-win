@@ -143,7 +143,7 @@ function ReplyBlock() {
 	}, []);
 	useEffect(() => { void refresh(); const t = window.setInterval(() => void refresh(), 5000); return () => window.clearInterval(t); }, [refresh]);
 	return <Card title={<Term zh="回复微信（只读）" en="reply status" hint="意图状态计数；不展示消息正文、token 或完整 openid" />}>
-		<div className="space-y-2 text-xs">
+		<div className="space-y-2 text-ui-sm">
 			<p>回复开关：{data ? (data.enabled ? "开启" : "关闭") : httpStatus === 403 ? "微信通道未启用" : httpStatus === 401 ? "未授权" : "暂不可用"}</p>
 			<p>意图：待处理 {data?.counts.pending ?? "—"} · 已发送 {data?.counts.sent ?? "—"} · 失败 {data?.counts.failed ?? "—"} · 未知 {data?.counts.unknown ?? "—"}</p>
 			<p>最近更新：<RelTime at={data?.lastAt ?? null} />{data?.lastError ? ` · 最近错误：${data.lastError}` : ""}</p>
@@ -229,18 +229,18 @@ function ReceiveBlock() {
 		>
 			<div className="space-y-2">
 				{worker !== null && !worker.enabled && (
-					<p className="text-xs text-foreground-subtle">
+					<p className="text-ui-sm text-foreground-subtle">
 						消息接收未启用（config <span className="font-mono">channels.wechat.receive.enabled</span> 缺省 false——显式 opt-in 后 daemon 才会拉取；本页为只读展示）。
 					</p>
 				)}
 				{worker?.status === "auth_required" && (
-					<p className="text-xs text-destructive">{worker.lastError ?? "bot_token 已失效"}：请解绑后重新扫码绑定（worker 已停止轮询，不会风暴重试）。</p>
+					<p className="text-ui-sm text-destructive">{worker.lastError ?? "bot_token 已失效"}：请解绑后重新扫码绑定（worker 已停止轮询，不会风暴重试）。</p>
 				)}
 				{worker?.status === "uncertain" && worker.lastError !== null && (
-					<p className="text-xs text-warning">{worker.lastError}</p>
+					<p className="text-ui-sm text-warning">{worker.lastError}</p>
 				)}
 				{worker !== null && worker.enabled && (
-					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-ui-sm">
 						<dt className="text-foreground-subtle">轮询状态</dt>
 						<dd className="text-foreground">
 							{WORKER_STATUS_LABEL[worker.status]}；最近拉取 <RelTime at={worker.lastPollAt} />；待处理 {worker.backlog} 条
@@ -265,12 +265,12 @@ function ReceiveBlock() {
 									)}
 									{m.artifactPending === true && <Badge tone="gray">附件待处理</Badge>}
 								</div>
-								<p className="mt-1 break-all text-xs text-foreground">{m.text}</p>
+								<p className="mt-1 break-all text-ui-sm text-foreground">{m.text}</p>
 							</li>
 						))}
 					</ul>
 				)}
-				{quarantine !== null && quarantine.count > 0 && <section className="border-t border-border pt-2"><h4 className="text-xs font-medium">被拒/未处理（{quarantine.count}）</h4><p className="text-ui-xs">这些条目没有进入会话；加入白名单或绑定本人后会重新评估，不是永久终态。</p><ul>{quarantine.entries.map((e, i) => <li key={`${e.msgId}-${i}`} className="text-ui-sm">{e.reason} · {e.at} · {e.msgId ?? "—"}</li>)}</ul></section>}
+				{quarantine !== null && quarantine.count > 0 && <section className="border-t border-border pt-2"><h4 className="text-ui-sm font-medium">被拒/未处理（{quarantine.count}）</h4><p className="text-ui-xs">这些条目没有进入会话；加入白名单或绑定本人后会重新评估，不是永久终态。</p><ul>{quarantine.entries.map((e, i) => <li key={`${e.msgId}-${i}`} className="text-ui-sm">{e.reason} · {e.at} · {e.msgId ?? "—"}</li>)}</ul></section>}
 				<p className="text-ui-xs leading-relaxed text-foreground-subtle">
 					W1 只收不投：收到的消息仅持久化在本机私有 inbox 并在此只读展示（发送者 ID 前缀脱敏、正文截断）。
 				</p>
@@ -281,18 +281,79 @@ function ReceiveBlock() {
 
 interface InputStatus { enabled: boolean; allowFrom: { id: string; masked: string }[]; masterAlive: boolean; masterSid12?: string; lastDecision: string | null; lastReason: string | null; lastAt: string | null }
 interface Sender { fromId: string; fromNicknameMasked: string | null; lastAt: string; msgCount: number; allowlisted: boolean }
+/** §7 A-13：原先整段压成单行 JSX，语义不可读；本轮按结构断行（零行为变化）。 */
 function InputBlock() {
- const [status, setStatus] = useState<InputStatus | null>(null); const [senders, setSenders] = useState<Sender[]>([]);
- const refresh = useCallback(async () => { const [s, a] = await Promise.all([fetchWechatReadonly<InputStatus>("/v1/wechat/input/status"), fetchWechatReadonly<Sender[]>("/v1/wechat/senders")]); if(s.ok) setStatus(s.data); if(a.ok) setSenders(a.data); }, []);
- useEffect(() => { void refresh(); const t=window.setInterval(()=>void refresh(),5000); return ()=>window.clearInterval(t); },[refresh]);
- const save = async (patch: {enabled?:boolean;allowFrom?:string[];add?:string[];remove?:string[]}) => { const r=await fetch("/v1/wechat/input/set",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(patch)}); if(r.ok) await refresh(); };
- return <Card title="允许微信消息进入对话"><div className="space-y-3">
- <p className="text-xs font-semibold text-destructive">开启后，白名单内的微信消息将作为你本人的输入进入当前 master 会话（单条一次批 + 脱敏审计）。</p>
- <Toggle on={status?.enabled===true} onChange={v=>void save({enabled:v})} labels={["关闭","开启"]}/>
- <div><p className="text-xs font-medium">白名单</p>{(status?.allowFrom.length??0)===0?<p className="text-xs text-destructive">未配置 = 拒绝所有（fail-closed）</p>:<ul>{status?.allowFrom.map(item=><li key={item.id}>{item.masked}<Button variant="ghost" onClick={()=>void save({remove:[item.id]})}>删除</Button></li>)}</ul>}</div>
- <div><p className="text-xs font-medium">最近发送者</p>{senders.map(s=><div key={s.fromId} className="flex gap-2 text-xs"><span>{s.fromId.slice(0,6)}…{s.fromId.slice(-4)} {s.fromNicknameMasked??""} · {s.lastAt} · {s.msgCount} 条</span>{s.allowlisted?<Badge tone="green">已允许</Badge>:<Button variant="secondary" onClick={()=>void save({add:[s.fromId]})}>允许</Button>}</div>)}</div>
- <p className="text-xs">为什么没进来：<span className={status?.masterAlive?"text-success":"text-destructive"}>{status?.masterAlive?"master 在线":"master 离线"}</span> · {status?.lastDecision??"暂无判定"} ({status?.lastReason??"—"}) · <RelTime at={status?.lastAt??null}/>{status?.masterAlive===false&&"；先 /gui open"}</p>
- </div></Card>;
+	const [status, setStatus] = useState<InputStatus | null>(null);
+	const [senders, setSenders] = useState<Sender[]>([]);
+	const refresh = useCallback(async () => {
+		const [s, a] = await Promise.all([
+			fetchWechatReadonly<InputStatus>("/v1/wechat/input/status"),
+			fetchWechatReadonly<Sender[]>("/v1/wechat/senders"),
+		]);
+		if (s.ok) setStatus(s.data);
+		if (a.ok) setSenders(a.data);
+	}, []);
+	useEffect(() => {
+		void refresh();
+		const t = window.setInterval(() => void refresh(), 5000);
+		return () => window.clearInterval(t);
+	}, [refresh]);
+	const save = async (patch: { enabled?: boolean; allowFrom?: string[]; add?: string[]; remove?: string[] }) => {
+		const r = await fetch("/v1/wechat/input/set", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(patch),
+		});
+		if (r.ok) await refresh();
+	};
+	return (
+		<Card title="允许微信消息进入对话">
+			<div className="space-y-3">
+				<p className="text-ui-sm font-semibold text-destructive">
+					开启后，白名单内的微信消息将作为你本人的输入进入当前 master 会话（单条一次批 + 脱敏审计）。
+				</p>
+				<Toggle on={status?.enabled === true} onChange={(v) => void save({ enabled: v })} labels={["关闭", "开启"]} />
+				<div>
+					<p className="text-ui-sm font-medium">白名单</p>
+					{(status?.allowFrom.length ?? 0) === 0 ? (
+						<p className="text-ui-sm text-destructive">未配置 = 拒绝所有（fail-closed）</p>
+					) : (
+						<ul>
+							{status?.allowFrom.map((item) => (
+								<li key={item.id}>
+									{item.masked}
+									<Button variant="ghost" onClick={() => void save({ remove: [item.id] })}>删除</Button>
+								</li>
+							))}
+						</ul>
+					)}
+				</div>
+				<div>
+					<p className="text-ui-sm font-medium">最近发送者</p>
+					{senders.map((s) => (
+						<div key={s.fromId} className="flex gap-2 text-ui-sm">
+							<span>
+								{s.fromId.slice(0, 6)}…{s.fromId.slice(-4)} {s.fromNicknameMasked ?? ""} · {s.lastAt} · {s.msgCount} 条
+							</span>
+							{s.allowlisted ? (
+								<Badge tone="green">已允许</Badge>
+							) : (
+								<Button variant="secondary" onClick={() => void save({ add: [s.fromId] })}>允许</Button>
+							)}
+						</div>
+					))}
+				</div>
+				<p className="text-ui-sm">
+					为什么没进来：
+					<span className={status?.masterAlive ? "text-success" : "text-destructive"}>
+						{status?.masterAlive ? "master 在线" : "master 离线"}
+					</span>{" · "}
+					{status?.lastDecision ?? "暂无判定"} ({status?.lastReason ?? "—"}) · <RelTime at={status?.lastAt ?? null} />
+					{status?.masterAlive === false && "；先 /gui open"}
+				</p>
+			</div>
+		</Card>
+	);
 }
 
 export function ChannelsPage() {
@@ -444,13 +505,13 @@ export function ChannelsPage() {
 						<EmptyState>
 							微信连接功能尚未启用（channels.wechat.enabled = off）。点击下方按钮启用后，即可在本页生成绑定二维码。
 						</EmptyState>
-						<p className="text-xs text-foreground-subtle">启用后需在本机 TUI 侧完成扫码。</p>
+						<p className="text-ui-sm text-foreground-subtle">启用后需在本机 TUI 侧完成扫码。</p>
 						<div className="flex gap-2">
 							<Button variant="primary" onClick={() => void doEnable()} disabled={busy !== null}>
 								{busy === "enable" ? "启用中…" : "启用微信连接"}
 							</Button>
 						</div>
-						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				</Card>
 			</div>
@@ -494,19 +555,19 @@ export function ChannelsPage() {
 
 				{uiState === "idle" && (
 					<div className="space-y-3">
-						<p className="text-xs text-foreground-subtle">未绑定。生成后用**手机微信**扫码确认（二维码约 120 秒内有效，过期需重新生成）。</p>
+						<p className="text-ui-sm text-foreground-subtle">未绑定。生成后用**手机微信**扫码确认（二维码约 120 秒内有效，过期需重新生成）。</p>
 						<div className="flex gap-2">
 							<Button variant="primary" onClick={() => void doStart()} disabled={busy !== null}>
 								{busy === "start" ? "生成中…" : "生成二维码"}
 							</Button>
 						</div>
-						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				)}
 
 				{(uiState === "waiting" || uiState === "scanned") && (
 					<div className="space-y-3">
-						<p className="text-xs text-foreground-subtle">
+						<p className="text-ui-sm text-foreground-subtle">
 							{uiState === "scanned" ? "已扫码，请在**手机端**点「确认登录」…" : "等待扫码：请用**手机微信**扫描下方二维码"}
 							{expiresIn !== null && (
 								<span className="text-foreground-subtle">（约 {expiresIn}s 内有效）</span>
@@ -528,13 +589,13 @@ export function ChannelsPage() {
 								{busy === "cancel" ? "取消中…" : "取消"}
 							</Button>
 						</div>
-						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				)}
 
 				{uiState === "bound" && (
 					<div className="space-y-3">
-						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 							<dt className="text-foreground-subtle">绑定时间</dt>
 							<dd className="text-foreground">
 								<RelTime at={status?.boundAt ?? null} />
@@ -550,25 +611,25 @@ export function ChannelsPage() {
 								{busy === "unbind" ? "解绑中…" : "解绑"}
 							</Button>
 						</div>
-						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				)}
 
 				{uiState === "expired" && (
 					<div className="space-y-3">
-						<p className="text-xs text-foreground-subtle">二维码已过期（约 120s 未确认）。请重新生成后再次扫码。</p>
+						<p className="text-ui-sm text-foreground-subtle">二维码已过期（约 120s 未确认）。请重新生成后再次扫码。</p>
 						<div className="flex gap-2">
 							<Button variant="primary" onClick={() => void doStart()} disabled={busy !== null}>
 								{busy === "start" ? "生成中…" : "重新生成"}
 							</Button>
 						</div>
-						{actionError !== null && <p className="text-xs text-destructive">{actionError}</p>}
+						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				)}
 
 				{uiState === "error" && (
 					<div className="space-y-3">
-						<p className="text-xs text-destructive">{status?.message ?? "未知错误"}</p>
+						<p className="text-ui-sm text-destructive">{status?.message ?? "未知错误"}</p>
 						<div className="flex gap-2">
 							<Button variant="primary" onClick={() => void doStart()} disabled={busy !== null}>
 								{busy === "start" ? "重试中…" : "重试"}

@@ -81,7 +81,7 @@ export function MasterPage() {
 					{!att ? (
 						<EmptyState icon={<Crown className="size-5" />}>还没有会话接管主控——接管后这里会显示值守信息</EmptyState>
 					) : (
-						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 							<dt className="text-foreground-subtle"><Term zh="主控身份" en="logical id" /></dt>
 							<dd><ShortId value="agent://master_default" /></dd>
 							<dt className="text-foreground-subtle"><Term zh="当前值守会话" en="owner session" /></dt>
@@ -149,7 +149,7 @@ export function MasterPage() {
 						{!proposal ? (
 							<EmptyState icon={<Crown className="size-5" />}>还没有交接提案</EmptyState>
 						) : (
-							<div className="space-y-1.5 text-xs">
+							<div className="space-y-1.5 text-ui-sm">
 								<div className="flex items-center gap-2">
 									<Badge tone={statusTone(pStatus)}>{zhStatus(PROPOSAL_STATUS_ZH, pStatus)}</Badge>
 									<span className="text-foreground-subtle">接班代数：{genText}</span>
@@ -213,7 +213,7 @@ export function MasterPage() {
 							{autoHandoff === null ? (
 								<Tooltip>
 									<TooltipTrigger asChild>
-										<span className="cursor-help border-b border-dashed border-border-hover text-sm text-foreground-subtle">状态未知</span>
+										<span className="cursor-help border-b border-dashed border-border-hover text-ui-base text-foreground-subtle">状态未知</span>
 									</TooltipTrigger>
 									<TooltipContent>后端数据未就绪，无法读取真实状态</TooltipContent>
 								</Tooltip>
@@ -237,7 +237,7 @@ export function MasterPage() {
 					{masterTimeline.length === 0 ? (
 						<EmptyState icon={<Crown className="size-5" />}>还没有发生过交接事件</EmptyState>
 					) : (
-						<ul className="space-y-1 text-xs">
+						<ul className="space-y-1 text-ui-sm">
 							{masterTimeline.map((t) => (
 								<li key={t.id} className="flex gap-2">
 									<RelTime at={t.at} className="w-20 shrink-0 text-ui-xs text-foreground-subtle" />

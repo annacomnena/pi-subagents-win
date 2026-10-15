@@ -59,8 +59,10 @@ export function RuntimeOverlay() {
 			aria-label="运行时"
 			className="absolute inset-0 z-30"
 		>
-			{/* SettingsPage 骨架（SettingsPage.tsx#L1375 照抄）：68px 图标栏 / ≥lg 268px 全栏 */}
-			<div className="relative grid h-screen min-h-full w-full grid-cols-[68px_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] bg-background lg:grid-cols-[268px_minmax(0,1fr)]">
+			{/* SettingsPage 骨架（SettingsPage.tsx#L1375 照抄）：68px 图标栏 / ≥lg 268px 全栏。
+			 * §7 A-15：容器底 bg-background → bg-panel（覆盖层是次级容器）+ 20px 圆角。
+			 * 圆角要与 A-15 已有约定一致才可见：与返回钮同口径内缩 m-1（w-[calc(100%-0.5rem)]）。 */}
+			<div className="relative m-1 grid h-[calc(100%-0.5rem)] min-h-0 w-[calc(100%-0.5rem)] grid-cols-[68px_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] overflow-hidden rounded-[20px] border border-border bg-panel lg:grid-cols-[268px_minmax(0,1fr)]">
 				{/* 左导航栏 */}
 				<nav className="flex min-h-0 flex-col overflow-y-auto p-1" aria-label="运行时 section 导航">
 					{/* 返回钮（SettingsPage.tsx#L1408 圆角-xl 套件照抄） */}
