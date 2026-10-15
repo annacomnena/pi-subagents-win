@@ -1,7 +1,7 @@
 /**
  * AppearancePage.tsx — 「外观」设置页（S6：主题偏好）。
  *
- * 纯 UI 态：偏好写 localStorage（键 `od-gui-theme`），**不写 config.json、
+ * 纯 UI 态：偏好仅存**本次会话内存**（不持久化 —— K3 断言禁止 WebStorage），**不写 config.json、
  * 不加后端端点、不动 daemon**（指导文档 §2 C-3 红线）。
  *
  * 默认暖暗（风格指南口径「暖暗优先」，工作台长时间盯屏）；暖亮为结构免费的次选。
@@ -44,9 +44,9 @@ export function AppearancePage() {
 
 	return (
 		<div className="space-y-3">
-			<PageIntro>界面主题（只影响本浏览器，不写服务端配置）</PageIntro>
+			<PageIntro>界面主题（仅本次会话；刷新后回默认暖暗）</PageIntro>
 			<Card
-				title={<Term zh="主题" en="theme" hint="偏好存 localStorage 键 od-gui-theme；默认暖暗；不写 config.json、不加后端端点" />}
+				title={<Term zh="主题" en="theme" hint="默认暖暗；仅本次会话生效（不持久化）；不写 config.json、不加后端端点" />}
 			>
 				<ul className="space-y-2">
 					{OPTIONS.map((o) => {

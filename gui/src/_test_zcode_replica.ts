@@ -55,10 +55,11 @@ ok("1 主题底座：暖色契约 token / 14px / 滚动条 / 动画 / @custom-va
 
 // main.tsx 按 localStorage 偏好选主题（读优先，默认暖暗）
 const mainSrc = read("main.tsx");
-assert.ok(mainSrc.includes('from "./theme"') && mainSrc.includes("applyTheme(root, initial)"), "main.tsx 经 theme.ts 应用主题（非硬编码 class）");
-assert.ok(read("theme.ts").includes('THEME_STORAGE_KEY = "od-gui-theme"'), "主题偏好键 od-gui-theme");
-assert.ok(read("theme.ts").includes('=== "warm-light" ? "warm-light" : "warm-dark"'), "默认值 = 暖暗（风格指南口径）");
-ok("1b main.tsx 读 localStorage 选主题（默认暖暗；偏好纯 UI 态）");
+assert.ok(mainSrc.includes('from "./theme"') && mainSrc.includes("applyTheme(root, DEFAULT_THEME)"), "main.tsx 经 theme.ts 应用主题（非硬编码 class）");
+assert.ok(read("theme.ts").includes('DEFAULT_THEME: GuiTheme = "warm-dark"'), "默认值 = 暖暗（风格指南口径）");
+// 2026-10-16：主题改为**内存态**（K3 断言禁止 gui/src 全量 WebStorage）⇒ 不再断言 localStorage 键
+assert.ok(!/localStorage|sessionStorage/.test(read("theme.ts")), "theme.ts 零 WebStorage（K3 口径）");
+ok("1b main.tsx 经 theme.ts 应用主题（默认暖暗；内存态、零 WebStorage）");
 
 // ── 2. 依赖 + ui 14 件 ─────────────────────────────────────────────
 const pkg = JSON.parse(read("../package.json")) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };

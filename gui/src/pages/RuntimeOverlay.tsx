@@ -34,7 +34,7 @@ const SECTIONS: { id: RuntimeOverlaySection; zh: string; icon: LucideIcon }[] = 
 	{ id: "wechat", zh: "微信连接", icon: MessageCircle },
 	// 2026-09-30：第 6 个 section「主动性」（从微信页拆出的独立设置页：开关 + frontier 可视化）
 	{ id: "autonomy", zh: "主动性", icon: Activity },
-	// S6：主题偏好（UI 态；localStorage，不写 config.json/不加端点）
+	// S6：主题偏好（UI 态；仅本次会话内存，不写 config.json/不加端点 —— 见 theme.ts 头注）
 	{ id: "appearance", zh: "外观", icon: Palette },
 ];
 
