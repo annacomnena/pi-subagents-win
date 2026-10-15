@@ -110,10 +110,14 @@ import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
 import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
+import { resolveForceReplayMount } from "./force-replay-mount.ts";
 import {
+	defaultSessionsRoot,
 	defaultTabRunsDir,
 	newTabRunId,
+	readTabDispatch,
 	readTabResultFile,
+	sessionBucketForCwd,
 	validateTabDispatchRecord,
 	writeTabDispatch,
 	type TabDispatchRecord,
