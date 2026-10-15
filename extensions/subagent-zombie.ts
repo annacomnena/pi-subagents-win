@@ -190,6 +190,22 @@ export function writeRecordAtomic(runsDir: string, id: string, rec: unknown): vo
 	renameSync(tmp, finalPath);
 }
 
+/** 锁身份指纹：每次接管生成唯一 token，用于「移走的是不是我看到的那枚锁」核对。 */
+function mintToken(): string {
+	return `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * 测试专用 seam（**唯一用途**：确定性复现「两个接管者同时判定僵锁」这个窄竞态窗口）。
+ * 生产代码永不设置它。这是必要的：实测证明「顺序调用」与「多进程撞窗口」都无法稳定复现
+ * 该竞态（TTL 会挡住顺序第二次；撞窗口概率过低），故只能显式注入。
+ */
+let __claimReapTestHook: (() => void) | undefined;
+/** 仅供测试：设置在「判定僵锁」与「实际接管」之间执行的钩子。 */
+export function __setClaimReapTestHook(h: (() => void) | undefined): void {
+	__claimReapTestHook = h;
+}
+
 /** CAS 锁的 TTL：赢家若在写终态前崩溃，超此龄的锁被视为僵锁（可被接管），避免永久卡死。 */
 export function reapLockTtlMs(): number {
 	return intEnv("PI_SUBAGENT_ZOMBIE_LOCK_TTL_MS", 5 * 60 * 1000);
@@ -216,22 +232,65 @@ export function claimReap(
 	if (!existsSync(runsDir)) mkdirSync(runsDir, { recursive: true });
 	const lockPath = join(runsDir, `${id}.reaped`);
 	try {
-		writeFileSync(lockPath, JSON.stringify(meta), { flag: "wx" });
+		writeFileSync(lockPath, JSON.stringify({ ...meta, token: mintToken() }), { flag: "wx" });
 		return true;
 	} catch (e) {
 		if ((e as { code?: string }).code !== "EEXIST") throw e;
 	}
 	// 已存在：判定是否为僵锁（赢家崩溃）
 	try {
-		const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { at?: string };
+		const rawLock = readFileSync(lockPath, "utf8");
+		const raw = JSON.parse(rawLock) as { at?: string; token?: string };
 		const atMs = Date.parse(String(raw.at ?? ""));
 		// 与 detectZombie 同一时钟源（可注入，便于测试与控制）
 		const nowMs = opts.now?.() ?? Date.now();
 		const age = Number.isFinite(atMs) ? nowMs - atMs : Number.POSITIVE_INFINITY;
 		if (age < reapLockTtlMs()) return false; // 别人的活锁 ⇒ 正常短路
-		// 僵锁：接管（删后重建；仍是 wx 排他）
-		rmSync(lockPath, { force: true });
-		writeFileSync(lockPath, JSON.stringify({ ...meta, tookOver: true }), { flag: "wx" });
+		// 测试 seam（仅用于确定性验证「僵锁接管」的原子性）：
+		// 在「认定是僵锁」之后、「实际接管」之前调用。测试借此模拟**另一个接管者
+		// 恰好在此刻插入**（这是旧实现 rmSync+wx 产生双赢家的真实窗口）。
+		// 同时它也暴露了「原子 rename」的漏洞：A 移走的可能是 B 刚建的新锁。
+		__claimReapTestHook?.();
+		// 僵锁接管（L4 二轮 + 自测 Z18 修正：**必须带身份校验的原子接管**）
+		//
+		// 演进史（三步，每步都被一个真实测试推翻过）：
+		//  1. `rmSync(lock) + writeFileSync(lock, wx)` —— 两步之间 B 可删 A 刚建的新锁 ⇒ 双赢家。
+		//  2. 仅靠 `renameSync(lock, graveyard)` 视为原子 —— **仍双赢家**：
+		//     时序：A 读锁（僵） → 【B 移走僵锁、建新锁】 → A 的 rename 移走的是 **B 的新锁**
+		//     （路径存在就成功）⇒ A 也认为自己赢了。Z18（seam 注入）确定复现了这个缺陷。
+		//  3. 本实现：rename **之后再核对**自己移走的那枚锁的 **token** 是否等于最初读到的那枚。
+		//     不等 ⇒ 自己移走的是别人的新锁 ⇒ 把锁**原子放回**（rename 回去）并认输。
+		//     这才能真正保证「恰好一个赢家」。
+		const observedToken = typeof raw.token === "string" ? raw.token : undefined;
+		const graveyard = join(runsDir, `.${id}.reaped.stale-${process.pid}-${nowMs}`);
+		try {
+			renameSync(lockPath, graveyard); // 原子：源不存在则 ENOENT
+		} catch {
+			return false; // 别人先移走了 ⇒ 认输
+		}
+		// 身份核对：确认坟墓里的是「我读到的那枚锁」
+		try {
+			const moved = JSON.parse(readFileSync(graveyard, "utf8")) as { token?: string };
+			const movedToken = typeof moved.token === "string" ? moved.token : undefined;
+			if (observedToken !== movedToken) {
+				// 不等 ⇒ 我移走的是别人的（更新的）锁 ⇒ 放回并认输（不双赢、不破坏别人的锁）
+				// 注：用 `!==` 而非「双方都定义才比」——旧锁/测试造的锁可能**无 token**（undefined），
+				// 此时若按「都定义才比」会跳过核对 ⇒ 双赢家（Z18 实测暴露）。
+				try { renameSync(graveyard, lockPath); } catch { /* 放回失败：best-effort，仍认输 */ }
+				return false;
+			}
+		} catch {
+			// 坟墓不可读：无法证明归属 ⇒ 保守认输（放回）
+			try { renameSync(graveyard, lockPath); } catch { /* ignore */ }
+			return false;
+		}
+		try {
+			writeFileSync(lockPath, JSON.stringify({ ...meta, tookOver: true, token: mintToken() }), { flag: "wx" });
+		} catch {
+			return false; // 别人已重建 ⇒ 认输
+		}
+		// 清掉坟墓（best-effort；已是自己的锁）
+		try { rmSync(graveyard, { force: true }); } catch { /* ignore */ }
 		return true;
 	} catch {
 		return false; // 锁文件不可读/竞态失败 ⇒ 保守不接管（宁可不判）
