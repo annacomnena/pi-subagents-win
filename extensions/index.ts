@@ -748,7 +748,14 @@ function parseJsonEvents(
 	opts?: {
 		timedOut?: () => boolean;
 		candidates?: AssistantTextCandidate[];
-		onProgressEvent?: (ev: { type: "tool" | "turn" | "text" | "done"; toolName?: string; detail?: string; turn?: number; text?: string }) => void;
+		onProgressEvent?: (ev: { type: "tool" | "turn" | "text" | "done"; toolName?: string; detail?: string; argsDigest?: string; turn?: number; text?: string }) => void;
+		/**
+		 * 不可恢复失败回调（must-fix 5）：stopReason==="error" 且属于「换重试也救不回」类
+		 * （额度/认证/计费/membership）时调用，让调用方**主动终止子进程**。
+		 * 为什么不在这里直接 kill：本函数是纯解析（无 child 引用）；且它也被 close 时的
+		 * 残余缓冲解析调用（那时进程已死，kill 无意义）。
+		 */
+		onFatalFailure?: (kind: string) => void;
 	},
 ): void {
 	const candidates = opts?.candidates;
@@ -831,6 +838,12 @@ function parseJsonEvents(
 					result.status = "failed";
 					result.error = msg.errorMessage ?? "model error";
 					onUpdate?.("✗ error", result.error.slice(0, 120));
+					// must-fix 5：不可恢复类（额度/认证/计费/membership）⇒ 通知调用方终止子进程。
+					// 否则子进程可能继续输出/挂住，等待方无限等（2026-10-15 事故的直接成因）。
+					const __cls = classifyModelFailure(result.error, result.requestedModel ?? result.model);
+					if (!__cls.retryable || __cls.kind === "usage_cap" || __cls.kind === "auth") {
+						opts?.onFatalFailure?.(__cls.kind);
+					}
 					continue;
 				}
 				if (stopReason === "aborted") {
@@ -1027,6 +1040,9 @@ async function runSingle(
 		const textCandidates: AssistantTextCandidate[] = [];
 		let timedOut = false;
 		let forceKill: ReturnType<typeof setTimeout> | null = null;
+		// must-fix 5：不可恢复失败的幂等门（同一 run 只终止一次）
+		let fatalKilled = false;
+		let fatalKind: string | undefined;
 		const kill = () => { child.kill("SIGTERM"); forceKill = setTimeout(() => child.kill("SIGKILL"), 2000); };
 		if (signal?.aborted) kill(); else signal?.addEventListener("abort", kill, { once: true });
 
@@ -1052,9 +1068,21 @@ async function runSingle(
 		const parseOpts = {
 			timedOut: () => timedOut,
 			candidates: textCandidates,
-			onProgressEvent: (e: { type: string; toolName?: string; detail?: string; turn?: number; text?: string }) => {
+			// must-fix 5：不可恢复失败（额度/认证）⇒ 立即终止子进程。
+			// 语义：置终态 + kill（SIGTERM→SIGKILL 兜底）；等待方立即拿到 failed，不再无限等。
+			onFatalFailure: (kind: string) => {
+				if (fatalKilled) return;
+				fatalKilled = true;
+				fatalKind = kind;
+				onUpdate?.(`⛔ fatal ${kind}`, "终止子进程（不可恢复）");
+				try { kill(); } catch { /* 已退出 */ }
+			},
+			onProgressEvent: (e: { type: string; toolName?: string; detail?: string; argsDigest?: string; turn?: number; text?: string }) => {
 				if (e.type === "tool") {
 					toolCallsCount++;
+					pushRecentCall(ring, { tool: e.toolName ?? "?", argsDigest: e.argsDigest ?? normalizeArgsDigest(e.detail ?? ""), ts: new Date().toISOString(), turn: result.usage.turns ?? 0 }, RING_K);
+					// 运行中观测：回传有界快照，消费方（async 派发）节流落盘；close 时仍走 result.recentCalls 终态快照。
+					opts?.onRecentCalls?.(ring.slice(-RING_K), result.usage.turns ?? 0);
 					currentToolName = e.toolName;
 					currentToolDetail = e.detail;
 					pushTimeline(`⚡ ${e.toolName}${e.detail ? `: ${e.detail}` : ""}`);
@@ -1122,9 +1150,11 @@ async function runSingle(
 				result.text = Buffer.from(best).toString("utf8");
 			}
 			// 立即释放所有临时大缓冲区与事件监听器引用
+			// ⚠️ must-fix（审查发现）：`stderrBuf` **不能在此清空**——下面 1269-1282 行仍要用它
+			// 提取 provider 错误（包括额度/认证线索）。先前在此清空 ⇒ mergeProviderError 拿到空串，
+			// 导致错误信息与 USAGE_CAP 判定双双丢失。改为在 close 处理末尾（用完之后）清空。
 			buf = "";
 			lineBuf = "";
-			stderrBuf = "";
 			textCandidates.length = 0;
 			try {
 				child.stdout?.removeAllListeners();
@@ -1159,6 +1189,8 @@ async function runSingle(
 				// Enrich stopReason=error messages with stderr (often holds GLM 套餐/额度 detail).
 				result.error = mergeProviderError(result.error, stderrBuf, code, resolvedModel);
 			}
+			// 用完之后才释放 stderrBuf（must-fix：勿提前清）
+			stderrBuf = "";
 			result.agent = agent?.name;
 			// Prefer provider/id we requested when assistant only echoes bare id.
 			if (!result.model && resolvedModel) result.model = resolvedModel;
