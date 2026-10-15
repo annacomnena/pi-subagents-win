@@ -17,7 +17,9 @@
  *     ② pid 存在 + 身份不匹配（pid 被重用）      → 硬证据（原进程已死）
  *     ③ pid 缺失 + `lastActivity` 超龄          → **弱证据 ⇒ 默认只观察（写 suspect 标记 + 审计），
  *                                                  不落终态**（除非显式开启 auto）
- * - **M2**：幂等不靠 read-check-write，靠**文件系统排他创建**（`wx` flag）做跨进程 CAS。
+ * - **M2**：幂等不靠 read-check-write，靠**文件系统排他创建**（`wx` flag）。
+ *   注意（L4 五轮）：这只给「**至多一个非-force 赢家**」，**不声称 exactly-one**——
+ *   `force` 是显式人工路径，不保证排他。
  * - **M8**：不阻塞 UI 读路径；`inspectLiveProcess` 走 PowerShell（单次可阻塞 ~20s）
  *   ⇒ **只在「pid 存在且 signal-0 判活为真」时才调用**（需要身份确认的少见分支）。
  * - **纪律**：本模块**只落终态，绝不杀进程**（进程已死才判 zombie）。
@@ -174,7 +176,7 @@ export function detectZombie(rec: KillableRunRecord, deps: ZombieDeps = {}): Zom
 	return { zombie: false, weak: false, reason: "too-young", basisMs: idleBase };
 }
 
-// ── 原子写 + 跨进程 CAS ────────────────────────────────────────────
+// ── 原子写 + 永久 claim ────────────────────────────────────────────
 
 /**
  * 原子写 run json（tmp + rename，同分区 rename 是原子的）。
@@ -196,14 +198,15 @@ function mintToken(): string {
 }
 
 /**
- * 跨进程「恰好一次」CAS：用 `.reaped` 文件的**排他创建**（`wx`）判定归属。
+ * 永久 claim：用 `.reaped` 文件的**排他创建**（`wx`）判定归属。
+ * **语义是「至多一个非-force 赢家」，不是 exactly-one**（L4 五轮）。
  *
  * 审查 M2 明确：read-check-write 与普通 rename **都不是 CAS**。本函数用
  * `writeFileSync(..., {flag:"wx"})` —— OS 保证同时只有一个调用者能创建成功。
  *
  * **僵锁接管（L4 P1-3）**：赢家可能在「拿到锁 → 写终态」之间崩溃，使 `.reaped` 永久存在
  * 而 run 永远不被回收。故锁带 TTL：若已存在的锁龄 > TTL 且 run 仍非终态，则可接管
- * （删锁重建）。这保留了「恰好一次」在正常路径的保证，又避免单点永久卡死。
+ * 根因：「过期无主文件」无法安全实现 owner 回收（需 fencing token）⇒ 已改为**永久 claim**。
  *
  * @returns true=本进程赢得 CAS（应继续落终态）；false=已被别人处理（应短路）
  */
@@ -279,7 +282,7 @@ export interface ReapResult {
  * 幂等落终态：僵尸 run ⇒ `status="failed"` + `failure{kind:"zombie",…}` + `endedAt`。
  *
  * 幂等保证（两道）：
- *  ① **CAS**：`claimReap()` 排他创建 `.reaped`（跨进程恰好一次）；
+ *  ① **claim**：`claimReap()` 排他创建 `.reaped`（至多一个非-force 赢家）；
  *  ② **状态短路**：落终态前重读，若已非 `running` 则放弃（防「迟到旧 finalize」被覆盖）。
  *
  * 纪律：**不杀进程**（调用方已在 detectZombie 拿到「进程已死」证据时才走此路）。
@@ -311,7 +314,7 @@ export function reapZombie(
 		return { reaped: false, reason: verdict.reason };
 	}
 
-	// CAS：跨进程恰好一次
+	// claim：至多一个非-force 赢家（**不声称 exactly-one**，见 claimReap 头注）
 	const at = new Date(now).toISOString();
 	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at }, { now: () => now, force: opts.force })) {
 		return { reaped: false, reason: "already-reaped" };
