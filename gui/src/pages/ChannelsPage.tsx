@@ -97,7 +97,7 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 					href={url}
 					target="_blank"
 					rel="noreferrer"
-					className="text-ui-sm text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+					className="text-ui-sm text-accent-text underline decoration-accent/40 underline-offset-2 hover:decoration-accent"
 				>
 					在浏览器里打开该图片 URL 后扫码
 				</a>
@@ -580,7 +580,7 @@ export function ChannelsPage() {
 									href={qrUrl}
 									target="_blank"
 									rel="noreferrer"
-									className="text-ui-sm font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+									className="text-ui-sm font-medium text-accent-text underline decoration-accent/40 underline-offset-2 hover:decoration-accent"
 								>
 									在手机微信里打开
 								</a>

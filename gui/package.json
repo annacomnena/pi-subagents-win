@@ -7,7 +7,8 @@
   "scripts": {
     "predev": "node -e \"if(process.env.PI_RUNTIME_PROFILE==='prod'){console.error('[gui] refused: vite dev forbidden in prod profile');process.exit(1)}\"",
     "dev": "vite",
-    "build": "tsc --noEmit && vite build"
+    "build": "tsc --noEmit && vite build",
+    "test:gui-theme": "node --experimental-strip-types src/_test_gui_theme.ts"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

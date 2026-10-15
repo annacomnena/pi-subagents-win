@@ -53,9 +53,12 @@ assert.ok(css.includes("@custom-variant data-active"), "shadcn 语义 variant �
 assert.ok(css.includes('@import "tw-animate-css"'), "tw-animate-css 接入");
 ok("1 主题底座：暖色契约 token / 14px / 滚动条 / 动画 / @custom-variant 全对锚");
 
-// main.tsx 常挂 theme-warm-dark
-assert.ok(read("main.tsx").includes('classList.add("theme-warm-dark")'), "documentElement 常挂 theme-warm-dark");
-ok("1b main.tsx 挂 .theme-warm-dark（Web 默认暗色口径）");
+// main.tsx 按 localStorage 偏好选主题（读优先，默认暖暗）
+const mainSrc = read("main.tsx");
+assert.ok(mainSrc.includes('from "./theme"') && mainSrc.includes("applyTheme(root, initial)"), "main.tsx 经 theme.ts 应用主题（非硬编码 class）");
+assert.ok(read("theme.ts").includes('THEME_STORAGE_KEY = "od-gui-theme"'), "主题偏好键 od-gui-theme");
+assert.ok(read("theme.ts").includes('=== "warm-light" ? "warm-light" : "warm-dark"'), "默认值 = 暖暗（风格指南口径）");
+ok("1b main.tsx 读 localStorage 选主题（默认暖暗；偏好纯 UI 态）");
 
 // ── 2. 依赖 + ui 14 件 ─────────────────────────────────────────────
 const pkg = JSON.parse(read("../package.json")) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };

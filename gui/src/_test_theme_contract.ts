@@ -113,7 +113,7 @@ for (const line of [
 	"--color-input-border: var(--color-border)",
 	"--color-input-border-focused: var(--color-accent)",
 	"--color-input-border-focus: var(--color-accent)",
-	"--color-accent-text: var(--color-accent)",
+	"--color-accent-text: var(--color-brand-coral)", // L4 复算修正：原 = accent #c96442，card 上仅 4.17:1；现 4 表面 5.21–5.90
 	"--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent)",
 	"--animated-gradient-text-strong: rgba(250, 249, 245, 1)",
 	"--animated-gradient-text-soft: rgba(250, 249, 245, 0.22)",

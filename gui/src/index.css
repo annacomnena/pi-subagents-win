@@ -199,7 +199,8 @@
 	--color-accent: var(--color-brand-terracotta); /* #c96442 */
 	--color-accent-hover: color-mix(in oklab, var(--color-brand-terracotta) 88%, var(--color-brand-ivory)); /* #d4795a（变亮） */
 	--color-accent-foreground: var(--color-brand-ink); /* #141413（4.73:1） */
-	--color-accent-text: var(--color-accent); /* 暗底文字重音用 accent 本身（= 珊瑚邻近档） */
+	--color-accent-text: var(--color-brand-coral); /* §6 表「coral 文字重音」#d97757：4 表面 5.21–5.90 全部 ≥4.5。
+	 * L4 复算：原值 = accent 本身 #c96442，落 card #21201e 仅 4.17:1（不达）——S1 设错。 */
 	--color-primary: var(--color-brand-ivory);
 	--color-primary-foreground: var(--color-brand-ink);
 	--color-secondary: var(--color-selected); /* 暖选中档，替代旧 ZCode 冷灰 secondary */
