@@ -7,158 +7,268 @@
 /* 云端模板常用样式的构建保障（styles.css#L47 同款），不是运行时 class 白名单 */
 @source inline("text-center text-ui-base/relaxed text-foreground-subtle font-semibold font-normal text-foreground whitespace-nowrap underline decoration-foreground-subtle decoration-dashed underline-offset-4");
 
-/* ── 主题底座（ZCode 1:1 复刻 第 1 步）──────────────────────────────────
- * 整表移植 zcode packages/ui/src/styles.css 必需集：token 保 zcode 原名，
- * 值照抄 styles.css（:root 亮色定义 + .theme-zai-dark 生效值，Web 默认暗色口径）。
- * .dark 层不搬（无切换器）；zcode 未定义处 2026-09-30 起**有意补齐** ring/muted/
- * muted-foreground/info 四枚（暗色可读性拍板：焦点环与 badge/kbd/tabs 的 no-op 复活），
- * 其余 token 仍照抄不发明（见 20260930_gui_visual_polish_plan.md S1）。 */
+/* ── 主题底座（Anthropic 暖纸体系 第 1 步）──────────────────────────────
+ * 2026-10-15 起：由 ZCode「Zai Dark」1:1 复刻改为 Anthropic 暖纸体系
+ * （plans/20261015_gui_anthropic_style_guide.md §3 值表）。
+ * 风格值来自 OpenDesign 自带设计系统包 design-systems/claude/（curated fixture，
+ * 非 anthropic.com 抓取值）。暖暗优先（工作台长时间盯屏）；浅色为结构免费的次选主题。
+ * 口径：中性色全部带黄褐底调、系统内无冷蓝灰；陶土 #c96442 是唯一彩色动作；
+ * 深度靠 0 0 0 1px 环状阴影 + 表面色阶，不引第二套投影语言。 */
 
 :root {
 	--ui-font-size: 14px;
 }
 
-/* 亮色基底（zcode :root 同值；只留定义，不接切换器） */
+/* ── 亮色基底（§3.3；只留定义与 .theme-warm-light 生效值，不接切换器）── */
 @theme {
+	/* 品牌基础色（§3.4）：两层同值，只读派生输入，不直接当角色 token 用 */
+	--color-brand-ink: #141413; /* Anthropic Near Black（暖炭） */
+	--color-brand-ivory: #faf9f5;
+	--color-brand-parchment: #f5f4ed;
+	--color-brand-sand: #e8e6dc; /* Warm Sand */
+	--color-brand-mist: #b0aea5; /* Warm Silver */
+	--color-brand-terracotta: #c96442;
+	--color-brand-coral: #d97757;
+	--color-brand-crimson: #b53333;
+	--color-brand-ochre: #96601a;
+	--color-brand-olive: #5f6b4f;
+	--color-brand-focus: #3898ec; /* 系统内唯一冷色，仅可访问性用途 */
+	/* 派生输入别名：所有 color-mix 表达式统一指向它（= 品牌 Warm Sand） */
+	--color-surface-warm: var(--color-brand-sand);
+
 	/* Windows 的 Consolas 不含中文字形：CJK 段显式加入（styles.css#L137） */
 	--font-mono:
 		ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
 		"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", monospace;
+	/* 衬线：仅用于 ≥20px 区块标题/空态主句（§4 硬规则，中文小字号不可用），Windows+CJK 可用栈 */
+	--font-display: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+
 	--text-ui-xl: calc(var(--ui-font-size) + 4px);
 	--text-ui-lg: calc(var(--ui-font-size) + 2px);
 	--text-ui-base: var(--ui-font-size);
 	--text-ui-caption: calc(var(--ui-font-size) - 1px);
 	--text-ui-sm: calc(var(--ui-font-size) - 2px);
-	--text-ui-xs: calc(var(--ui-font-size) - 4px);
+	/* 10→11：CJK 在 10px 不可读（§4） */
+	--text-ui-xs: calc(var(--ui-font-size) - 3px);
+	/* 保留定义；CI 断言禁止新增调用点（§4 ui-2xs 淘汰） */
 	--text-ui-2xs: calc(var(--ui-font-size) - 5px);
-	--animated-gradient-text-strong: rgba(10, 10, 10, 1);
-	--animated-gradient-text-soft: rgba(10, 10, 10, 0.22);
-	--color-background: var(--color-neutral-50);
-	--color-background-alt: color-mix(in oklab, var(--color-neutral-100) 60%, transparent);
-	--color-background-win-alt: var(--color-neutral-200);
-	--color-brand: var(--color-sky-400);
-	--color-trajectory-user: #2563eb;
-	--color-trajectory-assistant: #0f766e;
-	--color-trajectory-reasoning: #7c3aed;
-	--color-trajectory-tool-call: #d97706;
-	--color-trajectory-tool-result: #0284c7;
-	--color-accent: var(--color-sky-50);
-	--color-border: color-mix(in oklab, var(--color-neutral-950) 10%, transparent);
-	--color-border-hover: color-mix(in oklab, var(--color-neutral-950) 20%, transparent);
-	--color-hover: var(--color-neutral-200);
-	--color-selected: color-mix(in oklab, var(--color-neutral-950) 10%, transparent);
-	--color-header: var(--color-neutral-100);
-	--color-panel: var(--color-neutral-100);
-	--color-sidebar: var(--color-neutral-100);
-	--color-surface: color-mix(in oklab, var(--color-neutral-950) 3%, transparent);
-	--color-surface-hover: color-mix(in oklab, var(--color-neutral-950) 5%, transparent);
-	--color-card: var(--color-white);
-	--color-card-selected: var(--color-neutral-200);
+
+	/* 浮层深度（§5：环 + 低语影；卡片仍扁平，浮层只此一套阴影语言） */
+	--shadow-overlay: 0 0 0 1px var(--color-border), 0 4px 24px rgba(20, 20, 19, 0.28);
+
+	--animated-gradient-text-strong: rgba(20, 20, 19, 1);
+	--animated-gradient-text-soft: rgba(20, 20, 19, 0.22);
+	--color-background: #f5f4ed; /* Parchment 羊皮纸（非纯白） */
+	--color-background-alt: color-mix(in oklab, var(--color-brand-ink) 4%, transparent);
+	--color-background-win-alt: var(--color-brand-sand);
+	/* 暖银：gui/src 里 bg-brand ×3 / text-brand ×2 / ring-brand ×1 / border-brand ×1 共 7 处
+	 * 调用点本轮不改，靠这枚 token 由冷白转暖银而自动可用（text-brand 落暖纸面时改用
+	 * --color-brand-ink 更好，但那是 S3+ 的事）。 */
+	--color-brand: var(--color-brand-mist);
+	--color-sidebar: #efece4;
+	--color-panel: #faf9f5; /* Ivory */
+	--color-header: color-mix(in oklab, var(--color-brand-ink) 4%, var(--color-brand-parchment));
+	--color-card: #faf9f5;
+	--color-card-selected: var(--color-brand-sand);
 	--color-card-border: var(--color-border);
-	--color-popover: var(--color-white);
+	--color-surface: color-mix(in oklab, var(--color-brand-ink) 3%, transparent);
+	--color-surface-hover: color-mix(in oklab, var(--color-brand-ink) 6%, transparent);
+	--color-hover: color-mix(in oklab, var(--color-brand-ink) 5%, transparent);
+	--color-selected: color-mix(in oklab, var(--color-brand-ink) 8%, transparent);
+	--color-border: #dcd8cc;
+	--color-border-hover: #c2bdb0;
+	--color-foreground: #141413;
+	--color-foreground-strong: var(--color-brand-ink);
+	--color-foreground-subtle: #5e5d59; /* Olive Gray（5.98:1 on Parchment） */
+	--color-foreground-subtlest: #706f69; /* §3.3 抬到 AA（4.57:1），不再沿用 stone 3.31:1 */
+	--color-foreground-inverse: var(--color-brand-ivory);
+	--color-accent: #c96442; /* 唯一彩色动作 */
+	--color-accent-hover: #d4795a;
+	--color-accent-foreground: #141413; /* accent 上的字（4.73:1） */
+	--color-accent-text: #b4553a; /* 浅底上的文字重音（#c96442 仅 3.54:1 不合格） */
+	--color-primary: var(--color-brand-ink);
+	--color-primary-foreground: var(--color-brand-ivory);
+	--color-secondary: var(--color-brand-sand);
+	--color-secondary-foreground: #141413; /* 补缺：badge secondary 原本引用未定义 token 静默失效 */
+	--color-popover: #faf9f5;
 	--color-popover-foreground: var(--color-foreground);
-	--color-popover-header: var(--color-neutral-100);
+	--color-popover-header: var(--color-brand-sand);
 	--color-popover-border: var(--color-border);
-	--color-input: var(--color-white);
-	--color-input-focused: var(--color-neutral-50);
-	--color-input-border: var(--color-border);
-	--color-input-border-hover: var(--color-border-hover);
-	--color-input-border-focused: var(--color-brand);
-	--color-menu: var(--color-white);
-	--color-menu-hover: var(--color-neutral-100);
-	--color-primary: var(--color-neutral-950);
-	--color-primary-foreground: var(--color-neutral-50);
-	--color-secondary: var(--color-neutral-300);
-	--color-interaction-ask-surface: var(--color-sky-50);
-	--color-interaction-ask-foreground: var(--color-sky-700);
-	--color-interaction-ask-fill: color-mix(in oklab, var(--color-green-500) 20%, transparent);
-	--color-foreground: var(--color-neutral-700);
-	--color-foreground-subtle: color-mix(in oklab, var(--color-neutral-700) 60%, transparent);
-	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-700) 40%, transparent);
-	--color-foreground-inverse: var(--color-white);
-	--color-success: var(--color-green-600);
-	--color-success-foreground: var(--color-foreground-inverse);
-	--color-destructive: var(--color-red-600);
-	--color-destructive-foreground: var(--color-foreground-inverse);
-	--color-warning: var(--color-yellow-600);
-	--color-warning-foreground: var(--color-foreground-inverse);
-	--color-tag: var(--color-neutral-200);
-	--color-toast: var(--color-white);
-	--color-tooltip: var(--color-neutral-100);
-	--color-tooltip-foreground: var(--color-neutral-950);
-	/* 2026-09-30 有意补齐（zcode 未定义；亮色基底仅留定义，暗色一套拍板不变） */
-	--color-ring: rgba(0, 0, 0, 0.35);
-	--color-muted: var(--color-neutral-100);
-	--color-muted-foreground: var(--color-neutral-500);
-	--color-info: var(--color-sky-600);
+	--color-input: #ffffff; /* theme-contract:allow — §3.3 输入底为白（功能性例外，同 QR 白底；非冷灰遗留） */
+	--color-input-focused: var(--color-brand-ivory);
+	--color-input-border: #dcd8cc; /* 补缺：9 处输入边框引用（此前 token 未定义 → 静默失效） */
+	--color-input-border-hover: #c2bdb0;
+	--color-input-border-focused: var(--color-accent);
+	--color-input-border-focus: var(--color-accent);
+	--color-focus-ring: #2d70ab; /* 浅底：#3898ec 仅 2.77:1，禁用（§6） */
+	--color-ring: color-mix(in oklab, var(--color-brand-ink) 22%, transparent);
+	--color-menu: var(--color-brand-ivory);
+	--color-menu-hover: var(--color-brand-sand);
+	--color-muted: var(--color-brand-sand); /* 补缺（zcode 未定义） */
+	--color-muted-foreground: #5e5d59;
+	--color-tag: var(--color-brand-sand);
+	--color-toast: var(--color-brand-ivory);
+	--color-tooltip: #2a2825; /* 暖浮层底 */
+	--color-tooltip-foreground: var(--color-brand-ivory);
+	--color-interaction-ask-surface: #f6e7df; /* terra 12% over ivory */
+	--color-interaction-ask-foreground: #b4553a;
+	--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent);
+	--color-success: #4f6b3f;
+	--color-success-foreground: var(--color-brand-ink);
+	--color-destructive: #a83f34;
+	--color-destructive-foreground: var(--color-brand-ink);
+	--color-warning: #8a5a12;
+	--color-warning-foreground: var(--color-brand-ink);
+	--color-info: #2d70ab;
 }
 
-/* 生效主题：Zai Dark（Web 默认暗色；main.tsx 给 documentElement 常挂 .theme-zai-dark）
- * 值照抄 styles.css .theme-zai-dark 块（#L606-757）。 */
-.theme-zai-dark {
-	--animated-gradient-text-strong: rgba(255, 255, 255, 1);
-	--animated-gradient-text-soft: rgba(255, 255, 255, 0.22);
-	--color-background: #161616;
-	--color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
-	--color-background-win-alt: #2b2b2b;
-	--color-brand: #ffffff;
-	--color-trajectory-user: #60a5fa;
-	--color-trajectory-assistant: #2dd4bf;
-	--color-trajectory-reasoning: #a78bfa;
-	--color-trajectory-tool-call: #f59e0b;
-	--color-trajectory-tool-result: #38bdf8;
-	--color-accent: #001d3d;
-	--color-border: rgba(255, 255, 255, 0.1);
-	--color-border-hover: rgba(255, 255, 255, 0.15);
-	--color-hover: rgba(255, 255, 255, 0.05);
-	--color-selected: rgba(255, 255, 255, 0.1);
-	--color-header: #202020;
-	--color-panel: #202020;
-	--color-sidebar: #161616;
-	--color-surface: rgba(255, 255, 255, 0.05);
-	--color-surface-hover: rgba(255, 255, 255, 0.1);
-	--color-card: #2b2b2b;
-	--color-card-selected: var(--color-input);
+/* ── 生效主题：暖纸暗色（Web 默认暗色；main.tsx 给 documentElement 常挂 .theme-warm-dark）
+ * 值 = §3.1/§3.2 暖暗表。品牌基础色两层同值；半透明档用 color-mix 保 alpha（行末附
+ * 合成到 #141413 的等值 hex）；不透明表面/文字档按 §3 权威 hex 直写——§3.1 表里的
+ * color-mix 派生式对这类档不收敛到同一 hex（实测偏差远超回归比对容差），
+ * 且 §6 对比度验收以 hex 为准，故 hex 优先。 */
+.theme-warm-dark {
+	/* 品牌基础色（= @theme 同值，本层派生输入） */
+	--color-brand-ink: #141413;
+	--color-brand-ivory: #faf9f5;
+	--color-brand-parchment: #f5f4ed;
+	--color-brand-sand: #e8e6dc;
+	--color-brand-mist: #b0aea5;
+	--color-brand-terracotta: #c96442;
+	--color-brand-coral: #d97757;
+	--color-brand-crimson: #b53333;
+	--color-brand-ochre: #96601a;
+	--color-brand-olive: #5f6b4f;
+	--color-brand-focus: #3898ec;
+	--color-surface-warm: var(--color-brand-sand);
+
+	--animated-gradient-text-strong: rgba(250, 249, 245, 1);
+	--animated-gradient-text-soft: rgba(250, 249, 245, 0.22);
+	--color-background: var(--color-brand-ink); /* #141413 暖炭页面底 */
+	--color-background-alt: color-mix(in oklab, var(--color-surface-warm) 7%, transparent);
+	--color-background-win-alt: #2d2d2b; /* §3.1 selected 档 */
+	--color-brand: var(--color-brand-mist); /* #b0aea5 暖银（7 处调用点本轮不改） */
+	--color-sidebar: #191917;
+	--color-panel: #1c1b19;
+	--color-header: var(--color-panel); /* #1c1b19：顶栏与页面底拉开一档 */
+	--color-card: #21201e;
+	--color-card-selected: var(--color-selected); /* #2d2d2b */
 	--color-card-border: var(--color-border);
-	--color-popover: #2b2b2b;
+	--color-surface: color-mix(in oklab, var(--color-surface-warm) 5%, transparent);
+	--color-surface-hover: color-mix(in oklab, var(--color-surface-warm) 10%, transparent);
+	--color-hover: color-mix(in oklab, var(--color-surface-warm) 8%, transparent); /* #252523 */
+	--color-selected: color-mix(in oklab, var(--color-surface-warm) 12%, transparent); /* #2d2d2b */
+	--color-border: color-mix(in oklab, var(--color-surface-warm) 14%, transparent); /* #33312d */
+	--color-border-hover: color-mix(in oklab, var(--color-surface-warm) 24%, transparent); /* #494640 */
+	--color-foreground: var(--color-brand-mist); /* #d9d7cd 正文 */
+	--color-foreground-strong: var(--color-brand-ivory); /* #faf9f5 标题/强调 */
+	--color-foreground-subtle: #a09f96; /* §3.1 权威 hex（6.93:1 on #141413） */
+	--color-foreground-subtlest: #898880; /* §3.1 权威 hex（5.18:1 on #141413） */
+	--color-foreground-inverse: var(--color-brand-ink); /* #141413：浅色面上的字一律近黑 */
+	--color-accent: var(--color-brand-terracotta); /* #c96442 */
+	--color-accent-hover: color-mix(in oklab, var(--color-brand-terracotta) 88%, var(--color-brand-ivory)); /* #d4795a（变亮） */
+	--color-accent-foreground: var(--color-brand-ink); /* #141413（4.73:1） */
+	--color-accent-text: var(--color-accent); /* 暗底文字重音用 accent 本身（= 珊瑚邻近档） */
+	--color-primary: var(--color-brand-ivory);
+	--color-primary-foreground: var(--color-brand-ink);
+	--color-secondary: var(--color-selected); /* 暖选中档，替代旧 ZCode 冷灰 secondary */
+	--color-secondary-foreground: var(--color-foreground); /* 补缺（原引用未定义） */
+	--color-popover: var(--color-card);
 	--color-popover-foreground: var(--color-foreground);
-	--color-popover-header: #202020;
+	--color-popover-header: var(--color-panel);
 	--color-popover-border: var(--color-border);
-	--color-input: #2b2b2b;
-	--color-input-focused: var(--color-input);
-	--color-input-border: var(--color-border);
+	--color-input: var(--color-card); /* #21201e */
+	--color-input-focused: var(--color-card);
+	--color-input-border: var(--color-border); /* 补缺：9 处输入边框引用复活 */
 	--color-input-border-hover: var(--color-border-hover);
-	--color-input-border-focused: var(--color-border-hover);
-	--color-menu: #2b2b2b;
-	--color-menu-hover: #363636;
-	--color-primary: #ffffff;
-	--color-primary-foreground: #000000;
-	--color-secondary: #363636;
-	--color-interaction-ask-surface: #001d3d;
-	--color-interaction-ask-foreground: #80beff;
-	--color-interaction-ask-fill: rgba(70, 191, 114, 0.24);
-	--color-foreground: var(--color-neutral-300);
-	--color-foreground-subtle: color-mix(in oklab, var(--color-neutral-300) 60%, transparent);
-	--color-foreground-inverse: #000000;
-	--color-success: #46bf72;
-	--color-success-foreground: #000000;
-	--color-destructive: #ff5c5c;
-	--color-destructive-foreground: #ffffff;
-	--color-warning: #ff8a30;
-	--color-warning-foreground: #000000;
-	--color-tag: #363636;
-	--color-toast: #2b2b2b;
-	--color-tooltip: #2b2b2b;
-	--color-tooltip-foreground: #f8f8f8;
-	/* 2026-09-30 有意补齐（zcode 未定义；暗色可读性拍板）：
-	 * ring=/50 调制后 ≈25% 白环（badge ring-[3px]、textarea ring-2 生效）；
-	 * muted=背景与卡底之间的抬升档（badge outline hover / Kbd / Tabs 轨道复活）；
-	 * info=真信息蓝（legacy Badge tone=blue 三处调用点）；subtlest 30→50%（≈2.2:1→≈4:1） */
-	--color-ring: rgba(255, 255, 255, 0.5);
-	--color-muted: #242424;
-	--color-muted-foreground: var(--color-neutral-400);
-	--color-info: #38bdf8;
-	--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 50%, transparent);
+	--color-input-border-focused: var(--color-accent); /* 焦点/拖拽高亮改陶土（不再用白品牌色） */
+	--color-input-border-focus: var(--color-accent);
+	--color-focus-ring: var(--color-brand-focus); /* #3898ec：系统唯一冷色，仅可访问性 */
+	--color-ring: color-mix(in oklab, var(--color-surface-warm) 28%, transparent);
+	--color-menu: var(--color-card);
+	--color-menu-hover: var(--color-hover);
+	--color-muted: var(--color-hover); /* 补缺（zcode 未定义/冷灰）→ 暖抬升档 */
+	--color-muted-foreground: var(--color-foreground-subtle);
+	--color-tag: var(--color-hover); /* 补缺（zcode 未定义/冷灰）→ 暖抬升档 */
+	--color-toast: var(--color-panel); /* 补缺（zcode 未定义/冷灰）→ 暖浮层底 */
+	--color-tooltip: color-mix(in oklab, var(--color-surface-warm) 22%, transparent); /* 补缺：暖浮层 #2a2825 */
+	--color-tooltip-foreground: var(--color-foreground-strong);
+	--color-interaction-ask-surface: color-mix(in oklab, var(--color-brand-terracotta) 22%, var(--color-brand-ink)); /* 陶土 wash #37251e */
+	--color-interaction-ask-foreground: var(--color-brand-ivory); /* 暖白字（实测 13.2:1） */
+	--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent);
+	--color-success: #87956f; /* 品牌 muted green 提亮版 */
+	--color-success-foreground: var(--color-brand-ink); /* #141413（≥5.9:1） */
+	--color-destructive: #cf7359; /* 品牌 Error Crimson 提亮版（暖、不刺眼） */
+	--color-destructive-foreground: var(--color-brand-ink);
+	--color-warning: #c08f45; /* 暖赭 */
+	--color-warning-foreground: var(--color-brand-ink);
+	--color-info: var(--color-brand-focus); /* #3898ec（系统唯一冷色） */
+	/* --color-trajectory-* 五枚（tool-call 等）全库 0 调用点，2026-10-15 删除死 token */
+}
+
+/* ── 生效主题：暖纸亮色（§3.3；结构免费，本轮不接切换器）────────────── */
+.theme-warm-light {
+	--animated-gradient-text-strong: rgba(20, 20, 19, 1);
+	--animated-gradient-text-soft: rgba(20, 20, 19, 0.22);
+	--color-background: #f5f4ed; /* Parchment */
+	--color-background-alt: color-mix(in oklab, var(--color-brand-ink) 4%, transparent);
+	--color-background-win-alt: var(--color-brand-sand);
+	--color-brand: var(--color-brand-mist);
+	--color-sidebar: #efece4;
+	--color-panel: #faf9f5;
+	--color-header: color-mix(in oklab, var(--color-brand-ink) 4%, var(--color-brand-parchment));
+	--color-card: #faf9f5;
+	--color-card-selected: var(--color-brand-sand);
+	--color-card-border: var(--color-border);
+	--color-surface: color-mix(in oklab, var(--color-brand-ink) 3%, transparent);
+	--color-surface-hover: color-mix(in oklab, var(--color-brand-ink) 6%, transparent);
+	--color-hover: color-mix(in oklab, var(--color-brand-ink) 5%, transparent);
+	--color-selected: color-mix(in oklab, var(--color-brand-ink) 8%, transparent);
+	--color-border: #dcd8cc;
+	--color-border-hover: #c2bdb0;
+	--color-foreground: #141413;
+	--color-foreground-strong: var(--color-brand-ink);
+	--color-foreground-subtle: #5e5d59;
+	--color-foreground-subtlest: #706f69;
+	--color-foreground-inverse: var(--color-brand-ivory);
+	--color-accent: #c96442;
+	--color-accent-hover: #d4795a;
+	--color-accent-foreground: #141413;
+	--color-accent-text: #b4553a;
+	--color-primary: var(--color-brand-ink);
+	--color-primary-foreground: var(--color-brand-ivory);
+	--color-secondary: var(--color-brand-sand);
+	--color-secondary-foreground: #141413;
+	--color-popover: #faf9f5;
+	--color-popover-foreground: var(--color-foreground);
+	--color-popover-header: var(--color-brand-sand);
+	--color-popover-border: var(--color-border);
+	--color-input: #ffffff; /* theme-contract:allow — §3.3 输入底为白（功能性例外） */
+	--color-input-focused: var(--color-brand-ivory);
+	--color-input-border: #dcd8cc;
+	--color-input-border-hover: #c2bdb0;
+	--color-input-border-focused: var(--color-accent);
+	--color-input-border-focus: var(--color-accent);
+	--color-focus-ring: #2d70ab; /* 浅底禁用 #3898ec（2.77:1） */
+	--color-ring: color-mix(in oklab, var(--color-brand-ink) 22%, transparent);
+	--color-menu: var(--color-brand-ivory);
+	--color-menu-hover: var(--color-brand-sand);
+	--color-muted: var(--color-brand-sand);
+	--color-muted-foreground: #5e5d59;
+	--color-tag: var(--color-brand-sand);
+	--color-toast: var(--color-brand-ivory);
+	--color-tooltip: #2a2825;
+	--color-tooltip-foreground: var(--color-brand-ivory);
+	--color-interaction-ask-surface: #f6e7df;
+	--color-interaction-ask-foreground: #b4553a;
+	--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent);
+	--color-success: #4f6b3f;
+	--color-success-foreground: var(--color-brand-ink);
+	--color-destructive: #a83f34;
+	--color-destructive-foreground: var(--color-brand-ink);
+	--color-warning: #8a5a12;
+	--color-warning-foreground: var(--color-brand-ink);
+	--color-info: #2d70ab;
 }
 
 /* ── 全局基线 ─────────────────────────────────────────────────────── */
@@ -182,15 +292,18 @@ body {
 	overflow: hidden;
 }
 
-/* 系统级 focus 高亮复位：outline 清零保留 zcode 观感（styles.css#L119-131 同款）；
- * box-shadow 清零 2026-09-30 移除——shadcn 组件焦点环以 box-shadow（ring-*）实现，
- * 全局清零会把组件级 focus-visible:ring-* 一并压掉，键盘焦点全不可见（P1-3） */
-*:focus,
-*:focus-visible {
-	outline: none !important;
+/* 键盘焦点可见（§5：替换旧的「全局 outline 清零」）：鼠标点击不显环，
+ * Tab/键盘焦点显 2px 陶土体系焦点环；高对比模式下另走系统 outline。 */
+:focus:not(:focus-visible) {
+	outline: none;
 }
 
-/* 高对比模式可访问性下限：恢复系统 outline（forced-colors 下 ring 也不可靠） */
+:focus-visible {
+	outline: 2px solid var(--color-focus-ring);
+	outline-offset: 2px;
+}
+
+/* 高对比模式可访问性下限：恢复系统 outline（forced-colors 下自定义环也不可靠） */
 @media (forced-colors: active) {
 	*:focus,
 	*:focus-visible {
@@ -445,7 +558,7 @@ body {
 }
 
 /* ── 0923 2003：自研零依赖 markdown 渲染器样式（字面类，ui/Markdown.tsx 产出；
- *  不引 typography plugin 的 .prose——md-* 显式 token 化，与 ZCode token 体系同源）── */
+ *  不引 typography plugin 的 .prose——md-* 显式 token 化，与主题 token 体系同源）── */
 .md-prose {
 	color: var(--color-foreground);
 	line-height: 1.65;

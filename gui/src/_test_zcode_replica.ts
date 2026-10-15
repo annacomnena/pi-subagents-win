@@ -24,21 +24,24 @@ const ok = (name: string): void => {
 
 // ── 1. 主题底座（index.css token 表 / 14px / 滚动条 / 动画 / custom-variant）────
 const css = read("index.css");
-assert.ok(css.includes(".theme-zai-dark"), "index.css 有 .theme-zai-dark 生效层");
+assert.ok(css.includes(".theme-warm-dark"), "index.css 有 .theme-warm-dark 生效层（暖纸暗色，默认）");
+assert.ok(css.includes(".theme-warm-light"), "index.css 有 .theme-warm-light 生效层（暖纸亮色，结构免费）");
 assert.ok(css.includes("--ui-font-size: 14px"), "14px 基准字号");
+// 2026-10-15 暖纸体系契约（plans/20261015_gui_anthropic_style_guide.md §3/§8）：
+// 原「ZCode 颜色字面值」断言改成「暖色契约」断言；数值级回归比对搬到 _test_theme_contract.ts
 for (const token of [
-	"--color-input-border-focused: var(--color-border-hover)", // zai 主题 focused = border-hover（非 brand）
-	// 2026-09-30 有意分歧（暗色可读性拍板，plans/20260930_gui_visual_polish_plan.md S1）：
-	// subtlest 30%→50%（#161616 上对比 ≈2.2:1→≈4:1）；zcode 原值 30%，复刻纪律让位于可读性
-	"--color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 50%, transparent)",
-	"--color-selected: rgba(255, 255, 255, 0.1)",
-	"--color-brand: #ffffff",
-	"--color-trajectory-tool-call: #f59e0b",
-	"--animated-gradient-text-soft: rgba(255, 255, 255, 0.22)",
-	"--color-interaction-ask-fill: rgba(70, 191, 114, 0.24)",
+	"--color-accent: #c96442", // 唯一彩色动作：陶土
+	"--color-accent-foreground: #141413", // accent 上的近黑字（4.73:1）
+	"--color-input-border:", // 补缺：此前未定义 → 9 处输入边框静默失效
+	"--font-display: Georgia", // 衬线栈（仅 ≥20px 标题）
+	"--text-ui-xs: calc(var(--ui-font-size) - 3px)", // 10→11（CJK 可读下限）
+	"--color-selected: color-mix(in oklab, var(--color-surface-warm) 12%, transparent)",
+	"--animated-gradient-text-soft: rgba(250, 249, 245, 0.22)", // 暖白扫光
+	"--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent)",
 ]) {
-	assert.ok(css.includes(token), `token 值对锚 §3.2：${token}`);
+	assert.ok(css.includes(token), `暖色契约 token：${token}`);
 }
+assert.ok(!/^\s*--color-trajectory-[a-z-]+\s*:/m.test(css), "--color-trajectory-* 死 token 已删除（0 调用点）");
 assert.ok(css.includes("scrollbar-width: auto") && css.includes("width: 14px"), "全局滚动条整块（14px/thumb 圆角）");
 assert.ok(css.includes("animation: gradient-flow 4s linear infinite"), "gradient-flow：4s linear infinite");
 assert.ok(/zcode-stream-text-in 900ms cubic-bezier\(0\.16, 1, 0\.3, 1\)/.test(css), "stream text/tool：900ms cubic-bezier(0.16,1,0.3,1)");
@@ -48,11 +51,11 @@ assert.ok(css.includes("task-search-result-highlight 1.2s ease-out both"), "sear
 assert.ok(css.includes("fork-highlight-pulse 1.6s ease-out 1"), "fork highlight：1.6s ease-out");
 assert.ok(css.includes("@custom-variant data-active"), "shadcn 语义 variant 手写块（data-active）");
 assert.ok(css.includes('@import "tw-animate-css"'), "tw-animate-css 接入");
-ok("1 主题底座：token 值表 / 14px / 滚动条 / 动画 / @custom-variant 全对锚");
+ok("1 主题底座：暖色契约 token / 14px / 滚动条 / 动画 / @custom-variant 全对锚");
 
-// main.tsx 常挂 theme-zai-dark
-assert.ok(read("main.tsx").includes('classList.add("theme-zai-dark")'), "documentElement 常挂 theme-zai-dark");
-ok("1b main.tsx 挂 .theme-zai-dark（Web 默认暗色口径）");
+// main.tsx 常挂 theme-warm-dark
+assert.ok(read("main.tsx").includes('classList.add("theme-warm-dark")'), "documentElement 常挂 theme-warm-dark");
+ok("1b main.tsx 挂 .theme-warm-dark（Web 默认暗色口径）");
 
 // ── 2. 依赖 + ui 14 件 ─────────────────────────────────────────────
 const pkg = JSON.parse(read("../package.json")) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };

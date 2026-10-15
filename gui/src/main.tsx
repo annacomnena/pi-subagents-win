@@ -7,9 +7,9 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
-// 主题底座（ZCode 1:1 第 1 步）：Web 默认暗色口径——documentElement 常挂 zai-dark
-//（zcode web/main.tsx resolveWebInitialTheme 默认 zai-dark；亮色切换器不做）。
-document.documentElement.classList.add("theme-zai-dark");
+// 主题底座（Anthropic 暖纸体系 §2 C-1）：Web 默认暗色口径——documentElement 常挂
+// .theme-warm-dark（暖炭底 + 陶土重音）；浅色 .theme-warm-light 只留定义，切换器 C-3 本轮不做。
+document.documentElement.classList.add("theme-warm-dark");
 
 createRoot(document.getElementById("root")!).render(
 	<StrictMode>
