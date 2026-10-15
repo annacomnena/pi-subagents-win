@@ -26,6 +26,7 @@ import {
 } from "./external-cli.ts";
 import { registerCodexHeaders } from "./codex-headers.ts";
 import { registerSubPresetsCommand } from "./model-presets.ts";
+import { checkDispatchTier, loadCostTiers, normalizeRoleTier, registerTiersCommand, resolveCostTier, type CostTier, type GateDecision, type ModelCostTiersTable, type RoleTierInterval } from "./tiers.ts";
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
 import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
@@ -424,8 +425,9 @@ function formatFailureForMainAgent(result: SubagentResult, triedModels?: string[
 			"ACTION_REQUIRED (main agent):",
 			"- This is treated as a package/usage cap (Zhipu/GLM often returns bare HTTP 429 when 套餐用量用尽).",
 			"- Do NOT retry the same model (waiting will not restore package quota).",
-			"- Switch the main session to a higher-tier / different provider model via /model (or setModel),",
+			"- Pick a same-costTier substitute: a model in the SAME costTier that also lies inside this role's [min,max] interval (check layers with /tiers show),",
 			"  then re-run the failed subagent step with model= override or updated /sub-models defaults.",
+			"- Never escalate above max or downgrade below min; if every same-costTier substitute is exhausted → STOP and ask the user.",
 			"- Prefer a model not on the tried_models list above (avoid Zhipu/glm if that is exhausted).",
 		);
 	} else if (cls.retryable) {
@@ -1251,6 +1253,28 @@ function withAllAttemptUsage(
 	return result;
 }
 
+/**
+ * costTier 派发门 + `costTier.enforce` 灰度开关（纯函数，供 runWithFallback 三处门点调用：主门 / fallback 逐候选门 / 无模型名门）。
+ * `enforce=true` → 门判定原样生效；`enforce=false`（默认，warn-only 灰度）→ 门不通过时降级为告警放行，
+ * 原始判定保留在 `.gate`（调用方按 gate.allowed/gate.warn 区分「真放行」与「warn-only 未拦」）。
+ */
+export function costTierGate(args: {
+	role?: string;
+	model?: string;
+	table: ModelCostTiersTable;
+	roleTier: Record<string, RoleTierInterval>;
+	explicitOverride: boolean;
+	allowTierEscalation: boolean;
+	mainCall: boolean;
+	enforce: boolean;
+}): { allowed: boolean; gate: GateDecision } {
+	const gate = checkDispatchTier({
+		role: args.role, model: args.model, table: args.table, roleTier: args.roleTier,
+		explicitOverride: args.explicitOverride, allowTierEscalation: args.allowTierEscalation, mainCall: args.mainCall,
+	});
+	return { allowed: gate.allowed || !args.enforce, gate };
+}
+
 /** Human-readable fallback chain, e.g. "cli:claude ✗ PROVIDER → miaomiao/...". Empty if no fallback occurred. */
 function fallbackChainText(result: SubagentResult): string {
 	const fails = result.priorFailures ?? [];
@@ -1260,7 +1284,7 @@ function fallbackChainText(result: SubagentResult): string {
 	return `${segs.join(" → ")} → ${ok}`;
 }
 
-async function runWithFallback(
+export async function runWithFallback(
 	agent: AgentDef | null,
 	task: string,
 	systemPrompt?: string,
@@ -1298,20 +1322,87 @@ async function runWithFallback(
 		normalizedFallbacks = configuredFallbacks.filter(Boolean);
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
+
+	// costTier 派发门（执行点①）：在候选集展开后、任何 runSingle spawn 之前判定。
+	// table 用 .table（checkDispatchTier 收 ModelCostTiersTable；缺表时 emptyTable 带 present:false）。
+	const __table = loadCostTiers().table;
+	const __roleTier = normalizeRoleTier(readConfig().roleTier);
+	const __gateArgs = {
+		role: agent?.name,
+		table: __table,
+		roleTier: __roleTier,
+		explicitOverride: model !== undefined,
+		allowTierEscalation: opts?.allowTierEscalation === true,
+		mainCall: opts?.mainCall === true,
+		enforce: process.env.PI_COST_TIER_ENFORCE === "1" || readConfig().costTier?.enforce === true,
+	};
 	if (candidates.length === 0) {
+		// 无模型名门（L4 M1 补修）：零候选（无 config 模型且无 fallback）时不再有「绕过路径」——
+		// spawn 前用 model:"" 跑门（explicitOverride 必为 false：没模型名可点名）。
+		// 缺表 → table_missing fail-open 放行；表 present 且角色区间可解析而判定不通过 + enforce=true
+		// → 结构化拦截（与主门同形，model=(none)）；enforce=false（默认）→ warn-only 放行。
+		const __noModelGate = costTierGate({ ...__gateArgs, model: "", explicitOverride: false });
+		if (!__noModelGate.allowed) {
+			return {
+				status: "failed",
+				text: "",
+				usage: emptyUsageSummary(),
+				usageEvents: [],
+				runId: randomUUID(),
+				error: `[subagent-tier-blocked role=${agent?.name ?? "(none)"} model=(none) tier=${__noModelGate.gate.tier} interval=${JSON.stringify(__roleTier[agent?.name ?? ""] ?? null)} side=${__noModelGate.gate.side ?? "n/a"}] ${__noModelGate.gate.message}`,
+				agent: agent?.name,
+				triedModels: [],
+			};
+		}
+		if (!__noModelGate.gate.allowed) onUpdate?.(`⚠ tier ${__noModelGate.gate.code}（enforce=false warn-only，未拦）`, "(none)");
+		else if (__noModelGate.gate.warn) onUpdate?.("⚠ tier " + __noModelGate.gate.code, "(none)");
 		const result = await runSingle(agent, task, systemPrompt, undefined, timeoutMs, signal, onUpdate, opts);
 		if (result.requestedModel) result.triedModels = [result.requestedModel];
 		return result;
 	}
+	// 主门（候选 0）：越界 → 立即结构化失败，不得进入 fallback / 不写 priorFailures / 不经 classifyModelFailure。
+	// 2026-10-16 二轮必修：改走 costTierGate——enforce=false（默认 warn-only 灰度）在主门同样生效
+	// （旧实现直调 checkDispatchTier 在候选 0 上硬拦，与「默认 warn-only」语义矛盾）。
+	const __primaryGate = costTierGate({ ...__gateArgs, model: candidates[0] });
+	if (!__primaryGate.allowed) {
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: `[subagent-tier-blocked role=${agent?.name ?? "(none)"} model=${candidates[0]} tier=${__primaryGate.gate.tier} interval=${JSON.stringify(__roleTier[agent?.name ?? ""] ?? null)} side=${__primaryGate.gate.side ?? "n/a"}] ${__primaryGate.gate.message}`,
+			agent: agent?.name,
+			requestedModel: candidates[0],
+			triedModels: [],
+		};
+	}
+	if (!__primaryGate.gate.allowed) onUpdate?.(`⚠ tier ${__primaryGate.gate.code}（enforce=false warn-only，未拦）`, candidates[0]);
+	else if (__primaryGate.gate.warn) onUpdate?.("⚠ tier " + __primaryGate.gate.code, candidates[0]);
 
 	let lastResult: SubagentResult | undefined;
 	const dispatchRunId = randomUUID();
 	const allUsageEvents: SubagentUsageEvent[] = [];
 	const tried: string[] = [];
 	const priorFailures: AttemptFailure[] = [];
+	let __anySpawned = false;
+	let __lastBlockedGate: { model: string; gate: ReturnType<typeof checkDispatchTier> } | undefined;
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
+		if (index > 0) {
+			// fallback candidate：spawn 前再跑一次门；越界 → 跳过（不 spawn、不记 tried）。
+			// L4 M2：index>0 候选强制 explicitOverride:false ——「用户点名」只覆盖 candidate 0，不覆盖 fallback 链。
+			const __gate = costTierGate({ ...__gateArgs, model: candidate, explicitOverride: false });
+			if (!__gate.allowed) {
+				priorFailures.push({ model: candidate, kind: "TIER_BLOCKED", error: __gate.gate.message });
+				__lastBlockedGate = { model: candidate, gate: __gate.gate };
+				continue;
+			}
+			if (!__gate.gate.allowed) onUpdate?.(`⚠ tier ${__gate.gate.code}（enforce=false warn-only，未拦）`, candidate);
+			else if (__gate.gate.warn) onUpdate?.("⚠ tier " + __gate.gate.code, candidate);
+		}
 		tried.push(candidate);
+		__anySpawned = true;
 		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, opts);
 		result.requestedModel = candidate;
 		result.triedModels = [...tried];
@@ -1343,6 +1434,22 @@ async function runWithFallback(
 			continue;
 		}
 		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
+	}
+	if (!__anySpawned && __lastBlockedGate) {
+		// 全部候选在 spawn 前被门跳过（正常情况下的候选 0 已在上游单独判定并直接返回）。
+		const __blocked = __lastBlockedGate;
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: dispatchRunId,
+			error: `[subagent-tier-blocked role=${agent?.name ?? "(none)"} model=${__blocked.model} tier=${__blocked.gate.tier} interval=${JSON.stringify(__roleTier[agent?.name ?? ""] ?? null)} side=${__blocked.gate.side ?? "n/a"}] ${__blocked.gate.message}`,
+			agent: agent?.name,
+			requestedModel: __blocked.model,
+			triedModels: tried,
+			priorFailures,
+		};
 	}
 	return lastResult
 		? withAllAttemptUsage(lastResult, allUsageEvents, dispatchRunId, tried, priorFailures)
@@ -1379,6 +1486,7 @@ async function runParallel(
 	allAgents: AgentDef[],
 	signal?: AbortSignal,
 	onUpdate?: (status: string, text: string, parallelProgress?: ParallelProgressInfo) => void,
+	dispatchOpts?: RunDispatchOptions,
 ): Promise<SubagentResult[]> {
 	const limit = Math.max(1, Math.min(concurrency, MAX_CONCURRENCY));
 	const results: SubagentResult[] = [];
@@ -1453,7 +1561,7 @@ async function runParallel(
 				: undefined;
 
 			try {
-				results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools });
+				results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools, allowTierEscalation: dispatchOpts?.allowTierEscalation, mainCall: dispatchOpts?.mainCall });
 				tasksProgress[idx].status = results[idx].status;
 				tasksProgress[idx].elapsedMs = results[idx].durationMs ?? (Date.now() - tasksProgress[idx].startedAt);
 				tasksProgress[idx].detail = results[idx].status === "completed" ? "完成" : (results[idx].error ?? "失败");
@@ -2054,6 +2162,7 @@ export default function (pi: ExtensionAPI) {
 		writeTabDispatch(runsDir, dispatch);
 		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
 		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: args.linkDetail });
+		// 角色区间门适用域：Sub-Master 一次性 tab（master 无角色归属），costTier 角色区间门不适用。
 		const result = spawnPiTab({
 			wtPath, piCli, cwd: args.cwd, title: args.title, prompt, tabRunId: runId, runsDir,
 			onSpawnError: (err) => markFailed(err),
@@ -2676,6 +2785,7 @@ export default function (pi: ExtensionAPI) {
 		// home 守卫配套（0923）：global successor 一律在 home 启动，否则后继 attach 必被拒绝。
 		const cwd = requestedCwd ?? homedir();
 		if (!cwd) throw new Error("master-transfer: 无法确定 home 目录，拒绝 spawn 后继（旧主仍是 owner）");
+		// 角色区间门适用域：后继/主会话 tab（无角色归属），costTier 角色区间门不适用。
 		const result = spawnPiTab({
 			wtPath, piCli, cwd, prompt,
 			// 标题过 wt 风险字符消毒（reason 可能含 %/;/引号并进 --title；旧路径无防护）
@@ -2757,6 +2867,7 @@ export default function (pi: ExtensionAPI) {
 		writeTabDispatch(runsDir, dispatch);
 		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
 		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: `local-master=${args.scope}` });
+		// 角色区间门适用域：local-master 常驻 tab（无角色归属），costTier 角色区间门不适用。
 		const result = spawnPiTab({
 			wtPath, piCli, cwd: args.cwd, title, prompt: args.prompt, tabRunId: runId, runsDir,
 			onSpawnError: markFailed,
@@ -2852,7 +2963,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
 		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
-		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), switch the main session model via /model to a higher-tier/different provider, then retry with model= override — do not retry the same model.");
+		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), pick a same-costTier substitute — a model in the same costTier that also lies inside the role's [min,max] interval (check with /tiers show) — then retry with model= override; never escalate above max or downgrade below min, and if all same-tier substitutes are exhausted, STOP and ask the user. Do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
 		// 主会话专属禁轮询纪律（isMainSession 门：tab/子 agent 不注入——"STOP 是合法终态"与 worker 的 tab-finish 纪律冲突，见 no-poll.ts 头注释）
@@ -3306,6 +3417,12 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, signal, onUpdate, _ctx) {
 			const p = rawParams as Record<string, any>;
 
+			// costTier 升层身份门：allowTierEscalation 是主会话/用户点名专属能力，
+			// 子 agent / task tab 自己传一律拒绝（isMainSession 见 identity.ts）。
+			if (p.allowTierEscalation === true && !isMainSession()) {
+				return { isError: true, content: [{ type: "text", text: "allowTierEscalation 仅主会话/用户点名可传；子 agent / task tab 传一律拒绝。" }] };
+			}
+
 			// 入参校验：空 task 的派发在任何 profile 下都是调用方 bug
 			// （同时封死 review 指出的绕过面：空字符串 task 不再进入派发分支）。
 			if (p.task !== undefined && !String(p.task ?? "").trim()) {
@@ -3480,6 +3597,7 @@ export default function (pi: ExtensionAPI) {
 								details: parallelProgress ? { parallelProgress } : undefined,
 							})
 						: undefined,
+					{ allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession() },
 				);
 				for (const r of results) recordUsage(r.agent, r);
 				const parts = results.map(function(r, i) {
@@ -3505,7 +3623,7 @@ export default function (pi: ExtensionAPI) {
 					header +=
 						"\n\n[subagent-failure kind=USAGE_CAP] " +
 						usageCaps.length +
-						" task(s) hit package/usage cap. ACTION_REQUIRED (main agent): switch main session model via /model to a higher-tier/different provider, then retry failed tasks with model= override (avoid tried_models)." ;
+						" task(s) hit package/usage cap. ACTION_REQUIRED (main agent): pick a same-costTier substitute (same costTier + inside the role's [min,max]; check /tiers show), then retry failed tasks with model= override (avoid tried_models). Never escalate above max or downgrade below min; if all same-tier substitutes are exhausted → STOP and ask the user." ;
 				}
 				return {
 					content: [{ type: "text", text: header + "\n\n" + parts.join("\n\n---\n\n") }],
@@ -3562,7 +3680,7 @@ export default function (pi: ExtensionAPI) {
 							details: progress ? { progress } : undefined,
 						})
 					: undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools });
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession() });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
@@ -3589,7 +3707,7 @@ export default function (pi: ExtensionAPI) {
 					const body = formatSubagentTextForParent(result.text || "(no output)", result.runId);
 					return { content: [{ type: "text", text: identityHeader + modelLine + body }], details: { result: sanitizeResultForDetails(result) } };
 				}
-				// Failed: structured error for main agent (usage cap → switch higher-tier model).
+				// Failed: structured error for main agent (usage cap → same-costTier substitute; else STOP and ask the user).
 				const body = formatFailureForMainAgent(result, result.triedModels);
 				return { content: [{ type: "text", text: identityHeader + modelLine + body }], isError: true, details: { result: sanitizeResultForDetails(result) } };
 			}
