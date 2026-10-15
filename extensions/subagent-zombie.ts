@@ -88,6 +88,14 @@ export interface ZombieDeps {
 	now?: () => number;
 	isPidAlive?: (pid: number) => boolean;
 	inspectLiveProcess?: (pid: number) => { pid: number; startedAtMs?: number; cmd?: string } | null;
+	/**
+	 * 跳过 `inspectLiveProcess`（PowerShell，单次可阻塞 ~20s）——**周期 tick 路径专用**。
+	 *
+	 * 理由（审查 M8）：tick 是同步 setInterval 回调，在事件循环里跑 20s 的 PowerShell 不可接受。
+	 * 跳过只损失「pid-reused」这一罕见情况的检测（此时 isPidAlive 为真 ⇒ 我们不判 ⇒ **保守不误杀**），
+	 * on-read 惰性路径（用户主动查询）不跳，仍能抓到它。
+	 */
+	skipInspect?: boolean;
 }
 
 /** 解析时间基准：优先 pidRecordedAt，其次 startedAt；都没有 ⇒ undefined。 */
@@ -143,7 +151,8 @@ export function detectZombie(rec: KillableRunRecord, deps: ZombieDeps = {}): Zom
 		// 硬证据 ①：signal-0 判死
 		if (!alive(pid)) return { zombie: true, weak: false, reason: "pid-dead", basisMs: idleBase };
 		// 硬证据 ②：pid 活着但身份不匹配（OS 重用了该 pid）——仅在需要时查（PowerShell 慢）
-		const live = inspect(pid);
+		// tick 路径 skipInspect ⇒ 跳过（保守：不判、不误杀；on-read 路径仍会抳）
+		const live = deps.skipInspect ? null : inspect(pid);
 		if (live !== null && typeof live.startedAtMs === "number") {
 			const recMs = Date.parse(String(rec.pidRecordedAt ?? ""));
 			// 登记容差窗口（与 subagent-kill 同量级：前 5min / 后 3min）

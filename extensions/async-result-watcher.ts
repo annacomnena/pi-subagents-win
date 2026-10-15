@@ -36,6 +36,7 @@ import { defaultLinksPath, listLinks } from "./links.ts";
 import { preInject, postInject, injectFollowUpQuietly, type InjectionContext } from "./injection-gate.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
+import { reapZombiesInDir } from "./subagent-zombie.ts";
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
 const TICK_MS = 10_000;
@@ -246,6 +247,12 @@ export function onRunFile(
 	const error = record.result?.error
 		? ` — ${record.result.error.replace(/\s+/g, " ").slice(0, 120)}`
 		: "";
+	// 失败分类投影（计划要求 6 / 审查 M6）：把 watchdog 或子 agent 自己落的 `failure`
+	// 写进注入正文，让主会话一眼看到「为什么失败、能不能换模型重试」。
+	const failure = (record as { failure?: { kind?: string; model?: string; httpStatus?: number | null; source?: string } }).failure;
+	const failureLine = failure
+		? `\n失败分类: kind=${failure.kind ?? "?"}${failure.source ? ` source=${failure.source}` : ""}${failure.model ? ` model=${failure.model}` : ""}${failure.httpStatus ? ` http=${failure.httpStatus}` : ""}`
+		: "";
 	const task = (record.task ?? "").slice(0, 80);
 	const cost = record.result?.usage?.cost ? ` ($${record.result.usage.cost.toFixed(4)})` : "";
 
@@ -268,7 +275,7 @@ export function onRunFile(
 	// L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条链 async，防竞态面扩大）。
 	if (opts.autoInject !== false) {
 		const body = [
-			`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}`,
+			`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}${failureLine}`,
 			`产物: ${join(runsDir, `${runId}.json`)}`,
 			`下一步: 用 subagent-win({ action: "status", runId: "${runId}" }) 取全文。`,
 			NO_POLL_HINT,
@@ -392,6 +399,13 @@ export function registerAsyncResultWatcher(
 			try {
 				pollUnnotified(runsDir, fullOpts);
 			} catch { /* tick 失败不影响下轮 */ }
+			// 僵尸看门狗（失败必达终态的**宿主侧兜底**）：2026-10-15 六个死 pid 的 `running` run
+			// 导致上游死等 100min，而 watcher 只认终态文件 ⇒ 死进程的记录无人回收。
+			// 此处复用**既有** 10s tick（不新增定时器）；skipInspect=true 避免在事件循环里跑
+			// PowerShell（审查 M8）；只扫 *.json（实测 654 文件中仅 54 个 JSON）。
+			try {
+				reapZombiesInDir(runsDir, { deps: { skipInspect: true }, limit: 50 });
+			} catch { /* 看门狗失败不影响投递 */ }
 		}, TICK_MS);
 		tickInterval.unref?.();
 	};
