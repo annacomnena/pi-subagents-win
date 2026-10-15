@@ -122,7 +122,7 @@ assert.ok(chat.includes("思考过程"), "reasoning 折叠标题");
 ok("4 transcript：5 种行→zcode 行型映射 + 工具卡 + mask（无光标字符）");
 
 // ── 5. composer 1:1（锚 §2.c）─────────────────────────────────────
-assert.ok(chat.includes("rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused"), "输入壳三态边框整串（ChatPromptEditor#L346-353）");
+assert.ok(chat.includes("rounded-xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused"), "输入壳三态边框整串（ChatPromptEditor#L346-353；S6b 圆角收敛 16→12px）");
 assert.ok(chat.includes("border-accent bg-input"), "拖拽高亮占位（§7 A-8④ 陶土体系）");
 assert.ok(chat.includes("cursor-pointer gap-1 rounded-lg bg-accent text-ui-base text-accent-foreground hover:bg-accent-hover"), "发送钮整串（ConversationComposer#L2088；§7 A-8③ 全库唯一彩色主 CTA）");
 assert.ok(chat.includes("<ArrowUp className=\"size-4\" />"), "发送钮 ArrowUp icon-md");

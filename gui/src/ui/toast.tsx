@@ -310,7 +310,7 @@ export function ToastMessageView({
   return (
     <div
       className={cn(
-        "rounded-2xl border bg-toast/60 text-ui-base shadow-overlay backdrop-blur-xl transition-[transform,opacity] duration-200 ease-[cubic-bezier(0.77,0,0.175,1)] motion-reduce:transform-none motion-reduce:transition-opacity",
+        "rounded-xl border bg-toast/60 text-ui-base shadow-overlay backdrop-blur-xl transition-[transform,opacity] duration-200 ease-[cubic-bezier(0.77,0,0.175,1)] motion-reduce:transform-none motion-reduce:transition-opacity",
         isUpdate
           ? "origin-bottom-left w-[min(300px,calc(100vw-1rem))] max-w-[min(300px,calc(100vw-1rem))] border-popover-border text-foreground shadow-overlay"
           : isNotice
@@ -348,7 +348,7 @@ export function ToastMessageView({
             <button
               type="button"
               onClick={onAction ?? item.onAction}
-              className="h-7 max-w-14 shrink-0 truncate rounded-md bg-secondary px-2 text-ui-base font-medium text-foreground transition-colors hover:bg-hover"
+              className="h-7 max-w-14 shrink-0 truncate rounded-lg bg-secondary px-2 text-ui-base font-medium text-foreground transition-colors hover:bg-hover"
             >
               {item.actionLabel}
             </button>
@@ -388,7 +388,7 @@ export function ToastMessageView({
               type="button"
               onClick={onDismiss}
               aria-label={item.dismissLabel ?? "Close"}
-              className="flex size-6 shrink-0 items-center justify-center rounded-md text-foreground-subtle hover:bg-hover hover:text-foreground"
+              className="flex size-6 shrink-0 items-center justify-center rounded-lg text-foreground-subtle hover:bg-hover hover:text-foreground"
             >
               <X className="size-3.5" aria-hidden="true" />
             </button>

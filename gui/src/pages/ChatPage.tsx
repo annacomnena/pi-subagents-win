@@ -6,7 +6,7 @@
  *   assistantText→行式 <Markdown>（0923 2003 自研零依赖渲染器，替换 whitespace-pre-wrap 纯文本）；
  *   reasoning→Collapsible 默认收起（正文同 Markdown）；
  *   toolCall→Collapsible 单行卡（运行中=animated-gradient-text 扫光≈流式；无光标字符）。
- * - composer（拍板 6）：rounded-2xl border-input-border bg-input p-3 三态边框 + 发送钮
+ * - composer（拍板 6 + S6b 圆角收敛）：rounded-xl border-input-border bg-input p-3 三态边框 + 发送钮
  *   icon-md bg-brand ArrowUp；加号钮与 Stop 钮灰显占位（无后端，Tooltip「未接入」）。
  * - 数据面零改动：GET transcript 首屏 + WS 增量（useEventStream）+ sendChatMessage
  *   （P2 session.message POST + outbox 两段回执，OUTBOX_STATUS 文案沿用）。
@@ -493,12 +493,12 @@ export function ChatPage() {
 									e.preventDefault();
 									setDragging(false); // 附件拖放无后端：占位高亮，落点不接收
 								}}
-								className={`relative flex flex-col gap-3 overflow-hidden rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused ${
+								className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused ${
 									dragging ? "border-accent bg-input" : ""
 								}`}
 							>
 								{dragging && (
-									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-accent/15 backdrop-blur-sm">
+									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-accent/15 backdrop-blur-sm">
 										<div className="flex items-center gap-2 rounded-full border border-accent/40 bg-card px-4 py-2 text-ui-base text-accent-text shadow-overlay">
 											<span>附件拖放未接入</span>
 										</div>

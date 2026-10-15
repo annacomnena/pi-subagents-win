@@ -229,7 +229,7 @@ export function SessionList() {
 					placeholder="过滤会话（标题 / ID / 仓库名）"
 					className="h-7 min-w-0 flex-1"
 				/>
-				<div className="flex h-7 shrink-0 overflow-hidden rounded-md border border-border" role="group" aria-label="组内排序">
+				<div className="flex h-7 shrink-0 overflow-hidden rounded-lg border border-border" role="group" aria-label="组内排序">
 					{(
 						[
 							["updated", "最近更新"],
@@ -244,7 +244,7 @@ export function SessionList() {
 								saveSortBy(value); // 维度切换落盘 `saw-ws-sort`（机制同 saw-ws-expansion）
 							}}
 							aria-pressed={sortBy === value}
-							className={`px-1.5 text-ui-sm transition-colors focus-visible:rounded-md ${
+							className={`px-1.5 text-ui-sm transition-colors focus-visible:rounded-lg ${
 								sortBy === value
 									? "bg-tag text-foreground"
 									: "text-foreground-subtle hover:bg-hover"

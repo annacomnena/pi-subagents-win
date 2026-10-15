@@ -72,7 +72,7 @@ export function TimelinePage() {
 						key={f.id}
 						type="button"
 						onClick={() => setFilterId(f.id)}
-						className={`rounded-md border px-2 py-0.5 text-ui-xs transition-colors ${
+						className={`rounded-lg border px-2 py-0.5 text-ui-xs transition-colors ${
 							filterId === f.id
 								? "border-border-hover bg-selected text-foreground"
 								: "border-border text-foreground-subtle hover:bg-hover hover:text-foreground"
@@ -97,7 +97,7 @@ export function TimelinePage() {
 				) : (
 					<ul className="divide-y divide-border">
 						{items.map((t) => (
-							<li key={t.id} className="flex items-start gap-2 rounded-md px-1 py-1.5 text-ui-sm transition-colors hover:bg-hover">
+							<li key={t.id} className="flex items-start gap-2 rounded-lg px-1 py-1.5 text-ui-sm transition-colors hover:bg-hover">
 								<RelTime at={t.at} className="w-20 shrink-0 text-ui-xs text-foreground-subtle" />
 								<span className="mt-0.5 shrink-0">{kindBadge(t)}</span>
 								<span className="min-w-0">

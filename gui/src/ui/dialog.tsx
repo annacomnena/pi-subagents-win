@@ -39,7 +39,8 @@ function DialogOverlay({
   );
 }
 
-// 圆角规范迁移：默认外壳统一 2xl，三个截图/附件预览入口显式保留 xl，内容层级独立计算。
+    // 圆角档：浮层 = 12px（rounded-xl，§5 P2「圆角收敛到 8/12/20/999 + 媒体 16」）。
+    // 16px（rounded-2xl）是媒体专用档，浮层不得占用；参见 §3 px↔class 映射表。
 function DialogContent({
   className,
   children,
@@ -61,7 +62,7 @@ function DialogContent({
           // Electron 自绘标题栏下，弹窗可能会落进窗口顶部的 drag 区域。
           // 如果不把弹窗内容整体标成 no-drag，右上角关闭按钮这类交互会被窗口拖拽命中吞掉。
           // 浮层统一「环 + 低语影」（§5 深度语言）：shadow-overlay 替代 shadow-md。
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-popover-border bg-popover p-4 text-ui-base/relaxed text-foreground shadow-overlay duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 [app-region:no-drag]",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-popover-border bg-popover p-4 text-ui-base/relaxed text-foreground shadow-overlay duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 [app-region:no-drag]",
           className,
         )}
         {...props}
