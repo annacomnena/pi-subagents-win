@@ -135,6 +135,7 @@ import { runSystemGc } from "./gc-cleaner.ts";
 import {
 	applyKillOutcome,
 	clearRunProcess,
+	createThrottledRunMerger,
 	DEFAULT_RUNS_DIR,
 	formatRunList,
 	killAsyncRun,
@@ -293,9 +294,10 @@ function readConfig(): AgentConfig {
 			searcherMode: parsed.searcherMode ?? "auto",
 			liteMode: parsed.liteMode ?? "off",
 			masterSuccession: normalizeMasterSuccession(parsed.masterSuccession),
+			loopGuard: normalizeLoopGuard(parsed.loopGuard),
 		};
 	} catch {
-		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off", masterSuccession: normalizeMasterSuccession(undefined) };
+		return { models: {}, fallbackModels: {}, thinking: {}, notifications: true, searcherMode: "auto", liteMode: "off", masterSuccession: normalizeMasterSuccession(undefined), loopGuard: normalizeLoopGuard(undefined) };
 	}
 }
 
@@ -698,6 +700,8 @@ interface SubagentResult {
 	agent?: string;
 	durationMs?: number;
 	toolCallsCount?: number;
+	/** 循环观测（2026-10-14，纯加法）：最近 K 次工具调用环形明细（async 持久化到 run json）。 */
+	recentCalls?: RecentCallEntry[];
 }
 
 export interface SubagentProgressInfo {
@@ -1154,6 +1158,7 @@ async function runSingle(
 			result.agent = agent?.name;
 			result.durationMs = Date.now() - startTime;
 			result.toolCallsCount = toolCallsCount;
+			result.recentCalls = ring.slice(-RING_K);
 			resolve_(result);
 		});
 		child.on("close", (code) => {
@@ -1164,6 +1169,7 @@ async function runSingle(
 			result.toolCallsCount = toolCallsCount;
 			// 处理缓冲区中剩余行（即使中断也有部分结果）
 			if (lineBuf.trim()) parseJsonEvents(lineBuf + "\n", result, (s, t) => emitUpdate(s, t), parseOpts);
+			result.recentCalls = ring.slice(-RING_K);
 			// Final text selection across all assistant turns.
 			const best = pickBestAssistantText(textCandidates);
 			if (best) {
@@ -1732,8 +1738,8 @@ function listJsonlFiles(dir: string): string[] {
 	return out;
 }
 
-function collectSubagentUsage(day: DayBounds): UsageBucket {
-	const total = emptyUsage();
+/** 逐行解析用量账本（本地日 + UTC legacy 双读；按 id 去重）。供 /today-usage 与 /tiers usage 共用。 */
+export function readUsageRecords(day: { label: string; startMs: number; endMs: number }): Array<{ agent?: string | null; model?: string | null; usage: UsageSummary; runId: string }> {
 	const utcDates = overlappingUtcDates(day);
 	// Read the local format plus UTC-named legacy files that may overlap this local day.
 	const candidates = new Set<string>([
@@ -1755,16 +1761,29 @@ function collectSubagentUsage(day: DayBounds): UsageBucket {
 				const eventId = typeof r.id === "string" ? r.id : `legacy:${r.ts}:${line}`;
 				if (seenEvents.has(eventId)) continue;
 				seenEvents.add(eventId);
-				const runId = typeof r.runId === "string" ? r.runId : eventId;
-				seenRuns.add(runId);
 				const u = r.usage ?? {};
-				addUsage(total, {
-					input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
-					cost: u.cost, turns: u.turns,
+				out.push({
+					agent: typeof r.agent === "string" ? r.agent : null,
+					model: typeof r.model === "string" && r.model ? r.model : null,
+					usage: {
+						input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+						cost: u.cost, turns: u.turns,
+					} as UsageSummary,
+					runId: typeof r.runId === "string" ? r.runId : eventId,
 				});
-				addModelUsage(total, typeof r.model === "string" && r.model ? r.model : "unknown", u, 0);
 			} catch { /* skip bad line */ }
 		}
+	}
+	return out;
+}
+
+function collectSubagentUsage(day: DayBounds): UsageBucket {
+	const total = emptyUsage();
+	const seenRuns = new Set<string>();
+	for (const rec of readUsageRecords(day)) {
+		addUsage(total, rec.usage);
+		addModelUsage(total, rec.model ?? "unknown", rec.usage, 0);
+		seenRuns.add(rec.runId);
 	}
 	total.count = seenRuns.size;
 	return total;
@@ -1839,6 +1858,11 @@ interface AsyncRunRecord {
 	killedAt?: string;
 	killedBy?: string;
 	killReason?: string;
+	/** 循环观测（2026-10-14，纯加法）：最近 K 次工具调用环形明细（终态快照；kill 后仍保留，见 subagent-kill.ts applyKillOutcome）。 */
+	recentCalls?: RecentCallEntry[];
+	/** 运行中循环观测（2026-10-14，纯加法，异步增量写）：最近一次工具命中的 turn / 当前 turn 计数（供 no_progress 判定）。 */
+	lastToolTurn?: number;
+	turnClock?: number;
 }
 
 function listAsyncRuns(): AsyncRunRecord[] {
@@ -3142,6 +3166,7 @@ export default function (pi: ExtensionAPI) {
 			"异步: { agent, task, model?, cwd? }（**缺省就是异步**，仍是无头 subagent；本轮就要结果才显式 async: false 走同步）",
 			"查状态: { action: \"status\", runId? }（async subagent 的 runId 只能用这里查询）",
 			"列出/终止: { action: \"list\" } 列出全部 async runs（runId/agent/状态/pid/启动/lastActivity，卡住的 run 会看到 idle 很大）；{ action: \"kill\", runId } （或 action:\"cancel\"）直接终止该 run 的整棵进程树并落成 cancelled，无需手工找 PID；kill 缺省取本会话唯一的 running run。",
+			"最近调用/循环判定: { action: \"recent-calls\", runId? | tabRunId?, n? }（只读；返回最近 n 次工具调用 + verdict ok|repeating|no_progress + hint；默认 n=3 上限 5；async 读 run json 环形明细，tab 读会话 JSONL 尾部）",
 			"安全语义: kill 只杀该 runId 登记过的 pid 及其子树，并向 OS 核对进程启动时间+命令行（防 pid 被重用后误杀）；run 已终态/已 cancelled 时幂等返回不报错。",
 			"不要对 async subagent 使用 tab-status、reclaim-tabs、tab-finish 或 set-timer。",
 			"【async 决策准则】缺省即异步（非阻塞，返回 runId，产物落盘 plans/，靠完成事件/async-result-watcher/status 收割）；只有结果本轮马上要用（下一步依赖、L4 复核）才显式 async: false 同步等待；同批独立任务用 tasks: [...] 并行（并行缺省同样异步，显式 async:false 才阻塞）。async subagent 不是可见 tab，不需要 timer。只有主会话需要可见、独立、可回收标签页时，才调用 launch-tabs。",
@@ -3202,6 +3227,10 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (args.action === "list") {
 				return new Text(`${title} ${theme.fg("muted", "list")}`, 0, 0);
+			}
+			if (args.action === "recent-calls") {
+				const target = args.tabRunId ?? args.runId;
+				return new Text(`${title} ${theme.fg("muted", "recent-calls")}${target ? " " + theme.fg("dim", String(target)) : ""}`, 0, 0);
 			}
 			if (args.async) {
 				const agentDef = args.agent ? agents.find((a) => a.name === args.agent) ?? null : null;
@@ -3295,6 +3324,13 @@ export default function (pi: ExtensionAPI) {
 				const text = result.content[0];
 				const raw = text?.type === "text" ? text.text : "running...";
 				return new Text(`${theme.fg("warning", "↻")} ${theme.fg("toolTitle", "subagent-win")} ${theme.fg("dim", raw)}`, 0, 0);
+			}
+
+			// ── recent-calls 只读观测（纯文本原样展示）──
+			if (d?.recentCalls) {
+				const first = result.content?.[0];
+				const raw = first?.type === "text" ? first.text : "";
+				return new Text(raw, 0, 0);
 			}
 
 			// ── 2. 并行任务完成态渲染 ──
@@ -3539,6 +3575,129 @@ export default function (pi: ExtensionAPI) {
 				const killRes = await killAsyncRun({ runId: targetRunId, runsDir: RUNS_DIR, reason: typeof p.reason === "string" ? p.reason : undefined });
 				if (killRes.ok) refreshAsyncPanel();
 				return { content: [{ type: "text", text: killRes.message }], isError: !killRes.ok };
+			}
+
+			// 循环观测（2026-10-14，只读）：最近工具调用 + verdict（ok|repeating|no_progress）。
+			// loopGuard.enabled 不影响只读查询；仅当命中且 action:"kill" 时才复用既有 killAsyncRun 终止 async run。
+			if (p.action === "recent-calls") {
+				const n = clampN(p.n);
+				const loopGuard = normalizeLoopGuard(readConfig().loopGuard);
+				const tabId = typeof p.tabRunId === "string" && p.tabRunId
+					? p.tabRunId
+					: typeof p.runId === "string" && p.runId.startsWith("tab_") ? p.runId : undefined;
+				let entries: RecentCallEntry[] = [];
+				let id = typeof p.tabRunId === "string" && p.tabRunId ? p.tabRunId : (typeof p.runId === "string" ? p.runId : "");
+				let source: "async" | "tab" = "async";
+				let agent: string | undefined;
+				let model: string | undefined;
+				let status: string | undefined;
+				let errorReason: RecentCallsReason | undefined;
+				let running = false;
+				let toolCallsCount = 0;
+				let turnClock = 0;
+				let lastToolTurn = 0;
+
+				if (tabId) {
+					source = "tab"; id = tabId;
+					const dispatch = readTabDispatch(defaultTabRunsDir(), tabId);
+					if (!dispatch) {
+						errorReason = "not-found";
+					} else {
+						model = dispatch.requestedModel;
+						status = dispatch.dispatchStatus;
+						const located = locateTabSession(dispatch, defaultSessionsRoot());
+						if (!located.path) {
+							errorReason = located.reason ?? "no-session";
+						} else {
+							// 2026-10-16 修复（一轮 L4 已知限制）：原 `turnClock = lastToolTurn` ⇒ 差值恒 0，
+							// tab 只能判 repeating、no_progress 永不可触发。改为数尾部有界窗口（同一次尾读，
+							// 不二次 IO）内的 assistant 回合作回合时钟：最后一次工具调用之后每多一个纯文本
+							// assistant 回合，差值 +1 → no_progress 可触发。窗口相对计数是真实会话回合数的
+							// 下界，classifyLoop 的 `turnClock ≥ thr` 守卫保持保守。
+							const tabWindow = collectTabWindow(located.path, n);
+							entries = tabWindow.entries;
+							lastToolTurn = entries.reduce((m, e) => Math.max(m, e.turn), 0);
+							turnClock = tabWindow.windowTurns;
+							toolCallsCount = entries.length;
+							// 无工具明细时：窗口内 assistant 回合已达标（≥ 阈值）仍交给 classifyLoop
+							//（可判 no_progress）；连回合数都不足才算 no-detail（降级 unknown）。
+							if (entries.length === 0 && turnClock < loopGuard.threshold) errorReason = "no-detail";
+						}
+					}
+				} else {
+					const runs = listAsyncRuns();
+					const target = typeof p.runId === "string" && p.runId
+						? runs.find((r) => r.id === p.runId)
+						: resolveSessionRun(runs);
+					if (!target) {
+						errorReason = "not-found";
+					} else {
+						source = "async"; id = target.id;
+						agent = target.agent;
+						model = target.result?.requestedModel ?? target.result?.model ?? target.model;
+						status = target.status;
+						running = target.status === "running";
+						toolCallsCount = target.result?.toolCallsCount ?? 0;
+						const calls = target.recentCalls ?? target.result?.recentCalls;
+						if (!Array.isArray(calls) || calls.length === 0) {
+							errorReason = "no-detail";
+						} else {
+							entries = collectAsyncCalls({ recentCalls: calls }, n);
+							// 运行中记录：明细/lastToolTurn/turnClock 由 onRecentCalls 增量写回（非终态快照）。
+							const ringLastToolTurn = entries.reduce((m, e) => Math.max(m, e.turn), 0);
+							lastToolTurn = typeof target.lastToolTurn === "number" ? Math.max(target.lastToolTurn, ringLastToolTurn) : ringLastToolTurn;
+							turnClock = (target.result?.usage?.turns ?? 0) || (typeof target.turnClock === "number" ? target.turnClock : 0) || lastToolTurn;
+						}
+					}
+				}
+
+				if (errorReason && errorReason !== "no-detail") {
+					return { content: [{ type: "text", text: formatRecentCallsError(errorReason, id) }], isError: true };
+				}
+				let verdict: RecentCallsVerdict;
+				if (errorReason === "no-detail") {
+					verdict = {
+						verdict: "unknown",
+						basis: `no tool detail (toolCallsCount=${toolCallsCount})`,
+						hint: "该 run 无工具明细（旧记录/无调用），可看 status/toolCallsCount",
+					};
+				} else {
+					const c = classifyLoop(entries, { turnClock, lastToolTurn }, loopGuard.threshold);
+					verdict = { verdict: c.verdict, basis: c.basis, hint: c.hint };
+				}
+
+				// loopGuard 自动处置（默认关闭；只读查询不受影响）：命中且 enabled 才介入。
+				let effectiveLoopGuard: LoopGuardConfig | undefined;
+				let loopGuardBasis: string | undefined;
+				if (loopGuard.enabled && verdict.verdict !== "ok" && verdict.verdict !== "unknown") {
+					loopGuardBasis = verdict.basis;
+					effectiveLoopGuard = loopGuard;
+					const ui = (_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui;
+					if (loopGuard.action === "kill") {
+						if (source === "async" && running && id) {
+							const killRes = await killAsyncRun({ runId: id, runsDir: RUNS_DIR, reason: `loopGuard:${verdict.verdict}` });
+							if (killRes.ok) refreshAsyncPanel();
+							try { ui?.notify(`loopGuard kill: ${id} (${verdict.verdict})`, "warning"); } catch { /* UI 不可用不阻塞 */ }
+						} else {
+							// tab 无 kill 能力 → 降级 warn 并在 hint 里提示手工处理
+							effectiveLoopGuard = { ...loopGuard, action: "warn" };
+							verdict = { ...verdict, hint: `${verdict.hint}；tab 无 kill 能力，请手工处理` };
+						}
+					} else {
+						try { ui?.notify(`loopGuard warn: ${id} (${verdict.verdict})`, "warning"); } catch { /* ignore */ }
+					}
+				}
+
+				const out = formatRecentCalls(
+					{
+						id, source, agent, model, status, n,
+						...(effectiveLoopGuard ? { loopGuard: effectiveLoopGuard } : {}),
+						...(loopGuardBasis ? { loopGuardBasis } : {}),
+					},
+					entries,
+					verdict,
+				);
+				return { content: [{ type: "text", text: out }], details: { recentCalls: true } };
 			}
 
 			// L3 parallel 缺省异步（2026-09-23）：p.async !== false（缺省/true）时每个 subtask 走与单发
@@ -4035,6 +4194,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /sub-presets 命令（模型预设槽位，逻辑在 model-presets.ts）──
 	registerSubPresetsCommand(pi, { reloadConfig, writeConfig });
+	registerTiersCommand(pi, { reloadConfig, writeConfig, readUsageRecords });
 
 	// ── /subagent-gc 与 /gc 命令：手动回收内存与清理碎片 ──
 	const handleGc = async (args: string | undefined, ctx: ExtensionCommandContext) => {
