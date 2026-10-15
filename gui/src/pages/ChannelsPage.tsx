@@ -74,9 +74,9 @@ function QrBlock({ image, url, loading }: { image: WechatQrImageBody | null; url
 	return (
 		<div className="space-y-2">
 			{showImage ? (
-				<img src={dataUrl} alt="微信登录二维码" className="h-48 w-48 rounded border border-border bg-white" />
+				<img src={dataUrl} alt="微信登录二维码" className="h-48 w-48 rounded-lg border border-border bg-white" />
 			) : (
-				<div className="space-y-2 rounded border border-border bg-surface p-3">
+				<div className="space-y-2 rounded-lg border border-border bg-card p-3">
 					<p className="text-ui-xs text-foreground-subtle">
 						{image === null ? (loading ? "正在加载二维码…" : "等待二维码数据…") : `二维码取图失败（回退为 URL）：${image.error ?? "未知原因"}`}
 					</p>
@@ -253,7 +253,7 @@ function ReceiveBlock() {
 				{inbox !== null && inbox.messages.length > 0 && (
 					<ul className="space-y-1.5">
 						{inbox.messages.map((m) => (
-							<li key={m.msgId} className="rounded border border-border bg-surface p-2">
+							<li key={m.msgId} className="rounded-lg border border-border bg-card p-2">
 								<div className="flex flex-wrap items-center gap-2 text-ui-sm text-foreground-subtle">
 									<span className="font-mono">{m.msgId}</span>
 									<span>{m.nickname ?? m.from}</span>

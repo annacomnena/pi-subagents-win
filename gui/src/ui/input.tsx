@@ -8,10 +8,10 @@ const inputVariants = cva(
   {
     variants: {
       size: {
-        xs: "h-5 rounded-sm px-2 py-0.5 text-ui-base file:h-4 file:text-ui-base",
-        sm: "h-6 rounded-md px-2 py-0.5 text-ui-base/relaxed file:h-5 file:text-ui-base/relaxed",
+        xs: "h-5 rounded-lg px-2 py-0.5 text-ui-base file:h-4 file:text-ui-base",
+        sm: "h-6 rounded-lg px-2 py-0.5 text-ui-base/relaxed file:h-5 file:text-ui-base/relaxed",
         default:
-          "h-7 rounded-md px-2 py-0.5 text-ui-base md:text-ui-base/relaxed file:h-6 file:text-ui-base/relaxed",
+          "h-7 rounded-lg px-2 py-0.5 text-ui-base md:text-ui-base/relaxed file:h-6 file:text-ui-base/relaxed",
         lg: "h-8 rounded-lg px-3 py-1.5 text-ui-base file:h-6 file:text-ui-base",
       },
     },
