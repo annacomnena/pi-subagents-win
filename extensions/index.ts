@@ -1760,6 +1760,32 @@ function resolveSessionRun(runs: AsyncRunRecord[]): AsyncRunRecord | undefined {
 	})[0];
 }
 
+/**
+ * 本会话可见的 async runId 集合（L4 P1-4）。
+ *
+ * 用途：on-read 惰性僵尸回收**不得动别人会话的 run**。
+ * `status`/`list` 的可见面本就是「本会话派发」（见 `resolveSessionRun`），
+ * 回收面必须按同一归属集收窄，否则一个会话的查询会改写另一会话的 run json。
+ */
+function scopedRunIds(): string[] {
+	const myIds = new Set([sessionScopeKey(), getCurrentSessionId()].filter((v): v is string => Boolean(v)));
+	let links: ReturnType<typeof listLinks> = [];
+	try { links = listLinks(); } catch { links = []; }
+	const dispatcherOf = (runId: string): string | undefined => {
+		for (const link of links) {
+			if (link.kind !== "async" || link.targetId !== runId) continue;
+			if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+		}
+		return undefined;
+	};
+	return listAsyncRuns()
+		.filter((r) => {
+			const d = dispatcherOf(r.id);
+			return d !== undefined && myIds.has(d);
+		})
+		.map((r) => r.id);
+}
+
 // ── 可搜索选择器（TUI）────────────────────────────────────────────
 // 当候选项较多时（如模型列表），提供一个带搜索框的选择器，避免在长列表里翻找。
 // 返回用户选中的原始 options 字符串；取消或无匹配时返回 undefined。
@@ -3320,10 +3346,11 @@ export default function (pi: ExtensionAPI) {
 				// 使等待方不必等 10s tick 就拿到终态。
 				// 与 tick 路径的区别：on-read **不跳 inspect**（用户主动查询，值得花一次 PowerShell）；
 				// 失败静默（只读路径不得因回收失败而不可用）。
+				// ⚠️ L4 P1-4：无参分支只回收**本会话可见**的 run（不得动别人会话的 run）。
 				if (p.runId) {
 					try { reapZombie(RUNS_DIR, p.runId); } catch { /* 只读路径：静默 */ }
 				} else {
-					try { reapZombiesInDir(RUNS_DIR, { limit: 10 }); } catch { /* 静默 */ }
+					try { reapZombiesInDir(RUNS_DIR, { limit: 10, runIds: scopedRunIds() }); } catch { /* 静默 */ }
 				}
 				const runs = listAsyncRuns();
 				// L3 status 默认会话隔离（2026-09-23）：无参只返回本会话派发的 run（按时间最新的一个）；
@@ -3369,7 +3396,12 @@ export default function (pi: ExtensionAPI) {
 			// 直接 kill 支持（2026-10-13）：list 看谁卡住；kill/cancel 按 runId 树杀（见 subagent-kill.ts）。
 			if (p.action === "list") {
 				// on-read 惰性回收（同 status）：让 `list` 不会展示已经死掉的僵尸 run。
-				try { reapZombiesInDir(RUNS_DIR, { limit: 50 }); } catch { /* 静默 */ }
+				// ⚠️ L4 P1-4：**不得回收其他会话的 run**。`list` 只展示本会话派发的 run（既有隔离），
+				// 故回收面也按同一归属集收窄——先取本会话可见 runId，再只对这批做回收。
+				try {
+					const mine = scopedRunIds();
+					reapZombiesInDir(RUNS_DIR, { limit: 50, runIds: mine });
+				} catch { /* 静默 */ }
 				return { content: [{ type: "text", text: formatRunList(listAsyncRunSummaries(RUNS_DIR)) }] };
 			}
 
