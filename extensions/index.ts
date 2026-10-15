@@ -151,6 +151,8 @@ import {
 } from "./subagent-kill.ts";
 // 僵尸看门狗（失败必达终态的宿主侧兜底）：on-read 惰性回收（tick 路径在 async-result-watcher）
 import { reapZombie, reapZombiesInDir } from "./subagent-zombie.ts";
+// 墙钟总预算（opt-in）：纯判定层 + 参数校验（C2 起接线）
+import { parseWallBudget } from "./subagent-wall-budget.ts";
 import {
 	classifyLoop,
 	clampN,
@@ -414,10 +416,14 @@ export function classifyModelFailure(
 	modelHint?: string,
 ): {
 	retryable: boolean;
-	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "stall" | "other";
+	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "stall" | "wall_budget" | "other";
 	label: string;
 } {
 	const message = error.toLowerCase();
+	// 墙钟总预算到点（C2）：优先于 timeout/stall 判定（它是调用方显式设的上限，语义最明确）
+	if (/wall-budget-exceeded|wall.?budget/i.test(message)) {
+		return { retryable: false, kind: "wall_budget", label: "WALL_BUDGET" };
+	}
 	const model = (modelHint ?? "").toLowerCase();
 	const isZhipuFamily =
 		/(^|[\/\s_-])(zhipu|glm|智谱)/i.test(model) ||
@@ -1167,12 +1173,36 @@ async function runSingle(
 		let fatalKilled = false;
 		let fatalKind: string | undefined;
 		const kill = () => { child.kill("SIGTERM"); forceKill = setTimeout(() => child.kill("SIGKILL"), 2000); };
-		if (signal?.aborted) kill(); else signal?.addEventListener("abort", kill, { once: true });
+		if (signal?.aborted) kill(); else signal?.addEventListener("abort", () => { clearWallTimer(); kill(); }, { once: true });
 
 		// 停顿检测（inactivity/stall timeout）：不是给整个任务限时——
 		// 只要子进程持续有输出（有进展）就重置计时器；只有「卡住不动超过 timeoutMs」才判超时停止。
 		// 错误（exit≠0 / stopReason=error）走正常停止路径，不受此超时影响。
 		let stallTimer: ReturnType<typeof setTimeout> | null = null;
+		// ── 墙钟总预算（opt-in；缺省 undefined = 不启用，逐字节保持既有行为）──
+		// 语义：自 spawn 起算，与是否有输出无关；到点置 failed(wall_budget) + kill。
+		// 与上面 stall 计时**并存**，谁先到谁生效（不改变 stall 语义）。
+		let wallTimer: ReturnType<typeof setTimeout> | null = null;
+		let wallBudgetExceeded = false;
+		// 预算来源（供 status/面板显示）
+		const __wallParsed = parseWallBudget(opts?.maxWallMs);
+		if (__wallParsed.enabled && __wallParsed.ms !== undefined && opts?.maxWallMs !== undefined) {
+			wallTimer = setTimeout(() => {
+				wallBudgetExceeded = true;
+				result.status = "failed";
+				result.error = "wall-budget-exceeded";
+				emitUpdate(
+					"⏱ wall-budget",
+					`budget ${Math.round((__wallParsed.ms as number) / 1000)}s exhausted (source=${opts?.maxWallSource ?? "param"}); killing ${resolvedModel ?? "default"}`,
+				);
+				kill();
+			}, __wallParsed.ms);
+		} else if (__wallParsed.reject !== undefined && opts?.maxWallMs !== undefined) {
+			// 非法值：忽略 + 告警（不崩、不静默采用）
+			console.warn(`[subagent-win] maxWallMs 非法（${String(opts?.maxWallMs)}）：${__wallParsed.reject} ⇒ 忽略（不启用墙钟预算）`);
+			onUpdate?.("⚠ maxWallMs 非法", `${__wallParsed.reject} ⇒ 忽略`);
+		}
+		const clearWallTimer = () => { if (wallTimer) { clearTimeout(wallTimer); wallTimer = null; } };
 		const resetStall = () => {
 			if (stallTimer) clearTimeout(stallTimer);
 			if (!timeoutMs) { stallTimer = null; return; }
@@ -1245,6 +1275,7 @@ async function runSingle(
 		child.on("error", (err) => {
 			clearInterval(heartbeat);
 			if (stallTimer) clearTimeout(stallTimer);
+			clearWallTimer(); // 墙钟预算：error 路径统一清理
 			buf = ""; lineBuf = ""; stderrBuf = ""; textCandidates.length = 0;
 			try {
 				child.stdout?.removeAllListeners();
@@ -1262,6 +1293,7 @@ async function runSingle(
 		child.on("close", (code) => {
 			clearInterval(heartbeat);
 			if (stallTimer) clearTimeout(stallTimer);
+			clearWallTimer(); // 墙钟预算：close 路径统一清理
 			if (forceKill) clearTimeout(forceKill);
 			result.durationMs = Date.now() - startTime;
 			result.toolCallsCount = toolCallsCount;
@@ -1297,6 +1329,11 @@ async function runSingle(
 			if (timedOut) {
 				result.status = "failed";
 				result.error = "timeout";
+			} else if (wallBudgetExceeded) {
+				// 墙钟总预算到点（C2）：**语义优先级高于普通非 0 退出**——
+				// 保留 wall-budget-exceeded 作为 error（不被 mergeProviderError 覆盖为 0 退出语义）。
+				result.status = "failed";
+				result.error = "wall-budget-exceeded";
 			} else if (code !== 0 && result.status !== "completed") {
 				result.status = "failed";
 				result.error = mergeProviderError(result.error, stderrBuf, code, resolvedModel);
@@ -1577,6 +1614,22 @@ export interface RunDispatchOptions extends RunnerToolsOptions {
 	allowTierEscalation?: boolean;
 	/** 本次调用是否来自主会话（isMainSession()）：unknown/selfpaid 显式覆盖的放行条件之一。 */
 	mainCall?: boolean;
+	/**
+	 * **墙钟总预算**（ms，opt-in；缺省 undefined = 不启用，逐字节保持既有行为）。
+	 *
+	 * 与 `timeoutMs`（参数）的区别（口径写死，不许混）：
+	 * - `timeoutMs` = **停顿超时**：子进程持续有输出就**重置**计时 ⇒ 不限制总时长。
+	 * - `maxWallMs` = **墙钟总预算**：自 spawn 起算，**与是否有输出无关**，到点即终止。
+	 * 两者可同时设置，**谁先到谁生效**。
+	 *
+	 * 到点行为：置 `failed` + `error="wall-budget-exceeded"` + kill（SIGTERM→SIGKILL）
+	 * ⇒ 等待方立即拿到 failed（**不用 cancelled 语义**）。
+	 *
+	 * 解析：`parseWallBudget()`（非法值忽略 + 告警，见 `subagent-wall-budget.ts`）。
+	 */
+	maxWallMs?: number;
+	/** 预算来源（`"param"` | `"env"` | `"config"`），供 status/面板显示「来自何处」。 */
+	maxWallSource?: string;
 }
 
 interface TaskInput {
