@@ -3918,6 +3918,10 @@ export default function (pi: ExtensionAPI) {
 					const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}${idx.toString(36)}`;
 					asyncRunIds.push(runId);
 					const effModel = t.model ?? agentDefaultModel(agentDef);
+					// 墙钟预算（C2-c）：显式参数优先于 env；缺省不启用
+					const __wb = resolveWallBudget(t.maxWallMs !== undefined ? t.maxWallMs : (p as { maxWallMs?: number }).maxWallMs);
+					const __wallMs = __wb.ms;
+					const __wallSrc = __wb.source;
 					if (t.agent && !agentDef) {
 						const record: AsyncRunRecord = { id: runId, agent: t.agent, task: t.task ?? "", model: effModel, status: "failed", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined,
 							result: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId, error: `unknown agent: ${t.agent}`, agent: t.agent } };
@@ -3926,7 +3930,7 @@ export default function (pi: ExtensionAPI) {
 						asyncLines.push(`${runId} [${label}] failed: unknown agent: ${t.agent}`);
 						return;
 					}
-					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined };
+					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined, ...(__wallMs !== undefined ? { maxWallMs: __wallMs, maxWallSource: __wallSrc } : {}) };
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
 					// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
@@ -3934,6 +3938,7 @@ export default function (pi: ExtensionAPI) {
 					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, () => touchRunActivity(runId), {
 						cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools,
 						allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(),
+						...(__wallMs !== undefined ? { maxWallMs: __wallMs, maxWallSource: __wallSrc } : {}),
 						onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
 						onRecentCalls: (calls, turn) => {
 							const lastToolTurn = calls.reduce((m, e) => Math.max(m, e.turn), 0);
@@ -4015,6 +4020,11 @@ export default function (pi: ExtensionAPI) {
 					detail: `agent=${p.agent ?? "subagent"} ${String(p.task ?? "").slice(0, 60)}`,
 				});
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
+				// 墙钟预算（C2-c）：显式参数优先于 env；缺省不启用
+				const __wb1 = resolveWallBudget(p.maxWallMs);
+				const __wallMs1 = __wb1.ms;
+				const __wallSrc1 = __wb1.source;
+				if (__wallMs1 !== undefined) { record.maxWallMs = __wallMs1; record.maxWallSource = __wallSrc1; writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record)); }
 				// L3 Model 披露（纯加法）：dispatch 时把 effective model 写入记录，供 status 的 Model: 行展示。
 				if (!record.model) { try { record.model = resolveCallModel(p.model, agentDef) ?? undefined; } catch { /* 保持无 model */ } writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record)); }
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
@@ -4023,8 +4033,8 @@ export default function (pi: ExtensionAPI) {
 				// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
 				const persistRecentCalls = createThrottledRunMerger(runId, RUNS_DIR);
 				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, () => touchRunActivity(runId), {
-					cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools,
-					allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(),
+					cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(),
+					...(__wallMs1 !== undefined ? { maxWallMs: __wallMs1, maxWallSource: __wallSrc1 } : {}),
 					onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
 					onRecentCalls: (calls, turn) => {
 						const lastToolTurn = calls.reduce((m, e) => Math.max(m, e.turn), 0);
@@ -4056,7 +4066,7 @@ export default function (pi: ExtensionAPI) {
 							details: progress ? { progress } : undefined,
 						})
 					: undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession() });
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(), maxWallMs: p.maxWallMs, maxWallSource: p.maxWallMs !== undefined ? "param" : undefined });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
