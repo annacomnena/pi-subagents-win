@@ -296,6 +296,38 @@ try {
 	}
 
 
+	// ── Z18：**force 对弱证据生效**（裁决 3 + 计划审查 M9）──────────────
+	{
+		// 弱证据：无 pid + 闲置超 2h（默认阈值）
+		const stale = iso(NOW - 3 * 60 * 60 * 1000);
+		const mkWeak = (id: string) =>
+			mk(id, { id, status: "running", startedAt: stale, lastActivity: stale });
+
+		// ① 无 force ⇒ 只观察（不判死、不改状态）
+		mkWeak("run_z18a");
+		const r1 = reapZombie(root, "run_z18a", { now: () => NOW });
+		assert.equal(r1.reaped, false, "弱证据 + 无 force ⇒ 不落终态");
+		assert.equal(r1.suspect, true, "写出观察标记");
+		assert.equal(readRunRecord(root, "run_z18a")!.status, "running", "状态未被改（不判死）");
+		assert.ok(existsSync(join(root, "run_z18a.zombie-suspect")), ".zombie-suspect 标记存在");
+
+		// ② 有 force ⇒ **对弱证据生效**（这是 M9 修复的核心；旧实现会 observe-only 提前返回）
+		mkWeak("run_z18b");
+		const r2 = reapZombie(root, "run_z18b", { now: () => NOW, force: true });
+		assert.equal(r2.reaped, true, "弱证据 + force ⇒ 落终态（旧实现此处为 false）");
+		const rec2 = readRunRecord(root, "run_z18b")!;
+		assert.equal(rec2.status, "failed", "落 failed");
+		const fail2 = rec2.failure as { kind: string; source: string };
+		assert.equal(fail2.kind, "zombie");
+		assert.equal(fail2.source, "manual-force", "来源标为 manual-force（可审计，区别于 watchdog）");
+
+		// ③ force 幂等：再次 force ⇒ 已终态短路
+		const r3 = reapZombie(root, "run_z18b", { now: () => NOW, force: true });
+		assert.equal(r3.reaped, false, "已终态 ⇒ force 也不重复落");
+		ok("Z18 force 对弱证据生效（M9 修复）+ 来源可审计 + 幂等");
+	}
+
+
 	console.log(`\n_test_subagent_zombie: all ${n} groups passed`);
 } finally {
 	rmSync(root, { recursive: true, force: true });

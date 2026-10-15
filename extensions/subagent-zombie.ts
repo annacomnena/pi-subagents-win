@@ -298,8 +298,18 @@ export function reapZombie(
 
 	const verdict = detectZombie(rec, { now: () => now, ...(opts.deps ?? {}) });
 	if (!verdict.zombie) {
-		// 弱证据 + 观察模式 ⇒ 只写标记，不改状态
+		// 弱证据（无 pid + 闲置）：默认**只观察，不判死**。
+		//
+		// C7（裁决 3 + 计划审查 M9）：`force` 必须能对**弱证据**生效 ——
+		// 旧实现只把 force 透传给 `claimReap`，而弱证据走本分支**提前返回**
+		// ⇒ `force` 对弱证据**实际不生效**（与裁决 3 恰好相反）。
 		if (verdict.weak) {
+			if (opts.force === true) {
+				// 人工显式恢复：**只对弱证据生效**（硬证据走自动路径，不需要 force）。
+				// 资格在写终态前**重验**（下面 claim 后再读一次），防判定静默变化。
+				return reapClaimed(runsDir, id, rec, verdict, { now, deps: opts.deps, force: true });
+			}
+			// 默认：只写观察标记，不改状态
 			try {
 				if (!existsSync(join(runsDir, `${id}.zombie-suspect`))) {
 					writeFileSync(
@@ -314,7 +324,24 @@ export function reapZombie(
 		return { reaped: false, reason: verdict.reason };
 	}
 
-	// claim：至多一个非-force 赢家（**不声称 exactly-one**，见 claimReap 头注）
+	// 硬证据（pid-dead / pid-reused）：走正常路径（不需 force）
+	return reapClaimed(runsDir, id, rec, verdict, { now, deps: opts.deps, force: opts.force });
+}
+
+/**
+ * 取得 claim 并落终态（硬证据与「force + 弱证据」共用）。
+ *
+ * 资格重验（计划审查 M9/M10）：赢下 claim 后**重读**，若当前已非 running / result 已终态 ⇒ 短跑；
+ * 若原判弱证据但重读后已变硬证据 ⇒ 仍可继续（硬证据更硬）；反之（原硬后变活）⇒ 放弃（保守）。
+ */
+function reapClaimed(
+	runsDir: string,
+	id: string,
+	rec: KillableRunRecord,
+	verdict: ZombieVerdict,
+	opts: { now: number; deps?: ZombieDeps; force?: boolean; viaForce?: boolean },
+): ReapResult {
+	const now = opts.now;
 	const at = new Date(now).toISOString();
 	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at }, { now: () => now, force: opts.force })) {
 		return { reaped: false, reason: "already-reaped" };
@@ -348,7 +375,8 @@ export function reapZombie(
 						? "watchdog: 登记 pid 已被 OS 重用（原进程已退出）"
 						: "watchdog: 登记 pid 不存活（进程已退出）",
 			at,
-			source: "watchdog",
+			// 区分来源（裁决 3 可审计）：watchdog=自动（硬证据）；manual-force=人工恢复（弱证据）
+			source: opts.force === true && verdict.weak ? "manual-force" : "watchdog",
 		},
 	};
 	// 保留既有 result 形状（若有），否则補一个失败的（供既有消费方读取）
