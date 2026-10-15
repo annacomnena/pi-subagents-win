@@ -87,7 +87,7 @@
 	--color-foreground: #141413;
 	--color-foreground-strong: var(--color-brand-ink);
 	--color-foreground-subtle: #5e5d59; /* Olive Gray（5.98:1 on Parchment） */
-	--color-foreground-subtlest: #706f69; /* §3.3 抬到 AA（4.57:1），不再沿用 stone 3.31:1 */
+	--color-foreground-subtlest: #6c6b65; /* L4 复算修正：原 #706f69 在 sidebar #efece4 上仅 4.27:1（不达）；现值 page 4.85 / sidebar 4.53 / card 5.07 */
 	--color-foreground-inverse: var(--color-brand-ivory);
 	/* §7 A-8① 用户气泡角色 token（暖沙底 + 近黑字，14.7:1）。
 	 * 用独立角色 token 而非直接挑 --color-surface-warm（后者是 color-mix 的派生输入别名）。 */
@@ -96,7 +96,7 @@
 	--color-accent: #c96442; /* 唯一彩色动作 */
 	--color-accent-hover: #d4795a;
 	--color-accent-foreground: #141413; /* accent 上的字（4.73:1） */
-	--color-accent-text: #b4553a; /* 浅底上的文字重音（#c96442 仅 3.54:1 不合格） */
+	--color-accent-text: #a84e33; /* L4 复算修正：原 #b4553a 在 page 4.43 / sidebar 4.14（不达）；现值 page 5.01 / sidebar 4.68 / card 5.24 */
 	--color-primary: var(--color-brand-ink);
 	--color-primary-foreground: var(--color-brand-ivory);
 	--color-secondary: var(--color-brand-sand);
@@ -125,11 +125,12 @@
 	--color-interaction-ask-foreground: #b4553a;
 	--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent);
 	--color-success: #4f6b3f;
-	--color-success-foreground: var(--color-brand-ink);
+	/* L4 复算修正：亮色语义实底偏暗，近黑字仅 3.01–3.12:1（不达）⇒ 改近白字（5.61–5.82:1）*/
+	--color-success-foreground: var(--color-brand-ivory);
 	--color-destructive: #a83f34;
-	--color-destructive-foreground: var(--color-brand-ink);
+	--color-destructive-foreground: var(--color-brand-ivory);
 	--color-warning: #8a5a12;
-	--color-warning-foreground: var(--color-brand-ink);
+	--color-warning-foreground: var(--color-brand-ivory);
 	--color-info: #2d70ab;
 }
 
@@ -259,14 +260,14 @@
 	--color-foreground: #141413;
 	--color-foreground-strong: var(--color-brand-ink);
 	--color-foreground-subtle: #5e5d59;
-	--color-foreground-subtlest: #706f69;
+	--color-foreground-subtlest: #6c6b65; /* L4 复算修正（同 @theme 亮基底）*/
 	--color-foreground-inverse: var(--color-brand-ivory);
 	--color-bubble-user: var(--color-brand-sand); /* §7 A-8① 暖沙气泡（14.7:1） */
 	--color-bubble-user-foreground: var(--color-brand-ink);
 	--color-accent: #c96442;
 	--color-accent-hover: #d4795a;
 	--color-accent-foreground: #141413;
-	--color-accent-text: #b4553a;
+	--color-accent-text: #a84e33; /* L4 复算修正（同 @theme 亮基底）*/
 	--color-primary: var(--color-brand-ink);
 	--color-primary-foreground: var(--color-brand-ivory);
 	--color-secondary: var(--color-brand-sand);
@@ -295,11 +296,11 @@
 	--color-interaction-ask-foreground: #b4553a;
 	--color-interaction-ask-fill: color-mix(in oklab, var(--color-brand-terracotta) 20%, transparent);
 	--color-success: #4f6b3f;
-	--color-success-foreground: var(--color-brand-ink);
+	--color-success-foreground: var(--color-brand-ivory); /* L4 复算修正（同 @theme 亮基底）*/
 	--color-destructive: #a83f34;
-	--color-destructive-foreground: var(--color-brand-ink);
+	--color-destructive-foreground: var(--color-brand-ivory);
 	--color-warning: #8a5a12;
-	--color-warning-foreground: var(--color-brand-ink);
+	--color-warning-foreground: var(--color-brand-ivory);
 	--color-info: #2d70ab;
 }
 

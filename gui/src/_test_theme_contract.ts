@@ -72,10 +72,10 @@ for (const line of [
 	"--color-border-hover: #c2bdb0",
 	"--color-foreground: #141413",
 	"--color-foreground-subtle: #5e5d59",
-	"--color-foreground-subtlest: #706f69",
+	"--color-foreground-subtlest: #6c6b65", // L4 复算修正：原 #706f69 在 sidebar 上仅 4.27:1
 	"--color-accent: #c96442",
 	"--color-accent-foreground: #141413",
-	"--color-accent-text: #b4553a",
+	"--color-accent-text: #a84e33", // L4 复算修正：原 #b4553a 在 page 4.43 / sidebar 4.14
 	"--color-destructive: #a83f34",
 	"--color-warning: #8a5a12",
 	"--color-success: #4f6b3f",

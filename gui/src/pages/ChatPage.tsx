@@ -499,7 +499,7 @@ export function ChatPage() {
 							>
 								{dragging && (
 									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-accent/15 backdrop-blur-sm">
-										<div className="flex items-center gap-2 rounded-full border border-accent/40 bg-card px-4 py-2 text-ui-base text-accent-text shadow-overlay">
+										<div className="flex items-center gap-2 rounded-full border border-accent/40 bg-card px-4 py-2 text-ui-base text-foreground shadow-overlay">
 											<span>附件拖放未接入</span>
 										</div>
 									</div>
