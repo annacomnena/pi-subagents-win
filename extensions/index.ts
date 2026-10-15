@@ -129,6 +129,7 @@ import {
 import {
 	buildWorkflowTabPrompt,
 	launchTaskTitle,
+	modePrefix,
 	parseLaunchRequest,
 	sanitizeWtTitle,
 	spawnPiTab,
@@ -866,7 +867,7 @@ function parseJsonEvents(
 				else {
 					try { detail = JSON.stringify(args).slice(0, 50); } catch { detail = ""; }
 				}
-				opts?.onProgressEvent?.({ type: "tool", toolName, detail });
+				opts?.onProgressEvent?.({ type: "tool", toolName, detail, argsDigest: normalizeArgsDigest(args) });
 				onUpdate?.(`⚡ ${toolName}`, detail);
 			}
 			if (ev.type === "message_end" && ev.message?.role === "assistant") {
@@ -1853,7 +1854,7 @@ export function readUsageRecords(day: { label: string; startMs: number; endMs: n
 		...utcDates.map((d) => join(USAGE_DIR, `${d}.jsonl`)),
 	]);
 	const seenEvents = new Set<string>();
-	const seenRuns = new Set<string>();
+	const out: Array<{ agent?: string | null; model?: string | null; usage: UsageSummary; runId: string }> = [];
 	for (const filePath of candidates) {
 		if (!existsSync(filePath)) continue;
 		let text: string;
