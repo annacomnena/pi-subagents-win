@@ -28,7 +28,7 @@
  * 不改变 run 状态；硬证据（①②）**总是**落终态（因为那是确定的死亡）。
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_RUNS_DIR, isPidAlive, inspectLiveProcess, type KillableRunRecord } from "./subagent-kill.ts";
 
@@ -190,12 +190,20 @@ export function writeRecordAtomic(runsDir: string, id: string, rec: unknown): vo
 	renameSync(tmp, finalPath);
 }
 
+/** CAS 锁的 TTL：赢家若在写终态前崩溃，超此龄的锁被视为僵锁（可被接管），避免永久卡死。 */
+export function reapLockTtlMs(): number {
+	return intEnv("PI_SUBAGENT_ZOMBIE_LOCK_TTL_MS", 5 * 60 * 1000);
+}
+
 /**
  * 跨进程「恰好一次」CAS：用 `.reaped` 文件的**排他创建**（`wx`）判定归属。
  *
  * 审查 M2 明确：read-check-write 与普通 rename **都不是 CAS**。本函数用
- * `writeFileSync(..., {flag:"wx"})` —— OS 保证同时只有一个调用者能创建成功，
- * 这才是真正的跨进程互斥。
+ * `writeFileSync(..., {flag:"wx"})` —— OS 保证同时只有一个调用者能创建成功。
+ *
+ * **僵锁接管（L4 P1-3）**：赢家可能在「拿到锁 → 写终态」之间崩溃，使 `.reaped` 永久存在
+ * 而 run 永远不被回收。故锁带 TTL：若已存在的锁龄 > TTL 且 run 仍非终态，则可接管
+ * （删锁重建）。这保留了「恰好一次」在正常路径的保证，又避免单点永久卡死。
  *
  * @returns true=本进程赢得 CAS（应继续落终态）；false=已被别人处理（应短路）
  */
@@ -203,14 +211,30 @@ export function claimReap(
 	runsDir: string,
 	id: string,
 	meta: { reason: ZombieReason; pid?: number; at: string },
+	opts: { now?: () => number } = {},
 ): boolean {
 	if (!existsSync(runsDir)) mkdirSync(runsDir, { recursive: true });
+	const lockPath = join(runsDir, `${id}.reaped`);
 	try {
-		writeFileSync(join(runsDir, `${id}.reaped`), JSON.stringify(meta), { flag: "wx" });
+		writeFileSync(lockPath, JSON.stringify(meta), { flag: "wx" });
 		return true;
 	} catch (e) {
-		if ((e as { code?: string }).code === "EEXIST") return false;
-		throw e;
+		if ((e as { code?: string }).code !== "EEXIST") throw e;
+	}
+	// 已存在：判定是否为僵锁（赢家崩溃）
+	try {
+		const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { at?: string };
+		const atMs = Date.parse(String(raw.at ?? ""));
+		// 与 detectZombie 同一时钟源（可注入，便于测试与控制）
+		const nowMs = opts.now?.() ?? Date.now();
+		const age = Number.isFinite(atMs) ? nowMs - atMs : Number.POSITIVE_INFINITY;
+		if (age < reapLockTtlMs()) return false; // 别人的活锁 ⇒ 正常短路
+		// 僵锁：接管（删后重建；仍是 wx 排他）
+		rmSync(lockPath, { force: true });
+		writeFileSync(lockPath, JSON.stringify({ ...meta, tookOver: true }), { flag: "wx" });
+		return true;
+	} catch {
+		return false; // 锁文件不可读/竞态失败 ⇒ 保守不接管（宁可不判）
 	}
 }
 
@@ -272,13 +296,18 @@ export function reapZombie(
 
 	// CAS：跨进程恰好一次
 	const at = new Date(now).toISOString();
-	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at })) {
+	if (!claimReap(runsDir, id, { reason: verdict.reason, pid: rec.pid, at }, { now: () => now })) {
 		return { reaped: false, reason: "already-reaped" };
 	}
 
-	// 迟到旧 finalize 防护：赢下 CAS 后重读，若已非 running ⇒ 不覆盖（真完成优先）
+	// 迟到旧 finalize 防护（L4 修正：不只查顶层 status，还要查 result.status）：
+	// 真完成可能只写在 result 上（而顶层仍是 running）——此时不得覆盖。
 	const fresh = readRunRecord(runsDir, id);
 	if (!fresh || fresh.status !== "running") {
+		return { reaped: false, reason: "already-terminal" };
+	}
+	const freshResultStatus = (fresh.result as { status?: string } | undefined)?.status;
+	if (freshResultStatus === "completed" || freshResultStatus === "failed" || freshResultStatus === "cancelled") {
 		return { reaped: false, reason: "already-terminal" };
 	}
 

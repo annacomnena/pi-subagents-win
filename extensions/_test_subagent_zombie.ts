@@ -211,6 +211,41 @@ try {
 		ok("Z11 批量扫描遵守 limit（不在 UI 读路径无界扫）");
 	}
 
+	// ── Z12：CAS 僵锁接管（L4 P1-3：赢家崩溃后不得永久卡死）──────────────
+	{
+		const id = "run_z12";
+		mk(id, { id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		// 造一个「很旧」的锁（模拟赢家拿到锁后崩溃、run 仍 running）
+		const staleAt = iso(NOW - 10 * 60 * 1000); // 10min 前 > TTL(5min)
+		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ reason: "pid-dead", at: staleAt }), { flag: "wx" });
+		const r = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false } });
+		assert.equal(r.reaped, true, "僵锁应被接管（否则永久卡死）");
+		assert.equal(readRunRecord(root, id)!.status, "failed", "接管后落终态");
+		ok("Z12 CAS 僵锁接管（TTL 超龄 ⇒ 可被接管，防永久卡死）");
+	}
+
+	// ── Z13：result.status 已是终态 ⇒ 不覆盖（L4 P1-5）─────────────────
+	{
+		const id = "run_z13";
+		// 顶层仍 running，但 result 已 completed（真完成只写在了 result 上）
+		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999, result: { status: "completed", text: "done" } });
+		const r = reapZombie(root, id, { now: () => NOW, deps: { isPidAlive: () => false } });
+		assert.equal(r.reaped, false, "result=completed 不被 zombie 覆盖");
+		assert.equal(readRunRecord(root, id)!.status, "running", "顶层 status 未被改写");
+		ok("Z13 result.status=completed ⇒ 不覆盖（只查顶层 status 不够，已补）");
+	}
+
+	// ── Z14：runIds 白名单（L4 P1-4：不得回收他人会话的 run）────────────
+	{
+		mk("run_z14a", { id: "run_z14a", status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		mk("run_z14b", { id: "run_z14b", status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		const r = reapZombiesInDir(root, { now: () => NOW, deps: { isPidAlive: () => false }, runIds: ["run_z14a"] });
+		assert.deepEqual(r.reaped, ["run_z14a"], "只回收白名单内的 run");
+		assert.equal(readRunRecord(root, "run_z14b")!.status, "running", "白名单外的 run 未被触碰");
+		ok("Z14 runIds 白名单：只回收本会话可见的 run（跨会话语义防护）");
+	}
+
+
 	console.log(`\n_test_subagent_zombie: all ${n} groups passed`);
 } finally {
 	rmSync(root, { recursive: true, force: true });
