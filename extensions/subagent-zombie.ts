@@ -237,63 +237,87 @@ export function claimReap(
 	} catch (e) {
 		if ((e as { code?: string }).code !== "EEXIST") throw e;
 	}
-	// 已存在：判定是否为僵锁（赢家崩溃）
-	try {
-		const rawLock = readFileSync(lockPath, "utf8");
-		const raw = JSON.parse(rawLock) as { at?: string; token?: string };
-		const atMs = Date.parse(String(raw.at ?? ""));
-		// 与 detectZombie 同一时钟源（可注入，便于测试与控制）
+	// 已存在：判定是否为僵锁（赢家崩溃）。需要**接管**。
+	//
+	// ## 为什么不用「move-aside + 核对 + 放回」（三代实现的教训）
+	//  1. `rmSync + writeFileSync(wx)`：两步间可删他人新锁 ⇒ 双赢家。
+	//  2. 仅 `renameSync(lock→graveyard)` 视为原子 ⇒ 仍双赢家：A 可能移走 B 刚建的新锁。
+	//  3. 加 token 核对 + 「放回」⇒ **仍双赢家**（L4 三轮反例，Windows 实测确认）：
+	//     A 核对失败后用 rename 放回，而 **Windows 上 rename 会覆盖已存在目标**
+	//     ⇒ 抹掉第三方 C 刚建的新锁 ⇒ B、C 都曾返回 true。
+	//  根因：rename/move 语义**不是 no-clobber**，且核对与移动之间存在 TOCTOU。
+	//
+	// ## 本实现（第 4 代）：独立的 `wx` 接管锁
+	// 接管本身用**排他创建** `.reaping` 做 CAS（OS 保证恰好一个创建者），完全不靠 rename：
+	//   - `wx` 创建 `.reaping` 失败 ⇒ 别人正在接管 ⇒ 认输（不双赢）。
+	//   - 赢家再核对「原锁 token 是否仍是最初读到的那枚」；变了 ⇒ 别人已换过锁 ⇒ 认输。
+	//   - 核对通过才替换锁文件（先删后 wx 建）。**绝不覆盖别人的锁**。
+	// 残留窗口（诚实声明）：赢家若在「建 `.reaping` → 完成替换」之间崩溃，`.reaping` 会残留，
+	// 使该 run 后续接管被挡。用同 TTL 兜底清除（属**单一层级**的降级，远低于前几代的概率）。
+	const takeoverPath = join(runsDir, `.${id}.reaping`);
+	const observedToken = (() => {
+		try {
+			const raw = JSON.parse(readFileSync(lockPath, "utf8")) as { at?: string; token?: string };
+			return { token: typeof raw.token === "string" ? raw.token : undefined, at: raw.at };
+		} catch {
+			return null;
+		}
+	})();
+	if (observedToken === null) return false; // 锁不可读 ⇒ 保守不接管
+
+	// TTL 判定（在读锁之后做，避免无谓的接管锁创建）
+	{
+		const atMs = Date.parse(String(observedToken.at ?? ""));
 		const nowMs = opts.now?.() ?? Date.now();
 		const age = Number.isFinite(atMs) ? nowMs - atMs : Number.POSITIVE_INFINITY;
 		if (age < reapLockTtlMs()) return false; // 别人的活锁 ⇒ 正常短路
-		// 测试 seam（仅用于确定性验证「僵锁接管」的原子性）：
-		// 在「认定是僵锁」之后、「实际接管」之前调用。测试借此模拟**另一个接管者
-		// 恰好在此刻插入**（这是旧实现 rmSync+wx 产生双赢家的真实窗口）。
-		// 同时它也暴露了「原子 rename」的漏洞：A 移走的可能是 B 刚建的新锁。
-		__claimReapTestHook?.();
-		// 僵锁接管（L4 二轮 + 自测 Z18 修正：**必须带身份校验的原子接管**）
-		//
-		// 演进史（三步，每步都被一个真实测试推翻过）：
-		//  1. `rmSync(lock) + writeFileSync(lock, wx)` —— 两步之间 B 可删 A 刚建的新锁 ⇒ 双赢家。
-		//  2. 仅靠 `renameSync(lock, graveyard)` 视为原子 —— **仍双赢家**：
-		//     时序：A 读锁（僵） → 【B 移走僵锁、建新锁】 → A 的 rename 移走的是 **B 的新锁**
-		//     （路径存在就成功）⇒ A 也认为自己赢了。Z18（seam 注入）确定复现了这个缺陷。
-		//  3. 本实现：rename **之后再核对**自己移走的那枚锁的 **token** 是否等于最初读到的那枚。
-		//     不等 ⇒ 自己移走的是别人的新锁 ⇒ 把锁**原子放回**（rename 回去）并认输。
-		//     这才能真正保证「恰好一个赢家」。
-		const observedToken = typeof raw.token === "string" ? raw.token : undefined;
-		const graveyard = join(runsDir, `.${id}.reaped.stale-${process.pid}-${nowMs}`);
+	}
+
+	// 测试 seam：在「判定僵锁」与「实际取得接管锁」之间
+	__claimReapTestHook?.();
+
+	// CAS：排他创建接管锁
+	const nowMs2 = opts.now?.() ?? Date.now();
+	try {
+		writeFileSync(takeoverPath, JSON.stringify({ at: meta.at, pid: process.pid }), { flag: "wx" });
+	} catch (e) {
+		if ((e as { code?: string }).code !== "EEXIST") return false;
+		// 接管锁已存在：可能是别人正在接管，也可能是**崩溃残留**
 		try {
-			renameSync(lockPath, graveyard); // 原子：源不存在则 ENOENT
+			const t = JSON.parse(readFileSync(takeoverPath, "utf8")) as { at?: string };
+			const tMs = Date.parse(String(t.at ?? ""));
+			const tAge = Number.isFinite(tMs) ? nowMs2 - tMs : Number.POSITIVE_INFINITY;
+			if (tAge < reapLockTtlMs()) return false; // 别人正在接管 ⇒ 认输
+			// 残留（崩溃）：TTL 超龄 ⇒ 清除后重试一次（单一层级降级）
+			rmSync(takeoverPath, { force: true });
+			writeFileSync(takeoverPath, JSON.stringify({ at: meta.at, pid: process.pid }), { flag: "wx" });
 		} catch {
-			return false; // 别人先移走了 ⇒ 认输
+			return false; // 无法取得接管锁 ⇒ 保守认输
 		}
-		// 身份核对：确认坟墓里的是「我读到的那枚锁」
+	}
+
+	try {
+		// 赢下接管锁后再核对：原锁是否仍是最初读到的那枚（防「别人已换过」）
+		let cur: { token?: string } = {};
 		try {
-			const moved = JSON.parse(readFileSync(graveyard, "utf8")) as { token?: string };
-			const movedToken = typeof moved.token === "string" ? moved.token : undefined;
-			if (observedToken !== movedToken) {
-				// 不等 ⇒ 我移走的是别人的（更新的）锁 ⇒ 放回并认输（不双赢、不破坏别人的锁）
-				// 注：用 `!==` 而非「双方都定义才比」——旧锁/测试造的锁可能**无 token**（undefined），
-				// 此时若按「都定义才比」会跳过核对 ⇒ 双赢家（Z18 实测暴露）。
-				try { renameSync(graveyard, lockPath); } catch { /* 放回失败：best-effort，仍认输 */ }
-				return false;
-			}
+			cur = JSON.parse(readFileSync(lockPath, "utf8")) as { token?: string };
 		} catch {
-			// 坟墓不可读：无法证明归属 ⇒ 保守认输（放回）
-			try { renameSync(graveyard, lockPath); } catch { /* ignore */ }
-			return false;
+			return false; // 锁已被移走/损坏 ⇒ 认输（不建锁，让别人赢）
 		}
+		const curToken = typeof cur.token === "string" ? cur.token : undefined;
+		if (curToken !== observedToken.token) return false; // 别人已换过 ⇒ 认输
+
+		// 替换：先删再排他建（不覆盖任何别人的锁）
+		rmSync(lockPath, { force: true });
 		try {
 			writeFileSync(lockPath, JSON.stringify({ ...meta, tookOver: true, token: mintToken() }), { flag: "wx" });
 		} catch {
-			return false; // 别人已重建 ⇒ 认输
+			return false; // 有人抢先建了新锁 ⇒ 认输（**不覆盖它**）
 		}
-		// 清掉坟墓（best-effort；已是自己的锁）
-		try { rmSync(graveyard, { force: true }); } catch { /* ignore */ }
 		return true;
-	} catch {
-		return false; // 锁文件不可读/竞态失败 ⇒ 保守不接管（宁可不判）
+	} finally {
+		// 释放接管锁（best-effort）
+		try { rmSync(takeoverPath, { force: true }); } catch { /* ignore */ }
 	}
 }
 

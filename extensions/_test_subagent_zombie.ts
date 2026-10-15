@@ -336,6 +336,39 @@ try {
 	}
 
 
+	// ── Z19：L4 三轮反例——三方交错（B 插入 + C 抢先建锁 + A 核对失败）──────
+	{
+		const id = "run_z19";
+		const meta = { reason: "pid-dead" as const, at: iso(NOW) };
+		mk(id, { id, status: "running", startedAt: longAgo, lastActivity: longAgo, pid: 999_999_999 });
+		writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW - 30 * 60 * 1000) }), { flag: "wx" });
+		// A 判定僵锁后：B 完成接管，再由 C 抢占（wx）建锁；A 恢复后核对应认输
+		// ⚠️ 诚实标注：C 这一步是**人工构造**（生产代码里只有本模块写 `.reaped`，
+		// 而合法接管者都被 `.reaping` 接管锁串行化）。本用例真正验证的性质是
+		// 「**A 绝不覆盖第三方的锁**」——这是第 4 代实现的结构性保证（不再用 rename 放回）。
+		let bWon: boolean | undefined, cWon: boolean | undefined;
+		__setClaimReapTestHook(() => {
+			__setClaimReapTestHook(undefined);
+			bWon = claimReap(root, id, meta, { now: () => NOW });           // B 正常接管
+			try {
+				// C 模拟「第三方在 A 已建 .reaping 前后抢建锁」：直接删锁再 wx 建（同 C 的接管路径）
+				rmSync(join(root, `${id}.reaped`), { force: true });
+				writeFileSync(join(root, `${id}.reaped`), JSON.stringify({ at: iso(NOW), token: "C-token" }), { flag: "wx" });
+				cWon = true;
+			} catch { cWon = false; }
+		});
+		const aWon = claimReap(root, id, meta, { now: () => NOW });
+		__setClaimReapTestHook(undefined);
+		assert.equal(bWon, true, "B 应赢");
+		assert.equal(cWon, true, "C 抢建成功");
+		assert.equal(aWon, false, `A 必须输（否则三方双赢家）——第3代「放回」实现会给 aWon=true`);
+		// C 的锁必须**未被 A 覆盖**
+		const lock = JSON.parse(readFileSync(join(root, `${id}.reaped`), "utf8")) as { token?: string };
+		assert.equal(lock.token, "C-token", "C 的锁不得被 A 抹掉（Windows rename 会覆盖 ⇒ 旧实现会抹）");
+		ok("Z19 三方交错：A 认输且不覆盖 C 的锁（能抓第3代「放回」实现）");
+	}
+
+
 	console.log(`\n_test_subagent_zombie: all ${n} groups passed`);
 } finally {
 	rmSync(root, { recursive: true, force: true });
