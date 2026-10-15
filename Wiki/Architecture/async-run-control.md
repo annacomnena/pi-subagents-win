@@ -2,8 +2,11 @@
 title: 异步 Run 控制面（list / kill）
 kind: concept
 status: current
-updated: 2026-10-13
+updated: 2026-10-16
 source_paths:
+  - extensions/subagent-zombie.ts
+  - extensions/_test_subagent_zombie.ts
+  - extensions/async-result-watcher.ts
   - extensions/subagent-kill.ts
   - extensions/index.ts#L1428
   - extensions/index.ts#L1665-L1684
@@ -92,6 +95,68 @@ kill 成功（非 preserveTerminal）后落盘：`status:"cancelled"` + `killedA
 - 影响：真实 `config.json` 里由**其它 owner** 持有的顶层键（`gui`/`channels`/`autonomy` 等）不再被本扩展的配置往返丢掉；枚举键的行为逐字节不变（仍归一化覆盖；脏枚举值原样透传是既有行为）。文件不存在或坏 JSON 仍回落纯缺省（无键可保留）。
 - 仍未覆盖：`masterSuccession` **切片内**的未知键仍会丢；跨进程 read-modify-write 的 lost update 仍存在（非本控制面范围）。
 
+### 僵尸看门狗（失败必达终态 · 宿主侧兜底）
+
+**问题（2026-10-15 真实事故）**：6 个 async run 挂在 `running` 而 pid 已死（idle 9h+）⇒ 上游会话
+**死等 100 分钟**，最后人工 `kill` 才解开。根因：**`running` 没有任何超时/僵尸出口**——
+watcher 只处理**已进终态**的 run（`status ∈ {completed,failed,cancelled}`），死进程产生的
+`running` 记录**不在任何人的视野内**。
+
+**模块**：`extensions/subagent-zombie.ts`（新增）。**纪律：只落状态、绝不杀进程**
+（进程已死才判 zombie；杀进程是 `subagent-kill` 的取权，三道门一字未改）。
+
+**判定（以「活进程证据」为主，不以「字段缺失」为主）**：
+
+| 分支 | 条件 | 证据强度 | 动作 |
+|---|---|---|---|
+| `pid-dead` | `pid` 存在 ∧ signal-0 判死 | **硬** | 落 `failed(zombie)` |
+| `pid-reused` | `pid` 活但启动时间不在登记容差窗口（前 5min/后 3min）| **硬** | 落 `failed(zombie)` |
+| `no-pid-idle` | 无 `pid` ∧ `lastActivity` 超 2h | **弱** | 默认**只写** `.zombie-suspect`；`PI_SUBAGENT_ZOMBIE_AUTO=1` 才落终态 |
+
+全部前置：`status==="running"` ∧ 年龄 ≥ `ZOMBIE_MIN_AGE_MS`(120s) ∧ 无终态（含 `result.status`）。
+**为何不能靠字段缺失判死**（L4 审查关键事实）：`subagent-kill` 的 `markKilled()` 会
+`delete pid/pidRecordedAt/pidCmdMarker` 并刷新 `lastActivity` ⇒ **事后 json 的 pid 缺失不代表当时缺失**。
+
+**触发（双路，复用既有设施）**：
+- **on-read 惰性**：`subagent-win({action:"status"|"list"})` 查询前先收口（等待方不必等 tick）；
+  **按会话归属收窄**（`scopedRunIds()`，与 `resolveSessionRun` 同口径）⇒ 不回收他会话的 run。
+- **周期 tick**：复用 `async-result-watcher` 既有 10s tick（**不新增定时器**）；`skipInspect:true`
+  避免在同步回调里跑 PowerShell（单次可阻塞 ~20s）；`limit:50` 防无界扫描。
+
+**幂等：持久 claim + 显式恢复（第 5 代，四代被推翻后的收敛）**
+
+`.reaped` 是 **永久** claim（`writeFileSync(..., {flag:"wx"})` 排他创建）。
+**语义 = 「至多一个非-force 赢家」，不声称 exactly-one。**
+
+演进史（每一代都被独立 L4 给出可复现时序推翻，全部留痕于 `plans/20261016_subagent_zombie_l4_review{,2,3,4}.md`）：
+
+| 代 | 实现 | 被推翻的原因 |
+|---|---|---|
+| 1 | `rmSync + writeFileSync(wx)` | 两步之间可删他人新锁 |
+| 2 | 仅 `renameSync` 移走视为原子 | A 可能移走 B 刚建的新锁（路径存在即成功）|
+| 3 | + token 核对 +「放回」 | **Windows 上 rename 会覆盖已存在目标**（实测）⇒ 抹掉第三方锁 |
+| 4 | 独立 `.reaping` 接管锁 + TTL | TTL **会回收仍在工作的接管锁**（owner 暂停超过 TTL）|
+| **5** | **永久 claim + `force` 人工恢复** | —— 结构上排除双赢家 |
+
+**根本结论**：一个「标记 + TTL」的看门狗**无法用「过期无主文件」安全实现 owner 回收**
+（那需要 fencing token；纯文件系统原语给不出）。故采纳 L4 建议：
+**simplify to permanent `wx` claim + explicit/manual stale recovery**。
+代价：赢家崩溃停在 claim 后会**永久卡住**，需人工 `reapZombie(id, {force:true})`。
+
+**降级保障（不用于掩盖双赢家）**：`reapZombie` 写终态前**重读**（顶层 `status` + `result.status`），
+已终态则短路 ⇒ 「真完成永不被覆盖」。
+
+**失败分类投影**：async 注入正文带 `失败分类: kind=… source=… model=… http=…`（读新 `failure` 字段）；
+`failure{kind,provider,model,httpStatus,message,at,source}` + `endedAt` 写入 run json。
+
+**可测性 env**：`PI_SUBAGENT_ZOMBIE_MIN_AGE_MS`(120s) / `PI_SUBAGENT_ZOMBIE_IDLE_MS`(120s) /
+`PI_SUBAGENT_ZOMBIE_NO_PID_IDLE_MS`(2h) / `PI_SUBAGENT_ZOMBIE_AUTO`(=1 才让弱证据落终态)。
+
+**相关修复（同批）**：`index.ts` 的 `stopReason==="error"` 分支原先只置 `failed` + `continue`
+⇒ 子进程不退出、上游无限等；现按 `classifyModelFailure` 判为不可恢复（`usage_cap`/`auth`/`!retryable`）
+时**回调 `onFatalFailure` → kill 子进程**。另修 `close` 中 `stderrBuf` **提前清空**导致
+provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
+
 ### 可测试性 env 一览
 
 | env | 作用 | 缺省（未设时语义逐字节不变） |
@@ -114,6 +179,17 @@ kill 成功（非 preserveTerminal）后落盘：`status:"cancelled"` + `killedA
 5. **跨宿主重启**：kill 依据是 run json 里登记的 pid + OS 身份基线（跨重启仍可查），但「保留 cancelled 不被 `.then` 覆盖」的 `killedRuns` 是**进程内**状态；宿主重启后旧 run 若仍 running、子进程成孤儿，kill 仍能按 pid+身份校验树杀并落 `cancelled`（此路径无 `.then` 可覆盖，语义正常）——**未实机演练**。
 6. **`PI_SUBAGENT_RUNS_DIR` 非全仓单一口径**：`async-panel.ts#L40` 与 `gc-cleaner.ts#L53` 仍硬编码 `~/.pi/agent/subagent-runs`。生产环境设了该 env 时 panel/gc 会与之漂移（gc 甚至可能清理真实目录）；本控制面自身口径单一（`subagent-kill.ts#L38` → `index.ts#L150`）。
 7. **旧记录不可杀**：本能力上线前派发、无 `pid` 字段的 run 只能返回 `no_pid` 安全报错，仍需手工处理。
+8. **僵尸看门狗的未覆盖面**（Item 52 新增）：
+   - **等待仍无界（P0，可分离议题）**：本看门狗只覆盖「僵尸」，**不提供端到端等待预算**——
+     持续输出的活进程 / external CLI / fallback 链仍无墙钟总上限（`timeoutMs` 是 stall 语义，
+     有输出就重置）⇒ **不得宣称整体失败等待有界**。
+   - **无 pid 僵尸默认不自动终结**：只写 `.zombie-suspect`；这是有意的保守边界（见上文判定表）。
+   - **`force` 无产品级入口**：`reapZombie(...,{force:true})` 仅在导出 API，尚无 CLI/工具包装 ⇒
+     永久 claim 的崩溃残留目前需开发者手工调用。
+   - **`force` 不保证排他**：多个 `force` 或 force 与在飞 claim 交错时可能多个返回 true
+     （属显式绕过人工路径的边界，非自动路径保证）。
+   - **跨进程僵锁竞态未做受控交错测试**：Z3 仅烟雾级（两真进程竞争）；无「暂停 owner 跨 TTL」的
+     确定性用例（第 5 代已无 TTL 接管路径，该用例随之失效并被删除）。
 8. **测试隔离纪律的已知缺口（非本控制面范围）**：`_test_async_panel.ts` 仍可经 `notifyAsyncCompletion` 弹真实 toast（可用 `PI_NOTIFY_DISABLE=1` 抑制，测试 runner 未统一设置）；`_test_readconfig_preserve_keys.ts` 会临时改写真实 `config.json` 字节（`finally` 还原，被 SIGKILL/硬超时打断的窗口内会留下夹具配置）。
 
 ### 已实证（勿拔高、也勿贬低）
@@ -165,6 +241,7 @@ kill 成功（非 preserveTerminal）后落盘：`status:"cancelled"` + `killedA
 ## Backlinks
 
 - [[Wiki 索引]]
+- [[工具调用可观测与循环判定]]（复用本页 `killAsyncRun`）
 
 ## Open Questions
 

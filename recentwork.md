@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 52 | P0 | **失败必达终态 + 僵尸看门狗**：额度/认证类不可恢复失败立即终止子进程（否则上游死等 100min，2026-10-15 事故 6 个僵尸）；新增宿主侧看门狗（pid 死 / pid 重用 ⇒ 落 `failed(zombie)`）；on-read 惰性 + watcher 10s tick 双路回收；`stderrBuf` 提前清空致额度线索丢失的 bug | none | 已 11 commit（`e22fd96`…`c450509`）；L4 五轮 PASS-WITH-NITS；**未解决**：等待仍无界（P0，可分离）+ 无 pid 僵尸默认观察模式 | 本区 |
 | 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API | — |
 | 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） | 本区 |
 | 49 | P1 | 微信媒体探针第四轮出站补测 + **人工确认收口**（P6 出站发图 e2e / P3 `client_id` 去重=1 条 / P8 链接形态 / P2 截断仍 U；`56e5088`） | Item 48 | 残余 U 7 项（大媒体·其它 `media_type`、上传失败语义、长语音/体积上限、真机 302、P2 截断、回声/卡片、P4-poll+send）；可开 media gateway 实现 | 本区 |
@@ -67,6 +68,28 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+
+<a id="item-52"></a>
+### Item 52 - 失败必达终态 + 僵尸看门狗（额度/进程失败）
+
+- **日期**：2026-10-15 / 16
+- **一句话**：治「额度耗尽后 subagent 不自终止、不汇报」——**2026-10-15 真实事故**：6 个 run 挂在 `running` 而 pid 已死（idle 9h+）⇒ 上游会话**死等 100 分钟**，最后人工 kill 才解开。根因：`running` 状态**没有任何超时/僵尸出口**（watcher 只处理已进终态的 run）。
+- **已交付（11 个本地 commit，**未 push**）**：
+  - `e22fd96` **额度/不可恢复失败立即终止子进程**（原 `stopReason==="error"` 只置 failed + `continue`，进程不退出 ⇒ 上游无限等）；同批修 `stderrBuf` 在 close 中**提前清空**导致 provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
+  - `4ca41ce` **新增 `extensions/subagent-zombie.ts`**（判定纯函数 + 幂等落终态）；`0057839` 注册 test 脚本；`dd6d60b` 接线 watcher 既有 10s tick + 失败分类投影进注入正文；`33e81f4` on-read 惰性回收（status/list）。
+  - `5b8e75e`/`f15178e` L4 二轮 3 条 P1（锁 TTL、`result.status` 防护、on-read 跨会话收窄）；`2b77fa1` 锁 token 身份校验；`b642d65` 第4代独立 `.reaping` CAS；**`e759184` 第5代简化——持久 claim + force 恢复（放弃 exactly-one，净减 139 行）**；`c450509` 注释澄清。
+- **关键设计结论（四代被推翻后的收敛）**：一个「标记 + TTL」看门狗**无法用过期无主文件安全实现 owner 回收**（需 fencing token）⇒ 改为 **永久 `wx` claim**（至多一个非-force 赢家）+ **显式人工恢复** `reapZombie(id,{force:true})`；**不再声称 exactly-one**。四代演进（rmSync+wx → 仅 rename → token 核对+放回 → `.reaping`+TTL）每一代的真实缺陷都由独立 L4 给出可复现时序。
+- **独立 L4**：5 轮（`plans/20261016_subagent_zombie_l4_review{,2,3,4,5}.md`），前 4 轮均 FAIL（每轮找到一个**真实**双赢家/漏检缺陷），**第 5 轮 PASS-WITH-NITS**（「第五代在非-force 自动路径下闭合了双赢家问题；未发现 force 进入自动路径」）。
+- **验证**：`test:subagent-zombie` **18/18**（含跨进程 CAS、误杀防护双向、原子写、幂等、跨会话白名单、force 恢复）；`test:subagent-kill`（kill 三道门未削弱）·`_test_async_result_watcher`·`test:async-panel`·`test:launch`·`test:external-cli`·`test:register-graph`·`test:tab-runs-runtime`·`test:tiers-gate`·`test:recent-calls`(178/0) 全绿。零真实 runs 目录副作用（全部临时目录夹具）。
+- **范围纪律**：工作区 `extensions/index.ts`（Item 1016 costTier）与 `subagent-kill.ts`（recent-calls mergeRunRecord）含**他人未提交改动** ⇒ 全程 **hunk 级精确分离**（逐 commit 证据：`plans/20261016_zombie_commit_provenance.md`；11 个 commit 的 `costTierGate`/`mergeRunRecord` 命中均为 0）。
+- **未解决（L4 定性为「可分离议题」，但确为产品限制）**：
+  1. **等待仍无界（P0）**：持续输出的活进程 / external CLI / fallback 链**没有墙钟总预算**（`timeoutMs` 是 stall 语义，有输出就重置）⇒ 本看门狗只覆盖「僵尸」，不提供端到端有界等待。
+  2. **无 pid 僵尸默认观察模式**：只写 `.zombie-suspect`，run 仍留 `running`（有意的保守安全边界：无 pid + 闲置不能证明死亡；`PI_SUBAGENT_ZOMBIE_AUTO=1` 才落终态）。
+  3. **force 恢复无产品级入口**：`reapZombie(...,{force:true})` 仅在导出 API，尚无 CLI/工具包装；永久 claim 崩溃残留需人工调用 ⇒ 部署 runbook 应说明。
+- **Priority**：P0
+- **Status**：active（主体已交付并过 L4；**未解决项待派发者裁决**）
+- **Commit**：`e22fd96`+`4ca41ce`+`0057839`+`dd6d60b`+`33e81f4`+`5b8e75e`+`f15178e`+`2b77fa1`+`b642d65`+`e759184`+`c450509`
+- **计划/审查**：`plans/20261015_subagent_failure_terminal_state_plan.md`（v2，含审查 must-fix 吸收）+ `plans/20261015_subagent_failure_plan_review.md` + L4 五轮报告 + `plans/20261016_zombie_commit_provenance.md`
 
 <a id="item-50"></a>
 ### Item 50 - M1 入站图片附件：真机验收通过 + 文档收尾
@@ -734,3 +757,4 @@
 1002 fix-s8-and-eval-trigger-expansion（execute E1–E3）：①修 _test_graph_frontier_shadow S8a 既有失败——根因 orphaned-grace 读墙钟（fixture 固定 NOW 必超 5min grace→两路判 orphaned/hidden→details 无 t_rm），修复=时钟注入贯通（classifyTabStatus/composeTabStatus 可选 now 缺省 Date.now()、classifyDispatch 第三参、两装配点传注入时钟；生产默认行为不变），shadow 29/29 + reverse 30/30 + 10 项回归全绿（仅 _test_runtime_wake 首用例基线残留）；②trigger 扩容只评估报告 plans/20261002_trigger_expansion_eval.md（①-⑩ 判态增量/可判vs该自主三档/④⑥ 前置=新事实生产者非新投影/OQ-1 无界自激环结构性不存在+notify 无 owner 滞留中风险）；L2 审查 PASS；改动 5 源码文件未 commit；Wiki：work-graph-read-only-projection ✏️（S8 残留闭环+时钟可注入契约），已 wiki-nav rebuild
 1002 OQ-1 防护（方案 A+C）+ trigger 扩容（⑤⑧ 进动作面）：①policy.ts 新增 TRIGGER_CLASS_MAP（4 rule 逐规则映射）+ TRIGGER_ALLOWLIST 派生 size=4 + decide L1 改映射口径 + L1.5 notify scope-owner 门（ownerless/stale→DENY）②run.ts 候选枚举按映射 + 装配 notifyScopeOwner + 方案 C 回声标记（suspectedEcho）+ status ⚠echo ③ledger.ts additive suspectedEcho 字段 + hasRecentNotifyForProject helper ④types.ts ActionClass 增可选 ownerCheck hook ⑤notify.ts 实现 ownerCheck（readAttachment→judgeScopeOwnerStale 三态）⑥测试 86 绿（72 基线+14 新：映射矩阵/方案 A 4 项/方案 C 3 项/⑤⑧ 防循环 3 项）+ 既有 notify 集成 4 处迁移 attach scope owner；autonomy 60 绿 / wiring 12/3 既有 / smoke OK；报告 plans/20261002_oq1_guard_trigger_expansion_impl.md；Wiki：无（收尾阶段统一做）；未 commit
 1002 OQ-1 防护+trigger 扩容 E2/E3 收尾：code-reviewer PASS-with-fixes（修 notify 异常 fail-closed + 回声窗口排除未来时间戳）+ 主会话复核发现 L1.5 unknown 放行缺口 → 补修（notify 仅 "ok" 放行，unknown/n/a → DENY(scope-owner-unknown)，含纯 decide 断言）→ **87 checks 绿** / autonomy 60 / wiring 12-3 既有 / smoke OK；审查 plans/20261002_oq1_guard_trigger_expansion_l4_review.md；Wiki：autonomy-suite ✏️（映射化 allowlist/owner 门/回声标记/测试基线 87/OQ-1 两缓解+通道 D 保留），已 wiki-nav rebuild
+1017 research（memory 机制调研，research-only）：Hermes（本机源码级）+ OpenClaw@2026.10.3（只读文档）记忆机制 + pi 现状/扩展能力面，6 个 searcher 串行（默认 provider entitlement 故障→ling/Ling-3.1-flash fallback）。报告 plans/20261016_research_agent_memory_mechanisms.md（+ part1–part5 分片）；结论：pi 无内建长期记忆、~/.pi/agent/AGENTS.md 静态无预算；建议先「最小静态版（MEMORY.md/USER.md+硬上限+before_agent_start 预算注入）」后「检索式版」。Wiki：新建 Wiki/Architecture/agent-memory-mechanisms.md（concept），_index + hotspot-working-set backlink 已补，已 wiki-nav rebuild（26 pages）
