@@ -142,6 +142,25 @@ import {
 	touchRunActivity,
 	type ChildSpawnInfo,
 } from "./subagent-kill.ts";
+// 僵尸看门狗（失败必达终态的宿主侧兜底）：on-read 惰性回收（tick 路径在 async-result-watcher）
+import { reapZombie, reapZombiesInDir } from "./subagent-zombie.ts";
+import {
+	classifyLoop,
+	clampN,
+	collectAsyncCalls,
+	collectTabWindow,
+	formatRecentCalls,
+	formatRecentCallsError,
+	locateTabSession,
+	normalizeArgsDigest,
+	normalizeLoopGuard,
+	pushRecentCall,
+	RING_K,
+	type LoopGuardConfig,
+	type RecentCallEntry,
+	type RecentCallsReason,
+	type RecentCallsVerdict,
+} from "./recent-calls.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = resolve(__dirname, "..");
@@ -3297,6 +3316,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (p.action === "status") {
+				// on-read 惰性回收（计划 §4-⑤）：查询前先对**被查的** run 跑一次僵尸判定，
+				// 使等待方不必等 10s tick 就拿到终态。
+				// 与 tick 路径的区别：on-read **不跳 inspect**（用户主动查询，值得花一次 PowerShell）；
+				// 失败静默（只读路径不得因回收失败而不可用）。
+				if (p.runId) {
+					try { reapZombie(RUNS_DIR, p.runId); } catch { /* 只读路径：静默 */ }
+				} else {
+					try { reapZombiesInDir(RUNS_DIR, { limit: 10 }); } catch { /* 静默 */ }
+				}
 				const runs = listAsyncRuns();
 				// L3 status 默认会话隔离（2026-09-23）：无参只返回本会话派发的 run（按时间最新的一个）；
 				// 跨会话查看须显式带 runId（全局查找不变）。归属判定复用 async-result-watcher 范式：
@@ -3340,6 +3368,8 @@ export default function (pi: ExtensionAPI) {
 
 			// 直接 kill 支持（2026-10-13）：list 看谁卡住；kill/cancel 按 runId 树杀（见 subagent-kill.ts）。
 			if (p.action === "list") {
+				// on-read 惰性回收（同 status）：让 `list` 不会展示已经死掉的僵尸 run。
+				try { reapZombiesInDir(RUNS_DIR, { limit: 50 }); } catch { /* 静默 */ }
 				return { content: [{ type: "text", text: formatRunList(listAsyncRunSummaries(RUNS_DIR)) }] };
 			}
 
