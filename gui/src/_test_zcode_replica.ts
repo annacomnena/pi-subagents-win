@@ -98,7 +98,7 @@ assert.ok(sidebar.includes("px-4 pt-2 pb-4"), "footer（WorkspaceSidebarFooter c
 assert.ok(!/dnd|DndContext|pinned|PinnedTask|GroupedTasks|TabsList/.test(sidebar), "分组 Tabs/置顶/归档/dnd 不渲染");
 const sessionList = read("pages/SessionList.tsx");
 assert.ok(sessionList.includes("group/task-item flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow]"), "会话项行 class 逐字对齐 TaskListItem#L534-546");
-assert.ok(sessionList.includes('isActive ? "bg-selected" : "hover:bg-surface-hover"'), "选中 bg-selected / hover bg-surface-hover 四态前置槽");
+assert.ok(sessionList.includes('isActive ? "bg-selected" : "hover:bg-hover"'), "选中 bg-selected / hover bg-hover（§7 A-7：行 hover 走暖抬升档）");
 assert.ok(sessionList.includes("h-1.5 w-1.5 rounded-full bg-destructive"), "error 红点 = h-1.5 w-1.5");
 assert.ok(sessionList.includes("titleSource"), "保留可读标题链成果（titleSource=id 灰显 shortId）");
 assert.ok(sessionList.includes("space-y-0.5"), "ul space-y-0.5");
@@ -106,7 +106,7 @@ ok("3 左栏：容器/列表项 class 串逐字对齐；分组/置顶/dnd 不渲
 
 // ── 4. 中央 transcript 1:1（锚 §2.b）──────────────────────────────
 const chat = read("pages/ChatPage.tsx");
-assert.ok(chat.includes("rounded-xl rounded-tr-xs border border-border bg-surface px-4 py-3"), "user 气泡（rounded-tr-xs 缺角必抄）");
+assert.ok(chat.includes("rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3"), "user 气泡（rounded-tr-xs 缺角必抄；§7 A-8① 暖沙底角色 token）");
 assert.ok(chat.includes("group/user-row flex flex-col items-end"), "user 行右对齐壳");
 assert.ok(chat.includes("mt-1 text-right text-ui-sm"), "outbox 回执状态行（气泡下）");
 assert.ok(chat.includes('className="group/assistant-row"') && chat.includes("whitespace-pre-wrap"), "assistant 行式纯文本");
@@ -122,9 +122,9 @@ assert.ok(chat.includes("思考过程"), "reasoning 折叠标题");
 ok("4 transcript：5 种行→zcode 行型映射 + 工具卡 + mask（无光标字符）");
 
 // ── 5. composer 1:1（锚 §2.c）─────────────────────────────────────
-assert.ok(chat.includes("rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused focus-within:bg-input-focused"), "输入壳三态边框整串（ChatPromptEditor#L346-353）");
-assert.ok(chat.includes("border-brand bg-input-focused ring-1 ring-brand/30"), "拖拽高亮占位");
-assert.ok(chat.includes("cursor-pointer gap-1 rounded-lg bg-brand text-ui-base text-foreground-inverse hover:bg-brand/80"), "发送钮整串（ConversationComposer#L2088）");
+assert.ok(chat.includes("rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused"), "输入壳三态边框整串（ChatPromptEditor#L346-353）");
+assert.ok(chat.includes("border-accent bg-input"), "拖拽高亮占位（§7 A-8④ 陶土体系）");
+assert.ok(chat.includes("cursor-pointer gap-1 rounded-lg bg-accent text-ui-base text-accent-foreground hover:bg-accent-hover"), "发送钮整串（ConversationComposer#L2088；§7 A-8③ 全库唯一彩色主 CTA）");
 assert.ok(chat.includes("<ArrowUp className=\"size-4\" />"), "发送钮 ArrowUp icon-md");
 assert.ok(chat.includes("group/toolbar flex items-end gap-3"), "工具栏行");
 assert.ok(chat.includes("Square className=\"size-4 fill-current\""), "Stop 钮灰显占位（secondary + Square fill-current）");

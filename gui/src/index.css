@@ -86,6 +86,10 @@
 	--color-foreground-subtle: #5e5d59; /* Olive Gray（5.98:1 on Parchment） */
 	--color-foreground-subtlest: #706f69; /* §3.3 抬到 AA（4.57:1），不再沿用 stone 3.31:1 */
 	--color-foreground-inverse: var(--color-brand-ivory);
+	/* §7 A-8① 用户气泡角色 token（暖沙底 + 近黑字，14.7:1）。
+	 * 用独立角色 token 而非直接挑 --color-surface-warm（后者是 color-mix 的派生输入别名）。 */
+	--color-bubble-user: var(--color-brand-sand);
+	--color-bubble-user-foreground: var(--color-brand-ink);
 	--color-accent: #c96442; /* 唯一彩色动作 */
 	--color-accent-hover: #d4795a;
 	--color-accent-foreground: #141413; /* accent 上的字（4.73:1） */
@@ -186,6 +190,8 @@
 	--color-foreground-subtle: #a09f96; /* §3.1 权威 hex（6.93:1 on #141413） */
 	--color-foreground-subtlest: #898880; /* §3.1 权威 hex（5.18:1 on #141413） */
 	--color-foreground-inverse: var(--color-brand-ink); /* #141413：浅色面上的字一律近黑 */
+	--color-bubble-user: var(--color-brand-sand); /* §7 A-8① 暖沙气泡（14.7:1） */
+	--color-bubble-user-foreground: var(--color-brand-ink);
 	--color-accent: var(--color-brand-terracotta); /* #c96442 */
 	--color-accent-hover: color-mix(in oklab, var(--color-brand-terracotta) 88%, var(--color-brand-ivory)); /* #d4795a（变亮） */
 	--color-accent-foreground: var(--color-brand-ink); /* #141413（4.73:1） */
@@ -252,6 +258,8 @@
 	--color-foreground-subtle: #5e5d59;
 	--color-foreground-subtlest: #706f69;
 	--color-foreground-inverse: var(--color-brand-ivory);
+	--color-bubble-user: var(--color-brand-sand); /* §7 A-8① 暖沙气泡（14.7:1） */
+	--color-bubble-user-foreground: var(--color-brand-ink);
 	--color-accent: #c96442;
 	--color-accent-hover: #d4795a;
 	--color-accent-foreground: #141413;

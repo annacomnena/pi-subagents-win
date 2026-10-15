@@ -64,7 +64,7 @@ export function Sidebar() {
 						onClick={() => setActiveTab(activeTab === "timeline" ? "chat" : "timeline")}
 						className={`w-full justify-start gap-2 rounded-lg px-2 ${
 							activeTab === "timeline"
-								? "bg-selected text-foreground hover:bg-selected shadow-[inset_2px_0_0_0_var(--color-brand)]"
+								? "bg-selected text-foreground hover:bg-selected shadow-[inset_2px_0_0_0_var(--color-accent)]"
 								: "text-foreground-subtle"
 						}`}
 					>

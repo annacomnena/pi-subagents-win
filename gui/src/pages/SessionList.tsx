@@ -161,7 +161,7 @@ export function SessionList() {
 				}}
 				tabIndex={0}
 				className={`group/task-item flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 transition-[background-color,border-color,box-shadow] focus-visible:ring-2 focus-visible:ring-ring/50 ${
-					isActive ? "bg-selected" : "hover:bg-surface-hover"
+					isActive ? "bg-selected" : "hover:bg-hover"
 				}`}
 			>
 				{/* 前置状态槽 16×16（#L559-600）：error 红点；unread/loading 无数据源不渲染 */}
@@ -247,7 +247,7 @@ export function SessionList() {
 							className={`px-1.5 text-ui-sm transition-colors focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 ${
 								sortBy === value
 									? "bg-tag text-foreground"
-									: "text-foreground-subtle hover:bg-surface-hover"
+									: "text-foreground-subtle hover:bg-hover"
 							}`}
 						>
 							{label}
@@ -287,7 +287,7 @@ export function SessionList() {
 										role="button"
 										tabIndex={0}
 										title={g.tooltip}
-										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-ring/50"
+										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring/50"
 									>
 										{g.ungrouped ? (
 						<Inbox className="size-4 shrink-0 text-foreground-subtlest" />
@@ -325,7 +325,7 @@ export function SessionList() {
 											type="button"
 											onClick={() => toggleOverflow(g, !overflowOpen)}
 											aria-expanded={overflowOpen}
-											className="mt-0.5 flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 text-ui-sm text-foreground-subtle transition-colors hover:bg-surface-hover"
+											className="mt-0.5 flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 text-ui-sm text-foreground-subtle transition-colors hover:bg-hover"
 										>
 											{overflowOpen ? (
 												"收起"

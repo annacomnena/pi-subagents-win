@@ -78,9 +78,9 @@ function TurnHeaderRowView({ row }: { row: Extract<TranscriptRow, { kind: "turnH
 function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userInput" }> }) {
 	return (
 		<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
-			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-surface px-4 py-3 text-ui-base text-foreground @min-[624px]/conversation:max-w-xl">
+			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
 				<div className="whitespace-pre-wrap">
-					{row.text.length > 0 ? row.text : <span className="text-foreground-subtlest">（非文本输入）</span>}
+					{row.text.length > 0 ? row.text : <span className="opacity-60">（非文本输入）</span>}
 				</div>
 			</div>
 		</RowShell>
@@ -493,13 +493,13 @@ export function ChatPage() {
 									e.preventDefault();
 									setDragging(false); // 附件拖放无后端：占位高亮，落点不接收
 								}}
-								className={`relative flex flex-col gap-3 overflow-hidden rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused focus-within:bg-input-focused ${
-									dragging ? "border-brand bg-input-focused ring-1 ring-brand/30" : ""
+								className={`relative flex flex-col gap-3 overflow-hidden rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused ${
+									dragging ? "border-accent bg-input" : ""
 								}`}
 							>
 								{dragging && (
-									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-accent/55 backdrop-blur-sm">
-										<div className="flex items-center gap-2 rounded-full border border-border bg-accent px-4 py-2 text-ui-base text-foreground shadow-sm">
+									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-accent/15 backdrop-blur-sm">
+										<div className="flex items-center gap-2 rounded-full border border-accent/40 bg-card px-4 py-2 text-ui-base text-accent-text shadow-overlay">
 											<span>附件拖放未接入</span>
 										</div>
 									</div>
@@ -570,7 +570,7 @@ export function ChatPage() {
 												disabled={!canSend}
 												onClick={() => void send()}
 												aria-label="发送"
-												className="cursor-pointer gap-1 rounded-lg bg-brand text-ui-base text-foreground-inverse hover:bg-brand/80"
+												className="cursor-pointer gap-1 rounded-lg bg-accent text-ui-base text-accent-foreground hover:bg-accent-hover"
 											>
 												<ArrowUp className="size-4" />
 											</Button>
@@ -600,7 +600,7 @@ function OutboxRowView({ e }: { e: ChatOutboxEntry }) {
 	const s = OUTBOX_STATUS[e.status];
 	return (
 		<div className="group/user-row flex flex-col items-end">
-			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-surface px-4 py-3 text-ui-base text-foreground @min-[624px]/conversation:max-w-xl">
+			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
 				<div className="whitespace-pre-wrap">{e.text}</div>
 			</div>
 			<div
