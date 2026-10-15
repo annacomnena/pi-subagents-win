@@ -44,6 +44,9 @@
 	--font-display: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
 
 	--text-ui-xl: calc(var(--ui-font-size) + 4px);
+	/* §7 A-10：主控页压力大数字（全页唯一视觉锚）。字阶表未列此档，但该页面明确需要；
+	 * 不进常规字阶体系（不得在列表/正文使用），仅此一处。 */
+	--text-ui-3xl: calc(var(--ui-font-size) + 16px);
 	--text-ui-lg: calc(var(--ui-font-size) + 2px);
 	--text-ui-base: var(--ui-font-size);
 	--text-ui-caption: calc(var(--ui-font-size) - 1px);

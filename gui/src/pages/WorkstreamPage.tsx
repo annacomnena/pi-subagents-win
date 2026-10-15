@@ -70,10 +70,10 @@ export function WorkstreamPage() {
 									<button
 										type="button"
 										onClick={() => setSelectedId(w.id)}
-										className={`w-full rounded-md px-2 py-1.5 text-left transition-colors ${
+										className={`w-full rounded-lg px-2 py-1.5 text-left transition-colors ${
 											selected?.id === w.id
-												? "bg-selected text-foreground"
-												: "text-foreground-subtle hover:bg-surface hover:text-foreground"
+												? "bg-selected text-foreground shadow-[inset_2px_0_0_0_var(--color-accent)]"
+												: "text-foreground-subtle hover:bg-hover hover:text-foreground"
 										}`}
 									>
 										<div className="flex items-center gap-2">

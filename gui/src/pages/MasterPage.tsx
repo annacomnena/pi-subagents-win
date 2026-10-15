@@ -123,7 +123,7 @@ export function MasterPage() {
 					<Card title={<Term zh="上下文压力" en="context pressure" hint="会话记忆快满时会自动提议交接" />}>
 						{livePct !== null && live ? (
 							<div className="flex items-baseline gap-3">
-								<span className="font-mono text-3xl text-foreground">{fmtPressurePct(live.pressure)}</span>
+								<span className="font-mono text-ui-3xl text-accent-text">{fmtPressurePct(live.pressure)}</span>
 								<span className="text-ui-sm text-foreground-subtle">
 									<Badge tone="green" title="值守会话 agent turn 结束时写盘的心跳活值">实时</Badge>
 									<RelTime at={live.updatedAt} /> 更新
@@ -131,14 +131,14 @@ export function MasterPage() {
 							</div>
 						) : proposalPct !== null ? (
 							<div className="flex items-baseline gap-3">
-								<span className="font-mono text-3xl text-foreground">{fmtPressurePct(proposal?.payload?.pressure)}</span>
+								<span className="font-mono text-ui-3xl text-accent-text">{fmtPressurePct(proposal?.payload?.pressure)}</span>
 								<span className="text-ui-sm text-foreground-subtle">
 									<RelTime at={proposal?.payload?.proposedAt as string | undefined} /> 提案时点值（非实时；暂无实时心跳）
 								</span>
 							</div>
 						) : (
 							<div className="flex items-center gap-2">
-								<span className="text-3xl text-foreground-subtle">暂无数据</span>
+								<span className="font-display text-ui-3xl text-foreground-subtle">暂无数据</span>
 								<span className="text-ui-sm text-foreground-subtle">无实时心跳，也没有交接提案</span>
 							</div>
 						)}

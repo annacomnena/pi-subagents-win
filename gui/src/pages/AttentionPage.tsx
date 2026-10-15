@@ -11,10 +11,13 @@ import { pendingDecisionBadge } from "../interactionBadge";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
 import type { AttentionItem, AttentionSeverity, InteractionResponse } from "../api/types";
 
-const SEV_BAND: Record<AttentionSeverity, string> = {
-	critical: "border-l-destructive",
-	warning: "border-l-warning",
-	info: "border-l-foreground-subtle",
+/** §7 A-9：不再用 border-l-4 色带 + bg-card/60（§6 第 4 条不及格对），
+ * 改成 8px 圆角行 + tone wash（底 12% chip 公式已在 .tone-chip 里；这里要底与环分开，
+ * 故用 tone-chip 的 bg 部分 + 保留 border 常规档）。 */
+const SEV_CHIP: Record<AttentionSeverity, string> = {
+	critical: "[--chip-tone:var(--color-destructive)]",
+	warning: "[--chip-tone:var(--color-warning)]",
+	info: "[--chip-tone:var(--color-foreground-subtle)]",
 };
 
 const SEV_ZH: Record<AttentionSeverity, string> = {
@@ -45,11 +48,14 @@ function AttentionCard({ item, response }: { item: AttentionItem; response?: Int
 	// 无 response 的待决策项 v1 不自造按钮，防范围蔓延——plan §3 拍板）
 	const canAccept = response?.command === "master.handoff.accept";
 	return (
-		<li className={`rounded border border-border border-l-4 bg-card/60 px-3 py-2 ${SEV_BAND[item.severity]}`} title={`级别：${SEV_ZH[item.severity]}`}>
+		<li
+			className={`tone-chip rounded-lg border px-3 py-2 ${SEV_CHIP[item.severity]}`}
+			title={`级别：${SEV_ZH[item.severity]}`}
+		>
 			<div className="flex flex-wrap items-center gap-2">
 				{typeBadge(item)}
 				<Badge tone={item.status === "open" ? "gray" : "green"}>{item.status === "open" ? "待处理" : "已处理"}</Badge>
-				<span className="text-xs font-medium text-foreground">{item.title}</span>
+				<span className="text-ui-sm font-medium text-foreground">{item.title}</span>
 				<RelTime at={item.createdAt} className="ml-auto text-ui-xs text-foreground-subtle" />
 			</div>
 			<p className="mt-1 text-ui-sm break-all text-foreground-subtle">{item.summary}</p>
@@ -87,7 +93,7 @@ export function AttentionPage() {
 		<div className="space-y-3">
 			<PageIntro>系统觉得需要你留意的事</PageIntro>
 			<div className="flex items-center gap-3">
-				<span className="text-xs text-foreground-subtle">已处理条目</span>
+				<span className="text-ui-sm text-foreground-subtle">已处理条目</span>
 				<Toggle on={includeResolved} onChange={setIncludeResolved} labels={["隐藏", "显示"]} />
 				<span className="ml-auto text-ui-xs text-foreground-subtle">/v1/attention{includeResolved ? "?includeResolved=1" : ""} · 2s</span>
 			</div>

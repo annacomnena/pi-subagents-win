@@ -43,7 +43,7 @@ export function RuntimePage() {
 			<div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
 				<Card title={<Term zh="服务" en="Host" />}>
 					{health ? (
-						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 							<dt className="text-foreground-subtle">实例 ID</dt>
 							<dd><ShortId value={health.host.instanceId} /></dd>
 							<dt className="text-foreground-subtle">监听地址</dt>
@@ -64,9 +64,11 @@ export function RuntimePage() {
 
 				<Card title={<Term zh="数量一览" en="counts" />}>
 					<div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-						{countsRows.map(([zh, en, v]) => (
-							<div key={en} className="rounded border border-border bg-surface px-2 py-1.5">
-								<p className="text-lg text-foreground">{v === undefined ? <span className="text-sm text-foreground-subtle">暂无</span> : v}</p>
+						{[...countsRows].map(([zh, en, v]) => (
+							<div key={en} className="rounded-lg border border-border bg-card px-2 py-1.5">
+								<p className="font-mono text-ui-xl text-foreground">
+									{v === undefined ? <span className="font-sans text-ui-sm text-foreground-subtle">暂无</span> : v}
+								</p>
 								<p className="text-ui-xs text-foreground-subtle">
 									{zh} <span className="font-mono text-foreground-subtle">{en}</span>
 								</p>
@@ -76,7 +78,7 @@ export function RuntimePage() {
 				</Card>
 
 				<Card title={<Term zh="事件日志（本次重建）" en="journal" />}>
-					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 						{journalRows.map(([zh, en, v]) => (
 							<RuntimeRow key={en} label={<>{zh} <span className="font-mono text-foreground-subtle">{en}</span></>} value={v === undefined ? "暂无" : String(v)} />
 						))}
