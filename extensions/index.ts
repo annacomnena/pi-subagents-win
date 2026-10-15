@@ -1184,23 +1184,33 @@ async function runSingle(
 		// 与上面 stall 计时**并存**，谁先到谁生效（不改变 stall 语义）。
 		let wallTimer: ReturnType<typeof setTimeout> | null = null;
 		let wallBudgetExceeded = false;
-		// 预算来源（供 status/面板显示）
-		const __wallParsed = parseWallBudget(opts?.maxWallMs);
-		if (__wallParsed.enabled && __wallParsed.ms !== undefined && opts?.maxWallMs !== undefined) {
+		// 预算来源（供 status/面板显示）：**显式参数优先于 env**（裁决第 2 条）
+		const __wall = resolveWallBudget(opts?.maxWallMs);
+		const __wallParsed = { enabled: __wall.ms !== undefined, ms: __wall.ms, reject: __wall.reject };
+		if (__wall.ms !== undefined) {
 			wallTimer = setTimeout(() => {
 				wallBudgetExceeded = true;
 				result.status = "failed";
 				result.error = "wall-budget-exceeded";
 				emitUpdate(
 					"⏱ wall-budget",
-					`budget ${Math.round((__wallParsed.ms as number) / 1000)}s exhausted (source=${opts?.maxWallSource ?? "param"}); killing ${resolvedModel ?? "default"}`,
+					`budget ${Math.round(__wall.ms / 1000)}s exhausted (source=${__wall.source ?? "param"}); killing ${resolvedModel ?? "default"}`,
 				);
 				kill();
-			}, __wallParsed.ms);
-		} else if (__wallParsed.reject !== undefined && opts?.maxWallMs !== undefined) {
+			}, __wall.ms);
+		} else if (__wall.reject !== undefined) {
 			// 非法值：忽略 + 告警（不崩、不静默采用）
-			console.warn(`[subagent-win] maxWallMs 非法（${String(opts?.maxWallMs)}）：${__wallParsed.reject} ⇒ 忽略（不启用墙钟预算）`);
-			onUpdate?.("⚠ maxWallMs 非法", `${__wallParsed.reject} ⇒ 忽略`);
+			console.warn(`[subagent-win] maxWallMs 非法（${String(opts?.maxWallMs)}）：${__wall.reject} ⇒ 忽略（不启用墙钟预算）`);
+			onUpdate?.("⚠ maxWallMs 非法", `${__wall.reject} ⇒ 忽略`);
+		}
+		if (__wall.envReject !== undefined) {
+			// env 非法：忽略 + 告警（显式提示环境变量来源，便于定位）
+			console.warn(`[subagent-win] PI_SUBAGENT_MAX_WALL_MS 非法（${String(process.env.PI_SUBAGENT_MAX_WALL_MS)}）：${__wall.envReject} ⇒ 忽略`);
+		}
+		// 把解析结果回写到 opts（供面板/run json 投影与状态显示来源）
+		if (opts !== undefined && __wall.ms !== undefined) {
+			opts.maxWallMs = __wall.ms;
+			opts.maxWallSource = __wall.source;
 		}
 		const clearWallTimer = () => { if (wallTimer) { clearTimeout(wallTimer); wallTimer = null; } };
 		const resetStall = () => {
@@ -1359,6 +1369,32 @@ async function runSingle(
 			resolve_(result);
 		});
 	});
+}
+
+/**
+ * 解析墙钟总预算：**显式参数优先于 env**（裁决第 2 条），并在 env 生效时标注来源。
+ *
+ * - 参数合法 ⇒ `{ms, source:"param"}`（**优先**，即使 env 也有值）；
+ * - 参数未传 / 非法 ⇒ 降级看 env `PI_SUBAGENT_MAX_WALL_MS`（合法则 `source:"env"`）；
+ * - 非法值⇒ 忽略（不启用）并交给调用方告警（本函数只回原因，不改行为）。
+ *
+ * 返回值 `ms === undefined` ⇒ 不启用（既有行为逐字节不变）。
+ */
+function resolveWallBudget(
+	specified: unknown,
+): { ms?: number; source?: "param" | "env"; reject?: string; envReject?: string } {
+	const p = parseWallBudget(specified);
+	if (p.enabled && p.ms !== undefined) return { ms: p.ms, source: "param" };
+	const paramReject = p.reject !== undefined && specified !== undefined && specified !== null ? p.reject : undefined;
+	// 参数未传或非法 ⇒ 看 env
+	const rawEnv = process.env.PI_SUBAGENT_MAX_WALL_MS;
+	if (rawEnv !== undefined && rawEnv !== "") {
+		const n = Number(rawEnv);
+		const e = parseWallBudget(Number.isFinite(n) && rawEnv.trim() !== "" ? n : rawEnv);
+		if (e.enabled && e.ms !== undefined) return { ms: e.ms, source: "env", reject: paramReject };
+		return { reject: paramReject, envReject: e.reject ?? "not-a-number" };
+	}
+	return { reject: paramReject };
 }
 
 function emptyUsageSummary(): UsageSummary {
@@ -3346,6 +3382,7 @@ export default function (pi: ExtensionAPI) {
 				})),
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
+				maxWallMs: Type.Optional(Type.Number({ description: "**墙钟总预算**（ms，opt-in，缺省不启用）：自 spawn 起算、与是否有输出无关，到点即终止并落 failed(wall_budget)。与 timeoutMs 并存、谁先到谁生效。注意：未启用时，持续输出的活进程等待**仍是无界的**。" })),
 				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
 				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 			}))),
@@ -3363,6 +3400,7 @@ export default function (pi: ExtensionAPI) {
 			})),
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
+			maxWallMs: Type.Optional(Type.Number({ description: "**墙钟总预算**（ms，opt-in，缺省不启用）：自 spawn 起算、与是否有输出无关，到点即终止并落 failed(wall_budget)。与 timeoutMs 并存、谁先到谁生效。注意：未启用时，持续输出的活进程等待**仍是无界的**。" })),
 			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
 			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 		}),
