@@ -270,6 +270,12 @@ interface AgentConfig {
 	liteMode?: LiteMode;
 	/** S3 自动交接（A1）：默认 auto:false；归一化见 master-auto.ts */
 	masterSuccession?: MasterSuccessionConfig;
+	/** costTier 角色区间覆盖（消费端用 normalizeRoleTier 归一化；readConfig 保持裸透传） */
+	roleTier?: Record<string, { min: CostTier; max: CostTier }>;
+	/** costTier 门 enforce 灰度开关：false（默认，warn-only 只告警不拦）| true（硬拦）；readConfig 裸透传，消费端只认 `=== true` */
+	costTier?: { enforce?: boolean };
+	/** 循环观测自动处置（默认关闭；归一化见 recent-calls.ts normalizeLoopGuard） */
+	loopGuard?: LoopGuardConfig;
 }
 
 function configPath(): string {
@@ -982,9 +988,22 @@ async function runSingle(
 		tools,
 		excludeTools,
 	});
+	// force-reasoning-replay 挂载：子 agent 是独立 pi 子进程，不加载项目级扩展；
+	// 仅当 PI_FORCE_REASONING_REPLAY 为真值时追加 `-e <扩展绝对路径>`（DeepSeek 类
+	// provider 缺 reasoning 回传会 400）。开关未设 ⇒ argv 与历史行为逐字一致；
+	// 路径不存在 ⇒ 不追加 + 可见警告（fail-open 但不得静默）。env 经 spawn 透传给子进程。
+	const replayMount = resolveForceReplayMount();
+	if (replayMount.extensionArg) {
+		argv.push("-e", replayMount.extensionArg);
+	} else if (replayMount.warning) {
+		console.warn(replayMount.warning);
+		onUpdate?.("⚠ force-replay 未挂载", replayMount.warning);
+	}
 
 	const startTime = Date.now();
 	let toolCallsCount = 0;
+	/** 循环观测（2026-10-14）：本次运行最近 K 次工具调用的内存环形缓冲（完成时快照到 result.recentCalls）。 */
+	const ring: RecentCallEntry[] = [];
 	const recentEvents: string[] = [];
 	let latestSnippet = "";
 	let currentToolName: string | undefined;
@@ -1470,6 +1489,15 @@ export interface RunDispatchOptions extends RunnerToolsOptions {
 	cwd?: string;
 	/** 子进程 spawn 成功回调：登记 pid + 命令行 marker，供 action=kill 的归属/身份校验。 */
 	onChildSpawn?: (info: ChildSpawnInfo) => void;
+	/**
+	 * 运行中循环观测回调（2026-10-14）：每次 tool 事件后回传有界最近 K 条明细 +
+	 * 当前 turn 计数；由派发侧负责节流与落盘。sync 路径无需接（无 run json）。
+	 */
+	onRecentCalls?: (calls: RecentCallEntry[], turn?: number) => void;
+	/** 主会话显式允许升层（越过角色 costTier 区间上界）；非主会话已在 handler 身份门拒收。 */
+	allowTierEscalation?: boolean;
+	/** 本次调用是否来自主会话（isMainSession()）：unknown/selfpaid 显式覆盖的放行条件之一。 */
+	mainCall?: boolean;
 }
 
 interface TaskInput {
@@ -3191,9 +3219,12 @@ export default function (pi: ExtensionAPI) {
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3；仅 async:false 同步路径有效，异步 fan-out 忽略）" })),
 			async: Type.Optional(Type.Boolean({ description: "异步执行（单发与并行 tasks 均适用）；**缺省 true（非阻塞，返回 runId 后靠完成事件/status 收割）**，只有本轮就要结果时才显式传 false 走同步等待" })),
-			action: Type.Optional(Type.String({ description: "status | list | kill（kill/cancel：按 runId 终止整棵进程树；list：列出 async runs 含 pid/lastActivity）" })),
-			runId: Type.Optional(Type.String({ description: "异步 run id（action=status/kill 用；kill 缺省取本会话唯一的 running run）" })),
+			action: Type.Optional(Type.String({ description: "status | list | kill | recent-calls（kill/cancel：按 runId 终止整棵进程树；list：列出 async runs 含 pid/lastActivity；recent-calls：只读观测最近工具调用与循环判定）" })),
+			runId: Type.Optional(Type.String({ description: "异步 run id（action=status/kill/recent-calls 用；kill 缺省取本会话唯一的 running run）" })),
 			reason: Type.Optional(Type.String({ description: "action=kill 的终止原因（写入 run json 的 killReason，便于审计）" })),
+			tabRunId: Type.Optional(Type.String({ description: "action=recent-calls 的 task tab run id（tab_…；优先于 runId；只读读会话 JSONL 尾部）" })),
+			n: Type.Optional(Type.Number({ description: "action=recent-calls 返回最近几次调用；缺省 3，夹紧到 [1,5]" })),
+			allowTierEscalation: Type.Optional(Type.Boolean({ description: "仅主会话/用户点名可传：允许本次派发越过角色 costTier 区间上界（升层 escalated）。子 agent / task tab 传入一律拒绝。" })),
 			systemPrompt: Type.Optional(Type.String()),
 			model: Type.Optional(Type.String({
 				description: "覆盖本次调用模型（优先于 config.json / agent frontmatter）。provider/id 或短名，如 Zhipu/glm-5.2、glm-5.2；外部 CLI 仅后端：cli:claude / cli:codex / cli:agy / cli:atomcode / cli:zcode（使用 CLI 默认模型）",
@@ -3728,11 +3759,19 @@ export default function (pi: ExtensionAPI) {
 					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined };
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
 					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
+					// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
+					const persistRecentCalls = createThrottledRunMerger(runId, RUNS_DIR);
 					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, () => touchRunActivity(runId), {
 						cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools,
+						allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(),
 						onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
+						onRecentCalls: (calls, turn) => {
+							const lastToolTurn = calls.reduce((m, e) => Math.max(m, e.turn), 0);
+							persistRecentCalls({ recentCalls: calls, lastToolTurn, turnClock: typeof turn === "number" && turn >= lastToolTurn ? turn : lastToolTurn });
+						},
 					}).then((result) => {
 						record.status = result.status; record.result = result;
+						record.recentCalls = result.recentCalls;
 						applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 						recordUsage(agentDef?.name, result);
 						clearRunProcess(runId);
@@ -3811,11 +3850,19 @@ export default function (pi: ExtensionAPI) {
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
+				// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
+				const persistRecentCalls = createThrottledRunMerger(runId, RUNS_DIR);
 				runWithFallback(agentDef, p.task ?? "", p.systemPrompt, p.model, p.timeoutMs, undefined, () => touchRunActivity(runId), {
 					cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools,
+					allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(),
 					onChildSpawn: (info) => registerRunProcess(RUNS_DIR, runId, info),
+					onRecentCalls: (calls, turn) => {
+						const lastToolTurn = calls.reduce((m, e) => Math.max(m, e.turn), 0);
+						persistRecentCalls({ recentCalls: calls, lastToolTurn, turnClock: typeof turn === "number" && turn >= lastToolTurn ? turn : lastToolTurn });
+					},
 				}).then((result) => {
 					record.status = result.status; record.result = result;
+					record.recentCalls = result.recentCalls;
 					applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 					recordUsage(agentDef?.name, result);
 					clearRunProcess(runId);
