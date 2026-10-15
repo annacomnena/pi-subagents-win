@@ -3,12 +3,13 @@
  * 约定路径 host 未暴露 → v0 硬编码 ~/.pi/agent/runtime 默认位置展示。
  */
 
-import { Server } from "lucide-react";
+import { Activity, Server } from "lucide-react";
 import { useGui } from "../store";
-import { Badge, Card, EmptyState, PageIntro, RelTime, ShortId, Term, naBadge } from "../ui";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term, naBadge } from "../ui";
 
 export function RuntimePage() {
 	const health = useGui((s) => s.health);
+	const pollHealth = useGui((s) => s.pollHealth); // P1 空态出口：刷新复用 store 面
 	const runtime = useGui((s) => s.snapshot?.runtime ?? null);
 
 	if (!health && !runtime) {
@@ -16,7 +17,12 @@ export function RuntimePage() {
 			<div className="space-y-3">
 				<PageIntro>后端全景：服务、信箱、任务、定时器</PageIntro>
 				<Card title={<Term zh="运行时" en="Runtime" />}>
-					<EmptyState icon={<Server className="size-5" />}>正在等待后端数据…（服务未就绪或连接中断）</EmptyState>
+					<EmptyState
+						icon={<Server className="size-5" />}
+						action={<Button variant="secondary" onClick={() => void pollHealth()}>重试</Button>}
+					>
+						正在等待后端数据…（服务未就绪或连接中断）
+					</EmptyState>
 				</Card>
 			</div>
 		);
@@ -89,7 +95,12 @@ export function RuntimePage() {
 
 				<Card title={<Term zh={`会话心跳（${health?.sessionHeartbeats.length ?? 0}）`} en="session heartbeats" />}>
 					{!health || health.sessionHeartbeats.length === 0 ? (
-						<EmptyState>暂无会话心跳（还没有会话活动，或数据未就绪）</EmptyState>
+						<EmptyState
+							icon={<Activity className="size-5" />}
+							action={<Button variant="secondary" onClick={() => void pollHealth()}>刷新</Button>}
+						>
+							暂无会话心跳（还没有会话活动，或数据未就绪）
+						</EmptyState>
 					) : (
 						<ul className="space-y-1 text-ui-sm">
 							{health.sessionHeartbeats.map((h) => (

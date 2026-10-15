@@ -10,6 +10,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { AlertTriangle, Inbox, KeyRound, Loader, MessageCircle } from "lucide-react";
 import { api, type FetchErr } from "../api/client";
 import type { WechatBindStatusBody, WechatQrImageBody, WechatReplyStatusBody } from "../api/types";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
@@ -217,7 +218,12 @@ function ReceiveBlock() {
 	if (failed && worker === null) {
 		return (
 			<Card title={<Term zh="收到的消息" en="inbox" hint="W1 接收；W2 注入需 channels.wechat.input.enabled" />}>
-				<EmptyState>暂无法加载收到的消息（daemon 可能未在线）。</EmptyState>
+				<EmptyState
+					icon={<AlertTriangle className="size-5" />}
+					action={<Button variant="secondary" onClick={() => void refresh()}>重试</Button>}
+				>
+					暂无法加载收到的消息（daemon 可能未在线）。
+				</EmptyState>
 			</Card>
 		);
 	}
@@ -248,7 +254,12 @@ function ReceiveBlock() {
 					</dl>
 				)}
 				{inbox !== null && inbox.messages.length === 0 && (
-					<EmptyState>暂无消息{worker !== null && worker.enabled ? "（长轮询静默期或无私聊文本）" : "（接收未启用）"}。</EmptyState>
+					<EmptyState
+						icon={<Inbox className="size-5" />}
+						action={<Button variant="secondary" onClick={() => void refresh()}>刷新</Button>}
+					>
+						暂无消息{worker !== null && worker.enabled ? "（长轮询静默期或无私聊文本）" : "（接收未启用）"}。
+					</EmptyState>
 				)}
 				{inbox !== null && inbox.messages.length > 0 && (
 					<ul className="space-y-1.5">
@@ -502,15 +513,18 @@ export function ChannelsPage() {
 					}
 				>
 					<div className="space-y-3">
-						<EmptyState>
+						{/* P1：出口并入空态自身（不再在外层重复同一按钮） */}
+						<EmptyState
+							icon={<MessageCircle className="size-5" />}
+							action={
+								<Button variant="primary" onClick={() => void doEnable()} disabled={busy !== null}>
+									{busy === "enable" ? "启用中…" : "启用微信连接"}
+								</Button>
+							}
+						>
 							微信连接功能尚未启用（channels.wechat.enabled = off）。点击下方按钮启用后，即可在本页生成绑定二维码。
 						</EmptyState>
 						<p className="text-ui-sm text-foreground-subtle">启用后需在本机 TUI 侧完成扫码。</p>
-						<div className="flex gap-2">
-							<Button variant="primary" onClick={() => void doEnable()} disabled={busy !== null}>
-								{busy === "enable" ? "启用中…" : "启用微信连接"}
-							</Button>
-						</div>
 						{actionError !== null && <p className="text-ui-sm text-destructive">{actionError}</p>}
 					</div>
 				</Card>
@@ -527,12 +541,17 @@ export function ChannelsPage() {
 				<PageIntro>微信连接</PageIntro>
 				<Card title={<Term zh="未获得本机凭据" en="401 unauthorized" />}>
 					<div className="space-y-3">
-						<EmptyState>未获得本机凭据：请先在本机 TUI 执行 /gui open 后再刷新。</EmptyState>
-						<div className="flex gap-2">
-							<Button variant="secondary" onClick={() => void refreshStatus()} disabled={busy !== null}>
-								刷新
-							</Button>
-						</div>
+						{/* P1：出口并入空态自身 */}
+						<EmptyState
+							icon={<KeyRound className="size-5" />}
+							action={
+								<Button variant="secondary" onClick={() => void refreshStatus()} disabled={busy !== null}>
+									刷新
+								</Button>
+							}
+						>
+							未获得本机凭据：请先在本机 TUI 执行 /gui open 后再刷新。
+						</EmptyState>
 					</div>
 				</Card>
 			</div>
@@ -551,7 +570,14 @@ export function ChannelsPage() {
 				title={<Term zh="绑定状态" en="status" hint="状态由 daemon 的 /v1/wechat/bind/status 提供；token 永不进浏览器" />}
 				right={<Badge tone={STATE_TONE[uiState]}>{STATE_LABEL[uiState]}</Badge>}
 			>
-				{uiState === "loading" && <EmptyState>正在加载绑定状态…（daemon 未就绪时此页不可用）</EmptyState>}
+				{uiState === "loading" && (
+					<EmptyState
+						icon={<Loader className="size-5 animate-spin" />}
+						action={<Button variant="secondary" onClick={() => void refreshStatus()} disabled={busy !== null}>刷新</Button>}
+					>
+						正在加载绑定状态…（daemon 未就绪时此页不可用）
+					</EmptyState>
+				)}
 
 				{uiState === "idle" && (
 					<div className="space-y-3">

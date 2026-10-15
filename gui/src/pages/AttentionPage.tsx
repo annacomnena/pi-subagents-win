@@ -106,7 +106,16 @@ export function AttentionPage() {
 				}
 			>
 				{attention.length === 0 ? (
-					<EmptyState icon={<Inbox className="size-5" />}>{includeResolved ? "暂无条目（历史也是空的）" : "暂无待关注"}</EmptyState>
+					<EmptyState
+						icon={<Inbox className="size-5" />}
+						action={
+							<Button variant="secondary" onClick={() => void pollAttention()} disabled={busy}>
+								{busy ? "刷新中…" : "刷新"}
+							</Button>
+						}
+					>
+						{includeResolved ? "暂无条目（历史也是空的）" : "暂无待关注"}
+					</EmptyState>
 				) : (
 					<ul className="space-y-2">
 						{attention.map((a) => (

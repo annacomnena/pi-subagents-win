@@ -5,7 +5,7 @@
  * （两步确认，确定性提案路径）。既有按钮并存不冲突：接受提案的可用性由投影 response 语义驱动。
  */
 
-import { useRef, useState } from "react";
+import { useRef, useState, useCallback } from "react";
 import { Crown } from "lucide-react";
 import { acceptHandoff, prepareHandoff, setAutoHandoff, useGui } from "../store";
 import { PROPOSAL_STATUS_ZH, fmtPressurePct, pressurePct, zhStatus } from "../format";
@@ -32,6 +32,13 @@ function statusTone(status: string | undefined): "yellow" | "blue" | "red" | "gr
 export function MasterPage() {
 	const health = useGui((s) => s.health);
 	const snapshot = useGui((s) => s.snapshot);
+	// P1 空态出口：本页无本地 fetch，刷新复用 store 的 poll 面
+	const pollHealth = useGui((s) => s.pollHealth);
+	const pollSnapshot = useGui((s) => s.pollSnapshot);
+	const pollInteractions = useGui((s) => s.pollInteractions);
+	const refreshMaster = useCallback(async () => {
+		await Promise.all([pollHealth(), pollSnapshot(), pollInteractions()]);
+	}, [pollHealth, pollSnapshot, pollInteractions]);
 	const interactions = useGui((s) => s.interactions);
 	const timeline = useGui((s) => s.timeline);
 	const autoHandoff = useGui((s) => s.autoHandoff);
@@ -79,7 +86,12 @@ export function MasterPage() {
 				{/* 主控状态 */}
 				<Card title={<Term zh="主控状态" en="Master" />}>
 					{!att ? (
-						<EmptyState icon={<Crown className="size-5" />}>还没有会话接管主控——接管后这里会显示值守信息</EmptyState>
+						<EmptyState
+							icon={<Crown className="size-5" />}
+							action={<Button variant="secondary" onClick={() => void refreshMaster()}>刷新</Button>}
+						>
+							还没有会话接管主控——接管后这里会显示值守信息
+						</EmptyState>
 					) : (
 						<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
 							<dt className="text-foreground-subtle"><Term zh="主控身份" en="logical id" /></dt>
@@ -147,7 +159,12 @@ export function MasterPage() {
 					{/* 交接提案 + Prepare/Transfer（disabled + tooltip） */}
 					<Card title={<Term zh="交接提案" en="handoff proposal" />}>
 						{!proposal ? (
-							<EmptyState icon={<Crown className="size-5" />}>还没有交接提案</EmptyState>
+							<EmptyState
+								icon={<Crown className="size-5" />}
+								action={<Button variant="secondary" onClick={() => void refreshMaster()}>刷新</Button>}
+							>
+								还没有交接提案（上下文压力接近阈值时系统会自动提议）
+							</EmptyState>
 						) : (
 							<div className="space-y-1.5 text-ui-sm">
 								<div className="flex items-center gap-2">
@@ -235,7 +252,12 @@ export function MasterPage() {
 				{/* 最近交接时间线（滤 master.handoff.*，跨两列占满） */}
 				<Card title={<Term zh="交接时间线" en="master.handoff.*" />} className="xl:col-span-2">
 					{masterTimeline.length === 0 ? (
-						<EmptyState icon={<Crown className="size-5" />}>还没有发生过交接事件</EmptyState>
+						<EmptyState
+							icon={<Crown className="size-5" />}
+							action={<Button variant="secondary" onClick={() => void refreshMaster()}>刷新</Button>}
+						>
+							还没有发生过交接事件
+						</EmptyState>
 					) : (
 						<ul className="space-y-1 text-ui-sm">
 							{masterTimeline.map((t) => (

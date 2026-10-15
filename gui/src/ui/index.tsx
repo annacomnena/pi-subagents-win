@@ -139,13 +139,17 @@ export function Toggle({ on, disabled, onChange, labels }: {
 }
 
 // ── 5. EmptyState（2026-09-30：默认色 subtlest→subtle；新增可选 icon）────────
+// 2026-10-15（P1）：新增可选 `icon` + `action`（一个明确出口），满足「空态有图标 + 说明 + 出口」。
+// 不再新增间距尺度（沿用 gap-2 / py-6）。
 
-export function EmptyState({ children, icon }: { children: ReactNode; icon?: ReactNode }) {
+export function EmptyState({ children, icon, action }: { children: ReactNode; icon?: ReactNode; action?: ReactNode }) {
 	return (
 		<div className="flex flex-col items-center gap-2 py-6 text-center text-ui-sm text-foreground-subtle">
 			{/* §7 B-9④：icon 色 subtlest→subtle（图标是信息，不是纯装饰） */}
 			{icon !== undefined && <span className="text-foreground-subtle">{icon}</span>}
 			{children}
+			{/* 出口：一个明确动作（按用户要求：空态必须给出口；无合适动作时不传，见各页裁决记录） */}
+			{action !== undefined && <div className="mt-1">{action}</div>}
 		</div>
 	);
 }

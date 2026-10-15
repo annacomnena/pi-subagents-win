@@ -5,7 +5,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, History } from "lucide-react";
 import { useGui } from "../store";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
 import type { TimelineItem } from "../api/types";
@@ -28,6 +28,7 @@ function kindBadge(t: TimelineItem) {
 
 export function TimelinePage() {
 	const timeline = useGui((s) => s.timeline);
+	const pollEvents = useGui((s) => s.pollEvents); // P1 空态出口
 	const timelineEnd = useGui((s) => s.timelineEnd);
 	const loadEarlier = useGui((s) => s.loadEarlierTimeline);
 	const setActiveTab = useGui((s) => s.setActiveTab);
@@ -53,6 +54,9 @@ export function TimelinePage() {
 	};
 
 	return (
+		// ⚠️ P1-② 约束：本页走 App.tsx 的 <main>（**无 padding**），故自带 p-4。
+		// 若将来把本页挪进 RuntimeOverlay（其右栅已有 p-4），**必须删掉这里的 p-4**，否则双重 padding。
+		// 页面级纵向节奏统一 space-y-3（与其余页面一致）。
 		<div className="space-y-3 p-4">
 			<div className="flex items-center justify-between">
 				<PageIntro>按时间看系统里发生过什么</PageIntro>
@@ -93,7 +97,12 @@ export function TimelinePage() {
 
 			<Card title={<Term zh={`时间线（${items.length}）`} en="Timeline" />}>
 				{items.length === 0 ? (
-					<EmptyState>还没有发生过事件（后端日志为空或数据未就绪）</EmptyState>
+					<EmptyState
+						icon={<History className="size-5" />}
+						action={<Button variant="secondary" onClick={() => void pollEvents()}>刷新</Button>}
+					>
+						还没有发生过事件（后端日志为空或数据未就绪）
+					</EmptyState>
 				) : (
 					<ul className="divide-y divide-border">
 						{items.map((t) => (

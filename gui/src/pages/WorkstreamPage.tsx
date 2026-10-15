@@ -4,7 +4,7 @@
  */
 
 import { useState } from "react";
-import { Layers } from "lucide-react";
+import { Layers, ListChecks, MousePointerClick, PlayCircle } from "lucide-react";
 import { pauseResumeWorkstream, useGui } from "../store";
 import { RUN_STATUS_ZH, TASK_STATUS_ZH, WS_STATUS_ZH, zhStatus } from "../format";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
@@ -40,6 +40,7 @@ function Unset() {
 
 export function WorkstreamPage() {
 	const workstreams = useGui((s) => s.snapshot?.workstreams ?? []);
+	const pollSnapshot = useGui((s) => s.pollSnapshot); // P1 空态出口
 	const tasks = useGui((s) => s.snapshot?.tasks ?? []);
 	const runs = useGui((s) => s.snapshot?.runs ?? []);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -62,7 +63,12 @@ export function WorkstreamPage() {
 			<div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(220px,1fr)_3fr]">
 				<Card title={<Term zh={`工作流（${workstreams.length}）`} en="Workstream" />}>
 					{workstreams.length === 0 ? (
-						<EmptyState icon={<Layers className="size-5" />}>暂无工作流</EmptyState>
+						<EmptyState
+							icon={<Layers className="size-5" />}
+							action={<Button variant="secondary" onClick={() => void pollSnapshot()}>刷新</Button>}
+						>
+							暂无工作流
+						</EmptyState>
 					) : (
 						<ul className="space-y-1">
 							{workstreams.map((w) => (
@@ -95,7 +101,13 @@ export function WorkstreamPage() {
 
 				{!selected ? (
 					<Card title="详情">
-						<EmptyState>从左侧选一个工作流查看详情</EmptyState>
+						{/* 出口 = 左列表本身（同视口可见）；另给「刷新」便于盘面刚变时重取 */}
+						<EmptyState
+							icon={<MousePointerClick className="size-5" />}
+							action={<Button variant="secondary" onClick={() => void pollSnapshot()}>刷新</Button>}
+						>
+							从左侧选一个工作流查看详情
+						</EmptyState>
 					</Card>
 				) : (
 					<div className="flex flex-col gap-3">
@@ -178,7 +190,12 @@ export function WorkstreamPage() {
 						<div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
 							<Card title={<Term zh={`任务（${wsTasks.length}）`} en="Tasks" />}>
 								{wsTasks.length === 0 ? (
-									<EmptyState>暂无关联任务</EmptyState>
+									<EmptyState
+										icon={<ListChecks className="size-5" />}
+										action={<Button variant="secondary" onClick={() => void pollSnapshot()}>刷新</Button>}
+									>
+										暂无关联任务
+									</EmptyState>
 								) : (
 									<ul className="space-y-1 text-ui-sm">
 										{wsTasks.map((t) => (
@@ -197,7 +214,12 @@ export function WorkstreamPage() {
 							</Card>
 							<Card title={<Term zh={`运行（${wsRuns.length}）`} en="Runs" />}>
 								{wsRuns.length === 0 ? (
-									<EmptyState>暂无关联运行（按任务选择器匹配出的记录为空）</EmptyState>
+									<EmptyState
+										icon={<PlayCircle className="size-5" />}
+										action={<Button variant="secondary" onClick={() => void pollSnapshot()}>刷新</Button>}
+									>
+										暂无关联运行（按任务选择器匹配出的记录为空）
+									</EmptyState>
 								) : (
 									<ul className="space-y-1 text-ui-sm">
 										{wsRuns.map((r) => (

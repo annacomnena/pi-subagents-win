@@ -16,7 +16,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Activity } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Inbox } from "lucide-react";
 import { api } from "../api/client";
 import type {
 	AutonomyGateStatus,
@@ -25,7 +25,7 @@ import type {
 	FrontierTrigger,
 	ProjectFrontier,
 } from "../api/types";
-import { Badge, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
+import { Badge, Button, Card, EmptyState, PageIntro, RelTime, Term, Toggle } from "../ui";
 
 // ── 迁出组件：AutonomySettings（开关 + 摘要状态；行为/API 逐字不变）────────────────
 
@@ -130,12 +130,25 @@ function FrontierViz() {
 	const title = <Term zh="自主性前沿" en="frontier" hint="autonomy 套件的触发投影：系统据此判断要不要放行唤醒。只读读盘，不重计算。" />;
 
 	if (snap === undefined) {
-		return <Card title={title}><EmptyState>{error || "正在加载 frontier 快照…"}</EmptyState></Card>;
+		// 加载态不配出口（不是空态）；读取失败时给「重试」
+		return (
+			<Card title={title}>
+				<EmptyState
+					icon={error ? <AlertTriangle className="size-5" /> : undefined}
+					action={error ? <Button variant="secondary" onClick={() => void refresh()}>重试</Button> : undefined}
+				>
+					{error || "正在加载 frontier 快照…"}
+				</EmptyState>
+			</Card>
+		);
 	}
 	if (snap === null) {
 		return (
 			<Card title={title}>
-				<EmptyState icon={<Activity className="size-6" />}>
+				<EmptyState
+					icon={<Activity className="size-6" />}
+					action={<Button variant="secondary" onClick={() => void refresh()}>刷新</Button>}
+				>
 					frontier 快照尚未生成（autonomy 未启用，或尚未完成首次 tick）。
 				</EmptyState>
 			</Card>
@@ -160,7 +173,12 @@ function FrontierViz() {
 			{/* A 项目状态矩阵 */}
 			<Card title={<Term zh="项目状态" en="projects" hint="每项目一行：state+variant / needsUser 高亮 / gate / 结果缺失 / 停滞 / overdue / runs 明细" />}>
 				{snap.projects.length === 0 ? (
-					<EmptyState>无进行中项目（盘面无可见 tab）。</EmptyState>
+					<EmptyState
+						icon={<Inbox className="size-5" />}
+						action={<Button variant="secondary" onClick={() => void refresh()}>刷新</Button>}
+					>
+						无进行中项目（盘面无可见 tab）。
+					</EmptyState>
 				) : (
 					<div className="space-y-2">
 						{snap.projects.map((p) => <ProjectRow key={p.project} p={p} />)}
@@ -170,8 +188,14 @@ function FrontierViz() {
 
 			{/* B 触发记录表 */}
 			<Card title={<Term zh="触发记录" en="triggers" hint="本帧触发：rule / project / evidence；approximate 降透明度 + 「近似」徽标区分" />}>
+				{/* 本帧无触发 = 正常的「没发生」；仍给「刷新」作为明确出口（用户要求：空态必给出口） */}
 				{snap.triggers.length === 0 ? (
-					<EmptyState>{snap.baseline ? "首帧基线：无触发（防冷启动风暴）。" : "本帧无触发。"}</EmptyState>
+					<EmptyState
+						icon={<CheckCircle2 className="size-5" />}
+						action={<Button variant="secondary" onClick={() => void refresh()}>刷新</Button>}
+					>
+						{snap.baseline ? "首帧基线：无触发（防冷启动风暴）。" : "本帧无触发。"}
+					</EmptyState>
 				) : (
 					<div>
 						{snap.triggers.map((t, i) => <TriggerRow key={`${t.rule}-${t.project}-${i}`} t={t} />)}
