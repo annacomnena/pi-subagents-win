@@ -28,6 +28,7 @@ import {
 	reapZombiesInDir,
 	writeRecordAtomic,
 	readRunRecord,
+	wallBudgetExceeded,
 } from "./subagent-zombie.ts";
 
 let n = 0;
@@ -325,6 +326,65 @@ try {
 		const r3 = reapZombie(root, "run_z18b", { now: () => NOW, force: true });
 		assert.equal(r3.reaped, false, "已终态 ⇒ force 也不重复落");
 		ok("Z18 force 对弱证据生效（M9 修复）+ 来源可审计 + 幂等");
+	}
+
+	// ── Z19：墙钟总预算判定（C2-d）─────────────────────────────────
+	{
+		// ① 未设 maxWallMs ⇒ 永不判（缺省不启用，逐字节保持既有行为）
+		const noBudget = { id: "x", status: "running", startedAt: longAgo } as never;
+		assert.equal(wallBudgetExceeded(noBudget, NOW).exceeded, false, "无 maxWallMs ⇒ 不判");
+		assert.equal(wallBudgetExceeded(noBudget, NOW).reason, "no-budget");
+		assert.equal(detectZombie(noBudget).reason === "wall-budget", false, "detectZombie 也不会因墙钟判死");
+
+		// ② 有 maxWallMs 但未到期 ⇒ 不判（且仍按既有分支走）
+		const notYet = { id: "x", status: "running", startedAt: iso(NOW - 10_000), pid: 1, maxWallMs: 60_000 } as never;
+		assert.equal(wallBudgetExceeded(notYet, NOW).exceeded, false, "未到点 ⇒ 不判");
+		assert.equal(wallBudgetExceeded(notYet, NOW).budgetMs, 60_000);
+		assert.equal(wallBudgetExceeded(notYet, NOW).elapsedMs, 10_000, "已用时长按 startedAt 算");
+
+		// ③ 到期 ⇒ 判（即使 pid 存活、lastActivity 很新 —— “与输出无关”的核心）
+		const over = { id: "x", status: "running", startedAt: iso(NOW - 90_000), pid: process.pid, lastActivity: justNow, maxWallMs: 60_000 } as never;
+		const d = detectZombie(over, { now: () => NOW });
+		assert.equal(d.zombie, true, "到点 ⇒ 判僵尸（即使 pid 存活且刚有活动）");
+		assert.equal(d.reason, "wall-budget");
+		assert.equal(d.weak, false, "硬证据（调用方显式上限），不是弱证据");
+		ok("Z19 墙钟预算判定：缺省不启用 / 未到点不判 / 到点即判（与输出无关）");
+	}
+
+	// ── Z20：墙钟到点 ⇒ **先 kill 后落终态** + 不用 cancelled 语义（C2-d）──
+	{
+		const stale2 = iso(NOW - 5 * 60 * 1000);
+		// 用一个已死的 pid（spawn 后立即退出）模拟「挂着的活进程」：
+		// 无论 pid 是否活，都应该先尝试 kill（不阻断），并落 failed。
+		const child = spawn(process.execPath, ["-e", "0"], { stdio: "ignore" });
+		child.unref();
+		mk("run_z20", {
+			id: "run_z20",
+			status: "running",
+			startedAt: stale2,
+			lastActivity: justNow,
+			pid: 999_999_999, // 不存在的 pid：kill 会失败，但**不得阻断落终态**
+			maxWallMs: 60_000,
+			maxWallSource: "env",
+		});
+		const r = reapZombie(root, "run_z20", { now: () => NOW });
+		assert.equal(r.reaped, true, "到点 ⇒ 落终态（kill 失败也不阻断）");
+		assert.equal(r.reason, "wall-budget");
+		const rec = readRunRecord(root, "run_z20")!;
+		assert.equal(rec.status, "failed", "顶状态 failed（**不是 cancelled**）");
+		const fail = rec.failure as { kind: string; source: string; message: string };
+		assert.equal(fail.kind, "zombie");
+		assert.equal(fail.source, "watchdog", "来源为 watchdog（自动，非 manual-force）");
+		assert.ok(/墙钟总预算到点/.test(fail.message), `消息写明原因（实得：${fail.message}）`);
+		assert.ok(/source=env/.test(fail.message), "消息注明来源（env/param）");
+		assert.ok(typeof rec.killReason === "string", "记录 kill 结果（可审计）");
+		assert.equal((rec.result as { status?: string }).status, "failed", "result 也是 failed");
+		assert.notEqual(rec.status, "cancelled", "**不得复用 cancelled 语义**（裁决第 3 条）");
+
+		// 幂等：再次扫不得重复落
+		const r2 = reapZombie(root, "run_z20", { now: () => NOW });
+		assert.equal(r2.reaped, false, "已终态 ⇒ 幂等不重复");
+		ok("Z20 墙钟到点：先 kill → failed(wall-budget) → 写明原因；非 cancelled；幂等");
 	}
 
 

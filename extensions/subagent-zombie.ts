@@ -32,7 +32,7 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_RUNS_DIR, isPidAlive, inspectLiveProcess, type KillableRunRecord } from "./subagent-kill.ts";
+import { DEFAULT_RUNS_DIR, isPidAlive, inspectLiveProcess, killProcessTree, type KillableRunRecord } from "./subagent-kill.ts";
 
 // ── 阈值（可 env 覆盖，便于测试与线上调参）──────────────────────────
 
@@ -56,6 +56,31 @@ export function zombieAutoEnabled(): boolean {
 	return process.env.PI_SUBAGENT_ZOMBIE_AUTO === "1";
 }
 
+/**
+ * 墙钟总预算是否已到点（C2-d：async 活进程的**统一收口**）。
+ *
+ * 背景（计划审查）：`runSingle` 的 `wallTimer` 只存在于**派发进程内**；若该进程已死
+ * （早退/崩溃/被关），已登记的 async run 就永远没人为它清场 ⇒ 等待方**依旧无界**。
+ * 本函数让看门狗（周期 tick + on-read）也能凭 run json 里的 `maxWallMs` 收口。
+ *
+ * 语义与 `runSingle` 完全一致：自 `startedAt`（回退 `pidRecordedAt`）起算，
+ * **与是否有输出无关**。未设 `maxWallMs` ⇒ 永不判（缺省不启用）。
+ *
+ * @returns 到点返回 `{ exceeded: true, budgetMs, elapsedMs, basisMs }`；否则 `exceeded: false`（可能带 reason）。
+ */
+export function wallBudgetExceeded(
+	rec: KillableRunRecord,
+	now: number,
+): { exceeded: boolean; budgetMs?: number; elapsedMs?: number; basisMs?: number; reason?: string } {
+	const raw = (rec as { maxWallMs?: unknown }).maxWallMs;
+	const budgetMs = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+	if (budgetMs === undefined) return { exceeded: false, reason: "no-budget" };
+	const basis = timeBasis(rec);
+	if (basis === undefined) return { exceeded: false, budgetMs, reason: "no-time-basis" };
+	const elapsedMs = now - basis;
+	return elapsedMs >= budgetMs ? { exceeded: true, budgetMs, elapsedMs, basisMs: basis } : { exceeded: false, budgetMs, elapsedMs, basisMs: basis };
+}
+
 function intEnv(name: string, dflt: number): number {
 	const raw = process.env[name];
 	if (!raw) return dflt;
@@ -72,6 +97,7 @@ export type ZombieReason =
 	| "alive"             // 未判：进程证据显示还活着
 	| "too-young"         // 未判：年龄不足
 	| "no-time-basis"     // 未判：无 startedAt 也无 pidRecordedAt（无法算年龄）
+	| "wall-budget"       // 硬证据（调用方显式上限）：墙钟总预算到点（C2-d）
 	| "already-terminal"  // 未判：已是终态
 	| "not-running";      // 未判：非 running
 
@@ -138,6 +164,12 @@ export function detectZombie(rec: KillableRunRecord, deps: ZombieDeps = {}): Zom
 	}
 
 	const basis = timeBasis(rec);
+	// ── 墙钟总预算（C2-d）：**调用方显式设的上限⇒ 优先于最小年龄**（不受 minAge 限制）──
+	// 未设 maxWallMs 则本分支不命中（缺省不启用，既有行为逐字节不变）。
+	const wb = wallBudgetExceeded(rec, now);
+	if (wb.exceeded) {
+		return { zombie: true, weak: false, reason: "wall-budget", basisMs: wb.basisMs };
+	}
 	if (basis === undefined) return { zombie: false, weak: false, reason: "no-time-basis" };
 	if (now - basis < zombieMinAgeMs()) {
 		return { zombie: false, weak: false, reason: "too-young", basisMs: basis };
@@ -369,11 +401,13 @@ function reapClaimed(
 			model: (fresh as { model?: string }).model,
 			httpStatus: null,
 			message:
-				verdict.reason === "no-pid-idle"
-					? `watchdog: pid 缺失且 ${Math.round(zombieNoPidIdleMs() / 60000)}min 无活动（弱证据）`
-					: verdict.reason === "pid-reused"
-						? "watchdog: 登记 pid 已被 OS 重用（原进程已退出）"
-						: "watchdog: 登记 pid 不存活（进程已退出）",
+				verdict.reason === "wall-budget"
+					? `watchdog: 墙钟总预算到点（${Math.round((wallBudgetExceeded(fresh, now).budgetMs ?? 0) / 1000)}s，source=${String((fresh as { maxWallSource?: string }).maxWallSource ?? "unknown")}）`
+					: verdict.reason === "no-pid-idle"
+						? `watchdog: pid 缺失且 ${Math.round(zombieNoPidIdleMs() / 60000)}min 无活动（弱证据）`
+						: verdict.reason === "pid-reused"
+							? "watchdog: 登记 pid 已被 OS 重用（原进程已退出）"
+							: "watchdog: 登记 pid 不存活（进程已退出）",
 			at,
 			// 区分来源（裁决 3 可审计）：watchdog=自动（硬证据）；manual-force=人工恢复（弱证据）
 			source: opts.force === true && verdict.weak ? "manual-force" : "watchdog",
@@ -390,6 +424,19 @@ function reapClaimed(
 			error: `[subagent-failure kind=ZOMBIE reason=${verdict.reason}] ${(next.failure as { message: string }).message}`,
 			agent: fresh.agent,
 		};
+	}
+	// ── C2-d：wall-budget 是「**到点主动收口**」，与其它僵尸判定不同 ——
+	// 前者的 pid **可能仍存活**（挂着的活进程），必须**先 kill 再落终态**（裁决第 3 条）。
+	// kill 失败（权限/已死）不阻断落终态（否则又成了「永远不清场」）。
+	if (verdict.reason === "wall-budget" && typeof fresh.pid === "number" && fresh.pid > 0) {
+		try {
+			const k = killProcessTree(fresh.pid);
+			(next as { killedAt?: string }).killedAt = at;
+			(next as { killedBy?: string }).killedBy = "wall-budget";
+			(next as { killReason?: string }).killReason = `wall_budget(ok=${k.ok},alreadyDead=${k.alreadyDead})`;
+		} catch (e) {
+			(next as { killReason?: string }).killReason = `wall_budget(kill-error: ${String((e as Error)?.message ?? e).slice(0, 80)})`;
+		}
 	}
 
 	writeRecordAtomic(runsDir, id, next);
