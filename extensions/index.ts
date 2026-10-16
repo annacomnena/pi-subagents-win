@@ -775,6 +775,23 @@ interface SubagentResult {
 	toolCallsCount?: number;
 	/** 循环观测（2026-10-14，纯加法）：最近 K 次工具调用环形明细（async 持久化到 run json）。 */
 	recentCalls?: RecentCallEntry[];
+	/**
+	 * **主动终止审计**（2026-10-16 加固：“撑死必须留凶手”）：任何本仓主动 kill 都要能答
+	 * 「谁杀的 / 什么触发 / 实测值 / 阈值」。与 `subagent-kill` 的 `killedAt`/`killReason` 同源口径；
+	 * async 路径会把本字段合并进 run json（`killAudit`）。
+	 */
+	killAudit?: KillAudit;
+}
+
+/** 主动终止审计记录（killer = 本仓内的终止路径标识；trigger = 触发源；measured/threshold = 判据实测值与阈值）。 */
+export interface KillAudit {
+	killer: "abort" | "stall" | "wall-budget" | "fatal-failure";
+	trigger: string;
+	at: string;
+	/** 判据实测值（如无输出毫秒数 / 已用时毫秒 / 失败类别）。 */
+	measured?: string | number;
+	/** 判据阈值（如 timeoutMs / maxWallMs）。 */
+	threshold?: string | number;
 }
 
 export interface SubagentProgressInfo {
@@ -1183,8 +1200,24 @@ async function runSingle(
 		// must-fix 5：不可恢复失败的幂等门（同一 run 只终止一次）
 		let fatalKilled = false;
 		let fatalKind: string | undefined;
-		const kill = () => { child.kill("SIGTERM"); forceKill = setTimeout(() => child.kill("SIGKILL"), 2000); };
-		if (signal?.aborted) kill(); else signal?.addEventListener("abort", () => { clearWallTimer(); kill(); }, { once: true });
+		// 主动终止统一入口（2026-10-16 加固：「撑死必须留凶手」）：
+		// killer/trigger/measured/threshold 全落 `result.killAudit`（async 路径再合并进 run json）。
+		const spawnedAt = Date.now();
+		const kill = (
+			killer: KillAudit["killer"] = "abort",
+			trigger = "unspecified",
+			measured?: string | number,
+			threshold?: string | number,
+		): void => {
+			result.killAudit ??= {
+				killer, trigger, at: new Date().toISOString(),
+				...(measured !== undefined ? { measured } : {}),
+				...(threshold !== undefined ? { threshold } : {}),
+			};
+			child.kill("SIGTERM"); forceKill = setTimeout(() => child.kill("SIGKILL"), 2000);
+		};
+		if (signal?.aborted) kill("abort", "signal-already-aborted", 0);
+		else signal?.addEventListener("abort", () => { clearWallTimer(); kill("abort", "host-abort-signal", Date.now() - spawnedAt); }, { once: true });
 
 		// 停顿检测（inactivity/stall timeout）：不是给整个任务限时——
 		// 只要子进程持续有输出（有进展）就重置计时器；只有「卡住不动超过 timeoutMs」才判超时停止。
@@ -1207,7 +1240,7 @@ async function runSingle(
 					"⏱ wall-budget",
 					`budget ${Math.round(__wall.ms / 1000)}s exhausted (source=${__wall.source ?? "param"}); killing ${resolvedModel ?? "default"}`,
 				);
-				kill();
+				kill("wall-budget", `maxWallMs(${__wall.source ?? "param"})`, Math.round((Date.now() - spawnedAt) / 1000) + "s", Math.round(__wall.ms / 1000) + "s");
 			}, __wall.ms);
 		} else if (__wall.reject !== undefined) {
 			// 非法值：忽略 + 告警（不崩、不静默采用）
@@ -1232,7 +1265,7 @@ async function runSingle(
 				result.status = "failed";
 				result.error = "stall-timeout";
 				emitUpdate("⏱ stalled", `killing ${resolvedModel ?? "default"} (no output for ${Math.round(timeoutMs / 1000)}s)`);
-				kill();
+				kill("stall", "no-output", Math.round(timeoutMs / 1000) + "s", Math.round(timeoutMs / 1000) + "s");
 			}, timeoutMs);
 		};
 		resetStall();
@@ -1249,7 +1282,7 @@ async function runSingle(
 				fatalKilled = true;
 				fatalKind = kind;
 				onUpdate?.(`⛔ fatal ${kind}`, "终止子进程（不可恢复）");
-				try { kill(); } catch { /* 已退出 */ }
+				try { kill("fatal-failure", kind); } catch { /* 已退出 */ }
 			},
 			onProgressEvent: (e: { type: string; toolName?: string; detail?: string; argsDigest?: string; turn?: number; text?: string }) => {
 				if (e.type === "tool") {
@@ -3961,6 +3994,11 @@ export default function (pi: ExtensionAPI) {
 					}).then((result) => {
 						record.status = result.status; record.result = result;
 						record.recentCalls = result.recentCalls;
+						if (result.killAudit) {
+							// 加固（「撑死必留凶手」）：主动终止的 killer/trigger/实测值/阈值落盘
+							(record as AsyncRunRecord & { killAudit?: unknown }).killAudit = result.killAudit;
+							record.killReason ??= `${result.killAudit.killer}:${result.killAudit.trigger}`;
+						}
 						applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 						recordUsage(agentDef?.name, result);
 						clearRunProcess(runId);
@@ -4057,6 +4095,11 @@ export default function (pi: ExtensionAPI) {
 				}).then((result) => {
 					record.status = result.status; record.result = result;
 					record.recentCalls = result.recentCalls;
+					if (result.killAudit) {
+						// 加固（「撑死必留凶手」）：主动终止的 killer/trigger/实测值/阈值落盘
+						(record as AsyncRunRecord & { killAudit?: unknown }).killAudit = result.killAudit;
+						record.killReason ??= `${result.killAudit.killer}:${result.killAudit.trigger}`;
+					}
 					applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 					recordUsage(agentDef?.name, result);
 					clearRunProcess(runId);
