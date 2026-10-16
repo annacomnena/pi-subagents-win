@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 53 | P0 | **唤醒必达（交付真账本 + C-3 判定层切换）**：终态事件阶段机 pending→leased→attempted→received→consumed + 租约/incident；A 快通道改绕 event/ACK；B 独立进程对账（独立 PID、公平分页）；**4 个注入调用点全部切换**（`undefined ⇒ unconfirmed`，delivered 仅由 consumed ACK 写）；R7/R8 故障矩阵用例 | none | 已 15 commit；L4 PASS 待补（luna 可作验收；F-1/F-2 已修）；**未决**：`effectiveStage` 在 incident 后不报 failed_delivery（消费侧口径待裁） | 本区 |
 | 52 | P0 | **失败必达终态 + 僵尸看门狗**：额度/认证类不可恢复失败立即终止子进程（否则上游死等 100min，2026-10-15 事故 6 个僵尸）；新增宿主侧看门狗（pid 死 / pid 重用 ⇒ 落 `failed(zombie)`）；on-read 惰性 + watcher 10s tick 双路回收；`stderrBuf` 提前清空致额度线索丢失的 bug | none | 已 11 commit（`e22fd96`…`c450509`）；L4 五轮 PASS-WITH-NITS；**未解决**：等待仍无界（P0，可分离）+ 无 pid 僵尸默认观察模式 | 本区 |
 | 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API | — |
 | 50 | P1 | **M1 入站图片附件真机验收通过**（gate `channels.wechat.artifact.enabled=true` 免重启 ≤95s；落盘 46,499B / `FFD8FF` / 1200×2670；注入 `〔附件：<路径> (image/jpeg, 46499B)〕`；**⭐ 模型经内建 `read` 读出 `test-9f3a`**；实现 `6ae8e0d`+`972e29f`） | Item 48 | 残余转 M2/M3（artifacts 明文无 GC、IP 段复验、语音/文件入站） | 本区 |
@@ -69,6 +70,25 @@
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
 
+<a id="item-53"></a>
+### Item 53 - 唤醒必达（交付真账本 + C-3 判定层切换）
+
+- **日期**：2026-10-16
+- **一句话**：治「run 已终态但归属会话从未真正处理该事件」——真实事故：GreenCAD run completed 后 tab idle 31min 无唤醒（pre-send `.notified` 经重启存活 ⇒ 抑制完成事件）。改为**交付真账本**（事件阶段机 + 租约 + incident）＋**两条独立通道**（A 快通道 fs.watch/tick、B 独立 PID 对账）＋**接收端 ACK 驱动交付**。
+- **已交付（15 个本地 commit，未 push）**：
+  - 账本与通道：`27684a7` 交付真账本（eventId/阶段机/租约/incident）；`46cbb3d` A 快通道改绕 event/ACK（修 P1/P2）；`5f201a8` B 对账通道（独立 PID、公平分页）；`83c20f4` P3 采纳（strict opt-in，零生产行为变化）。
+  - C 序列（判定层→调用点）：`030b28c` C-2 确认来源迁到 ACK（`pi.on("context")` 驱动 consumed）；`741cfa7` C-3 第1步 watcher；`f7423cf` 第2步 mailbox **信**；`8a194e1` 第3步 outbox（**consumed ACK 闭环**）；`236f8d3` 第4步通知类（index trace-fusion + mailbox 命令回执，`notifyFollowUpQuietly`）。
+  - 修正与回归：`eaeb6cb` 账本归档不再吞活 tab；`cc3b5d6` mailbox 两缺陷（**eventId revision 含 `new Date()`** ⇒ 每 tick 换 id；unconfirmed 不释放 ⇒ 永久停滞）；`52bcb08` cutover 断言假绿（漏 `await flush()`）；`5d4c486` L4 F-1/F-2（delivered 仅 consumed ACK；非 thenable 不算确证）；`e90310a` R7/R8 用例 + 修「unconfirmed 被写成 no-injector」。
+- **关键语义（strict，缺省）**：生产 `pi.sendUserMessage` **两级 delegate 均不 return** ⇒ 恒 `undefined` ⇒ **返回值不是送达证据**；`unconfirmed` 不 ack/不写终态；`delivered`（或 mailbox `ackLetter`）**仅由 consumed ACK 写**；`PI_DELIVERY_STRICT=0` 可回滚到旧契约。生产影响：切换前 `sent` 分支靠假阳性「承重」，切换后无静默回退。
+- **验证**：`_test_c3_mailbox_ack`(4) / `_test_c3_outbox_ack`(5) / `_test_delivery_crash_window`(R7,5) / `_test_delivery_host_contract`(R8,5) / `delivery-ledger`(12) / `delivery-reconciler`(8) / `delivery-ack`(5) / `message-outbox` / `runtime-cutover` / `runtime-commands` / `runtime-mailbox` / `injection-gate` / `async-result-watcher` / `event-bus` / `register-graph` / `p3-provenance`(8 条自证) —— **strict 与回滚双档全绿**；R7/R8 含 3 处**变异验证**（改一处必红）。全量 `_run_all_tests.sh` = `105 total / 100 pass / 5 fail`（4 项既存/环境 + 1 项负载 flake，非本线引入）。
+- **证据定源（重要）**：P3 的**承重证据 = 自证探针**（`scripts/_probe_p3_senduser_message.mjs` + `_test_p3_provenance.ts` 直读本机安装包，`self-verified=8 / peer-weak=0`）；grok 报告（provider 已删）降为**旁证弱档**。见 `plans/20261016_p3_provenance_resourcing.md`。
+- **L4**：`plans/20261016_c3_l4_review.md`（FAIL → F-1/F-2 已修）；按用户最终口径 **code-reviewer(luna) 出具可作验收**。
+- **未决/未做**：① `effectiveStage` 在 incident 已发布时不返回 `failed_delivery`（有 attempt 时恒报 attempted/received）⇒ 按 `stage` 统计的消费侧（GUI 红项/oracle）会误算未关单；推荐消费侧改判 `reconcileDecision().action`/`incidentId`，**待裁**。② `reliability-acceptance.mjs`（consult §8.2 全量 runner）未建，R1–R4/R9–R14 未落。③ `git push` 未授权。
+- **Priority**：P0
+- **Status**：active（4 个调用点已全部切换；待 L4 终评 + 未决项裁决）
+- **Commit**：`27684a7`+`46cbb3d`+`5f201a8`+`83c20f4`+`030b28c`+`eaeb6cb`+`741cfa7`+`f7423cf`+`8a194e1`+`236f8d3`+`cc3b5d6`+`52bcb08`+`0265c1a`+`5d4c486`+`e90310a`
+- **计划/审查**：`plans/20261016_consult_scheduling_and_wake_reliability.md`（设计）+ `plans/20261016_c3_l4_review.md` + `plans/20261016_r7_r8_impl.md` + `plans/20261016_p3_provenance_resourcing.md` + `plans/20261016_l4_tier_provenance_audit.md` + `plans/20261016_pending_strong_tier_queue.md`
+
 <a id="item-52"></a>
 ### Item 52 - 失败必达终态 + 僵尸看门狗（额度/进程失败）
 
@@ -81,6 +101,7 @@
 - **关键设计结论（四代被推翻后的收敛）**：一个「标记 + TTL」看门狗**无法用过期无主文件安全实现 owner 回收**（需 fencing token）⇒ 改为 **永久 `wx` claim**（至多一个非-force 赢家）+ **显式人工恢复** `reapZombie(id,{force:true})`；**不再声称 exactly-one**。四代演进（rmSync+wx → 仅 rename → token 核对+放回 → `.reaping`+TTL）每一代的真实缺陷都由独立 L4 给出可复现时序。
 - **独立 L4**：5 轮（`plans/20261016_subagent_zombie_l4_review{,2,3,4,5}.md`），前 4 轮均 FAIL（每轮找到一个**真实**双赢家/漏检缺陷），**第 5 轮 PASS-WITH-NITS**（「第五代在非-force 自动路径下闭合了双赢家问题；未发现 force 进入自动路径」）。
 - **验证**：`test:subagent-zombie` **18/18**（含跨进程 CAS、误杀防护双向、原子写、幂等、跨会话白名单、force 恢复）；`test:subagent-kill`（kill 三道门未削弱）·`_test_async_result_watcher`·`test:async-panel`·`test:launch`·`test:external-cli`·`test:register-graph`·`test:tab-runs-runtime`·`test:tiers-gate`·`test:recent-calls`(178/0) 全绿。零真实 runs 目录副作用（全部临时目录夹具）。
+- **⭐ 现场样本（2026-10-16 主机级故障，重启后新会话实测首次收口）**：两个 GreenCAD 线 async run（`run_mvabe41d_4c86` implementer / pid 1126720、`run_mvaa7sb2_iezo` planner / pid 1073620）在主机故障后**pid 已死但状态仍 `running`**（上游会死等）；重启后的新会话加载本批修复即自动收口为 `status=failed`、`zombieReapedAt=02:06:06.47Z`、`failure={kind:"zombie",source:"watchdog"}`、`error="[subagent-failure kind=ZOMBIE reason=pid-dead]"`（同一形状已被 `_test_subagent_zombie.ts` Z1 覆盖）⇒ 本项修复在**真实事故**上验证成立，非仅单测。
 - **范围纪律**：工作区 `extensions/index.ts`（Item 1016 costTier）与 `subagent-kill.ts`（recent-calls mergeRunRecord）含**他人未提交改动** ⇒ 全程 **hunk 级精确分离**（逐 commit 证据：`plans/20261016_zombie_commit_provenance.md`；11 个 commit 的 `costTierGate`/`mergeRunRecord` 命中均为 0）。
 - **未解决（L4 定性为「可分离议题」，但确为产品限制）**：
   1. **等待仍无界（P0）**：持续输出的活进程 / external CLI / fallback 链**没有墙钟总预算**（`timeoutMs` 是 stall 语义，有输出就重置）⇒ 本看门狗只覆盖「僵尸」，不提供端到端有界等待。
