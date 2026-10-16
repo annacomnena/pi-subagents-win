@@ -23,6 +23,7 @@ import { newOutboxItem, outboxDir, readOutboxItem, writeOutboxItem } from "./run
 import { consumeOutboxOnce } from "./outbox-bridge.ts";
 import { deliveryStrictEnabled } from "./injection-gate.ts";
 import { defaultDeliveryDir, listAttempts, listEvents, writeAck } from "./delivery-ledger.ts";
+import { claimInjection, confirmInjection } from "./runtime/receipts.ts";
 
 let n = 0;
 const ok = (name: string): void => { n += 1; console.log(`ok ${n} - ${name}`); };
@@ -138,6 +139,59 @@ try {
 			if (prev === undefined) delete process.env.PI_DELIVERY_STRICT; else process.env.PI_DELIVERY_STRICT = prev;
 		}
 		ok("O3 outbox：PI_DELIVERY_STRICT=0 回滚档位恢复旧行为");
+	}
+
+	// ── O4：strict 下「真 Promise resolve（sent）」只算 **received 级**：仍 pending，consumed ACK 才 delivered ──
+	{
+		const dir = outboxDir(STATE);
+		const c = mkItem("ob-c", "C3 outbox sent-await-ack");
+		writeOutboxItem(dir, c);
+		const rep = consumeOutboxOnce({
+			sessionId: SID, stateDir: STATE, journalPath: JOURNAL, deliveryDir: DELIVERY,
+			sendUserMessage: () => Promise.resolve(), // 真 Promise = 宿主已接受（received 级）
+		});
+		await flush();
+		assert.deepEqual(
+			rep.consumed.filter((x) => x.outboxId === c.id).map((x) => ({ a: x.action, r: x.reason })),
+			[{ a: "skipped", r: "sent-await-ack" }],
+			"**sent ≠ delivered**：宿主接受只算 received，交付仍由 ACK 决定",
+		);
+		assert.equal(readOutboxItem(dir, c.id)!.status, "pending", "留 pending 等 consumed ACK");
+		assert.equal(journalEvents("message.delivered").filter((e) => e.payload?.commandKey === "ob-c").length, 0, "零 journal message.delivered（不伪造终态）");
+		assert.equal(journalEvents("message.received").filter((e) => e.payload?.commandKey === "ob-c").length, 1, "journal message.received 一条（received 级证据）");
+		// 接收端 ACK ⇒ delivered
+		const ev4 = listEvents(DELIVERY, 500).find((e) => e.runId === `outbox_${c.id}`)!;
+		writeAck(DELIVERY, { eventId: ev4.eventId, stage: "consumed", attemptId: listAttempts(DELIVERY, ev4.eventId).at(-1)?.attemptId ?? "x", recipientGeneration: 1, at: new Date().toISOString(), evidence: "context-observed" });
+		let sendO4 = 0;
+		consumeOutboxOnce({ sessionId: SID, stateDir: STATE, journalPath: JOURNAL, deliveryDir: DELIVERY, sendUserMessage: () => { sendO4 += 1; } });
+		await flush();
+		assert.equal(sendO4, 0, "ACK 已成立 ⇒ 不再注入");
+		assert.equal(readOutboxItem(dir, c.id)!.status, "delivered", "consumed ACK ⇒ delivered（唯一终态路径）");
+		ok("O4 outbox：sent 只算 received，consumed ACK 才 delivered");
+	}
+
+	// ── O5：strict 下**收据回放**（injected-already）也不写 delivered（F-1 修复回归）──
+	{
+		const dir = outboxDir(STATE);
+		const d = mkItem("ob-d", "C3 outbox receipt-replay-await-ack");
+		writeOutboxItem(dir, d);
+		assert.equal(claimInjection(`outbox:${d.id}`, `outbox-bridge:${SID}:prev`).status, "claimed", "预置 claim（模拟上轮桥）");
+		assert.equal(confirmInjection(`outbox:${d.id}`, `outbox-bridge:${SID}:prev`), true, "预置 confirm（=收据已落地）");
+		let sendO5 = 0;
+		const rep5 = consumeOutboxOnce({
+			sessionId: SID, stateDir: STATE, journalPath: JOURNAL, deliveryDir: DELIVERY,
+			sendUserMessage: () => { sendO5 += 1; },
+		});
+		await flush();
+		assert.deepEqual(
+			rep5.consumed.filter((x) => x.outboxId === d.id).map((x) => ({ a: x.action, r: x.reason })),
+			[{ a: "skipped", r: "receipt-replayed-await-ack" }],
+			"**收据 ≠ consumed**：strict 下不写 delivered",
+		);
+		assert.equal(sendO5, 0, "收据已在 ⇒ 不二次注入");
+		assert.equal(readOutboxItem(dir, d.id)!.status, "pending", "留 pending 等 consumed ACK");
+		assert.equal(journalEvents("message.delivered").filter((e) => e.payload?.commandKey === "ob-d").length, 0, "零 journal message.delivered");
+		ok("O5 outbox：收据回放只算 received，consumed ACK 才 delivered");
 	}
 
 	console.log(`\n_test_c3_outbox_ack: all ${n} groups passed`);

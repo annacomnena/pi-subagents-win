@@ -139,13 +139,17 @@ export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector" | "
  * 故本函数**不**把「任何非 Promise 返回值」一律判死；只在**返回值既不是 Promise 也不是
  * 非空确证**时降级为 `unconfirmed`（诚实降级，咨询 §6.3.5）。
  *
- * 语义：`undefined`/`null` ⇒ **unconfirmed**（既不能证明发出、也不能证明失败）。
+ * 语义：`undefined`/`null` ⇒ **unconfirmed**（既不能证明发出、也不能证明失败）；
+ * **非 thenable 的其它值（数字/字符串/普通对象）也 ⇒ unconfirmed**（F-2：只有可核验的完成证据才算确认）。
  * 调用方 **不得**将 unconfirmed 当 sent/receipt（这正是 P3 的最小修法 ②）。
  */
 export function classifySendReturn(value: unknown): "confirmed" | "unconfirmed" {
-	if (value === undefined || value === null) return "unconfirmed";
-	if (typeof (value as { then?: unknown }).then === "function") return "confirmed"; // 真 Promise ⇒ 由 then/catch 决定
-	return "confirmed"; // 其他非空返回值（如 {ok:true}）：视为同步确证
+	// F-2（L4 20261016_c3_l4_review）：**只认 thenable**（真 Promise）。
+	// 理由：只有 thenable 能被 `await`/`catch` 核验（成功/失败两个可观测结果）；
+	// 数字/字符串/普通对象（如 `{ok:true}`）不是送达证据，把它们当「同步确证」等于把任意值当证明。
+	// 本机生产链恒 `undefined`（loader.js:295-297 + agent-session.js:2644-2652），故不影响现生产行为。
+	if (value !== null && typeof value === "object" && typeof (value as { then?: unknown }).then === "function") return "confirmed";
+	return "unconfirmed";
 }
 
 /**

@@ -65,8 +65,12 @@ async function run(
 	assert.equal(await run(() => undefined), "sent", "默认（strict 关）保持既有行为：`undefined` ⇒ sent（承重假阳性，待裁决迁移）");
 	// 0b. 真实 Promise resolve ⇒ sent（这才是可信确证）
 	assert.equal(await run(() => Promise.resolve()), "sent", "真 Promise resolve → sent（可信）");
-	// 0c. 非空同步返回值（如 {ok:true}）⇒ 视为同步确证
-	assert.equal(await run(() => ({ ok: true }), "hi", { strict: true }), "sent", "非空同步返回值 → sent（同步确证）");
+	// 0c. F-2（L4 20261016_c3_l4_review）：**非 thenable 的任意值都不是确认证据** ⇒ unconfirmed
+	assert.equal(await run(() => ({ ok: true }), "hi", { strict: true }), "unconfirmed", "F-2：普通对象 → unconfirmed（不把任意值当证明）");
+	assert.equal(await run(() => 1 as unknown, "hi", { strict: true }), "unconfirmed", "F-2：数字 → unconfirmed");
+	assert.equal(await run(() => "ok" as unknown, "hi", { strict: true }), "unconfirmed", "F-2：字符串 → unconfirmed");
+	// 0c-bis. thenable（非原生 Promise）也 ⇒ sent（可 await/catch 核验）
+	assert.equal(await run(() => ({ then: (r: (v: unknown) => void) => r(undefined) }) as unknown, "hi", { strict: true }), "sent", "thenable → sent（可核验）");
 	// 0d. null 与 undefined 同待遇（strict 下都不可信）
 	assert.equal(await run(() => null, "hi", { strict: true }), "unconfirmed", "null 同样不可当 sent（strict）");
 	// 0e. 如实声明：生产链（loader.js:295 + agent-session.js:2644 两级均不 return）

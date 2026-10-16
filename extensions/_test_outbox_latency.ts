@@ -23,6 +23,9 @@ const RUNTIME = mkdtempSync(join(tmpdir(), "outbox-latency-"));
 const STATE = join(RUNTIME, "state");
 process.env.PI_RUNTIME_DIR = RUNTIME;
 process.env.PI_SESSIONS_DIR = mkdtempSync(join(tmpdir(), "outbox-latency-sessions-"));
+// C-3：本探针测的是**时延/去重**，用真 Promise 且期待 delivered（旧契约）⇒ 跑在回滚档位；
+// strict（缺省）下 delivered 只能由 consumed ACK 写，见 `_test_c3_outbox_ack.ts`。
+process.env.PI_DELIVERY_STRICT = "0";
 
 import { newOutboxItem, outboxDir, writeOutboxItem, readOutboxItem } from "./runtime/message-outbox.ts";
 import { piSessionAddress } from "./runtime/address.ts";

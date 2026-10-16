@@ -31,6 +31,16 @@
  *
  * master 护栏在 executor 层（403 master-session-protected），桥永不见 master 目标的项。
  *
+ * C-3（则上交付，strict 缺省）：delivered **只能** 由接收端 `consumed` ACK 驱动（见
+ * `delivery-ack.ts` + 下文「ACK 驱动闭环」）。宿主 `send` 返回值不作为送达证据
+ * （生产 `pi.sendUserMessage` 恒 `undefined`）。strict 下：
+ *   - `sent`（真 Promise，仅替换上下文路径可达）⇒ confirm 收据 + journal `message.received`
+ *     （**received 级**证据）⇒ 仍留 pending 等 consumed ACK；**不写 delivered**；
+ *   - `injected-already`（收据回放）⇒ 同上，不写 delivered；
+ *   - `busy` / `no-injector` / `unconfirmed` ⇒ 不写终态，释放 claim 供重投；
+ *   - `consumed` ACK 出现 ⇒ 补写 delivered + journal `message.delivered`（唯一终态路径）。
+ * `PI_DELIVERY_STRICT=0`（回滚档位）恢复旧的「sent/收据 ⇒ delivered」行为。
+ *
  * 注册形态同 mailbox-consumer：session_start（子 agent 恒跳过）+ 启动即扫一轮（重启后
  * reclaim 不等首个 tick）+ interval tick（缺省 10s）。所有必要异常内部吞掉，绝不破坏宿主
  * 会话。**接线**：extensions/index.ts 已有 registerOutboxBridge 一行（并行冻结，不重碰）。
@@ -175,6 +185,9 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 			// 纪律：send 返回值**不是**送达证明（生产 `pi.sendUserMessage` 两级 delegate 都不 return
 			// ⇒ 恒 `undefined`）；delivered 终态由下方「ACK 驱动闭环」的 `consumed` ACK 决定。
 			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+			// C-3：strict（缺省）下 `undefined ⇒ unconfirmed`，且 `sent`/收据只算 received 级证据；
+			// delivered 仅由 consumed ACK 写（禁静默回退成 sent）。
+			const strict = deliveryStrictEnabled();
 			const terminalAt = item.createdAt;
 			let eventId: string | undefined;
 			try {
@@ -213,18 +226,23 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 				continue;
 			}
 			if (claim.status === "injected-already") {
-				// 前一轮已注入但崩溃未回写：收据回放 → 补写 delivered（终态守卫防竞态双写）
-				const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holderOf(opts.sessionId) });
-				if (marked !== null) appendBridgeJournalEvent("message.delivered", item, opts, { replayed: true });
-				report.consumed.push({ outboxId: item.id, action: "delivered", reason: "receipt-replayed" });
+				// 前一轮已注入但崩溃未回写（收据已存在）。**C-3：收据 ≠ 接收端 consumed 证据**
+				// ⇒ strict 下**不写 delivered**，只记 received 级 journal，留 pending 等上方 ACK 闭环收敛；
+				// 回滚档位保持旧行为（收据回放 ⇒ 补写 delivered，终态守卫防竞态双写）。
+				if (strict) {
+					appendBridgeJournalEvent("message.received", item, opts, { replayed: true });
+					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "receipt-replayed-await-ack" });
+				} else {
+					const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holderOf(opts.sessionId) });
+					if (marked !== null) appendBridgeJournalEvent("message.delivered", item, opts, { replayed: true });
+					report.consumed.push({ outboxId: item.id, action: "delivered", reason: "receipt-replayed" });
+				}
 				continue;
 			}
 			// 注入本会话（既有用户消息注入路径）。L3：await send 结果再分支；**receipt 只在 "sent"
 			// 之后**（.then 衔接，不改整条消费链 async，防竞态面扩大）。
 			const holder = holderOf(opts.sessionId);
 			const claimKey = claimKeyFor(item);
-			// C-3：strict（缺省）下 `undefined ⇒ unconfirmed`，delivered 由 ACK 驱动（禁静默回退成 sent）。
-			const strict = deliveryStrictEnabled();
 			const attemptId = eventId ? `${eventId}@OB@${Date.now()}` : undefined;
 			injectFollowUpQuietly(opts.sendUserMessage, buildOutboxInjectBody(item, undefined, eventId), { strict }).then((status) => {
 				// 尝试入账（**只表示调过发送**；`sent` 也只是 attempted，不等于 delivered）
@@ -244,6 +262,14 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 					const confirmed = confirmInjection(claimKey, holder);
 					if (!confirmed) {
 						report.consumed.push({ outboxId: item.id, action: "skipped", reason: "confirm-failed" });
+						return;
+					}
+					if (strict) {
+						// C-3：`sent`（真 Promise / 宿主已接受）只是 **received 级**证据，不等于接收端 consumed。
+						// 不得在此写 delivered（否则 installed 版本靠宿主返回值就“已交付”）；留 pending
+						// 等 consumed ACK（上方闭环），否则 60s 后由 B 判 failed_delivery + incident。
+						appendBridgeJournalEvent("message.received", item, opts, {});
+						report.consumed.push({ outboxId: item.id, action: "skipped", reason: "sent-await-ack" });
 						return;
 					}
 					const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holder });
@@ -296,7 +322,7 @@ function defaultStateDir(): string {
  * （§15 大内容不进信封；正文唯一落点是 outbox 盘面与会话转写）。
  */
 function appendBridgeJournalEvent(
-	type: "message.delivered" | "message.failed",
+	type: "message.delivered" | "message.received" | "message.failed",
 	item: OutboxItem,
 	opts: ConsumeOutboxOptions,
 	extra: { error?: string; replayed?: boolean },

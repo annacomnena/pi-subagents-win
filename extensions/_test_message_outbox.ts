@@ -25,10 +25,9 @@
  *   M11 跨进程（必修 1）：子进程 crash 遗留 claim → 主进程 stale 接管；两子进程并发 stale
  *      接管竞速 → unlink 门控 CAS 恰一个 claimed(tookOver)
  *
- * ⚠ C-3（唤醒必达）语义变更：本文件 fake send 多为 `Promise.resolve()`（= 替换上下文那条真 Promise
- *   路径，`agent-session.js:3479`），delivered 路径仍被覆盖；**生产形态**（`pi.sendUserMessage` 两级
- *   delegate 都不 return ⇒ `undefined`）⇒ `attempted-unconfirmed`，不再报 delivered/ack，改由
- *   `consumed` ACK 驱动 —— 见 `_test_c3_outbox_ack.ts`。
+ * ⚠ C-3（唤醒必达）语义变更：本文件运行在 **回滚档位（`PI_DELIVERY_STRICT=0`）**，即“旧契约”
+ *   （`sent` / 收据 ⇒ `delivered`）；**strict（缺省）下 `delivered` 只能由 `consumed` ACK 写**，
+ *   `sent`/收据只算 received 级证据 —— 该语义由 `_test_c3_outbox_ack.ts`（O1–O5）覆盖。
  *
  * 运行：npm run test:message-outbox
  */
@@ -42,6 +41,10 @@ import { spawn } from "node:child_process";
 // 隔离（env 先于 import，同既有 runtime 测试纪律）
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "msg-outbox-env-"));
 process.env.PI_SESSIONS_DIR = mkdtempSync(join(tmpdir(), "msg-outbox-sessions-"));
+// C-3（strict 缺省）：delivered 只能由接收端 `consumed` ACK 写（见 `_test_c3_outbox_ack.ts`）。
+// 本文件保留**旧契约/回滚档位**回归（sent/收据 ⇒ delivered、崩溃窗重投、confirm 核实等）
+// ⇒ 显式切到 `PI_DELIVERY_STRICT=0`；strict 语义由 `_test_c3_outbox_ack.ts`（O1–O5）专测。
+process.env.PI_DELIVERY_STRICT = "0";
 const ROOT = process.env.PI_RUNTIME_DIR!;
 const SESSIONS = process.env.PI_SESSIONS_DIR!;
 
