@@ -127,10 +127,21 @@ try {
 			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "收据确认");
 			assert.ok(existsSync(join(RUNSDIR, "tab_c1.notified")), ".notified 补认领");
 		}
-		// 重扫：不重注（两种档位都成立）
+		// 重扫（C-3 语义）：strict 下未确认 ⇒ 信已退回 pending ⇒ 下 tick 重投（at-least-once，
+		// 目标端按稳定 messageId 去重）；回滚档位已写收据 ⇒ 不重注。
 		const sent2: string[] = [];
 		const r2 = consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: (b) => { sent2.push(b); } });
+		await flush(); // L3：reportPush 在 send 的 .then 微任务（不 flush 读 r2.consumed 会是空数组）
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 0, "无重注");
+		if (deliveryStrictEnabled()) {
+			assert.equal(sent2.length, 1, "strict：未确认 ⇒ 下 tick 重投（at-least-once，非永久停滞）");
+			assert.ok(r2.consumed.some((c) => c.reason === "attempted-unconfirmed"), "重投仍未确认（交付仍由 ACK 决定）");
+			// 收尾：本块的信仍 pending ⇒ 用真 Promise 路径收敛为 ack，避免污染后续用例
+			consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: () => Promise.resolve() });
+			await flush();
+		} else {
+			assert.equal(sent2.length, 0, "回滚档位：已写收据 ⇒ 不重注");
+		}
 	}
 
 	// ── 6. 消费端：F17 旧信跳过 ────────────────────────────────────
