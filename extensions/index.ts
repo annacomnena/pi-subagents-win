@@ -416,7 +416,7 @@ export function classifyModelFailure(
 	modelHint?: string,
 ): {
 	retryable: boolean;
-	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "timeout" | "stall" | "wall_budget" | "other";
+	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "provider_network" | "timeout" | "stall" | "wall_budget" | "other";
 	label: string;
 } {
 	const message = error.toLowerCase();
@@ -461,6 +461,19 @@ export function classifyModelFailure(
 	}
 	if (/(timeout|\b408\b|timed?\s*out)/i.test(message)) {
 		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
+	}
+	// 连接类（provider/网络抖动，**可自愈**）：socket 关闭 / 5xx 无 body / undici 等。
+	// 为何单列：这些错此前落到 `other`（retryable:false）⇒ `index.ts:959` 的 fatal 门
+	// （`!retryable ⇒ onFatalFailure`）会**立即杀子进程**，零重试、零产出。
+	// 2026-10-16 实测：今日 3 条长跑的 `error==="terminated"`（undici socket 提前关闭）与
+	// `503 status code (no body)` 均为此形；见 `plans/20261016_terminated_provenance_investigation.md`。
+	// 归入 retryable 后：不再 fatal-kill，交由 fallback 链/有界重试处理，终态时明写连接类。
+	const connectionish =
+		/(\bterminated\b|socket hang ?up|other side closed|premature close|undici|socket closed|\bECONNRESET\b|ECONNREFUSED|\bEPIPE\b|EAI_AGAIN|\bETIMEDOUT\b|\b50[0-4]\b|bad gateway|service unavailable|no body|network error)/i.test(
+			error,
+		);
+	if (connectionish) {
+		return { retryable: true, kind: "provider_network", label: "PROVIDER_NETWORK" };
 	}
 	const providerish =
 		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|atomcode|zcode|location is not supported)/i.test(
