@@ -76,6 +76,7 @@ import { newReplyIntent, markReplyIntent, replyIntentDir } from "./runtime/wecha
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, touchSessionHeartbeat } from "./timers.ts";
+import { UPLOAD_MAX_BYTES } from "./runtime-host/uploads.ts";
 
 const SERVER_TS = join(dirname(fileURLToPath(import.meta.url)), "runtime-host", "server.ts");
 
@@ -867,6 +868,66 @@ try {
 			assert.deepEqual(readdirSync(obDir).sort(), before, "outbox 目录零新增（拒收不落盘）");
 			assert.deepEqual(existsSync(commandsDir) ? readdirSync(commandsDir).sort() : [], commandsBefore, "commands 状态目录零新增（拒收不落盘）");
 		} finally {
+			await h.close();
+		}
+	}
+
+	// ── T18 GUI 图片输入 S1：/v1/uploads（附件落盘 + 路径；魔数嗅探 + 鉴权 + 限额）──
+	{
+		const D = mkdtempDir("runtime-host-t18-");
+		DIRS.push(D);
+		const hp = join(D, "host.json");
+		const h = await createRuntimeHostServer({
+			hostPath: hp,
+			timersDir: join(D, "t"),
+			mailboxDir: join(D, "m"),
+			stateDir: join(D, "s"),
+			journalPath: join(D, "e.jsonl"),
+			uploadsRuntimeDir: D,
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			const auth = { "X-Command-Token": h.info.token! };
+			// ① 未鉴权 → 401（与 /v1/commands 同链）
+			const noAuth = await fetch(`${base}/v1/uploads`, { method: "POST", body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]) });
+			assert.equal(noAuth.status, 401, "T18① 无 token → 401");
+			// ② GET → 405（唯一写面语义）
+			const getRes = await fetch(`${base}/v1/uploads`, { headers: auth });
+			assert.equal(getRes.status, 405, "T18② GET /v1/uploads → 405");
+			// ③ 真 PNG（最小合法头 + 数据）→ 200 且落盘、路径在 uploads/ 内、字节一致
+			const png = Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+				Buffer.from("t18-png-body"),
+			]);
+			const up = await fetch(`${base}/v1/uploads`, { method: "POST", headers: auth, body: png });
+			assert.equal(up.status, 200, `T18③ 上传成功：${up.status}`);
+			const upBody = (await up.json()) as { uploadId: string; path: string; bytes: number; mediaType: string };
+			assert.equal(upBody.bytes, png.length, "T18④ bytes 回显 = 上传字节数");
+			assert.equal(upBody.mediaType, "image/png", "T18⑤ 魔数嗅探为 png（不信任 Content-Type）");
+			assert.ok(upBody.path.endsWith(`${upBody.uploadId}.png`), "T18⑥ 文件名为服务端 uploadId + 嗅探扩展名");
+			assert.ok(existsSync(upBody.path), "T18⑦ 文件真的落盘");
+			assert.deepEqual(readFileSync(upBody.path), png, "T18⑧ 落盘字节与上传一致（无截断/无转码）");
+			assert.equal(dirname(upBody.path), join(D, "uploads"), "T18⑨ 只能落在 <runtimeDir>/uploads");
+			// ⑩ 伪装图（text 冒充 image/png 的 Content-Type）→ 400（魔数不认就拒，防 svg/脚本面）
+			const fake = await fetch(`${base}/v1/uploads`, {
+				method: "POST",
+				headers: { ...auth, "content-type": "image/png" },
+				body: Buffer.from("<svg onload=alert(1)></svg>"),
+			});
+			assert.equal(fake.status, 400, "T18⑩ 非白名单魔数 → 400");
+			assert.equal(((await fake.json()) as { error: string }).error, "unsupported-type", "T18⑪ 错误码 unsupported-type");
+			// ⑫ 空体 → 400 empty
+			const empty = await fetch(`${base}/v1/uploads`, { method: "POST", headers: auth, body: Buffer.alloc(0) });
+			assert.equal(empty.status, 400, "T18⑫ 空体 → 400");
+			assert.equal(((await empty.json()) as { error: string }).error, "empty", "T18⑬ 错误码 empty");
+			// ⑭ 超限 → 413（不截断、不降级），且**不**留下半个文件
+			const beforeNames = readdirSync(join(D, "uploads")).length;
+			const big = Buffer.concat([png, Buffer.alloc(UPLOAD_MAX_BYTES, 0x41)]);
+			const tooBig = await fetch(`${base}/v1/uploads`, { method: "POST", headers: auth, body: big });
+			assert.equal(tooBig.status, 413, `T18⑭ 超 ${UPLOAD_MAX_BYTES} 字节 → 413`);
+			assert.equal(readdirSync(join(D, "uploads")).length, beforeNames, "T18⑮ 超限未落任何文件（含 .part 残留）");
+		}
+		finally {
 			await h.close();
 		}
 	}

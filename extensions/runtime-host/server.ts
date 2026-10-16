@@ -119,6 +119,7 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
+import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 import { piSessionAddress } from "../runtime/address.ts";
 import {
@@ -535,7 +536,8 @@ export interface RuntimeHostServerOptions {
 	lockWaitMs?: number;
 	/** 0923 wechat：runtime 根目录（凭据 <dir>/wechat/credentials.json；缺省 defaultRuntimeDir()；测试注入隔离）。 */
 	wechatRuntimeDir?: string;
-	/** 0923 wechat：iLink base URL（缺省 https://ilinkai.weixin.qq.com；本地 stub 测试）。 */
+	/** GUI 图片输入 S1：上传落盘根目录（缺省 defaultRuntimeDir()；测试注入隔离）。 */
+	uploadsRuntimeDir?: string;	/** 0923 wechat：iLink base URL（缺省 https://ilinkai.weixin.qq.com；本地 stub 测试）。 */
 	wechatBaseUrl?: string;
 	/** 0923 wechat：fetch 注入（缺省 global fetch；测试 fake fetch）。 */
 	wechatFetch?: WechatFetch;
@@ -631,6 +633,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	// 变化（receive.enabled 缺省 false → 不 spawn）；仅读端点 /v1/wechat/{worker/status,inbox}
 	// 从私有 store 读投影（只读，不触发 poll/claim/注入）。token 永不进任何响应。
 	const wechatRuntimeDir = opts.wechatRuntimeDir !== undefined ? opts.wechatRuntimeDir : defaultRuntimeDir();
+	// GUI 图片输入 S1：上传落盘根目录（`<dir>/uploads`；缺省 defaultRuntimeDir()；测试注入隔离）。
+	const uploadsRuntimeDir = opts.uploadsRuntimeDir !== undefined ? opts.uploadsRuntimeDir : defaultRuntimeDir();
 	const wechatStore = new WechatStore(WechatStore.resolveDir(wechatRuntimeDir));
 	const channelSupervisor = new ChannelSupervisor({ runtimeDir: wechatRuntimeDir, configPath });
 	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
@@ -1231,6 +1235,55 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					return;
 				}
 				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/bootstrap/exchange 仅接受 GET ?ott=（换 HttpOnly 同源 cookie）" });
+			}
+			if (u.pathname === "/v1/uploads") {
+				// GUI 图片输入 S1：图片**只落盘**（附件 + 路径），不进命令载荷（那面仍 64KB 上限）、
+				// 也不把 base64 写进会话 JSONL。鉴权沿用 authorizeCommand（无/错 → 401）。
+				if (!authorizeCommand(req)) {
+					respondJson(res, 401, { error: "unauthorized", hint: "POST /v1/uploads 需本机 token（X-Command-Token 或 sw_host_token/sw_gui_token cookie）" });
+					try { req.destroy(); } catch { /* ignore */ }
+					return;
+				}
+				if (req.method !== "POST") {
+					throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/uploads 仅接受 POST 原始图片字节（Content-Type 不参与判定，按魔数嗅探）" });
+				}
+				const chunks: Buffer[] = [];
+				let size = 0;
+				let responded = false;
+				req.on("data", (c: Buffer) => {
+					if (responded) return;
+					size += c.length;
+					if (size > UPLOAD_MAX_BYTES) {
+						responded = true;
+						respondJson(res, 413, { error: "payload-too-large", hint: `单张图片上限 ${UPLOAD_MAX_BYTES} 字节（不截断、不降级；请压缩后重传）` });
+						try { req.destroy(); } catch { /* ignore */ }
+						return;
+					}
+					chunks.push(c);
+				});
+				req.on("error", () => {
+					if (!responded) {
+						responded = true;
+						respondJson(res, 400, { error: "request-error" });
+					}
+				});
+				req.on("end", () => {
+					if (responded) return;
+					responded = true;
+					try {
+						// 机会式有界清理（never-throw）：控制磁盘不无限增长
+						pruneUploads({ runtimeDir: uploadsRuntimeDir });
+						const saved = saveUpload({ runtimeDir: uploadsRuntimeDir, bytes: Buffer.concat(chunks) });
+						if (!saved.ok) {
+							respondJson(res, saved.reason === "too-large" ? 413 : 400, { error: saved.reason, hint: saved.detail });
+							return;
+						}
+						respondJson(res, 200, { uploadId: saved.uploadId, path: saved.path, bytes: saved.bytes, mediaType: saved.mediaType });
+					} catch (e) {
+						respondJson(res, 500, { error: "upload-write-failed", hint: String((e as Error).message ?? e) });
+					}
+				});
+				return;
 			}
 			if (u.pathname === "/v1/commands") {
 				// 唯一写端点：仅 POST；GET /v1/commands → 405（读投影不含命令）
