@@ -25,6 +25,11 @@
  *   M11 跨进程（必修 1）：子进程 crash 遗留 claim → 主进程 stale 接管；两子进程并发 stale
  *      接管竞速 → unlink 门控 CAS 恰一个 claimed(tookOver)
  *
+ * ⚠ C-3（唤醒必达）语义变更：本文件 fake send 多为 `Promise.resolve()`（= 替换上下文那条真 Promise
+ *   路径，`agent-session.js:3479`），delivered 路径仍被覆盖；**生产形态**（`pi.sendUserMessage` 两级
+ *   delegate 都不 return ⇒ `undefined`）⇒ `attempted-unconfirmed`，不再报 delivered/ack，改由
+ *   `consumed` ACK 驱动 —— 见 `_test_c3_outbox_ack.ts`。
+ *
  * 运行：npm run test:message-outbox
  */
 
@@ -60,6 +65,7 @@ import {
 import { executeCommand } from "./runtime/command-executor.ts";
 import { newCommandFrame } from "./runtime/protocol.ts";
 import { claimInjection, confirmInjection } from "./runtime/receipts.ts";
+import { listEvents } from "./delivery-ledger.ts"; // C-3：核验正文 eventId 标记 = 账本真 eventId
 import { defaultRuntimeDir } from "./runtime/journal.ts";
 import { createRuntimeHostServer, type RuntimeHostHandle } from "./runtime-host/server.ts";
 import { attachMaster } from "./runtime/registry.ts";
@@ -177,8 +183,11 @@ try {
 			sessionId: "sid-A",
 			stateDir: STATE,
 			journalPath: JOURNAL,
+			// C-3：真 Promise resolve（= 替换上下文那条路径，`agent-session.js:3479`）才走 delivered；
+			// 生产 `pi.sendUserMessage` 不 return ⇒ `undefined ⇒ unconfirmed`（见 _test_c3_outbox_ack.ts）。
 			sendUserMessage: (body, opts) => {
 				injected.push({ body, deliverAs: opts?.deliverAs });
+				return Promise.resolve();
 			},
 			now: obNow(),
 		});
@@ -223,7 +232,7 @@ try {
 		assert.equal(claimInjection(`outbox:${e.id}`, "outbox-bridge:sid-A:prev").status, "claimed", "预置 claim（模拟上轮桥）");
 		assert.equal(confirmInjection(`outbox:${e.id}`, "outbox-bridge:sid-A:prev"), true, "预置 confirm（=已注入，收据落地）");
 		let injected2 = 0;
-		const r4 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => { injected2 += 1; }, now: obNow() });
+		const r4 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => { injected2 += 1; return Promise.resolve(); }, now: obNow() });
 		assert.deepEqual(r4.consumed, [{ outboxId: e.id, action: "delivered", reason: "receipt-replayed" }], "收据回放 → delivered");
 		assert.equal(injected2, 0, "不二次注入");
 		assert.equal(readOutboxItem(dir, e.id)!.status, "delivered");
@@ -233,7 +242,7 @@ try {
 		writeOutboxItem(dir, f);
 		claimInjection(`outbox:${f.id}`, "outbox-bridge:other-session");
 		let injected3 = 0;
-		const r5 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => { injected3 += 1; }, now: obNow() });
+		const r5 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => { injected3 += 1; return Promise.resolve(); }, now: obNow() });
 		assert.deepEqual(r5.consumed.map((x) => ({ a: x.action, r: x.reason })), [{ a: "skipped", r: "claimed-by-other" }]);
 		assert.equal(injected3, 0, "被他者 claim → 不注入");
 		assert.equal(readOutboxItem(dir, f.id)!.status, "pending", "保持 pending（stale 接管后可重试）");
@@ -256,14 +265,15 @@ try {
 		const repWait = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => undefined, now: obNow() });
 		assert.deepEqual(repWait.consumed.filter((c) => c.outboxId === g.id).map((c) => ({ a: c.action, r: c.reason })), [{ a: "skipped", r: "claimed-by-other" }], "残留新鲜 claim（含同 holder）→ 让位");
 		backdateClaim(g.id);
-		const rep = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => injected7.push(b), now: obNow() });
+		const rep = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => { injected7.push(b); return Promise.resolve(); }, now: obNow() });
 		await flush(); // L3：stale 接管重投 在 .then 微任务
 		assert.deepEqual(rep.consumed.filter((c) => c.outboxId === g.id).map((c) => c.action), ["delivered"], "stale 接管 → delivered");
 		assert.equal(injected7.length, 1, "崩溃窗口后重投（at-least-once：重注入，非 exactly-once）");
-		assert.equal(injected7[0], firstBody, "重投正文逐字相同（dedupe 标记稳定，可目标端去重）");
-		// 目标端按 dedupe 标记幂等去重：两轮外部副作用 → 有效消息恰 1
-		const marker = (b: string): string => /dedupe:outbox:([0-9a-f]{64})/.exec(b)![1]!;
-		assert.equal(new Set([marker(firstBody), marker(injected7[0]!)]).size, 1, "目标端 dedupe 幂等：重投不重复生效");
+		// C-3：正文 = 旧基文 + `\n[evt:<eventId>]` 标记；前缀逐字相同 ⇒ dedupe 身份稳定（目标端可去重）
+		assert.ok(injected7[0]!.startsWith(firstBody), "重投正文前缀逐字相同（dedupe 标记稳定）");
+		const evId7 = /\[evt:(async:outbox_[^\]\s]+)\]/.exec(injected7[0]!)?.[1];
+		assert.ok(evId7, "正文含 eventId 标记（接收端 context 观察才能写 consumed ACK）");
+		assert.equal(listEvents(join(ROOT, "delivery")).some((e) => e.eventId === evId7), true, "标记 = 账本真 eventId");
 		assert.equal(readOutboxItem(dir, g.id)!.status, "delivered");
 
 		// 异 holder 崩溃遗留：fresh claim → claimed-by-other；stale 后接管重投收敛 delivered
@@ -274,7 +284,7 @@ try {
 		assert.deepEqual(rSkip.consumed.filter((c) => c.outboxId === h.id).map((c) => ({ a: c.action, r: c.reason })), [{ a: "skipped", r: "claimed-by-other" }], "他 pod 新鲜 claim → 让位");
 		backdateClaim(h.id);
 		const injected7b: string[] = [];
-		const rep2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => injected7b.push(b), now: obNow() });
+		const rep2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => { injected7b.push(b); return Promise.resolve(); }, now: obNow() });
 		await flush(); // L3：stale 接管重投 在 .then 微任务
 		assert.deepEqual(rep2.consumed.filter((c) => c.outboxId === h.id).map((c) => c.action), ["delivered"], "stale 接管 → 重投 delivered");
 		assert.equal(injected7b.length, 1);
@@ -303,8 +313,10 @@ try {
 		// 注入成功后、confirm 前收据/claim 丢失（IO 故障形状）：sendUserMessage 回调内删 claim
 		const rep = consumeOutboxOnce({
 			sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, now: obNow(),
+			// C-3：真 Promise resolve 才走 confirm（生产形态 undefined ⇒ unconfirmed，不会到达 confirm）
 			sendUserMessage: () => {
 				rmSync(claimPathFor(j.id), { force: true });
+				return Promise.resolve();
 			},
 		});
 		await flush(); // L3：confirm 核实 在 .then 微任务
@@ -313,7 +325,7 @@ try {
 		assert.equal(journalEvents("message.delivered").filter((e) => (e.payload as any)?.commandKey === "kj").length, 0, "零 delivered journal");
 		// 下轮自愈：fresh claim → 重投（at-least-once，目标端 dedupe 兑底）→ confirm 成功 → delivered
 		const injected9: string[] = [];
-		const rep2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => injected9.push(b), now: obNow() });
+		const rep2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => { injected9.push(b); return Promise.resolve(); }, now: obNow() });
 		await flush(); // L3：下轮自愈重投 在 .then 微任务
 		assert.deepEqual(rep2.consumed.filter((c) => c.outboxId === j.id).map((c) => c.action), ["delivered"]);
 		assert.equal(injected9.length, 1, "重投恰一次");
@@ -328,7 +340,7 @@ try {
 		writeOutboxItem(dir, old);
 		writeOutboxItem(dir, fresh);
 		const injected10: string[] = [];
-		const rep = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => injected10.push(b), now: obNow() });
+		const rep = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => { injected10.push(b); return Promise.resolve(); }, now: obNow() });
 		await flush(); // L3：新鲜项注入 + 回写 在 .then 微任务（expired 为同步 sweep）
 		assert.deepEqual(rep.consumed.filter((c) => c.outboxId === old.id).map((c) => c.action), ["expired"], "超龄 pending → expired");
 		assert.deepEqual(rep.consumed.filter((c) => c.outboxId === fresh.id).map((c) => c.action), ["delivered"], "新鲜项照常投递");
@@ -378,7 +390,7 @@ try {
 		const repM = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => undefined, now: obNow() });
 		assert.ok(repM.consumed.find((c) => c.outboxId === m.id && c.action === "skipped" && c.reason === "claimed-by-other"), "跨进程残留 claim → 让位");
 		backdateClaim(m.id);
-		const repM2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => undefined, now: obNow() });
+		const repM2 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: () => Promise.resolve(), now: obNow() });
 		await flush(); // L3：跨进程 stale 接管重投 在 .then 微任务
 		assert.ok(repM2.consumed.find((c) => c.outboxId === m.id && c.action === "delivered"), "跨进程 stale 接管 → 收敛 delivered");
 
@@ -472,7 +484,7 @@ try {
 			assert.ok(item && item.status === "pending");
 			// 桥（目标会话侧）消费 → delivered（第二段完成）
 			const injected: string[] = [];
-			const rep = consumeOutboxOnce({ sessionId: targetSid, stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => injected.push(b) });
+			const rep = consumeOutboxOnce({ sessionId: targetSid, stateDir: STATE, journalPath: JOURNAL, sendUserMessage: (b) => { injected.push(b); return Promise.resolve(); } });
 			await flush(); // L3：桥消费注入 + delivered 回写 在 .then 微任务
 			assert.deepEqual(rep.consumed.map((c) => c.action), ["delivered"]);
 			assert.equal(readOutboxItem(dir, item.id)!.status, "delivered");
@@ -513,6 +525,7 @@ try {
 		const send = (b: string) => {
 			if (busy) return Promise.reject(new Error("Agent is already processing a prompt."));
 			injected12.push(b);
+			return Promise.resolve(); // C-3：空闲路径交真 Promise ⇒ confirmed ⇒ delivered
 		};
 		// 第一次：busy → 不标记 delivered、保持 pending、释放 claim（.claiming.json 删除）
 		const rep12 = consumeOutboxOnce({ sessionId: "sid-A", stateDir: STATE, journalPath: JOURNAL, sendUserMessage: send, now: obNow() });

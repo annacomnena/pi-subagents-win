@@ -84,7 +84,8 @@ async function measureTickLatency(tickMs: number): Promise<number[]> {
 		consumeOutboxOnce({
 			sessionId: SESSION_ID,
 			stateDir: STATE,
-			sendUserMessage: () => { /* counted by outbox status change */ },
+			// C-3：交真 Promise（= 替换上下文路径）才走 delivered；生产 undefined ⇒ unconfirmed
+			sendUserMessage: () => { /* counted by outbox status change */ return Promise.resolve(); },
 		});
 		await flush(); // 微任务
 		const latency = Date.now() - t0;
@@ -112,7 +113,7 @@ async function measureEventDrivenLatency(): Promise<number[]> {
 				sessionStarted = true;
 				cb({}, { sessionManager: { sessionId: SESSION_ID } });
 			},
-			sendUserMessage: (_body) => { injectedCount++; },
+			sendUserMessage: (_body) => { injectedCount++; return Promise.resolve(); },
 		},
 		{ stateDir: STATE, intervalMs: 10_000 }, // 10s tick 兜底
 	);
@@ -133,7 +134,7 @@ async function measureEventDrivenLatency(): Promise<number[]> {
 		const item = readOutboxItem(dir, id);
 		if (item?.status !== "delivered") {
 			// 兜底：可能 in-flight 守卫拦截了（上轮 microtask 未清）→ 直接消费
-			consumeOutboxOnce({ sessionId: SESSION_ID, stateDir: STATE, sendUserMessage: () => { injectedCount++; } });
+			consumeOutboxOnce({ sessionId: SESSION_ID, stateDir: STATE, sendUserMessage: () => { injectedCount++; return Promise.resolve(); } });
 			await flush();
 		}
 	}
@@ -160,7 +161,7 @@ async function assertNoDuplicate(): Promise<void> {
 	writeOutboxItem(dir, item);
 
 	// 连续触发多次 consumeOutboxOnce（模拟 watch + tick 同时到达）
-	const send = (body: string) => { injectedCount++; injectedBodies.push(body); };
+	const send = (body: string) => { injectedCount++; injectedBodies.push(body); return Promise.resolve(); }; // C-3：真 Promise ⇒ delivered
 
 	consumeOutboxOnce({ sessionId: SESSION_ID, stateDir: STATE, sendUserMessage: send });
 	await flush();

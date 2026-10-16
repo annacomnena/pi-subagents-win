@@ -50,8 +50,11 @@ import {
 } from "./runtime/message-outbox.ts";
 import { piSessionAddress } from "./runtime/address.ts";
 import { claimInjection, confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
-import { injectFollowUpQuietly } from "./injection-gate.ts";
+import { injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
 import { isSubagent } from "./identity.ts";
+// C-3：outbox 项也锚到交付真账本（`outbox_<id>`），delivered 终态改由 `consumed` ACK 驱动。
+import { eventMarker } from "./delivery-ack.ts";
+import { appendTrace, defaultDeliveryDir, ensureEvent, listAcks, recordAttempt, terminalRevisionOf } from "./delivery-ledger.ts";
 
 export interface ConsumeOutboxOptions {
 	sessionId: string;
@@ -65,6 +68,8 @@ export interface ConsumeOutboxOptions {
 	sourceLabel?: string;
 	/** pending TTL（缺省 24h；测试注入更短触发 expired 扫描）。 */
 	pendingTtlMs?: number;
+	/** 交付账本目录（C-3；缺省 defaultDeliveryDir()，测试注入隔离目录）。 */
+	deliveryDir?: string;
 	now?: Date;
 }
 
@@ -120,8 +125,10 @@ function claimKeyFor(item: OutboxItem): string {
  * 重投逐字相同）——目标端据此幂等去重（at-least-once 的对偶约束）。正文逐字保留
  * （控制字符已由 executor payload 白名单拒绝）。
  */
-export function buildOutboxInjectBody(item: OutboxItem, sourceLabel = "Web Console 远程输入"): string {
-	return `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}`;
+export function buildOutboxInjectBody(item: OutboxItem, sourceLabel = "Web Console 远程输入", eventId?: string): string {
+	const base = `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}`;
+	// C-3：正文携带 eventId 标记 —— 接收端 `pi.on("context")` 才能检出它并写 `consumed` ACK。
+	return eventId ? `${base}\n${eventMarker(eventId)}` : base;
 }
 
 /**
@@ -164,6 +171,40 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 				report.consumed.push({ outboxId: item.id, action: "skipped", reason: "no-injector" });
 				continue;
 			}
+			// ── C-3：交付真账本关联（`outbox_<id>`），使命中可由接收端 ACK 驱动 ──
+			// 纪律：send 返回值**不是**送达证明（生产 `pi.sendUserMessage` 两级 delegate 都不 return
+			// ⇒ 恒 `undefined`）；delivered 终态由下方「ACK 驱动闭环」的 `consumed` ACK 决定。
+			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+			const terminalAt = item.createdAt;
+			let eventId: string | undefined;
+			try {
+				const { event } = ensureEvent(dDir, {
+					runId: `outbox_${item.id}`,
+					terminalRevision: terminalRevisionOf({
+						status: "pending", endedAt: terminalAt,
+						result: { status: "pending", text: item.text, outboxId: item.id },
+					}),
+					terminalSnapshotPath: join(dir, `${item.id}.json`),
+					dispatcherSessionId: opts.sessionId,
+					observedAt: now(),
+					terminalAt,
+				});
+				eventId = event.eventId;
+			} catch { /* 账本失败不阻断投递（best-effort；B 通道可从终态重建） */ }
+
+			// **ACK 驱动闭环（C-3 核心）**：既有 `consumed` ACK ⇒ 交付成立，补写 delivered。
+			// 这是唯一**不**依赖 send 返回值的成功路径，也是「unconfirmed 之后崩溃」的收敛点。
+			if (eventId) {
+				try {
+					if (listAcks(dDir, eventId).some((a) => a.stage === "consumed")) {
+						const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holderOf(opts.sessionId) });
+						if (marked !== null) appendBridgeJournalEvent("message.delivered", item, opts, { replayed: true });
+						report.consumed.push({ outboxId: item.id, action: "delivered", reason: "ack-consumed" });
+						continue;
+					}
+				} catch { /* 账本读失败：按未确认处理，继续正常投递路径 */ }
+			}
+
 			// 注入互斥（at-least-once 重试收敛；stale 10min / 同 holder 自取回接管）。刻意不走
 			// preInject：outbox 项按会话寻址（非 master 域），owner 压制不适用；claim 是唯一写入口。
 			const claim = claimInjection(claimKeyFor(item), holderOf(opts.sessionId));
@@ -182,7 +223,21 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 			// 之后**（.then 衔接，不改整条消费链 async，防竞态面扩大）。
 			const holder = holderOf(opts.sessionId);
 			const claimKey = claimKeyFor(item);
-			injectFollowUpQuietly(opts.sendUserMessage, buildOutboxInjectBody(item)).then((status) => {
+			// C-3：strict（缺省）下 `undefined ⇒ unconfirmed`，delivered 由 ACK 驱动（禁静默回退成 sent）。
+			const strict = deliveryStrictEnabled();
+			const attemptId = eventId ? `${eventId}@OB@${Date.now()}` : undefined;
+			injectFollowUpQuietly(opts.sendUserMessage, buildOutboxInjectBody(item, undefined, eventId), { strict }).then((status) => {
+				// 尝试入账（**只表示调过发送**；`sent` 也只是 attempted，不等于 delivered）
+				if (eventId && attemptId) {
+					try {
+						recordAttempt(dDir, eventId, {
+							attemptId, channel: "A", at: now(),
+							status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : status === "unconfirmed" ? "unconfirmed" : "no-injector",
+							leaseOwner: `OB:${process.pid}`, leaseUntil: new Date(Date.now() + 15_000).toISOString(),
+						});
+						if (status === "unconfirmed") appendTrace(dDir, { kind: "C3-attempted-unconfirmed", source: "outbox-bridge", outboxId: item.id, eventId });
+					} catch { /* best-effort */ }
+				}
 				if (status === "sent") {
 					// 必修 1：confirm 返回值必须核实——失败（收据未落地/claim 被他人接管）不回写
 					// delivered（防伪造终态）；留 pending 交下轮收据回放或重投（目标端 dedupe 幂等）。
@@ -207,6 +262,13 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 					const marked = markOutboxItem(dir, item.id, { status: "failed", at: now(), by: holder, error });
 					if (marked !== null) appendBridgeJournalEvent("message.failed", item, opts, { error });
 					report.consumed.push({ outboxId: item.id, action: "failed", reason: error });
+				} else if (status === "unconfirmed") {
+					// ── C-3：**不把返回值当送达**（P3）──────────────────────────────
+					// 生产形态（send 不 return）恒落此分支。不 confirm、不回写 delivered、**不释放**
+					// claim（消息可能已入 context；重投交给 10min 租约语义，防重复注入）。交付是否成立
+					// 完全由 `consumed` ACK 决定（见上方闭环）；60s 未 consumed ⇒ B 判 failed_delivery
+					// + incident；item 仍 pending，TTL 后转 expired（不产生永久孤儿）。
+					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "attempted-unconfirmed" });
 				} else {
 					// no-injector：原 skipped 路径（同步预检 typeof!==function 已 continue，理论不可达；双保险）。
 					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "no-injector" });
