@@ -103,7 +103,38 @@ export function postInject(ctx: InjectionContext, ok: boolean): void {
  *   - "failed"      其余 reject / 同步 throw（真实失败）→ 调用方走原失败路径（可 selfDisable）
  *   - "no-injector" send 非函数（host 进程 / 测试桩未接注入通道）→ 调用方走原 no-injector 路径
  */
-export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector";
+export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector" | "unconfirmed";
+
+/**
+ * 判定 send 的返回值是否**可信的已发送**证明。
+ *
+ * ## 为何需要这个判定（P3，已由异 provider 独立复算）
+ * 本机 Pi 的 `pi.sendUserMessage` **不是**底层方法，而是 `bindCore` 包装：
+ * `dist/core/agent-session.js:2644-2652` 的 wrapper
+ * ```js
+ * sendUserMessage: (content, options) => {
+ *   this.sendUserMessage(content, options).catch((err) => { runner.emitError({...}); });
+ * }   // ← 不 return 底层 Promise
+ * ```
+ * **底层 reject 时 wrapper 同步返回 `undefined`**（错误只进 emitError）⇒ 调用方看到的
+ * 是「无 rejection」，极易被误记成成功。底层确实会 reject（`agent-session.js:1485` busy、
+ * `:1468` compaction；对照：替换上下文交真 Promise `:3479`；类型声明 `agent-session.d.ts:569`
+ * 写明 `Promise<void>`）。
+ *
+ * ## 反面证据（防过度修，同样采纳）
+ * **不是所有 reject 都等于没发出去**：streaming 且 `deliverAs:"followUp"` 会入队后正常
+ * 返回（`agent-session.js:1489-1494`，且 `:1804` 说明 `streamingBehavior = options.deliverAs`）。
+ * 故本函数**不**把「任何非 Promise 返回值」一律判死；只在**返回值既不是 Promise 也不是
+ * 非空确证**时降级为 `unconfirmed`（诚实降级，咨询 §6.3.5）。
+ *
+ * 语义：`undefined`/`null` ⇒ **unconfirmed**（既不能证明发出、也不能证明失败）。
+ * 调用方 **不得**将 unconfirmed 当 sent/receipt（这正是 P3 的最小修法 ②）。
+ */
+export function classifySendReturn(value: unknown): "confirmed" | "unconfirmed" {
+	if (value === undefined || value === null) return "unconfirmed";
+	if (typeof (value as { then?: unknown }).then === "function") return "confirmed"; // 真 Promise ⇒ 由 then/catch 决定
+	return "confirmed"; // 其他非空返回值（如 {ok:true}）：视为同步确证
+}
 
 /**
  * 静默发送一条 followUp 注入并 await 其结果（L3 修复核心）。
@@ -123,19 +154,45 @@ export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector";
  * @param send  注入实现（生产接 pi.sendUserMessage，测试传 fake；undefined = 无注入通道）。
  *              形参用 `unknown` 兼容「类型 void / 运行时 Promise」的 sendUserMessage。
  * @param body  注入正文（字符串）。
+ * @param opts  `strict`（**P3，opt-in**）：`true` 时把「无可信确证」（wrapper 返回
+ *              `undefined` —— 本机 pi 的两级 delegate 都不 return，见 `classifySendReturn`）
+ *              降级为 `unconfirmed` 而不是 `sent`。
+ *
+ *              为何默认 `false`（**如实声明，不是偷懒**）：本机 pi 生产链恒返回 `undefined`
+ *              ⇒ 开严格模式后 **`sent` 分支永不发生**，所有既有调用点会从「已确认」变成
+ *              「未确认」⇒ 交付不再 confirm/ack（大面积重投）。
+ *              咨询 §6.3.5 的正解正是「最小诚实降级 = attempted-unconfirmed → failed_delivery；
+ *              需宿主适配后再开放自动接续保证」—— 但那需要同步改动 4 个调用点语义，
+ *              属重大行为变更，**待裁决后单独落地**。当前先提供可测的能力与回归，不静默改现状。
  */
 export function injectFollowUpQuietly(
 	send: ((body: string, opts?: { deliverAs?: string }) => unknown) | undefined,
 	body: string,
+	opts: { strict?: boolean } = {},
 ): Promise<InjectionSendStatus> {
 	if (typeof send !== "function") return Promise.resolve("no-injector");
-	return Promise.resolve()
-		.then(() => send(body, { deliverAs: "followUp" }))
-		.then(() => "sent")
-		.catch((e: unknown): InjectionSendStatus => {
-			const msg = e instanceof Error ? e.message : String(e);
-			return /already processing/i.test(msg) ? "busy" : "failed";
-		});
+	// ⚠ 实现要点：**不能**写 `.then(() => send(...)).then((ret) => …)` —— 链式 then 会
+	// **自动展平** send 返回的 Promise，`ret` 拿到的是 resolve 后的值（普通情况就是
+	// `undefined`），就无法区分「wrapper 未 return」与「真 Promise resolve」。
+	// 因此必须先在回调内**捕获原始返回值**，再决定是否 await。
+	let raw: unknown;
+	try {
+		raw = send(body, { deliverAs: "followUp" });
+	} catch (e) {
+		return Promise.resolve(classifyThrown(e));
+	}
+	// P3（strict）：wrapper 不 return 底层 Promise ⇒ 底层 reject 时我们只看到 `undefined`，
+	// 与成功形态无法区分 ⇒ 这类「无 rejection 也无确证」**不得**记 sent。
+	if (opts.strict === true && classifySendReturn(raw) === "unconfirmed") return Promise.resolve("unconfirmed");
+	return Promise.resolve(raw)
+		.then((): InjectionSendStatus => "sent")
+		.catch((e: unknown): InjectionSendStatus => classifyThrown(e));
+}
+
+/** 异常分类（busy 与 failed 的判定口径，两处共用）。 */
+function classifyThrown(e: unknown): InjectionSendStatus {
+	const msg = e instanceof Error ? e.message : String(e);
+	return /already processing/i.test(msg) ? "busy" : "failed";
 }
 
 export interface SuppressionRecord {

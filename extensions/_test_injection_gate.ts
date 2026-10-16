@@ -35,10 +35,14 @@ import { claimInjection, releaseInjectionClaim, hasNotificationReceipt } from ".
 const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 /** 跑 helper 并断言永不 reject（返回的 Promise 必须 resolve 出合法 status）。 */
-async function run(send: Parameters<typeof injectFollowUpQuietly>[0], body = "hi"): Promise<InjectionSendStatus> {
+async function run(
+	send: Parameters<typeof injectFollowUpQuietly>[0],
+	body = "hi",
+	opts: { strict?: boolean } = {},
+): Promise<InjectionSendStatus> {
 	let settled = false;
 	const status = await new Promise<InjectionSendStatus>((resolve, reject) => {
-		injectFollowUpQuietly(send, body).then(
+		injectFollowUpQuietly(send, body, opts).then(
 			(s) => { settled = true; resolve(s); },
 			(e) => reject(new Error(`helper 不应 reject，却 reject 了：${e instanceof Error ? e.message : String(e)}`)),
 		);
@@ -47,10 +51,31 @@ async function run(send: Parameters<typeof injectFollowUpQuietly>[0], body = "hi
 	return status;
 }
 
+// ── 0. P3 回归：wrapper 不 return ⇒ `undefined` **不得**当 sent（本组修前会红）──
+//
+// 事实（本仓自验探针 `scripts/_probe_p3_senduser_message.mjs` + 异 provider 独立复算）：
+//   loader.js:295（extension 实际拿到的 API）→ runtime → agent-session.js:2644 两级**都不 return**
+//   底层 Promise ⇒ 底层 reject 时调用方只见 `undefined`，与成功形态**无法区分**。
+//   故 `undefined` 必须降级为 `unconfirmed`（诚实降级，咨询 §6.3.5），**不得**当 sent/receipt。
+{
+	// 0a. 修前会红：`() => undefined` 旧期望 "sent"（那就是 P3 假阳性）
+	assert.equal(await run(() => undefined, "hi", { strict: true }), "unconfirmed", "**P3（strict）**：`undefined`（wrapper 假阳性）⇒ unconfirmed，不是 sent");
+	// 默认（strict 关）保持既有行为 ⇒ **零生产回归**（见下方 §0e 的如实声明）
+	assert.equal(await run(() => undefined), "sent", "默认（strict 关）保持既有行为：`undefined` ⇒ sent（承重假阳性，待裁决迁移）");
+	// 0b. 真实 Promise resolve ⇒ sent（这才是可信确证）
+	assert.equal(await run(() => Promise.resolve()), "sent", "真 Promise resolve → sent（可信）");
+	// 0c. 非空同步返回值（如 {ok:true}）⇒ 视为同步确证
+	assert.equal(await run(() => ({ ok: true }), "hi", { strict: true }), "sent", "非空同步返回值 → sent（同步确证）");
+	// 0d. null 与 undefined 同待遇（strict 下都不可信）
+	assert.equal(await run(() => null, "hi", { strict: true }), "unconfirmed", "null 同样不可当 sent（strict）");
+	// 0e. 如实声明：生产链（loader.js:295 + agent-session.js:2644 两级均不 return）
+	//     ⇒ `pi.sendUserMessage` 恒返回 undefined ⇒ 开 strict 后 sent 分支不可达。
+	//     这正是「假阳性承重」的可执行证据，也是本步只做 opt-in 的原因。
+	assert.equal(await run(() => undefined, "hi", { strict: true }), "unconfirmed", "生产形态（两级不 return）⇒ 恒 unconfirmed（strict）");
+}
+
 // ── 1. sent ────────────────────────────────────────────────────────────
 {
-	// 1a. 同步 void（测试桩常见形态）
-	assert.equal(await run(() => undefined), "sent", "同步 void → sent");
 	// 1b. 异步 resolve（真实 sendUserMessage idle 形态：返回 Promise）
 	assert.equal(await run(() => Promise.resolve()), "sent", "异步 resolve → sent");
 	// 1c. 异步 resolve（延迟一拍，模拟真实 turn 完成）
@@ -98,7 +123,8 @@ async function run(send: Parameters<typeof injectFollowUpQuietly>[0], body = "hi
 // ── 5. 永不 reject（各分支都 resolve）──────────────────────────────────
 {
 	const cases: Array<[Parameters<typeof injectFollowUpQuietly>[0], InjectionSendStatus]> = [
-		[() => undefined, "sent"],
+		[() => undefined, "sent"], // 默认（strict 关）：既有行为不变
+		[() => Promise.resolve(), "sent"],
 		[() => Promise.reject(new Error("already processing")), "busy"],
 		[() => Promise.reject(new Error("boom")), "failed"],
 		[() => { throw new Error("sync boom"); }, "failed"],
