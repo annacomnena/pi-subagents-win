@@ -1024,12 +1024,23 @@ async function runSingle(
 
 	// External CLI backends (claude / codex / agy / atomcode) — spawn local harness, not pi.
 	if (resolvedModel && isExternalCliModel(resolvedModel)) {
+		// C3：external CLI 分支在下方**提前 return**，建不到 pi 子进程路径的 wallTimer ⇒
+		// 必须在此单独解析并透传 `maxWallMs`（否则 `maxWallMs` 对 cli:* 静默无效 = 裁决 ① 的缺口）。
+		const __wallCli = resolveWallBudget(opts?.maxWallMs);
+		if (__wallCli.reject !== undefined) {
+			console.warn(`[subagent-win] maxWallMs 非法（${String(opts?.maxWallMs)}）：${__wallCli.reject} ⇒ 忽略（cli:* 不启用墙钟预算）`);
+			onUpdate?.("⚠ maxWallMs 非法", `${__wallCli.reject} ⇒ 忽略`);
+		}
+		if (__wallCli.envReject !== undefined) {
+			console.warn(`[subagent-win] PI_SUBAGENT_MAX_WALL_MS 非法（${String(process.env.PI_SUBAGENT_MAX_WALL_MS)}）：${__wallCli.envReject} ⇒ 忽略`);
+		}
 		const ext = await runExternalCli({
 			modelRef: resolvedModel,
 			task,
 			systemPrompt: finalPrompt || undefined,
 			thinking: resolvedThinking,
 			timeoutMs,
+			maxWallMs: __wallCli.ms,
 			signal,
 			cwd: workingDirectory,
 			agentName: agent?.name,

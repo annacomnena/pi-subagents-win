@@ -62,6 +62,18 @@ export interface RunExternalCliParams {
 	systemPrompt?: string;
 	thinking?: string;
 	timeoutMs?: number;
+	/**
+	 * **墙钟总预算**（ms，opt-in；缺省 undefined = 不启用，逐字节保持既有行为）。
+	 *
+	 * 与 `timeoutMs` 的区别（口径写死，与 `index.ts` 的 `runSingle` 一致）：
+	 * - `timeoutMs` = **停顿超时**：有输出就重置（本文件既有语义，未动）。
+	 * - `maxWallMs` = **墙钟总预算**：自 spawn 起算、**与是否有输出无关**，到点即终止。
+	 *
+	 * 到点行为：置 `failed` + `error="wall-budget-exceeded"` + kill（与 pi 子进程路径同构），
+	 * **不用 cancelled 语义**。C3 补丁：此前 external CLI 分支在 `runSingle` 内**提前 return**，
+	 * 永远建不到 wall timer ⇒ `maxWallMs` 对 `cli:*` 实际无效（本参数即为此缺口而加）。
+	 */
+	maxWallMs?: number;
 	signal?: AbortSignal;
 	cwd?: string;
 	agentName?: string;
@@ -697,6 +709,7 @@ async function runZcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		args,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs ?? 600000, // default 10 minutes
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		captureStdout: true, // plain stdout capture (same as agy / AtomCode)
@@ -763,6 +776,7 @@ async function runMimo(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		args: buildMimoArgs(taskPrompt, ctx.cwd),
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		onJsonLine: (event) => {
@@ -787,7 +801,7 @@ async function runMimo(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 
 // ── shared spawn runner ────────────────────────────────────────────────────
 
-interface StreamRunOptions {
+export interface StreamRunOptions {
 	backend: ExternalBackend;
 	command: string;
 	args: string[];
@@ -795,6 +809,8 @@ interface StreamRunOptions {
 	stdinText?: string;
 	cwd: string;
 	timeoutMs?: number;
+	/** 墙钟总预算（C3）：与 timeoutMs 并存、谁先到谁生效。 */
+	maxWallMs?: number;
 	signal?: AbortSignal;
 	onUpdate?: (status: string, text: string) => void;
 	/** Line-oriented JSON event handler (claude/codex). */
@@ -805,17 +821,25 @@ interface StreamRunOptions {
 	onChildSpawn?: (info: { pid: number; marker: string }) => void;
 }
 
-interface StreamRunOutcome {
+export interface StreamRunOutcome {
 	code: number | null;
 	signal: NodeJS.Signals | null;
 	stdout: string;
 	stderr: string;
 	timedOut: boolean;
 	aborted: boolean;
+	/** 墙钟总预算到点（C3）；与 timedOut 区分（stall vs wall）。 */
+	wallBudgetExceeded?: boolean;
 	oversizeError?: string;
 }
 
-function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
+/**
+ * 流式跑一个子进程。
+ *
+ * 导出而非私有：`_test_external_cli.ts` 需要**真实 spawn** 做「stall 不触发 vs wall 到点」的
+ * 决定性对照（用一个持续输出、永不自然退出的假后端）。这不是测试专用后门——它就是生产路径本身。
+ */
+export function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 	return new Promise((resolve) => {
 		const isWin = process.platform === "win32";
 		const child = spawn(opts.command, opts.args, {
@@ -836,6 +860,18 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 		let stdout = "";
 		let lineBuf = "";
 		let timedOut = false;
+		// ── 墙钟总预算（C3，opt-in）：自 spawn 起算，与是否有输出无关 ──
+		let wallTimer: ReturnType<typeof setTimeout> | null = null;
+		let wallBudgetExceeded = false;
+		if (typeof opts.maxWallMs === "number" && Number.isFinite(opts.maxWallMs) && opts.maxWallMs > 0) {
+			const ms = opts.maxWallMs;
+			wallTimer = setTimeout(() => {
+				wallBudgetExceeded = true;
+				opts.onUpdate?.("⏱ wall-budget", `budget ${Math.round(ms / 1000)}s exhausted (${opts.backend}); killing`);
+				kill();
+			}, ms);
+		}
+		const clearWallTimer = () => { if (wallTimer) { clearTimeout(wallTimer); wallTimer = null; } };
 		let oversizeError: string | undefined;
 		let forceKill: ReturnType<typeof setTimeout> | null = null;
 
@@ -954,6 +990,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 
 		child.on("error", (err) => {
 			if (stallTimer) clearTimeout(stallTimer);
+			clearWallTimer();
 			if (forceKill) clearTimeout(forceKill);
 			if (heartbeat) clearInterval(heartbeat);
 			resolve({
@@ -962,6 +999,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 				stdout,
 				stderr: err.message,
 				timedOut,
+				wallBudgetExceeded,
 				aborted: Boolean(opts.signal?.aborted),
 				oversizeError,
 			});
@@ -969,6 +1007,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 
 		child.on("close", (code, signal) => {
 			if (stallTimer) clearTimeout(stallTimer);
+			clearWallTimer();
 			if (forceKill) clearTimeout(forceKill);
 			if (heartbeat) clearInterval(heartbeat);
 			if (!opts.captureStdout && lineBuf.trim()) {
@@ -981,6 +1020,7 @@ function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 				stdout,
 				stderr: stderrBuffer.text(),
 				timedOut,
+				wallBudgetExceeded,
 				aborted: Boolean(opts.signal?.aborted),
 				oversizeError,
 			});
@@ -1077,6 +1117,7 @@ async function runClaude(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		stdinText: ctx.task,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		onJsonLine: (event) => {
@@ -1121,6 +1162,7 @@ async function runCodex(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		stdinText: ctx.task,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		onJsonLine: (event) => {
@@ -1168,6 +1210,7 @@ async function runAgy(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 		args,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		captureStdout: true,
@@ -1200,6 +1243,7 @@ async function runAtomcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> 
 		args: buildAtomcodeArgs(taskPrompt),
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
+		maxWallMs: ctx.maxWallMs,
 		signal: ctx.signal,
 		onUpdate: ctx.onUpdate,
 		captureStdout: true,
@@ -1242,6 +1286,13 @@ function finishStreamResult(opts: {
 	if (outcome.timedOut) {
 		base.status = "failed";
 		base.error = "timeout";
+		base.text = opts.resultText.trim();
+		return base;
+	}
+	// C3：墙钟总预算到点（**优先于非 0 退出**，与 pi 子进程路径口径一致；不用 cancelled）
+	if (outcome.wallBudgetExceeded) {
+		base.status = "failed";
+		base.error = "wall-budget-exceeded";
 		base.text = opts.resultText.trim();
 		return base;
 	}
