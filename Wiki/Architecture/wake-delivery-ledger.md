@@ -50,8 +50,8 @@ C 序列实现 + 两轮独立复核）。
 - **A 快通道**：`async-result-watcher.ts`（fs.watch + 10s tick）→ 注入并记 attempt（`channel:"A"`）。
 - **B 对账通道**：`delivery-reconciler.ts` —— 模块头明示**不 import watcher**（不共享 selfDisabled/seen/.notified），
   只读权威终态 JSON + 账本；`scanTerminalRuns` 公平分页 round-robin（`:100-133`）。
-- **⚠ 生产接线状态（2026-10-16 核实）**：B **尚未接线生产**（`index.ts` 对 `reconcileOnce`/`delivery-reconciler`
-  零引用）⇒ **运行时当前只有 A 一层**；接线前不得宣称「双通道运行时」，60s 升级亦不会在生产实际发生。
+- **⚠ 生产接线状态（2026-10-16 切片 1）**：B 已接线 **runtime-host**（`runtime-host/delivery-reconciler-loop.ts`，由 `server.ts` 随 host 起停；kill switch `PI_DELIVERY_RECONCILER=0`；cursor 持久化 `state/delivery-reconciler.json`）。
+  **仍不得宣称「双通道运行时」**：**host 为 opt-in（默认 OFF）** ⇒ host 不在时 B 缺席；`degraded(reconciler-host-down)` 可见面属**切片 2（未做）**。
 - **共同故障域（不得宣称全链路双活）**：A/B 最终都走同一个 Pi 注入器（`loader.js:295-297` +
   `agent-session.js:2644-2652`）；且 `consumed` ACK 的唯一生产写点在 watcher 的 `pi.on("context")` 钩子
   ⇒ 接收会话未部署本扩展时两条通道同时失去 consumed 证据。
