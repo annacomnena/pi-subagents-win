@@ -18,6 +18,7 @@ import type {
 	SessionsBody,
 	TimelineResponse,
 	TranscriptBody,
+	UploadResult,
 	WechatBindStartBody,
 	WechatBindStatusBody,
 	WechatQrImageBody,
@@ -200,15 +201,28 @@ export const api = {
 
 	/** G6-P2：session.message（to=pi://<sessionId>；payload {text} 1..8000 字节）。
 	 *  同源 cookie 认证（P2 起写端点 fail-closed；dev 由 vite proxy 注入）。 */
-	sessionMessage: (sessionId: string, text: string): Promise<FetchResult<CommandOutcomeBody>> =>
+	sessionMessage: (sessionId: string, text: string, attachments?: string[]): Promise<FetchResult<CommandOutcomeBody>> =>
 		postJson<CommandOutcomeBody>("/v1/commands", {
 			frame: "command",
 			type: "session.message",
 			to: `pi://${sessionId}`,
 			commandKey: newCommandKey("msg"),
 			issuedAt: new Date().toISOString(),
-			payload: { text },
+			// GUI 图片输入 S2：attachments = 上传 id 列表（图不内联；服务端落 outbox 时转绝对路径）
+			payload: attachments !== undefined && attachments.length > 0 ? { text, attachments } : { text },
 		} satisfies CommandFrameInput, 8000),
+
+	/**
+	 * GUI 图片输入 S1：上传**原始图片字节**到 /v1/uploads（同源 cookie 鉴权同 /v1/commands）。
+	 * 不走 postJson（那会把图片 base64 进 JSON，白白胀 33% 且绕不过 64KB 命令护栏）；
+	 * 失败沿用 FetchResult 判别联合（never-throw）。
+	 */
+	uploadImage: (file: Blob): Promise<FetchResult<UploadResult>> =>
+		fetchJson<UploadResult>("/v1/uploads", {
+			method: "POST",
+			headers: { "content-type": file.type || "application/octet-stream" },
+			body: file,
+		}, 20000),
 
 	// ── G6-P1：sessions / transcript（只读数据面；WS 增量之外的 HTTP 兜底）──
 

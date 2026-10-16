@@ -62,6 +62,7 @@ import {
 } from "./runtime/message-outbox.ts";
 import {
 	buildOutboxInjectBody,
+	attachmentBlock,
 	consumeOutboxOnce,
 	registerOutboxBridge,
 } from "./outbox-bridge.ts";
@@ -549,6 +550,41 @@ try {
 		assert.deepEqual(rep12c.consumed.filter((c) => c.outboxId === k.id).map((c) => c.action), ["delivered"], "空闲后重投 delivered");
 		assert.equal(injected12.length, 1, "空闲后恰一次注入");
 		assert.equal(readOutboxItem(dir, k.id)!.status, "delivered", "回写 delivered");
+	}
+
+	// ── GUI 图片输入 S3：注入正文带附件**路径块**（不内联 base64）──
+	{
+		const dir = mkdtempSync(join(tmpdir(), "msg-outbox-att-"));
+		DIRS.push(dir);
+		const withAtt = newOutboxItem({
+			dedupeKey: "session.message:att-1",
+			commandKey: "att-1",
+			to: piSessionAddress("sid-att"),
+			sessionId: "sid-att",
+			text: "看一下这张图",
+			attachments: ["C:\\rt\\uploads\\up_a1.png", "C:\\rt\\uploads\\up_b2.jpg"],
+			now: new Date(),
+		});
+		writeOutboxItem(dir, withAtt);
+		const body = buildOutboxInjectBody(withAtt, undefined, "ev_att");
+		assert.ok(body.includes("看一下这张图"), "正文保留");
+		assert.ok(body.includes("[用户上传图片 2 张"), `附件块头存在：${body}`);
+		assert.ok(body.includes("1. C:\\rt\\uploads\\up_a1.png"), "附件路径 1 逐字出现");
+		assert.ok(body.includes("2. C:\\rt\\uploads\\up_b2.jpg"), "附件路径 2 逐字出现");
+		assert.ok(!/base64|data:image/i.test(body), "正文无 base64/data:image（用户口径：不进 jsonl）");
+		assert.ok(body.includes("read"), "明确告知用 read 工具取图");
+		// 反例：无附件时正文与旧式**逐字相同**（零行为变更，向后兼容）
+		const noAtt = newOutboxItem({
+			dedupeKey: "session.message:att-0",
+			commandKey: "att-0",
+			to: piSessionAddress("sid-att"),
+			sessionId: "sid-att",
+			text: "纯文本",
+			now: new Date(),
+		});
+		assert.equal(buildOutboxInjectBody(noAtt, "Web Console 远程输入"), `（Web Console 远程输入｜dedupe:outbox:${noAtt.id}）\n纯文本`, "无附件 → 旧格式逐字不变");
+		assert.equal(attachmentBlock(undefined), "", "attachmentBlock(undefined) = 空串");
+		assert.equal(attachmentBlock([]), "", "attachmentBlock([]) = 空串");
 	}
 } finally {
 	for (const d of DIRS) {

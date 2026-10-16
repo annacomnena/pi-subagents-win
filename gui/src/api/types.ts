@@ -322,6 +322,15 @@ export interface CommandFrameInput {
 	payload?: Record<string, unknown>;
 }
 
+/** GUI 图片输入 S1：POST /v1/uploads 回执（图只落盘；会话里只出现路径）。 */
+export interface UploadResult {
+	uploadId: string;
+	/** 服务端落盘绝对路径（仅本机 GUI 可见；不进会话日志）。 */
+	path: string;
+	bytes: number;
+	mediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+}
+
 export type CommandOutcomeBody =
 	| { status: "accepted"; summary: string; replayed: boolean }
 	| { status: "rejected"; reason: string; detail?: string; replayed: boolean }

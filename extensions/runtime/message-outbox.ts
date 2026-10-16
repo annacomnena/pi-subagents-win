@@ -59,6 +59,8 @@ export interface OutboxItem {
 	sessionId: string;
 	/** 消息正文（1..8000 UTF-8 字节；校验在 executor payload 白名单）。 */
 	text: string;
+	/** GUI 图片输入 S2：附件**绝对路径**列表（图不内联；桥在正文里给路径，agent 用 `read` 自取）。 */
+	attachments?: string[];
 	reason?: string;
 	status: OutboxStatus;
 	createdAt: string;
@@ -158,6 +160,7 @@ export function newOutboxItem(input: {
 	to: ObjectAddress;
 	sessionId: string;
 	text: string;
+	attachments?: string[];
 	reason?: string;
 	now: Date;
 }): OutboxItem {
@@ -176,6 +179,7 @@ export function newOutboxItem(input: {
 		createdAt: at,
 		updatedAt: at,
 	};
+	if (input.attachments !== undefined && input.attachments.length > 0) item.attachments = input.attachments;
 	if (input.reason !== undefined) item.reason = input.reason;
 	return item;
 }

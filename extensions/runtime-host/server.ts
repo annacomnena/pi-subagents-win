@@ -119,7 +119,7 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
-import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload } from "./uploads.ts";
+import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 import { piSessionAddress } from "../runtime/address.ts";
 import {
@@ -771,6 +771,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					journalPath: opts.journalPath,
 					configPath,
 					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）。
+					// GUI 图片输入 S2：附件 id → 绝对路径的解析根（与 /v1/uploads 落盘根**同源**）。
+					uploadsDir: uploadsDir(uploadsRuntimeDir),
 					// R1 注：TOCTOU（预检活→执行时死）落 post-claim 旧护栏 409 会占 key，同 key 重试重放 409，需换 key（fail-closed；claim 顺序不动）。
 					...(trustedMasterInjection !== undefined ? { trustedMasterInjection } : {}),
 				});

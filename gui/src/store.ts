@@ -198,7 +198,7 @@ interface GuiState {
 	/** outbox 主题续传指针（journal seq/epoch/gen 同机）。 */
 	chatOutboxHead: TranscriptHead | null;
 	/** 会话页输入框发送（POST /v1/commands session.message；never-throw，拒绝/失败落 failed/rejected）。 */
-	sendChatMessage: (sessionId: string, text: string) => Promise<void>;
+	sendChatMessage: (sessionId: string, text: string, attachments?: string[]) => Promise<void>;
 	pollChatSessions: () => Promise<void>;
 	openChatSession: (id: string) => Promise<void>;
 	reloadChatSession: (id: string) => Promise<void>;
@@ -405,11 +405,12 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatOutbox: {},
 	chatOutboxHead: null,
 
-	sendChatMessage: async (sessionId, text) => {
+	sendChatMessage: async (sessionId, text, attachments) => {
 		const commandKey = `gui_msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+		// GUI 图片输入 S2：附件只带 id（图已落盘；正文由服务端拼路径）；两段回执行仍展示正文
 		const entry: ChatOutboxEntry = { commandKey, sessionId, text, status: "sending", at: new Date().toISOString() };
 		set({ chatOutbox: { ...get().chatOutbox, [commandKey]: entry } });
-		const r = await api.sessionMessage(sessionId, text);
+		const r = await api.sessionMessage(sessionId, text, attachments);
 		const cur = get().chatOutbox[commandKey];
 		if (cur === undefined) return; // 已被裁剪（理论不发生）
 		if (!r.ok) {

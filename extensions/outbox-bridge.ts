@@ -135,8 +135,14 @@ function claimKeyFor(item: OutboxItem): string {
  * 重投逐字相同）——目标端据此幂等去重（at-least-once 的对偶约束）。正文逐字保留
  * （控制字符已由 executor payload 白名单拒绝）。
  */
+export function attachmentBlock(paths: string[] | undefined): string {
+	if (paths === undefined || paths.length === 0) return "";
+	const lines = paths.map((p, i) => `${i + 1}. ${p}`).join("\n");
+	return `\n\n[用户上传图片 ${paths.length} 张；图片未内联在会话里，需要时用 read 工具按下列路径读取]\n${lines}`;
+}
+
 export function buildOutboxInjectBody(item: OutboxItem, sourceLabel = "Web Console 远程输入", eventId?: string): string {
-	const base = `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}`;
+	const base = `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}${attachmentBlock(item.attachments)}`;
 	// C-3：正文携带 eventId 标记 —— 接收端 `pi.on("context")` 才能检出它并写 `consumed` ACK。
 	return eventId ? `${base}\n${eventMarker(eventId)}` : base;
 }

@@ -15,7 +15,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench } from "lucide-react";
+import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench, X } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
 import { usePoll } from "../usePoll";
@@ -27,6 +27,17 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/colla
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import type { ChatOutboxEntry, TranscriptRow } from "../api/types";
 import type { StreamSubscribeMsg } from "../api/types";
+import { api } from "../api/client";
+import {
+	attachmentIds,
+	canSendMessage,
+	candidatesFrom,
+	formatBytes,
+	pickAttachments,
+	rejectHint,
+	type AttachmentItem,
+	type FileListLike,
+} from "../composerAttachments";
 
 // 回看 mask 渐隐常数（ConversationTimeline.tsx#L99-100）
 const COMPOSER_MESSAGE_MASK_FADE_PX = 24;
@@ -252,6 +263,18 @@ export function ChatPage() {
 	const outboxMap = useGui((s) => s.chatOutbox);
 	const [draft, setDraft] = useState("");
 	const [dragging, setDragging] = useState(false);
+	// GUI 图片输入 S4：输入框内的图片附件（Ctrl+V 粘贴 / 拖放 / 选择文件）
+	const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
+	const [attachHint, setAttachHint] = useState<string | null>(null);
+	const fileRef = useRef<HTMLInputElement | null>(null);
+	// 本地预览 URL 释放（移除/卸载时）——防 memory leak；不在渲染期 revoke（会黑图）
+	useEffect(() => {
+		return () => {
+			for (const a of attachments) URL.revokeObjectURL(a.previewUrl);
+		};
+		// 仅在卸载时清全部（逐张移除在 removeAttachment 里即时 revoke）
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
 
 	// gui:dev 的本机 Vite proxy 在上游注入 cookie；浏览器不持有 token。
 	const url = useMemo(() => streamUrl(null), []);
@@ -420,13 +443,54 @@ export function ChatPage() {
 	};
 
 	// L3 窄路径：master 会话经本机受信通道可注入（服务端三证据门；离线回 409 master-offline）。
-	const canSend = activeId !== null && draft.trim().length > 0;
+	const canSend = activeId !== null && canSendMessage(draft, attachments);
+
+	/** 接收一批图片（粘贴/拖放/选择共用）：本地上预览 + 并行上传，逐条拒绝给理由。 */
+	const acceptFiles = (files: FileListLike): void => {
+		const candidates = candidatesFrom(files);
+		if (candidates.length === 0) return;
+		const { accept, rejected } = pickAttachments(attachments, candidates);
+		setAttachHint(rejected.length > 0 ? rejected.map(rejectHint).join("；") : null);
+		if (accept.length === 0) return;
+		const items: AttachmentItem[] = accept.map(({ file, name }) => ({
+			previewUrl: URL.createObjectURL(file as unknown as Blob),
+			name,
+			bytes: file.size,
+			uploadId: null,
+		}));
+		setAttachments((prev) => [...prev, ...items]);
+		// 上传（每张独立失败）：成功才填 uploadId；失败在缩略图上标错并允许删除重试
+		items.forEach((item, i) => {
+			void api.uploadImage(accept[i].file as unknown as Blob).then((r) => {
+				setAttachments((prev) =>
+					prev.map((a) =>
+						a.previewUrl === item.previewUrl
+							? r.ok
+								? { ...a, uploadId: r.data.uploadId }
+								: { ...a, uploadId: null, previewUrl: a.previewUrl, name: `${a.name}（上传失败）` }
+							: a,
+					),
+				);
+				if (!r.ok) setAttachHint(`上传失败（${r.status}）：${r.status === 413 ? "单张超过 5MiB，请压缩" : "请重试"}`);
+			});
+		});
+	};
+
+	const removeAttachment = (previewUrl: string): void => {
+		URL.revokeObjectURL(previewUrl);
+		setAttachments((prev) => prev.filter((a) => a.previewUrl !== previewUrl));
+		setAttachHint(null);
+	};
 
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
-		if (text.length === 0 || activeId === null) return;
+		if (activeId === null || !canSendMessage(draft, attachments)) return;
+		const ids = attachmentIds(attachments);
 		setDraft("");
-		await useGui.getState().sendChatMessage(activeId, text);
+		for (const a of attachments) URL.revokeObjectURL(a.previewUrl);
+		setAttachments([]);
+		setAttachHint(null);
+		await useGui.getState().sendChatMessage(activeId, text, ids.length > 0 ? ids : undefined);
 	};
 
 	return (
@@ -491,7 +555,9 @@ export function ChatPage() {
 								onDragLeave={() => setDragging(false)}
 								onDrop={(e) => {
 									e.preventDefault();
-									setDragging(false); // 附件拖放无后端：占位高亮，落点不接收
+									setDragging(false);
+									// GUI 图片输入 S4：拖进来的图片走与粘贴同一条链（本地预览 + 上传）
+									acceptFiles(e.dataTransfer?.files ?? null);
 								}}
 								className={`relative flex flex-col gap-3 overflow-hidden rounded-xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:!border-input-border-focused ${
 									dragging ? "border-accent bg-input" : ""
@@ -500,13 +566,51 @@ export function ChatPage() {
 								{dragging && (
 									<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-accent/15 backdrop-blur-sm">
 										<div className="flex items-center gap-2 rounded-full border border-accent/40 bg-card px-4 py-2 text-ui-base text-foreground shadow-overlay">
-											<span>附件拖放未接入</span>
+											<span>松手即添加图片（png / jpeg / webp / gif，≤4 张）</span>
 										</div>
 									</div>
+								)}
+								{/* S4 缩略图行：粘贴/拖放/选择后的图片（可逐张删除；未传完不可发） */}
+								{attachments.length > 0 && (
+									<div className="flex flex-wrap items-start gap-2" data-composer-attachments="1">
+										{attachments.map((a) => (
+											<div key={a.previewUrl} className="group/thumb relative">
+												<img
+													src={a.previewUrl}
+													alt={a.name}
+													title={`${a.name}（${formatBytes(a.bytes)}）`}
+													className="size-16 rounded-lg border border-border object-cover"
+												/>
+												{a.uploadId === null && (
+													<span className="absolute inset-x-0 bottom-0 rounded-b-lg bg-card/85 text-center text-ui-xs text-foreground-subtle">上传中…</span>
+												)}
+												<button
+													type="button"
+													onClick={() => removeAttachment(a.previewUrl)}
+													aria-label={`删除附件 ${a.name}`}
+													title="删除这张图片"
+													className="absolute -right-1.5 -top-1.5 rounded-full border border-border bg-card p-0.5 text-foreground-subtle opacity-0 transition-opacity hover:text-foreground group-hover/thumb:opacity-100 focus:opacity-100"
+												>
+													<X className="size-3" />
+												</button>
+											</div>
+										))}
+									</div>
+								)}
+								{attachHint !== null && (
+									<p className="text-ui-sm text-foreground-subtle" role="status">{attachHint}</p>
 								)}
 								<textarea
 									value={draft}
 									onChange={(e) => setDraft(e.target.value)}
+									onPaste={(e) => {
+										// GUI 图片输入 S4：Ctrl+V 粘贴图片（剪贴板有图 → 拦截默认；纯文字 → 放行给浏览器）
+										const files = e.clipboardData?.files ?? null;
+										if (files !== null && files.length > 0) {
+											e.preventDefault();
+											acceptFiles(files);
+										}
+									}}
 									onKeyDown={(e) => {
 										if (e.key === "Enter" && !e.shiftKey) {
 											e.preventDefault();
@@ -527,17 +631,32 @@ export function ChatPage() {
 								<div className="group/toolbar flex items-end gap-3">
 									<div className="flex min-w-0 flex-1 items-center">
 										<div className="flex shrink-0 items-center gap-1">
-											{/* 加号钮灰显占位（拍板 1：保工具栏骨架 1:1） */}
+											{/* S4：加号钮 = 选图入口（隐藏 file input；Ctrl+V 粘贴 / 拖放同样可用） */}
+											<input
+												ref={fileRef}
+												type="file"
+												accept="image/png,image/jpeg,image/webp,image/gif"
+												multiple
+												hidden
+												onChange={(e) => {
+													acceptFiles(e.target.files);
+													e.target.value = ""; // 同一文件可重复选
+												}}
+											/>
 											<Tooltip>
 												<TooltipTrigger asChild>
-													{/* disabled 原生 button 不派发 hover；包裹层只承接 Tooltip，不接任何动作。 */}
-													<span className="inline-flex">
-														<Button type="button" variant="ghost" size="icon-md" disabled aria-label="附件与命令（未接入）">
-															<Plus className="size-4" />
-														</Button>
-													</span>
+													<Button
+														type="button"
+														variant="ghost"
+														size="icon-md"
+														aria-label="添加图片"
+														disabled={activeId === null}
+														onClick={() => fileRef.current?.click()}
+													>
+														<Plus className="size-4" />
+													</Button>
 												</TooltipTrigger>
-												<TooltipContent>未接入（附件 / mention / slash 面板无后端）</TooltipContent>
+												<TooltipContent>添加图片（也可直接 Ctrl+V 粘贴或拖进来；png / jpeg / webp / gif）</TooltipContent>
 											</Tooltip>
 											<ConnBadge conn={conn} />
 										</div>

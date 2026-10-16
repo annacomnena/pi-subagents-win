@@ -132,7 +132,10 @@ assert.ok(chat.includes("cursor-pointer gap-1 rounded-lg bg-accent text-ui-base 
 assert.ok(chat.includes("<ArrowUp className=\"size-4\" />"), "发送钮 ArrowUp icon-md");
 assert.ok(chat.includes("group/toolbar flex items-end gap-3"), "工具栏行");
 assert.ok(chat.includes("Square className=\"size-4 fill-current\""), "Stop 钮灰显占位（secondary + Square fill-current）");
-assert.equal((chat.match(/<span className="inline-flex">/g) ?? []).length >= 2, true, "加号/Stop 的 disabled button 由无动作 span 承接 Tooltip hover");
+// 2026-10-16 S4 图片输入：加号钮从「灰显占位」改为**真实入口**（选图/粘贴/拖放），
+// 仅 Stop 仍为无动作 span 承接 Tooltip hover；同时断言加号已接上图片选择链。
+assert.equal((chat.match(/<span className="inline-flex">/g) ?? []).length >= 1, true, "Stop 的 disabled button 由无动作 span 承接 Tooltip hover");
+assert.ok(chat.includes('aria-label="添加图片"') && chat.includes("fileRef.current?.click()"), "加号钮 = 选图入口（S4，不再是占位）");
 assert.ok(chat.includes('sendChatMessage'), "发送链复用 sendChatMessage（零改动）");
 assert.ok(chat.includes("e.key === \"Enter\" && !e.shiftKey"), "Enter 发送 / Shift+Enter 换行");
 assert.ok(chat.includes("Master 会话拒绝远程输入"), "masterProtected 禁输入文案保留");
@@ -170,7 +173,8 @@ const offenders = files.filter((f) => RAW.test(readFileSync(f, "utf8")));
 assert.deepEqual(offenders, [], `raw 调色板类全退役（zinc-/amber-/blue-9/emerald-）：${offenders.join(",")}`);
 const store = read("store.ts");
 assert.ok(store.includes("sidebarCollapsed"), "store 附加 sidebarCollapsed（折叠动画数据源）");
-assert.ok(store.includes("sendChatMessage: async (sessionId, text)") && store.includes("api.sessionMessage"), "发送链 P2 契约零改动");
+// 2026-10-16 S4：发送链签名新增可选 attachments（图片输入）——契约仍成立：仍是 sendChatMessage → api.sessionMessage。
+assert.ok(store.includes("sendChatMessage: async (sessionId, text, attachments)") && store.includes("api.sessionMessage(sessionId, text, attachments)"), "发送链 P2 契约（+S4 可选 attachments）");
 ok("7 收尾：raw palette=0 / store 折叠字段 / 发送链零改动");
 
 console.log(`\nall ${n} groups passed — ZCode 1:1 复刻布局冒烟`);

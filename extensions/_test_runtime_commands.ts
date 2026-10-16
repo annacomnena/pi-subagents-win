@@ -736,6 +736,36 @@ try {
 		const itemWs = listOutboxItems(obDir).find((it) => it.commandKey === "sm-wschars")!;
 		assert.equal(itemWs.text, "line1\nline2\ttab\rcr", "正文逐字保留");
 
+		// ── GUI 图片输入 S2：attachments（上传 id → 绝对路径）──
+		{
+			const upDir = join(ROOT, "uploads-sm");
+			mkdirSync(upDir, { recursive: true });
+			const upId = "up_AbCdEf123456";
+			writeFileSync(join(upDir, `${upId}.png`), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+			const execUp = (key: string, payload: unknown) =>
+				exec(sm(key, piSessionAddress(targetSid), payload as Record<string, unknown>), { stateDir: SM, journalPath: J11, sessionsDir, uploadsDir: upDir });
+			const before = outboxCount();
+			// ① 正常附件：接受 + outbox 记**绝对路径**（不记 base64）
+			const rAtt = execUp("sm-att", { text: "看一下这张图", attachments: [upId] });
+			assert.ok(rAtt.status === "accepted", `附件消息 accepted：${JSON.stringify(rAtt)}`);
+			const attItem = listOutboxItems(obDir).find((it) => it.commandKey === "sm-att")!;
+			assert.deepEqual(attItem.attachments, [join(upDir, `${upId}.png`)], "outbox 记绝对路径");
+			assert.ok(!JSON.stringify(attItem).includes("base64"), "outbox 无 base64 字样（不内联）");
+			assert.ok(JSON.stringify(attItem).length < 2048, "outbox 项仍小（只带路径）");
+			// ② 只剩图、无正文：允许（粘图直接回车）
+			const rImgOnly = execUp("sm-att-notext", { text: "", attachments: [upId] });
+			assert.ok(rImgOnly.status === "accepted", `空正文 + 有附件 → accepted：${JSON.stringify(rImgOnly)}`);
+			// ③ 反例：附件 id 形状非法（路径穿越/非字符串/条数超限）→ invalid-payload
+			assert.equal(execUp("sm-att-trav", { text: "x", attachments: ["../../etc/passwd"] }).reason, "invalid-payload", "路径穿越形状拒收");
+			assert.equal(execUp("sm-att-num", { text: "x", attachments: [123] }).reason, "invalid-payload", "非字符串 id 拒收");
+			assert.equal(execUp("sm-att-arr", { text: "x", attachments: "up_abcdef" }).reason, "invalid-payload", "attachments 非数组拒收");
+			assert.equal(execUp("sm-att-5", { text: "x", attachments: Array.from({ length: 5 }, () => upId) }).reason, "invalid-payload", "超 4 张拒收");
+			// ④ 反例：id 形状合法但文件不存在 → 专用 reason attachment-missing（不静默丢弃、不占 outbox）
+			const rGone = execUp("sm-att-gone", { text: "x", attachments: ["up_ZZZZZZZZZZZZ"] });
+			assert.ok(rGone.status === "rejected" && rGone.reason === "attachment-missing", `缺失附件 → attachment-missing：${JSON.stringify(rGone)}`);
+			assert.equal(outboxCount(), before + 2, "仅两条合法附件消息落 outbox（拒收零落盘）");
+		}
+
 		// happy path：accepted → outbox pending 落盘 + journal queued；正文不进 journal
 		const jBefore = listRuntimeEnvelopes({ path: J11 }).envelopes;
 		const rOk = exec(sm("sm-ok", piSessionAddress(targetSid), msg("你好，远程会话", { reason: "gui" })), { stateDir: SM, journalPath: J11, sessionsDir });

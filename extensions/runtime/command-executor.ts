@@ -42,7 +42,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { masterAddress, parseObjectAddress, type ObjectAddress } from "./address.ts";
@@ -50,6 +50,7 @@ import { newEventEnvelope } from "./envelope.ts";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
 import { readLiveness } from "./liveness.ts";
 import { DEFAULT_MASTER_SUCCESSION, normalizeMasterSuccession } from "./master-auto.ts";
+import { uploadIdOk, UPLOAD_MAX_PER_MESSAGE } from "../runtime-host/uploads.ts";
 import {
 	newOutboxItem,
 	outboxDir,
@@ -119,6 +120,9 @@ export interface ExecuteCommandOptions {
 	commandsDir?: string;
 	/** G6-P2：pi sessions 根目录（session.message 存在性校验用；缺省 defaultSessionsDir()）。 */
 	sessionsDir?: string;
+	/** GUI 图片输入 S2：上传落盘目录（`<runtimeDir>/uploads`；session.message 附件解析用；
+	 *  缺省 `<defaultRuntimeDir()>/uploads`，与 server 侧上传端点同源）。 */
+	uploadsDir?: string;
 	/** L3 窄路径：本机受信 GUI→当前 master owner 会话的唯一例外。缺省（undefined）=
 	 *  通道不存在，master owner 目标一律 403 master-session-protected（旧行为）。 */
 	trustedMasterInjection?: TrustedMasterInjectionPolicy;
@@ -274,9 +278,25 @@ function sessionMessagePayloadOk(payload: unknown): boolean {
 	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
 	const rec = payload as Record<string, unknown>;
 	for (const key of Object.keys(rec)) {
-		if (key !== "text" && key !== "reason") return false; // 封闭字段集
+		if (key !== "text" && key !== "reason" && key !== "attachments") return false; // 封闭字段集
 	}
-	if (typeof rec.text !== "string" || !sessionMessageTextOk(rec.text)) return false;
+	// GUI 图片输入 S2：attachments = 上传 id 列表（≤4，形状校验；存在性在 executor 解析时判）。
+	let attachments: unknown[] = [];
+	if (rec.attachments !== undefined) {
+		if (!Array.isArray(rec.attachments)) return false;
+		if (rec.attachments.length > UPLOAD_MAX_PER_MESSAGE) return false;
+		for (const id of rec.attachments) {
+			if (typeof id !== "string" || !uploadIdOk(id)) return false;
+		}
+		attachments = rec.attachments;
+	}
+	// 正文：有附件时允许**空正文**（粘图直接回车是正常用法）；无附件时仍要求非空。
+	if (typeof rec.text !== "string") return false;
+	if (attachments.length === 0) {
+		if (!sessionMessageTextOk(rec.text)) return false;
+	} else if (rec.text.length > 0 && !sessionMessageTextOk(rec.text)) {
+		return false;
+	}
 	if (rec.reason !== undefined) {
 		if (typeof rec.reason !== "string") return false;
 		if (Buffer.byteLength(rec.reason, "utf8") > 512) return false;
@@ -515,6 +535,24 @@ function runHandoffPrepare(opts: ExecuteCommandOptions): CommandOutcome {
  * 护栏（默认拒收）：to=agent://master_default → 403（入口已拒）；to 的 sessionId == 当前
  * master attachment 会话 → 同拒（换皮地址也进不来；attachment 缺失/未 attach → 不拦截）。
  */
+function unsupportedUploadAttachmentId(id: string): boolean {
+	return !uploadIdOk(id);
+}
+
+/** 附件 id → 落盘绝对路径；同一 id 试扩展名（仅白名单四种）。缺失返回 null（调用方拒收）。 */
+function resolveUploadPath(opts: ExecuteCommandOptions, id: string): string | null {
+	const dir = opts.uploadsDir ?? join(defaultRuntimeDir(), "uploads");
+	for (const ext of ["png", "jpg", "webp", "gif"]) {
+		const p = join(dir, `${id}.${ext}`);
+		try {
+			if (statSync(p).isFile()) return p;
+		} catch {
+			/* 继续试下一个扩展名 */
+		}
+	}
+	return null;
+}
+
 function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): CommandOutcome {
 	const parsed = parseObjectAddress(frame.to);
 	if (!parsed || parsed.scheme !== "pi" || parsed.value.length === 0) return reject("invalid-payload");
@@ -544,7 +582,18 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 	const sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
 	if (findSessionFile(sessionsDir, sessionId) === null) return reject("no-session");
 
-	const payload = frame.payload as { text: string; reason?: string };
+	const payload = frame.payload as { text: string; reason?: string; attachments?: string[] };
+	// GUI 图片输入 S2：附件 id → 绝对路径（**只带路径**，不读图片字节、不内联 base64）。
+	// 缺失/不存在的附件一律拒收（不静默丢弃：GUI 才能提示「图已过期，请重传」）。
+	let attachmentPaths: string[] = [];
+	if (payload.attachments !== undefined) {
+		for (const id of payload.attachments) {
+			if (unsupportedUploadAttachmentId(id)) return reject("invalid-payload");
+			const p = resolveUploadPath(opts, id);
+			if (p === null) return reject("attachment-missing");
+			attachmentPaths.push(p);
+		}
+	}
 	const dedupeKey = `${frame.type}:${frame.commandKey}`;
 	const dir = outboxDir(stateRoot(opts));
 	try {
@@ -558,6 +607,7 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 		to: frame.to,
 		sessionId,
 		text: payload.text,
+		...(attachmentPaths.length > 0 ? { attachments: attachmentPaths } : {}),
 		...(payload.reason !== undefined ? { reason: payload.reason } : {}),
 		now: opts.now ?? new Date(),
 	});
