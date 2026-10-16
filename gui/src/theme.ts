@@ -25,6 +25,11 @@ export const THEME_LABEL: Record<GuiTheme, string> = {
 /** 默认主题（风格指南口径：暖暗优先）。 */
 export const DEFAULT_THEME: GuiTheme = "warm-dark";
 
+/** 切到另一档（纯函数；主界面亮暗开关与「外观」设置页共用同一判定）。 */
+export function nextTheme(theme: GuiTheme): GuiTheme {
+	return theme === "warm-dark" ? "warm-light" : "warm-dark";
+}
+
 type ElLike = { classList: { add(c: string): void; remove(c: string): void } };
 
 /** 应用主题：先清两档再挂当前档（避免并存时规则优先级歧义）。 */

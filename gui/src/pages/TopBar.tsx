@@ -8,13 +8,15 @@
  * [无后端支撑]=不渲染：更新徽标、终端/side-pane 钮、Git 摘要、trace。
  */
 
-import { PanelLeft, Settings } from "lucide-react";
+import { Moon, PanelLeft, Settings, Sun } from "lucide-react";
 import { useGui } from "../store";
 import { pendingDecisionBadge } from "../interactionBadge";
 import { fmtPressurePct, fmtRel, fmtTime, pressurePct } from "../format";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import type { AttentionItem } from "../api/types";
+import { THEME_LABEL, nextTheme } from "../theme";
+import { toggleTheme, useThemeValue } from "../useTheme";
 
 function asString(v: unknown): string | undefined {
 	return typeof v === "string" && v.length > 0 ? v : undefined;
@@ -65,6 +67,8 @@ export function TopBar() {
 			: chatActiveId;
 
 	const proposal = latestHandoffAttention(attention);
+	// 亮暗开关（主界面直开）：图标示「当前档」、label/title 示「点击后切到哪档」
+	const theme = useThemeValue();
 	// G5.2：压力显示优先 liveness 活值 + as-of；无心跳/无有效读数回退提案时点值并标注
 	const live = useGui((s) => s.snapshot?.master?.liveness ?? null);
 	const livePct = pressurePct(live?.pressure);
@@ -149,6 +153,18 @@ export function TopBar() {
 							{badge.count}
 						</Badge>
 					</button>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon-lg"
+						aria-label={`切换到${THEME_LABEL[nextTheme(theme)]}主题`}
+						aria-pressed={theme === "warm-light"}
+						data-theme-toggle="1"
+						title={`界面主题：当前${THEME_LABEL[theme]}——点击切到${THEME_LABEL[nextTheme(theme)]}（仅本次会话，不持久化，不改 config.json）`}
+						onClick={toggleTheme}
+					>
+						{theme === "warm-dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+					</Button>
 					<Button
 						type="button"
 						variant="ghost"

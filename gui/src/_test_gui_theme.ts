@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { applyColorScheme, applyTheme, DEFAULT_THEME, THEME_CLASSES, THEME_LABEL } from "./theme.ts";
+import { applyColorScheme, applyTheme, DEFAULT_THEME, nextTheme, THEME_CLASSES, THEME_LABEL } from "./theme.ts";
 
 let n = 0;
 const ok = (name: string): void => {
@@ -77,5 +77,31 @@ ok("④ 红线：主题相关 5 文件零 WebStorage（与 K3 断言一致）");
 	assert.ok(!/fetch\(|\/v1\/|config\.json|document\.|window\./.test(code), "theme.ts 代码零网络/零 config/零 DOM 全局");
 }
 ok("⑤ theme.ts 纯逻辑（零网络 / 零 config.json / 零 DOM 全局）");
+
+// ⑥ nextTheme：两档对合（互切回来 == 原档）+ 覆盖两档
+{
+	assert.equal(nextTheme("warm-dark"), "warm-light", "暗→亮");
+	assert.equal(nextTheme("warm-light"), "warm-dark", "亮→暗");
+	assert.equal(nextTheme(nextTheme("warm-dark")), "warm-dark", "对合：切两次回原档");
+}
+ok("⑥ nextTheme：两档互切 + 对合（主界面开关纯逻辑）");
+
+// ⑦ 主界面亮暗开关存在性 + 状态共享（静态断言；防“只改设置页不改顶栏”这类回归）
+{
+	const top = readFileSync(new URL("./pages/TopBar.tsx", import.meta.url), "utf8");
+	assert.ok(top.includes('data-theme-toggle="1"'), "TopBar 有亮暗开关节点（data-theme-toggle）");
+	assert.ok(top.includes("onClick={toggleTheme}"), "开关绑 toggleTheme");
+	assert.ok(/aria-label=\{`切换到\$\{THEME_LABEL\[nextTheme\(theme\)\]\}主题`\}/.test(top), "开关 aria-label 说明切到哪档");
+	assert.ok(top.includes("aria-pressed"), "开关带 aria-pressed 状态");
+	assert.ok(top.includes("useThemeValue"), "TopBar 读共享主题态（非自持 useState）");
+
+	const hookRaw = readFileSync(new URL("./useTheme.ts", import.meta.url), "utf8");
+	// 去注释后再断言：头注里提到旧实现用 useState（是说明文字，不是代码）
+	const hook = hookRaw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+	assert.ok(hook.includes("useSyncExternalStore"), "useTheme 用 useSyncExternalStore 共享单份状态");
+	assert.ok(!/useState/.test(hook), "useTheme 代码不得再用 useState（否则顶栏与设置页各持一份）");
+	assert.ok(hook.includes("export function toggleTheme"), "导出 toggleTheme");
+}
+ok("⑦ 主界面开关存在 + 主题态全局共享（单份状态）");
 
 console.log(`\n_test_gui_theme: all assertions passed (${n})`);
