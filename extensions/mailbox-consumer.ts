@@ -45,7 +45,7 @@ import { resolveRecipient } from "./runtime/resolver.ts";
 import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled, notifyFollowUpQuietly } from "./injection-gate.ts";
 // C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
 import { eventMarker } from "./delivery-ack.ts";
-import { appendTrace, ensureEvent, listAcks, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
+import { appendTrace, ensureEvent, listAcks, listAttempts, loadEvent, publishIncident, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
@@ -82,6 +82,11 @@ export interface ConsumeOptions {
 	deliveryDir?: string;
 	/** 注入实现（生产接 pi.sendUserMessage，测试传 fake） */
 	sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
+	/**
+	 * 当前时刻（ms；缺省 `Date.now()`）。**D-1 退避门**需要可注入时钟才能确定性测试；
+	 * 生产不传即真实时钟。
+	 */
+	nowMs?: number;
 	/** executeCommand 选项透传（stateDir/configPath/commandsDir/journalPath；测试注入隔离用） */
 	executeCommandOptions?: ExecuteCommandOptions;
 }
@@ -165,6 +170,45 @@ export function consumeMailboxOnce(opts: ConsumeOptions): ConsumeReport {
 	}
 }
 
+// ── D-1（global Master 2026-10-16 裁定）：unconfirmed 重投**有限退避**，绝不无界重投 ──
+/** 重投退避序列（第 k 次重投前的等待）；±20% 抖动在 `mailboxRetryGate` 内施加。 */
+export const MAILBOX_RETRY_BACKOFF_MS = [5_000, 10_000, 20_000, 40_000, 80_000] as const;
+/** 重投次数上限（**首次注入不计**）——到顶 ⇒ `failed_delivery` + incident（绝不静默丢）。 */
+export const MAILBOX_RETRY_MAX_RETRIES = 5;
+/** 总交付期限（自**首次**尝试算起）；超过即升级，不得无界等待。 */
+export const MAILBOX_RETRY_TOTAL_MS = 5 * 60_000;
+
+export type MailboxRetryGate =
+	| { action: "proceed" }
+	| { action: "wait"; nextAt: number; reason: "retry-backoff" }
+	| { action: "exhausted"; reason: "retry-budget-exhausted" | "retry-deadline-exceeded" };
+
+/**
+ * D-1 退避门（**纯函数**）：由已发生的 attempts 决定「现在可否再投」。
+ *   - 无 attempt ⇒ `proceed`（首投，零延迟）；
+ *   - 已重投 ≥ `MAILBOX_RETRY_MAX_RETRIES` ⇒ `exhausted`（预算）；
+ *   - `now - 首次尝试` ≥ `MAILBOX_RETRY_TOTAL_MS` ⇒ `exhausted`（期限）；
+ *   - 距**上次尝试**不足退避（含 ±20% 抖动）⇒ `wait(nextAt)`；否则 `proceed`。
+ * `rand` 可注入以便确定性测试。
+ */
+export function mailboxRetryGate(
+	attempts: Array<{ at: string }>,
+	nowMs: number,
+	rand: () => number = Math.random,
+): MailboxRetryGate {
+	if (attempts.length === 0) return { action: "proceed" };
+	const firstAt = Date.parse(attempts[0]!.at);
+	const lastAt = Date.parse(attempts[attempts.length - 1]!.at);
+	if (!Number.isFinite(firstAt) || !Number.isFinite(lastAt)) return { action: "proceed" };
+	const retries = attempts.length - 1; // 已发生的重投次数（首次不计）
+	if (retries >= MAILBOX_RETRY_MAX_RETRIES) return { action: "exhausted", reason: "retry-budget-exhausted" };
+	if (nowMs - firstAt >= MAILBOX_RETRY_TOTAL_MS) return { action: "exhausted", reason: "retry-deadline-exceeded" };
+	const base = MAILBOX_RETRY_BACKOFF_MS[Math.min(retries, MAILBOX_RETRY_BACKOFF_MS.length - 1)]!;
+	const nextAt = lastAt + base * (1 + (rand() * 0.4 - 0.2));
+	if (nowMs < nextAt) return { action: "wait", nextAt: Math.round(nextAt), reason: "retry-backoff" };
+	return { action: "proceed" };
+}
+
 function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	const report: ConsumeReport = { owner: null, consumed: [] };
 	const recipient = opts.recipient ?? masterAddress();
@@ -177,6 +221,7 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	}
 	const owner = attachment.sessionId;
 	report.owner = owner;
+	const nowMs = opts.nowMs ?? Date.now(); // D-1 退避门与 attempt 时间戳的可注入时钟
 
 	// 命令信枚举（仅 master_default 域；M2：{fileId, letter} 是唯一遍历源——同键多封
 	// 各自独立处理，重放信由 executor 幂等回放 outcome，逐封 ack 终态；枚举失败 →
@@ -258,7 +303,7 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					terminalAt: stableAt,
 				});
 				mbEventId = event.eventId;
-				mbAttemptId = `${event.eventId}@MB@${Date.now()}`;
+				mbAttemptId = `${event.eventId}@MB@${nowMs}`;
 			} catch { /* 账本失败不阻断消费（best-effort） */ }
 			// **ACK 驱动闭环（C-3）**：既有 `consumed` ACK ⇒ 交付成立，补 ack、不重投。
 			// 这是 strict 下 `sent` 不可达时的**唯一**收尾路径（否则信每 10min 被 stale 重投一次）。
@@ -270,6 +315,25 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 						continue;
 					}
 				} catch { /* 账本读失败：按未确认处理，继续正常注入路径 */ }
+			}
+			// ── D-1 退避门（global Master 2026-10-16 裁定）：unconfirmed 重投**有限退避** ──
+			// 有 attempt 时：未到退避时刻 ⇒ 释放 claim 退回 pending 等下一轮（不注入）；
+			// 预算/期限到顶 ⇒ **发布 incident** + 保持 claimed（不再重投；**绝不静默丢**）。
+			if (mbEventId) {
+				const gate = mailboxRetryGate(listAttempts(dDir, mbEventId), nowMs);
+				if (gate.action === "exhausted") {
+					try {
+						const ev = loadEvent(dDir, mbEventId);
+						if (ev) publishIncident(dDir, ev, gate.reason, nowMs);
+					} catch { /* incident 出口失败不阻断消费循环 */ }
+					reportPush(report, messageId, "skipped", gate.reason);
+					continue; // 保持 claimed：不再重投（incident 已可观测）
+				}
+				if (gate.action === "wait") {
+					if (frameId) releaseClaimed(recipient, frameId, holderOf(opts.sessionId), { mailboxDir });
+					reportPush(report, messageId, "skipped", "retry-backoff");
+					continue;
+				}
 			}
 			// 统一门（S6：消费端传谁的 recipient 就按谁的归属判；缺省全局逐字节不变，零回归）
 			const key = receiptKeyFor(letter);
@@ -292,7 +356,7 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 				if (mbEventId && mbAttemptId) {
 					try {
 						recordAttempt(dDir, mbEventId, {
-							attemptId: mbAttemptId, channel: "A", at: new Date().toISOString(),
+							attemptId: mbAttemptId, channel: "A", at: new Date(nowMs).toISOString(),
 							status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : status === "unconfirmed" ? "unconfirmed" : "no-injector",
 							leaseOwner: `MB:${process.pid}`, leaseUntil: new Date(Date.now() + 15_000).toISOString(),
 						});

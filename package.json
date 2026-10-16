@@ -148,7 +148,8 @@
     "test:delivery-ack": "node --experimental-strip-types extensions/_test_delivery_ack.ts",
     "test:c3-mailbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_mailbox_ack.ts",
     "test:c3-outbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_outbox_ack.ts",
-    "test:p3-provenance": "node --experimental-strip-types extensions/_test_p3_provenance.ts"
+    "test:p3-provenance": "node --experimental-strip-types extensions/_test_p3_provenance.ts",
+    "test:mailbox-retry-budget": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_retry_budget.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

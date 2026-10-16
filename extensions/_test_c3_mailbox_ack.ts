@@ -118,15 +118,22 @@ try {
 		const body3 = reportBody("c3 稳定 eventId", "tab_c3_3");
 		deliverLetter(body3, { mailboxDir: MB3 });
 		const sent: string[] = [];
+		const T0 = Date.now();
 		const opts = { sessionId: "sess-c3", mailboxDir: MB3, runsDir: join(ROOT, "tab-runs"), deliveryDir: DELIVERY, sendUserMessage: (b: string) => { sent.push(b); } };
-		consumeMailboxOnce(opts);
+		consumeMailboxOnce({ ...opts, nowMs: T0 });
 		await flush();
-		consumeMailboxOnce(opts);
+		// D-1（global Master 裁定）：unconfirmed 后**退避**（首次重投前 5s）⇒ 退避窗内不重投
+		const rWait = consumeMailboxOnce({ ...opts, nowMs: T0 + 1_000 });
+		await flush();
+		assert.ok(rWait.consumed.some((c) => c.reason === "retry-backoff"), "**D-1**：退避窗内 ⇒ 不重投（retry-backoff）");
+		assert.equal(sent.length, 1, "退避窗内只有首次注入");
+		// 超过退避（5s±20% ⇒ 取 6.5s 必过）⇒ 重投一次
+		consumeMailboxOnce({ ...opts, nowMs: T0 + 6_500 });
 		await flush();
 		const evs = listEvents(DELIVERY, 200).filter((e) => e.runId === `mailbox_${body3.id}`);
-		assert.equal(evs.length, 1, `同一封信连续两 tick 只建 1 个事件（revision 必须稳定；实得 ${evs.length}）`);
-		assert.equal(sent.length, 2, "at-least-once：未确认 ⇒ 每 tick 重投（目标端按 messageId 去重）");
-		ok("M3 mailbox：eventId 稳定（revision 不含 now），未确认仍可重投");
+		assert.equal(evs.length, 1, `同一封信多 tick 只建 1 个事件（revision 必须稳定；实得 ${evs.length}）`);
+		assert.equal(sent.length, 2, "退避到期 ⇒ 重投（at-least-once，目标端按 messageId 去重）");
+		ok("M3 mailbox：eventId 稳定（revision 不含 now），D-1 退避窗内不重投、到期才重投");
 
 		// ── M4：ACK 驱动闭环 —— consumed ACK ⇒ 补 ack、停止重投（复用 M3 的 pending 信）──
 		const ev = evs[0]!;

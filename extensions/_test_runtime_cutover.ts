@@ -134,8 +134,10 @@ try {
 		await flush(); // L3：reportPush 在 send 的 .then 微任务（不 flush 读 r2.consumed 会是空数组）
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 0, "无重注");
 		if (deliveryStrictEnabled()) {
-			assert.equal(sent2.length, 1, "strict：未确认 ⇒ 下 tick 重投（at-least-once，非永久停滞）");
-			assert.ok(r2.consumed.some((c) => c.reason === "attempted-unconfirmed"), "重投仍未确认（交付仍由 ACK 决定）");
+			// D-1（global Master 2026-10-16 裁定）：unconfirmed 采用**有限退避**（5/10/20/40/80s ±20%）
+			// ⇒ 退避窗内的下 tick **不重投**（retry-backoff），信仍 pending（非永久停滞）。
+			assert.equal(sent2.length, 0, "strict + D-1：退避窗内不重投");
+			assert.ok(r2.consumed.some((c) => c.reason === "retry-backoff"), "如实报 retry-backoff（非静默丢）");
 			// 收尾：本块的信仍 pending ⇒ 用真 Promise 路径收敛为 ack，避免污染后续用例
 			consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: () => Promise.resolve() });
 			await flush();
