@@ -41,7 +41,7 @@ import {
 } from "./runtime-host/daemon-lifecycle.ts";
 import { PROTOCOL_VERSION, readHostInfo } from "./runtime-host/discovery.ts";
 import { runtimeIdForDir } from "./runtime-host/identity.ts";
-import { isProcessAlive } from "./runtime/liveness.ts";
+import { isProcessAlive, probePidState } from "./runtime/liveness.ts";
 
 const DIRS: string[] = [ROOT];
 const sleepers: Array<ReturnType<typeof spawn>> = [];
@@ -256,6 +256,131 @@ try {
 			assert.equal(readHostInfo(hp)?.instanceId, "host_fixture_dead", "④ host.json 未被覆盖");
 			const lock = readRuntimeLock(lockPathFor(hp));
 			assert.ok(lock && lock.pid === holder.pid, "④ 活锁未被删/抢");
+		}
+
+		// ── ⑤–⑦ EPERM 家族（Windows：已终止但仍有句柄引用的 pid 也返回 EPERM）──
+		// 根因：旧 isProcessAlive 把 EPERM 判成「活」⇒ classifyHost=stale ⇒ 永久 fail-closed
+		//（实测 pid 6744：不在进程表、端口无监听，kill 仍 EPERM）⇒ 地基卡死。
+		{
+			// ⑤ EPERM + 进程表无此 pid + 端口无人应答 ⇒ dead ⇒ 必须能持锁重建（不再永久卡死）
+			const D = mkd("ensure-eperm-5-");
+			writeHost(D, hostFixture(D, { port: 1 })); // 1 号端口确定无人应答
+			const log: SpawnLog = { calls: [] };
+			const r = await ensureRuntimeDaemon({
+				hostPath: join(D, "host.json"),
+				serverPath: join(D, "server.ts"),
+				waitMs: 3000,
+				spawn: fakeSpawnFor(D, log, healthyPort),
+				probePid: (pid) => (pid === process.pid ? { state: "alive", basis: "kill" } : { state: "dead", basis: "enumerate" }),
+			});
+			console.log(`⑤ EPERM+表无+端口空 → ok=${r.ok} uncertain=${r.uncertain ?? false} spawn=${log.calls.length} note=${r.note ?? "-"}`);
+			assert.equal(r.ok, true, `⑤ 枚举确证 dead 应进入重建（EPERM 不再永久 fail-closed）：${r.error ?? ""}`);
+			assert.equal(log.calls.length, 1, "⑤ 注入 spawn 被调用一次");
+			assert.ok((r.note ?? "").includes("僵尸"), `⑤ 回执标注僵尸接管：${r.note ?? ""}`);
+		}
+		{
+			// ⑥ 反例守卫：EPERM + 表无此 pid **但端口有人应答** ⇒ 不得认死、不得重建（防覆盖看不见的活 daemon）
+			const D = mkd("ensure-eperm-6-");
+			writeHost(D, hostFixture(D, { port: healthyPort }));
+			const log: SpawnLog = { calls: [] };
+			const r = await ensureRuntimeDaemon({
+				hostPath: join(D, "host.json"),
+				serverPath: join(D, "server.ts"),
+				waitMs: 3000,
+				spawn: fakeSpawnFor(D, log, healthyPort),
+				probePid: (pid) => (pid === process.pid ? { state: "alive", basis: "kill" } : { state: "dead", basis: "enumerate" }),
+			});
+			console.log(`⑥ EPERM+表无+端口应答 → ok=${r.ok} uncertain=${r.uncertain ?? false} spawn=${log.calls.length} error=${r.error ?? "-"}`);
+			assert.equal(r.ok, false, "⑥ 端口应答时不得重建");
+			assert.equal(r.uncertain, true, "⑥ 仍 uncertain fail-closed");
+			assert.equal(log.calls.length, 0, "⑥ spawn 未被调用");
+			assert.equal(readHostInfo(join(D, "host.json"))?.instanceId, "host_fixture_dead", "⑥ host.json 未被覆盖");
+		}
+		{
+			// ⑦ 无确证（unknown：枚举不可用/非 win32）⇒ 保持既有 fail-closed，不判死也不判活
+			const D = mkd("ensure-eperm-7-");
+			writeHost(D, hostFixture(D, { port: healthyPort }));
+			const log: SpawnLog = { calls: [] };
+			const r = await ensureRuntimeDaemon({
+				hostPath: join(D, "host.json"),
+				serverPath: join(D, "server.ts"),
+				waitMs: 3000,
+				spawn: fakeSpawnFor(D, log, healthyPort),
+				probePid: () => ({ state: "unknown", basis: "unknown" }),
+			});
+			console.log(`⑦ unknown → ok=${r.ok} uncertain=${r.uncertain ?? false} spawn=${log.calls.length}`);
+			assert.equal(r.ok, false, "⑦ unknown 不得重建");
+			assert.equal(r.uncertain, true, "⑦ unknown 仍 uncertain");
+			assert.equal(log.calls.length, 0, "⑦ spawn 未被调用");
+		}
+		{
+			// ⑧ probePidState 单元矩阵（注入 kill/enumerate ⇒ 不依赖本机 pid 状况）
+			const eperm = (): never => {
+				const e = new Error("kill EPERM") as NodeJS.ErrnoException;
+				e.code = "EPERM";
+				throw e;
+			};
+			const esrch = (): never => {
+				const e = new Error("kill ESRCH") as NodeJS.ErrnoException;
+				e.code = "ESRCH";
+				throw e;
+			};
+			assert.deepEqual(probePidState(123, { kill: () => {} }), { state: "alive", basis: "kill" }, "⑧ kill 成功 ⇒ alive/kill");
+			assert.deepEqual(probePidState(123, { kill: esrch }), { state: "dead", basis: "kill" }, "⑧ ESRCH ⇒ dead/kill（不查表）");
+			if (process.platform === "win32") {
+				assert.deepEqual(probePidState(123, { kill: eperm, enumerate: () => false }), { state: "dead", basis: "enumerate" }, "⑧ EPERM+表无 ⇒ dead/enumerate");
+				assert.deepEqual(probePidState(123, { kill: eperm, enumerate: () => true }), { state: "alive", basis: "enumerate" }, "⑧ EPERM+表有 ⇒ alive/enumerate");
+				assert.deepEqual(probePidState(123, { kill: eperm, enumerate: () => undefined }), { state: "unknown", basis: "unknown" }, "⑧ EPERM+枚举不可用 ⇒ unknown");
+			} else {
+				assert.deepEqual(probePidState(123, { kill: eperm }), { state: "unknown", basis: "unknown" }, "⑧ 非 win32 EPERM ⇒ unknown（Unix 语义不变）");
+			}
+			assert.deepEqual(probePidState(0, { kill: () => {} }), { state: "dead", basis: "kill" }, "⑧ 非法 pid ⇒ dead");
+			console.log("⑧ probePidState 矩阵全绿");
+		}
+		{
+			// ⑨ 真实枚举（非注入）：钉住 tasklist 无匹配时退出码 1 的坑
+			//（execFileSync 会抛 ⇒ 只能得 unknown；必须 spawnSync 读 stdout）
+			if (process.platform === "win32") {
+				const eperm = (): never => {
+					const e = new Error("kill EPERM") as NodeJS.ErrnoException;
+					e.code = "EPERM";
+					throw e;
+				};
+				assert.deepEqual(probePidState(process.pid, { kill: eperm }), { state: "alive", basis: "enumerate" }, "⑨ 真实枚举：本进程在表中");
+				assert.equal(probePidState(999999, { kill: eperm }).state, "dead", "⑨ 真实枚举：999999 不在表中 ⇒ dead（无匹配退出码 1 不影响）");
+				console.log("⑨ 真实 tasklist 枚举双向全绿");
+			}
+		}
+
+		{
+			// ⑩ EPERM 僵尸锁：锁持有人 pid 被判「死」（严格探针）⇒ 必须进入「清僵尸锁后重建」
+			//（真实事故形态：host.json.lock 仍记 pid 6744，旧 lockHolderAlive 判活 ⇒ 永久「活锁占用」）
+			const D = mkd("ensure-eperm-10-");
+			const hp = join(D, "host.json");
+			writeHost(D, hostFixture(D, { port: 1 }));
+			const ac = acquireRuntimeLock(lockPathFor(hp), {
+				kind: "daemon",
+				pid: 6744,
+				instanceId: "host_eperm_zombie",
+				runtimeId: runtimeIdForDir(D),
+				acquiredAt: new Date().toISOString(),
+			});
+			assert.equal(ac.acquired, true, "⑩ 前置：僵尸锁写入成功");
+			const log: SpawnLog = { calls: [] };
+			const r = await ensureRuntimeDaemon({
+				hostPath: hp,
+				serverPath: join(D, "server.ts"),
+				waitMs: 3000,
+				spawn: fakeSpawnFor(D, log, healthyPort),
+				// 6744 = EPERM 僵尸锁持有人、999999 = 僵尸 host.json（严格探针均判死）；新实例（pid=本进程）= 活
+				probePid: (pid) =>
+					pid === 6744 || pid === 999999 ? { state: "dead", basis: "enumerate" } : { state: "alive", basis: "kill" },
+			});
+			console.log(`⑩ EPERM 僵尸锁 → ok=${r.ok} uncertain=${r.uncertain ?? false} spawn=${log.calls.length} note=${r.note ?? "-"} error=${r.error ?? "-"}`);
+			assert.equal(r.ok, true, `⑩ 僵尸锁应被清后重建（不再「活锁占用」卡死）：${r.error ?? ""}`);
+			assert.equal(log.calls.length, 1, "⑩ 注入 spawn 被调用一次");
+			assert.ok((r.note ?? "").includes("僵尸"), `⑩ 回执标注僵尸接管：${r.note ?? ""}`);
+			assert.equal(readRuntimeLock(lockPathFor(hp)), null, "⑩ handoff 锁最终已释放");
 		}
 
 		console.log("_test_ensure_dead_rebuild: all assertions passed");

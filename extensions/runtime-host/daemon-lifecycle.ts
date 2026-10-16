@@ -32,6 +32,7 @@ import {
 	type HostInfo,
 } from "./discovery.ts";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
+import { probePidState, type PidProbeResult } from "../runtime/liveness.ts";
 import { runtimeIdForDir, runLocalChallenge, type ChallengeMeta } from "./identity.ts";
 import { traceSpawn } from "../spawn-trace.ts";
 
@@ -79,9 +80,13 @@ export function readRuntimeLock(lockPath: string): RuntimeLock | null {
 }
 
 /** 锁持有人是否存活（同进程 pid 视为自持=活，由调用方按 kind 决策）。 */
-export function lockHolderAlive(lock: RuntimeLock | null): boolean {
+export function lockHolderAlive(lock: RuntimeLock | null, deps: { probePid?: (pid: number) => PidProbeResult } = {}): boolean {
 	if (!lock) return false;
-	return isProcessAlive(lock.pid);
+	// 严格探针：Windows 上 EPERM ≠ 活（已终止但被句柄引用的 pid 也 EPERM）⇒
+	// 旧 isProcessAlive 会把僵尸锁持有人判活 ⇒ 永久「活锁占用」fail-closed（实测 pid 6744）。
+	// unknown（无从确证）仍按「活」处理 = fail-closed，不抢可疑锁。
+	const st = (deps.probePid ?? probePidState)(lock.pid);
+	return st.state !== "dead";
 }
 
 /**
@@ -203,6 +208,8 @@ export interface DaemonEnsureOptions {
 	challengeTimeoutMs?: number;
 	spawn?: (o: { serverPath: string; runtimeDir: string }) => DaemonSpawnHandle;
 	now?: () => string;
+	/** 测试注入：严格 pid 探针（缺省 runtime/liveness.ts::probePidState）。 */
+	probePid?: (pid: number) => PidProbeResult;
 }
 
 export interface DaemonEnsureResult {
@@ -324,7 +331,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 		if (file.runtimeId && file.runtimeId !== runtimeId) {
 			return fail(`身份不符：host.json runtimeId=${file.runtimeId} ≠ 本目录 ${runtimeId}（fail-closed，未复用）`, { uncertain: true, info: file, pid: file.pid, port: file.port });
 		}
-		const state = await classifyHost(file, { timeoutMs: opts.challengeTimeoutMs ?? 2000 });
+		const state = await classifyHost(file, { timeoutMs: opts.challengeTimeoutMs ?? 2000, probePid: opts.probePid });
 		if (state === "dead") {
 			// 仅放行 dead：不可复用 ≠ 不确定——返回 null（=「不可复用，继续往下走」）。
 			// 由**已持锁**的主路径（下方「重读 → dead → 僵尸接管重建」分支）决策；
@@ -350,7 +357,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 
 	// A) 锁被其它活进程持有 → 只读确权路径（绝不 spawn、不删锁）
 	const held = readRuntimeLock(lockPath);
-	if (held && held.pid !== process.pid && lockHolderAlive(held)) {
+	if (held && held.pid !== process.pid && lockHolderAlive(held, { probePid: opts.probePid })) {
 		if (held.kind === "handoff") {
 			// 另一 ensure 正在交接：等它发布的新文件（等锁释放+新 host.json），超时 → uncertain
 			const t0 = Date.now();
@@ -363,7 +370,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 					return fail("交接后文件仍不可确权：fail-closed", { uncertain: true, info: cur, pid: cur.pid, port: cur.port });
 				}
 				const still = readRuntimeLock(lockPath);
-				if ((!still || !lockHolderAlive(still)) && Date.now() - t0 > 2000) {
+				if ((!still || !lockHolderAlive(still, { probePid: opts.probePid })) && Date.now() - t0 > 2000) {
 					break; // 交接方已退且无新文件 → 落到 B 路径重决策
 				}
 				if (Date.now() - t0 > waitMs) {
@@ -393,7 +400,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 		const cur = readRuntimeLock(lockPath);
 		if (
 			cur && cur.instanceId === ac.existing.instanceId &&
-			!lockHolderAlive(cur) && stealStaleLock(lockPath, handoff)
+			!lockHolderAlive(cur, { probePid: opts.probePid }) && stealStaleLock(lockPath, handoff)
 		) {
 			ac = { acquired: true, existing: null };
 		}
@@ -409,7 +416,7 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 	try {
 		const cur = readHostInfo(hostPath);
 		if (cur) {
-			const state = await classifyHost(cur, { timeoutMs: 1500 });
+			const state = await classifyHost(cur, { timeoutMs: 1500, probePid: opts.probePid });
 			if (state === "alive") {
 				// 锁空闲但服务活着（pre-lock 旧 daemon 或锁丢失）：挑战确权后复用，不重建
 				const r = await tryReuse(cur);

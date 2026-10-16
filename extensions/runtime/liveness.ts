@@ -17,6 +17,7 @@
  * 纪律：never-throw（gauge 永不打断主流程，写失败返回 false 静默）；纯库、路径
  * 可注入、无 Pi API 依赖（同 master-succession/master-control 纪律）。
  */
+import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
@@ -132,6 +133,55 @@ export function isProcessAlive(pid: number): boolean {
 	} catch (e) {
 		return (e as NodeJS.ErrnoException).code === "EPERM";
 	}
+}
+
+// ── 严格存活探针（host 域专用；不改 isProcessAlive 的既有语义）──────────
+
+/** 严格探针三态；`unknown` = 无法确证（调用方须 fail-closed，不得当活也不得当死）。 */
+export type PidState = "alive" | "dead" | "unknown";
+
+export interface PidProbeResult {
+	state: PidState;
+	/** 判定依据：kill（可信号）/ enumerate（OS 进程表确证）/ unknown（EPERM 且无从确证）。 */
+	basis: "kill" | "enumerate" | "unknown";
+}
+
+/** Windows 进程表枚举：`tasklist /FI "PID eq <pid>" /NH /FO CSV`。true=在 / false=不在 / undefined=查询不可用（不猜）。
+ *  用 spawnSync（非 execFileSync）：tasklist 在**无匹配**时以退出码 1 结束，
+ *  execFileSync 会抛错 ⇒ 只能读到「查不出」而拿不到「确定不在」（实测踩坑）。 */
+function winPidEnumerated(pid: number): boolean | undefined {
+	const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
+		timeout: 2000,
+		windowsHide: true,
+		encoding: "utf8",
+	});
+	if (r.error || typeof r.stdout !== "string") return undefined;
+	return r.stdout.includes(`"${pid}"`);
+}
+
+/**
+ * 严格存活探针：`process.kill(pid,0)` 成功 ⇒ alive（可信号）；抛非 EPERM ⇒ dead。
+ * **EPERM 在 Windows 上不能判活**：已终止但仍有句柄引用的 pid 同样返回 EPERM
+ * （实测 pid 已不在进程表、端口无监听，kill 仍 EPERM ⇒ 旧 isProcessAlive 判活 ⇒
+ *  host ensure 永久 fail-closed 卡死），故须用 OS 进程表确证：
+ *  - 非 win32 ⇒ unknown（保持 Unix 语义「EPERM=在，只是没权限」，不擅自改判）；
+ *  - 枚举存在 ⇒ alive；枚举不存在 ⇒ dead；枚举不可用 ⇒ unknown。
+ */
+export function probePidState(
+	pid: number,
+	deps: { kill?: (pid: number) => void; enumerate?: (pid: number) => boolean | undefined } = {},
+): PidProbeResult {
+	if (!Number.isInteger(pid) || pid <= 0) return { state: "dead", basis: "kill" };
+	try {
+		(deps.kill ?? process.kill)(pid, 0);
+		return { state: "alive", basis: "kill" };
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== "EPERM") return { state: "dead", basis: "kill" };
+	}
+	if (process.platform !== "win32") return { state: "unknown", basis: "unknown" };
+	const present = (deps.enumerate ?? winPidEnumerated)(pid);
+	if (present === undefined) return { state: "unknown", basis: "unknown" };
+	return { state: present ? "alive" : "dead", basis: "enumerate" };
 }
 
 export interface MasterLiveness {

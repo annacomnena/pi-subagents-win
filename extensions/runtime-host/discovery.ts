@@ -25,8 +25,8 @@ import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
 // isProcessAlive 唯一实现在 runtime/liveness.ts（0920 backlog B7 移居；runtime-host→runtime 方向合规）
-import { isProcessAlive } from "../runtime/liveness.ts";
-export { isProcessAlive };
+import { isProcessAlive, probePidState, type PidProbeResult } from "../runtime/liveness.ts";
+export { isProcessAlive, probePidState, type PidProbeResult };
 
 /** 协议版本（首版冻结；G5 GUI 对接时按此分叉）。 */
 export const PROTOCOL_VERSION = 1;
@@ -208,8 +208,19 @@ export function fetchHostHealth(port: number, opts?: { timeoutMs?: number }): Pr
 }
 
 /** host 四态判定：先 pid 探针（cheap），再 health 探活。host.json 内容缺失/不可用由调用方先判 missing。 */
-export async function classifyHost(info: HostInfo, opts?: { timeoutMs?: number }): Promise<HostState> {
-	if (!isProcessAlive(info.pid)) return "dead";
+export async function classifyHost(
+	info: HostInfo,
+	opts?: { timeoutMs?: number; probePid?: (pid: number) => PidProbeResult },
+): Promise<HostState> {
+	const probe = (opts?.probePid ?? probePidState)(info.pid);
+	// unknown（EPERM 且无从确证）⇒ 不得判死：保持既有 fail-closed（调用方走 uncertain）。
+	if (probe.state === "unknown") return "stale";
+	if (probe.state === "dead") {
+		// 枚举确证的 dead（EPERM + 进程表无此 pid）仍要求**端口无人应答**才认死：
+		// 本函数是「唯一 spawn 决策点」的前置，宁可 fail-closed 也不得覆盖可能活着的 daemon。
+		if (probe.basis === "enumerate" && (await fetchHostHealth(info.port, opts)) !== null) return "stale";
+		return "dead";
+	}
 	const health = await fetchHostHealth(info.port, opts);
 	return health === null ? "stale" : "alive";
 }
