@@ -15,8 +15,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
-import { sendReportToMain } from "./report.ts";
+import { defaultReportsDir, sendReportToMain } from "./report.ts";
 import { getTabRunId, isMainSession, isSubagent, isTabSession } from "./identity.ts";
 import { isTraceWorker } from "./capabilities.ts";
 import {
@@ -269,17 +271,51 @@ export function registerTabTelemetry(
 				return { content: [{ type: "text", text: "当前进程不是标签页（无 tab-run-id）" }], isError: true };
 			}
 			const p = rawParams as { message?: string; taskId?: string; summary?: string };
-			const message = (p.message ?? "").trim();
-			if (!message) {
+			const raw = (p.message ?? "").trim();
+			if (!raw) {
 				return { content: [{ type: "text", text: "message 必填" }], isError: true };
+			}
+			// ── 显式截断（2026-10-16 修复：“**静默截断 = 静默丢失**”）──────────────
+			// 旧行为：`message.slice(0, 1000)` 无任何标记、仍报 `✓ 已回报` ⇒ 主会话看到的正文被截断
+			// 而两头都不知（实测：4 份回报长度**恰好全为 1000**，其中一整个「离线项 4 条」段被丢）。
+			// 新行为：① 全文落盘（不丢内容）；② 正文尾部**显式**追加 TRUNCATED 标记 + 全文路径；
+			//          ③ 工具返回**警告**（告知发送方已截断，请改走「长内容落盘 + 给路径」）。
+			const MAX_MESSAGE_CHARS = 1000;
+			let message = raw;
+			let fullTextPath: string | undefined;
+			let omitted = 0;
+			if (raw.length > MAX_MESSAGE_CHARS) {
+				const dir = defaultReportsDir();
+				try {
+					if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+					fullTextPath = join(dir, `${runId}-${Date.now().toString(36)}.full.txt`);
+					writeFileSync(fullTextPath, raw, "utf8");
+				} catch {
+					fullTextPath = undefined; // 落盘失败不阻断回报（标记仍写，并降级为“未落盘”）
+				}
+				// 先算标记长度再切片：保证**标记本身**不被下游截断（否则又成静默丢失）
+				const markerOf = (n: number): string =>
+					`\n[TRUNCATED: ${n} chars omitted — 内容在 ${fullTextPath ?? "(落盘失败，原文未保留)"}]`;
+				let keep = MAX_MESSAGE_CHARS - markerOf(raw.length - MAX_MESSAGE_CHARS).length;
+				if (keep < 0) keep = 0;
+				omitted = raw.length - keep;
+				message = raw.slice(0, keep) + markerOf(omitted);
 			}
 			try {
 				sendReportToMain({
 					from: runId,
-					message: message.slice(0, 1000),
+					message,
 					taskId: p.taskId,
 					summary: p.summary?.slice(0, 200),
 				});
+				if (omitted > 0) {
+					return {
+						content: [{
+							type: "text",
+							text: `⚠ 已向主会话回报，但**正文被截断**（省略 ${omitted} 字符；已显式标注）。全文已落盘: ${fullTextPath ?? "(落盘失败)"}\n后续请把长内容写文件、在 message 里给路径（截断即丢失）。`,
+						}],
+					};
+				}
 				return { content: [{ type: "text", text: `✓ 已向主会话回报（runId=${runId}）` }] };
 			} catch (err) {
 				return { content: [{ type: "text", text: `回报失败: ${err instanceof Error ? err.message : String(err)}` }], isError: true };

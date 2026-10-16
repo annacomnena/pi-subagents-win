@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyForReclaim, registerTabStatusTools, registerTabTelemetry, viewToBrief } from "./tab-runs-runtime.ts";
@@ -99,6 +99,42 @@ writeTabDispatch(runsDir, dispatch);
 	const finishTool = pi.findTool("tab-finish");
 	assert.ok(finishTool, "应注册 tab-finish");
 	assert.ok(pi.findTool("tab-report"), "应注册 tab-report（tab → 主会话回报通道）");
+
+	// ── tab-report 显式截断（2026-10-16：“**静默截断 = 静默丢失**”）───────────────
+	// 旧行为 `message.slice(0,1000)`：正文被截断、无标记、仍报 ✓ ⇒ 主会话与发送方都不知。
+	{
+		const home = mkdtempSync(join(tmpdir(), "tab-report-home-"));
+		const prevU = process.env.USERPROFILE;
+		const prevH = process.env.HOME;
+		process.env.USERPROFILE = home;
+		process.env.HOME = home;
+		try {
+			const tool = pi.findTool("tab-report")!;
+			const TAIL = "TAIL_MUST_BE_IN_FULL_TEXT";
+			const long = "A".repeat(1500) + TAIL;
+			const res = await tool.execute("", { message: long, taskId: "T-trunc" });
+			const text = ((res as { content?: Array<{ text?: string }> }).content ?? []).map((c) => c.text ?? "").join("\n");
+			// ① 工具返回值必须**警告**（不得再像旧行为那样只报 ✓）
+			assert.ok(/正文被截断/.test(text), `返回值必须警告已截断（实得 ${text.slice(0, 160)}）`);
+			assert.ok(!/^✓ 已向主会话回报/.test(text.trim()), "截断时不得只报成功");
+			const m = /全文已落盘: (\S+)/.exec(text);
+			assert.ok(m, "返回值必须给出全文路径");
+			assert.ok(existsSync(m![1]!), `全文必须已落盘（${m![1]}）`);
+			assert.ok(readFileSync(m![1]!, "utf8").includes(TAIL), "落盘必须是**全文**（含尾部），不是被切过的副本");
+			// ② 隔离核验：报告落在临时 home 下（不污染真实 ~/.pi/agent/reports）
+			const reportsDir = join(home, ".pi", "agent", "reports");
+			const jsons = readdirSync(reportsDir).filter((f) => f.endsWith(".json"));
+			assert.ok(jsons.length >= 1, "报告已写入临时 reports 目录（隔离生效）");
+			const rec = JSON.parse(readFileSync(join(reportsDir, jsons[0]!), "utf8")) as { message: string };
+			assert.ok(rec.message.length <= 1000, `投递正文必须 ≤1000（实得 ${rec.message.length}）`);
+			// ③ **核心不变量**：投递正文自带显式截断标记 + 路径（“静默截断 = 静默丢失”）
+			assert.ok(/\[TRUNCATED: \d+ chars omitted — 内容在 .+\]$/.test(rec.message.trimEnd()), `投递正文必须以截断标记结尾（实得尾部：${rec.message.slice(-120)}）`);
+		} finally {
+			if (prevU === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevU;
+			if (prevH === undefined) delete process.env.HOME; else process.env.HOME = prevH;
+			rmSync(home, { recursive: true, force: true });
+		}
+	}
 	const res = await finishTool.execute("", { status: "completed", summary: "全部完成", artifacts: ["plans/20260806.md"] });
 	assert.ok(!(res as { isError?: boolean }).isError, JSON.stringify(res));
 
