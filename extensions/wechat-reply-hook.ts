@@ -29,6 +29,11 @@ export interface ReplyHookDeps {
  store?: () => WechatStore;
  /** 绑定 owner openid（缺省 readOutboundOwnerOpenId(runtimeDir) = credentials.json 现读）——出站授权 owner 位。 */
  ownerOpenId?: () => string | undefined;
+ /** 权威消息列表来源（缺省 undefined = 只用传入的 messages）。
+  *  为什么需要：`agent_end.messages` 是**本次 run 新增**的消息（pi bundle: `emit({type:"agent_end",messages:newMessages})`），
+  *  不是会话投影 ⇒ 微信注入那条 user 消息通常根本不在其中（实证：本轮 agent_end 消息只有 1 条 assistant）。
+  *  生产由 register 传 `ctx.sessionManager.buildSessionContext().messages`（含 compaction/context_edit 投影）。 */
+ transcript?: () => unknown[] | undefined;
 }
 function textOf(message: any): string {
  const c = message?.content;
@@ -160,12 +165,21 @@ export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushRe
 export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}): { written: boolean; reason?: ReplySkipReason } {
  try {
   const runtimeDir = deps.runtimeDir ?? defaultRuntimeDir(); const stateDir = deps.stateDir ?? join(runtimeDir, "state");
+  // 权威投影优先（见 ReplyHookDeps.transcript 注）：取不到时退回本 run 消息（测试/异常路径，行为不变）
+  let tx: unknown[] | undefined;
+  try { tx = deps.transcript?.() ?? undefined; } catch { tx = undefined; }
+  if (Array.isArray(tx)) messages = tx;
   if (deps.subagent?.()) return { written: false };
   const cfg = readWechatReplyConfig(deps.configPath ?? readWechatConfigPath());
   if (!cfg.enabled) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "reply-disabled" }); return { written: false, reason: "reply-disabled" }; }
   // 0924 mode 分支（计划 §6①）：broadcast 只暂存（不看 marker——非微信触发轮同样广播，B1）；
   // flush 在 agent_settled。reply-only 走下方 marker 路径，逐字节原样（计划 §7 B5 红线）。
   if (cfg.mode === "broadcast") { stashWechatBroadcast(messages, deps); return { written: false }; }
+  // 2026-10-16 修（**出站恒断根因**，实证）：真实原因不在「找哪条 user」，而在**消息来源**——
+  // `agent_end.messages` 是**本次 run 新增**的消息（pi: `emit({type:"agent_end",messages:newMessages})`），
+  // 微信注入那条 user 属于上一轮，通常根本不在其中 ⇒ 最近 user 找不到 marker ⇒ 恒 marker-not-first
+  // ⇒ 出站对任何「注入轮与答复轮不同 run」的会话永久失效（实证：事故 cut 的 run 消息 6 条全无 user）。
+  // 修法：权威 transcript（ctx.sessionManager.buildSessionContext().messages）优先，见 ReplyHookDeps.transcript。
   // 0929 修（长会话 marker-not-first 缺陷）：marker 必须从**最近**的 user 消息里找。
   // 原实现用 messages.find(⇒首条 user)，在长会话下恒命中历史首条（无 marker）⇒ 静默 return
   //（不写审计，不可观测）⇒ reply-only 路径对已运行多日的会话永久失效。
@@ -174,10 +188,28 @@ export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}
    ? (messages as any).findLast((m: any) => m?.role === "user")
    : [...messages].reverse().find((m: any) => m?.role === "user");
   if (!lastUser) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
-  const match = textOf(lastUser).match(/dedupe:outbox:([0-9a-f]{64})/);
-  if (!match) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
-  const outboxId = match[1]; const rec = new WechatStore(join(runtimeDir, "wechat", "receive")).readInbox(0).find(r => r.outboxId === outboxId);
-  if (!rec || rec.state !== "injected") { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "no-inbox-match" }); return { written: false, reason: "no-inbox-match" }; }
+  const MARKER_RE = /dedupe:outbox:([0-9a-f]{64})/;
+  const store = new WechatStore(join(runtimeDir, "wechat", "receive"));
+  const inbox = store.readInbox(0);
+  const resolve = (id: string) => inbox.find(r => r.outboxId === id && r.state === "injected");
+  const match = textOf(lastUser).match(MARKER_RE);
+  // 主路径：最近一条 user 的 marker（原语义不变）。
+  let rec = match ? resolve(match[1]) : undefined;
+  if (!rec) {
+   // 2026-10-16 回退（有界）：最近一条 user 的 marker 指向的入站记录不在（例如其后又有一条
+   // 远程注入把 marker 覆盖成「非微信来源」）⇒ 从新到旧找**第一条能对上入站记录**的 marker。
+   // 只回退到「确实有微信入站记录」的那条 ⇒ 不会回复非微信来源；无记录仍走原拒绝码。
+   if (!match) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
+   const users = typeof (messages as any).filter === "function" ? (messages as any).filter((m: any) => m?.role === "user") : [];
+   for (let i = users.length - 1; i >= 0; i--) {
+    const m2 = textOf(users[i]).match(MARKER_RE);
+    if (!m2) continue;
+    const cand = resolve(m2[1]);
+    if (cand) { rec = cand; audit(stateDir, { at: new Date().toISOString(), event: "resolved-older-wx-marker", msgId: maskWechatOpenId(cand.msgId) }); break; }
+   }
+  }
+  if (!rec) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "no-inbox-match" }); return { written: false, reason: "no-inbox-match" }; }
+  const outboxId = rec.outboxId!;
   if (rec.fromId.endsWith("@im.bot")) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", msgId: maskWechatOpenId(rec.msgId), from: maskWechatOpenId(rec.fromId), reason: "bot-domain" }); return { written: false, reason: "bot-domain" }; }
   const dir = replyIntentDir(stateDir); const id = deriveReplyIntentId(outboxId); if (readReplyIntent(dir, id)) return { written: false };
   let text = lastNonEmptyAssistantText(messages);
@@ -190,7 +222,17 @@ export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}
  } catch { return { written: false }; }
 }
 export function registerWechatReplyHook(pi: ExtensionAPI): void {
- pi.on("agent_end", (event: any) => { try { if (isSubagent()) return; extractWechatReply(event?.messages ?? []); } catch {} });
+ pi.on("agent_end", (event: any, ctx: any) => {
+  try {
+   if (isSubagent()) return;
+   // 2026-10-16 修：agent_end.messages 只是本次 run 的新增消息；权威 transcript 取 sessionManager 投影
+   //（取不到就退回 run 消息——不改变旧行为，只是不再把「微信注入那条不在本 run」当成「没有微信轮」）。
+   const transcript = (): unknown[] | undefined => {
+    try { return ctx?.sessionManager?.buildSessionContext?.().messages; } catch { return undefined; }
+   };
+   extractWechatReply(event?.messages ?? [], { transcript });
+  } catch {}
+ });
  // 0924 广播时机门（计划 §1.1 门 3，用户裁定③）：agent_end 只暂存，agent_settled 才 flush。
  pi.on("agent_settled", () => { try { flushWechatBroadcast(); } catch {} });
 }

@@ -16,7 +16,7 @@
  * 跑法：`node --experimental-strip-types ./extensions/_test_wechat_reply.ts` 或 `npx tsx` 同文件。
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, utimesSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -416,6 +416,78 @@ try {
 	console.error(`主流程异常: ${e instanceof Error ? e.stack : String(e)}`);
 	process.exitCode = 1;
 }
+
+	// ── 2026-10-16 出站恒断修复（用户实报障；根因=消息来源，见 plans/20261016_wechat_outbound_diagnosis.md）──
+	const countIntents = (stateDir: string): number => {
+		const d = replyIntentDir(stateDir);
+		return existsSync(d) ? readdirSync(d).length : 0;
+	};
+
+	await check("A 正控（事故形状）：run 消息无 user，权威 transcript 含微信注入 ⇒ 必须回复", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-a-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const outboxId = "a".repeat(64);
+			new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "mWxA", fromId: "human@im.wechat", fromNickname: null, text: "如何了", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const transcript = [
+				{ role: "user", content: `（Web Console 远程输入｜dedupe:outbox:${outboxId}）
+[微信 o9cq80…chat] 如何了` },
+				{ role: "user", content: `（Web Console 远程输入｜dedupe:outbox:${"b".repeat(64)}）
+[微信 …] 另一件事` },
+				{ role: "assistant", content: [{ type: "text", text: "最终答复正文" }] },
+			];
+			const runMessages = [{ role: "assistant", content: [{ type: "text", text: "最终答复正文" }] }];
+			// 负控：只喂 run 消息 = 旧行为 = 复现事故
+			assert.equal(extractWechatReply(runMessages, { stateDir: mkdtempSync(join(tmpdir(), "wechat-reply-a-old-")), runtimeDir, configPath }).reason, "marker-not-first", "旧行为复现事故（负控）");
+			const r = extractWechatReply(runMessages, { stateDir, runtimeDir, configPath, transcript: () => transcript });
+			assert.equal(r.written, true, `权威 transcript ⇒ 恢复出站：${JSON.stringify(r)}`);
+			const intent = readReplyIntent(replyIntentDir(stateDir), deriveReplyIntentId(outboxId));
+			assert.ok(intent, "为**微信那条** outbox 写了 intent");
+			assert.equal(intent!.text, "最终答复正文", "正文取最近非空 assistant 文本");
+			assert.equal(intent!.fromId, "human@im.wechat", "收件人 = 微信触发者");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	await check("B 负控①：无 transcript（退化）⇒ 与旧实现逐字相同，不回复", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-b-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const outboxId = "b".repeat(64);
+			new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "mWxB", fromId: "human@im.wechat", fromNickname: null, text: "在吗", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			assert.equal(extractWechatReply([{ role: "assistant", content: "答" }], { stateDir, runtimeDir, configPath }).reason, "marker-not-first", "无 transcript ⇒ 不回复（诚实边界）");
+			assert.equal(countIntents(stateDir), 0, "零 intent");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	await check("C 负控②：transcript 全无 marker（非微信轮）⇒ marker-not-first，零 intent", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-c-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const r = extractWechatReply([{ role: "assistant", content: "答" }], { stateDir, runtimeDir, configPath, transcript: () => [{ role: "user", content: "纯本地提问" }, { role: "assistant", content: "答" }] });
+			assert.equal(r.reason, "marker-not-first", "无 marker 一律不回复");
+			assert.equal(countIntents(stateDir), 0, "零 intent");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	await check("D 负控③：bot 域仍被拒（防环红线，transcript 路径下同样成立）", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-d-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const outboxId = "c".repeat(64);
+			new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "mBot", fromId: "bot@im.bot", fromNickname: null, text: "in", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const r = extractWechatReply([{ role: "assistant", content: "答" }], { stateDir, runtimeDir, configPath, transcript: () => [{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", content: "答" }] });
+			assert.equal(r.reason, "bot-domain", `bot 域必须拒发：${JSON.stringify(r)}`);
+			assert.equal(countIntents(stateDir), 0, "零 intent");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
 
 clearInterval(keepAlive);
 if (failures.length > 0) {
