@@ -42,7 +42,7 @@ import { COMMAND_TYPES, type CommandFrame } from "./runtime/protocol.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
-import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
+import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled, notifyFollowUpQuietly } from "./injection-gate.ts";
 // C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
 import { eventMarker } from "./delivery-ack.ts";
 import { appendTrace, ensureEvent, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
@@ -363,7 +363,11 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			// 指令语义；不走 preInject 门——回执重复无害）。L3：await send 结果吞掉 busy 拒绝（防逃逸到
 			// bindCore 报成 Extension "<runtime>" error）；best-effort，busy/failed 不影响 ack（命令已
 			// 确定性执行并 ack，回执只是通知）。
-			injectFollowUpQuietly(opts.sendUserMessage, buildCommandReceiptBody(letter.frame, outcome));
+			// C-3：命令回执是**通知**（不承担交付证据），但仍不得把返回值当送达 —— 未确认/失败
+			// 如实留痕（不伪造 sent，也不因此改变 ack 语义）。
+			notifyFollowUpQuietly(opts.sendUserMessage, buildCommandReceiptBody(letter.frame, outcome), {
+				source: "mailbox-command-receipt", deliveryDir: opts.deliveryDir,
+			});
 			// 三态全终态 ack、不重投（同 fileId 收尾）：rejected 在 executor 幂等 claim 之前拒、
 			// 不占键，重投必再拒；failed 留 pending/claimed 会经 10min stale reclaim 无限空转——
 			// 重试语义由 issuer 换新 commandKey 重发承担。

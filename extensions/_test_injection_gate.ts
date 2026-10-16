@@ -21,14 +21,15 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // 隔离 runtime 目录（releaseInjectionClaim 测试用；先于 import）
 process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "injection-gate-env-"));
 
-import { injectFollowUpQuietly, type InjectionSendStatus } from "./injection-gate.ts";
+import { injectFollowUpQuietly, notifyFollowUpQuietly, deliveryStrictEnabled, type InjectionSendStatus } from "./injection-gate.ts";
+import { defaultDeliveryDir } from "./delivery-ledger.ts";
 import { claimInjection, releaseInjectionClaim, hasNotificationReceipt } from "./runtime/receipts.ts";
 
 // flush 微任务队列（helper 内部走 Promise.resolve().then 链）。
@@ -165,6 +166,35 @@ async function run(
 	releaseInjectionClaim(key, holder);
 	releaseInjectionClaim("", holder); // 空键 no-op
 	releaseInjectionClaim("has space", holder); // 含空白 no-op（与 claim 同纪律）
+}
+
+// ── 8. notifyFollowUpQuietly（C-3：通知类调用点诚实留痕；不伪造 sent）──────────
+{
+	const tracePath = join(defaultDeliveryDir(), "trace.jsonl");
+	const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+	// 生产形态（send 不 return ⇒ undefined）⇒ unconfirmed ⇒ 必留痕
+	notifyFollowUpQuietly(() => { /* 不 return = 生产形态 */ }, "notify-body-1", { source: "test-notify" });
+	await flush();
+	const t1 = readFileSync(tracePath, "utf8");
+	assert.ok(t1.includes("C3-notify-unconfirmed") && t1.includes("test-notify"), "未确认 ⇒ 如实留痕（不伪造 sent）");
+	// 真 Promise resolve ⇒ sent ⇒ 零留痕
+	notifyFollowUpQuietly(() => Promise.resolve(), "notify-body-2", { source: "test-notify-ok" });
+	await flush();
+	assert.equal(readFileSync(tracePath, "utf8").includes("test-notify-ok"), false, "sent ⇒ 不写留痕");
+	// 无注入通道 ⇒ no-injector ⇒ 如实留痕
+	notifyFollowUpQuietly(undefined, "notify-body-3", { source: "test-notify-ni" });
+	await flush();
+	assert.ok(readFileSync(tracePath, "utf8").includes("C3-notify-no-injector"), "无注入通道 ⇒ 如实留痕");
+	// 回滚档位：strict=false 时 undefined 当 sent ⇒ 零留痕（旧行为）
+	process.env.PI_DELIVERY_STRICT = "0";
+	try {
+		assert.equal(deliveryStrictEnabled(), false, "回滚档位已生效");
+		notifyFollowUpQuietly(() => { /* 不 return */ }, "notify-body-4", { source: "test-notify-rollback" });
+		await flush();
+		assert.equal(readFileSync(tracePath, "utf8").includes("test-notify-rollback"), false, "回滚档位 ⇒ 旧行为零留痕");
+	} finally {
+		delete process.env.PI_DELIVERY_STRICT;
+	}
 }
 
 console.log("_test_injection_gate: all assertions passed");

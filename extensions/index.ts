@@ -83,7 +83,7 @@ import { registerWechatReplyHook } from "./wechat-reply-hook.ts";
 // 0924 远程斜杠命令旁路（白名单分级 + 未知命令显式拒绝；裁定⑤缺省 fail-closed）
 import { buildWechatStatusText, registerWechatRemoteCommands } from "./wechat-command-consumer.ts";
 import { registerGuiAutoStart } from "./gui-autostart.ts"; // G6 L3：GUI 自动拉起（opt-in）
-import { injectFollowUpQuietly } from "./injection-gate.ts"; // L3：忙时冲突静默重试（await send 结果）
+import { notifyFollowUpQuietly } from "./injection-gate.ts"; // C-3：通知类调用点（strict + 未确认留痕）
 import type { WakeDecision } from "./runtime/wake.ts";
 import { localMasterScope, type ScopeWakeDecision } from "./runtime/scope.ts";
 import {
@@ -2333,10 +2333,13 @@ export default function (pi: ExtensionAPI) {
 			if (outcome.phase === "started") {
 				// L3：await send 结果吞掉 busy 拒绝（防逃逸到 bindCore 报成 Extension "<runtime>" error）；
 				// 通知尽力而为（busy/failed 不阻塞），收集已在后台，用 /trace-fusion-status 查进度。
-				injectFollowUpQuietly(
+				// C-3：`pi.sendUserMessage` 生产恒返回 `undefined` ⇒ 返回值不是送达证明；本调用点
+				// **不声称已送达**（无独立交付账本），但未确认/失败必留痕（`notifyFollowUpQuietly`）。
+				notifyFollowUpQuietly(
 					pi.sendUserMessage,
 					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
 进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
+					{ source: "index:trace-fusion", runId: outcome.runId },
 				);
 			}
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）

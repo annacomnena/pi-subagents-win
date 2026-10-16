@@ -159,7 +159,9 @@ try {
 		const sent: string[] = [];
 		const r = consumeMailboxOnce({
 			sessionId: sid, mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"),
-			sendUserMessage: (b) => sent.push(b),
+			// C-3：块体（不 return）= 生产形态（`pi.sendUserMessage` 恒 undefined）；
+			// 表达式体 `(b)=>sent.push(b)` 会返回数组长度（数字）→ 会被误当「同步确证」。
+			sendUserMessage: (b) => { sent.push(b); },
 			executeCommandOptions: execOpts,
 		});
 		const entry = r.consumed.find((c) => c.action === "executed");
@@ -172,6 +174,11 @@ try {
 		assert.ok(!sent[0]!.includes("auto-on:t1") && !sent[0]!.includes("t1"), "M1 红线：commandKey / payload.reason 原文不进回执");
 		assert.ok(!sent[0]!.includes("关联:") && !/[0-9a-f]{12}/.test(sent[0]!), "L4 二次返修：回执零 correlation / 内容派生 token（SHA-256 截断是可枚举 oracle，已移除）");
 		assert.equal(commandLetter(key)!.status, "acked", "信 acked 终态");
+		// C-3：命令回执是通知（undefined send = 生产形态）⇒ 未确认必留痕，不伪造 sent
+		{
+			const trace = readFileSync(join(ROOT, "delivery", "trace.jsonl"), "utf8");
+			assert.ok(trace.includes("C3-notify-unconfirmed") && trace.includes("mailbox-command-receipt"), "C-3：命令回执未确认 ⇒ 如实留痕");
+		}
 
 		// executor 副作用真实落盘：config patch + journal + 幂等盘面
 		const cfg = JSON.parse(readFileSync(tmpCfg, "utf8")) as { masterSuccession?: { auto?: boolean }; models?: number[] };

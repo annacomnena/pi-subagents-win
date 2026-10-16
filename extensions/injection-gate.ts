@@ -20,6 +20,7 @@ import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
 import { claimInjection, confirmInjection } from "./runtime/receipts.ts";
+import { appendTrace, defaultDeliveryDir } from "./delivery-ledger.ts";
 
 export type InjectionPath = "legacy-eventbus" | "legacy-reports" | "mailbox-consumer" | "steer-channel";
 
@@ -204,6 +205,32 @@ export function injectFollowUpQuietly(
 function classifyThrown(e: unknown): InjectionSendStatus {
 	const msg = e instanceof Error ? e.message : String(e);
 	return /already processing/i.test(msg) ? "busy" : "failed";
+}
+
+/**
+ * C-3：**通知类**调用点的诚实包装（无独立交付账本的 followUp 通知）。
+ *
+ * 为何需要：`pi.sendUserMessage` 生产恒返回 `undefined`（两级 delegate 都不 return），
+ * 把返回值当送达就是 P3 假阳性。通知类调用点（trace-fusion 完成提示、命令回执）
+ * **不声称已送达**（无 eventId/账本、不参与 ACK 对账），但也不得静默当作成功：
+ * 非 `sent` 时写一条 trace（`C3-notify-<status>`，source 可鉴别），供事后审计。
+ *
+ * 与 `injectFollowUpQuietly` 的关系：本函数只是它的「strict + 留痕」薄包装，
+ * 不改 ack/receipt 语义（调用方自行决定是否 ack）。
+ */
+export function notifyFollowUpQuietly(
+	send: ((body: string, opts?: { deliverAs?: string }) => unknown) | undefined,
+	body: string,
+	opts: { source: string; runId?: string; deliveryDir?: string },
+): void {
+	injectFollowUpQuietly(send, body, { strict: deliveryStrictEnabled() }).then((status) => {
+		if (status === "sent") return;
+		appendTrace(opts.deliveryDir ?? defaultDeliveryDir(), {
+			kind: `C3-notify-${status}`,
+			source: opts.source,
+			...(opts.runId !== undefined ? { runId: opts.runId } : {}),
+		});
+	});
 }
 
 export interface SuppressionRecord {
