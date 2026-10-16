@@ -45,7 +45,7 @@ import { resolveRecipient } from "./runtime/resolver.ts";
 import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled, notifyFollowUpQuietly } from "./injection-gate.ts";
 // C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
 import { eventMarker } from "./delivery-ack.ts";
-import { appendTrace, ensureEvent, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
+import { appendTrace, ensureEvent, listAcks, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
@@ -241,6 +241,36 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			if (letter.frame.frame === "message" && letter.frame.inReplyTo) {
 				matchAndCloseExpectationSafe({ frame: letter.frame, mailboxDir });
 			}
+			// ── C-3：交付真账本关联（在**注入尝试之前**建立，以便 ACK 驱动闭环可先行短路）──
+			// revision 必须**稳定**（由信自身的不可变字段派生）：旧写法用 `new Date()` ⇒ 每 tick
+			// 生成不同 eventId ⇒ 重复事件 + ACK 永远对不上。
+			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+			const stableAt = letterTime(letter);
+			let mbEventId: string | undefined;
+			let mbAttemptId: string | undefined;
+			try {
+				const { event } = ensureEvent(dDir, {
+					runId: `mailbox_${messageId}`,
+					terminalRevision: terminalRevisionOf({ id: messageId, status: "completed", endedAt: stableAt, result: { status: "completed", text: letter.frame.frame } }),
+					terminalSnapshotPath: join(mailboxDir, messageId),
+					dispatcherSessionId: opts.sessionId ?? "unknown",
+					observedAt: new Date().toISOString(),
+					terminalAt: stableAt,
+				});
+				mbEventId = event.eventId;
+				mbAttemptId = `${event.eventId}@MB@${Date.now()}`;
+			} catch { /* 账本失败不阻断消费（best-effort） */ }
+			// **ACK 驱动闭环（C-3）**：既有 `consumed` ACK ⇒ 交付成立，补 ack、不重投。
+			// 这是 strict 下 `sent` 不可达时的**唯一**收尾路径（否则信每 10min 被 stale 重投一次）。
+			if (mbEventId) {
+				try {
+					if (listAcks(dDir, mbEventId).some((a) => a.stage === "consumed")) {
+						ackLetter(recipient, frameId!, { mailboxDir });
+						reportPush(report, messageId, "injected", "ack-consumed");
+						continue;
+					}
+				} catch { /* 账本读失败：按未确认处理，继续正常注入路径 */ }
+			}
 			// 统一门（S6：消费端传谁的 recipient 就按谁的归属判；缺省全局逐字节不变，零回归）
 			const key = receiptKeyFor(letter);
 			const verdict = preInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer", ...(opts.recipient ? { recipient: opts.recipient } : {}) });
@@ -255,23 +285,7 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			}
 			// 注入。L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条消费链
 			// async，防竞态面扩大）。没有 injector 也未投递，必须释放 claim 后重试，不能伪造已消费。
-			//
-			// C-3：新增**交付账本**关联。mailbox 本身已有真 ACK（`ackLetter`）；本层把「已投递」
-			// 再锚到 eventId，使 `consumed` 可由 `pi.on("context")` 观察驱动（与 watcher 同构）。
-			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
-			let mbEventId: string | undefined;
-			let mbAttemptId: string | undefined;
-			try {
-				const { event } = ensureEvent(dDir, {
-					runId: `mailbox_${messageId}`,
-					terminalRevision: terminalRevisionOf({ id: messageId, status: "completed", endedAt: new Date().toISOString(), result: { status: "completed", text: letter.frame.frame } }),
-					terminalSnapshotPath: join(mailboxDir, messageId),
-					dispatcherSessionId: opts.sessionId ?? "unknown",
-					observedAt: new Date().toISOString(),
-				});
-				mbEventId = event.eventId;
-				mbAttemptId = `${event.eventId}@MB@${Date.now()}`;
-			} catch { /* 账本失败不阻断消费（best-effort） */ }
+			// C-3：eventId 已在注入前建立（见上方账本块），正文携带标记供接收端 context 观察。
 			const mbBody = mbEventId ? `${buildInjectBody(letter)}\n${eventMarker(mbEventId)}` : buildInjectBody(letter);
 			const strict = deliveryStrictEnabled();
 			injectFollowUpQuietly(opts.sendUserMessage, mbBody, { strict }).then((status) => {
@@ -296,9 +310,14 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					ackLetter(recipient, frameId!, { mailboxDir });
 					reportPush(report, messageId, "injected");
 				} else if (status === "unconfirmed") {
-					// C-3：**不把返回值当送达**。mailbox 的真 ACK 仍是 `ackLetter`（消息确实落盘进入
-					// 会话才会被下轮 context 观察）；此处**不** ackLetter、**不** confirm —— 交付是否成立
-					// 由 context 观察的 `consumed` 决定，否则 60s 后由 B 判 failed_delivery + incident。
+					// C-3：**不把返回值当送达**（P3）：不 ackLetter、不 confirm —— 交付是否成立由
+					// `consumed` ACK 决定（见上方闭环）。
+					// 但要与 busy 同构地**释放两处 claim 把信退回 pending**：否则信永久停在 claimed
+					// （本循环只枚举 pending），既不重投也不 ack ＝ 永久停滞（违反「必达」）。
+					// at-least-once 收敛：最坏重投一条，目标端按稳定 messageId 幂等去重；
+					// 一旦 `consumed` ACK 出现，上方闭环立即 ack 并停止重投。
+					releaseInjectionClaim(key, verdict.holder);
+					if (frameId) releaseClaimed(recipient, frameId, holderOf(opts.sessionId), { mailboxDir });
 					reportPush(report, messageId, "skipped", "attempted-unconfirmed");
 				} else if (status === "busy" || status === "no-injector") {
 					// agent 忙或没有注入通道，消息均未真正注入：不 ack/confirm、不 selfDisable；释放注入互斥
