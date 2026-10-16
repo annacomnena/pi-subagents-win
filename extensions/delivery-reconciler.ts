@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
 	appendTrace,
 	effectiveStage,
+	effectiveStageOf,
 	ensureEvent,
 	listAcks,
 	listAttempts,
@@ -181,7 +182,8 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 
 		const attempts = listAttempts(opts.deliverDir, event.eventId);
 		const acks = listAcks(opts.deliverDir, event.eventId);
-		const view = effectiveStage(event, attempts, acks, now);
+		// D-2：显式传 incident 状态（统一消费入口 `effectiveStageOf`；incident 开启 ⇒ 终态失败）
+		const view = effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
 		const decision = reconcileDecision(event, view, attempts, now);
 
 		if (decision.action === "none") {

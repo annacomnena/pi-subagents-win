@@ -16,6 +16,7 @@ import {
 	ackIncident,
 	deriveEventId,
 	effectiveStage,
+	effectiveStageOf,
 	ensureEvent,
 	eventFileKey,
 	isDelivered,
@@ -281,6 +282,46 @@ try {
 		assert.equal(closed + silent, allEvents.length, "oracle 覆盖全部事件（不右删失）");
 		assert.ok(closed > 0, "至少有已关单事件（consumed 或 failed_delivery）");
 		ok(`D12 独立 oracle：从原始文件复算 ${allEvents.length} 个事件（closed=${closed}, silent=${silent}）`);
+	}
+
+	// ── D13（D-2，2026-10-16 裁定）：矩阵单测 —— incident 开启 ⇒ **任何路径**都不得返回成功态 ──
+	// 硬断言：incident 已发布时，无论 attempts/acks 如何组合，`effectiveStageOf` 必须返回
+	// `failed_delivery`（绝不 consumed/received/attempted/retry_scheduled/pending）。
+	{
+		const mkEv = (extra: Record<string, unknown> = {}) => ({
+			eventId: "async:run_d13:deadbeef", runId: "run_d13", terminalRevision: "deadbeef",
+			terminalSnapshotPath: "x.json", dispatcherSessionId: "sess_a", recipientGeneration: 1,
+			observedAt: iso(NOW), terminalAt: iso(NOW), deliveryDeadline: iso(NOW + DELIVERY_DEADLINE_MS),
+			...extra,
+		}) as unknown as Parameters<typeof effectiveStageOf>[0]["event"];
+		const mkAttempt = (status: string) => ({ attemptId: `a-${status}`, channel: "A" as const, at: iso(NOW + 1000), status, leaseOwner: "A:1", leaseUntil: iso(NOW + 16_000) }) as unknown as Parameters<typeof effectiveStageOf>[0]["attempts"][number];
+		const mkAck = (stage: "received" | "consumed") => ({ eventId: "async:run_d13:deadbeef", stage, attemptId: "a-x", recipientGeneration: 1, at: iso(NOW + 2000), evidence: "context-observed" }) as unknown as Parameters<typeof effectiveStageOf>[0]["acks"][number];
+
+		const attemptSets = [[], [mkAttempt("sent")], [mkAttempt("unconfirmed")], [mkAttempt("failed")], [mkAttempt("no-injector")], [mkAttempt("busy")]];
+		const ackSets = [[], [mkAck("received")], [mkAck("consumed")], [mkAck("received"), mkAck("consumed")]];
+		const SUCCESS = new Set(["consumed", "received", "attempted", "retry_scheduled", "pending"]);
+		let combos = 0;
+		for (const attempts of attemptSets) {
+			for (const acks of ackSets) {
+				combos += 1;
+				// (a) incident 开启 ⇒ 必为 failed_delivery，且**绝不**落在成功/中间态
+				const withInc = effectiveStageOf({ event: mkEv({ incidentId: "inc_d13", incidentAt: iso(NOW + 65_000) }), attempts, acks }, { incidentId: "inc_d13", incidentAt: iso(NOW + 65_000) }, NOW + 70_000);
+				assert.equal(withInc.stage, "failed_delivery", `**D-2 硬断言**：incident 开启 ⇒ failed_delivery（attempts=${attempts.length}, acks=${acks.length}）`);
+				assert.equal(SUCCESS.has(withInc.stage), false, "incident 开启时不得返回任何成功/中间态");
+				// (b) incident 关闭 ⇒ 仍然按原优先级（与 incident 无关的路径不变）
+				const noInc = effectiveStageOf({ event: mkEv(), attempts, acks }, {}, NOW + 70_000);
+				assert.notEqual(noInc.stage, "failed_delivery", "无 incident 时不得凭空报 failed_delivery");
+			}
+		}
+		assert.equal(combos, 24, "矩阵覆盖 6 attempts × 4 acks = 24 组合");
+		// (c) 单入口核验：兼容入口 `effectiveStage` 与 `effectiveStageOf` **同源**（不重复逻辑）
+		const evInc = mkEv({ incidentId: "inc_d13b", incidentAt: iso(NOW + 65_000) });
+		assert.deepEqual(
+			effectiveStage(evInc, [mkAttempt("sent")], [mkAck("consumed")], NOW + 70_000),
+			effectiveStageOf({ event: evInc, attempts: [mkAttempt("sent")], acks: [mkAck("consumed")] }, { incidentId: "inc_d13b", incidentAt: iso(NOW + 65_000) }, NOW + 70_000),
+			"兼容入口与唯一纯函数结果一致（单一实现）",
+		);
+		ok(`D13 D-2 矩阵：24 组合 incident 开启恒 failed_delivery（无成功态泄漏）；兼容入口同源`);
 	}
 
 	console.log(`\n_test_delivery_ledger: all ${n} groups passed`);

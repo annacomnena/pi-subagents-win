@@ -265,12 +265,14 @@ try {
 		// ── 全窗共同断言 ──
 		assert.ok(runBytes(rd, runId).equals(bytesBefore), "① 原 run 终态逐字节不变（SIGKILL 后亦然）");
 		assert.equal(listEvents(d).filter((e) => e.runId === runId).length, 1, "② 全程只有 1 个事件");
-		// 注：有 attempt 时 `effectiveStage` 先归因于 attempt（stage 仍报 attempted），incidentId 不改变 stage——
-		// 故过期后 reconcileDecision 会**再次**返回 fail_delivery；但 publishIncident 幂等 ⇒ 不产生第二个 incident。
-		// 这一 stage 归因观（stage 恒 attempted ≠ failed_delivery）已作为「发现」记入 plans/20261016_r7_r8_impl.md。
+		// D-2（2026-10-16 裁定）：incident 已发布 ⇒ 阶段**恒**为 failed_delivery（不再被 attempt 掩盖）
+		// ⇒ 过期后重判是 `none/already-failed-delivery`（比“再报一次 fail_delivery”更强的幂等）。
 		const closed = reload(d, ev.eventId);
 		assert.equal(closed.incidentId, listOpenIncidents(d)[0].incidentId, "incidentId 已持久在事件元数据（跨重启可见）");
-		assert.equal(reconcileDecision(closed, stageOf(closed, d, NOW + DELIVERY_DEADLINE_MS + 2_000), attempts2, NOW + DELIVERY_DEADLINE_MS + 2_000).action, "fail_delivery", "过期后重判仍是 fail_delivery（幂等由 incident 唯一性兑现）");
+		const closedView = stageOf(closed, d, NOW + DELIVERY_DEADLINE_MS + 2_000);
+		assert.equal(closedView.stage, "failed_delivery", "**D-2 硬约束**：incident 开启 ⇒ 阶段 = failed_delivery（不得报 consumed/成功态）");
+		const rejudge = reconcileDecision(closed, closedView, attempts2, NOW + DELIVERY_DEADLINE_MS + 2_000);
+		assert.equal(rejudge.action, "none", "过期后重判 = none（终态失败不可反复发布）");
 		await reconcileOnce({ runsDir: rd, deliverDir: d, now: NOW + DELIVERY_DEADLINE_MS + 6_000, resolveDispatcher: () => "sess_dispatch" });
 		assert.equal(incidentFiles(d).length, 1, "③ 幂等重跑不产生第二个 incident");
 		ok("R7-b 租约已领 + 子进程 SIGKILL：无永久 claimed、租约过期接管、单一 incident、run 不变");
@@ -369,7 +371,8 @@ try {
 		assert.equal(listAcks(d, ev.eventId).filter((a) => a.stage === "received").length, 1, "received 回执仍在（append-only，不被擦除）");
 		const closed = reload(d, ev.eventId);
 		assert.ok(closed.incidentId, "失败事实跨重启可见（事件元数据持久 incidentId）");
-		assert.equal(stageOf(closed, d, past + 1_000).stage, "received", "重启后 stage 保持 received（**不是** consumed；见「发现 1」阶段优先级说明）");
+		// D-2：incident 已发布 ⇒ 阶段**恒**为 failed_delivery（不得再报 received/consumed）
+		assert.equal(stageOf(closed, d, past + 1_000).stage, "failed_delivery", "**D-2 硬约束**：incident 开启 ⇒ failed_delivery（received 不再掩盖终态）");
 		assert.equal(isDelivered(stageOf(closed, d, past + 1_000).stage), false, "received 永远不算 delivered");
 
 		// ── 全窗共同断言 ──

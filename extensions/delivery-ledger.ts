@@ -308,18 +308,35 @@ export interface StageView {
 	consumedBy?: DeliveryAck;
 }
 
+/** 账本状态（单一入参对象；D-2：把 incident 状态显式化，禁止各消费点自行 if-else）。 */
+export interface LedgerState {
+	event: DeliveryEvent;
+	attempts: DeliveryAttempt[];
+	acks: DeliveryAck[];
+}
+
+/** incident 状态（缺省 = 未发布）。 */
+export interface IncidentState {
+	incidentId?: string;
+	incidentAt?: string;
+}
+
 /**
- * 由「事件 + 尝试 + 回执」推导**有效阶段**。优先级（高者胜）：
- * consumed > received > attempted > leased > pending；`failed_delivery` 由 reconcile 判定给出。
+ * **唯一**的阶段推导纯函数（D-2，2026-10-16 global Master 裁定）。
+ *
+ * 优先级（高者胜）：**failed_delivery（已发布 incident）> consumed > received > attempted > retry_scheduled > pending**。
+ *
+ * **硬约束（D-2）**：`incident` 已发布 ⇒ 本次交付已终结为失败，**任何路径都不得再返回
+ * `consumed`/成功态**（迟到 consumed ACK 不反悔；重新投递属**新 delivery generation**，
+ * 由消费方另行处理，见咨询 §6.1）。所有消费方**必须**经本函数取阶段，禁止各自 if-else。
  *
  * 关键纪律：`attempted` 即使 status==="sent" 也**只是 attempted**（P3：wrapper 的 sent 是假阳性）。
  */
-export function effectiveStage(
-	event: DeliveryEvent,
-	attempts: DeliveryAttempt[],
-	acks: DeliveryAck[],
-	now: number,
-): StageView {
+export function effectiveStageOf(ledger: LedgerState, incident: IncidentState, now: number): StageView {
+	const { event, attempts, acks } = ledger;
+	if (incident.incidentId) {
+		return { stage: "failed_delivery", evidence: `incident:${incident.incidentId}`, lastAt: incident.incidentAt };
+	}
 	const consumed = acks.filter((a) => a.stage === "consumed").at(-1);
 	if (consumed) return { stage: "consumed", evidence: `consumed:${consumed.evidence}`, lastAt: consumed.at, consumedBy: consumed };
 	const received = acks.filter((a) => a.stage === "received").at(-1);
@@ -329,8 +346,20 @@ export function effectiveStage(
 		if (last.status === "sent") return { stage: "attempted", evidence: `attempted:${last.channel}:sent`, lastAt: last.at };
 		return { stage: "retry_scheduled", evidence: `attempt:${last.channel}:${last.status}`, lastAt: last.at };
 	}
-	if (event.incidentId) return { stage: "failed_delivery", evidence: `incident:${event.incidentId}`, lastAt: event.incidentAt };
 	return { stage: "pending", evidence: "no-attempt", lastAt: event.observedAt };
+}
+
+/**
+ * 兼容入口（从 event 提取 incident 状态）。**实现与 `effectiveStageOf` 同源**（不重复逻辑）；
+ * 生产消费方新代码请直接用 `effectiveStageOf(ledger, incident, now)` 显式传 incident 状态。
+ */
+export function effectiveStage(
+	event: DeliveryEvent,
+	attempts: DeliveryAttempt[],
+	acks: DeliveryAck[],
+	now: number,
+): StageView {
+	return effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
 }
 
 export type ReconcileAction =
@@ -509,7 +538,8 @@ export async function reconcileEvent(
 ): Promise<ReconcileOutcome> {
 	const attempts = listAttempts(dir, event.eventId);
 	const acks = listAcks(dir, event.eventId);
-	const view = effectiveStage(event, attempts, acks, now);
+	// D-2：显式传 incident 状态（唯一纯函数 `effectiveStageOf`）
+	const view = effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
 	const action = reconcileDecision(event, view, attempts, now, opts);
 
 	if (action.action === "fail_delivery") {
