@@ -83,10 +83,80 @@ export interface DeliveryReconcilerStatus extends DeliveryReconcilerState {
 	statePath: string;
 	/** 最近一轮的扫描统计（供 `master-status`/GUI 观测；未跑过则为 null）。 */
 	lastScan: { scanned: number; results: number; undispatched?: number } | null;
+	/**
+	 * **B 通道健康（切片 2）**：host 为 opt-in ⇒ host 不在时 B 就缺席，必须能一等可见地
+	 * 报 `degraded(reconciler-host-down)`，而不是静默单通道 A。
+	 */
+	health: DeliveryReconcilerHealth;
 }
 
 export function deliveryReconcilerStatePath(stateDir: string = join(defaultRuntimeDir(), "state")): string {
 	return join(stateDir, "delivery-reconciler.json");
+}
+
+/** 健康判定结果（供 `status()`/`master-status`/GUI 复用）。 */
+export interface DeliveryReconcilerHealth {
+	status: "ok" | "degraded";
+	reason?: "reconciler-host-down" | "reconciler-stale" | "reconciler-error";
+	/** `lastTickAt` 到 `now` 的毫秒数（无法计算则 undefined）。 */
+	ageMs?: number;
+}
+
+/** 默认 stale 阈值：B 的 tick 是 10s，30s = 3 个周期未动即判停摆。 */
+export const RECONCILER_STALE_AFTER_MS = 30_000;
+
+/**
+ * **B 通道健康（纯函数，切片 2）**：host 为 **opt-in** ⇒ host 不在时 B 就缺席，
+ * 必须能**一等可见**地报 `degraded(reconciler-host-down)`，而不是静默单通道 A。
+ *
+ * 判定顺序（先无、再死、再旧、再错）：
+ *   1. 状态文件缺失 ⇒ `reconciler-host-down`（B 从未跑过 / state 被清）；
+ *   2. `hostPid` 不存活 ⇒ `reconciler-host-down`（宿主已退出）；
+ *   3. `lastTickAt` 缺失或年龄 > `staleAfterMs` ⇒ `reconciler-stale`（循环停摆）；
+ *   4. `lastError` 非空 ⇒ `reconciler-error`（循环在跑但报错）；
+ *   5. 否则 `ok`。
+ * 全部输入可注入 ⇒ 可确定性测试。
+ */
+export function deliveryReconcilerHealth(
+	opts: {
+		stateDir?: string;
+		now?: number;
+		staleAfterMs?: number;
+		/** 进程存活探针（缺省用 `process.kill(pid,0)` 语义；测试可注入）。 */
+		isPidAlive?: (pid: number) => boolean;
+		/** 直接注入状态（测试用；缺省从盘读）。 */
+		state?: DeliveryReconcilerState;
+	} = {},
+): DeliveryReconcilerHealth {
+	const now = opts.now ?? Date.now();
+	const staleAfter = opts.staleAfterMs ?? RECONCILER_STALE_AFTER_MS;
+	const alive = opts.isPidAlive ?? isPidAliveDefault;
+	const state = opts.state ?? readDeliveryReconcilerState(opts.stateDir);
+	// 1. 从未跑过 / state 被清
+	if (opts.state === undefined && !existsSync(deliveryReconcilerStatePath(opts.stateDir))) {
+		return { status: "degraded", reason: "reconciler-host-down" };
+	}
+	// 2. 宿主进程已退出
+	if (state.hostPid > 0 && !alive(state.hostPid)) return { status: "degraded", reason: "reconciler-host-down" };
+	// 3. 停摆
+	if (!state.lastTickAt) return { status: "degraded", reason: "reconciler-stale" };
+	const age = now - Date.parse(state.lastTickAt);
+	if (!Number.isFinite(age) || age > staleAfter) {
+		return { status: "degraded", reason: "reconciler-stale", ageMs: Number.isFinite(age) ? age : undefined };
+	}
+	// 4. 报错
+	if (state.lastError) return { status: "degraded", reason: "reconciler-error", ageMs: age };
+	return { status: "ok", ageMs: age };
+}
+
+/** 默认存活探针（同 zombie/liveness 口径：EPERM 视为活）。 */
+function isPidAliveDefault(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
 /** 读状态（缺失/坏 JSON/字段非法 → 缺省）。never-throw。 */
@@ -247,6 +317,8 @@ export function startDeliveryReconcilerLoop(opts: DeliveryReconcilerLoopOptions 
 		const disabled = (reason: "kill-switch" | "stopped"): DeliveryReconcilerStatus => ({
 			cursor: null, lastTickAt: null, tickCount: 0, lastError: null, hostPid: process.pid,
 			running: false, reason, intervalMs, runsDir, deliverDir, statePath, lastScan: null,
+			// kill switch 关闭 ⇒ 零动作，但健康必须诚实：缺状态文件 = host-down 语义
+			health: { status: "degraded", reason: "reconciler-host-down" },
 		});
 		return {
 			stop: (): void => { /* 本来就没启动：no-op */ },
@@ -323,6 +395,8 @@ export function startDeliveryReconcilerLoop(opts: DeliveryReconcilerLoopOptions 
 			running,
 			...(running ? {} : { reason: "stopped" as const }),
 			intervalMs, runsDir, deliverDir, statePath, lastScan,
+			// 健康：以**同一进程内的活状态**判定（不重读盘，避免与实际 state 漂移）
+			health: deliveryReconcilerHealth({ stateDir, state: { ...state, hostPid: process.pid } }),
 		}),
 		runOnce: enqueue,
 		ready,

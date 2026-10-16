@@ -43,8 +43,10 @@ delete process.env.PI_DELIVERY_RECONCILER;
 import {
 	startDeliveryReconcilerLoop,
 	deliveryReconcilerEnabled,
+	deliveryReconcilerHealth,
 	deliveryReconcilerStatePath,
 	readDeliveryReconcilerState,
+	RECONCILER_STALE_AFTER_MS,
 } from "./runtime-host/delivery-reconciler-loop.ts";
 import { listEvents, listAcks, listAttempts, listOpenIncidents } from "./delivery-ledger.ts";
 import { listOutboxItems, outboxDir } from "./runtime/message-outbox.ts";
@@ -402,6 +404,36 @@ try {
 			assert.equal(negUndiscovered.length, 3, "E5 反例：3 条终态永远扫不到 ⇒ 该断言在漏持久化时必红");
 		}
 		ok("E5 cursor 跨重启续接：3 段各推进不同圆环段、5 条终态全覆盖；反例：不持久化 ⇒ 3 条永漏");
+	}
+
+	// ── H（切片 2）：B 通道健康 —— host 为 opt-in ⇒ 必须能一等可见地报 degraded ──
+	// 反例自检（门 A）+ 观测点可证伪（门 ①）：ok 与四种 degraded 必须**成对**出现；
+	// 若把阈值改成 Infinity 或永远返回 ok，本组会红。
+	{
+		const T = Date.now();
+		const alive = (): boolean => true;
+		const dead = (): boolean => false;
+		const mkState = (over: Record<string, unknown> = {}) => ({
+			cursor: null, lastTickAt: new Date(T - 5_000).toISOString(), tickCount: 3, lastError: null, hostPid: 4242, ...over,
+		});
+		// ok（成对支点：另一端必须能 degraded）
+		assert.deepEqual(deliveryReconcilerHealth({ state: mkState() as never, now: T, isPidAlive: alive }), { status: "ok", ageMs: 5_000 }, "新鲜 tick + 宿主活 ⇒ ok");
+		// stale
+		const st = deliveryReconcilerHealth({ state: mkState({ lastTickAt: new Date(T - 60_000).toISOString() }) as never, now: T, isPidAlive: alive });
+		assert.equal(st.status, "degraded", "停摆 ⇒ degraded");
+		assert.equal(st.reason, "reconciler-stale", "停摆原因 = reconciler-stale");
+		// host-down（pid 死）
+		assert.equal(deliveryReconcilerHealth({ state: mkState() as never, now: T, isPidAlive: dead }).reason, "reconciler-host-down", "host pid 死 ⇒ host-down");
+		// error
+		assert.equal(deliveryReconcilerHealth({ state: mkState({ lastError: "boom" }) as never, now: T, isPidAlive: alive }).reason, "reconciler-error", "lastError ⇒ reconciler-error");
+		// 缺失状态文件（未注入 state ⇒ 真读盘）
+		const sd = mkdtempSync(join(tmpdir(), "rec-health-"));
+		assert.equal(deliveryReconcilerHealth({ stateDir: sd, now: T }).reason, "reconciler-host-down", "无状态文件 ⇒ host-down（B 从未跑/state 被清）");
+		// 阈值边界成对：恰好 = 阈值 ⇒ ok；过 1ms ⇒ degraded（防“恒零/恒非零”假观测）
+		assert.equal(deliveryReconcilerHealth({ state: mkState({ lastTickAt: new Date(T - RECONCILER_STALE_AFTER_MS).toISOString() }) as never, now: T, isPidAlive: alive }).status, "ok", "恰好 = STALE_AFTER ⇒ 仍 ok");
+		assert.equal(deliveryReconcilerHealth({ state: mkState({ lastTickAt: new Date(T - RECONCILER_STALE_AFTER_MS - 1).toISOString() }) as never, now: T, isPidAlive: alive }).status, "degraded", "过阈值 1ms ⇒ degraded");
+		rmSync(sd, { recursive: true, force: true });
+		ok("H B 健康：ok / stale / host-down / error / 缺文件 + 阈值成对");
 	}
 
 	console.log(`\n_test_delivery_reconciler_loop: all ${n} groups passed`);
