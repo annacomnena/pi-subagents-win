@@ -1,5 +1,12 @@
 // 用**已安装**的 pi 包复算 P3：ExtensionAPI.sendUserMessage 的返回值语义。
-// 与异 provider（grok-4.5）的独立复算交叉验证；本探针只读源码 + 模拟两级链，不写真实 runtime。
+//
+// 证据来源分类（2026-10-16 重新定源，global Master 指令）：
+//   (A) 自证实测（**承重**）：本探针 + `extensions/_test_p3_provenance.ts`（断言式，逐条带 file:line），
+//       直接读本机已安装 pi 包源码；不依赖任何第三方报告。
+//   (B) 旁证（**弱档，未采信**）：异 provider（krill/grok-4.5）报告——该 provider 已被用户删除
+//       （理由：模型不可用）⇒ 其结论一律降级为未验证；其主张已由 (A) 逐条独立复现。
+// 结论承重依据 = (A)；grok 报告不得单独引用为证据。
+// 断言版：`npm run test:p3-provenance`。
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 

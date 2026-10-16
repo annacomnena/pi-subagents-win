@@ -145,7 +145,8 @@
     "probe:p3-send": "node scripts/_probe_p3_senduser_message.mjs",
     "test:delivery-ack": "node --experimental-strip-types extensions/_test_delivery_ack.ts",
     "test:c3-mailbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_mailbox_ack.ts",
-    "test:c3-outbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_outbox_ack.ts"
+    "test:c3-outbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_outbox_ack.ts",
+    "test:p3-provenance": "node --experimental-strip-types extensions/_test_p3_provenance.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
