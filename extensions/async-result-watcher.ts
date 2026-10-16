@@ -37,6 +37,15 @@ import { preInject, postInject, injectFollowUpQuietly, type InjectionContext } f
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { reapZombiesInDir } from "./subagent-zombie.ts";
+// 交付真账本（唤醒必达 D2）：A 快通道围绕 event/ACK 推进，不再以 `.notified` 收尾。
+import {
+	defaultDeliveryDir,
+	ensureEvent,
+	recordAttempt,
+	terminalRevisionOf,
+	writeAck,
+	appendTrace,
+} from "./delivery-ledger.ts";
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
 const TICK_MS = 10_000;
@@ -61,6 +70,8 @@ interface RunRecord {
 export interface AsyncResultWatcherOptions {
 	/** 监听目录（缺省 ~/.pi/agent/subagent-runs/；测试注入隔离目录）。 */
 	runsDir?: string;
+	/** 交付账本目录（缺省 defaultDeliveryDir()；测试注入隔离目录）。 */
+	deliveryDir?: string;
 	/** 完成时 toast（默认 true）。 */
 	toast?: boolean;
 	/** 完成时注入用户消息唤醒模型（默认 true）。 */
@@ -274,13 +285,41 @@ export function onRunFile(
 	// 注入（核心：向归属会话发 followUp 唤醒）
 	// L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条链 async，防竞态面扩大）。
 	if (opts.autoInject !== false) {
-		const body = [
+			const body = [
 			`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}${failureLine}`,
 			`产物: ${join(runsDir, `${runId}.json`)}`,
 			`下一步: 用 subagent-win({ action: "status", runId: "${runId}" }) 取全文。`,
 			NO_POLL_HINT,
 		].join("\n");
+		// ── D2：记录到交付真账本（A 快通道）──────────────────────────────
+		// 纪律（咨询 §6.1/§6.3）：`.notified` **只是本通道的进程内/跨实例去重**，
+		// **不是**交付证据；真正证据是 ledger 里的 `consumed` ACK（由接收端/B 通道写）。
+		// 因此这里只 `recordAttempt`（“调过发送”），**绝不**在 sent 时写 consumed。
+		const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+		let attemptId: string | undefined;
+		try {
+			const { event } = ensureEvent(dDir, {
+				runId,
+				terminalRevision: terminalRevisionOf(record as unknown as Record<string, unknown>),
+				terminalSnapshotPath: join(runsDir, `${runId}.json`),
+				dispatcherSessionId: dispatcher,
+				observedAt: new Date().toISOString(),
+			});
+			attemptId = `${event.eventId}@A@${Date.now()}@${Math.random().toString(36).slice(2, 8)}`;
+			appendTrace(dDir, { kind: "A-attempt", eventId: event.eventId, runId, attemptId });
+		} catch { /* 账本写入失败不阻断注入（best-effort；B 通道会从终态重建） */ }
 		injectFollowUpQuietly(opts.sendUserMessage, body).then((status) => {
+			// 尝试结果入账（**只表示调过发送**；`sent` 也只是 attempted）
+			if (attemptId) {
+				try {
+					const eid = attemptId.slice(0, attemptId.lastIndexOf("@A@"));
+					recordAttempt(dDir, eid, {
+						attemptId, channel: "A", at: new Date().toISOString(),
+						status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : "no-injector",
+						leaseOwner: `A:${process.pid}`, leaseUntil: new Date(Date.now() + 15_000).toISOString(),
+					});
+				} catch { /* best-effort */ }
+			}
 			if (status === "sent") {
 				postInject(gateCtx, true); // 注入成功 → 确认收据（receipt 只在 sent 后）
 			} else if (status === "busy") {
@@ -288,7 +327,10 @@ export function onRunFile(
 				//（at-least-once：最坏重投一条，目标可容忍；详见 releaseAsyncResultClaim）。
 				releaseAsyncResultClaim(runsDir, runId, key, gate.holder);
 			} else if (status === "failed") {
-				selfDisabled = true; // 真实失败 → 停止注入（原失败路径）
+				// P2 修复：**不再全局 selfDisabled**。真实失败只影响**本事件/本通道**；
+				// 无关事件的交付不受拖累（旧实现 selfDisabled 全局压制 ⇒ P2）。
+				// 本事件会在期限后被判定 failed_delivery（由对账通道负责）。
+				appendTrace(opts.deliveryDir ?? defaultDeliveryDir(), { kind: "A-send-failed", runId, attemptId });
 			} else {
 				// no-injector：没有实际发送，不能伪造 receipt；释放后等待注入通道恢复再重试。
 				releaseAsyncResultClaim(runsDir, runId, key, gate.holder);

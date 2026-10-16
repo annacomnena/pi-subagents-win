@@ -11,7 +11,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -472,7 +472,9 @@ const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
 	assert.equal(existsSync(join(subDir, `${runId}.notified`)), true, "成功后 .notified 应重建");
 }
 
-// ── 15. L3: failed 照旧（真实失败 → 不标记 delivered、selfDisable 停止注入）──
+// ── 15. L3/P2: failed 不标记 delivered；**且不得全局 selfDisable 压掉无关事件** ──
+// 修前（坏基线）：failed ⇒ selfDisabled=true ⇒ 新 run 也被挡下（P2：无关完成事件被压掉）。
+// 修后：失败只影响**本事件/本通道**；无关 run 照常注入；本事件走账本升级路径。
 {
 	_resetAsyncResultWatcher();
 	const sent: string[] = [];
@@ -489,20 +491,29 @@ const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 	const opts = {
 		runsDir: subDir, linksPath: LINKS, toast: false, autoInject: true,
+		deliveryDir: join(subDir, "delivery"),
 		sendUserMessage: (_c: string, _o?: unknown) => Promise.reject(new Error("Connection error.")),
 	};
 	onRunFile(subDir, `${runId}.json`, opts);
 	await flush();
-	assert.equal(sent.length, 0, "failed 不得标记 delivered（不注入）");
-	// selfDisable 隔离验证：新 run（未 seen）也应被 selfDisabled 挡下（原失败路径）
+	// 失败注入**不得**伪造 delivered：账本里不得出现 consumed ack
+	const trace = readFileSync(join(subDir, "delivery", "trace.jsonl"), "utf8");
+	assert.ok(trace.includes(`${runId}`), "失败尝试已入交付账本（可审计）");
+	assert.ok(!trace.includes("consumed"), "失败**不得**写 consumed");
+
+	// **P2 关键断言（修前会红）**：无关的新 run 必须仍能正常注入，不被拖累
 	const runId2 = "run_l3_failed_2";
+	linkAsync(runId2);
 	writeFileSync(join(subDir, `${runId2}.json`), JSON.stringify({
 		id: runId2, agent: "test", task: "第二个", status: "completed",
 		startedAt: new Date().toISOString(),
 		result: { status: "completed", text: "ok" },
 	}), "utf8");
-	const r2 = onRunFile(subDir, `${runId2}.json`, opts);
-	assert.equal(r2, false, "failed 后 selfDisable → 新 run 也不注入（原失败路径）");
+	const sent2: string[] = [];
+	const opts2 = { ...opts, sendUserMessage: (c: string) => { sent2.push(c); return Promise.resolve(); } };
+	onRunFile(subDir, `${runId2}.json`, opts2);
+	await flush();
+	assert.equal(sent2.length, 1, "**P2 修复**：一条发送失败不得压掉无关完成事件（修前此处 selfDisabled ⇒ 0）");
 }
 
 // ── 16. L3: no-injector 不伪造 receipt，释放后等待通道恢复重试 ─────────

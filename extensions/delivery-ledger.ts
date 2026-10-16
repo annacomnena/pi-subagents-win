@@ -99,6 +99,11 @@ export function deliveryDir(runtimeDir: string = defaultRuntimeDir()): string {
 	return join(runtimeDir, "delivery");
 }
 
+/** 缺省交付账本目录（生产默认；测试注入隔离目录）。 */
+export function defaultDeliveryDir(): string {
+	return deliveryDir();
+}
+
 /** 文件名安全化：eventId 含 `:`，Windows 文件名非法 ⇒ 编码（可逆，不改 eventId 本身）。 */
 export function eventFileKey(eventId: string): string {
 	return encodeURIComponent(eventId);
