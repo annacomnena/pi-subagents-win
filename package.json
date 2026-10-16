@@ -141,6 +141,7 @@
     "test:subagent-zombie": "node --experimental-strip-types ./extensions/_test_subagent_zombie.ts",
     "test:subagent-wall-budget": "node --experimental-strip-types ./extensions/_test_subagent_wall_budget.ts",
     "test:delivery-ledger": "node --experimental-strip-types extensions/_test_delivery_ledger.ts",
+    "test:delivery-reconciler-loop": "node --experimental-strip-types extensions/_test_delivery_reconciler_loop.ts",
     "test:delivery-reconciler": "node --experimental-strip-types extensions/_test_delivery_reconciler.ts",
     "test:delivery-crash-window": "node --experimental-strip-types extensions/_test_delivery_crash_window.ts",
     "test:delivery-host-contract": "node --experimental-strip-types extensions/_test_delivery_host_contract.ts",

@@ -152,6 +152,8 @@ import {
 	type WechatFetch,
 } from "./wechat-bind.ts";
 import { ChannelSupervisor } from "./channel-supervisor.ts";
+// B 对账通道（切片 1）：独立进程内的 10s 周期对账（kill switch PI_DELIVERY_RECONCILER=0）。
+import { startDeliveryReconcilerLoop, type DeliveryReconcilerLoopHandle } from "./delivery-reconciler-loop.ts";
 import { setAutonomyEnabled } from "./autonomy-config.ts";
 import { readAutonomyConfig } from "../runtime/autonomy/config.ts";
 import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/collect.ts";
@@ -1526,10 +1528,29 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			} catch {
 				/* 监督面 never-throw：启动失败不炸 host */
 			}
+			// B 对账通道接线（唯一接线点）：随 host 生命周期 start/stop；`PI_DELIVERY_RECONCILER=0`
+			// ⇒ 零动作不启动。stateDir 与 outbox sweep 同源（状态文件 + 定向唤醒 spool 都在其中）；
+			// never-throw：接线失败不炸 host（B 缺席 = 退化为单通道 A，如实可观测）。
+			let deliveryReconciler: DeliveryReconcilerLoopHandle | null = null;
+			try {
+				deliveryReconciler = startDeliveryReconcilerLoop({
+					stateDir: outboxStateDirFor(opts),
+					...(opts.linksPath !== undefined ? { linksPath: opts.linksPath } : {}),
+					log: (msg: string): void => { try { console.error(msg); } catch { /* ignore */ } },
+				});
+			} catch {
+				/* B 接线 never-throw：启动失败不炸 host */
+			}
 			resolvePromise({
 				server,
 				info,
 				close: async () => {
+					// B 对账循环随 host 生命周期停止（先停：不再产生新的对账副作用）
+					try {
+						deliveryReconciler?.stop();
+					} catch {
+						/* 停循环 never-throw */
+					}
 					stopWechatInput();
 					stopWechatReply();
 					// 0923 wechat：停有界绑定流程（不动磁盘——bound 凭据跨重启保留）
