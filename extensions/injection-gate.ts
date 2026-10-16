@@ -103,6 +103,17 @@ export function postInject(ctx: InjectionContext, ok: boolean): void {
  *   - "failed"      其余 reject / 同步 throw（真实失败）→ 调用方走原失败路径（可 selfDisable）
  *   - "no-injector" send 非函数（host 进程 / 测试桩未接注入通道）→ 调用方走原 no-injector 路径
  */
+/**
+ * C-3 可回滚开关：调用点是否采用**严格模式**（`undefined ⇒ unconfirmed`，delivered 改由 ACK 驱动）。
+ *
+ * `PI_DELIVERY_STRICT=0` ⇒ 回滚到旧的「返回值当 sent」行为（兼容窗口用，**会重新引入 P3 假阳性**）。
+ * 缺省启用：因为生产 `pi.sendUserMessage` 恒返回 `undefined`（两级 delegate 都不 return），
+ * 旧行为等于「无条件认为成功」—— 那不是有效证据，只是承重的假阳性（见 P3 探针）。
+ */
+export function deliveryStrictEnabled(): boolean {
+	return process.env.PI_DELIVERY_STRICT !== "0";
+}
+
 export type InjectionSendStatus = "sent" | "busy" | "failed" | "no-injector" | "unconfirmed";
 
 /**

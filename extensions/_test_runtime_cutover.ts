@@ -25,7 +25,7 @@ import { attachMaster, readCutover, setCutover } from "./runtime/registry.ts";
 import { deliverLetter } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { hasNotificationReceipt } from "./runtime/receipts.ts";
-import { isCutoverActive, postInject, preInject } from "./injection-gate.ts";
+import { isCutoverActive, postInject, preInject, deliveryStrictEnabled } from "./injection-gate.ts";
 import { consumeMailboxOnce } from "./mailbox-consumer.ts";
 
 const master = masterAddress();
@@ -112,13 +112,22 @@ try {
 		await flush(); // L3：message send + 收据 在 .then 微任务
 		assert.equal(r.owner, "sess-A");
 		assert.equal(r.consumed.length, 1);
-		assert.equal(r.consumed[0]!.action, "injected");
-		assert.equal(sent.length, 1, "恰好注入一次");
+		assert.equal(sent.length, 1, "恰好注入一次（零回归）");
 		assert.ok(sent[0]!.includes("tab_c1"));
 		assert.ok(sent[0]!.includes("busy-poll"), "mailbox 完成信正文应含禁轮询纪律");
-		assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "收据确认");
-		assert.ok(existsSync(join(RUNSDIR, "tab_c1.notified")), ".notified 补认领");
-		// 重扫：已 ack，不重注
+		// C-3：fake send 不 return（= 生产形态）⇒ strict 下为 attempted-unconfirmed：
+		// **不收据、不补 .notified、不 ack**（交付由 ACK 决定）；回滚档位保持旧行为。
+		if (deliveryStrictEnabled()) {
+			assert.equal(r.consumed[0]!.action, "skipped", "strict：不计 injected（未确认）");
+			assert.equal(r.consumed[0]!.reason, "attempted-unconfirmed", "如实报告尝试但未确认");
+			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), false, "**未确认不得写收据**（P3）");
+			assert.equal(existsSync(join(RUNSDIR, "tab_c1.notified")), false, "未确认不得补 .notified（它不再是交付证明）");
+		} else {
+			assert.equal(r.consumed[0]!.action, "injected");
+			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "收据确认");
+			assert.ok(existsSync(join(RUNSDIR, "tab_c1.notified")), ".notified 补认领");
+		}
+		// 重扫：不重注（两种档位都成立）
 		const sent2: string[] = [];
 		const r2 = consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: (b) => { sent2.push(b); } });
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 0, "无重注");

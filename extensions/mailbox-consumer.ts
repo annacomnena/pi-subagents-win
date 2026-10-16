@@ -42,7 +42,10 @@ import { COMMAND_TYPES, type CommandFrame } from "./runtime/protocol.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { readAttachment, readCutover } from "./runtime/registry.ts";
 import { resolveRecipient } from "./runtime/resolver.ts";
-import { auditSuppression, postInject, preInject, injectFollowUpQuietly } from "./injection-gate.ts";
+import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
+// C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
+import { eventMarker } from "./delivery-ack.ts";
+import { appendTrace, ensureEvent, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
@@ -75,6 +78,8 @@ export interface ConsumeOptions {
 	mailboxDir?: string;
 	/** .notified 认领目录（缺省真实 tab-runs；测试传隔离目录） */
 	runsDir?: string;
+	/** 交付账本目录（C-3；缺省 defaultDeliveryDir()，测试注入隔离目录）。 */
+	deliveryDir?: string;
 	/** 注入实现（生产接 pi.sendUserMessage，测试传 fake） */
 	sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
 	/** executeCommand 选项透传（stateDir/configPath/commandsDir/journalPath；测试注入隔离用） */
@@ -250,7 +255,36 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 			}
 			// 注入。L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条消费链
 			// async，防竞态面扩大）。没有 injector 也未投递，必须释放 claim 后重试，不能伪造已消费。
-			injectFollowUpQuietly(opts.sendUserMessage, buildInjectBody(letter)).then((status) => {
+			//
+			// C-3：新增**交付账本**关联。mailbox 本身已有真 ACK（`ackLetter`）；本层把「已投递」
+			// 再锚到 eventId，使 `consumed` 可由 `pi.on("context")` 观察驱动（与 watcher 同构）。
+			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+			let mbEventId: string | undefined;
+			let mbAttemptId: string | undefined;
+			try {
+				const { event } = ensureEvent(dDir, {
+					runId: `mailbox_${messageId}`,
+					terminalRevision: terminalRevisionOf({ id: messageId, status: "completed", endedAt: new Date().toISOString(), result: { status: "completed", text: letter.frame.frame } }),
+					terminalSnapshotPath: join(mailboxDir, messageId),
+					dispatcherSessionId: opts.sessionId ?? "unknown",
+					observedAt: new Date().toISOString(),
+				});
+				mbEventId = event.eventId;
+				mbAttemptId = `${event.eventId}@MB@${Date.now()}`;
+			} catch { /* 账本失败不阻断消费（best-effort） */ }
+			const mbBody = mbEventId ? `${buildInjectBody(letter)}\n${eventMarker(mbEventId)}` : buildInjectBody(letter);
+			const strict = deliveryStrictEnabled();
+			injectFollowUpQuietly(opts.sendUserMessage, mbBody, { strict }).then((status) => {
+				if (mbEventId && mbAttemptId) {
+					try {
+						recordAttempt(dDir, mbEventId, {
+							attemptId: mbAttemptId, channel: "A", at: new Date().toISOString(),
+							status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : status === "unconfirmed" ? "unconfirmed" : "no-injector",
+							leaseOwner: `MB:${process.pid}`, leaseUntil: new Date(Date.now() + 15_000).toISOString(),
+						});
+						if (status === "unconfirmed") appendTrace(dDir, { kind: "C3-attempted-unconfirmed", source: "mailbox", messageId, eventId: mbEventId });
+					} catch { /* best-effort */ }
+				}
 				if (status === "sent") {
 					postInject({ key, sessionId: opts.sessionId, path: "mailbox-consumer" }, true);
 					// .notified 补认领（best-effort：堵 legacy 路径重注，terra 三路去重）
@@ -261,6 +295,11 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					} catch { /* best-effort */ }
 					ackLetter(recipient, frameId!, { mailboxDir });
 					reportPush(report, messageId, "injected");
+				} else if (status === "unconfirmed") {
+					// C-3：**不把返回值当送达**。mailbox 的真 ACK 仍是 `ackLetter`（消息确实落盘进入
+					// 会话才会被下轮 context 观察）；此处**不** ackLetter、**不** confirm —— 交付是否成立
+					// 由 context 观察的 `consumed` 决定，否则 60s 后由 B 判 failed_delivery + incident。
+					reportPush(report, messageId, "skipped", "attempted-unconfirmed");
 				} else if (status === "busy" || status === "no-injector") {
 					// agent 忙或没有注入通道，消息均未真正注入：不 ack/confirm、不 selfDisable；释放注入互斥
 					// + 把信退回 pending，供下 tick 重试。at-least-once 收敛：最坏重投一条，目标端按稳定

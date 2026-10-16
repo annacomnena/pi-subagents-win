@@ -33,7 +33,7 @@ import { refreshAsyncPanel } from "./async-panel.ts";
 import { claimNotified } from "./event-bus.ts";
 import { getCurrentSessionId, isMainSession, isSubagent, isTabSession, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
-import { preInject, postInject, injectFollowUpQuietly, type InjectionContext } from "./injection-gate.ts";
+import { preInject, postInject, injectFollowUpQuietly, deliveryStrictEnabled, type InjectionContext } from "./injection-gate.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { reapZombiesInDir } from "./subagent-zombie.ts";
@@ -48,17 +48,6 @@ import {
 } from "./delivery-ledger.ts";
 // C-2：接收端 ACK（`consumed` 由 context 钩子驱动；注入正文必带 eventId 标记）
 import { eventMarker, extractEventIdsFromMessages, ackConsumed } from "./delivery-ack.ts";
-
-/**
- * C-3 可回滚开关：调用点是否采用**严格模式**（`undefined ⇒ unconfirmed`，delivered 改由 ACK 驱动）。
- *
- * `PI_DELIVERY_STRICT=0` ⇒ 回滚到旧的「返回值当 sent」行为（兼容窗口用，**会重新引入 P3 假阳性**）。
- * 缺省 `1`（启用）：因为生产 `pi.sendUserMessage` 恒返回 `undefined`，旧行为等于「无条件认为成功」——
- * 那不是有效证据，只是承重的假阳性。
- */
-export function deliveryStrictEnabled(): boolean {
-	return process.env.PI_DELIVERY_STRICT !== "0";
-}
 
 /** 换行常量（避免在模板串里写反斜线 n 被预处理弄乱）。 */
 const NL = String.fromCharCode(10);

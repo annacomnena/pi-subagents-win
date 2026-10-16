@@ -920,7 +920,7 @@ console.log("✓ _test_async_result_watcher: all assertions passed");
 	const dDir = join(subDir, "delivery");
 	const trace = readFileSync(join(dDir, "trace.jsonl"), "utf8");
 	// 档位相关断言：strict（缺省）才记 attempted-unconfirmed；回滚档位下不记（旧行为）
-	const { deliveryStrictEnabled } = await import("./async-result-watcher.ts");
+	const { deliveryStrictEnabled } = await import("./injection-gate.ts");
 	if (deliveryStrictEnabled()) {
 		assert.ok(trace.includes("C3-attempted-unconfirmed"), "**C-3（strict）**：记 attempted-unconfirmed（如实，不冒充 sent）");
 	} else {

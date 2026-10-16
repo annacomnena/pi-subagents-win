@@ -46,6 +46,7 @@ import { maybePropose, readProposal } from "./runtime/master-succession.ts";
 import { writeLiveness } from "./runtime/liveness.ts";
 import { deliverCommand, deliverLetter, listLetters } from "./runtime/mailbox.ts";
 import { consumeMailboxOnce } from "./mailbox-consumer.ts";
+import { deliveryStrictEnabled } from "./injection-gate.ts"; // C-3：档位相关断言
 import {
 	createRuntimeHostServer,
 	type RuntimeHostHandle,
@@ -798,9 +799,19 @@ try {
 		const sent2: string[] = [];
 		const r2 = consumeMailboxOnce({ sessionId: sid, mailboxDir: ROOT, runsDir, sendUserMessage: (b) => { sent2.push(b); } });
 		await flush(); // L3：message 注入 + ack 在 .then 微任务
-		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 1, "message 帧照常注入");
-		assert.equal(sent2.length, 1);
-		assert.ok(!listLetters(master, undefined, ROOT).some((l) => l.frame.frame === "message" && l.frame.body.summary === "smoke report" && l.status === "pending"), "message 信已 ack");
+		// C-3 语义变更：fake send **不 return**（= 生产形态，`pi.sendUserMessage` 恒 undefined）
+		// ⇒ strict 下为 `attempted-unconfirmed`，**不再报 injected/ack**（信留 pending 供对账）。
+		// 回滚档位（PI_DELIVERY_STRICT=0）保持旧行为（报 injected + ack）。
+		const strict = deliveryStrictEnabled();
+		assert.equal(sent2.length, 1, "message 帧照常**尝试**注入（零回归）");
+		if (strict) {
+			assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 0, "**strict**：未确认⇒不报 injected（P3）");
+			assert.equal(r2.consumed.filter((c) => c.reason === "attempted-unconfirmed").length, 1, "如实报 attempted-unconfirmed");
+			assert.ok(listLetters(master, undefined, ROOT).some((l) => l.frame.frame === "message" && l.frame.body.summary === "smoke report" && l.status !== "acked"), "**信留 pending**（交付由 ACK 决定）");
+		} else {
+			assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 1, "回滚档位：message 帧照常注入+ack");
+			assert.ok(!listLetters(master, undefined, ROOT).some((l) => l.frame.frame === "message" && l.frame.body.summary === "smoke report" && l.status === "pending"), "message 信已 ack");
+		}
 	}
 
 	// ── 0924：decodeCommandBody 严格解码（远程中文 U+FFFD 烧毁修复；plans/0924_remote_input_encoding_fix.md）──

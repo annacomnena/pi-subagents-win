@@ -143,7 +143,8 @@
     "test:delivery-ledger": "node --experimental-strip-types extensions/_test_delivery_ledger.ts",
     "test:delivery-reconciler": "node --experimental-strip-types extensions/_test_delivery_reconciler.ts",
     "probe:p3-send": "node scripts/_probe_p3_senduser_message.mjs",
-    "test:delivery-ack": "node --experimental-strip-types extensions/_test_delivery_ack.ts"
+    "test:delivery-ack": "node --experimental-strip-types extensions/_test_delivery_ack.ts",
+    "test:c3-mailbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_mailbox_ack.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
