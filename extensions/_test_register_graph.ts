@@ -127,6 +127,7 @@ assert.deepEqual(toolNames, [
 // 同批修复存量漂移（补 /local-master-ensure、/send-letter、/wechat-remote-run——三者均为此前被 tool 断言失败遮挡的既有注册，与本次 steer 通道无关）；
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
 // （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
+// 2026-10-14 costTier 门补 /tiers（tiers.ts 命令面，index.ts#3916 接线）。
 assert.deepEqual(commandNames, [
 	"agents",
 	"autonomy",
@@ -158,6 +159,7 @@ assert.deepEqual(commandNames, [
 	"tabs",
 	"task-close",
 	"task-create",
+	"tiers",
 	"timers",
 	"today-usage",
 	"trace-fusion-clean",
@@ -181,12 +183,16 @@ assert.deepEqual(commandNames, [
 // （index.ts 通知钩子 + tab 遥测 tracking + hotspot v4 采集）。
 // 2026-09-24 hotspot v4：旧 detect/usage 退役、collect 接管采集；
 // session_before_compact 随 v2 inject 退役移除（它曾是全仓唯一挂点）。
+// 2026-10-16 C-2：async-result-watcher 新增 `context` x1（交付 ACK：检出 eventId ⇒
+// 写 `consumed` —— P3 正解，送达依据从返回值迁到「进入有效 context」）。
+// 注意：`context` 在 emitContext 中为可见消息（不含 system），本仓只读不改。
 assert.deepEqual(eventNames, [
 	"agent_end",
 	"agent_settled",
 	"agent_start",
 	"before_agent_start",
 	"before_provider_headers",
+	"context",
 	"input",
 	"message_end",
 	"resources_discover",

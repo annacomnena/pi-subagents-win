@@ -15,10 +15,10 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { readdirSync } from "node:fs";
+import { appendFileSync, readdirSync } from "node:fs";
 import { Type } from "typebox";
 import { getTabRunId, isMainSession, isSubagent, setCurrentSessionId } from "./identity.ts";
-import { defaultTabRunsDir, readTabDispatch, readTabResultFile, readTabState } from "./tab-runs.ts";
+import { defaultTabRunsDir, readTabDispatch, readTabResultFile, readTabState, resolveTabLedger } from "./tab-runs.ts";
 import {
 	defaultSteerDir,
 	expirePendingSteerRecords,
@@ -228,9 +228,27 @@ export function registerSteerTools(pi: ExtensionAPI, opts: SteerRuntimeOptions =
 			if (!check.ok || !check.value) return text(`steer 参数非法: ${check.errors.join("; ")}`, true);
 			const { tabRunId, mode, body } = check.value;
 
-			// 写前守卫（§3.5）：未知 tab / 已终态 tab 一律拒绝，绝不写僵尸记录
-			if (!readTabDispatch(runsDir, tabRunId)) {
-				return text(`unknown tab（无派发账本）: ${tabRunId}`, true);
+			// 写前守卫（§3.5）：未知 tab / 已终态 tab 一律拒绝，绝不写僵尸记录。
+			//
+			// 2026-10-16 修正（实测事故：tab-steer 报 `unknown tab（无派发账本）` 但会话仍活）：
+			// `archiveStaleTabRuns` 只挡 working/attached，`waiting`（活着的空闲 tab）会被移入
+			// `_archived/` ⇒ 旧实现只查活跃目录就**静默丢消息**。现改用 `resolveTabLedger`：
+			// 区分「仅被归档但仍活」与「真已终态」，前者**可投递**（备用通道）+ **可观测**。
+			const ledger = resolveTabLedger(runsDir, tabRunId);
+			if (!ledger.deliverable) {
+				// 明确理由（不得笼统 "unknown tab"）：no-ledger-dead / archived-dead
+				return text(`tab 不可投递 [${ledger.resolution}]: ${tabRunId} — ${ledger.reason}`, true);
+			}
+			// 归档/无账本但仍活：不静默 —— 落一条可观测记录（投递本身走同一 steer 目录，
+			// 该目录**不依赖派发账本**，故能送达；这正是本次事故中 timer 通道能代偿的原因同构）。
+			if (ledger.resolution === "archived-alive" || ledger.resolution === "no-ledger-alive") {
+				try {
+					appendFileSync(
+						join(runsDir, "ledger-fallback.jsonl"),
+						`${JSON.stringify({ at: new Date().toISOString(), tabRunId, resolution: ledger.resolution, reason: ledger.reason, source: "tab-steer" })}\n`,
+						"utf8",
+					);
+				} catch { /* best-effort：可观测失败不阻断投递 */ }
 			}
 			if (targetRunTerminal(runsDir, tabRunId)) {
 				return text(`tab already terminal: ${tabRunId}`, true);

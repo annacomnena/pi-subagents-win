@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
+	TAB_RUNS_ARCHIVE_DIR,
+	archiveStaleTabRuns,
 	buildTabStatusView,
 	classifyTabStatus,
 	composeTabStatus,
@@ -16,6 +18,7 @@ import {
 	readTabDispatch,
 	readTabResultFile,
 	readTabState,
+	resolveTabLedger,
 	sessionBucketForCwd,
 	validateTabDispatchRecord,
 	validateTabResult,
@@ -316,6 +319,92 @@ const WORKFLOW = "workflow" as const;
 
 	rmSync(sessionsRoot, { recursive: true, force: true });
 	rmSync(runsDir, { recursive: true, force: true });
+}
+
+// ── 归档回退（2026-10-16 实测事故：归档 ⇒ 活着的 tab 不可 steer）─────────
+{
+	// 构造：一个 waiting（**活着**）的 tab + 一个 completed（终态）的 tab
+	const runsDir2 = mkdtempSync(join(tmpdir(), "tab-runs-archive-"));
+	const dispatch = (id: string): void => {
+		writeFileSync(join(runsDir2, `${id}.json`), JSON.stringify({
+			id, version: 1, taskId: "taskX", cwd: process.cwd(), mode: "workflow",
+			dispatchStatus: "dispatched", dispatchedAt: new Date().toISOString(),
+		}), "utf8");
+	};
+	const state = (id: string, phase: string, terminal: boolean): void => {
+		writeFileSync(join(runsDir2, `${id}.state.json`), JSON.stringify({
+			id, phase, turn: "idle", terminal, lastActivityAt: new Date().toISOString(),
+		}), "utf8");
+	};
+
+	// ① 修根因：**waiting（活着）不得被归档**
+	const alive = "tab_alive_waiting";
+	dispatch(alive);
+	state(alive, "waiting", false);
+	const archived1 = archiveStaleTabRuns(runsDir2, 0); // maxAge=0：最激进的归档档位
+	assert.equal(existsSync(join(runsDir2, `${alive}.json`)), true, "**waiting 活着 ⇒ 不得归档**（修前会红：旧实现只挡 working/attached）");
+	assert.equal(existsSync(join(runsDir2, TAB_RUNS_ARCHIVE_DIR, `${alive}.json`)), false, "不得被移入 _archived");
+
+	// ② 全未终态但无 state 文件 ⇒ 保守不归档（旧实现会归档）
+	const noState = "tab_no_state";
+	dispatch(noState);
+	archiveStaleTabRuns(runsDir2, 0);
+	assert.equal(existsSync(join(runsDir2, `${noState}.json`)), true, "无 state ⇒ 无法证明终态 ⇒ 不归档");
+
+	// ③ 已终态 + 超龄 ⇒ 允许归档（真终态必须能清理）
+	const dead = "tab_dead_completed";
+	dispatch(dead);
+	state(dead, "completed", true);
+	// 把 dispatchedAt 改早，使超过 72h
+	writeFileSync(join(runsDir2, `${dead}.json`), JSON.stringify({
+		id: dead, version: 1, taskId: "taskX", cwd: process.cwd(), mode: "workflow",
+		dispatchStatus: "dispatched",
+		dispatchedAt: new Date(Date.now() - 100 * 3600 * 1000).toISOString(),
+	}), "utf8");
+	const archivedCount = archiveStaleTabRuns(runsDir2, 72);
+	assert.ok(archivedCount >= 1, `已终态 + 超龄 ⇒ 归档（实得 ${archivedCount}）`);
+	assert.equal(existsSync(join(runsDir2, TAB_RUNS_ARCHIVE_DIR, `${dead}.json`)), true, "终态账本已入 _archived");
+
+	// ④ 判定区分：归档但**仍活** vs 归档且**已终态**
+	//    alive：手动模拟「已被旧版本归档」的既成事实
+	state(alive, "waiting", false);
+	mkdirSync(join(runsDir2, TAB_RUNS_ARCHIVE_DIR), { recursive: true });
+	writeFileSync(join(runsDir2, TAB_RUNS_ARCHIVE_DIR, `${alive}.json`), JSON.stringify({
+		id: alive, version: 1, taskId: "taskX", cwd: process.cwd(), mode: "workflow",
+		dispatchStatus: "dispatched", dispatchedAt: new Date().toISOString(),
+	}), "utf8");
+	// 移除活跃账本以模拟归档后的状态
+	rmSync(join(runsDir2, `${alive}.json`), { force: true });
+	const rAlive = resolveTabLedger(runsDir2, alive);
+	assert.equal(rAlive.resolution, "archived-alive", `归档但仍活 ⇒ archived-alive（实得 ${rAlive.resolution}）`);
+	assert.equal(rAlive.deliverable, true, "**归档但仍活 ⇒ 可投递**（不得静默丢消息）");
+	assert.ok(rAlive.reason.includes("alive"), "理由可诊断");
+
+	const rDead = resolveTabLedger(runsDir2, dead);
+	assert.equal(rDead.resolution, "archived-dead", `归档且已终态 ⇒ archived-dead（实得 ${rDead.resolution}）`);
+	assert.equal(rDead.deliverable, false, "已终态 ⇒ 不得复活/重复投递");
+
+	// ⑤ 无账本但活着 vs 彻底未知（错误必须可诊断）
+	const ghost = "tab_ghost_alive";
+	state(ghost, "attached", false);
+	const rGhost = resolveTabLedger(runsDir2, ghost);
+	assert.equal(rGhost.resolution, "no-ledger-alive", "无账本但活 ⇒ 明确诊断（非笼统 unknown）");
+	assert.equal(rGhost.deliverable, true);
+	const rNone = resolveTabLedger(runsDir2, "tab_totally_unknown");
+	assert.equal(rNone.resolution, "no-ledger-dead", "彻底未知 ⇒ no-ledger-dead（理由明确）");
+	assert.equal(rNone.deliverable, false);
+	assert.ok(!/^unknown tab/.test(rNone.reason), "理由不得是笼统 'unknown tab'");
+
+	// ⑥ active 行为不变（零回归）
+	const act = "tab_active_ok";
+	dispatch(act);
+	state(act, "working", false);
+	const rAct = resolveTabLedger(runsDir2, act);
+	assert.equal(rAct.resolution, "active", "活跃账本 ⇒ active（原路径）");
+	assert.equal(rAct.deliverable, true);
+
+	rmSync(runsDir2, { recursive: true, force: true });
+	console.log("ok - 归档回退：waiting 不归档 / 终态可归档 / archived-alive 可投递 / archived-dead 不复活 / 错误可诊断");
 }
 
 console.log("tab-runs tests passed");

@@ -579,15 +579,24 @@ export function archiveStaleTabRuns(runsDir: string, maxAgeHours = 72): number {
 			const statePath = join(runsDir, `${id}.state.json`);
 			const notifiedPath = join(runsDir, `${id}.notified`);
 
-			// 防护：若任务明确处于 working / attached 活跃状态，绝不归档
+			// 防护：若任务处于**非终态**活跃状态，绝不归档。
+			//
+			// 2026-10-16 修根因：旧实现只挡 working/attached，遗漏了 **waiting** ——
+			// 那是**活着的空闲 tab**（在等输入/等下次唤醒），被归档后其派发账本被移走 ⇒
+			// `steer` 只查活跃目录 ⇒ 报 `unknown tab` 并**静默丢消息**（实测事故）。
+			//
+			// 语义：**“非终态”就不归档**，终态的证据有三条任一即可（不要求单一字段）：
+			//   ① state.phase 属终态集合；② state.terminal === true；③ 存在 result 文件。
+			// 三者全无 ⇒ 保守不归档（宁可积压也不丢消息；无 state 不代表已终态）。
+			let terminalEvidence = existsSync(resultPath);
 			if (existsSync(statePath)) {
 				try {
-					const s = JSON.parse(readFileSync(statePath, "utf8"));
-					if (s && (s.phase === "working" || s.phase === "attached")) {
-						continue;
-					}
-				} catch { /* ignore */ }
+					const s = JSON.parse(readFileSync(statePath, "utf8")) as { phase?: string; terminal?: boolean } | null;
+					const TERMINAL_PHASES = ["completed", "failed", "cancelled", "orphaned"];
+					if (s && (TERMINAL_PHASES.includes(String(s.phase)) || s.terminal === true)) terminalEvidence = true;
+				} catch { /* 半截/损坏 state：不据此判定（下方 terminalEvidence 仍可能来自 result） */ }
 			}
+			if (!terminalEvidence) continue;
 
 			// 传 maxAgeHours === 0 时：仅归档已具备终态的跑次
 			if (maxAgeHours === 0) {
@@ -867,5 +876,114 @@ export function composeTabStatus(opts: {
 		usage: status.usage,
 		source: "session-jsonl",
 		note: status.note,
+	};
+}
+
+// ── 归档回退：账本缺失但会话仍活（新证据 2026-10-16）──────────────────
+
+/**
+ * 账本解析结果（**明确区分「仅被归档但仍活」与「真已终态」**）。
+ *
+ * ## 解决什么
+ * `archiveStaleTabRuns` 的防护只挡 `working`/`attached`；处于 **`waiting`**（活着的空闲 tab）
+ * 或已终态但仍在写 state 的跑次会被移入 `_archived/`。而 `steer-runtime` 只查活跃目录 ⇒
+ * 报 `unknown tab（无派发账本）` 并**静默丢消息**（实测事故）。
+ *
+ * 本函数把「无账本」细分为四种情况，供调用方**按情况处置**而非笼统拒绝：
+ *   - `active`         活跃目录有账本（原路径，行为不变）；
+ *   - `archived-alive` 活跃目录无、`_archived/` 有，且 state/session 仍活
+ *                      ⇒ **可投递**（走备用通道），并**落 incident/可观测**；
+ *   - `archived-dead`  归档且 state 已是终态 ⇒ **不得复活**（拒绝，明确理由）；
+ *   - `no-ledger-alive` 两处都无账本，但 state/session 仍活 ⇒ 可观测 + 可投递；
+ *   - `no-ledger-dead`  两处都无且不活 ⇒ 真未知（原 `unknown tab` 语义，但**理由明确**）。
+ */
+export type LedgerResolution = "active" | "archived-alive" | "archived-dead" | "no-ledger-alive" | "no-ledger-dead";
+
+export interface LedgerResolutionResult {
+	resolution: LedgerResolution;
+	/** 活跃目录的账本（仅 active 时有）。 */
+	dispatch: TabDispatchRecord | null;
+	/** 归档目录的账本（仅 archived-* 时有）。 */
+	archivedDispatch: TabDispatchRecord | null;
+	/** state 文件存在且非终态（探活依据）。 */
+	stateAlive: boolean;
+	/** state 的 phase（诊断用）。 */
+	statePhase?: string;
+	/** 是否允许投递（true = 走投递；false = 拒绝）。 */
+	deliverable: boolean;
+	/** 供日志/incident 的人类可读理由（不得笼统 "unknown tab"）。 */
+	reason: string;
+}
+
+/** 归档目录名（与 archiveStaleTabRuns 一致）。 */
+export const TAB_RUNS_ARCHIVE_DIR = "_archived";
+
+/** 在归档目录里读派发账本。 */
+function readArchivedTabDispatch(runsDir: string, runId: string): TabDispatchRecord | null {
+	const path = join(runsDir, TAB_RUNS_ARCHIVE_DIR, `${runId}.json`);
+	if (!existsSync(path)) return null;
+	try {
+		const check = validateTabDispatchRecord(JSON.parse(readFileSync(path, "utf8")));
+		return check.ok && check.value ? check.value : null;
+	} catch {
+		return null;
+	}
+}
+
+/** state 是否「活着」：存在且 phase 非终态（attached/working/waiting）。 */
+function stateAlivePhase(state: TabState | null): boolean {
+	if (!state) return false;
+	return state.phase === "attached" || state.phase === "working" || state.phase === "waiting";
+}
+
+/**
+ * 解析 tab 账本归属（含归档回退）。
+ *
+ * 只读、无副作用；不修改归档、不复活、不删任何文件。
+ */
+export function resolveTabLedger(runsDir: string, runId: string): LedgerResolutionResult {
+	const state = readTabState(runsDir, runId);
+	const alive = stateAlivePhase(state);
+	const statePhase = state?.phase;
+
+	const active = readTabDispatch(runsDir, runId);
+	if (active) {
+		return {
+			resolution: "active", dispatch: active, archivedDispatch: null,
+			stateAlive: alive, statePhase, deliverable: true, reason: "ledger present in active dir",
+		};
+	}
+
+	const archived = readArchivedTabDispatch(runsDir, runId);
+	if (archived) {
+		if (alive) {
+			return {
+				resolution: "archived-alive", dispatch: null, archivedDispatch: archived,
+				stateAlive: true, statePhase,
+				deliverable: true,
+				reason: `ledger archived but session alive (phase=${statePhase ?? "?"}) ⇒ deliver via fallback channel`,
+			};
+		}
+		return {
+			resolution: "archived-dead", dispatch: null, archivedDispatch: archived,
+			stateAlive: false, statePhase,
+			deliverable: false,
+			reason: `ledger archived and session not alive (phase=${statePhase ?? "none"}) ⇒ do not revive`,
+		};
+	}
+
+	if (alive) {
+		return {
+			resolution: "no-ledger-alive", dispatch: null, archivedDispatch: null,
+			stateAlive: true, statePhase,
+			deliverable: true,
+			reason: `no ledger anywhere but session alive (phase=${statePhase ?? "?"}) ⇒ deliver via fallback channel`,
+		};
+	}
+	return {
+		resolution: "no-ledger-dead", dispatch: null, archivedDispatch: null,
+		stateAlive: false, statePhase,
+		deliverable: false,
+		reason: `no ledger and session not alive (phase=${statePhase ?? "none"})`,
 	};
 }

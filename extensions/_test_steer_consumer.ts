@@ -331,10 +331,13 @@ function makeTools(steerDir: string, runsDir: string): {
 		);
 
 		// 未知 tab：isError 且零落盘
+		//
+		// 2026-10-16 修正：不再笼统 `unknown tab`，而是**可诊断的细分理由**
+		// （新证据要求③：区分 `no-ledger-alive` 与 `no-ledger-dead`）。此处无 state ⇒ dead。
 		const unknownTab = "tab_unknown_guard_x";
 		const rUnknown = await steerTool.execute("t1", { tabRunId: unknownTab, message: "hi" });
 		assert.equal(rUnknown.isError, true, "未知 tab → isError");
-		assert.ok(paramText(rUnknown).includes("unknown tab"), `文案: ${paramText(rUnknown)}`);
+		assert.ok(paramText(rUnknown).includes("no-ledger-dead"), `理由可诊断（不得笼统）: ${paramText(rUnknown)}`);
 		assert.equal(existsSync(join(steerDir, unknownTab)), false, "拒绝时不创建 steer 目录");
 
 		// 已终态 tab：isError
