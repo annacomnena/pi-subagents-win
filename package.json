@@ -140,7 +140,8 @@
     "test:gui-contrast": "node --experimental-strip-types ./gui/src/_test_contrast.ts",
     "test:subagent-zombie": "node --experimental-strip-types ./extensions/_test_subagent_zombie.ts",
     "test:subagent-wall-budget": "node --experimental-strip-types ./extensions/_test_subagent_wall_budget.ts",
-    "test:delivery-ledger": "node --experimental-strip-types extensions/_test_delivery_ledger.ts"
+    "test:delivery-ledger": "node --experimental-strip-types extensions/_test_delivery_ledger.ts",
+    "test:delivery-reconciler": "node --experimental-strip-types extensions/_test_delivery_reconciler.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

@@ -127,6 +127,14 @@ export interface DeliveryEvent {
 	runId: string;
 	terminalRevision: string;
 	terminalSnapshotPath: string;
+	/**
+	 * **终态发生时刻**（来自 run 的 `endedAt`/`zombieReapedAt`）。
+	 *
+	 * 与 `observedAt`（发现时刻）区分：B 可能晚于终态很久才第一次扫到该 run，
+	 * 若用 `observedAt` 算期限，则「晚发现的旧事件」会被错误地给予新的 60s
+	 * （相当于隐式展期，违反咨询 §6.5「不隐式展期」）。故所有期限以本字段为准。
+	 */
+	terminalAt: string;
 	/** 派发者稳定身份（links 解析结果）。 */
 	dispatcherSessionId: string;
 	/** 接收者世代（迁移接收者时保留 eventId、递增 generation）。 */
@@ -163,6 +171,8 @@ export function ensureEvent(
 		dispatcherSessionId: string;
 		recipientGeneration?: number;
 		observedAt?: string;
+		/** 终态发生时刻（缺省回退 observedAt）；期限基准，见 DeliveryEvent.terminalAt。 */
+		terminalAt?: string;
 		deliveryDeadlineMs?: number;
 	},
 ): { event: DeliveryEvent; created: boolean } {
@@ -171,6 +181,7 @@ export function ensureEvent(
 	const existing = loadEvent(dir, eventId);
 	if (existing) return { event: existing, created: false };
 	const observedAt = input.observedAt ?? new Date().toISOString();
+	const terminalAt = input.terminalAt ?? observedAt;
 	const deadlineMs = input.deliveryDeadlineMs ?? DELIVERY_DEADLINE_MS;
 	const event: DeliveryEvent = {
 		eventId,
@@ -180,7 +191,8 @@ export function ensureEvent(
 		dispatcherSessionId: input.dispatcherSessionId,
 		recipientGeneration: input.recipientGeneration ?? 1,
 		observedAt,
-		deliveryDeadline: new Date(Date.parse(observedAt) + deadlineMs).toISOString(),
+		terminalAt,
+		deliveryDeadline: new Date(Date.parse(terminalAt) + deadlineMs).toISOString(),
 	};
 	atomicWrite(join(dir, `${eventFileKey(eventId)}.json`), JSON.stringify(event));
 	return { event, created: true };
@@ -350,7 +362,7 @@ export function reconcileDecision(
 		return { action: "fail_delivery", reason: `deadline-exceeded(deadline=${event.deliveryDeadline},stage=${view.stage})` };
 	}
 
-	const observed = Date.parse(event.observedAt);
+	const observed = Date.parse(event.terminalAt ?? event.observedAt);
 	const firstRetryMs = opts.reconcileFirstRetryMs ?? RECONCILE_FIRST_RETRY_MS;
 	const leaseMs = opts.leaseMs ?? LEASE_MS;
 	if (!Number.isFinite(observed)) return { action: "none", reason: "no-observed-at" };
