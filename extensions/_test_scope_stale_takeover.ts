@@ -134,7 +134,12 @@ try {
 		assert.equal(att.generation, 2, "gen+1（对齐 forceStale 语义）");
 		assert.equal(att.detail, repo.toplevel, "detail（toplevel 路径）保留");
 		assert.notEqual(readBytes(attFileOf(addr)), before, "attachment 已覆盖写");
-		assert.equal(readScopeLiveness(scope)!.sessionId, "sess-old", "接管不碰 liveness 文件（新 owner 首个钩子才写）");
+		// C 补（2026-10-16）：接管成功后**立即刷本 scope liveness**（修「认领后到首个 agent turn
+		// 之前 liveness 仍是旧代」的窗口；旧行为是不碰该文件）。
+		const livenessAfter = readScopeLiveness(scope)!;
+		assert.equal(livenessAfter.sessionId, "sess-new", "接管后 liveness 已刷新为新 owner（不再等首个钩子）");
+		assert.equal(livenessAfter.generation, 2, "liveness generation = 新代");
+		assert.notEqual(livenessAfter.updatedAt, undefined, "liveness updatedAt 已写");
 
 		// journal：agent.session.takeover 含 prev/evidence；attempt 事件同在
 		const envs = listRuntimeEnvelopes({ path: join(ROOT, "events.jsonl") }).envelopes;
@@ -160,7 +165,7 @@ try {
 		assert.equal(d.fire, false);
 		assert.equal(d.reason, "not-owner", "旧 owner 评估 not-owner");
 		assert.deepEqual(noteScopeWakeInbox("sess-old", repo.cwd), [], "旧 owner attention 记账 no-op");
-		assert.equal(readScopeLiveness(scope)!.sessionId, "sess-old", "旧 owner 路径不覆写 liveness");
+		assert.equal(readScopeLiveness(scope)!.sessionId, "sess-new", "旧 owner 路径不覆写 liveness（仍为新 owner）");
 	}
 
 	// ── T2 不误杀三态 ─────────────────────────────────────────────

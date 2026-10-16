@@ -263,7 +263,9 @@ const evOf = (scope: string): ScopeConsumeEvidence | null => readConsumeEvidence
 
 	// ownership transfer：旧 owner pid 死 → 新会话按既有 stale 判据接管（gen+1），
 	// 再激活 = 停旧起新（stoppedOld）——同一时刻该 scope 恒至多一个消费者。
-	writeScopeLiveness({ scopeKey: scope, sessionId: "sess_sc2", generation: 1, pid: DEAD_PID });
+	// 注：接管成功会**立即刷 liveness**（C 补）⇒ 此处刻意把 `now` 推后 31s 绕开 30s 节流，
+	// 才能植入“旧 owner pid 死”的测试夹具（节流只影响同身份重写，不影响生产语义）。
+	writeScopeLiveness({ scopeKey: scope, sessionId: "sess_sc2", generation: 1, pid: DEAD_PID }, { now: new Date(Date.now() + 31_000) });
 	const takeover = takeoverStaleScopeOwner("sess_sc3", cwd);
 	assert.equal(takeover.outcome, "took-over", `接管应成功，实际=${JSON.stringify(takeover)}`);
 	const attAfter = readAttachment(localMasterAddress(scope))!;
@@ -312,7 +314,7 @@ const evOf = (scope: string): ScopeConsumeEvidence | null => readConsumeEvidence
 	const gen4 = evOf(scope)!;
 
 	// 所有权失效（另一会话按既有 stale 判据接管，gen+1）→ 下一 tick 自检停循环
-	writeScopeLiveness({ scopeKey: scope, sessionId: "sess_sc4", generation: 1, pid: DEAD_PID });
+	writeScopeLiveness({ scopeKey: scope, sessionId: "sess_sc4", generation: 1, pid: DEAD_PID }, { now: new Date(Date.now() + 31_000) }); // 绕 30s 节流植入「pid 死」夹具（同上一段）
 	const took = takeoverStaleScopeOwner("sess_sc5", cwd);
 	assert.equal(took.outcome, "took-over", `接管应成功，实际=${JSON.stringify(took)}`);
 	const newGen = readAttachment(localMasterAddress(scope))!.generation;

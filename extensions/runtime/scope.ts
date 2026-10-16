@@ -40,7 +40,7 @@ import { defaultRuntimeDir } from "./journal.ts";
 import { ackClaimedBy, claimLetters, defaultMailboxDir, listLetters, mailboxDirFor, type Letter } from "./mailbox.ts";
 import { attachMasterWithAudit, takeoverMasterWithAudit } from "./adapters/session-lifecycle.ts";
 import { readAttachment, readCutover, type MasterAttachment } from "./registry.ts";
-import { isProcessAlive, readScopeLiveness, type ScopeLiveness } from "./liveness.ts";
+import { isProcessAlive, readScopeLiveness, writeScopeLiveness, type ScopeLiveness } from "./liveness.ts";
 import {
 	buildReplyRecipe,
 	isInFlight,
@@ -106,6 +106,26 @@ export type ScopeGenesisOutcome =
 	| { outcome: "skipped"; scope?: string; reason: "bad-session" | "no-cwd" | "owner-active" | "attach-failed" | "io-error" };
 
 /**
+ * C 补（2026-10-16，僵尸死角研究）：**认领成功即刷本 scope liveness**。
+ *
+ * 为何必须：`writeScopeLiveness` 原本**唯一**写手是 `session-hooks.ts:46`，只在
+ * `agent_start`/`agent_end` 被调 ⇒ 新 owner 认领后到**首个 agent turn 之前**，
+ * `scope-liveness/<scope>.json` 仍是**旧代**（身份不匹配 ⇒ `judgeScopeOwnerStale` 返
+ * `skip:identity-mismatch`）⇒ `master-attach` / `ensure` 在这一窗口内看不到新主。
+ * 本处在**认领落盘处**补写一次（与认领同址）：首次写入时 `prev.sessionId !== sid`
+ * ⇒ 30s 节流不生效，保证立即落盘；身份门由「调用点只能拿到刚成功的 attachment」提供。
+ * 零新增权力：不新增判据、不新增放行面，只是把已有的“自己是谁”事实及时写盘。
+ * never-throw（同 gauge 语义）：写盘失败不阻断认领。
+ */
+function refreshScopeLivenessAfterClaim(scope: string, sessionId: string, generation: number): void {
+	try {
+		writeScopeLiveness({ scopeKey: scope, sessionId, generation });
+	} catch {
+		/* never-throw：gauge 不阻断主流程 */
+	}
+}
+
+/**
  * 静默 genesis 认领。前置门（全部不过 = 静默 no-op，不重试不上报）：
  *   1. sessionId 非 "unknown"（M1 哨兵，registry 层双满足）；
  *   2. 本 scope 无 owner（有 owner 无论死活一律不动——v1 无 stale 分支）；
@@ -132,7 +152,10 @@ export function silentScopeGenesis(sessionId: string, cwd?: string): ScopeGenesi
 		// 主会话拍板：toplevel 完整路径直接写 attachment detail 自由字段（无 git 回退 cwd 本身）
 		const detail = gitToplevel(norm) ?? norm;
 		const r = attachMasterWithAudit({ sessionId, agent: addr, detail });
-		if (r.ok) return { outcome: "attached", scope, attachment: r.attachment };
+		if (r.ok) {
+			refreshScopeLivenessAfterClaim(scope, sessionId, r.attachment.generation);
+			return { outcome: "attached", scope, attachment: r.attachment };
+		}
 		return {
 			outcome: "skipped",
 			scope,
@@ -212,6 +235,7 @@ export function takeoverStaleScopeOwner(
 			},
 		);
 		if (r.ok) {
+			refreshScopeLivenessAfterClaim(scope, sessionId, r.attachment.generation);
 			return { outcome: "took-over", scope, attachment: r.attachment, prevSessionId: r.prevSessionId, prevGeneration: r.prevGeneration };
 		}
 		return { outcome: "skipped", scope, reason: "takeover-failed" };
