@@ -43,9 +43,17 @@ const CANDIDATES = [
 
 const PKG = CANDIDATES.find((p) => existsSync(join(p, "dist", "core", "agent-session.js")));
 if (!PKG) {
-	console.log("_test_p3_provenance: SKIP（未找到已安装的 @earendil-works/pi-coding-agent）");
+	// GLM-5.3 复核 nit（采纳）：结构性迁移（文件改名/搬目录）时断言会**静默消失**。
+	// ⇒ 醒目 WARN；在需要硬门的场景（CI）设 `PI_P3_PROVENANCE_REQUIRED=1` 则非 0 退出。
+	console.log("⚠ _test_p3_provenance: SKIP —— 未找到已安装的 @earendil-works/pi-coding-agent（断言面静默消失，非通过）");
+	if (process.env.PI_P3_PROVENANCE_REQUIRED === "1") process.exit(1);
 	process.exit(0);
 }
+// 锁定被测版本（便于事后追溯；非断言）
+try {
+	const pkgJson = JSON.parse(readFileSync(join(PKG, "package.json"), "utf8")) as { version?: string };
+	console.log(`_test_p3_provenance: 被测包版本 = ${pkgJson.version ?? "unknown"} @ ${PKG}`);
+} catch { /* 版本读取失败不影响断言 */ }
 
 let n = 0;
 const ok = (name: string): void => { n += 1; console.log(`ok ${n} - ${name}`); };
