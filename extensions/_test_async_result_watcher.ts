@@ -883,3 +883,74 @@ const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
 }
 
 console.log("✓ _test_async_result_watcher: all assertions passed");
+
+// ── 18. C-3（P3）：生产形态（send 返回 undefined）**不得**当 delivered ──────
+// 决定性断言：`pi.sendUserMessage` 生产恒返回 undefined（loader.js:295 + agent-session.js:2644
+// 两级都不 return）。故：
+//   · 必须有 `attempted-unconfirmed` 记录（可审计）；
+//   · **不得**写 `consumed`（那是 P3 假阳性）；
+//   · 交付是否成立完全由 context ACK 决定（下一组验证）。
+{
+	_resetAsyncResultWatcher();
+	const subDir = join(dir, "c3-unconfirmed");
+	mkdirSync(subDir, { recursive: true });
+	const runId = "run_c3_unconfirmed";
+	be(ME);
+	linkAsync(runId);
+	writeFileSync(join(subDir, `${runId}.json`), JSON.stringify({
+		id: runId, agent: "test", task: "c3", status: "completed",
+		startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
+		result: { status: "completed", text: "ok" },
+	}), "utf8");
+
+	// 生产形态：send 不 return（与 loader.js:295 行为一致）
+	const sentBodies: string[] = [];
+	const opts = {
+		runsDir: subDir, linksPath: LINKS, toast: false, autoInject: true,
+		deliveryDir: join(subDir, "delivery"),
+		sendUserMessage: (c: string) => { sentBodies.push(c); /* 不 return —— 生产形态 */ },
+	};
+	onRunFile(subDir, `${runId}.json`, opts);
+	await flush();
+
+	assert.equal(sentBodies.length, 1, "消息已尝试发送（正文含 eventId 标记）");
+	assert.ok(/\[evt:async:run_c3_unconfirmed:/.test(sentBodies[0]), "正文必须携带 eventId 标记（接收端据此写 consumed）");
+
+	const { listAcks, listAttempts } = await import("./delivery-ledger.ts");
+	const dDir = join(subDir, "delivery");
+	const trace = readFileSync(join(dDir, "trace.jsonl"), "utf8");
+	// 档位相关断言：strict（缺省）才记 attempted-unconfirmed；回滚档位下不记（旧行为）
+	const { deliveryStrictEnabled } = await import("./async-result-watcher.ts");
+	if (deliveryStrictEnabled()) {
+		assert.ok(trace.includes("C3-attempted-unconfirmed"), "**C-3（strict）**：记 attempted-unconfirmed（如实，不冒充 sent）");
+	} else {
+		assert.ok(!trace.includes("C3-attempted-unconfirmed"), "回滚档位（PI_DELIVERY_STRICT=0）⇒ 不记 unconfirmed（旧行为）");
+	}
+
+	// 关键否定断言：**不得**出现 consumed（P3 假阳性）
+	let eventId = "";
+	for (const line of trace.split("\n")) {
+		const m = /"eventId":"(async:[^"]+)"/.exec(line);
+		if (m) { eventId = m[1]; break; }
+	}
+	assert.ok(eventId, `trace 里应有 eventId（实得 ${eventId}）`);
+	assert.equal(listAcks(dDir, eventId).filter((a) => a.stage === "consumed").length, 0, "**未进入 context ⇒ 不得写 consumed**（P3 核心）");
+	assert.equal(listAttempts(dDir, eventId).length >= 1, true, "已记 attempt（可审计）");
+}
+
+// ── 19. C-3：ACK 驱动送达（context 观察 ⇒ consumed）────────────────────
+{
+	const { ackConsumed, eventMarker } = await import("./delivery-ack.ts");
+	const { listAcks, listAttempts, effectiveStage, loadEvent, listEvents } = await import("./delivery-ledger.ts");
+	const dDir = join(dir, "c3-unconfirmed", "delivery");
+	const evs = listEvents(dDir, 100).filter((e) => e.runId === "run_c3_unconfirmed");
+	assert.equal(evs.length, 1, "上一组已建事件");
+	const ev = evs[0];
+	const before = effectiveStage(ev, listAttempts(dDir, ev.eventId), listAcks(dDir, ev.eventId), Date.now());
+	assert.notEqual(before.stage, "consumed", "ACK 前不是 consumed");
+	// 模拟 context 钩子观察到该 eventId（正是 watcher 注册的钩子所做的事）
+	ackConsumed(dDir, [ev.eventId], { evidence: "context-observed" });
+	const after = effectiveStage(loadEvent(dDir, ev.eventId)!, listAttempts(dDir, ev.eventId), listAcks(dDir, ev.eventId), Date.now());
+	assert.equal(after.stage, "consumed", "**eventId 进入 context ⇒ consumed（送达成立）** — 返回值未参与");
+	assert.ok(eventMarker(ev.eventId).includes(ev.eventId), "标记可逆");
+}

@@ -49,6 +49,20 @@ import {
 // C-2：接收端 ACK（`consumed` 由 context 钩子驱动；注入正文必带 eventId 标记）
 import { eventMarker, extractEventIdsFromMessages, ackConsumed } from "./delivery-ack.ts";
 
+/**
+ * C-3 可回滚开关：调用点是否采用**严格模式**（`undefined ⇒ unconfirmed`，delivered 改由 ACK 驱动）。
+ *
+ * `PI_DELIVERY_STRICT=0` ⇒ 回滚到旧的「返回值当 sent」行为（兼容窗口用，**会重新引入 P3 假阳性**）。
+ * 缺省 `1`（启用）：因为生产 `pi.sendUserMessage` 恒返回 `undefined`，旧行为等于「无条件认为成功」——
+ * 那不是有效证据，只是承重的假阳性。
+ */
+export function deliveryStrictEnabled(): boolean {
+	return process.env.PI_DELIVERY_STRICT !== "0";
+}
+
+/** 换行常量（避免在模板串里写反斜线 n 被预处理弄乱）。 */
+const NL = String.fromCharCode(10);
+
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
 const TICK_MS = 10_000;
 const MAX_SEEN = 500;
@@ -315,8 +329,9 @@ export function onRunFile(
 		} catch { /* 账本写入失败不阻断注入（best-effort；B 通道会从终态重建） */ }
 		// C-2：正文**必带 eventId 标记** —— 接收端才能从 context 钩子的 messages 里检出它，
 		// 从而在不依赖返回值的前提下写 `consumed` ACK（P3 的正解）。
-		const body = eventId ? `${baseBody}\n${eventMarker(eventId)}` : baseBody;
-		injectFollowUpQuietly(opts.sendUserMessage, body).then((status) => {
+		const body = eventId ? `${baseBody}${NL}${eventMarker(eventId)}` : baseBody;
+		const strict = deliveryStrictEnabled();
+		injectFollowUpQuietly(opts.sendUserMessage, body, { strict }).then((status) => {
 			// 尝试结果入账（**只表示调过发送**；`sent` 也只是 attempted）
 			if (attemptId) {
 				try {
@@ -330,6 +345,14 @@ export function onRunFile(
 			}
 			if (status === "sent") {
 				postInject(gateCtx, true); // 注入成功 → 确认收据（receipt 只在 sent 后）
+			} else if (status === "unconfirmed") {
+				// ── C-3：**不再把返回值当送达**（P3）──────────────────────
+				// 生产 `pi.sendUserMessage` 恒返回 `undefined` ⇒ 本分支是常态。
+				// 硬约束（裁决 4）：**严禁**悄悄回退成 `sent`；如实降级为「已尝试、未确认」，
+				// 交付是否成立**完全由 ACK 决定**（`pi.on("context")` 检出 eventId ⇒ consumed）。
+				// 未在 60s 期限内 consumed ⇒ B 对账通道判 `failed_delivery` + incident。
+				// 不释放 claim（消息**可能已入 context**；重投交给 B 的租约语义，防重复注入）。
+				appendTrace(dDir, { kind: "C3-attempted-unconfirmed", runId, attemptId, strict });
 			} else if (status === "busy") {
 				// agent 忙，消息未真正注入：不 confirm、不 selfDisable；释放本次认领供下 tick 重试
 				//（at-least-once：最坏重投一条，目标可容忍；详见 releaseAsyncResultClaim）。
