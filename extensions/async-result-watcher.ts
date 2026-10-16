@@ -46,6 +46,8 @@ import {
 	writeAck,
 	appendTrace,
 } from "./delivery-ledger.ts";
+// C-2：接收端 ACK（`consumed` 由 context 钩子驱动；注入正文必带 eventId 标记）
+import { eventMarker, extractEventIdsFromMessages, ackConsumed } from "./delivery-ack.ts";
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
 const TICK_MS = 10_000;
@@ -285,7 +287,7 @@ export function onRunFile(
 	// 注入（核心：向归属会话发 followUp 唤醒）
 	// L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条链 async，防竞态面扩大）。
 	if (opts.autoInject !== false) {
-			const body = [
+			const baseBody = [
 			`⏱ async ${agent} ${runId} ${record.status}${cost}：${task}${error}${failureLine}`,
 			`产物: ${join(runsDir, `${runId}.json`)}`,
 			`下一步: 用 subagent-win({ action: "status", runId: "${runId}" }) 取全文。`,
@@ -297,6 +299,7 @@ export function onRunFile(
 		// 因此这里只 `recordAttempt`（“调过发送”），**绝不**在 sent 时写 consumed。
 		const dDir = opts.deliveryDir ?? defaultDeliveryDir();
 		let attemptId: string | undefined;
+		let eventId: string | undefined;
 		try {
 			const { event } = ensureEvent(dDir, {
 				runId,
@@ -304,10 +307,15 @@ export function onRunFile(
 				terminalSnapshotPath: join(runsDir, `${runId}.json`),
 				dispatcherSessionId: dispatcher,
 				observedAt: new Date().toISOString(),
+				terminalAt: typeof record.endedAt === "string" ? record.endedAt : undefined,
 			});
+			eventId = event.eventId;
 			attemptId = `${event.eventId}@A@${Date.now()}@${Math.random().toString(36).slice(2, 8)}`;
 			appendTrace(dDir, { kind: "A-attempt", eventId: event.eventId, runId, attemptId });
 		} catch { /* 账本写入失败不阻断注入（best-effort；B 通道会从终态重建） */ }
+		// C-2：正文**必带 eventId 标记** —— 接收端才能从 context 钩子的 messages 里检出它，
+		// 从而在不依赖返回值的前提下写 `consumed` ACK（P3 的正解）。
+		const body = eventId ? `${baseBody}\n${eventMarker(eventId)}` : baseBody;
 		injectFollowUpQuietly(opts.sendUserMessage, body).then((status) => {
 			// 尝试结果入账（**只表示调过发送**；`sent` 也只是 attempted）
 			if (attemptId) {
@@ -460,6 +468,22 @@ export function registerAsyncResultWatcher(
 		} catch { /* ctx 不可用则保持 undefined */ }
 		begin();
 	});
+
+	// ── C-2：`consumed` ACK（**替代返回值**作为送达依据）────────────────
+	// 权威 seam：`pi.on("context")` 在**每次模型请求前**收到即将进入 context 的消息
+	// （runner.js:1000-1015 emitContext）。只读检出 eventId 标记 ⇒ 写 `consumed`。
+	// 这是 P3 的正解：不依赖 `pi.sendUserMessage` 的返回值（生产恒 undefined）。
+	pi.on("context", ((event: { messages?: unknown[] }) => {
+		try {
+			const msgs = event?.messages;
+			if (!Array.isArray(msgs)) return;
+			const ids = extractEventIdsFromMessages(msgs);
+			if (ids.length === 0) return;
+			const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+			ackConsumed(dDir, ids, { evidence: "context-observed" });
+			appendTrace(dDir, { kind: "C2-consumed-ack", eventIds: ids });
+		} catch { /* ACK 写入失败不影响模型请求（纯观察，不改 context） */ }
+	}) as never);
 
 	return () => {
 		sessionGen++; // 使 tick stale
