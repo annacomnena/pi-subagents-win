@@ -142,6 +142,8 @@
     "test:subagent-wall-budget": "node --experimental-strip-types ./extensions/_test_subagent_wall_budget.ts",
     "test:delivery-ledger": "node --experimental-strip-types extensions/_test_delivery_ledger.ts",
     "test:delivery-reconciler": "node --experimental-strip-types extensions/_test_delivery_reconciler.ts",
+    "test:delivery-crash-window": "node --experimental-strip-types extensions/_test_delivery_crash_window.ts",
+    "test:delivery-host-contract": "node --experimental-strip-types extensions/_test_delivery_host_contract.ts",
     "probe:p3-send": "node scripts/_probe_p3_senduser_message.mjs",
     "test:delivery-ack": "node --experimental-strip-types extensions/_test_delivery_ack.ts",
     "test:c3-mailbox-ack": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_c3_mailbox_ack.ts",

@@ -327,7 +327,10 @@ export function onRunFile(
 					const eid = attemptId.slice(0, attemptId.lastIndexOf("@A@"));
 					recordAttempt(dDir, eid, {
 						attemptId, channel: "A", at: new Date().toISOString(),
-						status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : "no-injector",
+						// F（R7/R8 实测发现）：三元链的 else 曾同时吞掉 `unconfirmed` 与 `no-injector`
+						// ⇒ 未确认被写成 `no-injector`，阶段变 `retry_scheduled` ⇒ 租约 15s 后被 B 再投，
+						// 与本分支「不释放 claim、防重复注入」的意图相悖。显式映射 `unconfirmed`。
+						status: status === "sent" ? "sent" : status === "busy" ? "busy" : status === "failed" ? "failed" : status === "unconfirmed" ? "unconfirmed" : "no-injector",
 						leaseOwner: `A:${process.pid}`, leaseUntil: new Date(Date.now() + 15_000).toISOString(),
 					});
 				} catch { /* best-effort */ }
