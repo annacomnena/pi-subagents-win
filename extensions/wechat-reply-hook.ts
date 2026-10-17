@@ -65,12 +65,27 @@ function lastNonEmptyAssistantText(messages: unknown[]): string {
  return assistantTextAfter(messages, -1);
 }
 
+/**
+ * 取最后一条非空 assistant 消息**本体**（不只文本）：`agent_end` 兜底暂存需要它与文本**成对**，
+ * 以便用消息派生的稳定 id（见 deriveBroadcastMessageId）而非轮次 id 写 intent。
+ * 与 assistantTextAfter 同口径：倒序取首个非空 assistant 文本。
+ */
+function lastAssistantMessage(messages: unknown[]): { text: string; message: any | null } {
+ for (let i = messages.length - 1; i >= 0; i--) { const m: any = messages[i]; if (m?.role !== "assistant") continue; const candidate = textOf(m); if (candidate.trim()) return { text: candidate, message: m }; }
+ return { text: "", message: null };
+}
+
 // ── 0924 出站广播：agent_end 暂存 / agent_settled flush ─────────────────
 //
 // 时机门（计划 §1.1 门 3，用户裁定③）：agent_end = 一次低层 run 结束（重试/compaction/
 // steering 后可继续、可多次），agent_settled = 权威终界、每 session 级 run 一次（无 payload）。
 // 故 agent_end 只暂存（每次覆盖 = 本轮最终态），agent_settled 时 flush 出意图。
-interface BroadcastStash { sessionId: string; roundKey: string; firstUserText: string; firstUserTs: number | string | null; text: string; }
+interface BroadcastStash {
+ sessionId: string;
+ /** 广播 intent 的幂等键来源 = **被暂存那条消息**的消息 id（不是轮次 id，见 deriveBroadcastMessageId 注）。 */
+ msgId: string;
+ firstUserText: string; firstUserTs: number | string | null; text: string;
+}
 let pendingBroadcast: BroadcastStash | null = null;
 /** 测试辅助：清空暂存（生产路径由 flush 自清）。 */
 export function resetWechatBroadcastStash(): void { pendingBroadcast = null; }
@@ -87,16 +102,50 @@ export function deriveBroadcastRoundId(sessionId: string, firstUserTs: number | 
  return createHash("sha256").update(`${sessionId}:${firstUserTs ?? "no-ts"}:${inner}`, "utf8").digest("hex");
 }
 
+/**
+ * **消息级**广播幂等键（缺陷 2 的修法，见 plans/20261017_wechat_broadcast_per_message.md §2）。
+ *
+ * 为什么不再用 roundKey：`deriveBroadcastRoundId` 一轮只有一个值 ⇒ 同轮所有段共享 intent id
+ * ⇒ 同轮第二条起被 `readReplyIntent` 幂等门静默吞掉（连审计都不落）。要「每一条回复都广播」
+ * 就必须按**消息**唯一。
+ *
+ * 复合 key 口径与 extensions/tab-runs-runtime.ts:110-118 的 usage 去重一致：
+ *   `${message.id}|${message.timestamp}|${message.responseId}`
+ * 实测依据（本机会话 JSONL 的 assistant 消息样本，3 条）：`message` 本体**无 `id`**，但稳定带
+ * `timestamp`（number, ms）与 `responseId`（UUID）；条目级 `id` 由 sessionManager 另发（不在 message 本体）。
+ * ⇒ 三者任一存在即可稳定去重；三者全缺 ⇒ 退化为 `sessionId + 正文哈希`（同会话内两段完全
+ * 相同的正文会被并成一条——真实消息恒带 timestamp+responseId，该退化路径不可达，见计划未闭合项 2）。
+ *
+ * 前缀 `wechat-broadcast-msg:` 与 reply/command/broadcast 既有前缀均不同源；输出仍 64hex（ReplyIntent 校验口径）。
+ */
+export function deriveBroadcastMessageId(sessionId: string, message: unknown, text: string): string {
+ const m: any = message ?? {};
+ const mid = typeof m.id === "string" ? m.id : "";
+ const mts = typeof m.timestamp === "number" || typeof m.timestamp === "string" ? String(m.timestamp) : "";
+ const mrid = typeof m.responseId === "string" ? m.responseId : "";
+ const composite = `${mid}|${mts}|${mrid}`;
+ if (composite !== "||") return createHash("sha256").update(`wechat-broadcast-msg:${sessionId}:${composite}`, "utf8").digest("hex");
+ const inner = createHash("sha256").update(text, "utf8").digest("hex");
+ return createHash("sha256").update(`wechat-broadcast-msg:${sessionId}:text:${inner}`, "utf8").digest("hex");
+}
+
+/** 广播正文口径（消息路径与 flush 路径共用一个函数，避免两处截断规则漂移）。 */
+const BROADCAST_TEXT_MAX = 4000;
+function broadcastText(raw: string): string { return raw.length > BROADCAST_TEXT_MAX ? raw.slice(0, BROADCAST_TEXT_MAX) + "…[截断]" : raw; }
+
 /** mode=broadcast 时 agent_end 暂存（收件人集合与资格门留给 flush 判定，避免过早判定）。 */
 function stashWechatBroadcast(messages: unknown[], deps: ReplyHookDeps): void {
  const first = messages.find((m: any) => m?.role === "user") as any;
  const firstUserText = first ? textOf(first) : "";
  const ts = first?.timestamp;
  const firstUserTs: number | string | null = typeof ts === "number" || typeof ts === "string" ? ts : null;
- let text = lastNonEmptyAssistantText(messages);
- if (text.length > 4000) text = text.slice(0, 4000) + "…[截断]";
+ const last = lastAssistantMessage(messages);
+ const text = broadcastText(last.text);
  const sessionId = deps.sessionId?.() ?? getCurrentSessionId() ?? "unknown";
- pendingBroadcast = { sessionId, roundKey: deriveBroadcastRoundId(sessionId, firstUserTs, firstUserText), firstUserText, firstUserTs, text };
+ // 兜底暂存的幂等键同样按**消息**派生（不是轮次）：这样与 message_end 路径写出的 intent **同 id**
+ // ⇒ 消息路径已写过时兜底自动 count 0（不重发），消息路径漏写时兜底仍能补最后一条。
+ const msgId = deriveBroadcastMessageId(sessionId, last.message, text);
+ pendingBroadcast = { sessionId, msgId, firstUserText, firstUserTs, text };
 }
 
 function defaultMasterSessionId(): string | null {
@@ -105,43 +154,63 @@ function defaultMasterSessionId(): string | null {
 
 export interface BroadcastFlushResult { written: boolean; count: number; reason?: ReplySkipReason; }
 
+/** 资格门通过后的上下文（runtimeDir/stateDir/cfg）——两条广播路径（消息级 / settled flush）共用。 */
+interface BroadcastGate {
+ ok: boolean; result?: BroadcastFlushResult;
+ runtimeDir: string; stateDir: string;
+ cfg: { enabled: boolean; mode: string; sessionScope: string; allowOut: string[] };
+}
+
 /**
- * agent_settled flush：资格门（缺省 owner = 只有 global master 会话广播，用户裁定①；
- * readAttachment 不可读/无 attachment → fail-closed 不广播）→ 取暂存 → 内容检查 →
- * 收件人 = knownChats() 候选池 ∩ **出站授权集合**（绑定 owner ∪ reply.allowOut，0925 P0；
- * knownChats 不再直接当收件人集合，rejected / 入站白名单均不参与授权裁决）→
- * 每收件人写一个 kind:"broadcast" intent（一个 intent 一个收件人）。
- * 出站与否（connected 门 + TTL + **发送前二次复核**）在 watcher 侧判定，hook 只排队（计划 §1.1 门 4、§5）。
+ * 广播资格门（**两条路径共用，语义逐字沿用旧 flush**）：
+ * subagent 门 → `enabled` / `mode==="broadcast"` 门 → `sessionScope` 门
+ *（owner = 只有 global master 会话；readAttachment 不可读/未 attach → fail-closed）。
+ *
+ * `auditGateSkips`：资格门失败是否落审计行。settled flush 传 true（既有 S1 语义：**有暂存**才记，
+ * 真正丢弃了内容才值得记）；消息路径传 false —— audit jsonl 无轮转，tab 会话的每条 assistant 消息
+ * 都落一行 `not-master-owner` 会复现「96 次」噪声（2026-10-17 实测）。门本身**不改**：仍只允许主会话。
  */
-export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushResult {
+function broadcastGate(deps: ReplyHookDeps, auditGateSkips: boolean, hadContent: boolean, onSkip?: () => void): BroadcastGate {
+ const runtimeDir = deps.runtimeDir ?? defaultRuntimeDir(); const stateDir = deps.stateDir ?? join(runtimeDir, "state");
+ const cfg = readWechatReplyConfig(deps.configPath ?? readWechatConfigPath());
+ const fail = (reason: ReplySkipReason, extra?: Record<string, unknown>): BroadcastGate => {
+  onSkip?.();
+  if (auditGateSkips && hadContent) audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason, ...(extra ?? {}) });
+  return { ok: false, result: { written: false, count: 0, reason }, runtimeDir, stateDir, cfg };
+ };
+ if ((deps.subagent ?? isSubagent)()) return { ok: false, result: { written: false, count: 0 }, runtimeDir, stateDir, cfg };
+ // disabled / mode 已翻回 reply-only：丢弃暂存静默返回（**零审计**，旧行为逐字不变；不产生任何 reply 侧副作用）
+ if (!cfg.enabled || cfg.mode !== "broadcast") { onSkip?.(); return { ok: false, result: { written: false, count: 0 }, runtimeDir, stateDir, cfg }; }
+ if (cfg.sessionScope === "owner") {
+  const ownerSid = deps.masterSessionId ? deps.masterSessionId() : defaultMasterSessionId();
+  const currentSid = deps.sessionId?.() ?? getCurrentSessionId();
+  if (!ownerSid) return fail("master-attachment-unavailable", { scope: "owner" });
+  if (!currentSid || currentSid !== ownerSid) return fail("not-master-owner", { scope: "owner" });
+ } else if (cfg.sessionScope === "main" && !(deps.mainSession ?? isMainSession)()) {
+  return fail("not-main-session", { scope: "main" });
+ } // scope "any"：仅 subagent 门（上方）
+ return { ok: true, runtimeDir, stateDir, cfg };
+}
+
+/**
+ * **广播写 intent 的唯一出口**（消息级广播与 settled flush 共用；顺序 = 旧 flush 逐字沿用）：
+ * 跨会话校验 → 正文非空 → knownChats 候选池 → **出站授权**（绑定 owner ∪ reply.allowOut）→
+ * 每收件人一个 kind:"broadcast" intent（一收件人一 intent）+ 既有审计面。
+ * 出站与否（connected 门 + TTL + 发送前二次复核）在 watcher 侧判定，hook 只排队。
+ *
+ * 幂等：intent id = deriveBroadcastIntentId(msgId, fromId)，msgId 是**消息级**键 ⇒ 同消息重复投递
+ * EEXIST → created:false（不重发），不同消息各一条（不吞）。收件人范围**未放宽**。
+ */
+function writeBroadcastIntents(input: { msgId: string; text: string; sessionId: string }, deps: ReplyHookDeps, gate: BroadcastGate): BroadcastFlushResult {
  try {
-  const runtimeDir = deps.runtimeDir ?? defaultRuntimeDir(); const stateDir = deps.stateDir ?? join(runtimeDir, "state");
-  if ((deps.subagent ?? isSubagent)()) return { written: false, count: 0 };
-  const cfg = readWechatReplyConfig(deps.configPath ?? readWechatConfigPath());
-  // disabled / mode 已翻回 reply-only：丢弃暂存静默返回（不产生任何 reply 侧副作用）
-  if (!cfg.enabled || cfg.mode !== "broadcast") { pendingBroadcast = null; return { written: false, count: 0 }; }
+  const { runtimeDir, stateDir, cfg } = gate;
   const at = () => new Date().toISOString();
-  // S1（L4）：资格门失败但本会话无暂存 → 静默返回（audit jsonl 无轮转会单向增长，
-  // 不能让每个 tab settled 轮都落一行）；有 stash 才记审计（真正丢弃了内容才值得记）。
-  const hadStash = pendingBroadcast !== null;
-  if (cfg.sessionScope === "owner") {
-   const ownerSid = deps.masterSessionId ? deps.masterSessionId() : defaultMasterSessionId();
-   const currentSid = deps.sessionId?.() ?? getCurrentSessionId();
-   if (!ownerSid) { pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "master-attachment-unavailable", scope: "owner" }); return { written: false, count: 0, reason: "master-attachment-unavailable" }; }
-   if (!currentSid || currentSid !== ownerSid) { pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "not-master-owner", scope: "owner" }); return { written: false, count: 0, reason: "not-master-owner" }; }
-  } else if (cfg.sessionScope === "main" && !(deps.mainSession ?? isMainSession)()) {
-   pendingBroadcast = null; if (hadStash) audit(stateDir, { at: at(), event: "skipped", reason: "not-main-session", scope: "main" }); return { written: false, count: 0, reason: "not-main-session" };
-  } // scope "any"：仅 subagent 门（上方）
-  const stash = pendingBroadcast; pendingBroadcast = null;
-  if (!stash) { audit(stateDir, { at: at(), event: "skipped", reason: "no-stash" }); return { written: false, count: 0, reason: "no-stash" }; }
-  // S4（L4）：暂存会话 ≠ 当前 settled 会话 → 丢弃 + 审计（防同进程内 tab 先暂存、
-  // master 隗后 settled 时把 tab 轮内容按 owner 资格广播出去）。口径与 stashWechat
-  // Broadcast 的 sessionId 记录一致（两端取不到时均为 "unknown"，视为同端）。
-  if (stash.sessionId !== ((deps.sessionId?.() ?? getCurrentSessionId()) ?? "unknown")) {
-   audit(stateDir, { at: at(), event: "skipped", reason: "stash-session-mismatch", scope: cfg.sessionScope });
-   return { written: false, count: 0, reason: "stash-session-mismatch" };
-  }
-  if (!stash.text) { audit(stateDir, { at: at(), event: "skipped", reason: "no-text", msgId: maskWechatOpenId(stash.roundKey) }); return { written: false, count: 0, reason: "no-text" }; }
+  // S4（L4）：内容所属会话 ≠ 当前会话 → 丢弃 + 审计（防同进程内 tab 先暂存、master 隗后 settled
+  // 时把 tab 轮内容按 owner 资格广播出去）。两端取不到时均为 "unknown"，视为同端。
+  const currentSid = (deps.sessionId?.() ?? getCurrentSessionId()) ?? "unknown";
+  if (input.sessionId !== currentSid) { audit(stateDir, { at: at(), event: "skipped", reason: "stash-session-mismatch", scope: cfg.sessionScope }); return { written: false, count: 0, reason: "stash-session-mismatch" }; }
+  const text = broadcastText(input.text ?? "");
+  if (!text) { audit(stateDir, { at: at(), event: "skipped", reason: "no-text", msgId: maskWechatOpenId(input.msgId) }); return { written: false, count: 0, reason: "no-text" }; }
   const dir = replyIntentDir(stateDir);
   let chats: { fromId: string; lastAt: string }[] = [];
   try { chats = (deps.store ? deps.store() : new WechatStore(join(runtimeDir, "wechat", "receive"))).knownChats(); } catch { chats = []; }
@@ -166,14 +235,56 @@ export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushRe
   const now = deps.now?.();
   let count = 0;
   for (const chat of recipients) {
-   const id = deriveBroadcastIntentId(stash.roundKey, chat.fromId);
-   if (readReplyIntent(dir, id)) continue; // 同轮重复 flush：同 id → 文件已存在 → 不重写不重发
-   const result = newReplyIntent(dir, { id, msgId: stash.roundKey, outboxId: stash.roundKey, fromId: chat.fromId, clientId: deriveBroadcastClientId(stash.roundKey, chat.fromId), text: stash.text, kind: "broadcast", ...(now ? { now } : {}) });
+   const id = deriveBroadcastIntentId(input.msgId, chat.fromId);
+   if (readReplyIntent(dir, id)) continue; // 同消息重复投递：同 id → 文件已存在 → 不重写不重发
+   const result = newReplyIntent(dir, { id, msgId: input.msgId, outboxId: input.msgId, fromId: chat.fromId, clientId: deriveBroadcastClientId(input.msgId, chat.fromId), text, kind: "broadcast", ...(now ? { now } : {}) });
    if (!result?.created) continue;
    count++;
-   audit(stateDir, { at: at(), event: "intent-written", kind: "broadcast", msgId: maskWechatOpenId(stash.roundKey), from: maskWechatOpenId(chat.fromId) });
+   audit(stateDir, { at: at(), event: "intent-written", kind: "broadcast", msgId: maskWechatOpenId(input.msgId), from: maskWechatOpenId(chat.fromId) });
   }
   return { written: count > 0, count };
+ } catch { return { written: false, count: 0 }; }
+}
+
+/**
+ * **message_end 驱动：每条非空 assistant 文本 ⇒ 立即广播一条**（2026-10-17 缺陷 1 的修法）。
+ * 为什么要消息级：`agent_end` 只暂存**本轮最后一条**（覆盖式），中间段全部丢失（实测：一轮 3 段
+ * 只推最后一段）。`message_end` 每消息一次触发（pi `dist/core/agent-session.js:893`，本仓
+ * `extensions/tab-runs-runtime.ts:100` 真实用法）⇒ 逐条出站。
+ * 门槛与 flush **完全相同**（同一 broadcastGate：subagent / enabled / mode / sessionScope），
+ * 因此 tab 会话仍被拒（用户口径：只广播主会话）。
+ */
+export function broadcastWechatMessage(message: unknown, deps: ReplyHookDeps = {}): BroadcastFlushResult {
+ try {
+  const m: any = message;
+  if (!m || m.role !== "assistant") return { written: false, count: 0 };
+  const raw = textOf(m);
+  if (!raw.trim()) return { written: false, count: 0 }; // 纯工具轮 / 空正文：零动作（无审计噪声）
+  const sessionId = (deps.sessionId?.() ?? getCurrentSessionId()) ?? "unknown";
+  const gate = broadcastGate(deps, false, true); // 消息路径：门失败静默（防 tab 每消息一行审计）
+  if (!gate.ok) return gate.result!;
+  const text = broadcastText(raw);
+  return writeBroadcastIntents({ msgId: deriveBroadcastMessageId(sessionId, m, text), text, sessionId }, deps, gate);
+ } catch { return { written: false, count: 0 }; }
+}
+
+/**
+ * agent_settled flush（**兜底通道**，保留的理见计划 §2）：资格门（缺省 owner = 只有 global master 会话广播，
+ * 用户裁定①；readAttachment 不可读/无 attachment → fail-closed 不广播）→ 取暂存 → 内容检查 →
+ * 收件人 = knownChats() 候选池 ∩ **出站授权集合** → 每收件人一个 kind:"broadcast" intent。
+ * 暂存的 msgId 同样**按消息**派生 ⇒ 与 message_end 已写过的 intent 同 id ⇒ 不重发（count 0）。
+ */
+export function flushWechatBroadcast(deps: ReplyHookDeps = {}): BroadcastFlushResult {
+ try {
+  // S1（L4）：资格门失败但本会话无暂存 → 静默返回（audit jsonl 无轮转会单向增长，
+  // 不能让每个 tab settled 轮都落一行）；有 stash 才记审计（真正丢弃了内容才值得记）。
+  // 门失败一律丢弃暂存（原语义不变）。
+  const hadStash = pendingBroadcast !== null;
+  const gate = broadcastGate(deps, true, hadStash, () => { pendingBroadcast = null; });
+  if (!gate.ok) return gate.result!;
+  const stash = pendingBroadcast; pendingBroadcast = null;
+  if (!stash) { audit(gate.stateDir, { at: new Date().toISOString(), event: "skipped", reason: "no-stash" }); return { written: false, count: 0, reason: "no-stash" }; }
+  return writeBroadcastIntents({ msgId: stash.msgId, text: stash.text, sessionId: stash.sessionId }, deps, gate);
  } catch { return { written: false, count: 0 }; }
 }
 
@@ -253,6 +364,13 @@ export function registerWechatReplyHook(pi: ExtensionAPI): void {
    extractWechatReply(event?.messages ?? [], { transcript });
   } catch {}
  });
+ // 2026-10-17（缺陷 1 修法）：**每条 assistant 文本 ⇒ 立即广播一条**。
+ // 为什么不用 agent_settled：agent_end 只暂存本轮最后一条（覆盖式）⇒ 一轮多段只剩最后一段出站
+ //（实测 06:40:01/09/25 三段全丢，仅 06:40:43 那段推送）。message_end 每消息一次触发。
+ // 门槛与 flush 相同（同一 broadcastGate）：tab / subagent / enabled=false / reply-only 均零动作。
+ pi.on("message_end", (event: any) => { try { broadcastWechatMessage(event?.message); } catch {} });
  // 0924 广播时机门（计划 §1.1 门 3，用户裁定③）：agent_end 只暂存，agent_settled 才 flush。
+ // 暂存保留为**兜底**：暂存幂等键已改为**消息级**（deriveBroadcastMessageId）⇒ 与 message_end 写过的
+ // intent 同 id ⇒ 不重发；若某消息未走 message_end（扩展加载/异常）仍能补最后一条（不会漏）。
  pi.on("agent_settled", () => { try { flushWechatBroadcast(); } catch {} });
 }

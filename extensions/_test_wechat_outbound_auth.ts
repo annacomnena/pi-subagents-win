@@ -111,9 +111,15 @@ function senderFetch(log: { to: string; clientId: string }[]): WechatFetch {
 	};
 }
 function round(firstUserText: string, ts: number, assistantText: string): unknown[] {
+	// 2026-10-17 修（T3 回归）：真实 pi assistant 消息**恒带 `timestamp`+`responseId`**（见
+	// `wechat-reply-hook.ts::deriveBroadcastMessageId` 注与实测）。旧夹具两条 assistant 都不带标识 ⇒
+	// 广播消息 id 退化为「正文哈希」⇒ T3 两轮正文同为 BODY ⇒ 两轮同 id ⇒ 第二轮被幂等门吞掉
+	//（表现为 `撤销后只应给 A 写 intent` 的 `0 !== 1`）。夹具改为贴近真实消息形状，不让退化路径
+	// 在「两轮同正文」场景下误判。`ts` 复用 user 的时间戳并派生稳定 responseId ⇒ 同一轮内稳定、跨轮不同。
+	const rid = `rid-outbound-auth-${ts}`;
 	return [
 		{ role: "user", content: firstUserText, timestamp: ts },
-		{ role: "assistant", content: [{ type: "text", text: assistantText }] },
+		{ role: "assistant", content: [{ type: "text", text: assistantText }], timestamp: ts + 1, responseId: rid },
 	];
 }
 function seedBroadcast(env: Env, fromId: string, roundSeed: string, at?: Date): string {
