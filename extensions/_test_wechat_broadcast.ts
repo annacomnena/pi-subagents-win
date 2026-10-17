@@ -5,8 +5,9 @@
  *   + plans/0924_wechat_broadcast_recon.md（位置与校准）
  *   + 用户最终裁定（覆盖计划 §9 待裁点）：
  *     ① sessionScope 缺省 "owner" = 只有 global master 会话广播（readAttachment 不可读/未
- *        attach → fail-closed 不广播）；② 缺省 mode="broadcast"；③ 触发 = agent_settled
- *        （agent_end 只暂存，settled 无暂存 → 审计 no-stash）；④ TTL=10min 常量、failed 不重试。
+ *        attach → fail-closed 不广播）；② 缺省 mode="broadcast"（已被下方 0925 口径替代）；
+ *        ③ 原触发 agent_settled，现 message_end 逐条即时广播 + agent_end 全量补写；
+ *        ④ TTL=10min 常量、failed 不重试。
  *
  * 0925 P0 出站收件授权（astra §二第 1 项，用户批准推翻上述信任假设）对本文件的影响：
  *   - **收件人假设变更**：knownChats() 不再直接等于收件人集合。广播收件人 = 绑定 owner
@@ -26,7 +27,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import {
 	extractWechatReply, flushWechatBroadcast, resetWechatBroadcastStash,
-	deriveBroadcastRoundId, deriveBroadcastMessageId, broadcastWechatMessage, type ReplyHookDeps,
+	deriveBroadcastRoundId, deriveBroadcastMessageId, broadcastWechatMessage, registerWechatReplyHook, type ReplyHookDeps,
 } from "./wechat-reply-hook.ts";
 import {
 	listReplyIntents, markReplyIntent, newReplyIntent, readReplyIntent, replyIntentDir,
@@ -94,6 +95,21 @@ function envDeps(env: Env, over: Partial<ReplyHookDeps> = {}): ReplyHookDeps {
 	// 故显式钉 subagent:()=>false；B6 的 subagent 用例再覆写为 true。
 	return { stateDir: env.stateDir, runtimeDir: env.runtimeDir, configPath: env.configPath, subagent: () => false, sessionId: () => MASTER_SID, masterSessionId: () => MASTER_SID, ...over };
 }
+/** Only fake the event bus and external dependencies; handlers are the production registrations. */
+function registeredPi(deps: ReplyHookDeps) {
+	const handlers = new Map<string, ((event: any, ctx?: any) => unknown)[]>();
+	const pi = {
+		on(name: string, handler: (event: any, ctx?: any) => unknown) {
+			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+		},
+		emit(name: string, event: any = {}, ctx?: any) {
+			assert.ok(handlers.has(name), `未注册 ${name}`);
+			for (const handler of handlers.get(name)!) handler(event, ctx);
+		},
+	};
+	registerWechatReplyHook(pi as any, deps);
+	return pi;
+}
 function putChat(env: Env, msgId: string, fromId: string, receivedAt = new Date().toISOString(), extra: Record<string, unknown> = {}): void {
 	new WechatStore(join(env.runtimeDir, "wechat", "receive")).putInbox({ msgId, fromId, fromNickname: null, text: "in", receivedAt, state: "pending", ...extra } as any);
 }
@@ -126,7 +142,8 @@ function senderFetch(log: { to: string; clientId: string }[], responder?: (to: s
 function round(firstUserText: string, ts: number | null, assistantText: string): unknown[] {
 	return [
 		{ role: "user", content: firstUserText, ...(ts === null ? {} : { timestamp: ts }) },
-		{ role: "assistant", content: [{ type: "text", text: "旧答案（不选）" }] },
+		// 单文本广播夹具：中间纯工具消息不广播；多文本全量语义由 P1/MF3 独立断言。
+		{ role: "assistant", content: [{ type: "toolCall", id: "tool", name: "bash", arguments: {} }] },
 		{ role: "assistant", content: [{ type: "text", text: assistantText }] },
 	];
 }
@@ -236,7 +253,7 @@ try {
 			const deps = envDeps(env);
 			const msgs1 = round("第一问", 1758000002000, BODY);
 			assert.equal(flushAfter(extractWechatReply(msgs1, deps), deps).count, 2);
-			// 同轮重放：同 messages → 同 roundKey → 同 id 集 → 0 新建
+			// 同 messages 对象重放 → 同消息 key 集 → 0 新建
 			const again = flushAfter(extractWechatReply(msgs1, deps), deps);
 			assert.equal(again.written, false);
 			assert.equal(again.count, 0, "同轮重复 flush 不应新建");
@@ -246,7 +263,7 @@ try {
 			let stop = startWechatReplyWatcher({ runtimeDir: env.runtimeDir, stateDir: env.stateDir, configPath: env.configPath, intervalMs: 15, fetchImpl: senderFetch(log) });
 			await sleep(140); stop();
 			assert.equal(log.length, 2, "watcher 应只发 2 次（同轮不重发）");
-			// 跨轮：不同 firstUserText + timestamp → roundKey 变 → 文件累加、互不覆盖
+			// 跨轮不同消息 → 文件累加、互不覆盖
 			const body2 = BODY + "-ROUND2";
 			assert.equal(flushAfter(extractWechatReply(round("第二问", 1758000003000, body2), deps), deps).count, 2);
 			assert.equal(intentFiles(env.stateDir).length, 4, "跨轮文件未累加");
@@ -390,13 +407,13 @@ try {
 	});
 
 	// ── B8 内容选取与截断 ───────────────────────────────────────────
-	await check("B8 末条非空 assistant 原文；4001 → 4000+…[截断]；纯工具轮 → no-text 零 intent", async () => {
+	await check("B8 单文本 assistant 原文；4001 → 4000+…[截断]；纯工具轮 → no-text 零 intent", async () => {
 		resetWechatBroadcastStash();
 		const env = mkEnv(BROADCAST_CFG);
 		try {
 			putChat(env, "m-a", A);
 			const deps = envDeps(env);
-			// 内容 = 末条非空 assistant（非最后一条消息也可——倒序取首个非空）
+			// 单文本消息原文完整保留；全量多文本补写见 MF3。
 			assert.equal(flushAfter(extractWechatReply(round("内容问", 1758000008100, "末条原文 KEEP-ME"), deps), deps).count, 1);
 			// 截断：4001 → 4000 + "…[截断]"
 			assert.equal(flushAfter(extractWechatReply(round("截断问", 1758000008200, "x".repeat(4001)), deps), deps).count, 1);
@@ -644,7 +661,7 @@ try {
 	// P 系列（2026-10-17）：**每条 assistant 回复都广播**（message_end 驱动）
 	// 依据 plans/20261017_wechat_broadcast_per_message.md
 	// ══════════════════════════════════════════════════════════════════
-	/** 真实形态的 assistant 消息（实测：message 本体无 id，但带 timestamp(ms)+responseId）。 */
+	/** 一种 assistant 形状；字段缺失与碰撞边界另有显式测试，不假设恒带。 */
 	function amsg(text: string, ts: number, rid = `rid-${ts}`): Record<string, unknown> {
 		return { role: "assistant", content: [{ type: "text", text }], timestamp: ts, responseId: rid, stopReason: "stop" };
 	}
@@ -665,19 +682,12 @@ try {
 				amsg(SEG2, 1760000020000),
 				amsg(SEG3, 1760000030000),
 			];
-			// — 修前口径基线（缺陷 1 复现）：只用旧路径（agent_end 暂存 + settled flush）⇒ 仅 1 条
-			const baselineEnv = mkEnv(BROADCAST_CFG);
-			try {
-				putChat(baselineEnv, "m-a", A);
-				const bDeps = envDeps(baselineEnv);
-				extractWechatReply(roundMsgs, bDeps); // agent_end 暂存（覆盖式：只留最后一段）
-				flushWechatBroadcast(bDeps);          // agent_settled flush
-				assert.equal(intentFiles(baselineEnv.stateDir).length, 1, "缺陷 1 复现：旧路径一轮 3 段应只剩 1 条 intent");
-				assert.equal(listReplyIntents(replyIntentDir(baselineEnv.stateDir))[0]?.text, SEG3, "旧路径只留最后一段");
-			} finally { resetWechatBroadcastStash(); rmSync(baselineEnv.root, { recursive: true, force: true }); }
-			// — 修后：message_end 逐条 ⇒ 3 条 intent，正文各自独立
-			for (const m of roundMsgs.filter((x) => (x as any).role === "assistant")) {
-				assert.equal(broadcastWechatMessage(m, deps).count, 1, `消息应各写 1 条：${JSON.stringify((m as any).content)}`);
+			const pi = registeredPi(deps);
+			// 必须在 agent_end/settled 前检查：否则兜底会掩盖 message_end 接线短路。
+			let expected = 0;
+			for (const message of roundMsgs.filter((x) => (x as any).role === "assistant")) {
+				pi.emit("message_end", { message });
+				assert.equal(intentFiles(env.stateDir).length, ++expected, "注册 handler 每消息应新增 1 条 intent");
 			}
 			const dir = replyIntentDir(env.stateDir);
 			const items = listReplyIntents(dir);
@@ -689,9 +699,9 @@ try {
 				assert.match(it.msgId, /^[0-9a-f]{64}$/);
 			}
 			assert.equal(new Set(items.map((i) => i.msgId)).size, 3, "三段 msgId 应互不相同（缺陷 2：不得共享轮次 key）");
-			// — 兜底通道重入：agent_end 暂存（只留末段）+ settled flush ⇒ 末段同 id ⇒ count 0、不重发
-			assert.equal(extractWechatReply(roundMsgs, deps).written, false);
-			assert.equal(flushWechatBroadcast(deps).count, 0, "兜底通道重复写了末段（应被消息级 id 挡住）");
+			// 注册的兜底路径同对象重入不重发。
+			pi.emit("agent_end", { messages: roundMsgs });
+			pi.emit("agent_settled");
 			assert.equal(intentFiles(env.stateDir).length, 3, "兜底通道使文件数变化");
 			// — watcher 侧：三条都应出站（每收件人 3 次 fetch）
 			writeCreds(env); setWorkerStatus(env, "connected");
@@ -723,13 +733,64 @@ try {
 			assert.equal(broadcastWechatMessage(amsg("一模一样的正文", 1760000200000), deps).count, 1);
 			assert.equal(broadcastWechatMessage(amsg("一模一样的正文", 1760000300000), deps).count, 1);
 			assert.equal(intentFiles(env.stateDir).length, 3, "不同消息未各发一条（仍被吞）");
-			// 进程重启等价面：重新派生同一消息的 id 仍相同（幂等跨进程成立）
-			assert.equal(deriveBroadcastMessageId(MASTER_SID, m1, "重复投递的同一段"), listReplyIntents(replyIntentDir(env.stateDir))[0]!.msgId, "消息 id 派生物不稳定（重启后会重发）");
-			// 标识退化：无 id/timestamp/responseId ⇒ 内容哈希（同对象重复 1 条；不同对象各 1 条）
+			// 同对象再次派生稳定；无真实 id 不承诺跨进程稳定。
+			assert.equal(deriveBroadcastMessageId(MASTER_SID, m1, "重复投递的同一段"), listReplyIntents(replyIntentDir(env.stateDir))[0]!.msgId, "同对象消息 key 不稳定");
+			// 标识退化：无 id/timestamp/responseId ⇒ 对象 nonce + 元组（同对象幂等）。
 			const noId = { role: "assistant", content: "无标识正文" };
 			assert.equal(broadcastWechatMessage(noId, deps).count, 1);
 			assert.equal(broadcastWechatMessage(noId, deps).count, 0, "无标识同内容重复应幂等");
 			assert.equal(intentFiles(env.stateDir).length, 4);
+		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	await check("MF2 完全相同元组/缺字段不同对象不吞；真实 id 的克隆重投幂等；完整正文参与 key", () => {
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			putChat(env, "m-a", A);
+			const deps = envDeps(env), pi = registeredPi(deps);
+			let expected = 0;
+			for (const fields of [{ timestamp: 42 }, { responseId: "shared" }, { timestamp: 42, responseId: "shared" }, {}]) {
+				for (let i = 0; i < 2; i++) {
+					const message = { role: "assistant", content: "同毫秒同正文", ...fields };
+					pi.emit("message_end", { message });
+					assert.equal(intentFiles(env.stateDir).length, ++expected, "同元组不同消息被误吞");
+					pi.emit("message_end", { message });
+					assert.equal(intentFiles(env.stateDir).length, expected, "同对象重投不幂等");
+				}
+			}
+			const message = { role: "assistant", id: "unique-message", content: "真实唯一 id" };
+			pi.emit("message_end", { message }); expected++;
+			pi.emit("message_end", { message: { ...message } });
+			assert.equal(intentFiles(env.stateDir).length, expected, "唯一 id 克隆未去重");
+			const other = { ...message, id: "other-id" };
+			pi.emit("message_end", { message: other });
+			assert.equal(intentFiles(env.stateDir).length, ++expected);
+			assert.notEqual(deriveBroadcastMessageId(MASTER_SID, other, "正文"), deriveBroadcastMessageId(OTHER_SID, other, "正文"));
+			const bare = {};
+			assert.notEqual(deriveBroadcastMessageId(MASTER_SID, bare, "x".repeat(4000) + "A"), deriveBroadcastMessageId(MASTER_SID, bare, "x".repeat(4000) + "B"), "完整正文哈希未参与");
+		} finally { rmSync(env.root, { recursive: true, force: true }); }
+	});
+
+	await check("MF3 agent_end 全量补写、空末条不回退、跨 run 累积；投影历史不广播", () => {
+		resetWechatBroadcastStash();
+		const env = mkEnv(BROADCAST_CFG);
+		try {
+			putChat(env, "m-a", A);
+			const pi = registeredPi(envDeps(env));
+			const messages = [amsg("兜底第一条", 1), amsg("兜底第二条", 1), amsg("兜底第三条", 1), { role: "assistant", content: [] }];
+			const ctx = { sessionManager: { buildSessionContext: () => ({ messages: [amsg("历史不得补发", 0), ...messages] }) } };
+			pi.emit("message_end", { message: messages[0] });
+			pi.emit("agent_end", { messages: messages.slice(0, 2) }, ctx);
+			pi.emit("agent_end", { messages: messages.slice(2) }, ctx);
+			pi.emit("agent_settled");
+			assert.deepEqual(listReplyIntents(replyIntentDir(env.stateDir)).map(i => i.text).sort(), ["兜底第一条", "兜底第二条", "兜底第三条"].sort());
+			pi.emit("agent_end", { messages }, ctx); pi.emit("agent_settled");
+			assert.equal(intentFiles(env.stateDir).length, 3, "兜底重放不幂等");
+			// 整个 run 没有 message_end 也必须逐条补写。
+			const missing = [amsg("全漏一", 2), amsg("全漏二", 2), { role: "assistant", content: [] }];
+			pi.emit("agent_end", { messages: missing }); pi.emit("agent_settled");
+			assert.equal(intentFiles(env.stateDir).length, 5, "全漏 run 的中间消息未补写");
+			assert.deepEqual(listReplyIntents(replyIntentDir(env.stateDir)).map(i => i.text).sort(), ["兜底第一条", "兜底第二条", "兜底第三条", "全漏一", "全漏二"].sort());
 		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
 	});
 
@@ -740,20 +801,18 @@ try {
 		try {
 			putChat(env, "m-a", A);
 			const tabDeps = envDeps(env, { sessionId: () => OTHER_SID });
-			const r = broadcastWechatMessage(amsg("tab 自己的回复", 1760000200000), tabDeps);
-			assert.equal(r.count, 0, "tab 会话不得广播");
-			assert.equal(r.reason, "not-master-owner");
+			const pi = registeredPi(tabDeps);
+			pi.emit("message_end", { message: amsg("tab 自己的回复", 1760000200000) });
 			assert.equal(intentFiles(env.stateDir).length, 0, "tab 会话写了 intent");
 			assert.equal(auditText(env.stateDir), "", "消息路径门失败不应落审计（防每 tab 消息一行噪声）");
 			// master 未 attach（fail-closed）
 			const noOwner = envDeps(env, { masterSessionId: () => null });
-			assert.equal(broadcastWechatMessage(amsg("无 owner", 1760000200001), noOwner).reason, "master-attachment-unavailable");
+			registeredPi(noOwner).emit("message_end", { message: amsg("无 owner", 1760000200001) });
 			assert.equal(intentFiles(env.stateDir).length, 0);
 			// 非 assistant / 空文本：零动作（不读配置、不落审计）
 			const deps = envDeps(env);
-			assert.equal(broadcastWechatMessage({ role: "user", content: "用户消息" }, deps).count, 0, "user 消息不应广播");
-			assert.equal(broadcastWechatMessage({ role: "assistant", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, deps).count, 0, "纯工具消息不应广播");
-			assert.equal(broadcastWechatMessage({ role: "assistant", content: "   " }, deps).count, 0, "空白正文不应广播");
+			const ownerPi = registeredPi(deps);
+			for (const message of [{ role: "user", content: "用户消息" }, { role: "assistant", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, { role: "assistant", content: "   " }]) ownerPi.emit("message_end", { message });
 			assert.equal(intentFiles(env.stateDir).length, 0);
 			assert.equal(auditText(env.stateDir), "");
 		} finally { resetWechatBroadcastStash(); rmSync(env.root, { recursive: true, force: true }); }
