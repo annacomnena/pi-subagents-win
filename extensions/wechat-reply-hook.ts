@@ -44,9 +44,25 @@ function textOf(message: any): string {
 function audit(stateDir: string, row: Record<string, unknown>): void {
  try { const p = join(stateDir, "wechat-reply-audit.jsonl"); mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, JSON.stringify(row) + "\n", { encoding: "utf8", mode: 0o600 }); } catch {}
 }
-function lastNonEmptyAssistantText(messages: unknown[]): string {
- for (let i = messages.length - 1; i >= 0; i--) { const m: any = messages[i]; if (m?.role !== "assistant") continue; const candidate = textOf(m); if (candidate.trim()) return candidate; }
+/**
+ * 取**触发本轮的那条 marker user 之后**的首条非空 assistant 文本（从后往前）。
+ *
+ * 2026-10-17 修（陈旧文本 / 真答复被幂等吞掉，事故见 plans/20261017_wechat_stale_text_fix.md）：
+ * 原实现 `lastNonEmptyAssistantText(messages)` 在**整段会话**里向后找，不限定在 marker user 之后。
+ * 一旦本轮是错误轮（如 Cloudflare 520：assistant content=[]），它会捞到**注入轮之前**的历史文本
+ * ⇒ 写出的 intent 正文是陈旧旧回答；而 intent id 由 outboxId 派生 ⇒ 幂等门永不更新
+ * ⇒ 下一轮（真答复）命中「已存在」直接 return ⇒ **用户永远收不到本轮真答复**。
+ * 修法 A：作用域限定 —— `fromIndex` 之后没有非空 assistant 文本 ⇒ 返回空 ⇒ 走既有 `no-text`
+ * （不写 intent、不退化为旧文本）⇒ 真答复那轮仍能正常写。
+ */
+function assistantTextAfter(messages: unknown[], fromIndex: number): string {
+ for (let i = messages.length - 1; i > fromIndex; i--) { const m: any = messages[i]; if (m?.role !== "assistant") continue; const candidate = textOf(m); if (candidate.trim()) return candidate; }
  return "";
+}
+
+/** 兼容保留：整段会话的最近非空 assistant 文本（**生产路径不再使用**，仅 flush/诊断口径）。 */
+function lastNonEmptyAssistantText(messages: unknown[]): string {
+ return assistantTextAfter(messages, -1);
 }
 
 // ── 0924 出站广播：agent_end 暂存 / agent_settled flush ─────────────────
@@ -193,6 +209,8 @@ export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}
   const inbox = store.readInbox(0);
   const resolve = (id: string) => inbox.find(r => r.outboxId === id && r.state === "injected");
   const match = textOf(lastUser).match(MARKER_RE);
+  // marker user 在 messages 里的**下标**：正文作用域（assistantTextAfter）以它为界。
+  let markerIdx = match ? messages.lastIndexOf(lastUser) : -1;
   // 主路径：最近一条 user 的 marker（原语义不变）。
   let rec = match ? resolve(match[1]) : undefined;
   if (!rec) {
@@ -200,19 +218,21 @@ export function extractWechatReply(messages: unknown[], deps: ReplyHookDeps = {}
    // 远程注入把 marker 覆盖成「非微信来源」）⇒ 从新到旧找**第一条能对上入站记录**的 marker。
    // 只回退到「确实有微信入站记录」的那条 ⇒ 不会回复非微信来源；无记录仍走原拒绝码。
    if (!match) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "marker-not-first" }); return { written: false, reason: "marker-not-first" }; }
-   const users = typeof (messages as any).filter === "function" ? (messages as any).filter((m: any) => m?.role === "user") : [];
-   for (let i = users.length - 1; i >= 0; i--) {
-    const m2 = textOf(users[i]).match(MARKER_RE);
+   for (let i = messages.length - 1; i >= 0; i--) {
+    const mu: any = messages[i];
+    if (mu?.role !== "user" || mu === lastUser) continue;
+    const m2 = textOf(mu).match(MARKER_RE);
     if (!m2) continue;
     const cand = resolve(m2[1]);
-    if (cand) { rec = cand; audit(stateDir, { at: new Date().toISOString(), event: "resolved-older-wx-marker", msgId: maskWechatOpenId(cand.msgId) }); break; }
+    if (cand) { rec = cand; markerIdx = i; audit(stateDir, { at: new Date().toISOString(), event: "resolved-older-wx-marker", msgId: maskWechatOpenId(cand.msgId) }); break; }
    }
   }
   if (!rec) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", reason: "no-inbox-match" }); return { written: false, reason: "no-inbox-match" }; }
   const outboxId = rec.outboxId!;
   if (rec.fromId.endsWith("@im.bot")) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", msgId: maskWechatOpenId(rec.msgId), from: maskWechatOpenId(rec.fromId), reason: "bot-domain" }); return { written: false, reason: "bot-domain" }; }
   const dir = replyIntentDir(stateDir); const id = deriveReplyIntentId(outboxId); if (readReplyIntent(dir, id)) return { written: false };
-  let text = lastNonEmptyAssistantText(messages);
+  // 作用域限定：只认 marker user **之后**的 assistant 文本（防陈旧文本；见 assistantTextAfter 注）
+  let text = assistantTextAfter(messages, markerIdx);
   if (!text) { audit(stateDir, { at: new Date().toISOString(), event: "skipped", msgId: maskWechatOpenId(rec.msgId), from: maskWechatOpenId(rec.fromId), reason: "no-text" }); return { written: false, reason: "no-text" }; }
   if (text.length > 4000) text = text.slice(0, 4000) + "…[截断]";
   const result = newReplyIntent(dir, { id, msgId: rec.msgId, outboxId, fromId: rec.fromId, clientId: deriveReplyClientId(rec.msgId, outboxId), text });

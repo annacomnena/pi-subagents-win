@@ -489,6 +489,55 @@ try {
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
 
+	// ── 2026-10-17 陈旧文本缺陷（事故形状：错误轮空 assistant + 历史陈旧文本 + 下次真答复）──
+	// 修前：错误轮写出**陈旧旧文本**（intent id 由 outboxId 派生 ⇒ 一经写死）⇒ 真答复轮命中幂等
+	// ⇒ 用户永远收不到本轮真答复（事故见 plans/20261017_wechat_stale_text_fix.md）。
+	await check("E 事故时序：错误轮(空 assistant) 不得写陈旧文本；下一轮真答复必须写出真正文", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-e-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const outboxId = "f".repeat(64);
+			new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "mE1", fromId: "human@im.wechat", fromNickname: null, text: "如何了", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const marker = `（Web Console 远程输入｜dedupe:outbox:${outboxId}）
+[微信 o9cq80…chat] 如何了`;
+			// cut1（错误轮）：marker user 之后只有**空 content** 的 assistant（Cloudflare 520 形状），
+			// 而它之前有历史陈旧文本——旧实现会把这句当正文发出去。
+			const cut1 = [
+				{ role: "user", content: "早先的本地提问" },
+				{ role: "assistant", content: "陈旧的旧回答（上一轮）" },
+				{ role: "user", content: marker },
+				{ role: "assistant", content: [], stopReason: "error", errorMessage: "520" },
+			];
+			const r1 = extractWechatReply([], { stateDir, runtimeDir, configPath, transcript: () => cut1 });
+			assert.equal(r1.reason, "no-text", `错误轮必须走 no-text（不得写陈旧文本）：${JSON.stringify(r1)}`);
+			assert.equal(countIntents(stateDir), 0, "错误轮零 intent（不留陈旧文本）");
+			// cut2（真答复轮）：marker user 之后有真正文
+			const cut2 = [...cut1, { role: "assistant", content: [{ type: "text", text: "状态报告如下（真答复正文）" }] }];
+			const r2 = extractWechatReply([], { stateDir, runtimeDir, configPath, transcript: () => cut2 });
+			assert.equal(r2.written, true, `真答复轮必须能写出：${JSON.stringify(r2)}`);
+			const intent = readReplyIntent(replyIntentDir(stateDir), deriveReplyIntentId(outboxId));
+			assert.ok(intent, "真答复 intent 已写");
+			assert.equal(intent!.text, "状态报告如下（真答复正文）", "正文 = 真答复（不是陈旧旧文本）");
+			assert.ok(!intent!.text.includes("陈旧的旧回答"), "正文绝不含陈旧文本");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	await check("F 反例守卫：marker 之后只有空 assistant、此前也无旧文本 ⇒ 仍 no-text（不虚构正文）", () => {
+		const root = mkdtempSync(join(tmpdir(), "wechat-reply-f-"));
+		try {
+			const stateDir = join(root, "state"), runtimeDir = join(root, "runtime"), configPath = join(root, "config.json");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(configPath, JSON.stringify({ channels: { wechat: { reply: { mode: "reply-only" } } } }));
+			const outboxId = "e".repeat(64);
+			new WechatStore(join(runtimeDir, "wechat", "receive")).putInbox({ msgId: "mF1", fromId: "human@im.wechat", fromNickname: null, text: "x", receivedAt: new Date().toISOString(), state: "injected", outboxId });
+			const tr = [{ role: "user", content: `dedupe:outbox:${outboxId}` }, { role: "assistant", content: [] }];
+			assert.equal(extractWechatReply([], { stateDir, runtimeDir, configPath, transcript: () => tr }).reason, "no-text", "无正文 ⇒ no-text");
+			assert.equal(countIntents(stateDir), 0, "零 intent");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
 clearInterval(keepAlive);
 if (failures.length > 0) {
 	console.error(`\n${failures.length} 项失败: ${failures.join(" | ")}`);
