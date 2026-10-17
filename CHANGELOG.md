@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.8.0] — 2026-10-17
+
+> 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
+
+- **心跳（修「静默死亡 29h」）**：`writeAutonomyHeartbeat()` 在 wake tick **开头无条件**写 `state/autonomy/heartbeat.json`
+  （tmp+rename 原子写，never-throw），即使后续被 `gate.ts:73` 的 `enabled!==true` 完全旁路也写。
+  根因实证：2026-10-16 10:37–10:43 一次 `config.json` **整文件重写**丢掉顶层 `autonomy` 键（备份考古：
+  `bak-glmreview`(10:37) 有 / `bak-luna-weak`(10:43) 无；`frontier.json` 末次写盘 10:38:07 正落在两者之间），
+  整链静默死亡 29 小时。心跳把「tick 活着」与「autonomy 在工作」解耦。
+- **陈旧检测 + 诊断**：`frontierFreshness()`（阈值 `max(3×tick,5min)`）给出 `ageMs` / `stale` / **`suspectedDisabled`**
+  （心跳新鲜但 frontier 陈旧 ⇒ 最可能被关，与「进程死」区分）。`/autonomy status` 改为显示**年龄**（`29.0h 前`）
+  + `⚠️STALE` + 心跳行 + 一行诊断。旧版只打绝对时间（`asof=2026-10-16T02:38:07`），这是 29h 未被发现的直接原因。
+- **监管账本（P0）**：新纯库 `runtime/supervision.ts` —— `state/supervision/{open,closed}/<runId>.json`
+  （抄 `expectations.ts` 骨架：SoT=一对象一文件、原子 tmp+rename、never-throw）。**只有主会话写**（`/supervise on|off|pause|resume|status`
+  或 `launch-tabs(supervise:true)`）；autonomy **只读**，永不写账本（与 `expectations.ts:25` 同构）。**tab 永不写自己的账本**。
+- **六态语义机（P0）**：`deriveTabSupervisionState` → `NOT_MONITORED / ACTIVE / PAUSED_USER / BLOCKED_USER / DONE / STALLED`。
+  **`stagnation` 判据重构**：旧 `nonTerm.some(staleOver) || resultMissing` 拆除（`resultMissing` 无时基，任何无
+  `result.json` 的非终态 tab 立刻 true ⇒ 实测三条线全 true、零区分度）；新判据 = `state === "STALLED"`
+  （账本 active ∧ waiting ∧ `stop=stop` ∧ idle>pushMs）。**无账本 ⇒ `NOT_MONITORED` ⇒ 静默**。
+- **`toolUse` 豁免**：`FrontierSourceTab` 新增 `stop` 字段（`lastStopReason` 早已采集但未透传到 autonomy）；
+  `phase=working ∧ stop=toolUse` 即使 idle 50min 也是 ACTIVE（长命令不是停滞）。
+- **阈值按实测数据定档**：单日 392 个间隔 `median 0.07min / P95 0.7 / P99 48.7`，P95→P99 断崖 ⇒
+  `SOFT 5min / PUSH 15min / USER 30min / HANG 60min`（旧 45min 单档）。
+- **验证**：`_test_runtime_autonomy` 66 checks（+6 例：STALLED / NOT_MONITORED / toolUse 豁免 / PAUSED_USER /
+  BLOCKED_USER / idleMs=null 不猜）；`_test_runtime_autonomy_actions` 87 checks 未回归。
+  变异：短路账本门 ⇒ `SUP-P0(b)` 实红（共 8 项红），字节级还原（sha256 `cbefb076…`）。
+  顺手修真 bug：`makeTab` 未透传 `idleMs` ⇒ 新判据永远判不出 STALLED。
+- **`AGENTS.md` 新建（10 节 agent 强制约束）**：R-0 证据优先于记忆；R-1 **禁止整文件重写 config.json**
+  （必须 read-modify-write 单键，附本次事故时间线）；R-2 静默失效不可接受（心跳/年龄/三态可区分）；
+  R-3 派生缓存不得当权威；R-4 审查纪律（L4 另起进程 + **变异必须变真实接线不是函数体**）；
+  R-5 夹具贴近真实形状；R-6 幂等取舍（宁重发不漏发）；R-7 push 走 443；**R-7b 同 provider 连败冷却 ≥30s
+  （附 Cloudflare 对照实验：直连与代理**同秒同时挂**，与代理无关）**；R-8 长跑切片；R-9 用户交互边界；R-10 未闭合表。
+- **微信出站（同批）**：广播改 `message_end` 驱动逐条推送（前序提交）；陈旧文本缺陷修复。
+- **README 重写 §11**：`Autonomy & the global → local dispatch plane` —— 三种失败模式 / 心跳三态表 /
+  监管账本与六态判据 / 阈值数据依据 / 六条不变式 / global→local 调度平面（工具表 + 单向委派 + 四种失效处理）/ 开启方式。
+  §1 Overview 加 2 条；§18 加 2 条诚实边界（**P0 只显示不推动**、心跳只证 tick 活不证工作在推进）。
+- **未闭合（已写入 README §18 + AGENTS.md R-10）**：P1 主动推动未实现（`supervise-push` / wake prompt 注入）；
+  `test:runtime-wake` 在 HEAD 上本来就坏（`git stash -u` 全程清空验证，非本次引入）；
+  frontier 多写者共写单文件（per-project 分文件属中期项）；`config.json` 整文件重写的机制性防护（目前靠 R-1 人工遵守）。
+
 ## [0.7.0] — 2026-10-06 (版本跃迁：0.6.0 → 0.7.0，覆盖 2026-09-23 后 182 个提交；起因为 iCloud 备份停在 v0.6.0-20260923，版本号未 bump 导致 182 提交未触发新备份)
 
 - **autonomy 主动性套件**：global master 主动性套件 v1（纯函数层）+ P1 最小可回滚动作（diagnostic-report + 全套 harness）+ P2 v2-b 期望账本（frontier ⑧ 获真载体）+ 阶段二 notify-local-master 真机验证（actions.jsonl 9 行 + 真发信）+ Graph 补齐（carrier 进 diff + 4 字段 + graph 源）+ OQ-1 防护（owner 检查 + suspectedEcho）+ trigger 扩至 4 条（TRIGGER_CLASS_MAP）。

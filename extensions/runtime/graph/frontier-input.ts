@@ -21,8 +21,10 @@ export interface FrontierInputOptions {
 /**
  * 单 run 适配（纯）：carrier 不存在 = 非可见 tab，**不猜、不 emit**（L1 K4）。
  * `graph/collect.ts#L165-L175` 的不变量 = carrier 存在 ⇒ gate/needsHuman/staleOver/overdue/pidAlive
- * 五键齐；此处对四值键做完整性兜底（缺任一 → 按缺 carrier 处理，绝不补默认值）。
+ * + stop/idleMs（监管 P0）齐；此处对值键做完整性兜底（缺任一 → 按缺 carrier 处理，绝不补默认值）。
  * `pidAlive === null`（无 state.pid）**合法**，原样保留（同 v2）。
+ * 例外：`stop`/`idleMs` 缺失时回退 `"unknown"`/`null`（与 v2 carrier7 口径对齐；
+ * `stop="unknown"` 与 `idleMs=null` 均**不入** STALLED 判据 ⇒ 降级方向安全）。
  */
 function toTab(view: GraphProjectView, ref: GraphRunRef): FrontierSourceTab | null {
 	// 成员资格：无归属 / 无相位 / 无 carrier → 不 emit。
@@ -36,6 +38,8 @@ function toTab(view: GraphProjectView, ref: GraphRunRef): FrontierSourceTab | nu
 		// R4：直接用已归一 project 键（视图键，与 ref.project 同值），零转换。
 		repoPath: view.project,
 		phase: ref.phase,
+		stop: typeof ref.stop === "string" && ref.stop.length > 0 ? ref.stop : "unknown",
+		idleMs: typeof ref.idleMs === "number" && Number.isFinite(ref.idleMs) ? ref.idleMs : null,
 		needsHuman,
 		gate: ref.gate,
 		staleOver,

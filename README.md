@@ -19,20 +19,31 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Observe & steer locally**: a resident runtime daemon + local web console (GUI), default OFF, loopback-only (§8, §14).
 - **Manage long-lived "master" sessions**: a gated family of master tools — the agent can never take over / hand off / switch on its own (§9).
 - **Let the master watch for you** (optional): an autonomy suite + expectation ledger — default: zero automatic action (§11).
+- **Survive its own switch being flipped off**: an unconditional heartbeat runs before every gate, so "switched off" is distinguishable from "never on" and from "process dead" — and the status line reports *age*, not just a timestamp (§11.2).
+- **Know the difference between idle and stalled**: supervision is an explicit per-task intent written by the master; without it, idle is just idle. Six states incl. `PAUSED_USER` / `BLOCKED_USER` / `STALLED`, plus a `toolUse` exemption so a 50-minute conformance sweep is not mistaken for a hang (§11.3).
 
 ### Architecture
 
 ```
-                  ┌──────────────────── main session ────────────────────┐
-                  │  subagent-win  ·  launch-tabs  ·  tab-status/          │
-                  │  reclaim-tabs  ·  set-timer  ·  tab-report listener   │
-                  └──────────┬──────────────────────────┬────────────────┘
-                             │                          │
-              ┌──────────────▼──────────────┐  ┌────────▼─────────────────────┐
-              │  subagents (one-shot)        │  │  tabs (visible pi sessions)   │
-              │  sync / parallel / async     │  │  /launch → wt.exe new-tab      │
-              └──────────────────────────────┘  └───────────────────────────────┘
+                  ┌──────────────────── global master (main session) ─────────────────┐
+                  │  subagent-win · launch-tabs · master-dispatch · /supervise         │
+                  │  reclaim-tabs · set-timer · tab-report listener                    │
+                  │  ── autonomy tick (30s): heartbeat · frontier · supervision ──     │
+                  └───────┬─────────────────────┬──────────────────────┬──────────────┘
+                          │                     │                      │
+        ┌─────────────────▼────────┐  ┌─────────▼──────────┐  ┌────────▼─────────────────┐
+        │  subagents (headless)     │  │  tabs (visible)     │  │  local masters (per-repo) │
+        │  sync/parallel/async      │  │  /launch → wt.exe   │  │  agent://master_local_<scope> │
+        │  model= per call          │  │  own pi process     │  │  own wake loop + attention    │
+        └───────────────────────────┘  └─────────────────────┘  └───────────────────────────┘
+                                                                              ▲
+                                             global dispatches work ──────────┘
+                                             (master-dispatch / local-master-ensure)
 ```
+
+**Three tiers, one control plane.** Everything below the global master is *delegated*, never
+self-elected: a subagent cannot spawn tabs, a tab cannot call `launch-tabs`, and no session can
+take over / hand off / flip cutover on its own (§9). Those are hard gates in code, not conventions.
 
 ### Subagents vs. Tabs
 
@@ -125,6 +136,8 @@ subagent-win({ action: "status", runId: "run_xxx" })
 The async task panel (TUI widget + status bar + completion toast) shows running background jobs; `/runs` lists recent ones.
 
 A stuck async run can be inspected and stopped without hunting PIDs: `subagent-win({ action: "list" })` shows each run's `runId`/status/pid/`idle` pulse, and `subagent-win({ action: "kill", runId })` (alias `cancel`) kills that run's process tree and marks it `cancelled`. See `Wiki/Architecture/async-run-control.md` for the two safety checks (recorded pid + start-time/command-line verification), idempotency, and known limits.
+
+Recent tool calls / loop detection (read-only): `subagent-win({ action: "recent-calls", runId })` reads the async run's bounded tool-call ring from its run json; `{ action: "recent-calls", tabRunId }` reads the task tab's session JSONL tail (`tab_...` ids may also be passed as `runId`). It returns the last `n` calls (default 3, max 5) plus a `verdict` (`ok` | `repeating` | `no_progress`) and a one-line hint, hard-capped at 1536 bytes. `loopGuard` in `config.json` (default `{ "enabled": false, "threshold": 3, "action": "warn" }`) is opt-in auto-disposal: `warn` only annotates the response, while `kill` must be set explicitly and reuses the same safe `killAsyncRun` path (tab targets have no kill capability and fall back to `warn`). See `Wiki/Architecture/loop-observability.md`.
 
 ### 3.2 Consultant — user-named model evaluation
 
@@ -503,20 +516,160 @@ The WeChat channel is a **Client Plane** endpoint: long-polling against the WeCh
 
 **Secret hygiene:** `bot_token` never enters logs / GUI / WS / argv; credentials are stored 0600 under `<runtimeDir>/wechat/`; all outbound network goes only to the iLink base URL + allow-listed attachment CDN hosts. Binding (QR) is done from the GUI "WeChat" section, which is always rendered (with an in-page "enable" affordance while the channel is off).
 
-## 11. Autonomy Suite & Expectation Ledger
+## 11. Autonomy & the global → local dispatch plane
 
-**Autonomy suite** — moves the global master from "passively waits for instructions" to "proactively derives + explicit actions".
-- **Default: zero automatic action.** The whole suite is opt-in — `config.json "autonomy": {"enabled": true}` (strict `=== true`, per-field fail-closed normalization). When off, wake-loop behavior is byte-identical to the legacy path and `state/autonomy/` creates no new files.
-- **Switches** — `/autonomy on|off|status|kill [reason]|clear` (manual operations commands; subagent sessions blocked; every flip leaves an audit line) + a GUI settings card. `kill` is the in-suite fire switch (suppresses the wake gate); stopping the legacy wake itself is `/master-cutover off`.
-- **When enabled** — each tick collects a *frontier* (project-level state map); a **wake gate** (gating / 2 s debounce / 15 s cooldown) decides whether the existing wake chain is allowed to proceed. v2 only gates and records — it never acts.
-- **Action surface (separately default-OFF)** — `autonomy.actions.enabled === true` opens a **rollback-only** action subsystem. Two action classes today: `diagnostic-report` (effect confined to its own namespace) and `notify-local-master` (exactly **one new letter file** in the target scope master's mailbox — deliver only, never consume/ack anyone else's mailbox). The whole chain is **fail-closed** (any unknown / read failure / exception → refuse), with hard-coded budgets (1 new action per tick, ≤2/hour rolling, per-trigger dedupe) and a persistent circuit breaker (a falsified rollback promise freezes everything until manual clear), plus a git porcelain pre/post guard (any new dirty entry → rollback + freeze). It **never auto-dispatches work and never auto-restarts workers**.
-- **Where the evidence lives** — `state/autonomy/`: `audit.jsonl` (structured decision lines), the frontier snapshot, the wake-gate state, and `actions/actions.jsonl` (per-action ledger: attempted / precheck / executed / postverified / rolled_back / …, 0600, ~1 MB two-generation rotation). `/autonomy status` prints the summary; the GUI shows a live frontier visualization.
+> This is the part that turns "a tool that delegates" into **a control plane you can leave alone**.
+> Default is **off with zero trace**; nothing below happens until you turn it on.
 
-**Expectation ledger (⑧ request → reply expectation)** — the requester declares *what reply it is waiting for* at the moment of successful delivery; the consumer chain closes the wait when the matching reply arrives (four-key match, body never read); timeouts are derived from an explicit `now` at read time — **no timers, no background process**.
-- SoT: `~/.pi/agent/runtime/state/expectations/{open,closed}/<requestId>.json` (one file per request); the journal receives only 3 additive events (`project.expected_event_{set,arrived,timeout}`). Default deadline 30 min, overridable per letter.
-- **Production entry point** — `/send-letter <to> [--subject S] [--body B] [--deadline 30m] [--no-expect]` (manual operations command; subagent sessions blocked; rejections are audited).
-- **Read surfaces** — the autonomy frontier trigger (`expected_event_timeout`), the watchdog overdue check, attention entries (`request-timeout`), and the read-only work-graph projection (§12). The autonomy suite is **read-only** on this ledger; the writer is the consumer chain.
+### 11.1 Why it exists (three failure modes it was built against)
 
+| Failure | Symptom | What was missing |
+|---|---|---|
+| **Silent death** | The whole autonomy chain stopped for 29 hours; `frontier.json` / `wake-gate.json` / `audit.jsonl` all froze at the same second. Nobody noticed. | No liveness signal *independent of the feature switch*. |
+| **Zero-discrimination state** | `stagnation: true` for **every** project — one actively working, one paused by the user, one finished. | Judgement had no semantics: `resultMissing` fired with no time base. |
+| **"Stalled" ≠ "should be running"** | A task sat idle for 48 min because it was *correctly* waiting for the master to unblock a provider cooldown. | No carrier for "I was told to supervise this one". |
+
+Each of those is now a named invariant (§11.4).
+
+### 11.2 Heartbeat — the switch cannot die quietly
+
+`writeAutonomyHeartbeat()` runs at the **top of every wake tick**, *before* any gate:
+
+```
+~/.pi/agent/runtime/state/autonomy/heartbeat.json
+{ at, iso, pid, sessionId, tickIntervalMs }
+```
+
+Because it is written unconditionally, it decouples two questions that used to be one:
+
+| heartbeat | frontier | Meaning |
+|---|---|---|
+| fresh | fresh | healthy |
+| fresh | stale | **autonomy is switched off** (config key lost / `/autonomy off`) — `suspectedDisabled` |
+| stale | stale | the tick itself is not running (process dead, or old code) |
+
+`/autonomy status` renders age (not just an absolute timestamp), a `⚠️STALE` tag past
+`max(3×tick, 5min)`, and a one-line diagnosis. Before this, the status line printed
+`asof=2026-10-16T02:38:07` with no age — which is exactly why 29 hours went unnoticed.
+
+### 11.3 Supervision — "stalled" means *stalled against an intent*
+
+**The intent is explicit, per task, and written by the master only.** It lives in a ledger, not
+in config and not in the derived cache:
+
+```
+~/.pi/agent/runtime/state/supervision/open/<runId>.json
+{ version, runId, taskId, repoPath, status: "active"|"paused", setBy, setAt,
+  pausedAt, pauseReason, softMs?, pushMs?, userMs?, epoch: { startedAt, pushes[] } }
+```
+
+- **Who writes**: only the master side — `/supervise on|off|pause|resume|status`, or
+  `launch-tabs(supervise: true)`. **A tab never writes its own ledger entry** (a supervised
+  process must not be able to declare itself healthy).
+- **Who reads**: the autonomy tick, read-only. Autonomy writes only its own namespace
+  (`state/autonomy/**`) — same discipline as the expectation ledger.
+
+**No ledger entry ⇒ `NOT_MONITORED` ⇒ silence.** That single rule removes the entire class of
+"everything looks stalled" false positives, and it is the machine-readable form of the user's
+sentence *"when you are supervising a task for me"*.
+
+#### Six states (pure derivation, every tick)
+
+| State | Condition | Action |
+|---|---|---|
+| `NOT_MONITORED` | no ledger entry | **nothing** (this is the default for every run) |
+| `ACTIVE` | active ∧ (`stop=toolUse` ∨ idle < SOFT) | nothing |
+| `DONE` | ledger open ∧ run is terminal | prompt master to reclaim + close ledger |
+| `PAUSED_USER` | ledger `status:"paused"` | nothing (shows "paused 2h") |
+| `BLOCKED_USER` | active ∧ (`needsHuman` ∨ gate awaiting ∨ attention>0) | **remind, never nudge** — it is waiting on a human |
+| `STALLED` | active ∧ `phase=waiting` ∧ `stop=stop` ∧ idle ≥ PUSH | **report + nudge** |
+
+**`toolUse` exemption**: `phase=working ∧ stop=toolUse` stays `ACTIVE` even at 50 min. A long
+`verify_m0.sh` or a 24-row conformance sweep is work, not a stall. This is why `lastStopReason`
+had to be threaded into the carrier — it was already being collected but never reached autonomy.
+
+#### Thresholds (data-derived, not guessed)
+
+Measured over 392 inter-message gaps in one repo on a single day:
+
+```
+median 0.07 min · P75 0.1 · P90 0.2 · P95 0.7 · P99 48.7 · max 314.5
+>5min: 11   >15min: 7   >30min: 5   >45min: 4
+```
+
+There is a **cliff** between P95 and P99 — either a worker is running (seconds) or it is stuck
+(tens of minutes); there is almost nothing in between.
+
+| Tier | Default | Behaviour |
+|---|---|---|
+| SOFT | **5 min** | show in `/autonomy status` only |
+| PUSH | **15 min** | first nudge (STALLED only) |
+| USER | **30 min** or push budget exhausted | escalate to the human |
+| HANG | **60 min** | `working + toolUse` this long ⇒ report "possibly hung", **never auto-kill** |
+
+> **v0.8.0 scope**: the ledger, the six states and the thresholds above are **shipped and
+> read-only**. The nudge/push half (P1) is designed and specced in
+> `plans/20261017_stagnation_supervision_plan.md` §C but is **not in this release** — `PUSH`/
+> `USER` currently surface as status and triggers, not as injected messages.
+
+### 11.4 Invariants (each one is a regression that actually happened)
+
+1. **A feature switch must never silence its own liveness signal.** Heartbeat is written before
+   the gate, unconditionally.
+2. **An "off" switch must be distinguishable from "never turned on".** Heartbeat present +
+   frontier stale ⇒ `suspectedDisabled`.
+3. **Derived caches are not authority.** `frontier.json` is a projection; read `asof` age before
+   trusting it. The authoritative intent lives in the ledger, never in the cache.
+4. **A supervised process may not self-report health.** Only the master writes supervision state.
+5. **`stalled` requires an intent.** Absent an explicit supervision mandate, idle is just idle.
+6. **Long tool use is not a stall.** `toolUse` is exempt from every idle threshold below HANG.
+
+### 11.5 The global → local dispatch plane
+
+The global master (`agent://master_default`) does not do repo work itself; it **owns intent and
+dispatches execution** to per-repo local masters (`agent://master_local_<scope>`, §6.7).
+
+```
+global master  ── master-dispatch ──▶  task tab (visible, cwd = repo)
+      │                                      │
+      │◀──── tab-report / result.json ───────┘
+      │
+      └── local-master-ensure ──▶  local master (owns the repo's wake loop,
+                                                 attention, and its own scope mailbox)
+```
+
+| Tool / command | Tier | What it does |
+|---|---|---|
+| `master-dispatch` | global | dispatch a task tab with full ledger + reclaim chain (same code path as `launch-tabs`) |
+| `local-master-ensure` | global | idempotently ensure a repo's local master is alive; **never** force-attaches or spawns a duplicate |
+| `/master-attach` · `/master-detach` · `/master-transfer` | both | succession; token-gated, `gen+1`, confirm-before-cutover |
+| `/master-cutover` | global | the single consumption switch; every consumer reads it fresh each tick |
+| `/supervise` | global | mark a run as supervised (the ledger entry described above) |
+| `master-status` / `master-pressure` / `master-handoff` | read-only | observability for the plane itself |
+
+**Delegation is one-way and gated.** A tab may delegate *downward* via `subagent-win` only; it may
+never call `launch-tabs` or `master-dispatch`. A subagent may do neither. The gate is enforced by
+identity checks in code, not by prompt discipline — the model cannot talk its way past them.
+
+**Failure handling** (the part most control planes get wrong):
+
+- **Lost owner** ⇒ scope stays owned-but-inactive; no auto-election, no steal.
+- **Zombie owner** ⇒ `local-master-ensure` reports `consume-unverified` and **degrades explicitly**
+  rather than spawning a second consumer.
+- **Dead pid** ⇒ never reused as evidence of liveness without a start-time + command-line re-check
+  (a reused PID once caused a `WM_CLOSE` to be delivered to the wrong process).
+- **Reclaim is not completion.** A terminal tab with no `result.json` is `unconfirmed`, never
+  "done"; the reclaim channel flags it rather than silently succeeding.
+
+### 11.6 Turning it on
+
+```jsonc
+// config.json — absent ⇒ autonomy fully off, zero IO, zero audit lines
+{ "autonomy": { "enabled": true } }
+```
+
+```bash
+/
 ## 12. Work Graph — Read-only Projection (experimental)
 
 > **Status: experimental / internal.** A read-only relationship surface — **not a user-facing feature** (no tool or command exposes it directly); safe to ignore.
@@ -527,7 +680,7 @@ A pure-library projection over the four existing objects (**Master / Workstream 
 - `diff(since)` for change tracking; snapshot schema v2 (run carrier fields, derived project fields, next expected event).
 - **Wiring status** — introduced as a **shadow run** (zero production wiring, revertible with a single commit); since 2026-10-02 it serves as the **autonomy frontier data source** behind a single-point switch (`PI_AUTONOMY_FRONTIER_SOURCE`; production default `graph`, an externally pre-set non-empty value wins — the escape hatch). A 34-frame shadow comparison proved the graph-derived frontier input canonical-equal to the legacy path (zero unexplained differences).
 
-## 13. Approval Gate — planned, not shipped in v0.7.0
+## 13. Approval Gate — planned, not shipped in v0.8.0
 
 A unified approval gate (one gate shared by the TUI / GUI / WeChat surfaces) is **designed and decided, but not implemented**:
 - priority `deny > ask > auto`; **floor actions are never approvable on any surface** (root / system-directory deletion, privilege escalation, reading or exfiltrating keys, payments / deploys, direct writes to the shared ledger);
@@ -807,6 +960,8 @@ File system is the bus: ledgers under `~/.pi/agent/` are the shared state; `fs.w
 - **Windows `fs.watch`** can miss events on large/network directories — the 5–10s tick fallback covers this.
 - **External CLIs** run with no-approval/dangerous modes — use only in trusted repos (same policy as those CLIs themselves). See §4 for wiring them as role-agent backends.
 - **Two changelogs:** the project's `changelog.md` (monthly project history) vs this package's `CHANGELOG.md` (release log).
+- **Supervision is a carrier, not a nudge (v0.8.0).** `STALLED` produces a state + a trigger; it does **not** yet inject a message into the stalled tab. The push half is specced (`plans/20261017_stagnation_supervision_plan.md` §C) but unshipped — today, a stalled supervised run is *visible*, not *self-healing*.
+- **The heartbeat proves the tick is alive, not that work is progressing.** Tick fresh + frontier stale ⇒ the switch is off (that is exactly the 29-hour outage); tick fresh + frontier fresh + a run idle ⇒ nothing is broken at the autonomy layer, the run itself is simply idle and only `STALLED` (with an explicit supervision mandate) will say so.
 - **trace-fusion diagnose vs implement:** diagnose never runs commands in your repo (evidence claims are reviewed, not rerun); implement gives real build/test evidence but costs 10GB+ disk per run on large repos — clean with `/trace-fusion-clean` when done. Lane reads/writes inside gitignored paths are not visible to the dirty-baseline check (documented residual risk).
 
 ---
