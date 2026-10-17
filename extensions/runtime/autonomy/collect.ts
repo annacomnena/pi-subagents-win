@@ -17,6 +17,7 @@
  * - v1 无任何调用方注册它（无循环、无注册——计划工程约束 2）；仅测试（temp 目录）与后续 L2 接线使用。
  *   本层不产生任何 wake/注入：Wake Gate 判定由调用层用 evaluateWakeGate（纯）消费返回的 diff。
  */
+import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "../journal.ts";
@@ -360,4 +361,81 @@ export function readExpectationInputs(opts?: { stateDir?: string }): FrontierExp
 	} catch {
 		return undefined; // never-throw：读取失败按无载体处理（不猜）
 	}
+}
+
+/**
+ * 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）
+ *
+ * 背景：`gate.ts:73` 的「D-E enabled !== true → 完全旁路（零 IO/零审计/零写盘）」是刻意设计
+ * （默认关闭不污染日志），但代价是：**开了之后被意外关掉也完全无声**。2026-10-16 10:43 一次
+ * config.json 整文件重写丢掉顶层 `autonomy` 键 ⇒ 整链静默死亡 29 小时，frontier/wake-gate/audit
+ * 三个文件同秒停更，只能靠人偶然发现。
+ *
+ * 本心跳把「tick 进程活着」与「autonomy 是否在工作」解耦：
+ *   - 心跳停      ⇒ 进程/tick 死（或从未注册）
+ *   - 心跳新 + frontier 旧 ⇒ autonomy 被关（可判别，不再与「从未开启」混淆）
+ *
+ * 语义：纯观测加法，**不改变任何 autonomy 判定**。never-throw。
+ */
+export interface AutonomyHeartbeat {
+	at: number;
+	iso: string;
+	pid: number;
+	sessionId: string | null;
+	tickIntervalMs: number;
+}
+
+export function writeAutonomyHeartbeat(opts: { stateDir?: string; sessionId?: string | null; tickIntervalMs: number }): boolean {
+	try {
+		const dir = autonomyDir(opts?.stateDir);
+		mkdirSync(dir, { recursive: true });
+		const now = Date.now();
+		const hb: AutonomyHeartbeat = {
+			at: now,
+			iso: new Date(now).toISOString(),
+			pid: process.pid,
+			sessionId: opts?.sessionId ?? null,
+			tickIntervalMs: opts.tickIntervalMs,
+		};
+		// tmp+rename 原子写：读方永不会读到半截 JSON。
+		const target = join(dir, "heartbeat.json");
+		const tmp = join(dir, `heartbeat.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+		writeFileSync(tmp, JSON.stringify(hb), { encoding: "utf8", mode: 0o600 });
+		renameSync(tmp, target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function readAutonomyHeartbeat(opts?: { stateDir?: string }): AutonomyHeartbeat | null {
+	try {
+		const raw: any = JSON.parse(readFileSync(join(autonomyDir(opts?.stateDir), "heartbeat.json"), "utf8"));
+		if (typeof raw?.at !== "number") return null;
+		return {
+			at: raw.at,
+			iso: typeof raw.iso === "string" ? raw.iso : new Date(raw.at).toISOString(),
+			pid: typeof raw.pid === "number" ? raw.pid : -1,
+			sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
+			tickIntervalMs: typeof raw.tickIntervalMs === "number" ? raw.tickIntervalMs : 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** frontier 快照新鲜度判定。STALE 阈值 = 3 个 tick 周期（下限 5min），避免单次抖动误报。 */
+export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: AutonomyHeartbeat | null, now = Date.now()): {
+	ageMs: number | null;
+	threshold: number;
+	stale: boolean;
+	/** tick 活着但 frontier 不新鲜 ⇒ 最可能是 autonomy 被关（而非进程死）。 */
+	suspectedDisabled: boolean;
+} {
+	const tick = heartbeat?.tickIntervalMs && heartbeat.tickIntervalMs > 0 ? heartbeat.tickIntervalMs : 30_000;
+	const threshold = Math.max(tick * 3, 5 * 60_000);
+	if (!snapshot) return { ageMs: null, threshold, stale: true, suspectedDisabled: Boolean(heartbeat) };
+	const ageMs = Math.max(0, now - snapshot.asof);
+	const hbFresh = Boolean(heartbeat && now - heartbeat.at <= threshold);
+	return { ageMs, threshold, stale: ageMs > threshold, suspectedDisabled: ageMs > threshold && hbFresh };
 }

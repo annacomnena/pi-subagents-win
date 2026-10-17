@@ -58,7 +58,7 @@ import {
 	parseLocalMasterEnsureArgs,
 	type LocalMasterSpawn,
 } from "./runtime/local-master-launch.ts";
-import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState } from "./runtime/autonomy/collect.ts";
+import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2574,11 +2574,29 @@ export default function (pi: ExtensionAPI) {
 				const tail = readAuditTail({ limit: 5 });
 				const actionsLines = summarizeActionsStatus(); // P1 动作面尾行（never-throw，≤5 行）
 				const iso = (t: number): string => new Date(t).toISOString().slice(0, 19);
+				// 2026-10-17（INC：autonomy 静默死亡 29h）：旧 status 只打 `asof=<绝对时间>`，
+				// 读的人**看不出“多久之前”**，因此 29 小时陈旧也没被发现。此处加：年龄 + STALE 标记
+				// + 心跳 + “tick 活着但 frontier 旧 ⇒ 怀疑被关”判别（与“从未开启”区分）。
+				const hb = readAutonomyHeartbeat();
+				const fresh = frontierFreshness(frontier, hb);
+				const ageTxt = fresh.ageMs === null ? "(无快照)"
+					: fresh.ageMs < 60_000 ? `${Math.round(fresh.ageMs / 1000)}s 前`
+					: fresh.ageMs < 3_600_000 ? `${Math.round(fresh.ageMs / 60_000)}min 前`
+					: `${(fresh.ageMs / 3_600_000).toFixed(1)}h 前`;
+				const staleTag = fresh.stale ? ` ⚠️STALE(>${Math.round(fresh.threshold / 60_000)}min)` : "";
+				const hbTxt = hb ? `心跳 ${Math.round(Math.max(0, Date.now() - hb.at) / 1000)}s 前 pid=${hb.pid} tick=${Math.round(hb.tickIntervalMs / 1000)}s` : "心跳 (none) —— tick 未注册或旧版本代码";
+				const diagLine = fresh.suspectedDisabled
+					? "⚠️ 诊断：tick 活着但 frontier 不新鲜 ⇒ **autonomy 很可能被关**（查 enabled 键是否还在 config）"
+					: hb && !fresh.stale ? "诊断：正常（tick 活着且快照新鲜）"
+					: !hb && frontier ? "⚠️ 诊断：无心跳但快照旧 ⇒ tick 未在跑（旧代码重启前不会自愈）"
+					: "诊断：未知";
 				body = [
 					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（切换：/autonomy on|off，或 GUI 设置区的「主动性套件」开关）`,
 					`kill-switch: ${kill ? `on (reason=${kill.reason} @${kill.at.slice(0, 19)} by=${kill.by})` : "off"}`,
 					`gating: ${gating.active ? "active" : `inactive (${gating.reason})`}`,
-					`frontier: ${frontier ? `asof=${iso(frontier.asof)} baseline=${frontier.baseline} projects=${frontier.projects.length} triggers(last)=${frontier.triggers.length}` : "(none)"}`,
+					`frontier: ${frontier ? `asof=${iso(frontier.asof)} (${ageTxt})${staleTag} baseline=${frontier.baseline} projects=${frontier.projects.length} triggers(last)=${frontier.triggers.length}` : "(none)"}`,
+					`${hbTxt}`,
+					`${diagLine}`,
 					`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
 					`audit (最近 ${tail.length} 行):`,
 					...(tail.length ? tail.map((l) => `  ${l}`) : ["  (空)"]),

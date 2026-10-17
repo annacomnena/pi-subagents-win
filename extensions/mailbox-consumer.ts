@@ -52,6 +52,7 @@ import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
+import { writeAutonomyHeartbeat } from "./runtime/autonomy/collect.ts";
 import {
 	auditScopeWakeSpawnFailed,
 	confirmScopeWakeSpawn,
@@ -597,6 +598,18 @@ export function registerWakeLoop(
 		const sid = ctx?.sessionManager?.sessionId;
 		interval = setInterval(() => {
 			if (closed()) return;
+			// 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）：每次 tick 无论后续是否
+			// 被 autonomy 门旁路，都写一份 heartbeat。为什么需要：`gate.ts:73` `enabled !== true`
+			// 是「零 IO / 零审计 / 零写盘」的完全旁路 ⇒ 一旦 enabled 被误关（如整文件重写 config
+			// 丢键），整链静默死亡且**无任何痕迹**，只能靠人偶然发现 frontier 陈旧。
+			// 本心跳把「tick 活着」与「autonomy 是否工作」解耦：心跳停 = 进程/tick 死；
+			// 心跳新但 frontier 旧 = autonomy 被关（可判别，不再与「从未开启」混淆）。
+			// never-throw：写失败不影响唤醒循环。
+			try {
+				writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
+			} catch {
+				/* 心跳永不破坏会话 */
+			}
 			try {
 				const decisions = evaluateWakes({
 					sessionId: sid,
