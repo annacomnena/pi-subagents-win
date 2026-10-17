@@ -207,6 +207,12 @@ export interface FrontierSourceTab {
 	runId: string;
 	repoPath: string;
 	phase: string;
+	/** 最后一条 assistant 消息 stopReason（`state.lastStopReason ?? probe.lastStopReason ?? "unknown"`）。
+	 *  2026-10-17 监管 P0：进 carrier 才能区分「正在跑工具(toolUse) vs 真空闲(stop)」。 */
+	stop: string;
+	/** 距 state.lastActivityAt 的毫秒数；无 state / 无该字段 → null（**不拿 mtime 冒充**）。
+	 *  监管 P0：SOFT/PUSH/USER 分档需要结构化时间基（旧 staleOver 只是 45min 布尔）。 */
+	idleMs: number | null;
 	needsHuman: boolean;
 	gate: GateStatus;
 	staleOver: boolean;
@@ -221,7 +227,6 @@ export interface TabDetail extends FrontierSourceTab {
 	taskId: string;
 	age: string;
 	stale: string;
-	stop: string;
 	artifact: string;
 	artifactMtime: string;
 	terminal: boolean;
@@ -320,7 +325,7 @@ export function reduceTabCarrier(input: TabCarrierInput): TabDetail | null {
 			runId: rec.id, repoPath, phase, taskId: rec.taskId || "unknown",
 			age: ageMs !== null ? relText(now - ageMs, now) : "?",
 			stale: staleMs !== null ? relText(now - staleMs, now) : "unknown",
-			staleOver, stop,
+			staleOver, stop, idleMs: staleMs,
 			artifact, artifactMtime, resultMissing, terminal,
 			openIssues: Array.isArray(result?.openIssues) ? result.openIssues.length : null,
 			summary: truncateSummary(probe?.lastAssistantText ?? state?.lastAssistantText ?? result?.finalText ?? result?.summary ?? ""),

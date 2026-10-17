@@ -30,10 +30,11 @@ import {
 	listOpenExpectations,
 	noticeAckKey,
 } from "../expectations.ts";
+import { listOpenSupervisionEntries, supervisionRootForStateDir } from "../supervision.ts";
 import { readLiveness } from "../liveness.ts";
 import { masterAddress } from "../address.ts";
 import { readAutonomyConfig } from "./config.ts";
-import { buildFrontier, mapPhaseToProjectState, type FrontierDiff, type FrontierExpectation, type FrontierSnapshot, type FrontierSourceSnapshot } from "./frontier.ts";
+import { buildFrontier, mapPhaseToProjectState, type FrontierDiff, type FrontierExpectation, type FrontierSnapshot, type FrontierSourceSnapshot, type FrontierSupervision } from "./frontier.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./kill-switch.ts";
 import { evaluateWatchdogChecks, type WatchdogReport } from "./watchdog.ts";
 import type { WakeGateState } from "./wake-gate.ts";
@@ -169,7 +170,13 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 		const overdueRequests = expectations
 			? expectations.filter((e) => now > e.deadlineAt).map((e) => e.requestId).sort()
 			: undefined;
-		const { next, diff } = buildFrontier({ snapshot, backlog, prev, now, ...(expectations ? { expectations } : {}) });
+		// ⑨ 监管账本（2026-10-17 监管 P0）：**只读**，目录不存在 → 不传字段（全部 NOT_MONITORED）。
+		const supervision = readSupervisionInputs({ stateDir });
+		const { next, diff } = buildFrontier({
+			snapshot, backlog, prev, now,
+			...(expectations ? { expectations } : {}),
+			...(supervision ? { supervision } : {}),
+		});
 		writeFrontierSnapshot(next, { stateDir }); // best-effort；失败不影响返回（C4 派生缓存）
 		appendAuditLine(
 			`frontier baseline=${next.baseline} projects=${next.projects.length} triggers=${diff.triggers.length} meaningful=${diff.meaningfulChanges} recordonly=${diff.recordOnly.length}`,
@@ -356,6 +363,41 @@ export function readExpectationInputs(opts?: { stateDir?: string }): FrontierExp
 				rev: rec.rev,
 				noticeAcked: acks.has(noticeAckKey(rec.requestId, rec.rev)),
 			});
+		}
+		return out;
+	} catch {
+		return undefined; // never-throw：读取失败按无载体处理（不猜）
+	}
+}
+
+/**
+ * ⑨ 监管账本 → frontier 输入（2026-10-17 监管 P0；**只读派生，绝不写账本**）。
+ *
+ * 红线（与 `readExpectationInputs` 同构，见 `supervision.ts` 头注释）：autonomy 侧**只有本节**接触
+ * 监管账本，且只调读入口（`listOpenSupervisionEntries`）。 写入口（`writeSupervisionEntry` /
+ * `setSupervisionStatus` / `closeSupervisionEntry`）的调用方只有主会话侧 `/supervise` 命令：
+ * 被监管者不得自报停滞。
+ *
+ * 语义：**账本目录不存在 → undefined**（⟺ 真无监管 = 全部 NOT_MONITORED = 静默）；
+ * 存在 → open 条目列表（只取 runId/status/阈值/epoch 推动数，不引申其它字段）。
+ * never-throw：读失败按无载体处理（不猜）。
+ */
+export function readSupervisionInputs(opts?: { stateDir?: string }): FrontierSupervision[] | undefined {
+	try {
+		const stateDir = opts?.stateDir;
+		const root = supervisionRootForStateDir(stateDir);
+		if (!existsSync(root)) return undefined;
+		const out: FrontierSupervision[] = [];
+		for (const rec of listOpenSupervisionEntries({ root })) {
+			const item: FrontierSupervision = {
+				runId: rec.runId,
+				status: rec.status,
+				epochPushes: Array.isArray(rec.epoch?.pushes) ? rec.epoch.pushes.length : 0,
+			};
+			if (typeof rec.softMs === "number" && Number.isFinite(rec.softMs) && rec.softMs > 0) item.softMs = rec.softMs;
+			if (typeof rec.pushMs === "number" && Number.isFinite(rec.pushMs) && rec.pushMs > 0) item.pushMs = rec.pushMs;
+			if (typeof rec.userMs === "number" && Number.isFinite(rec.userMs) && rec.userMs > 0) item.userMs = rec.userMs;
+			out.push(item);
 		}
 		return out;
 	} catch {

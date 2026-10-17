@@ -43,12 +43,15 @@ import { evaluateAutonomyGating, engageKillSwitch, readKillSwitch } from "./runt
 import {
 	RECORD_ONLY_NOCARRIER,
 	buildFrontier,
+	deriveTabSupervisionState,
 	mapPhaseToProjectState,
 	normalizeExactPath,
 	type FrontierRule,
 	type FrontierSnapshot,
+	type FrontierSupervision,
 	type ProjectFrontier,
 } from "./runtime/autonomy/frontier.ts";
+import type { FrontierSourceTab } from "./runtime/frontier-carriers.ts";
 import { evaluateWakeGate, type WakeGateState } from "./runtime/autonomy/wake-gate.ts";
 import {
 	CHECK_NAMES,
@@ -104,6 +107,9 @@ function makeTab(over: Partial<TabDetail> & { runId: string; repoPath: string; p
 		stale: over.stale ?? "unknown",
 		staleOver: over.staleOver ?? false,
 		stop: over.stop ?? "end_turn",
+		// 2026-10-17 监管 P0：idleMs 是 SOFT/PUSH/USER 分档的结构化时间基。漏透传会导致
+		// 所有测试 tab 的 idleMs 恒为 undefined（→ 新判据永远判不出 STALLED）。
+		idleMs: over.idleMs ?? null,
 		artifact: over.artifact ?? "-",
 		artifactMtime: over.artifactMtime ?? "?",
 		resultMissing: over.resultMissing ?? over.phase === "unconfirmed",
@@ -361,7 +367,9 @@ check("A3.3 unconfirmed → resultMissing → stagnation 真（C5 裁定）", ()
 	assert.equal(p.state, "Working");
 	assert.equal(p.variant, "resultMissing");
 	assert.equal(p.resultMissing, true);
-	assert.equal(p.stagnation, true);
+	// 2026-10-17 监管 P0 语义变更：resultMissing **不再直达** stagnation（旧判据零区分度，
+	// 实测 3/3 全 true）。stagnation 现由六态机派生 = STALLED；无监管账本 ⇒ NOT_MONITORED ⇒ false。
+	assert.equal(p.stagnation, false, "resultMissing 不得再直达 stagnation（监管 P0 语义）");
 });
 check("A3.4 仓 attention>0 喂 needs_user（terminal 无 result 可见待审）；无 attention 时不猜", () => {
 	const tabs = [makeTab({ runId: "r1", repoPath: R1, phase: "unconfirmed", needsHuman: false })];
@@ -461,11 +469,14 @@ check("A4.4 ⑤ needs_user false→true 边沿（true→true / false→false 不
 	});
 	assert.equal(d2.diff.triggers.length, 0);
 });
-check("A4.5 ⑨ stagnation false→true（staleOver 45min 边沿，复用 STALE_NO_PROGRESS_MS 语义）", () => {
-	const prev = makePrevSnap(NOW - 1000, [makeProject({ project: K, runs: { r1: "working" }, stagnation: false })]);
+check("A4.5 ⑨ stagnation false→true（监管 P0 新语义：账本 active + waiting + stop=stop + idle>15min）", () => {
+	const prev = makePrevSnap(NOW - 1000, [makeProject({ project: K, runs: { r1: "waiting" }, stagnation: false })]);
 	const { diff } = buildFrontier({
-		snapshot: makeSnapshot([makeTab({ runId: "r1", repoPath: R1, phase: "working", staleOver: true })]),
+		snapshot: makeSnapshot([
+			makeTab({ runId: "r1", repoPath: R1, phase: "waiting", stop: "stop", idleMs: 16 * 60_000, needsHuman: false }),
+		]),
 		backlog: [], prev, now: NOW,
+		supervision: [{ runId: "r1", status: "active", epochPushes: 0 }],
 	});
 	assert.deepEqual(diff.triggers.map((t) => t.rule), ["stagnation"]);
 });
@@ -545,7 +556,9 @@ check("A5 prev=null → baseline:true、零触发（全开标志也只建基线�
 	assert.deepEqual(diff.triggers, next.triggers);
 	const p = next.projects[0];
 	assert.equal(p.needsUser, true);
-	assert.equal(p.stagnation, true);
+	// 2026-10-17 监管 P0 语义变更：stagnation 不再由 staleOver 派发（旧判据零区分度），
+	// 而由六态机派生；本用例无监管账本 ⇒ NOT_MONITORED ⇒ false。
+	assert.equal(p.stagnation, false, "staleOver 不得再直达 stagnation（监管 P0 语义）");
 	assert.equal(p.overdue, 5);
 	assert.equal(p.meaningfulStateVersion, 1);
 });
@@ -812,7 +825,10 @@ const EXT_ROOT = join(REPO_ROOT, "extensions");
 check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 allowlist（Task 2006）", () => {
 	// v2 接线后生产文件 import 合法化：零 import 不变量改为 allowlist 双向精确匹配
 	//（多一个 = 红线违规；少一个 = 接线被静默拆除）。相对路径与相对名 ALLOW 对齐（L2 审查要点 ①）。
-	const ALLOW = ["index.ts", "master-tools.ts", "runtime-host/server.ts"]; // 相对 EXT_ROOT（2026-09-24 autonomy endpoint）
+	// 相对 EXT_ROOT。2026-10-17 新增 mailbox-consumer.ts：autonomy 心跳（writeAutonomyHeartbeat）必须
+	// 接在 wake tick 开头（tick 是唯一无条件每 30s 跑的位置），这是修「autonomy 静默死亡 29h」的实现点，
+	// 属正当接线（不是绕过 allowlist）。
+	const ALLOW = ["index.ts", "mailbox-consumer.ts", "master-tools.ts", "runtime-host/server.ts"]; // 相对 EXT_ROOT（2026-09-24 autonomy endpoint）
 	const offenders: string[] = [];
 	const walk = (dir: string): void => {
 		for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -979,6 +995,65 @@ check("A12.1 真链 deliverLetter → ⑧ 副作用可见 且 gate 仍 acted=fal
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+
+// ── 2026-10-17 监管 P0 验收（方案 §E-P0）：六态判据 ────────────────────
+// 判据：stagnation = (deriveTabSupervisionState === "STALLED")；旧判据（resultMissing 直达）已拆除。
+{
+	const mkTab = (over: Partial<FrontierSourceTab> = {}): FrontierSourceTab => ({
+		runId: "tab_test_1",
+		repoPath: "g:/code/x",
+		phase: "waiting",
+		stop: "stop",
+		idleMs: 16 * 60_000,
+		needsHuman: false,
+		gate: "ok",
+		staleOver: false,
+		overdue: 0,
+		resultMissing: true, // 故意 true：旧判据会直接 stagnation，新判据必须忽略
+		pidAlive: true,
+		...over,
+	});
+	const ledger: FrontierSupervision = { runId: "tab_test_1", status: "active", epochPushes: 0 };
+
+	check("SUP-P0(a) waiting+stop+账本active+idle16min ⇒ STALLED", () => {
+		assert.equal(deriveTabSupervisionState({ tab: mkTab(), ledger, attention: 0 }), "STALLED");
+	});
+
+	check("SUP-P0(b) 无账本 + idle16min ⇒ NOT_MONITORED（治旧判据 3/3 全 true 误报）", () => {
+		const st = deriveTabSupervisionState({ tab: mkTab(), ledger: undefined, attention: 0 });
+		assert.equal(st, "NOT_MONITORED");
+		assert.notEqual(st, "STALLED", "无账本不得判停滞");
+	});
+
+	check("SUP-P0(c) working+toolUse+idle50min+账本active ⇒ ACTIVE（toolUse 豁免）", () => {
+		assert.equal(
+			deriveTabSupervisionState({ tab: mkTab({ phase: "working", stop: "toolUse", idleMs: 50 * 60_000 }), ledger, attention: 0 }),
+			"ACTIVE",
+		);
+	});
+
+	check("SUP-P0(d) 账本 paused ⇒ PAUSED_USER（即便 idle 超阈值）", () => {
+		assert.equal(
+			deriveTabSupervisionState({ tab: mkTab({ idleMs: 120 * 60_000 }), ledger: { ...ledger, status: "paused" }, attention: 0 }),
+			"PAUSED_USER",
+		);
+	});
+
+	check("SUP-P0(e) 账本 active + needsHuman ⇒ BLOCKED_USER（在等人，不判停滞）", () => {
+		assert.equal(
+			deriveTabSupervisionState({ tab: mkTab({ needsHuman: true }), ledger, attention: 0 }),
+			"BLOCKED_USER",
+		);
+	});
+
+	check("SUP-P0(f) idleMs=null ⇒ 不判停滞（不拿 mtime 冒充）", () => {
+		assert.equal(
+			deriveTabSupervisionState({ tab: mkTab({ idleMs: null }), ledger, attention: 0 }),
+			"ACTIVE",
+		);
+	});
+}
 
 // ── 清理 + 汇总 ─────────────────────────────────────────────────────
 rmSync(ENV_TMP, { recursive: true, force: true });

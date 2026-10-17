@@ -59,6 +59,7 @@ import {
 	type LocalMasterSpawn,
 } from "./runtime/local-master-launch.ts";
 import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
+import { handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2598,6 +2599,8 @@ export default function (pi: ExtensionAPI) {
 					`${hbTxt}`,
 					`${diagLine}`,
 					`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
+					// ⑨ 监管账本（2026-10-17 P0）：每个 active 账本的状态（state + idle）——只读显示，零动作。
+					...supervisionLines(frontier),
 					`audit (最近 ${tail.length} 行):`,
 					...(tail.length ? tail.map((l) => `  ${l}`) : ["  (空)"]),
 					...actionsLines,
@@ -2606,6 +2609,20 @@ export default function (pi: ExtensionAPI) {
 				body = "autonomy status: (状态不可读)";
 			}
 			ctx.ui.notify(body, "info");
+		},
+	});
+	// ── /supervise（2026-10-17 监管 P0）：显式人力监管账本 ──
+	// 学术诚实定性（与 /autonomy 手动运维命令同款）：用户在交互会话手动键入的运维命令，
+	// 不新增 LLM 可调 tool。P0 **只读写账本 + 回显**：不调 tab-steer / set-timer / steer / spawn，
+	// 无任何推动/注入/abort。写操作在子 agent 会话被拦（handler 内 isSubagent 判定）。
+	pi.registerCommand("supervise", {
+		description: "停滞监管账本（P0 只显示不推动）：/supervise on|off|pause|resume|status [runId]",
+		handler: async (args, ctx) => {
+			const sid = durableSessionIdentity(ctx as never);
+			handleSuperviseCommand(args ?? "", ctx as never, {
+				isSubagent,
+				setBy: `user:${sid?.slice(0, 12) ?? "cli"}`,
+			});
 		},
 	});
 	// ── /send-letter（0929 M1 切片 A：⑧ 期望账本生产侧入账方——窄请求入口，方案 A1）──

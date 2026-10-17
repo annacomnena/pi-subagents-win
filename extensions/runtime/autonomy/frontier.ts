@@ -10,7 +10,14 @@
  *
  * C5 映射表（固化在代码与测试 A3）：tab phase（composeTabStatus 产物）→ 项目派生态。
  *   waiting / orphaned / unconfirmed 永不映射为 Completed（永不 terminal）；
- *   unconfirmed → resultMissing → 喂 stagnation；orphaned 喂 watchdog 检查 6（collect 装配层取 pidAlive===false）。
+ *   unconfirmed → resultMissing（**仅标注缺口，不再直达 stagnation**）；orphaned 喂 watchdog 检查 6
+ *   （collect 装配层取 pidAlive===false）。
+ *
+ * ⑨ stagnation（2026-10-17 监管 P0 重定义，plans/20261017_stagnation_supervision_plan.md §B）：
+ *   判据 = 「监管账本 active ∧ phase=waiting ∧ stop=stop ∧ idle > pushMs」，由六态机
+ *   `deriveTabSupervisionState` 派生；**没有账本条目 = NOT_MONITORED = 静默**。
+ *   旧判据（`nonTerm.some(staleOver) || resultMissing`，resultMissing 无时基直达）零区分度
+ *   （实测 3 个项目全 true，其中两个在跑/被用户暂停）→ 已拆除。
  *
  * §25 九条触发规则的 v1 评测范围：
  *   ②③⑤⑨ 实做（对照 prev 的边沿触发）；①（gate awaiting→ok）⑦（timer overdue 0→正）approx 并带 approx 标注；
@@ -60,6 +67,48 @@ export interface FrontierTrigger {
 
 export type ProjectState = "Working" | "Blocked" | "Completed" | "Failed" | "Cancelled";
 
+/**
+ * 监管语义状态（方案 §B.1 六态，每 tick 纯派生 + 账本显式字段；P0 只显示、零推动）。
+ *
+ *   NOT_MONITORED — runId 不在监管账本 open 集（**静默**：用户没要求监管 ⇒ 不报）
+ *   ACTIVE        — 账本 active ∧ (stop=toolUse ∨ idle<SOFT)  【toolUse 豁免在此】
+ *   DONE          — 账本 open ∧ 该 runId 已 terminal（不报，等主会话关账）
+ *   PAUSED_USER   — 账本显式 status="paused"（用户说"先做别的"时写入）
+ *   BLOCKED_USER  — 账本 active ∧ needsHuman ∨ 仓 attention>0（在等人/等决策：提醒但不推动）
+ *   STALLED       — 账本 active ∧ phase=waiting ∧ stop=stop ∧ idle∈[PUSH,∞) ∧ 非 BLOCKED/DONE
+ */
+export type SupervisionState = "NOT_MONITORED" | "ACTIVE" | "PAUSED_USER" | "BLOCKED_USER" | "DONE" | "STALLED";
+
+/** 阈值缺省（方案 §A.1；与 runtime/supervision.ts::SUPERVISION_THRESHOLDS 同源常量，本层零 IO 不得 import 该文件）。 */
+export const SUPERVISION_THRESHOLDS = {
+	softMs: 5 * 60_000,
+	pushMs: 15 * 60_000,
+	userMs: 30 * 60_000,
+	hangMs: 60 * 60_000,
+} as const;
+
+/** 监管输入（collect 只读账本后装配；`undefined` ⟺ 账本目录不存在 ⟺ 全 NOT_MONITORED）。 */
+export interface FrontierSupervision {
+	runId: string;
+	/** 账本持久状态：active | paused。 */
+	status: "active" | "paused";
+	/** 阈值覆盖（账本可覆盖缺省；P0 不接 config）。 */
+	softMs?: number;
+	pushMs?: number;
+	userMs?: number;
+	/** epoch 推动记录条数（P1 才增长；P0 恒 0）。 */
+	epochPushes: number;
+}
+
+/** 项目派生监管字段（进快照供 status/watchdog 显示；权威意图仍在账本）。 */
+export interface ProjectSupervision {
+	state: SupervisionState;
+	/** 该项目最严重 tab 的 idle（ms）；null = 无 idle 载体（无 state.lastActivityAt，不猜）。 */
+	idleMs: number | null;
+	/** 该项目所有在监管 tab 的 epoch 推动次数合计。 */
+	epochPushes: number;
+}
+
 export interface ProjectFrontier {
 	/** 归一化 repoPath（normalizeExactPath 口径，同 global-view aggs 键）。 */
 	project: string;
@@ -73,10 +122,15 @@ export interface ProjectFrontier {
 	runs: Record<string, string>;
 	/** ⑤ 载体：any(tab.needsHuman ∨ tab.gate==="awaiting") ∨ 仓 attention>0（terminal 无 result 可见待审）。 */
 	needsUser: boolean;
-	/** C5 裁定：unconfirmed → resultMissing → 走 stagnation。 */
+	/** C5 裁定：unconfirmed → resultMissing（仅标注 result 缺口；2026-10-17 起不再直达 stagnation）。 */
 	resultMissing: boolean;
-	/** ⑨ 载体：非终态 tab staleOver（45min，复用 STALE_NO_PROGRESS_MS 语义）∨ resultMissing。 */
+	/**
+	 * ⑨ 载体（2026-10-17 监管 P0 重定义）：`supervision.state === "STALLED"`。
+	 * 旧语义（`非终态 staleOver(45min) ∨ resultMissing`）已拆除：前者无分级时基、后者与时间无关。
+	 */
 	stagnation: boolean;
+	/** 监管派生态（P0 新增）：state 六态 + idleMs + epoch 推动次数。无账本 = NOT_MONITORED。 */
+	supervision: ProjectSupervision;
 	/** ⑦ approx 载体：TabDetail.overdue（repo 级 timer overdue 回填值）。 */
 	overdue: number;
 	/** ⑧ 载体（0928 P2 加法）：该项目全部未关闭超期的期望 id（排序；一 id 一文件，新声明不覆盖旧记录）。 */
@@ -112,6 +166,13 @@ export interface FrontierSourceTab {
 	/** exact-path 归一键（适配器直接用 GraphProjectView.project；buildFrontier 内部再归一幂等）。 */
 	repoPath: string;
 	phase: string;
+	/** 最后一条 assistant 消息的 stopReason（stop | toolUse | length | aborted | error | unknown）。
+	 *  2026-10-17 监管 P0：此前只在 TabDetail 上有、未进 carrier ⇒ autonomy 侧看不见
+	 *  「正在跑工具 vs 真空闲」，是语义分类缺失的第一刀。 */
+	stop: string;
+	/** 距最后一次活动（state.lastActivityAt）的毫秒数；null = 无载体（不猜）。
+	 *  监管 P0：SOFT/PUSH/USER 分档只能由**结构化时间**派生（旧 staleOver 是 45min 布尔）。 */
+	idleMs: number | null;
 	needsHuman: boolean;
 	gate: GateStatus;
 	staleOver: boolean;
@@ -139,6 +200,11 @@ export interface FrontierInputs {
 	 * `[]`/列表 = 账本存在（recordOnly 降为 2 条，⑧ 已有载体，可进 triggers）。
 	 */
 	expectations?: readonly FrontierExpectation[];
+	/**
+	 * 监管账本输入（2026-10-17 监管 P0；collect 装配：只含 **open** 条目）。
+	 * `undefined` ⟺ 本进程可见的监管账本目录不存在 ⟺ 全部 NOT_MONITORED（静默，不报）。
+	 */
+	supervision?: readonly FrontierSupervision[];
 }
 
 /** ⑧ 期望输入（纯函数零 IO：collect 读账本后装配）。deadlineAt = epoch ms。 */
@@ -196,10 +262,66 @@ export function mapPhaseToProjectState(phase: string): { state: ProjectState; va
 /** 多 tab 变体取最严重：orphaned(0) > resultMissing(1) > waiting(2) > 无(3)（确定性排序）。 */
 const VARIANT_RANK: Record<string, number> = { orphaned: 0, resultMissing: 1, waiting: 2 };
 
+/** 项目级六态取最严重（确定性序；数值越小越严重）。 */
+const SUPERVISION_RANK: Record<SupervisionState, number> = {
+	STALLED: 0,
+	BLOCKED_USER: 1,
+	PAUSED_USER: 2,
+	ACTIVE: 3,
+	DONE: 4,
+	NOT_MONITORED: 5,
+};
+
+/**
+ * 单 tab 监管六态派生（纯函数；方案 §B.1 判据逐条可机械检查）。
+ *
+ * 严格优先级（短路顺序即优先级，无歧义）：
+ *   1. 无账本条目                     → NOT_MONITORED（**治今天 3/3 全 true 的关键门**）
+ *   2. 账本 status="paused"           → PAUSED_USER（用户显式停：不报、不推）
+ *   3. 账本 active ∧ 已 terminal      → DONE（提示主会话回收关账，不报停滞）
+ *   4. 账本 active ∧ 需人 / attention → BLOCKED_USER（在等人：提醒但不推动）
+ *   5. 账本 active ∧ stop=toolUse     → ACTIVE（**toolUse 豁免**：在跑长工具，即使 idle 50min）
+ *   6. 账本 active ∧ phase=waiting ∧ stop=stop ∧ idle>pushMs → STALLED
+ *   7. 其余（working/attached/dispatched / idle 未超线 / idle 无载体）→ ACTIVE（不猜＝不报）
+ *
+ * 注（方案 §A.2 边角）：phase=waiting ∧ stop=toolUse 落入第 5 条 → ACTIVE（保守，不报停滞）。
+ */
+export function deriveTabSupervisionState(input: {
+	tab: FrontierSourceTab;
+	/** 账本条目；undefined = 该 runId 未被监管。 */
+	ledger: FrontierSupervision | undefined;
+	/** 仓 attention>0（⑤ 载体，与 needsUser 同口径）。 */
+	attention: number;
+}): SupervisionState {
+	const { tab, ledger, attention } = input;
+	if (!ledger) return "NOT_MONITORED";
+	if (ledger.status === "paused") return "PAUSED_USER";
+	if (mapPhaseToProjectState(tab.phase).terminal) return "DONE";
+	if (tab.needsHuman || tab.gate === "awaiting" || attention > 0) return "BLOCKED_USER";
+	if (tab.stop === "toolUse") return "ACTIVE"; // toolUse 豁免（跑长工具 ≠ 停滞）
+	const pushMs =
+		typeof ledger.pushMs === "number" && Number.isFinite(ledger.pushMs) && ledger.pushMs > 0
+			? ledger.pushMs
+			: SUPERVISION_THRESHOLDS.pushMs;
+	// idle 无载体（null）→ 不得当作停滞（不猜）
+	if (tab.phase === "waiting" && tab.idleMs !== null && Number.isFinite(tab.idleMs) && tab.idleMs > pushMs) return "STALLED";
+	return "ACTIVE";
+}
+
 type ProjectCore = Omit<ProjectFrontier, "meaningfulStateVersion">;
 
-/** 单 repo 聚合（纯）：只消费 FrontierSourceTab 结构化字段，不解析任何展示文本（约束 9）。 */
-function aggregateProject(project: string, tabs: FrontierSourceTab[], attention: number): ProjectCore {
+/**
+ * 单 repo 聚合（纯）：只消费 FrontierSourceTab 结构化字段，不解析任何展示文本（约束 9）。
+ *
+ * ⑨ stagnation（2026-10-17 监管 P0 重定义）：= `supervision.state === "STALLED"`。
+ * **`resultMissing` 与 `staleOver` 两条旧直达线已全部拆除**（前者与时间无关，后者无分级时基）。
+ */
+function aggregateProject(
+	project: string,
+	tabs: FrontierSourceTab[],
+	attention: number,
+	ledgerByRun: ReadonlyMap<string, FrontierSupervision>,
+): ProjectCore {
 	const nonTerm = tabs.filter((t) => !mapPhaseToProjectState(t.phase).terminal);
 	let state: ProjectState;
 	let variant: string | null;
@@ -221,13 +343,28 @@ function aggregateProject(project: string, tabs: FrontierSourceTab[], attention:
 	// ⑤ 三载体：TabDetail.needsHuman（含 gate=awaiting 与 classifyForReclaim awaitingInput）∨ 仓 attention>0
 	const needsUser = tabs.some((t) => t.needsHuman || t.gate === "awaiting") || attention > 0;
 	const resultMissing = tabs.some((t) => t.phase === "unconfirmed");
-	// ⑨：非终态 staleOver（45min）∨ resultMissing（C5 裁定 unconfirmed 直接喂 stagnation；
-	// "resultMissing 超阈值"无独立时基载体 → 实现为 unconfirmed 即 stagnation，见实现报告已知缺口）
-	const stagnation = nonTerm.some((t) => t.staleOver) || resultMissing;
+
+	// ── 监管派生（六态）──
+	let supervision: ProjectSupervision = { state: "NOT_MONITORED", idleMs: null, epochPushes: 0 };
+	const states: SupervisionState[] = [];
+	let idleMs: number | null = null;
+	let epochPushes = 0;
+	for (const t of tabs) {
+		const ledger = ledgerByRun.get(t.runId);
+		states.push(deriveTabSupervisionState({ tab: t, ledger, attention }));
+		if (ledger) epochPushes += Number.isFinite(ledger.epochPushes) ? ledger.epochPushes : 0;
+		if (typeof t.idleMs === "number" && Number.isFinite(t.idleMs)) idleMs = idleMs === null ? t.idleMs : Math.max(idleMs, t.idleMs);
+	}
+	if (states.length > 0) {
+		const worst = [...states].sort((a, b) => SUPERVISION_RANK[a] - SUPERVISION_RANK[b])[0];
+		supervision = { state: worst, idleMs, epochPushes };
+	}
+
+	const stagnation = supervision.state === "STALLED";
 	const overdue = tabs.reduce((m, t) => Math.max(m, t.overdue), 0);
 	const runs: Record<string, string> = {};
 	for (const t of tabs) runs[t.runId] = t.phase;
-	return { project, state, variant, gate, runs, needsUser, resultMissing, stagnation, overdue, overdueRequests: [] };
+	return { project, state, variant, gate, runs, needsUser, resultMissing, stagnation, supervision, overdue, overdueRequests: [] };
 }
 
 /**
@@ -262,6 +399,10 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 		else tabsByRepo.set(k, [d]);
 	}
 
+	// ⑨ 监管账本索引（P0）：runId → 条目。无账本（undefined）⇒ 空 map ⇒ 全部 NOT_MONITORED。
+	const ledgerByRun = new Map<string, FrontierSupervision>();
+	for (const s of inputs.supervision ?? []) ledgerByRun.set(s.runId, s);
+
 	const prevByRepo = new Map<string, ProjectFrontier>();
 	if (prev) for (const p of prev.projects) prevByRepo.set(p.project, p);
 
@@ -279,7 +420,7 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	}
 
 	const nextCores = new Map<string, ProjectCore>();
-	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0));
+	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0, ledgerByRun));
 
 	const triggers: FrontierTrigger[] = [];
 	// R4：未消费到信（pending>0）是可唤醒的真实输入，不消费/ack 邮件。

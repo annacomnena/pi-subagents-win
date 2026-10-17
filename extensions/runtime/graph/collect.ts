@@ -187,6 +187,7 @@ function readTabRunRefs(runsDir: string, sessionsRoot: string, timersDir: string
 			refs.runCarriers[subject] = {
 				gate: carrier.gate, needsHuman: carrier.needsHuman, staleOver: carrier.staleOver,
 				overdue: carrier.overdue, pidAlive: carrier.pidAlive,
+				stop: carrier.stop, idleMs: carrier.idleMs,
 			};
 			if (note.attention) {
 				const k = normalizeRepoKey(repoPath);
@@ -256,12 +257,12 @@ export function writeGraphSnapshotCache(snap: GraphSnapshot, opts?: { stateDir?:
 	}
 }
 
-const CARRIER_KEYS = ["gate", "needsHuman", "staleOver", "overdue", "pidAlive"] as const;
+const CARRIER_KEYS = ["gate", "needsHuman", "staleOver", "overdue", "pidAlive", "stop", "idleMs"] as const;
 
 /**
  * 缓存子结构校验（R5）：version/nodes/edges/projects 之外，校验 history 形状与每个 run 的
- * carrier 五键**存在性**（E2.0 起 `projectGraph` 恒赋，缺→null）。E2.0 前旧缓存无这些键
- * → 拒绝（防读出后 carrier 全 undefined 致 watchdog 检查 6 静默失活）。
+ * carrier **七键**存在性（E2.0 起 `projectGraph` 恒赋，缺→null；2026-10-17 监管 P0 扩 stop/idleMs
+ * 并 bump version 2→3）。旧形缓存（缺 stop/idleMs）→ 拒绝（防读出后语义分类静默失活）。
  */
 function isCurrentSnapshot(raw: unknown): raw is GraphSnapshot {
 	if (!raw || typeof raw !== "object") return false;
