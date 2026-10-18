@@ -405,7 +405,13 @@ export function supervisePush(
 		const needsHuman = gate === "awaiting" || attention > 0;
 		/** stop=error 的放行标记：**只进 audit 行**（不新增账本字段，不动 validateEntry 校验）。 */
 		const erroredRetry = stopReason === "error";
-		const terminal = view.terminal === true || result !== null;
+		// 2026-10-18（GLM D-1）：**兜底生成的 unconfirmed 不是「tab 自己完成」，不得作为 terminal 证据。**
+		// dd13dba 的 writeSettlementFallback 会在 stop=error 的 tab 于 agent_settled 同秒写一条
+		// status:"unconfirmed" 的 result ⇒ 旧判定 `result !== null` 立刻为 true ⇒ 七门之 3 拒推 ⇒
+		// 41265f4 刚专门放行的「stop=error 首次推动」被一分钟后自己引入的兜底废掉（SBS-B1 正是此形状）。
+		// 同口径参考：tab-runs.ts::isUnconfirmedFallback（steer/timers/archive 已同口径）。
+		const hasRealResult = result !== null && result.status !== "unconfirmed";
+		const terminal = view.terminal === true || hasRealResult;
 		const pidAlive = typeof state?.pid === "number" && Number.isFinite(state.pid)
 			? safePidAlive(state.pid)
 			: null;

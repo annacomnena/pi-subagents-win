@@ -511,6 +511,55 @@ console.log("8. classifyDispatch / event-bus 唤醒文案：兜底结果不得�
 	}
 }
 
+// ══════ 10. 常驻身份豁免：lms-* / master-* 不写兜底（2026-10-18 GLM D-3）══════
+// 根因：runtime/local-master-launch.ts:249 明令 local master 不要调 tab-finish、不要退出，
+// 其账本 taskId = `lms-<scope>`（:276-278）。以前兜底会每次 settle 给健康 local master 写一条
+// **永久** unconfirmed，其 attention:true（frontier-carriers.ts:203）会把同仓全部受监管 tab
+// 污染成 BLOCKED_USER。本组必须经**真实入口** pi.emit("agent_settled") 验证（R-4）。
+console.log("10. 常驻身份豁免：taskId=lms-* / master-* ⇒ 真 agent_settled 后不写兜底 result");
+{
+	const runsDir = mkdtempSync(join(tmpdir(), "tab-rf1-j-"));
+	const cases: Array<[string, string]> = [
+		["tab_rf1_lms", "lms-battlesandbox"],
+		["tab_rf1_master", "master-S2"],
+	];
+	try {
+		for (const [runId, taskId] of cases) {
+			writeTabDispatch(runsDir, mkDispatch(runId, taskId));
+			const pi = makeFakePi();
+			registerTabTelemetry(pi, { tabRunId: runId, runsDir });
+			await runOneTurn(pi, "local master 常驻回合 settle（设计行为，不是忘回报）");
+		}
+
+		check("10(a) taskId=\"lms-battlesandbox\" ⇒ 经 agent_settled 后不存在 result 文件", () => {
+			assert.equal(existsSync(tabResultPath(runsDir, "tab_rf1_lms")), false, "local master 不得被兜底写 unconfirmed");
+		});
+		check("10(b) taskId=\"master-S2\" ⇒ 同样不写 result 文件", () => {
+			assert.equal(existsSync(tabResultPath(runsDir, "tab_rf1_master")), false, "master 派发不得被兜底写 unconfirmed");
+		});
+		check("10(c) 对照：taskId=\"GFIX-2\"（普通派发）⇒ 仍写 unconfirmed（防豁免过宽）", () => {
+			const runId = "tab_rf1_normal";
+			writeTabDispatch(runsDir, mkDispatch(runId, "GFIX-2"));
+			assert.equal(writeSettlementFallback({ runsDir, runId, lastAssistantText: "普通 tab" }), "written");
+			const raw = JSON.parse(readFileSync(tabResultPath(runsDir, runId), "utf8")) as Record<string, unknown>;
+			assert.equal(raw.status, "unconfirmed");
+			assert.equal(raw.taskId, "GFIX-2");
+		});
+		check("10(d) 函数级：直调返回 skip-persistent-identity，且未落盘（两前缀均如此）", () => {
+			const runA = "tab_rf1_lms2";
+			const runB = "tab_rf1_master2";
+			writeTabDispatch(runsDir, mkDispatch(runA, "lms-other-scope"));
+			writeTabDispatch(runsDir, mkDispatch(runB, "master-X9"));
+			assert.equal(writeSettlementFallback({ runsDir, runId: runA, lastAssistantText: "x" }), "skip-persistent-identity");
+			assert.equal(writeSettlementFallback({ runsDir, runId: runB, lastAssistantText: "x" }), "skip-persistent-identity");
+			assert.equal(existsSync(tabResultPath(runsDir, runA)), false);
+			assert.equal(existsSync(tabResultPath(runsDir, runB)), false);
+		});
+	} finally {
+		rmSync(runsDir, { recursive: true, force: true });
+	}
+}
+
 // ── 汇总 + 清理 ───────────────────────────────────────────────────
 // ══════ 9. 连带（最小必要）：unconfirmed 兑底结果不得作为归档证据 ══════
 console.log("9. archiveStaleTabRuns：unconfirmed 兑底结果 ≠ 终态证据（沉默但活着的 tab 不得被移出活跃目录）");

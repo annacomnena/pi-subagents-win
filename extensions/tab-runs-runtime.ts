@@ -73,6 +73,11 @@ export type SettlementFallbackOutcome =
 	| "skip-has-result"
 	/** 无 dispatch 记录 ⇒ 非派发会话，不猜 */
 	| "skip-no-dispatch"
+	/**
+	 * 常驻身份豁免：`lms-*`（local master）/ `master-*`（master 派发）明令不调 tab-finish、不退出，
+	 * 给它们写兜底只会制造**永久 unconfirmed**（见 writeSettlementFallback 内的注释）。
+	 */
+	| "skip-persistent-identity"
 	/** 写入/校验失败（已 console.error；**不抛**） */
 	| "error";
 
@@ -89,6 +94,9 @@ export type SettlementFallbackOutcome =
  *   2. **已有 result.json 绝不覆盖**（先 exists 检查；写前再查一次以缩竞态窗口）。
  *      ⇒ 同一 runId 多次调用天然幂等（第二次看到自己写的那份 ⇒ skip-has-result）。
  *   3. **无 dispatch 记录不生成**（防误伤非派发会话 / 手工 PI_TAB_RUN_ID）。
+ *   3b. **常驻身份豁免**：`taskId` 前缀为 `lms-`（local master）或 `master-`（master 派发）⇒ 返回
+ *      `"skip-persistent-identity"`，**不写盘**。这两类 tab 明令不调 tab-finish、不退出
+ *      （`runtime/local-master-launch.ts:249`），给它们写兜底只会造永久 unconfirmed 污染（详 ④）。
  *   4. **never-throw**：任何异常只记 console.error 并返回 "error"。
  *
  * 可测性：`io` 注入是**函数参数**（不把 fs 调用散在事件体里），测试可直接注入会抛的写函数。
@@ -107,6 +115,19 @@ export function writeSettlementFallback(input: SettlementFallbackInput): Settlem
 		// ③ 无派发记录 → 不是派发出的 tab，不猜
 		const dispatch = input.dispatch !== undefined ? input.dispatch : readTabDispatch(runsDir, runId);
 		if (!dispatch) return "skip-no-dispatch";
+
+		// ④ 常驻身份豁免（2026-10-18，GLM D-3）：
+		//    local master（taskId=`lms-<scope>`，见 runtime/local-master-launch.ts:249 明令「不要调 tab-finish、
+		//    不要退出」）与 master 派发（`master-*`）都是**常驻** tab：它们每次 settle 都是设计行为，
+		//    不是「忘了回报」。给它们写兜底 ⇒ 每回合一条**永久** unconfirmed，而 unconfirmed 的
+		//    attention:true（runtime/frontier-carriers.ts:203）会把这个仓的 attention 抬成 >0 ⇒
+		//    同仓所有受监管 tab 派生 BLOCKED_USER（规则 5），STALLED 从此不可达。
+		//    ⇒ 豁免即跳写（不写盘、不造文件）。**只豁免这两个前缀**，不得扩到其它 taskId。
+		//    位置：在「已有 result 检查」之后（幂等语义不变）、「写盘」之前（不浪费 IO）。
+		const persistentTaskId = typeof dispatch.taskId === "string" ? dispatch.taskId : "";
+		if (persistentTaskId.startsWith("lms-") || persistentTaskId.startsWith("master-")) {
+			return "skip-persistent-identity";
+		}
 
 		const now = input.now ?? new Date();
 		const finalText = (input.lastAssistantText ?? "").slice(0, FALLBACK_FINAL_TEXT_MAX);
@@ -505,12 +526,26 @@ function viewToBrief(view: TabStatusView): Record<string, unknown> {
 
 export { viewToBrief };
 
-function classifyForReclaim(view: TabStatusView): "ready" | "pending" | "awaitingInput" | "failed" | "orphaned" {
+/**
+ * 回收分桶（P0 展示口径 → 主会话编排动作）。
+ *
+ * 2026-10-18（GLM D-2）：`unconfirmed` **不再归 failed**。
+ *   - failed 的语义是「已失败 ⇒ 可以另起新 tab」；而 unconfirmed 只意味着「这回合 settle 了、成果未声明」——
+ *     tab 可能只是中途停下、成果真实存在（SBS-B1 的 commit 是真的）。归 failed 会诱导主会话
+ *     「失败 → 另派」，即与可能复活的原 tab 产生**双写竞争**（两个 tab 改同一批文件）。
+ *   - 因此拆出独立一类 `"unconfirmed"`，语义 =「需人工核实实际进度，核实前不得直接另派同一任务」
+ *     （用户可见文案必须避用「重派 / re-run / 重启 / retry」字样，见 reclaim-tabs 分组文案）。
+ *   - 顺序：unconfirmed 先于 TERMINAL_PHASES（后者只含 completed/failed/cancelled，理论上不重叠，
+ *     显式前置是为了让「phase 字面 unconfirmed ⇒ 独立桶」不依赖 phase 集合的当前内容）。
+ */
+function classifyForReclaim(
+	view: TabStatusView,
+): "ready" | "pending" | "awaitingInput" | "unconfirmed" | "failed" | "orphaned" {
 	if (view.dispatch?.dispatchStatus === "launch_failed") return "failed";
+	if (view.phase === "unconfirmed") return "unconfirmed";
 	if (TERMINAL_PHASES.has(view.phase)) return view.resultMissing ? "pending" : "ready";
 	if (view.phase === "awaitingInput" || view.phase === "waiting") return "awaitingInput";
 	if (view.phase === "orphaned") return "orphaned";
-	if (view.phase === "unconfirmed") return "failed";
 	return "pending";
 }
 
@@ -609,7 +644,7 @@ export function registerTabStatusTools(
 			"永不阻塞、立即返回当前快照（2026-08-13 起移除轮询硬等；wait/timeoutMs/intervalMs 为废弃参数，仅向后兼容，调用方不应依赖）。",
 			"完成感知交给 event-bus（子 tab 写 result.json 自动唤醒主会话），编排巡检用 set-timer。",
 			"禁轮询: 不要用 turn 反复重调本工具/tab-status 等待状态变化；等待靠完成事件 + 一次性 set-timer 兜底。",
-			"返回 ready[]（终态可取结果）/ pending[]（进行中）/ awaitingInput[]（等待输入，非完成）/ failed[]（unconfirmed 或派发失败）/ orphaned[]。",
+			"返回 ready[]（终态可取结果）/ pending[]（进行中）/ awaitingInput[]（等待输入，非完成）/ unconfirmed[]（回合结束但未回报：**需人工核实实际进度，核实前不得直接另派同一任务**）/ failed[]（真失败/派发失败）/ orphaned[]。",
 			"result 缺失的终态标 resultMissing=true + completion=unconfirmed，绝不静默当成功。",
 		].join(" "),
 		parameters: Type.Object({
@@ -623,13 +658,13 @@ export function registerTabStatusTools(
 			return new Text(`${theme.fg("toolTitle", theme.bold("reclaim-tabs"))} ${theme.fg("accent", `${args.runIds.length} tabs`)}`, 0, 0);
 		},
 		renderResult(result, { expanded }, theme) {
-			const d = result.details as { ready?: unknown[]; pending?: unknown[]; awaitingInput?: unknown[]; failed?: unknown[]; orphaned?: unknown[] } | undefined;
+			const d = result.details as { ready?: unknown[]; pending?: unknown[]; awaitingInput?: unknown[]; unconfirmed?: unknown[]; failed?: unknown[]; orphaned?: unknown[] } | undefined;
 			if (!d) return new Text("", 0, 0);
-			const summary = `ready=${d.ready?.length ?? 0} pending=${d.pending?.length ?? 0} awaitingInput=${d.awaitingInput?.length ?? 0} failed=${d.failed?.length ?? 0} orphaned=${d.orphaned?.length ?? 0}`;
+			const summary = `ready=${d.ready?.length ?? 0} pending=${d.pending?.length ?? 0} awaitingInput=${d.awaitingInput?.length ?? 0} unconfirmed=${d.unconfirmed?.length ?? 0} failed=${d.failed?.length ?? 0} orphaned=${d.orphaned?.length ?? 0}`;
 			if (!expanded) return new Text(theme.fg("success", `reclaim-tabs: ${summary}`), 0, 0);
 			const c = new Container();
 			c.addChild(new Text(theme.fg("toolTitle", `reclaim-tabs: ${summary}`), 0, 0));
-			for (const [label, group] of [["ready", d.ready], ["pending", d.pending], ["awaitingInput", d.awaitingInput], ["failed", d.failed], ["orphaned", d.orphaned]] as const) {
+			for (const [label, group] of [["ready", d.ready], ["pending", d.pending], ["awaitingInput", d.awaitingInput], ["unconfirmed", d.unconfirmed], ["failed", d.failed], ["orphaned", d.orphaned]] as const) {
 				if (!group || group.length === 0) continue;
 				c.addChild(new Spacer(1));
 				c.addChild(new Text(theme.fg("accent", label), 0, 0));
@@ -649,7 +684,7 @@ export function registerTabStatusTools(
 			const views = new Map<string, TabStatusView>();
 			for (const id of runIds) views.set(id, buildTabStatusView(runsDir, id, sessionsRoot));
 
-			const groups = { ready: [] as Record<string, unknown>[], pending: [] as Record<string, unknown>[], awaitingInput: [] as Record<string, unknown>[], failed: [] as Record<string, unknown>[], orphaned: [] as Record<string, unknown>[] };
+			const groups = { ready: [] as Record<string, unknown>[], pending: [] as Record<string, unknown>[], awaitingInput: [] as Record<string, unknown>[], unconfirmed: [] as Record<string, unknown>[], failed: [] as Record<string, unknown>[], orphaned: [] as Record<string, unknown>[] };
 			for (const view of views.values()) {
 				const kind = classifyForReclaim(view);
 				const brief = viewToBrief(view);
@@ -657,14 +692,17 @@ export function registerTabStatusTools(
 				else if (TERMINAL_PHASES.has(view.phase)) brief.completion = "unconfirmed";
 				groups[kind].push(brief);
 			}
-			const summary = `ready=${groups.ready.length} pending=${groups.pending.length} awaitingInput=${groups.awaitingInput.length} failed=${groups.failed.length} orphaned=${groups.orphaned.length}`;
+			const summary = `ready=${groups.ready.length} pending=${groups.pending.length} awaitingInput=${groups.awaitingInput.length} unconfirmed=${groups.unconfirmed.length} failed=${groups.failed.length} orphaned=${groups.orphaned.length}`;
 			return {
 				content: [{
 					type: "text",
 					text: `reclaim-tabs: ${summary}\n\n` + [
 						groups.ready.length ? `ready:\n${groups.ready.map((r) => `  ✓ ${r.runId}${r.result ? ` → ${(r.result as { status?: string }).status}: ${String((r.result as { summary?: string }).summary ?? "").slice(0, 120)}` : ""}`).join("\n")}` : "",
 						groups.awaitingInput.length ? `awaitingInput:\n${groups.awaitingInput.map((r) => `  ⏳ ${r.runId} (等待输入，不是完成)`).join("\n")}` : "",
-						groups.failed.length ? `failed:\n${groups.failed.map((r) => `  ✗ ${r.runId}${r.result ? ` → ${(r.result as { status?: string }).status}` : " (unconfirmed/launch_failed)"}`).join("\n")}` : "",
+						// 文案硬约束（GLM D-2）：只提「核实实际进度」，**全文不得**出现「重派 / re-run / 重启 / retry」字样
+						//（否则等于建议另起新 tab ⇒ 与可能复活的原 tab 双写竞争）。故用「另派同一任务」。
+						groups.unconfirmed.length ? `unconfirmed:\n${groups.unconfirmed.map((r) => `  ❓ ${r.runId} (回合结束但未调用 tab-finish；需人工核实实际进度，核实前不得直接另派同一任务；先读该 tab 的交付物/计划文件再决定)`).join("\n")}` : "",
+						groups.failed.length ? `failed:\n${groups.failed.map((r) => `  ✗ ${r.runId}${r.result ? ` → ${(r.result as { status?: string }).status}` : " (launch_failed)"}`).join("\n")}` : "",
 						groups.pending.length ? `pending:\n${groups.pending.map((r) => `  … ${r.runId}`).join("\n")}` : "",
 						groups.orphaned.length ? `orphaned:\n${groups.orphaned.map((r) => `  ☠ ${r.runId}`).join("\n")}` : "",
 					].filter(Boolean).join("\n"),
