@@ -94,6 +94,13 @@ export interface SupervisionEntry {
 	userMs?: number;
 	/** 推动 epoch（P1 才写；P0 恒 `pushes: []`，只读消费）。 */
 	epoch: { startedAt: string; pushes: SupervisionPushRecord[] };
+	/**
+	 * 显式「静默」标记（2026-10-18 默认监管开启后新增；v1 可选字段）。
+	 * 语义：账本仍留档（open/ 不删、不进 closed/），但派生面按 NOT_MONITORED 处理（不问不动）。
+	 * 与 `status` 正交：status 保持 active，optOut 只影响 `deriveTabSupervisionState` 的判据。
+	 * 缺失 = 未静默（不是 false —— v1 不引入第二个 falsy 形状）。
+	 */
+	optOut?: true;
 	// ── 终态字段（closed/ 才有；open/ 恒缺省）──
 	closedBy?: string;
 	closedAt?: string;
@@ -159,6 +166,8 @@ function validateEntry(v: unknown): v is SupervisionEntry {
 	for (const k of ["softMs", "pushMs", "userMs"] as const) {
 		if (r[k] !== undefined && !isFinitePositive(r[k])) return false;
 	}
+	// optOut 为可选布尔标记：缺失合法；存在则必须严格 === true（拒绝 "yes"/1 等宽松形状）
+	if (r.optOut !== undefined && r.optOut !== true) return false;
 	return true;
 }
 
@@ -268,19 +277,7 @@ export function setSupervisionStatus(input: SetStatusInput, opts: { root?: strin
 		if (cur) {
 			base = { ...cur };
 		} else {
-			const dispatch = input.fromDispatch === false ? null : safeDispatch(input.runId, opts.tabRunsDir);
-			base = {
-				version: SUPERVISION_LEDGER_VERSION,
-				runId: input.runId,
-				taskId: dispatch?.taskId && dispatch.taskId.length > 0 ? dispatch.taskId : "unknown",
-				repoPath: dispatch?.cwd && dispatch.cwd.length > 0 ? dispatch.cwd : null,
-				status: "active",
-				setBy: input.setBy,
-				setAt: now,
-				pausedAt: null,
-				pauseReason: null,
-				epoch: { startedAt: now, pushes: [] },
-			};
+			base = freshEntry(input.runId, input.setBy, now, opts.tabRunsDir, input.fromDispatch !== false);
 			if (input.overrides) {
 				if (isFinitePositive(input.overrides.softMs)) base.softMs = input.overrides.softMs;
 				if (isFinitePositive(input.overrides.pushMs)) base.pushMs = input.overrides.pushMs;
@@ -296,12 +293,69 @@ export function setSupervisionStatus(input: SetStatusInput, opts: { root?: strin
 		} else {
 			base.pausedAt = null;
 			base.pauseReason = null;
+			// 显式用户 active（`/supervise on|resume`）覆盖此前的 optOut 静默标记；
+			// 自动派发登记不是新的用户意图，重复登记同一 runId 不得清除用户 optOut。
+			// paused 分支不碰 optOut（暂停 ≠ 取消静默），保持原值。
+			if (input.fromDispatch !== true) delete base.optOut;
 		}
 		if (input.overrides) {
 			if (isFinitePositive(input.overrides.softMs)) base.softMs = input.overrides.softMs;
 			if (isFinitePositive(input.overrides.pushMs)) base.pushMs = input.overrides.pushMs;
 			if (isFinitePositive(input.overrides.userMs)) base.userMs = input.overrides.userMs;
 		}
+		return writeSupervisionEntry(base, { root });
+	} catch {
+		return { ok: false, reason: "error" };
+	}
+}
+
+/**
+ * 新建一条 open 条目的骸架（`setSupervisionStatus` / `setSupervisionOptOut` 共用）。
+ * taskId/repoPath 缺省从 `tab-runs/<runId>.json` dispatch 取（读不到 → "unknown"/null，不猜）。
+ */
+function freshEntry(runId: string, by: string, now: string, tabRunsDir: string | undefined, fromDispatch: boolean): SupervisionEntry {
+	const dispatch = fromDispatch ? safeDispatch(runId, tabRunsDir) : null;
+	return {
+		version: SUPERVISION_LEDGER_VERSION,
+		runId,
+		taskId: dispatch?.taskId && dispatch.taskId.length > 0 ? dispatch.taskId : "unknown",
+		repoPath: dispatch?.cwd && dispatch.cwd.length > 0 ? dispatch.cwd : null,
+		status: "active",
+		setBy: by,
+		setAt: now,
+		pausedAt: null,
+		pauseReason: null,
+		epoch: { startedAt: now, pushes: [] },
+	};
+}
+
+/**
+ * 显式「静默」写入口（2026-10-18 默认监管开启后新增；`/supervise optout <runId>`）。
+ *
+ * 与 `closeSupervisionEntry`（`/supervise off`）的区别：
+ *   - `off`    = 关账（open → closed），条目**离开**监管集合 = 「这个结束了」
+ *   - `optout` = 静默留档（open/ 不变、不进 closed/），status 仍 active 但 `optOut: true`
+ *     ⇒ `deriveTabSupervisionState` 返 NOT_MONITORED（不问不动）= 「这个别管我」
+ * 已关账（closed/）→ `{ok:false, reason:"invalid"}`：终态不得重开（同 writeSupervisionEntry 口径）。
+ * never-throw。
+ */
+export function setSupervisionOptOut(
+	runId: string,
+	by: string,
+	opts: { root?: string; stateDir?: string; now?: Date; tabRunsDir?: string } = {},
+): WriteResult {
+	try {
+		const root = opts.root ?? supervisionRootForStateDir(opts.stateDir);
+		const now = (opts.now ?? new Date()).toISOString();
+		const cur = readSupervisionLedger(runId, { root });
+		if (cur?.closedAt) return { ok: false, reason: "invalid" };
+		const base: SupervisionEntry = cur ? { ...cur } : freshEntry(runId, by, now, opts.tabRunsDir, true);
+		base.status = "active"; // 静默 ≠ 暂停：status 斜交，optOut 才是派生判据
+		base.optOut = true;
+		base.setBy = by;
+		base.setAt = now;
+		base.pausedAt = null;
+		base.pauseReason = null;
 		return writeSupervisionEntry(base, { root });
 	} catch {
 		return { ok: false, reason: "error" };
@@ -357,6 +411,67 @@ export function closeSupervisionEntry(
 	}
 }
 
+// ── 派发即登记（2026-10-18 默认监管翻转）──────────────────────────
+
+export interface DispatchedTabLike {
+	runId?: string;
+	error?: string;
+	title?: string;
+}
+
+export interface AutoRegisterDeps {
+	/** 写者身份（`master:<sessionId>`）。 */
+	setBy: string;
+	stateDir?: string;
+	tabRunsDir?: string;
+	now?: Date;
+	/** 可注入的写入口（测试用）；缺省 `setSupervisionStatus`。 */
+	setStatus?: typeof setSupervisionStatus;
+	/** 审计行接收器（注入 `appendAuditLine`）；不传则静默丢弃（不 import autonomy/**）。 */
+	audit?: (line: string) => void;
+}
+
+/**
+ * 派发成功后自动登记监管账本（launch-tabs / master-dispatch 共用入口）。
+ *
+ * 背景（用户指令 2026-10-18）：**「只要是我派出去的 tab，默认就进监管账本」**。旧默认相反（无账本 ⇒
+ * NOT_MONITORED ⇒ 静默），把「记得授权」的负担留给了人 ⇒ SBS tab 停 8.5h 无人报。
+ *
+ * 约束：
+ *   - 只登记 `!item.error && item.runId` 的条目；失败项不建账本（error 也可能带 runId）。
+ *   - **整体 never-throw**：单条失败继续，失败时调 `deps.audit`。即使注入的 setStatus 抛异常也 catch 住。
+ *   - **不写 autonomy/**：audit 是注入的（supervision.ts 被 collect.ts import，反向 import 会成环
+ *     并踩 `_test_runtime_autonomy.ts` A10）。
+ */
+export function autoRegisterDispatchedTabs(
+	results: ReadonlyArray<DispatchedTabLike>,
+	deps: AutoRegisterDeps,
+): { registered: number; failed: number } {
+	let registered = 0;
+	let failed = 0;
+	for (const item of Array.isArray(results) ? results : []) {
+		if (!item || item.error) continue;
+		const runId = typeof item.runId === "string" ? item.runId : "";
+		if (!runId) continue;
+		try {
+			const setStatus = deps.setStatus ?? setSupervisionStatus;
+			const r = setStatus(
+				{ runId, status: "active", setBy: deps.setBy, fromDispatch: true },
+				{ stateDir: deps.stateDir, tabRunsDir: deps.tabRunsDir, now: deps.now },
+			);
+			if (r?.ok === true) registered++;
+			else {
+				failed++;
+				try { deps.audit?.(`supervision auto-register fail runId=${runId} reason=${r?.reason ?? "unknown"}`); } catch { /* audit failure must not escape dispatch */ }
+			}
+		} catch (e) {
+			failed++;
+			try { deps.audit?.(`supervision auto-register fail runId=${runId} reason=${e instanceof Error ? e.message : String(e)}`); } catch { /* audit failure must not escape dispatch */ }
+		}
+	}
+	return { registered, failed };
+}
+
 // ── 显示（/autonomy status + /supervise status 共用）────────────────
 
 /** 账本现状行（纯读；供命令渲染，不参与任何判据）。 */
@@ -367,7 +482,8 @@ export function supervisionLedgerLines(opts: { root?: string; stateDir?: string 
 	for (const e of entries) {
 		const th = thresholdsOf(e);
 		const paused = e.status === "paused" ? ` ⏸ paused${e.pauseReason ? `(${e.pauseReason})` : ""} @${(e.pausedAt ?? e.setAt).slice(0, 19)}` : "";
-		lines.push(`  ${e.runId} task=${e.taskId} ${paused || "active"} push=${Math.round(th.pushMs / 60_000)}m${e.repoPath ? ` repo=${basename(e.repoPath)}` : ""}`);
+		const optOut = e.optOut === true ? " ⏭ optout" : ""; // 纯展示；判据在 frontier.deriveTabSupervisionState
+		lines.push(`  ${e.runId} task=${e.taskId} ${paused || "active"}${optOut} push=${Math.round(th.pushMs / 60_000)}m${e.repoPath ? ` repo=${basename(e.repoPath)}` : ""}`);
 	}
 	return lines;
 }
@@ -377,11 +493,12 @@ export function supervisionLedgerLines(opts: { root?: string; stateDir?: string 
 /**
  * `/supervise` 命令体（从 index.ts 抽出，以便机械测试；index.ts 只做 `pi.registerCommand` 薄壳）。
  *
- * 用法：`/supervise on|off|pause|resume|status [runId]`
- *   - `on <runId>`     — 登记监管（active）；taskId/repoPath 从 tab-runs dispatch 取
+ * 用法：`/supervise on|off|pause|resume|optout|status [runId]`
+ *   - `on <runId>`     — 登记监管（active）；taskId/repoPath 从 tab-runs dispatch 取（并清除 optOut）
  *   - `off <runId>`    — 关账（open → closed）；不在 open 集则幂等提示
  *   - `pause <runId>`  — 用户显式暂停（PAUSED_USER：不报、不推）
- *   - `resume <runId>` — 恢复 active
+ *   - `resume <runId>` — 恢复 active（并清除 optOut）
+ *   - `optout <runId>` — 静默留档（`optOut: true` ⇒ 派生 NOT_MONITORED，entry 仍在 open/）
  *   - `status`         — 列出全部 open 账本
  *
  * **写操作在子 agent 会话被拒**（`isSubagent()`，与 `/autonomy` 手动运维命令同口径）。
@@ -401,7 +518,7 @@ export interface SuperviseCommandDeps {
 	now?: Date;
 }
 
-const SUPERVISE_USAGE = "用法：/supervise on|off|pause|resume|status [runId]";
+const SUPERVISE_USAGE = "用法：/supervise on|off|pause|resume|optout|status [runId]";
 
 export function handleSuperviseCommand(args: string, ctx: SuperviseCommandCtx, deps: SuperviseCommandDeps = {}): void {
 	const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -414,7 +531,7 @@ export function handleSuperviseCommand(args: string, ctx: SuperviseCommandCtx, d
 		ctx.ui.notify(supervisionLedgerLines({ stateDir: deps.stateDir }).join("\n"), "info");
 		return;
 	}
-	if (sub !== "on" && sub !== "off" && sub !== "pause" && sub !== "resume") return usage();
+	if (sub !== "on" && sub !== "off" && sub !== "pause" && sub !== "resume" && sub !== "optout") return usage();
 	// 写操作：子 agent 会话拦截（手动运维面）
 	if (deps.isSubagent?.()) {
 		ctx.ui.notify("supervise: 子 agent 会话不可写监管账本（手动运维命令）", "warning");
@@ -425,6 +542,16 @@ export function handleSuperviseCommand(args: string, ctx: SuperviseCommandCtx, d
 		const r = closeSupervisionEntry(runId, deps.setBy ?? "user:cli", { ...opts, reason: "manual" });
 		ctx.ui.notify(
 			r.ok ? `supervise off ${runId} → closed` : `supervise off ${runId} 未生效（${r.reason}）`,
+			r.ok ? "info" : "warning",
+		);
+		return;
+	}
+	if (sub === "optout") {
+		const r = setSupervisionOptOut(runId, deps.setBy ?? "user:cli", opts);
+		ctx.ui.notify(
+			r.ok
+				? `supervise optout ${runId} → 静默（NOT_MONITORED，账本仍留档）`
+				: `supervise optout ${runId} 未生效（${r.reason}）`,
 			r.ok ? "info" : "warning",
 		);
 		return;

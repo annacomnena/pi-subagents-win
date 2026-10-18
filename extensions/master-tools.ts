@@ -728,7 +728,7 @@ export function registerMasterTools(
 			if (res.error) {
 				return textResult({ text: `✗ ${res.title}: ${res.error}`, isError: true, details: { text: `✗ ${res.title}: ${res.error}`, runId: res.runId, title: res.title } });
 			}
-			const text = `master-dispatch 已启动：${res.title} runId=${res.runId}（用 tab-status / reclaim-tabs 回收）`;
+			const text = `master-dispatch 已启动：${res.title} runId=${res.runId}（用 tab-status / reclaim-tabs 回收）；监管: 已自动登记（/supervise off ${res.runId} 可取消）`;
 			return { content: [{ type: "text", text }], details: { runId: res.runId, title: res.title, taskId: (params.taskId ?? "").trim(), mode, text } };
 		},
 	});

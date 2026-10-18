@@ -2,10 +2,19 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-10-02
+updated: 2026-10-18
 source_paths:
   - extensions/runtime/autonomy/config.ts::normalizeAutonomy
   - extensions/runtime/autonomy/frontier.ts
+  - extensions/runtime/autonomy/frontier.ts::deriveTabSupervisionState
+  - extensions/runtime/autonomy/collect.ts::readSupervisionInputs
+  - extensions/runtime/supervision.ts::setSupervisionStatus
+  - extensions/runtime/supervision.ts::setSupervisionOptOut
+  - extensions/runtime/supervision.ts::autoRegisterDispatchedTabs
+  - extensions/runtime/supervision.ts::handleSuperviseCommand
+  - extensions/tab-runs.ts#L356-L369
+  - extensions/master-tools.ts#L731
+  - extensions/_test_runtime_supervision_default_on.ts
   - extensions/runtime/autonomy/kill-switch.ts
   - extensions/runtime/expectations.ts
   - extensions/runtime/autonomy/wake-gate.ts
@@ -49,6 +58,8 @@ source_paths:
 ## Summary
 
 global master 从"被动等指令"走向"主动推导 + 显式动作"的套件。**v1 是纯函数层（`3922ef4`）；v2 已接线**（唤醒总门进入 `evaluateWakes`、master-status 条件增量行、`/autonomy` 手动运维命令、结构化审计），本套件首次进入生产路径，故 `status: current`。v2 **不新增任何自动动作**：wake-gate `wake=true` 只放行既有 legacy 唤醒链，全部 v2 审计行 `acted=false` 恒真（动作面是其后独立子系统才打开的，见「动作面」节）。规格见本地 `plans/0923_global_master_autonomy_suite_v0.2.md`（v0.2）；v1 计划/实现/复核见 `plans/0923_autonomy_suite_v1_{plan,impl,review}.md`；v2 计划/实现/审查见 `plans/0923_autonomy_suite_v2_{plan,impl,review}.md`。
+
+**监管账本（supervision）已并入本页**（「监管账本（supervision）与默认开启」节）：它是 `stagnation` 判据的唯一载体，与 frontier 同一 tick 链路，故不单独开页。
 
 ## Current Contract
 
@@ -103,6 +114,80 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **GUI 诚实文案（阶段二升级）**：`gui/src/pages/AutonomyPage.tsx` 两处（卡片段 + 页 intro）= 「开启动作开关后仅执行可回滚动作（诊断报告 + 本地通知信），不自动派活、不自动重启 worker」；纯文案，不动逻辑。
 - **测试基线**：`npm run test:autonomy-actions`（`_test_runtime_autonomy_actions.ts`）**87 checks**（决策树矩阵 / 事务四行 / git 前后置 / 熔断预算 / 回退 / 回放三问 + notify 组：allowlist / 信件效应面 / pending 窗回滚 / claim 后处置 / dedupKey 含 class 段 / expectation 零写入 / 只发信不写文件 / 非 owner-kill-breaker 拒绝路径照旧 + **映射矩阵组**：4 rule × 2 class 逐格 allowed/DENY、`needs_user`+report 与 `expected_event_timeout`+notify 两反例 `DENY(class-not-allowed)`、**scope-owner 组**：`ownerCheck` 三态直测 / 无主 → `DENY(scope-ownerless)` 且 mailbox 零信件 / notify + `unknown`·`n/a` → `DENY(scope-owner-unknown)`（fail-closed） / 有主正路径四行 / stale(pid 死) → `DENY(scope-owner-stale)` / report 类 `"n/a"` 不受影响 / **回声组**：同 project 1h 内再动作 → `suspectedEcho=true`、异 project·超窗无标记、status `⚠echo` / **⑤⑧ 防循环组**：`expected_event_timeout` 只产 report → 再 tick `skipped(cooldown)`、`needs_user` 只产 notify、无主 → DENY 永不产无主信）；`_test_runtime_autonomy.ts` **60 checks**（A10.1d 代码缺省 false 仍过）；`_test_autonomy_wiring.ts` **15 项**（W1c 默认关逐字节同构 + `state/autonomy/actions*` 零新文件断言通过；W1b/W2.3/W3 为**既有基线失败**，与动作面无关——W2.3 连删 autonomy 键亦失败，W1b/W3 由 config 既有 `autonomy.enabled:true` 触发）。
 
+## 监管账本（supervision）与默认开启（2026-10-18）
+
+`stagnation` 的**权威意图载体**：每 runId 一份账本文件，由**主会话侧**写入，autonomy **只读**。默认值于 2026-10-18 **翻转为「派发即登记」**——旧默认相反（无账本 ⇒ `NOT_MONITORED` ⇒ 静默），把「记得授权」的负担留给人，缺陷实况 = SBS tab 停 8.5h 且三次 `stop=error` 卡死、autonomy 一次没报。
+
+### 存储形状与路径
+
+```
+<stateDir>/supervision/open/<runId>.json     ← 监管中（status = active | paused）
+<stateDir>/supervision/closed/<runId>.json   ← 已关账（终态：closedBy / closedAt / closeReason）
+```
+
+`stateDir` 缺省 `<runtimeDir>/state`（`~/.pi/agent/runtime/state`）。条目字段：`version:1` / `runId` / `taskId` / `repoPath` / `status:"active"|"paused"` / `setBy`（`master:<sid>` 或 `user:<sid>`）/ `setAt` / `pausedAt` / `pauseReason` / `softMs? pushMs? userMs?`（逐账本覆盖阈值）/ `epoch:{startedAt,pushes[]}`（P0 恒空）/ **`optOut?: true`** /（closed 才有）`closedBy? closedAt? closeReason?`。
+
+纪律逐条镜像 `expectations.ts`：SoT = 一对象一文件、原子 tmp+rename、**全 never-throw**、**`closed/` 优先读取**（同 id 两目录并存的关账竞态残留 ⇒ 终态收敛）、`listOpenSupervisionEntries` 跳过 closed 有同 id 的僵尸 open。读侧 `validateEntry` 严格：`version` 必须 `===1`、`status` ∈ {active,paused}、`optOut` 缺失合法但存在必须**严格 `=== true`**（拒绝 `"yes"`/`1` 等宽松形状）。已关账条目**不可复活**（`setSupervisionStatus` / `setSupervisionOptOut` 见 `closedAt` 一律 `{ok:false, reason:"invalid"}`）。
+
+### 六态语义与判据优先级
+
+`deriveTabSupervisionState`（纯函数、每 tick 重算、零 IO）按下列顺序**短路**：
+
+| # | 条件 | 结果 |
+|---|---|---|
+| 1 | 无账本条目（`!ledger`） | `NOT_MONITORED` |
+| 2 | `ledger.optOut === true` | `NOT_MONITORED`（静默留档：不问不动） |
+| 3 | `ledger.status === "paused"` | `PAUSED_USER` |
+| 4 | tab phase 终态 | `DONE`（等主会话关账） |
+| 5 | `needsHuman ∨ gate==="awaiting" ∨ attention>0` | `BLOCKED_USER`（提醒、不推动） |
+| 6 | `tab.stop === "error"` | `BLOCKED_USER`（需人介入重派） |
+| 7 | `tab.stop === "toolUse"` | `ACTIVE`（toolUse 豁免：跑长工具 ≠ 停滞） |
+| 8 | `phase==="waiting" ∧ idleMs 有限 ∧ idleMs > pushMs` | `STALLED` |
+| 9 | 其余 | `ACTIVE` |
+
+- `idleMs === null`（无 `state.lastActivityAt` 载体）**不得**当停滞（不猜）。
+- 阈值缺省 `SUPERVISION_THRESHOLDS` = SOFT 5min / PUSH 15min / USER 30min / HANG 60min，在 `supervision.ts` 与 `frontier.ts` 各存一份同源常量（frontier 零 IO 不得 import 该文件）。
+- 项目级取**最严重**一个 tab 的派生（`SUPERVISION_RANK`）；`ProjectFrontier.stagnation` 判据**未变**，仍是 `supervision.state === "STALLED"`（brief 明令一字不动）。
+
+#### `stop="error"` ⇒ `BLOCKED_USER`：为什么故意不限定 phase
+
+`extensions/tab-runs.ts` 的 phase 派生：`toolUse→working`、`stop|length→waiting`、**`error|aborted→unconfirmed`**。所以真实的 `stop="error"` 卡死 tab 其 `phase` 是 **`unconfirmed`** 而非 `waiting`——若把判据写成 `phase==="waiting" ∧ stop==="error"`，恰好漏掉最该人介入的形状（实证：SBS tab 三次 `stop=error` 卡死，phase 全为 `unconfirmed`）。故该判据**只判 `stop`，不判 `phase`**。
+
+- `aborted` **明确不并入**：用户主动中断不属于静默卡死。
+- `stop="error"` **不得**归 `STALLED`：它已经报错了，推它没用，需要的是人重派。
+
+### 默认开启契约：派发即登记
+
+`autoRegisterDispatchedTabs(results, deps)`（`extensions/runtime/supervision.ts`）是 launch-tabs 与 master-dispatch 共用的登记入口：
+
+- 只登记 `!item.error && item.runId` 的条目（失败项不建账本——`error` 结果也可能带 runId）；
+- 每条调 `setSupervisionStatus({ runId, status:"active", setBy, fromDispatch:true })`，`setBy = master:<sessionId>`；
+- **整体 never-throw**：单条写失败继续处理其余条目，失败只 `deps.audit(...)` 记一行（注入的 audit 自身抛异常也被 catch 住，不外泄给派发）；返回 `{registered, failed}`。
+
+两个接线点（同一原因：这两条派发都会产生 tab runId）：
+
+- `extensions/index.ts` 的 `launch-tabs` tool execute（`const ok = results.filter(...)` 之后）：返回文本追加 `监管: N 个已自动登记（用 /supervise off <runId> 可取消，/supervise optout <runId> 可静默留档）`；`isError` 仍**只**由 `ok === 0` 决定——监管写失败**不得**把派发变成 error。
+- `extensions/index.ts` 的 `dispatchTab` 闭包（`master-dispatch` 通道，`masterDispatchLaunch` 之后）：仅 `!res.stale && !res.error && res.runId` 才登记；返回形状不变；`extensions/master-tools.ts` 的成功文本同样提示「监管: 已自动登记」。
+
+**尚未接自动登记的派发路径**（已知缺口，勿声称已覆盖）：`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab。
+
+### 两种「别管」：`off` vs `optout`
+
+| 命令 | 语义 | 账本形态 | 派生 |
+|---|---|---|---|
+| `/supervise off <runId>` | **关账**（「这个结束了」） | open → closed（wx first-wins） | 条目**离开**监管集合 |
+| `/supervise optout <runId>` | **静默留档**（「这个别管我」） | **仍在 `open/`**，`status` 仍 `active`，写 `optOut: true` | `NOT_MONITORED` |
+
+`optout` 是「这个别管」的机器表达：留档（可审计、可回看）与不问不动（派生等价于未登记）同时成立；`optOut` 与 `status` **正交**（静默 ≠ 暂停）。已关账（closed/）条目做 optout → `{ok:false, reason:"invalid"}`（终态不得重开）。
+
+清除规则：`/supervise on|resume` **清除** `optOut`（显式「要监管」覆盖静默 —— `setSupervisionStatus` 在 `input.fromDispatch !== true` 时 `delete base.optOut`）；**自动派发登记不清除**（`input.fromDispatch === true`）——理由：重复登记同一 runId 不是用户的新意图，不得覆盖用户刚设的静默。`pause` 分支**不碰** `optOut`（暂停 ≠ 取消静默）。`/supervise` 的写操作在子 agent 会话被拒（`isSubagent()`），与 `/autonomy` 手动运维命令同口径。
+
+### 只读红线（未破）
+
+- autonomy 侧唯一接触点 = `collect.ts::readSupervisionInputs`，**只调读入口**（`supervisionRootForStateDir` + `listOpenSupervisionEntries`）；根目录不存在 ⇒ 返回 `undefined`（frontier 侧按「无载体」处理，不猜），读失败同样 `undefined`。它把 `optOut` 透传进 `FrontierSupervision` 供 `deriveTabSupervisionState` 判据，**不写任何账本文件**。
+- **被监管者（tab 自身）永不写自己的账本**：写入口调用方只有主会话侧（`/supervise` 命令 + `autoRegisterDispatchedTabs`）。理由：被监管者不得自报停滞，否则「关掉监管」与「没有停滞」在派生面不可区分。
+- P0 仍**零推动**：只记录意图 + 派生显示，不调 tab-steer / set-timer / steer / spawn；`epoch.pushes` 恒空数组。
+
 ## 接线落点与边界（v2 已接线形态）
 
 - **总门**：`wake.ts:evaluateWakes` 顶层（套件级门，不是 ws 级；cutover off / non-owner 提前返回不触本层——省 IO）。per-repo scope wake（`scope.ts`/`mailbox-consumer.ts` 平行接线面）**未接**，列后续。
@@ -144,6 +229,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 ## Evidence
 
+- **监管账本默认开启（2026-10-18 实测）**：`npx tsx extensions/_test_runtime_supervision_default_on.ts` → **all 26 checks passed**（自动登记两接线点 / `optout` 与 `off` 语义 / `stop=error→BLOCKED_USER` 不限 phase / 重复登记不清 optOut / 用法串含 optout）；`npx tsx extensions/_test_runtime_autonomy.ts` → **all 66 checks passed**（SUP-P0 六态组未回归）；`npm run test:autonomy-actions` → **all 87 checks passed**；`npm run smoke:extension-load` → extension load OK；`npm run test:master-dispatch` → **# pass 16**。源码：`extensions/runtime/supervision.ts::{autoRegisterDispatchedTabs,setSupervisionStatus,setSupervisionOptOut,handleSuperviseCommand}`、`extensions/runtime/autonomy/frontier.ts::deriveTabSupervisionState`、`extensions/runtime/autonomy/collect.ts::readSupervisionInputs`、接线 `extensions/index.ts`（launch-tabs execute + `dispatchTab` 闭包）、`extensions/master-tools.ts#L731`；phase 派生 `extensions/tab-runs.ts#L356-L369`（`error|aborted → unconfirmed`）。
+
 - v1：`extensions/_test_runtime_autonomy.ts` A1–A11 断言（含"测试不触真实 `~/.pi/agent/runtime`"隔离断言）；提交 `3922ef4`；L4 复核 `plans/0923_autonomy_suite_v1_review.md`（PASS，must-fix 0）。
 - v2（2026-09-23 实测）：
   - `npx tsx extensions/_test_runtime_autonomy.ts` → **all 56 checks passed**（55 基线 + A10.1b；A10.1 改 allowlist 后绿）。
@@ -165,6 +252,9 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - [[Wiki 索引]]
 
 ## Open Questions
+
+- **open 账本无 GC**：`autoRegisterDispatchedTabs` 使账本条目随每次派发增长，`closed/` 只在 `/supervise off` 时产生；无自动关账、无过期清理，长期运行会积累不过问的 open 条目（派生面仍正确——`DONE`/`NOT_MONITORED` 不报——只是文件数单调增长）。
+- **三条派发路径尚未接自动登记**：`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab —— 这些 tab 仍落在旧默认（无账本 ⇒ `NOT_MONITORED`）。
 
 - **OQ-1（notify 间接 wake）**：notify 信件是 wake 形态、可被 legacy scope wake 链认领（间接 spawn 风险）；其是否构成「autonomy 搭 legacy spawn 通道派自己的活」（设计 §1.4 结构性防火墙）未完全闭合。既有缓解 = `subject` 恒 `autonomy-notify/<rule>`（不以 `run://tab/` 开头）+ 只 deliver 不消费 + 效应面 = 恰一信件文件。**已补两项缓解**：① **效应 C 缓解已落地**——发信前查 scope owner 的 L1.5 门（无主 `scope-ownerless` / 死主 `scope-owner-stale` 拒投，liveness 判不了则放行），掐断「信滞留 pending → backlog 计数 → level 恒触发 → gate 稳态翻转」的产生条件；② **短环 B 可见化**——同 project 1h 内 notify 后再有动作 ⇒ 事件行 `suspectedEcho:true` + status `⚠echo`（只标记不改判定）。**仍开放：通道 D**——被信件唤醒的**下游 spawn 不在动作事务承诺面**（事务只管自身效应与回退，信被认领后派生的会话不归本事务管辖），其是否构成派活防火墙破口未闭合。
 - **audit 轮转仍无**（R5）：enabled 常开 ≈ 3 行/次评估 ≈ 2.6 万行/天（24h），无轮转无上限；先例 `master-injection.ts:268-287`（~1MB 两代 rename）留后续任务。

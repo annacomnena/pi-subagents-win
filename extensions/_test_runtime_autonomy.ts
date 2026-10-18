@@ -849,6 +849,9 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				if (p === join(EXT_ROOT, "_test_expectations.ts")) continue;
 				// P1（20261001）：动作面测试 import runtime/autonomy/action/** 字面量 → 排除（ALLOW 不动）
 				if (p === join(EXT_ROOT, "_test_runtime_autonomy_actions.ts")) continue;
+				// 2026-10-18 监管默认值翻转：该测试走真实读路径（readSupervisionInputs / buildFrontier）
+				// → 需要 import runtime/autonomy 字面量 → 排除（ALLOW 不动：仍是测试文件非生产接线点）
+				if (p === join(EXT_ROOT, "_test_runtime_supervision_default_on.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}

@@ -20,7 +20,7 @@ Windows-native subagent orchestration for [pi](https://github.com/earendil-works
 - **Manage long-lived "master" sessions**: a gated family of master tools — the agent can never take over / hand off / switch on its own (§9).
 - **Let the master watch for you** (optional): an autonomy suite + expectation ledger — default: zero automatic action (§11).
 - **Survive its own switch being flipped off**: an unconditional heartbeat runs before every gate, so "switched off" is distinguishable from "never on" and from "process dead" — and the status line reports *age*, not just a timestamp (§11.2).
-- **Know the difference between idle and stalled**: supervision is an explicit per-task intent written by the master; without it, idle is just idle. Six states incl. `PAUSED_USER` / `BLOCKED_USER` / `STALLED`, plus a `toolUse` exemption so a 50-minute conformance sweep is not mistaken for a hang (§11.3).
+- **Know the difference between idle and stalled**: dispatching a tab *is* the supervision intent — every successful dispatch auto-registers a ledger entry, and "don't watch this one" must be said explicitly (`/supervise off` / `optout`). Six states incl. `PAUSED_USER` / `BLOCKED_USER` / `STALLED`, plus a `toolUse` exemption so a 50-minute conformance sweep is not mistaken for a hang (§11.3).
 
 ### Architecture
 
@@ -560,29 +560,43 @@ in config and not in the derived cache:
 ```
 ~/.pi/agent/runtime/state/supervision/open/<runId>.json
 { version, runId, taskId, repoPath, status: "active"|"paused", setBy, setAt,
-  pausedAt, pauseReason, softMs?, pushMs?, userMs?, epoch: { startedAt, pushes[] } }
+  pausedAt, pauseReason, softMs?, pushMs?, userMs?, optOut?: true,
+  epoch: { startedAt, pushes[] } }
 ```
 
-- **Who writes**: only the master side — `/supervise on|off|pause|resume|status`, or
-  `launch-tabs(supervise: true)`. **A tab never writes its own ledger entry** (a supervised
-  process must not be able to declare itself healthy).
+- **Who writes**: only the master side. **Every successfully dispatched tab is auto-registered**
+  (`autoRegisterDispatchedTabs`, `setBy = master:<sid>`) on both dispatch paths (`launch-tabs` and
+  `master-dispatch`); `/supervise on|off|pause|resume|optout|status` is the manual override.
+  **A tab never writes its own ledger entry** (a supervised process must not be able to declare
+  itself healthy).
 - **Who reads**: the autonomy tick, read-only. Autonomy writes only its own namespace
   (`state/autonomy/**`) — same discipline as the expectation ledger.
 
-**No ledger entry ⇒ `NOT_MONITORED` ⇒ silence.** That single rule removes the entire class of
-"everything looks stalled" false positives, and it is the machine-readable form of the user's
-sentence *"when you are supervising a task for me"*.
+**Default: monitored.** Because dispatch *is* the authorisation, an idle tab you launched is a
+candidate stall without any extra step. `NOT_MONITORED` ("silence") is now the *exception*, and it
+only appears when you say so explicitly (`/supervise optout <runId>`, which keeps the entry on file
+in `open/` but derives `NOT_MONITORED`) or when the ledger write itself failed. The principle is
+unchanged — *don't interrupt without an intent* — the default value is just no longer "no intent":
+**dispatching a tab is the intent; to not be watched you have to say so.**
 
 #### Six states (pure derivation, every tick)
 
 | State | Condition | Action |
 |---|---|---|
-| `NOT_MONITORED` | no ledger entry | **nothing** (this is the default for every run) |
+| `NOT_MONITORED` | no ledger entry **or** `optOut: true` | **nothing** (you opted out, or there is no ledger — never by default) |
 | `ACTIVE` | active ∧ (`stop=toolUse` ∨ idle < SOFT) | nothing |
 | `DONE` | ledger open ∧ run is terminal | prompt master to reclaim + close ledger |
 | `PAUSED_USER` | ledger `status:"paused"` | nothing (shows "paused 2h") |
-| `BLOCKED_USER` | active ∧ (`needsHuman` ∨ gate awaiting ∨ attention>0) | **remind, never nudge** — it is waiting on a human |
+| `BLOCKED_USER` | active ∧ (`needsHuman` ∨ gate awaiting ∨ attention>0 **∨ `stop="error"`**) | **remind, never nudge** — it is waiting on a human |
 | `STALLED` | active ∧ `phase=waiting` ∧ `stop=stop` ∧ idle ≥ PUSH | **report + nudge** |
+
+**`stop="error"` ⇒ `BLOCKED_USER`, and the test deliberately does not constrain `phase`.** The
+real shape of a `stop=error` tab is `phase="unconfirmed"`, not `"waiting"` (`tab-runs.ts` derives
+`toolUse→working`, `stop|length→waiting`, `error|aborted→unconfirmed`), so a `phase==="waiting" ∧
+stop==="error"` test would miss exactly the shape that needs a human. It also must **not** be
+folded into `STALLED` — the run already reported an error, nudging it is useless; someone has to
+re-dispatch. `aborted` is deliberately **not** included (a user-initiated interrupt is not a
+silent hang).
 
 **`toolUse` exemption**: `phase=working ∧ stop=toolUse` stays `ACTIVE` even at 50 min. A long
 `verify_m0.sh` or a 24-row conformance sweep is work, not a stall. This is why `lastStopReason`
@@ -621,7 +635,9 @@ There is a **cliff** between P95 and P99 — either a worker is running (seconds
 3. **Derived caches are not authority.** `frontier.json` is a projection; read `asof` age before
    trusting it. The authoritative intent lives in the ledger, never in the cache.
 4. **A supervised process may not self-report health.** Only the master writes supervision state.
-5. **`stalled` requires an intent.** Absent an explicit supervision mandate, idle is just idle.
+5. **Default is an intent.** Dispatch *is* the mandate: every successfully dispatched tab is
+auto-registered, so cancelling supervision takes an explicit `/supervise off` or `/supervise
+optout` (historically: absent an explicit mandate, idle was just idle — that default is gone).
 6. **Long tool use is not a stall.** `toolUse` is exempt from every idle threshold below HANG.
 
 ### 11.5 The global → local dispatch plane
@@ -644,7 +660,7 @@ global master  ── master-dispatch ──▶  task tab (visible, cwd = repo)
 | `local-master-ensure` | global | idempotently ensure a repo's local master is alive; **never** force-attaches or spawns a duplicate |
 | `/master-attach` · `/master-detach` · `/master-transfer` | both | succession; token-gated, `gen+1`, confirm-before-cutover |
 | `/master-cutover` | global | the single consumption switch; every consumer reads it fresh each tick |
-| `/supervise` | global | mark a run as supervised (the ledger entry described above) |
+| `/supervise` | global | override the supervision ledger for one run — dispatched tabs are already registered by default (`off` = close, `optout` = silence but keep on file) |
 | `master-status` / `master-pressure` / `master-handoff` | read-only | observability for the plane itself |
 
 **Delegation is one-way and gated.** A tab may delegate *downward* via `subagent-win` only; it may

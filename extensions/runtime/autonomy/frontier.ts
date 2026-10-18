@@ -98,6 +98,11 @@ export interface FrontierSupervision {
 	userMs?: number;
 	/** epoch 推动记录条数（P1 才增长；P0 恒 0）。 */
 	epochPushes: number;
+	/**
+	 * 显式静默标记（2026-10-18 默认监管翻转）：true ⇒ 派生 **NOT_MONITORED**（不问不动），
+	 * 但条目仍在账本 open/ 集里留档。缺失 = 未静默。
+	 */
+	optOut?: boolean;
 }
 
 /** 项目派生监管字段（进快照供 status/watchdog 显示；权威意图仍在账本）。 */
@@ -277,9 +282,11 @@ const SUPERVISION_RANK: Record<SupervisionState, number> = {
  *
  * 严格优先级（短路顺序即优先级，无歧义）：
  *   1. 无账本条目                     → NOT_MONITORED（**治今天 3/3 全 true 的关键门**）
+ *   1b. 账本 optOut=true              → NOT_MONITORED（用户显式「这个别管」，静默留档）
  *   2. 账本 status="paused"           → PAUSED_USER（用户显式停：不报、不推）
  *   3. 账本 active ∧ 已 terminal      → DONE（提示主会话回收关账，不报停滞）
  *   4. 账本 active ∧ 需人 / attention → BLOCKED_USER（在等人：提醒但不推动）
+ *   4b. 账本 active ∧ stop="error"    → BLOCKED_USER（已报错卡死，需人介入重派）
  *   5. 账本 active ∧ stop=toolUse     → ACTIVE（**toolUse 豁免**：在跑长工具，即使 idle 50min）
  *   6. 账本 active ∧ phase=waiting ∧ stop=stop ∧ idle>pushMs → STALLED
  *   7. 其余（working/attached/dispatched / idle 未超线 / idle 无载体）→ ACTIVE（不猜＝不报）
@@ -295,9 +302,15 @@ export function deriveTabSupervisionState(input: {
 }): SupervisionState {
 	const { tab, ledger, attention } = input;
 	if (!ledger) return "NOT_MONITORED";
+	// 显式静默（`/supervise optout`）：账本仍留档，但派生面与「未登记」等价（不问不动）。
+	if (ledger.optOut === true) return "NOT_MONITORED";
 	if (ledger.status === "paused") return "PAUSED_USER";
 	if (mapPhaseToProjectState(tab.phase).terminal) return "DONE";
 	if (tab.needsHuman || tab.gate === "awaiting" || attention > 0) return "BLOCKED_USER";
+	// stop="error" ⇒ BLOCKED_USER（需人介入重派）。**不限定 phase**：真实形状是 `tab.stop=error` 的 tab
+	// phase 落在 "unconfirmed"（tab-runs.ts:358-368），只判 `phase==="waiting"` 会漏掉今晚三次卡死的实况。
+	// **不得**归 STALLED：它已经报错了，推它没用。`aborted` 明确不并入（用户主动中断，不属静默卡死）。
+	if (tab.stop === "error") return "BLOCKED_USER";
 	if (tab.stop === "toolUse") return "ACTIVE"; // toolUse 豁免（跑长工具 ≠ 停滞）
 	const pushMs =
 		typeof ledger.pushMs === "number" && Number.isFinite(ledger.pushMs) && ledger.pushMs > 0

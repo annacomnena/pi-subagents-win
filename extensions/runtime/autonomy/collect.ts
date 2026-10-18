@@ -397,6 +397,7 @@ export function readSupervisionInputs(opts?: { stateDir?: string }): FrontierSup
 			if (typeof rec.softMs === "number" && Number.isFinite(rec.softMs) && rec.softMs > 0) item.softMs = rec.softMs;
 			if (typeof rec.pushMs === "number" && Number.isFinite(rec.pushMs) && rec.pushMs > 0) item.pushMs = rec.pushMs;
 			if (typeof rec.userMs === "number" && Number.isFinite(rec.userMs) && rec.userMs > 0) item.userMs = rec.userMs;
+			if (rec.optOut === true) item.optOut = true; // 显式静默（派生 NOT_MONITORED，账本仍留档）
 			out.push(item);
 		}
 		return out;

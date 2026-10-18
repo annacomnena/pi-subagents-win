@@ -58,8 +58,8 @@ import {
 	parseLocalMasterEnsureArgs,
 	type LocalMasterSpawn,
 } from "./runtime/local-master-launch.ts";
-import { appendAuditEvent, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
-import { handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
+import { appendAuditEvent, appendAuditLine, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
+import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2622,7 +2622,7 @@ export default function (pi: ExtensionAPI) {
 	// 不新增 LLM 可调 tool。P0 **只读写账本 + 回显**：不调 tab-steer / set-timer / steer / spawn，
 	// 无任何推动/注入/abort。写操作在子 agent 会话被拦（handler 内 isSubagent 判定）。
 	pi.registerCommand("supervise", {
-		description: "停滞监管账本（P0 只显示不推动）：/supervise on|off|pause|resume|status [runId]",
+		description: "停滞监管账本（P0 只显示不推动）：/supervise on|off|pause|resume|optout|status [runId]",
 		handler: async (args, ctx) => {
 			const sid = durableSessionIdentity(ctx as never);
 			handleSuperviseCommand(args ?? "", ctx as never, {
@@ -3156,7 +3156,17 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			piErr = `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}`;
 		}
-		return masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
+		const res = masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
+		// 监管默认开启（2026-10-18 用户指令）：派发成功即自动建账本；stale/error 不登记，
+		// 写失败绝不影响派发结果（autoRegisterDispatchedTabs 自身 never-throw）。
+		if (!res.stale && !res.error && res.runId) {
+			autoRegisterDispatchedTabs([{ runId: res.runId, error: res.error, title: res.title }], {
+				setBy: `master:${args.sessionId}`,
+				tabRunsDir: defaultTabRunsDir(),
+				audit: (line) => appendAuditLine(line),
+			});
+		}
+		return res;
 	};
 
 	// local-master-ensure spawn 通道（0924 计划 §6）：与 spawnOneShotTab / spawnSuccessor
@@ -3395,15 +3405,22 @@ export default function (pi: ExtensionAPI) {
 				);
 			});
 			const ok = results.filter((item) => !item.error).length;
+			// 监管默认开启（2026-10-18 用户指令）：派发成功即自动建账本；写失败绝不影响派发结果。
+			const sup = autoRegisterDispatchedTabs(results, {
+				setBy: `master:${sessionIdentity(_ctx as never)}`,
+				tabRunsDir: runsDir,
+				audit: (line) => appendAuditLine(line),
+			});
 			const lines = results.map((item) => item.error
 				? `✗ ${item.title} [${item.runId}]: ${item.error}`
 				: `✓ ${item.title} [${item.runId}]: ${item.prompt.slice(0, 60)}`);
+			const supLine = `监管: ${sup.registered} 个已自动登记（用 /supervise off <runId> 可取消，/supervise optout <runId> 可静默留档）${sup.failed > 0 ? `，${sup.failed} 个登记失败` : ""}`;
 			return {
 				content: [{
 					type: "text",
-					text: `已并行启动 ${ok}/${results.length} 个 pi 标签页（runId 见下，用 tab-status / reclaim-tabs 回收）:\n${lines.join("\n")}`,
+					text: `已并行启动 ${ok}/${results.length} 个 pi 标签页（runId 见下，用 tab-status / reclaim-tabs 回收）:\n${lines.join("\n")}\n${supLine}`,
 				}],
-				details: { results },
+				details: { results, supervision: sup },
 				isError: ok === 0,
 			};
 		},

@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+> 主题：**监管（supervision）默认翻转 —— 从「派发后默认没人管」到「派发即登记」**；只改默认值与一个卡死判据，不改账本形状、不改只读红线、不改 `stagnation` 派生。
+
+- **根因**：旧默认「无账本 ⇒ `NOT_MONITORED` ⇒ 静默」把「记得授权监管」的负担留给了人。实况：SBS tab 停了 **8.5 小时**、期间三次 `stop=error` 卡死，autonomy 一次没报——不是判据算错，是**根本没进判据**。
+- **默认自动登记（派发即登记）**：新增 `runtime/supervision.ts::autoRegisterDispatchedTabs(results, deps)`——对每个 `!item.error && item.runId` 的派发结果调 `setSupervisionStatus({status:"active", setBy:"master:<sid>", fromDispatch:true})`，返回 `{registered, failed}`；**整体 never-throw**（单条写失败只 `deps.audit(...)` 记一行，注入的 audit 自身抛异常也不外泄给派发）。两个接线点（两条派发都产生 tab runId）：`extensions/index.ts` 的 `launch-tabs` tool execute（登记后返回文本追加「监管: N 个已自动登记…」，**`isError` 仍只由 `ok === 0` 决定**，监管写失败不得把派发变成 error）与 `extensions/index.ts` 的 `dispatchTab` 闭包（`master-dispatch` 通道，仅 `!res.stale && !res.error && res.runId` 才登记，返回形状不变；`master-tools.ts` 的成功文本同步提示已登记）。
+- **`stop=error` ⇒ `BLOCKED_USER`**（`frontier.ts::deriveTabSupervisionState`，在 needsHuman/gate/attention 之后、`toolUse` 豁免之前）：判据**故意不限定 `phase`**——`tab-runs.ts` 的 phase 派生是 `toolUse→working`、`stop|length→waiting`、`error|aborted→unconfirmed`，所以真实 `stop=error` 卡死 tab 的 phase 是 **`unconfirmed`** 而非 `waiting`，写成 `phase==="waiting"` 恰好漏掉最该人介入的形状。`aborted` 明确**不并入**（用户主动中断不是静默卡死）；`stop=error` **不得**归 `STALLED`（已经报错，推它没用，需人重派）。
+- **`/supervise optout <runId>`（新增，静默留档）**：与 `off` 语义严格区分——`off` = 关账（open → closed，条目离开监管集合）；`optout` = **条目仍在 `open/`、`status` 仍 `active`，但写 `optOut: true`** ⇒ 派生 `NOT_MONITORED`（不问不动）。账本 v1 只加一个可选字段 `optOut?: true`（缺失 = 未静默；存在必须严格 `=== true`）。这是「这个别管」的机器表达：留档可审计 + 派生等价于未登记。
+- **`setSupervisionStatus` 的 `optOut` 清除规则**：`fromDispatch !== true`（即 `/supervise on|resume` 等显式用户操作）才 `delete base.optOut`；**自动派发登记不清除**——重复登记同一 runId 不是用户的新意图，不得覆盖用户刚设的静默。`pause` 分支不碰 `optOut`（暂停 ≠ 取消静默）。
+- **明确不变**：账本存储形状与路径（`state/supervision/{open,closed}/<runId>.json`）、`stagnation` 派生（仍 `supervision.state === "STALLED"`，一字未动）、autonomy 侧**只读**（`collect.ts::readSupervisionInputs` 只调读入口）、**被监管者永不写自己的账本**这条红线。
+- **验证**：`npx tsx extensions/_test_runtime_supervision_default_on.ts` → **26 checks**；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks**；`npm run test:autonomy-actions` → **87 checks**；`npx tsx extensions/_test_model_failure_classify.ts` → **3 groups**；`npm run smoke:extension-load` → OK；`npm run test:master-dispatch` → **16 pass**。
+- **未闭合**：① `open/` 账本**无 GC**（派发越多条目越多；`closed/` 只在 `/supervise off` 时产生，无自动关账/过期清理）；② **三条派发路径尚未接自动登记**——`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab，这些 tab 仍落在旧默认（无账本 ⇒ `NOT_MONITORED`）；③ P1 推动（`supervise-push` / wake prompt 注入）仍未实现，`epoch.pushes` 恒空。
+
 ## [0.8.0] — 2026-10-17
 
 > 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
@@ -15,6 +28,7 @@
 - **监管账本（P0）**：新纯库 `runtime/supervision.ts` —— `state/supervision/{open,closed}/<runId>.json`
   （抄 `expectations.ts` 骨架：SoT=一对象一文件、原子 tmp+rename、never-throw）。**只有主会话写**（`/supervise on|off|pause|resume|status`
   或 `launch-tabs(supervise:true)`）；autonomy **只读**，永不写账本（与 `expectations.ts:25` 同构）。**tab 永不写自己的账本**。
+  （勘误：`launch-tabs` 的 `supervise` 参数**从未实现**；实际形态见 `## [Unreleased]` 的「派发即登记」。）
 - **六态语义机（P0）**：`deriveTabSupervisionState` → `NOT_MONITORED / ACTIVE / PAUSED_USER / BLOCKED_USER / DONE / STALLED`。
   **`stagnation` 判据重构**：旧 `nonTerm.some(staleOver) || resultMissing` 拆除（`resultMissing` 无时基，任何无
   `result.json` 的非终态 tab 立刻 true ⇒ 实测三条线全 true、零区分度）；新判据 = `state === "STALLED"`
