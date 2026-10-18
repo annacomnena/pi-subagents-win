@@ -228,6 +228,25 @@ function clampPushMax(v: unknown): number {
 }
 
 /**
+ * 路径归一（仅用于 repo 过滤比较）：反斜杠 → 斜杠、去尾斜杠、小写。
+ * 本地小函数（不引新依赖，也不复用 `frontier.ts::normalizeExactPath`：那个还要规范化盘符大小写，
+ * 且会把 `C:` 单独降小写；这里只要「同仓判等」这一个语义，多带行为反而难推理）。
+ */
+function normRepoPath(p: string): string {
+	return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * 仓归属判据：相等 ∨ 候选在该仓**子目录**下（dispatch.cwd 可能是 repo 子目录）。
+ * `filter` 必须是已经 `normRepoPath` 过的值。
+ */
+function repoPathMatches(candidate: string, filter: string): boolean {
+	const c = normRepoPath(candidate);
+	if (!c) return false; // 无仓载体 ⇒ 不命中（不猜）
+	return c === filter || c.startsWith(`${filter}/`);
+}
+
+/**
  * 从监管账本 + tab 账本派生 `WakeSupervisionItem[]`（P1 修正 ③：让第三参真正有生产调用方）。
  *
  * 取两类（任务书 §③）：
@@ -236,10 +255,23 @@ function clampPushMax(v: unknown): number {
  * 其余（terminal / working / 短 idle / 跑工具）不进块：wake prompt 越短，被唤醒的 master 越不容易跑偏。
  *
  * **整段 never-throw**：任何读失败/异常 ⇒ 返回 `undefined`（保持 buildWakePrompt 逐字节不变的既有保证）。
+ *
+ * 2026-10-18 G1-1：导出 + 新增 `repoPath` 可选过滤（scope 路复用；见 `buildScopeWakePrompt` 第四参）。
+ *   - 不给 `repoPath` ⇒ 行为**逐字节不变**（workstream 路跨仓，需要全机视角）；
+ *   - 给了 ⇒ 只保留该仓条目（scope wake 是 per-repo 的，把别的仓的 tab 塞进去只会让被唤醒的
+ *     local master 跑偏：它无权也无力推动他仓 tab）；
+ *   - 过滤后为空 ⇒ 返回 `undefined`（**关键**：保证「本仓无监管 ⇒ prompt 逐字节不变」）。
  */
-function deriveSupervisionItems(opts: { stateDir: string; runsDir: string; now: number }): WakeSupervisionItem[] | undefined {
+export function deriveSupervisionItems(opts: {
+	stateDir: string;
+	runsDir: string;
+	now: number;
+	/** 给出时只保留该仓条目（归一比较，覆盖 dispatch.cwd 在子目录的情形）。 */
+	repoPath?: string | null;
+}): WakeSupervisionItem[] | undefined {
 	try {
 		const entries = listOpenSupervisionEntries({ stateDir: opts.stateDir });
+		const repoFilter = opts.repoPath ? normRepoPath(opts.repoPath) : null;
 		if (!entries.length) return undefined;
 		const items: WakeSupervisionItem[] = [];
 		for (const entry of entries) {
@@ -269,10 +301,13 @@ function deriveSupervisionItems(opts: { stateDir: string; runsDir: string; now: 
 					stopReason !== "error" &&
 					stopReason !== "aborted";
 				if (!errored && !stalled) continue;
+				const itemRepoPath = dispatch?.cwd ?? entry.repoPath ?? "";
+				// repo 过滤（scope 路）：命中判据见 normRepoPath 注释；未给过滤 ⇒ 恒命中。
+				if (repoFilter !== null && !repoPathMatches(itemRepoPath, repoFilter)) continue;
 				items.push({
 					runId: entry.runId,
 					taskId: entry.taskId || dispatch?.taskId || "unknown",
-					repoPath: dispatch?.cwd ?? entry.repoPath ?? "",
+					repoPath: itemRepoPath,
 					idleMs,
 					stopReason,
 					summary: state?.lastAssistantText ?? "",
@@ -390,7 +425,7 @@ const WAKE_SUMMARY_MAX = 120;
  * 为什么要塞进 wake prompt：C.5 的执行主体是**被唤醒的 master**——它没有别的渠道知道
  * 「哪个 tab 停了多久、还能推几次」，只能由 wake prompt 带过去。
  */
-function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): string[] {
+export function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): string[] {
 	const shown = items.slice(0, 10);
 	return [
 		`停滞监管（需推动的 tab，按 budget 余量决定是否推）：`,

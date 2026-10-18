@@ -43,13 +43,17 @@ import { readAttachment, readCutover, type MasterAttachment } from "./registry.t
 import { isProcessAlive, readScopeLiveness, writeScopeLiveness, type ScopeLiveness } from "./liveness.ts";
 import {
 	buildReplyRecipe,
+	buildSupervisionBlock,
+	deriveSupervisionItems,
 	isInFlight,
 	MAILBOX_MODULE_URL,
 	readWakeState,
 	wakeHolder,
 	writeWakeState,
 	type WakeLetter,
+	type WakeSupervisionItem,
 } from "./wake.ts";
+import { defaultTabRunsDir } from "../tab-runs.ts";
 
 // ── scope 键（S1 + L4 M1/M2/M3 返修，纯函数）──────────────────────────────────────────
 
@@ -389,7 +393,24 @@ export function evaluateScopeWake(opts: ScopeWakeOptions): ScopeWakeDecision {
 
 	const letters = claimed.map(describeLetter);
 	const repoCwd = repoCwdOf(att);
-	return { scope: opts.scope, fire: true, letters, prompt: buildScopeWakePrompt(opts.scope, letters, repoCwd), repoCwd };
+	// 2026-10-18 G1-1（断点 ②）：scope 路也派生监管块（与 workstream 路**同源**，均调 wake.ts 的
+	// deriveSupervisionItems / buildSupervisionBlock，不另实现一份渲染）。
+	// 位置纪律：必须在 **claim 成功之后** —— claim-missed / no-mail 早退路径保持零 IO（不预读账本）。
+	// repoCwd=null ⇒ 不传 repoPath（= 不过滤，与 workstream 路一致）；过滤后无条目 ⇒ undefined ⇒
+	// buildScopeWakePrompt 输出**逐字节不变**（既有保证）。
+	const supervision = deriveSupervisionItems({
+		stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state"),
+		runsDir: opts.runsDir ?? defaultTabRunsDir(),
+		now,
+		...(repoCwd ? { repoPath: repoCwd } : {}),
+	});
+	return {
+		scope: opts.scope,
+		fire: true,
+		letters,
+		prompt: buildScopeWakePrompt(opts.scope, letters, repoCwd, supervision),
+		repoCwd,
+	};
 }
 
 // ── scope 唤醒确认 / 失败记账 ──────────────────────────────────────
@@ -429,7 +450,19 @@ export function auditScopeWakeSpawnFailed(scope: string, error: string, stateDir
 
 // ── Bounded prompt（调用方经 launch 纪律块包装）────────────────────
 
-export function buildScopeWakePrompt(scope: string, letters: WakeLetter[], repoCwd: string | null): string {
+/**
+ * scope wake 的 bounded prompt。
+ *
+ * 第四参 `supervision`（2026-10-18 G1-1，断点 ②）：监管块，**复用** `wake.ts::buildSupervisionBlock`
+ * / `WakeSupervisionItem`（workstream 路与 scope 路必须同源，否则两路会漂成两份渲染语法）。
+ * `undefined` / `[]` ⇒ 输出与三参调用**逐字节相同**（`_test_runtime_supervision_push` 第 11 组冻结断言）。
+ */
+export function buildScopeWakePrompt(
+	scope: string,
+	letters: WakeLetter[],
+	repoCwd: string | null,
+	supervision?: WakeSupervisionItem[],
+): string {
 	const shown = letters.slice(0, 10);
 	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
 	const replyBlock: string[] = [];
@@ -442,11 +475,14 @@ export function buildScopeWakePrompt(scope: string, letters: WakeLetter[], repoC
 			buildReplyRecipe(MAILBOX_MODULE_URL),
 		);
 	}
+	// 与 buildWakePrompt 同位置：`待处理输入` 行之后、`replyBlock` 之前（两路输出形态一致）。
+	const supervisionBlock = Array.isArray(supervision) && supervision.length > 0 ? buildSupervisionBlock(supervision) : [];
 	const lines = [
 		`你是仓库 ${scope} 的本地 Sub-Master（local master v1 唤醒，有终态的一次执行）。`,
 		repoCwd ? `工作目录：${repoCwd}（本仓）` : null,
 		`待处理输入（${letters.length}）：`,
 		...shown.map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...supervisionBlock,
 		...replyBlock,
 		`规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经本地 wake 层；`,
 		...(replies.length

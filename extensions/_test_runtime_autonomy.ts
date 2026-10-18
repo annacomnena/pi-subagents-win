@@ -41,6 +41,7 @@ process.env.PI_RUNTIME_DIR = ENV_TMP;
 import { DEFAULT_AUTONOMY, defaultAutonomyConfig, normalizeAutonomy, readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { evaluateAutonomyGating, engageKillSwitch, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import {
+	BLOCKED_OVERDUE_THROTTLE_MS,
 	RECORD_ONLY_NOCARRIER,
 	buildFrontier,
 	deriveTabSupervisionState,
@@ -49,6 +50,7 @@ import {
 	type FrontierRule,
 	type FrontierSnapshot,
 	type FrontierSupervision,
+	type FrontierTrigger,
 	type ProjectFrontier,
 } from "./runtime/autonomy/frontier.ts";
 import type { FrontierSourceTab } from "./runtime/frontier-carriers.ts";
@@ -189,6 +191,9 @@ function makeProject(p: Partial<ProjectFrontier> & { project: string }): Project
 		needsUser: p.needsUser ?? false,
 		resultMissing: p.resultMissing ?? false,
 		stagnation: p.stagnation ?? false,
+		blockedOverdue: p.blockedOverdue ?? false,
+		...(p.blockedOverdueRunId ? { blockedOverdueRunId: p.blockedOverdueRunId } : {}),
+		...(typeof p.blockedOverdueLastAt === "number" ? { blockedOverdueLastAt: p.blockedOverdueLastAt } : {}),
 		overdue: p.overdue ?? 0,
 		meaningfulStateVersion: p.meaningfulStateVersion ?? 1,
 	};
@@ -1063,6 +1068,150 @@ check("A12.1 真链 deliverLetter → ⑧ 副作用可见 且 gate 仍 acted=fal
 			deriveTabSupervisionState({ tab: mkTab({ idleMs: null }), ledger, attention: 0 }),
 			"ACTIVE",
 		);
+	});
+}
+
+// ── 2026-10-18 G1-1 验收（SUP-B）：独立触发 blocked_overdue ─────────────────
+// 判据：BLOCKED_USER ∧ idleMs > userMs(30min)；level 触发 + 1h/runId 节流；`stagnation` 一行不改。
+// 纯函数层：零 IO（不读真实账本，全部手工构造 FrontierSourceTab / FrontierSupervision）。
+console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
+{
+	const BTAB = "tab_od_1";
+	const mkOdTab = (over: Partial<FrontierSourceTab> = {}): FrontierSourceTab => ({
+		runId: BTAB,
+		repoPath: R1,
+		phase: "waiting",
+		stop: "error", // stop=error ⇒ 六态派生恒 BLOCKED_USER（与 phase 无关）
+		idleMs: 31 * 60_000,
+		needsHuman: false,
+		gate: "ok",
+		staleOver: false,
+		overdue: 0,
+		resultMissing: false,
+		pidAlive: true,
+		...over,
+	});
+	const mkOdLedger = (over: Partial<FrontierSupervision> = {}): FrontierSupervision => ({
+		runId: BTAB,
+		status: "active",
+		epochPushes: 0,
+		...over,
+	});
+	/** 两帧：帧1 = baseline（prev=null）建基线，帧2 = 真差分（这才是产触发的那帧）。 */
+	function twoFrames(
+		tabs: FrontierSourceTab[],
+		ledger: FrontierSupervision[] | undefined,
+		now: number = NOW,
+	): { next: FrontierSnapshot; diff: { triggers: FrontierTrigger[] } } {
+		const f1 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: null, now: now - 60_000, supervision: ledger });
+		return buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f1.next, now, supervision: ledger });
+	}
+
+	check("SUP-B1 BLOCKED_USER(stop=error) + idle 31min>30min ⇒ 帧2 出 blocked_overdue（带 runId）+ blockedOverdue=true", () => {
+		const { next, diff } = twoFrames([mkOdTab()], [mkOdLedger()]);
+		const od = diff.triggers.filter((t) => t.rule === "blocked_overdue");
+		assert.equal(od.length, 1, `必须恰 1 条 blocked_overdue，实得 ${JSON.stringify(diff.triggers)}`);
+		assert.equal(od[0]!.project, K);
+		assert.equal(od[0]!.runId, BTAB, "触发必须带 runId（节流键）");
+		assert.equal(od[0]!.approximate, false, "非近似触发（可进动作面）");
+		assert.match(od[0]!.evidence, /blocked_overdue:run=tab_od_1:idleMin=31/);
+		assert.equal(next.projects[0]!.blockedOverdue, true);
+		assert.equal(next.projects[0]!.blockedOverdueRunId, BTAB);
+		assert.equal(next.projects[0]!.supervision.state, "BLOCKED_USER", "夹具必须落在 BLOCKED_USER");
+	});
+
+	check("SUP-B2 对照：idle 29min < 30min ⇒ 无 blocked_overdue 且 blockedOverdue=false", () => {
+		const { next, diff } = twoFrames([mkOdTab({ idleMs: 29 * 60_000 })], [mkOdLedger()]);
+		assert.equal(diff.triggers.some((t) => t.rule === "blocked_overdue"), false);
+		assert.equal(next.projects[0]!.blockedOverdue, false);
+		assert.equal(next.projects[0]!.blockedOverdueRunId, undefined);
+	});
+
+	check("SUP-B3 节流：t0 发 / t0+5min 不发 / t0+61min 再发（≤1 次/小时/runId）", () => {
+		const tabs = [mkOdTab()];
+		const ledger = [mkOdLedger()];
+		const f1 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: null, now: NOW - 60_000, supervision: ledger });
+		// 帧2（t0）：首次提醒
+		const f2 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f1.next, now: NOW, supervision: ledger });
+		assert.deepEqual(f2.diff.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId), [BTAB], "帧2 必须提醒");
+		assert.equal(f2.next.projects[0]!.blockedOverdueLastAt, NOW, "节流时刻必须落盘=now");
+		// 帧3（t0+5min）：窗内不提醒，但 blockedOverdue 仍为 true（载体不消失）
+		const f3 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f2.next, now: NOW + 5 * 60_000, supervision: ledger });
+		assert.equal(f3.diff.triggers.some((t) => t.rule === "blocked_overdue"), false, "窗内不得重复提醒");
+		assert.equal(f3.next.projects[0]!.blockedOverdue, true, "载体仍为 true（只是被节流）");
+		assert.equal(f3.next.projects[0]!.blockedOverdueLastAt, NOW, "节流时刻沿用，不被未发射帧刷成新值");
+		// 帧4（t0+61min）：窗过期 ⇒ 再提醒
+		const f4 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f3.next, now: NOW + 61 * 60_000, supervision: ledger });
+		assert.deepEqual(f4.diff.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId), [BTAB], "窗过期必须再提醒");
+		assert.equal(f4.next.projects[0]!.blockedOverdueLastAt, NOW + 61 * 60_000);
+		// 不变式：节流值恒为 ≥1h（常量校验，防被悄悄调小）
+		assert.equal(BLOCKED_OVERDUE_THROTTLE_MS, 3_600_000, "节流窗必须 1h");
+	});
+
+	check("SUP-B4 不越界：BLOCKED_USER 项目 stagnation===false；STALLED 项目仍发 stagnation 且 blockedOverdue===false", () => {
+		// (a) BLOCKED_USER：stagnation 绝不为 true（stagnation 只认 STALLED，一行未改）
+		const a = twoFrames([mkOdTab()], [mkOdLedger()]);
+		assert.equal(a.next.projects[0]!.stagnation, false, "BLOCKED_USER 不得变成 stagnation");
+		assert.equal(a.diff.triggers.some((t) => t.rule === "stagnation"), false);
+		// (b) STALLED：waiting+stop=stop+idle 16min ⇒ STALLED ⇒ stagnation 依然边沿触发，但 blockedOverdue=false
+		// 边沿需要 prev.stagnation=false 作起点（用 makePrevSnap 手写，避免基线帧自己已带 stagnation=true）
+		const stalledTab = mkOdTab({ stop: "stop", idleMs: 16 * 60_000 });
+		const b = buildFrontier({
+			snapshot: makeSnapshot([stalledTab]),
+			backlog: [],
+			prev: makePrevSnap(NOW - 60_000, [makeProject({ project: K, runs: { [BTAB]: "waiting" }, stagnation: false })]),
+			now: NOW,
+			supervision: [mkOdLedger()],
+		});
+		assert.equal(b.next.projects[0]!.supervision.state, "STALLED", "夹具必须落在 STALLED");
+		assert.deepEqual(b.diff.triggers.map((t) => t.rule), ["stagnation"], "STALLED 仍只发 stagnation");
+		assert.equal(b.next.projects[0]!.stagnation, true);
+		assert.equal(b.next.projects[0]!.blockedOverdue, false, "STALLED 不得同时被算成 blocked_overdue");
+	});
+
+	check("SUP-B5 静默优先：账本 paused / optOut=true + idle 2h ⇒ 无 blocked_overdue（不问不动）", () => {
+		const tabs = [mkOdTab({ idleMs: 120 * 60_000 })];
+		for (const [label, ledger] of [
+			["paused", [mkOdLedger({ status: "paused" })]] as const,
+			["optOut", [mkOdLedger({ optOut: true })]] as const,
+		]) {
+			const { next, diff } = twoFrames(tabs, ledger as FrontierSupervision[]);
+			assert.equal(diff.triggers.some((t) => t.rule === "blocked_overdue"), false, `${label}：不得提醒`);
+			assert.equal(next.projects[0]!.blockedOverdue, false, `${label}：载体不得为 true`);
+		}
+	});
+
+	check("SUP-B6 无账本：NOT_MONITORED 项目 ⇒ 无 blocked_overdue（不猜）+ supervision 不可读时零崩溃", () => {
+		// (a) supervision 字段缺省（undefined ⟺ 账本目录不存在）
+		const noLedger = buildFrontier({ snapshot: makeSnapshot([mkOdTab({ idleMs: 120 * 60_000 })]), backlog: [], prev: null, now: NOW });
+		const f2 = buildFrontier({
+			snapshot: makeSnapshot([mkOdTab({ idleMs: 120 * 60_000 })]),
+			backlog: [], prev: noLedger.next, now: NOW + 60_000,
+		});
+		assert.equal(f2.diff.triggers.some((t) => t.rule === "blocked_overdue"), false, "无账本不得猜");
+		assert.equal(f2.next.projects[0]!.supervision.state, "NOT_MONITORED");
+		assert.equal(f2.next.projects[0]!.blockedOverdue, false);
+		// (b) 空账本数组（账本目录存在但无条目）⇒ 同上
+		const { next, diff } = twoFrames([mkOdTab({ idleMs: 120 * 60_000 })], []);
+		assert.equal(diff.triggers.some((t) => t.rule === "blocked_overdue"), false);
+		assert.equal(next.projects[0]!.blockedOverdue, false);
+	});
+
+	check("SUP-B7 逾期键取最重：多 tab 时 runId = idle 最大的那个（确定性）", () => {
+		const tabs = [
+			mkOdTab({ runId: "tab_od_a", idleMs: 31 * 60_000 }),
+			mkOdTab({ runId: "tab_od_b", idleMs: 90 * 60_000 }),
+		];
+		const ledger = [
+			mkOdLedger({ runId: "tab_od_a" }),
+			mkOdLedger({ runId: "tab_od_b" }),
+		];
+		const { next, diff } = twoFrames(tabs, ledger);
+		const od = diff.triggers.filter((t) => t.rule === "blocked_overdue");
+		assert.equal(od.length, 1, "项目级只出一条（节流键单值）");
+		assert.equal(od[0]!.runId, "tab_od_b", "必须取 idle 最大的 tab");
+		assert.match(od[0]!.evidence, /idleMin=90/, "证据里的 idle 必须是该 runId 自身，不是项目 max 的串味");
+		assert.equal(next.projects[0]!.blockedOverdueRunId, "tab_od_b");
 	});
 }
 

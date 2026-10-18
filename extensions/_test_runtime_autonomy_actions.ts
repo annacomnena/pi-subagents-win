@@ -844,7 +844,7 @@ check("预算常量硬编码（设计 §2；不可经 config 放大）", () => {
 	assert.equal(BUDGET.consecFailLimit, 2);
 	assert.equal(BUDGET.maxReadBytes, 256 * 1024);
 	assert.equal(BUDGET.maxWallClockMs, 5000);
-	assert.equal(TRIGGER_ALLOWLIST.size, 4); // 扩容：working_to_failed + stagnation + needs_user + expected_event_timeout
+	assert.equal(TRIGGER_ALLOWLIST.size, 5); // 扩容：working_to_failed + stagnation + needs_user + expected_event_timeout + blocked_overdue（2026-10-18 G1-1）
 	assert.equal(ACTION_CLASS_ALLOWLIST.size, 2); // diagnostic-report + notify-local-master
 });
 check("config 归一：actions 严格 === true；缺键/垃圾 = false", () => {
@@ -1542,6 +1542,100 @@ check("回放③「能不能撤」：queryActionsUndo 三终态 + 快照缺失 �
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// ════════════════════════ 2026-10-18 G1-1：blocked_overdue 动作面真实接线（验证 B）════════════════════════
+// 任务书 `plans/20261018_group1_task_brief.md`「验证 B」；实现规格 §4.2。
+// 目的：证明「新 trigger 进了 TRIGGER_CLASS_MAP 且**只**映射 notify」在**真实动作编排**上成立
+// （不是只断言映射表字面量；AGENTS R-4：断言必须经过真实入口 runAutonomyActions）。
+// 夹具形状：frontier 快照由 buildFrontier 产出的**同一 trigger 形状**手写（含 runId 字段）。
+console.log("G1-1 blocked_overdue 动作面接线（只 notify / 默认关闭零行为 / 1h 去重）");
+{
+	/** 写一份含 blocked_overdue 触发的 frontier 快照（形状对齐 frontier.ts 的发射字段）。 */
+	function writeBlockedOverdueFrontier(state: string, asof: number, runId = "r1"): void {
+		writeFrontierSnapshot(
+			{
+				asof,
+				baseline: false,
+				projects: [
+					{
+						project: NT_PROJECT, state: "Working", variant: "waiting", gate: "ok", runs: { [runId]: "waiting" },
+						needsUser: true, resultMissing: false, stagnation: false, blockedOverdue: true,
+						blockedOverdueRunId: runId,
+						supervision: { state: "BLOCKED_USER", idleMs: 31 * 60_000, epochPushes: 0 },
+						overdue: 0, overdueRequests: [], meaningfulStateVersion: 1,
+					},
+				],
+				triggers: [
+					{ rule: "blocked_overdue", project: NT_PROJECT, evidence: `blocked_overdue:run=${runId}:idleMin=31`, approximate: false, runId },
+				],
+			},
+			{ stateDir: state },
+		);
+	}
+
+	check("G1-1(a) TRIGGER_CLASS_MAP：blocked_overdue 只映 notify（不含 diagnostic-report）+ 已进 allowlist", () => {
+		assert.deepEqual(TRIGGER_CLASS_MAP["blocked_overdue"], ["notify-local-master"], "只提醒，不落诊断报告");
+		assert.equal(TRIGGER_ALLOWLIST.has("blocked_overdue"), true);
+		assert.equal(
+			TRIGGER_CLASS_MAP["blocked_overdue"]!.includes("diagnostic-report"),
+			false,
+			"blocked_overdue 不得映射 diagnostic-report（避免噪音 + 不占 1/tick 预算）",
+		);
+	});
+
+	check("G1-1(b) cfgOn + scope owner 在位 ⇒ actions.jsonl 出现 notify-local-master executed，且零 diagnostic-report 事件", () => {
+		const { root, state, cfgOn } = freshState("bo-run");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) }); // scope owner 在位
+			writeBlockedOverdueFrontier(state, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+			const events = readActionsTail({ stateDir: state, limit: 50 });
+			const notify = events.filter((e) => e.actionClass === "notify-local-master" && e.trigger?.rule === "blocked_overdue");
+			assert.deepEqual(notify.map((e) => e.kind), ["attempted", "precheck", "executed", "postverified"], `notify 四行齐全，实得 ${JSON.stringify(events.map((e) => [e.actionClass, e.kind, e.reason]))}`);
+			assert.equal(events.some((e) => e.actionClass === "diagnostic-report"), false, "不得出现 diagnostic-report（blocked_overdue 只 notify）");
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 1, "恰一个信件落盘（notify 效应面）");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(c) 对照：cfgOff（无 actions 键）⇒ 零动作事件、零新文件（默认关闭零行为不回归）", () => {
+		const { root, state, cfgOff } = freshState("bo-off");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+			writeBlockedOverdueFrontier(state, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOff, sessionId: sid, now: NOW });
+			assert.deepEqual(readActionsTail({ stateDir: state, limit: 50 }), [], "actions.jsonl 零事件");
+			assert.equal(existsSync(join(state, "autonomy", "actions")), false, "autonomy/actions 目录未创建");
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 0, "mailbox 零信件");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(d) 再一 tick（+60s）⇒ skipped(reason===\"cooldown\")（沿用 1h 去重，不刷屏）", () => {
+		const { root, state, cfgOn } = freshState("bo-cooldown");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(NT_PROJECT)) });
+			writeBlockedOverdueFrontier(state, NOW);
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 1, "首 tick 投递一封");
+			writeBlockedOverdueFrontier(state, NOW + 60_000); // 下一 tick 的快照（真实生产：frontier 每 tick 重写）
+			runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW + 60_000 });
+			const ev = readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.trigger?.rule === "blocked_overdue");
+			assert.ok(
+				ev.some((e) => e.kind === "skipped" && e.reason === "cooldown" && e.actionClass === "notify-local-master"),
+				`第二 tick 必须 SKIP(cooldown)，实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`,
+			);
+			assert.equal(listFilesRecursive(defaultMailboxDir()).length, 1, "第二 tick 不得再投一封");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+}
 
 // ── 小件 ─────────────────────────────────────────────────────────────
 function dirnameOf(p: string): string {

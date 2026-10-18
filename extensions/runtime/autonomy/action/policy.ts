@@ -26,12 +26,18 @@ export const ACTION_CLASS_ALLOWLIST: ReadonlySet<string> = new Set(["diagnostic-
  *      诊断记录需求已由 ③⑨⑧ 覆盖，不给 ⑤ 额外面）
  *   ⑧ expected_event_timeout → 仅诊断报告（设计 §4 诊断类第二成员 + eval「仅诊断类」；
  *      ⑧ 是 level 触发，映射 notify 会放大信件面）
+ *   ⑨b blocked_overdue → **仅 notify**（BLOCKED_USER 且超龄 > userMs）：本规则存在的理由就是
+ *      “已经卡住并在等人、而且已经等了很久”要在机器链路上出声。若再映射 diagnostic-report：
+ *       - 诊断面已由 ③⑨⑧ 覆盖，本规则不携带新的诊断信息（evidence 只有 run/idle）；
+ *       - 它是 level 触发（每 runId ≤1 次/小时），带 report 类会让 1/tick 预算被它长期占住。
+ *       ⇒ 只提醒，不落诊断报告（避免噪音）。
  */
 export const TRIGGER_CLASS_MAP: Readonly<Record<string, readonly string[]>> = {
 	working_to_failed: ["diagnostic-report", "notify-local-master"],
 	stagnation: ["diagnostic-report", "notify-local-master"],
 	needs_user: ["notify-local-master"],
 	expected_event_timeout: ["diagnostic-report"],
+	blocked_overdue: ["notify-local-master"], // 只提醒，**不映射 diagnostic-report**（避免噪音）
 };
 
 /** v1 trigger 白名单（由 TRIGGER_CLASS_MAP 派生；对外导出兼容）。 */

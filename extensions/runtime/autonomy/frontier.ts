@@ -53,6 +53,7 @@ export type FrontierRule =
 	| "deadline_urgency" // ⑦ approx：timer overdue 0→正（auto-push timer ≠ 真 deadline，明示近似）
 	| "expected_event_timeout" // ⑧（0928 P2）：账本存在时 level 触发；无账本 → record-only(no-carrier)
 	| "stagnation" // ⑨ 实做
+	| "blocked_overdue" // BLOCKED_USER ∧ idle > userMs（超龄无人处理：周期提醒，节流 ≤1 次/小时/runId）
 	| "ws_mail_backlog"; // 未消费 ws-mail 到信
 
 export interface FrontierTrigger {
@@ -63,6 +64,8 @@ export interface FrontierTrigger {
 	/** ⑧（0928 P2 加法）：触发对应的期望主键 + 修订号（wake 级 ack 表按 `<id>:r<rev>` 键）。 */
 	requestId?: string;
 	requestRev?: number;
+	/** blocked_overdue：逾期最重的 runId（节流键；其余规则缺省）。 */
+	runId?: string;
 }
 
 export type ProjectState = "Working" | "Blocked" | "Completed" | "Failed" | "Cancelled";
@@ -86,6 +89,15 @@ export const SUPERVISION_THRESHOLDS = {
 	userMs: 30 * 60_000,
 	hangMs: 60 * 60_000,
 } as const;
+
+/**
+ * blocked_overdue 节流窗（1h；≤1 次/小时/runId，沿用 push 预算纪律）。
+ *
+ * 语义登记：节流状态**只**落在 frontier 快照的 `blockedOverdueLastAt` 上（派生缓存，C4）。
+ * 若 frontier.json 被删/损坏 ⇒ 基线帧重建 ⇒ 节流状态丢失 ⇒ 同一 runId 最多**多提醒一次**
+ *（“宁可重发，不可漏发”，与 AGENTS R-5 取舍方向一致；不另立第二真相源）。
+ */
+export const BLOCKED_OVERDUE_THROTTLE_MS = 3_600_000;
 
 /** 监管输入（collect 只读账本后装配；`undefined` ⟺ 账本目录不存在 ⟺ 全 NOT_MONITORED）。 */
 export interface FrontierSupervision {
@@ -134,6 +146,16 @@ export interface ProjectFrontier {
 	 * 旧语义（`非终态 staleOver(45min) ∨ resultMissing`）已拆除：前者无分级时基、后者与时间无关。
 	 */
 	stagnation: boolean;
+	/**
+	 * ⑨b 载体（2026-10-18 G1-1）：存在「监管账本 active ∧ 派生 BLOCKED_USER ∧ idleMs > userMs」的 tab。
+	 * 与 `stagnation` **正交**（STALLED vs BLOCKED_USER 互斥）：它回答的是「已卡住并在等人，而且已经
+	 * 超龄超过 USER 阈值太久」——周期提醒，不是边沿。
+	 */
+	blockedOverdue: boolean;
+	/** blocked_overdue 的节流键（上一帧已提醒的 runId；无则缺省）。 */
+	blockedOverdueRunId?: string;
+	/** blocked_overdue 上次提醒时刻（epoch ms；节流窗 1h）。 */
+	blockedOverdueLastAt?: number;
 	/** 监管派生态（P0 新增）：state 六态 + idleMs + epoch 推动次数。无账本 = NOT_MONITORED。 */
 	supervision: ProjectSupervision;
 	/** ⑦ approx 载体：TabDetail.overdue（repo 级 timer overdue 回填值）。 */
@@ -343,7 +365,7 @@ export function deriveTabSupervisionState(input: {
 	return "ACTIVE";
 }
 
-type ProjectCore = Omit<ProjectFrontier, "meaningfulStateVersion">;
+type ProjectCore = Omit<ProjectFrontier, "meaningfulStateVersion" | "blockedOverdueLastAt">;
 
 /**
  * 单 repo 聚合（纯）：只消费 FrontierSourceTab 结构化字段，不解析任何展示文本（约束 9）。
@@ -384,11 +406,28 @@ function aggregateProject(
 	const states: SupervisionState[] = [];
 	let idleMs: number | null = null;
 	let epochPushes = 0;
+	// ⑨b blocked_overdue：与六态派生**同一处、同一循环**累计（必须复用派生结果，不重写判据）。
+	let blockedOverdue = false;
+	let blockedOverdueRunId: string | undefined;
+	let blockedOverdueIdleMs = -1;
 	for (const t of tabs) {
 		const ledger = ledgerByRun.get(t.runId);
-		states.push(deriveTabSupervisionState({ tab: t, ledger, attention }));
+		const st = deriveTabSupervisionState({ tab: t, ledger, attention });
+		states.push(st);
 		if (ledger) epochPushes += Number.isFinite(ledger.epochPushes) ? ledger.epochPushes : 0;
 		if (typeof t.idleMs === "number" && Number.isFinite(t.idleMs)) idleMs = idleMs === null ? t.idleMs : Math.max(idleMs, t.idleMs);
+		// ⑨b：BLOCKED_USER（在等人）且已超龄 > userMs ⇒ 周期提醒载体（stagnation 管 STALLED，两者互斥）。
+		const userMs =
+			typeof ledger?.userMs === "number" && Number.isFinite(ledger.userMs) && ledger.userMs > 0
+				? ledger.userMs
+				: SUPERVISION_THRESHOLDS.userMs;
+		if (st === "BLOCKED_USER" && typeof t.idleMs === "number" && Number.isFinite(t.idleMs) && t.idleMs > userMs) {
+			blockedOverdue = true;
+			if (t.idleMs > blockedOverdueIdleMs) {
+				blockedOverdueIdleMs = t.idleMs;
+				blockedOverdueRunId = t.runId; // 取逾期最重的那个 tab 作节流键（确定性）
+			}
+		}
 	}
 	if (states.length > 0) {
 		const worst = [...states].sort((a, b) => SUPERVISION_RANK[a] - SUPERVISION_RANK[b])[0];
@@ -399,7 +438,21 @@ function aggregateProject(
 	const overdue = tabs.reduce((m, t) => Math.max(m, t.overdue), 0);
 	const runs: Record<string, string> = {};
 	for (const t of tabs) runs[t.runId] = t.phase;
-	return { project, state, variant, gate, runs, needsUser, resultMissing, stagnation, supervision, overdue, overdueRequests: [] };
+	return {
+		project,
+		state,
+		variant,
+		gate,
+		runs,
+		needsUser,
+		resultMissing,
+		stagnation,
+		blockedOverdue,
+		...(blockedOverdueRunId ? { blockedOverdueRunId } : {}),
+		supervision,
+		overdue,
+		overdueRequests: [],
+	};
 }
 
 /**
@@ -458,6 +511,8 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0, ledgerByRun));
 
 	const triggers: FrontierTrigger[] = [];
+	// ⑨b blocked_overdue 本帧是否已发射（按项目键；用于把节流状态落到 next.projects）。
+	const blockedOverdueEmitted = new Set<string>();
 	// R4：未消费到信（pending>0）是可唤醒的真实输入，不消费/ack 邮件。
 	// 以当前 backlog 状态产生 trigger；无到信时不改变任何既有输出。
 	for (const mail of inputs.backlog) {
@@ -524,6 +579,27 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 			if (!pv.stagnation && cur.stagnation) {
 				triggers.push({ rule: "stagnation", project: key, evidence: "stagnation:false→true", approximate: false });
 			}
+			// ⑨b blocked_overdue（level + 1h/runId 节流；基线帧同样压制）。
+			// 与 ⑨ 正交：⑨ 管 STALLED，本规则管「BLOCKED_USER 且超龄 > userMs」——原来的永久静默区。
+			// 证据里的 idle 取**该 runId 自身**的 idle（不是项目 max），否则会把“别的 tab 停得久”当成本 tab 的逾期度。
+			if (cur.blockedOverdue && cur.blockedOverdueRunId) {
+				const prevSameRun = pv.blockedOverdue === true && pv.blockedOverdueRunId === cur.blockedOverdueRunId;
+				const lastAt = prevSameRun && typeof pv.blockedOverdueLastAt === "number" && Number.isFinite(pv.blockedOverdueLastAt) ? pv.blockedOverdueLastAt : null;
+				if (lastAt === null || now - lastAt >= BLOCKED_OVERDUE_THROTTLE_MS) {
+					const odTab = (tabsByRepo.get(key) ?? []).find((t) => t.runId === cur.blockedOverdueRunId);
+					const odIdleMs =
+						odTab && typeof odTab.idleMs === "number" && Number.isFinite(odTab.idleMs) ? odTab.idleMs : (cur.supervision.idleMs ?? 0);
+					const idleMin = Math.max(0, Math.round(odIdleMs / 60_000));
+					triggers.push({
+						rule: "blocked_overdue",
+						project: key,
+						evidence: `blocked_overdue:run=${cur.blockedOverdueRunId}:idleMin=${idleMin}`,
+						approximate: false,
+						runId: cur.blockedOverdueRunId,
+					});
+					blockedOverdueEmitted.add(key);
+				}
+			}
 		}
 	}
 
@@ -552,7 +628,23 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 			baseline || !pv
 				? 1
 				: pv.meaningfulStateVersion + ((triggerCountByRepo.get(key) ?? 0) > 0 || newOverdue ? 1 : 0);
-		projects.push({ ...core, overdueRequests: overdueIds, meaningfulStateVersion: version });
+		// ⑨b 节流状态（只落在这份派生缓存上；frontier.json 被删 ⇒ 最多多提醒一次，见 BLOCKED_OVERDUE_THROTTLE_MS 注释）。
+		// 与 spec §3.1.6 的差异（已在报告 §7 登记）：
+		//   spec 写「本帧 blockedOverdue 但未发射 ⇒ 若无 pv.lastAt 则置 now」，但那条分支在**新项目首次出现 /
+		//   runId 切换**时会把它自己变成漏发路径（从未发过通知，却被静默 1h）。这里改为「未发射 ⇒ 只沿用
+		//   pv 的 lastAt，无则缺省」：下帧必发（prevSameRun ∧ lastAt===null ⇒ 发射），不可能风暴，也不可能漏发。
+		const lastAt =
+			blockedOverdueEmitted.has(key)
+				? now
+				: core.blockedOverdue && pv && typeof pv.blockedOverdueLastAt === "number" && Number.isFinite(pv.blockedOverdueLastAt)
+					? pv.blockedOverdueLastAt
+					: undefined;
+			projects.push({
+				...core,
+				overdueRequests: overdueIds,
+				...(lastAt !== undefined ? { blockedOverdueLastAt: lastAt } : {}),
+				meaningfulStateVersion: version,
+			});
 	}
 
 	return {

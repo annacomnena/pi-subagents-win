@@ -20,7 +20,7 @@
  * 运行：npx tsx extensions/_test_runtime_supervision_push.ts
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,10 +49,10 @@ import {
 	writeSupervisionEntry,
 	type SupervisionEntry,
 } from "./runtime/supervision.ts";
-import { appendAuditLine } from "./runtime/autonomy/collect.ts";
-import { buildWakePrompt, evaluateWakes, type WakeLetter } from "./runtime/wake.ts";
+import { appendAuditLine, writeFrontierSnapshot } from "./runtime/autonomy/collect.ts";
+import { buildWakePrompt, deriveSupervisionItems, evaluateWakes, type WakeLetter } from "./runtime/wake.ts";
 import { attachMaster, setCutover } from "./runtime/registry.ts";
-import { deliverLetter } from "./runtime/mailbox.ts";
+import { defaultMailboxDir, deliverLetter } from "./runtime/mailbox.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { createWorkstream } from "./runtime/workstreams.ts";
@@ -60,6 +60,10 @@ import { workstreamAddress } from "./runtime/address.ts";
 import { readSteerRecord, sendSteerDetailed } from "./steer.ts";
 import { composeTabStatus, readTabDispatch, readTabResultFile, readTabState, tabResultPath, writeJsonAtomic, writeTabDispatch, writeTabState, type TabDispatchRecord, type TabState } from "./tab-runs.ts";
 import { classifyForReclaim } from "./tab-runs-runtime.ts";
+import { buildScopeWakePrompt, evaluateScopeWake, localMasterAddress, localMasterScope } from "./runtime/scope.ts";
+import { runAutonomyActions } from "./runtime/autonomy/action/run.ts";
+import { buildFrontier } from "./runtime/autonomy/frontier.ts";
+import type { FrontierSourceTab } from "./runtime/frontier-carriers.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -1143,6 +1147,199 @@ console.log("10. 跨提交交互：兜底 unconfirmed 不得作为 terminal 证�
 			assert.equal((res as { reason: string }).reason, "terminal", `必须命中 terminal 门，实得 ${JSON.stringify(res)}`);
 			assert.equal(existsSync(join(iso10.steerDir, RUN)), false, "被拒时不得落盘 steer");
 		} finally { iso10.dispose(); }
+	});
+}
+
+// ════════════════════ 11. scope wake prompt 监管块（2026-10-18 G1-1 断点 ②）════
+// 任务书：`plans/20261018_group1_task_brief.md`；实现规格：`plans/20261018_group1_impl_spec.md` §2/§4.3。
+// 核心：`buildScopeWakePrompt` 第四参走**与 workstream 路同一套** deriveSupervisionItems/buildSupervisionBlock；
+// 无监管 ⇒ 输出与三参调用**逐字节相同**（冻结字面量断言，不是“调两次比两次”）。
+console.log("11. scope wake prompt 监管块（第四参 + repo 过滤 + 逐字节冻结）");
+{
+	const SCOPE11 = "GreenCAD";
+	const REPO11 = "G:/code/GreenCAD";
+	const L11: WakeLetter[] = [
+		{
+			messageId: "msg_scope_p1",
+			subject: "autonomy-notify/stagnation",
+			summary: "[autonomy] stagnation @ G:/code/GreenCAD",
+			sentAt: iso(60_000),
+			requiresAck: false,
+		},
+	];
+	// 手写冻结字面量（照 buildScopeWakePrompt 现有行序/标点写死）——不是“调两次比两次”。
+	const SCOPE_FROZEN = [
+		"你是仓库 GreenCAD 的本地 Sub-Master（local master v1 唤醒，有终态的一次执行）。",
+		"工作目录：G:/code/GreenCAD（本仓）",
+		"待处理输入（1）：",
+		"- [autonomy-notify/stagnation] [autonomy] stagnation @ G:/code/GreenCAD",
+		"规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经本地 wake 层；",
+		"无 actionable 输入时立即 tab-finish 报 no-op，不许挂等；",
+		"你不是全局 Master：不得调用 master-attach/master-transfer/master-cutover，不处理 run 完成回收（run 归派发者）。",
+	].join("\n");
+
+	check("11(a) 三参调用 ⇒ 与手写冻结字面量逐字节相同", () => {
+		assert.equal(buildScopeWakePrompt(SCOPE11, L11, REPO11), SCOPE_FROZEN);
+	});
+	check("11(b) 传 undefined / [] ⇒ 同样逐字节相同（空监管不得留下空行/空块）", () => {
+		assert.equal(buildScopeWakePrompt(SCOPE11, L11, REPO11, undefined), SCOPE_FROZEN);
+		assert.equal(buildScopeWakePrompt(SCOPE11, L11, REPO11, []), SCOPE_FROZEN);
+		// 无工作目录（repoCwd=null）分支也钉死（不传监管时不得多出空行）
+		const FROZEN_NO_CWD = SCOPE_FROZEN.split("\n").filter((l) => !l.startsWith("工作目录：")).join("\n");
+		assert.equal(buildScopeWakePrompt(SCOPE11, L11, null), FROZEN_NO_CWD);
+	});
+	check("11(c) 真账本（本仓 tab + stop=error）⇒ prompt 含 停滞监管 / runId / supervise-push", () => {
+		const rt = mkIsolated("scope-block");
+		try {
+			process.env.PI_RUNTIME_DIR = dirname(rt.stateDir);
+			const RUN_ID = "tab_scope_blocked";
+			writeTabDispatch(rt.runsDir, mkDispatch(RUN_ID, "T-SCOPE", REPO11));
+			writeTabState(rt.runsDir, RUN_ID, mkState(RUN_ID, { phase: "waiting", lastStopReason: "error", lastAssistantText: "连接错误卡住" }));
+			seedLedger(mkLedger(RUN_ID, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
+
+			// 走 evaluateScopeWake 的**同一派生函数**（不是手写 item）⇒ 证明生产参数形状正确
+			const items = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime(), repoPath: REPO11 });
+			assert.ok(items && items.length === 1, `本仓账本必须派生 1 条，实得 ${JSON.stringify(items)}`);
+			assert.equal(items![0]!.runId, RUN_ID);
+			const p = buildScopeWakePrompt(SCOPE11, L11, REPO11, items);
+			assert.ok(p.includes("停滞监管"), `prompt 必须含监管块标题：\n${p}`);
+			assert.ok(p.includes(RUN_ID), "prompt 必须含 runId");
+			assert.ok(p.includes('supervise-push({runId:"' + RUN_ID + '"})'), `prompt 必须含 supervise-push 指令：\n${p}`);
+			assert.notEqual(p, SCOPE_FROZEN, "非空监管必须与冻结字面量不同");
+			// 位置：待处理输入 之后 / 规则 之前（与 buildWakePrompt 同位置）
+			const atInput = p.indexOf("待处理输入（1）");
+			const atSup = p.indexOf("停滞监管");
+			const atRule = p.indexOf("规则：单次有界执行");
+			assert.ok(atInput >= 0 && atSup > atInput && atRule > atSup, `顺序不符 input=${atInput} sup=${atSup} rule=${atRule}`);
+			// 其余行零改动：去掉监管块返回冻结字面量
+			assert.equal(p.replace(p.slice(atSup, atRule), ""), SCOPE_FROZEN, "插入监管块不得改动任何既有行");
+		} finally {
+			rt.dispose();
+		}
+	});
+	check("11(d) 账本只有他仓条目 ⇒ 本仓 prompt 不含监管块（repo 过滤生效）", () => {
+		const rt = mkIsolated("scope-filter");
+		try {
+			process.env.PI_RUNTIME_DIR = dirname(rt.stateDir);
+			const OTHER_RUN = "tab_other_repo";
+			writeTabDispatch(rt.runsDir, mkDispatch(OTHER_RUN, "T-OTHER", "H:/code/battlesandbox"));
+			writeTabState(rt.runsDir, OTHER_RUN, mkState(OTHER_RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(OTHER_RUN, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
+
+			// 不过滤（workstream 路行为）⇒ 能看到；过滤到本仓 ⇒ undefined
+			const all = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime() });
+			assert.ok(all && all.length === 1, "不过滤时必须看得见他仓条目（workstream 路零变化）");
+			const mine = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime(), repoPath: REPO11 });
+			assert.equal(mine, undefined, "他仓条目必须被过滤掉（过滤后为空 ⇒ undefined）");
+			assert.equal(
+				buildScopeWakePrompt(SCOPE11, L11, REPO11, mine),
+				SCOPE_FROZEN,
+				"过滤后无条目 ⇒ prompt 必须逐字节回到冻结字面量",
+			);
+			// 子目录形状（dispatch.cwd 在本仓子目录）也必须命中
+			const SUB = "G:/code/GreenCAD/src/nested";
+			const SUB_RUN = "tab_sub_dir";
+			writeTabDispatch(rt.runsDir, mkDispatch(SUB_RUN, "T-SUB", SUB));
+			writeTabState(rt.runsDir, SUB_RUN, mkState(SUB_RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(SUB_RUN, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
+			const subItems = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime(), repoPath: REPO11 });
+			assert.ok(subItems && subItems.length === 1 && subItems[0]!.runId === SUB_RUN, "子目录中的 tab 必须算作本仓");
+		} finally {
+			rt.dispose();
+		}
+	});
+}
+
+// ════════════════════ 12. 端到端到执行者之前（真实入口，AGENTS R-4）════
+// 链：buildFrontier 产 blocked_overdue → writeFrontierSnapshot → runAutonomyActions（双层合取 + 映射 + 投递）
+//     → scope mailbox 真出现 msg_autonomy*.json → evaluateScopeWake 火起且 prompt 带监管块。
+// **不断言** supervise-push 被调用成功 —— 断点 #4（标签页身份门）见 e2e proof 报告。
+console.log("12. 端到端（到执行者之前）：frontier → actions → scope mailbox → scope wake prompt");
+{
+	const SCOPE12 = "autonomy-stage2-probe";
+	const PROJECT12 = "c:/tmp/autonomy-stage2-probe"; // 无主仓路径；scope = 末段 basename
+	const RUN12 = "tab_e2e_blocked";
+	const SESS12 = "sess-g1-e2e";
+
+	function mkSourceTab(over: Partial<FrontierSourceTab> = {}): FrontierSourceTab {
+		return {
+			runId: RUN12,
+			repoPath: PROJECT12,
+			phase: "waiting",
+			stop: "error", // ⇒ 六态派生 BLOCKED_USER
+			idleMs: 31 * 60_000, // > userMs 30min ⇒ blocked_overdue
+			needsHuman: true,
+			gate: "unknown",
+			staleOver: false,
+			overdue: 0,
+			resultMissing: false,
+			pidAlive: true,
+			...over,
+		};
+	}
+
+	check("12(a) 真链：blocked_overdue → actions 投信 autonomy-notify/blocked_overdue → scope wake fire 且 prompt 带监管块", () => {
+		const rt = mkIsolated("e2e-scope");
+		try {
+			const root = dirname(rt.stateDir);
+			process.env.PI_RUNTIME_DIR = root;
+			const mailboxDir = defaultMailboxDir();
+
+			// ① 执行者前置：真 dispatch/state/账本（执行者被推动时 supervisor 要读的那套）
+			writeTabDispatch(rt.runsDir, mkDispatch(RUN12, "T-E2E", PROJECT12));
+			writeTabState(rt.runsDir, RUN12, mkState(RUN12, { phase: "waiting", lastStopReason: "error", lastAssistantText: "连接错误卡住" }));
+			seedLedger(mkLedger(RUN12, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
+
+			// ② tick 检测：buildFrontier 两帧（基线 + 真差分）⇒ blocked_overdue 触发
+			const snap = () => ({
+				attentionByRepo: {} as Record<string, number>,
+				details: [mkSourceTab()],
+				history: [] as { id: string; reason: string }[],
+			});
+			const ledgerInput = [{ runId: RUN12, status: "active" as const, epochPushes: 0 }];
+			const f1 = buildFrontier({ snapshot: snap(), backlog: [], prev: null, now: NOW.getTime() - 60_000, supervision: ledgerInput });
+			const f2 = buildFrontier({ snapshot: snap(), backlog: [], prev: f1.next, now: NOW.getTime(), supervision: ledgerInput });
+			const od = f2.diff.triggers.filter((t) => t.rule === "blocked_overdue");
+			assert.equal(od.length, 1, `帧2 必须产 blocked_overdue，实得 ${JSON.stringify(f2.diff.triggers)}`);
+			assert.equal(od[0]!.runId, RUN12);
+			assert.equal(writeFrontierSnapshot(f2.next, { stateDir: rt.stateDir }), true, "frontier 快照必须落盘");
+
+			// ③ 动作面：真 config（autonomy.enabled ∧ actions.enabled）+ 全局 owner 在位 + scope owner 在位
+			const cfgOn = join(root, "actions-on.json");
+			writeFileSync(cfgOn, JSON.stringify({ autonomy: { enabled: true, actions: { enabled: true } } }), "utf8");
+			setCutover(true, "g1-e2e");
+			attachMaster({ sessionId: SESS12 }); // 全局 master owner（L0 isOwner）
+			const scope = localMasterAddress(localMasterScope(PROJECT12));
+			const att = attachMaster({ sessionId: SESS12, agent: scope, detail: PROJECT12 });
+			assert.equal(att.ok, true, `scope owner attach 必须成功：${JSON.stringify(att)}`);
+			assert.equal(localMasterScope(PROJECT12), SCOPE12, "夹具 scope 必须等于预期段");
+
+			runAutonomyActions({ stateDir: rt.stateDir, configPath: cfgOn, sessionId: SESS12, now: NOW.getTime() });
+
+			// ④ scope mailbox 真出现信件（existsSync + 读回 subject）
+			const scopeMailbox = join(mailboxDir, scope.replace(/[^A-Za-z0-9._-]/g, "_"));
+			const files = existsSync(scopeMailbox) ? readdirSync(scopeMailbox).filter((n) => n.startsWith("msg_autonomy")) : [];
+			assert.equal(files.length, 1, `scope mailbox 必须恰一封 msg_autonomy*.json，实得 ${JSON.stringify(files)}`);
+			// 落盘形状 = Letter 信封 { frame, status, expiresAt }（deliverLetter:108）⇒ 字段在 frame 里
+			const letter = JSON.parse(readFileSync(join(scopeMailbox, files[0]!), "utf8"));
+			assert.equal(letter.status, "pending", "信件必须是 pending（未被消费）");
+			assert.equal(letter.frame.subject, "autonomy-notify/blocked_overdue", "信件 subject 必须是本规则");
+			assert.equal(letter.frame.to, scope, "信件必须投到本仓 scope master");
+			assert.equal(letter.frame.body.details.rule, "blocked_overdue", "信件 details.rule 必须是本规则");
+
+			// ⑤ 执行者被拉起：evaluateScopeWake 真实入口 ⇒ fire + prompt 带监管块 + 目标 runId
+			const d = evaluateScopeWake({
+				sessionId: SESS12, scope: SCOPE12, stateDir: rt.stateDir, runsDir: rt.runsDir, mailboxDir, now: NOW.getTime(),
+			});
+			assert.equal(d.fire, true, `scope wake 必须 fire，实得 ${JSON.stringify({ ...d, prompt: undefined })}`);
+			assert.equal(d.repoCwd, PROJECT12, "repoCwd 读回 attachment.detail");
+			assert.ok(d.prompt!.includes("blocked_overdue"), `prompt 必须带回本规则名：\n${d.prompt}`);
+			assert.ok(d.prompt!.includes("停滞监管"), `prompt 必须含监管块：\n${d.prompt}`);
+			assert.ok(d.prompt!.includes(RUN12), "prompt 必须含目标 runId（执行者据此调 supervise-push）");
+			assert.ok(d.prompt!.includes("supervise-push"), "prompt 必须含 supervise-push 指令");
+		} finally {
+			rt.dispose();
+		}
 	});
 }
 
