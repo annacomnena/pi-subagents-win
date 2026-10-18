@@ -17,6 +17,12 @@ import { join } from "node:path";
 delete (process.env as Record<string, string | undefined>).PI_SUBAGENT;
 delete (process.env as Record<string, string | undefined>).PI_TAB_RUN_ID;
 delete (process.env as Record<string, string | undefined>).PI_SESSION_PROFILE;
+// 本文件只测门（④⑤ 段走真实 runWithFallback 到 spawn 路径），**不测同模型重试**。
+// 不关重试会踩两个坑：① 默认退避 30s/60s；② 更致命的是每个候选 3 次尝试 × 5s stall 超时
+// ⇒ 3 候选 × 3 次 = 9 次 spawn（旧行为 3 次），整套从秒级涨到分钟级（实测 2m11s）。
+// 重试语义由 `_test_model_retry.ts` 专门验证，这里用测试缝隙 `maxSameModel=0` 锁回旧行为。
+process.env.PI_SUBAGENT_RETRY_MAX = "0";
+process.env.PI_SUBAGENT_RETRY_BACKOFF_MS = "5";
 
 let failed = 0;
 function check(label: string, cond: boolean): void {
