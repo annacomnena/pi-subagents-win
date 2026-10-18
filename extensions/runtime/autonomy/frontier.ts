@@ -93,7 +93,10 @@ export const SUPERVISION_THRESHOLDS = {
 /**
  * blocked_overdue 节流窗（1h；≤1 次/小时/runId，沿用 push 预算纪律）。
  *
- * 语义登记：节流状态**只**落在 frontier 快照的 `blockedOverdueLastAt` 上（派生缓存，C4）。
+ * 语义登记：节流状态的**权威账本**是 frontier 快照**顶层**的 `FrontierSnapshot.blockedOverdueThrottle`
+ *（派生缓存，C4）；`ProjectFrontier.blockedOverdueLastAt` 只是它在项目上的**投影**（供展示/测试）。
+ * 为什么权威在顶层：项目可能整帧从可见集合消失（tab 全变终态被 hidden / 进程重启 / 瞬时无 tab），
+ * 若账本挂在项目上就会随项目一起丢失（返工 R3 修的就是这个洞）。
  * 若 frontier.json 被删/损坏 ⇒ 基线帧重建 ⇒ 节流状态丢失 ⇒ 同一 runId 最多**多提醒一次**
  *（“宁可重发，不可漏发”，与 AGENTS R-5 取舍方向一致；不另立第二真相源）。
  */
@@ -163,9 +166,12 @@ export interface ProjectFrontier {
 	 */
 	blockedOverdueRunIds?: string[];
 	/**
-	 * blocked_overdue 节流账（runId → 上次提醒时刻 epoch ms；≤1 次/小时/runId）。
-	 * 按 runId 而非按项目记：项目内 tab 交替成为「最重」时，各自节流互不覆盖（否则同一 runId
-	 * 会在窗内被重复提醒）。只落派生缓存；`frontier.json` 被删 ⇒ 最多多提醒一次（R-5 方向）。
+	 * blocked_overdue 节流账的**投影**（runId → 上次提醒时刻 epoch ms；≤1 次/小时/runId）。
+	 *
+	 * **权威账本在快照顶层** `FrontierSnapshot.blockedOverdueThrottle[projectKey]`（返工 R3）：
+	 * 本字段 = `snapshot.blockedOverdueThrottle[project]` 的投影，只在「本项目本帧出现在 `projects` 里
+	 * 且账本非空」时存在。**发射判定不得读本字段**——项目整帧不可见时它不存在，读它会把该项目所有
+	 * runId 当作「从未提醒」而窗内重发（主会话 300 帧对抗走查实测 5 次）。仅供展示/测试/图投影。
 	 */
 	blockedOverdueLastAt?: Record<string, number>;
 	/** 监管派生态（P0 新增）：state 六态 + idleMs + epoch 推动次数。无账本 = NOT_MONITORED。 */
@@ -184,6 +190,17 @@ export interface FrontierSnapshot {
 	triggers: FrontierTrigger[];
 	/** true = 首帧（prev=null）：只建基线，不算触发，防冷启动风暴。 */
 	baseline: boolean;
+	/**
+	 * ⑨b blocked_overdue 的 **per-runId 1h 节流账**（projectKey → runId → 上次提醒时刻 epoch ms）。
+	 *
+	 * 为什么放**快照顶层**而不是 `ProjectFrontier.blockedOverdueLastAt`：项目可能整帧从可见集合消失
+	 * （tab 全变终态被 hidden / 进程重启 / 瞬时无 tab），此时该项目不在 `next.projects` 里 ⇒ 若账本
+	 * 挂在项目上就会**整块丢失**，重现后所有 runId 都被当作「从未提醒」而立刻重发（主会话 300 帧
+	 * 对抗走查实测 5 次窗内重发）。节流语义是「这个 runId 多久前被提醒过」，与“本帧能否看到它”无关。
+	 *
+	 * 只落派生缓存；`frontier.json` 被删/损坏 ⇒ 最多多提醒一次（R-5「宁可重发不可漏发」同方向）。
+	 */
+	blockedOverdueThrottle?: Record<string, Record<string, number>>;
 }
 
 export interface FrontierDiff {
@@ -525,8 +542,12 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	for (const [k, tabs] of tabsByRepo) nextCores.set(k, aggregateProject(k, tabs, attentionByRepo[k] ?? 0, ledgerByRun));
 
 	const triggers: FrontierTrigger[] = [];
-	// ⑨b blocked_overdue 本帧已发射（project → 本帧发射的 runId；用于把节流账落到 next.projects）。
+	// ⑨b blocked_overdue 本帧已发射（project → 本帧发射的 runId；用于把节流账落到顶层 + 项目投影）。
 	const blockedOverdueEmitted = new Map<string, string>();
+	// ⑨b 节流账**权威来源** = prev 快照**顶层** `blockedOverdueThrottle`（返工 R3）。
+	// 不用 `pv.blockedOverdueLastAt`：那是投影，项目整帧不可见时就没了。
+	const prevThrottleAll: Record<string, Record<string, number>> =
+		prev?.blockedOverdueThrottle && typeof prev.blockedOverdueThrottle === "object" ? prev.blockedOverdueThrottle : {};
 	// R4：未消费到信（pending>0）是可唤醒的真实输入，不消费/ack 邮件。
 	// 以当前 backlog 状态产生 trigger；无到信时不改变任何既有输出。
 	for (const mail of inputs.backlog) {
@@ -600,8 +621,10 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 			// 每项目每帧最多发 1 条（沿用既有形状，防一次刷屏）。按 runId 而非按「当前最重」判窗，
 			// 否则项目内两个 tab 交替成为最重时，同一 runId 会在 1h 窗内被重复提醒。
 			if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.length > 0) {
-				const prevLedger =
-					pv.blockedOverdueLastAt && typeof pv.blockedOverdueLastAt === "object" ? pv.blockedOverdueLastAt : {};
+				// 节流来源 = **顶层账本**（与项目可见性解耦）。读 `pv.blockedOverdueLastAt` 会在
+				// 「项目整帧消失后重现」时读到空 ⇒ 全部当「从未提醒」⇒ 窗内重发（返工 R3）。
+				const prevProjLedger = prevThrottleAll[key];
+				const prevLedger = prevProjLedger && typeof prevProjLedger === "object" ? prevProjLedger : {};
 				for (const rid of cur.blockedOverdueRunIds) {
 					const last = prevLedger[rid];
 					if (typeof last === "number" && Number.isFinite(last) && now - last < BLOCKED_OVERDUE_THROTTLE_MS) continue; // 该 runId 窗内
@@ -638,6 +661,27 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 	}
 
 	const projects: ProjectFrontier[] = [];
+	// ⑨b **顶层节流账**（per-runId，与项目可见性解耦；返工 R3 核心）：
+	//   ① 继承 prev 全部项目（**包括本帧未出现的项目**），只按 1h 时间窗裁剪；
+	//   ② 本帧发射的 runId 记 now。
+	// 时间窗裁剪同时给出上界（账本只含最近 1h 的条目），不需要按项目可见性剪。
+	// 与 spec §3.1.6 的字面差异（未发射且 prev 无记录 ⇒ 不预置 now）见 plans/20261018_group1_impl.md §7 D1：
+	//   预置 now 会把「首次发现」自己静默 1h（漏发）；这里不预置 ⇒ 下帧必发，不可能风暴也不可能漏发。
+	const nextThrottle: Record<string, Record<string, number>> = {};
+	for (const [proj, ledger] of Object.entries(prevThrottleAll)) {
+		if (!ledger || typeof ledger !== "object") continue;
+		const kept: Record<string, number> = {};
+		for (const [rid, ts] of Object.entries(ledger)) {
+			if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
+			if (now - ts >= BLOCKED_OVERDUE_THROTTLE_MS) continue; // 窗已过期 ⇒ 出账（上界由此保证）
+			kept[rid] = ts;
+		}
+		if (Object.keys(kept).length > 0) nextThrottle[proj] = kept;
+	}
+	for (const [proj, rid] of blockedOverdueEmitted) {
+		(nextThrottle[proj] ??= {})[rid] = now;
+	}
+
 	for (const key of [...nextCores.keys()].sort()) {
 		const core = nextCores.get(key)!;
 		const pv = prevByRepo.get(key);
@@ -648,34 +692,26 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 			baseline || !pv
 				? 1
 				: pv.meaningfulStateVersion + ((triggerCountByRepo.get(key) ?? 0) > 0 || newOverdue ? 1 : 0);
-		// ⑨b 节流账（per-runId，只落在这份派生缓存上；frontier.json 被删 ⇒ 最多多提醒一次）。
-		// 写入：本帧发射的 runId 记 now；其余**沿用 prev**。
-		// 裁剪：**按时间窗**（只留 now-ts < THROTTLE 的条目），**不按「本帧是否仍超龄」**——
-		//   按超龄集合裁剪会把「tab 短暂活动（idle 掉回阈值下）」误当成节流到期：
-		//   键被剔除后 tab 再超龄就会在 1h 窗内重发（返工 R2，主会话实测 t0+10 发、t0+20 又发）。
-		//   时间窗裁剪同时天然给出上界（账本只含最近 1h 的条目，不无界增长）。
-		// 与 spec §3.1.6 的字面差异（未发射且 prev 无记录 ⇒ 不预置 now）见 plans/20261018_group1_impl.md §7 D1：
-		//   预置 now 会把「首次发现」自己静默 1h（漏发）；这里不预置 ⇒ 下帧必发，不可能风暴也不可能漏发。
-		const emittedRid = blockedOverdueEmitted.get(key);
-		const prevLedger =
-			pv && pv.blockedOverdueLastAt && typeof pv.blockedOverdueLastAt === "object" ? pv.blockedOverdueLastAt : undefined;
-		let nextLedger: Record<string, number> | undefined;
-		for (const [rid, ts] of Object.entries(prevLedger ?? {})) {
-			if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
-			if (now - ts >= BLOCKED_OVERDUE_THROTTLE_MS) continue; // 窗已过期 ⇒ 出账（上界由此保证）
-			(nextLedger ??= {})[rid] = ts;
-		}
-		if (emittedRid) (nextLedger ??= {})[emittedRid] = now;
+		// ⑨b `blockedOverdueLastAt` = **顶层账本在项目上的投影**（供展示/图投影/测试）。
+		// 权威在 `next.blockedOverdueThrottle`；本字段**不作为**发射判定来源（项目整帧不可见时它不存在）。
+		// 裁剪语义（按时间窗、不按「本帧是否仍超龄」）已在顶层账本处统一完成（返工 R2/R3）。
+		const projLedger = nextThrottle[key];
 		projects.push({
 			...core,
 			overdueRequests: overdueIds,
-			...(nextLedger && Object.keys(nextLedger).length > 0 ? { blockedOverdueLastAt: nextLedger } : {}),
+			...(projLedger && Object.keys(projLedger).length > 0 ? { blockedOverdueLastAt: projLedger } : {}),
 			meaningfulStateVersion: version,
 		});
 	}
 
 	return {
-		next: { asof: now, projects, triggers: [...triggers], baseline },
+		next: {
+			asof: now,
+			projects,
+			triggers: [...triggers],
+			baseline,
+			...(Object.keys(nextThrottle).length > 0 ? { blockedOverdueThrottle: nextThrottle } : {}),
+		},
 		diff: {
 			triggers,
 			// ⑧ 条件化（语义诚实而非测试规避）：「no-carrier」的定义就是「本进程可见的账本不存在」。

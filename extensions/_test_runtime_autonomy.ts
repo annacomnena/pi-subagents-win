@@ -1232,15 +1232,24 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 	const odRunIds = (d: { triggers: FrontierTrigger[] }): string[] =>
 		d.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId as string);
 	/**
-	 * 逐帧跑 blocked_overdue 帧序（每帧一次 buildFrontier），打印「超龄集 / 发射 / 账本」并返回逐帧读数。
+	 * 逐帧跑 blocked_overdue 帧序（每帧一次 buildFrontier），打印「超龄集 / 发射 / 项内投影 / 顶层账本」并返回逐帧读数。
 	 * `baseNow` + `baseTabs` = 基线帧（prev=null ⇒ 零触发），之后才轮到 steps。
+	 * 返工 R3：额外返回 `top` = 快照**顶层** `blockedOverdueThrottle`（权威账本）、`projectCount`（本帧可见项目数）。
+	 * 项目整帧不可见时 `projects` 为空 ⇒ 投影/超龄集取缺省（不抛）。
 	 */
 	const runOdFrames = (
 		tag: string,
 		baseNow: number,
 		baseTabs: FrontierSourceTab[],
 		steps: Array<{ label: string; now: number; tabs: FrontierSourceTab[] }>,
-	): Array<{ label: string; emit: string[]; ledger: Record<string, number> | undefined; runIds: string[] }> => {
+	): Array<{
+		label: string;
+		emit: string[];
+		ledger: Record<string, number> | undefined;
+		runIds: string[];
+		top: Record<string, Record<string, number>> | undefined;
+		projectCount: number;
+	}> => {
 		let snap: FrontierSnapshot = buildFrontier({
 			snapshot: makeSnapshot(baseTabs),
 			backlog: [],
@@ -1248,14 +1257,28 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 			now: baseNow,
 			supervision: odLedgers,
 		}).next;
-		const out: Array<{ label: string; emit: string[]; ledger: Record<string, number> | undefined; runIds: string[] }> = [];
+		const out: Array<{
+			label: string;
+			emit: string[];
+			ledger: Record<string, number> | undefined;
+			runIds: string[];
+			top: Record<string, Record<string, number>> | undefined;
+			projectCount: number;
+		}> = [];
 		for (const s of steps) {
 			const r = buildFrontier({ snapshot: makeSnapshot(s.tabs), backlog: [], prev: snap, now: s.now, supervision: odLedgers });
-			const p = r.next.projects[0]!;
+			const p = r.next.projects[0];
 			const emit = odRunIds(r.diff);
-			out.push({ label: s.label, emit, ledger: p.blockedOverdueLastAt, runIds: p.blockedOverdueRunIds ?? [] });
+			out.push({
+				label: s.label,
+				emit,
+				ledger: p?.blockedOverdueLastAt,
+				runIds: p?.blockedOverdueRunIds ?? [],
+				top: r.next.blockedOverdueThrottle,
+				projectCount: r.next.projects.length,
+			});
 			console.log(
-				`    ${tag} ${s.label.padEnd(7)} 超龄集=[${(p.blockedOverdueRunIds ?? []).join(",")}] 发射=[${emit.join(",")}] 账本=${JSON.stringify(p.blockedOverdueLastAt ?? {})}`,
+				`    ${tag} ${s.label.padEnd(7)} 项目数=${r.next.projects.length} 超龄集=[${(p?.blockedOverdueRunIds ?? []).join(",")}] 发射=[${emit.join(",")}] 项内投影=${JSON.stringify(p?.blockedOverdueLastAt ?? {})} 顶层账本=${JSON.stringify(r.next.blockedOverdueThrottle ?? {})}`,
 			);
 			snap = r.next;
 		}
@@ -1406,6 +1429,140 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 		assert.equal(Object.hasOwn(rows[2]!.ledger ?? {}, ATAB), true, "A 不得因「短暂活动」而被剔除");
 		assert.deepEqual(rows[3]!.ledger, { [ATAB]: T0 + 10 * 60_000 }, "帧4 未发射 ⇒ 账本原封沿用");
 		assert.deepEqual(rows[4]!.ledger, { [ATAB]: T0 + 71 * 60_000 }, "帧5 账本刷新为 now");
+	});
+
+	// ── SUP-B11：项目整帧消失后重现，不得窗内重发（返工 R3 核心；第3帧顶层账本断言 + 第4帧 emit = 修复前必红）──
+	// 帧序逐字照抄 R3 规格 §2.2。夹具：同一 project K，tab A / tab B（mkOdTab 默认 stop=error ⇒ BLOCKED_USER）。
+	check("SUP-B11 项目整帧消失（details=[]）⇒ 顶层账本保留 ⇒ 重现后不得窗内重发", () => {
+		const T0 = NOW;
+		// 帧序逐字照抄 R3 规格 §2.2（第 1–6 帧）；第 7 帧是**补充帧**（见下方 comment，证明 B 是「延后」而非「漏发」）。
+		const rows = runOdFrames("SUP-B11", T0, mkAB(90, 35), [
+			{ label: "t0+3m", now: T0 + 3 * 60_000, tabs: mkAB(93, 38) }, // 发 A（最重且首次）
+			{ label: "t0+6m", now: T0 + 6 * 60_000, tabs: [] }, // 项目整帧消失（tab 全 hidden / 进程重启 / 无 tab）
+			{ label: "t0+9m", now: T0 + 9 * 60_000, tabs: mkAB(99, 44) }, // 重现：A 窗内 ⇒ 不得发 A
+			{ label: "t0+12m", now: T0 + 12 * 60_000, tabs: mkAB(102, null) }, // 只剩 A（最重）但窗内 ⇒ 不发
+			{ label: "t0+66m", now: T0 + 66 * 60_000, tabs: mkAB(156, null) }, // A 距 t0+3m 已 63min > 1h ⇒ 发 A
+			{ label: "补+3m", now: T0 + 69 * 60_000, tabs: mkAB(159, 47) }, // 补充帧：项目已连续可见 ⇒ B 首次超龄可发
+		]);
+		// ── 先断「发射」（红点本质）——表格式逐帧对照：一次报出**全部**不匹配帧，不在第一帧就中断 ──
+		// 期望表：
+		//   帧1 t0+3m  [A]   最重 A 且首次
+		//   帧2 t0+6m  []    details=[]（项目整帧消失）
+		//   帧3 t0+9m  []    重现帧：项目上帧不在 prev ⇒ 项目级边沿不触发（偏离 D3）；硬要求「不得发 A」
+		//   帧4 t0+12m []    A 最重但距 t0+3m 仅 9min（窗内）⇒ 不得重发
+		//   帧5 t0+66m [A]   A 距上次已 63min > 1h ⇒ 发
+		//   帧6 t0+69m [B]   surviving 帧：B 首次超龄 ⇒ 发（证明「延后而非漏发」）
+		const expectEmits: string[][] = [[ATAB], [], [], [], [ATAB], [BOD]];
+		const mismatches = rows
+			.map((r, i) => ({ i, label: r.label, actual: r.emit, expected: expectEmits[i]! }))
+			.filter((m) => JSON.stringify(m.actual) !== JSON.stringify(m.expected))
+			.map((m) => `  帧${m.i + 1}(${m.label}) actual=${JSON.stringify(m.actual)} expected=${JSON.stringify(m.expected)}`);
+		assert.deepEqual(
+			mismatches,
+			[],
+			`SUP-B11 逐帧发射不匹配（共 ${mismatches.length} 帧）：\n${mismatches.join("\n")}`,
+		);
+		assert.equal(rows[1]!.projectCount, 0, "帧2（t0+6m，details=[]）⇒ 本帧零项目（项目整帧消失）");
+		// ── 再断顶层账本（权威账本必须跨「项目不可见」存活）──
+		assert.equal(rows[1]!.ledger, undefined, "帧2 项内投影不存在（项目本帧不可见）—— 这正是旧实现丢账的地方");
+		assert.deepEqual(
+			rows[1]!.top,
+			{ [K]: { [ATAB]: T0 + 3 * 60_000 } },
+			"帧2（项目整帧消失）**顶层账本必须保留 { K: { A: t0+3m } }**（修复前顶层字段不存在/为空 ⇒ 必红）",
+		);
+		assert.deepEqual(
+			rows[2]!.top,
+			{ [K]: { [ATAB]: T0 + 3 * 60_000 } },
+			"帧3 重现帧未发射 ⇒ 顶层账本原封沿用（A 仍在窗内）",
+		);
+		assert.deepEqual(rows[2]!.ledger, rows[2]!.top?.[K], "帧3 项内投影 === 顶层账本[K]（投影语义）");
+		assert.deepEqual(rows[3]!.top, { [K]: { [ATAB]: T0 + 3 * 60_000 } }, "帧4 未发射 ⇒ 顶层账本原封沿用");
+		assert.deepEqual(rows[4]!.top, { [K]: { [ATAB]: T0 + 66 * 60_000 } }, "帧5 A 刷新为 now（旧值 t0+3m 已 63min > 1h ⇒ 自然出账）");
+		assert.deepEqual(rows[4]!.ledger, rows[4]!.top?.[K], "帧5 项内投影 === 顶层账本[K]");
+		assert.deepEqual(
+			rows[5]!.top,
+			{ [K]: { [ATAB]: T0 + 66 * 60_000, [BOD]: T0 + 69 * 60_000 } },
+			"帧6 顶层账本 = A 沿用 + B 记 now",
+		);
+	});
+
+	// ── SUP-B12：对抗性走查回归（属性断言，非逐帧快照）──
+	// 60 帧伪随机（固定种子；3 tab 同仓，随机可见性/idle 漂移与偶发活动），断言**全局不变式**：
+	//   对每个 runId，任意两次 blocked_overdue 发射的时间差 ≥ BLOCKED_OVERDUE_THROTTLE_MS。
+	// 这类属性断言正是能抓住 R1/R2 都漏掉的「项目整帧消失 ⇒ 账本丢失」那一类洞。
+	check("SUP-B12 伪随机 60 帧不变式：同一 runId 任意两次发射间隔 ≥ 1h（0 violations）", () => {
+		const mulberry32 = (seed: number): (() => number) => {
+			let a = seed >>> 0;
+			return () => {
+				a = (a + 0x6d2b79f5) >>> 0;
+				let t = a;
+				t = Math.imul(t ^ (t >>> 15), t | 1);
+				t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+				return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+			};
+		};
+		const rnd = mulberry32(0x5eed2026);
+		const RIDS = ["tab_p_a", "tab_p_b", "tab_p_c"];
+		const ledgers: FrontierSupervision[] = RIDS.map((runId) => mkOdLedger({ runId }));
+		const idleMin: Record<string, number> = {};
+		for (const r of RIDS) idleMin[r] = Math.round(rnd() * 25); // 起始 idle 全在阈值下
+		const T0 = NOW;
+		const tabsFor = (visible: boolean[]): FrontierSourceTab[] => {
+			const out: FrontierSourceTab[] = [];
+			for (let i = 0; i < RIDS.length; i++) {
+				if (!visible[i]) continue;
+				out.push(mkOdTab({ runId: RIDS[i]!, idleMs: Math.round(idleMin[RIDS[i]!]!) * 60_000 }));
+			}
+			return out;
+		};
+		const visibleNow = (): boolean[] => RIDS.map(() => rnd() < 0.62);
+		// 基线帧（prev=null）：全可见 + 全不超龄 ⇒ 零账本
+		let snap: FrontierSnapshot = buildFrontier({
+			snapshot: makeSnapshot(tabsFor([true, true, true])),
+			backlog: [],
+			prev: null,
+			now: T0 - 60_000,
+			supervision: ledgers,
+		}).next;
+		const lastEmit = new Map<string, number>();
+		let frames = 0;
+		let emits = 0;
+		let violations = 0;
+		const violationLines: string[] = [];
+		const allInvisibleFrames: number[] = [];
+		for (let i = 1; i <= 60; i++) {
+			const now = T0 + i * 3 * 60_000;
+			// idle 漂移：可见时偶发活动（掉回阈值下）；不可见时保持「卡住」，idle 继续涨
+			const vis = visibleNow();
+			for (let j = 0; j < RIDS.length; j++) {
+				const r = RIDS[j]!;
+				if (vis[j] && rnd() < 0.16) idleMin[r] = Math.round(rnd() * 20); // 活动：idle 重置到阈值下
+				else idleMin[r] = idleMin[r]! + 3;
+			}
+			if (vis.every((v) => !v)) allInvisibleFrames.push(i);
+			const r = buildFrontier({ snapshot: makeSnapshot(tabsFor(vis)), backlog: [], prev: snap, now, supervision: ledgers });
+			const emitted = odRunIds(r.diff);
+			frames++;
+			for (const rid of emitted) {
+				emits++;
+				const prevTs = lastEmit.get(rid);
+				if (prevTs !== undefined && now - prevTs < BLOCKED_OVERDUE_THROTTLE_MS) {
+					violations++;
+					violationLines.push(
+						`      帧${i} runId=${rid} 距上次发射仅 ${Math.round((now - prevTs) / 60_000)}min（<60min）`,
+					);
+				}
+				lastEmit.set(rid, now);
+			}
+			snap = r.next;
+		}
+		console.log(
+			`    SUP-B12 frames=${frames} emits=${emits} violations=${violations} 项目整帧消失帧数=${allInvisibleFrames.length}（帧号 ${allInvisibleFrames.join(",") || "无"}）`,
+		);
+		for (const line of violationLines.slice(0, 10)) console.log(line);
+		assert.equal(violations, 0, `不变式违背：同一 runId 两次发射间隔 < 1h 共 ${violations} 次\n${violationLines.join("\n")}`);
+		assert.ok(emits > 0, "夹具必须真的产生发射（否则断言空洞）");
+		assert.ok(allInvisibleFrames.length > 0, "60 帧随机序列必须含「项目整帧消失」帧（否则抓不到 R3 缺陷）");
 	});
 }
 

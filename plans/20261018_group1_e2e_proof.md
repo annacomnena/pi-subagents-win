@@ -129,24 +129,35 @@ const blockedOverdueRunIds = odHits.length > 0 ? odHits.map((h) => h.runId) : un
 ```
 阈值 `SUPERVISION_THRESHOLDS.userMs = 30 * 60_000`（`frontier.ts:89`）。
 
-**c) 触发发射（level + **per-runId** 1h 节流）** — `extensions/runtime/autonomy/frontier.ts:599-622`
+**c) 触发发射（level + **per-runId** 1h 节流）** — `extensions/runtime/autonomy/frontier.ts:599-646`
 > 返工 R1：旧形状是 `prevSameRun`（只在 prev.runId === cur.runId 时读 lastAt）⇒ 最重者交替时两条 runId 的节流记录互相覆盖，同一 runId 可在窗内重发。现改为遍历 `blockedOverdueRunIds`，每个 runId 各自查自己的账本时刻。
+> **返工 R3（2026-10-18 晚）**：节流来源改为**快照顶层的权威账本** `prev.blockedOverdueThrottle[projectKey]`，不再读 `pv.blockedOverdueLastAt`（后者降级为**投影**：项目整帧从 `details` 消失时它不存在，读它会把该项目所有 runId 当作「从未提醒」而窗内重发）。
 ```ts
-const blockedOverdueEmitted = new Map<string, string>();                                    // :529（project → 本帧发射的 runId）
-if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.length > 0) {  // :602
-    const prevLedger = pv.blockedOverdueLastAt && typeof pv.blockedOverdueLastAt === "object" ? pv.blockedOverdueLastAt : {};  // :603-604
-    for (const rid of cur.blockedOverdueRunIds) {                                           // :605
-        const last = prevLedger[rid];                                                       // :606
-        if (typeof last === "number" && Number.isFinite(last) && now - last < BLOCKED_OVERDUE_THROTTLE_MS) continue;  // :607（该 runId 窗内）
-        triggers.push({ rule: "blocked_overdue", project: key, runId: rid, ... });          // :612-618
-        blockedOverdueEmitted.set(key, rid);                                                // :619
-        break;  // 每项目每帧最多 1 条（:620）
+const blockedOverdueEmitted = new Map<string, string>();                                    // :546（project → 本帧发射的 runId）
+const prevThrottleAll = prev?.blockedOverdueThrottle && typeof prev.blockedOverdueThrottle === "object" ? prev.blockedOverdueThrottle : {};  // :549-550（权威账本）
+if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.length > 0) {  // :623
+    const prevProjLedger = prevThrottleAll[key];                                            // :626（顶层账本按项目取；**不读** pv.blockedOverdueLastAt）
+    const prevLedger = prevProjLedger && typeof prevProjLedger === "object" ? prevProjLedger : {};  // :627
+    for (const rid of cur.blockedOverdueRunIds) {                                           // :628
+        const last = prevLedger[rid];                                                       // :629
+        if (typeof last === "number" && Number.isFinite(last) && now - last < BLOCKED_OVERDUE_THROTTLE_MS) continue;  // :630（该 runId 窗内）
+        triggers.push({ rule: "blocked_overdue", project: key, runId: rid, ... });          // :635-641
+        blockedOverdueEmitted.set(key, rid);                                                // :642
+        break;  // 每项目每帧最多 1 条（:643）
     }
 }
 ```
 - `BLOCKED_OVERDUE_THROTTLE_MS = 3_600_000`（`frontier.ts:100`）
-- 节流账落 `next.projects[].blockedOverdueLastAt`（`frontier.ts:651-672`）：本帧发射的 runId 记 `now`（`:668`）；其余**沿用 prev**（`:663-667`）；**按 1h 时间窗裁剪**（`:665`：`now - ts >= BLOCKED_OVERDUE_THROTTLE_MS` 才出账，防无界增长；**不按「本帧是否仍超龄」裁剪** —— 返工 R2 修掉了按超龄集合裁剪导致的窗内重发；SUP-B9a/B9b/B10 钉住）
+- **权威账本落盘**：`next.blockedOverdueThrottle`（`frontier.ts:663-684` 构建、`:713` 写入快照）——
+  继承 prev **全部项目（含本帧未出现的项目）**（`:671` 遍历 `prevThrottleAll`，**不按可见性过滤**），
+  只按 1h 时间窗裁剪（`:675`：`now - ts >= BLOCKED_OVERDUE_THROTTLE_MS` 才出账）；本帧发射的 runId 记 `now`（`:681-683`）。
+  裁剪语义来自返工 R2（**不按「本帧是否仍超龄」裁剪**，否则 tab 短暂活动会剔除键 ⇒ 窗内重发）；
+  跨项目可见性存活来自返工 R3（否则项目整帧消失 ⇒ 账本整块丢失 ⇒ 重现后窗内重发）。
+- **项目字段是投影**：`ProjectFrontier.blockedOverdueLastAt`（`frontier.ts:698-702`）= `nextThrottle[key]` 的投影，
+  仅供展示/图投影/测试；**不作为发射判定来源**。
 - **基线帧压制**：整段在 `if (!baseline) {`（`frontier.ts:537`）之内 ⇒ 冷启动/快照丢失不会风暴
+- **测试证据**：`:1436`（**SUP-B11**，项目整帧 `details=[]` 后重现不得窗内重发，6 帧 + 1 补充帧）、
+  `:1493`（**SUP-B12**，伪随机 60 帧属性不变式：同一 runId 任意两次发射间隔 ≥ 1h）
 
 ### 1.5 8 小时的具体读数（按代码推理，非真机演练）
 
@@ -155,7 +166,10 @@ if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.l
 - `28_800_000 > 1_800_000` ⇒ `blockedOverdue = true`，`blockedOverdueRunIds = [tab.id]`（单 tab 时与 `blockedOverdueRunId` 同值）
 - 首帧（账本里该 runId 无记录）⇒ **立刻发一次** `blocked_overdue`
 - 之后每 **1 小时**（`now - ledger[runId] >= 3_600_000`）再发一次 ⇒ 8 小时内约 8 次提醒，且每次都带同一个 runId
-- **多 tab 情形（返工 R1）**：同项目内 A/B 两个超龄 tab 交替成为「最重」时，**各自独立**计 1h 窗（`blockedOverdueLastAt: { A: tA, B: tB }`）⇒ 任一 runId 不得在窗内被重复提醒。账本**按 1h 时间窗裁剪**（返工 R2）⇒ tab 短暂活动（idle 掉回阈值下）不会把它的键剔除。**测试证据**：`extensions/_test_runtime_autonomy.ts:1265`（SUP-B8，6 帧交替最重序列；帧 5 = 修复前的窗内重发红点）、`:1309`（SUP-B9a，4 帧：窗内不因暂离超龄集合而丢节流）、`:1349`（SUP-B9b，窗过期才出账/上界）、`:1371`（SUP-B10，单 tab 短暂活动 5 帧）
+- **多 tab 情形（返工 R1）**：同项目内 A/B 两个超龄 tab 交替成为「最重」时，**各自独立**计 1h 窗（权威账本 `blockedOverdueThrottle[project] = { A: tA, B: tB }`）⇒ 任一 runId 不得在窗内被重复提醒。账本**按 1h 时间窗裁剪**（返工 R2）⇒ tab 短暂活动（idle 掉回阈值下）不会把它的键剔除；账本**挂在快照顶层**（返工 R3）⇒ 项目整帧从 `details` 消失也不会丢失。**测试证据**：`extensions/_test_runtime_autonomy.ts:1265`（SUP-B8，6 帧交替最重序列；帧 5 = 修复前的窗内重发红点）、`:1309`（SUP-B9a，4 帧：窗内不因暂离超龄集合而丢节流）、`:1349`（SUP-B9b，窗过期才出账/上界）、`:1371`（SUP-B10，单 tab 短暂活动 5 帧）、**`:1436`（SUP-B11，项目整帧消失 6 帧 + 1 补充帧；帧 2 `details=[]` 时顶层账本必须保留）、` :1493`（SUP-B12，伪随机 60 帧属性不变式）**
+> **R3 的缓解事实（不得当成「没问题」）**：frontier 层若因 `frontier.json` 被删而丢账，仍会重出一遍 trigger，但 actions 层还有一道 1h 去重
+>（`breaker.ts::dedupHit`，key = `rule:class:project`）⇒ 同一项目 1h 内的第二次 `notify-local-master` 会被 `SKIP(cooldown)`，**不会真发第二封信**；
+> 代价只是**多一次无效唤醒**（wake-gate 可能多叫一次 master）。
 
 **这一步的测试证据**：`extensions/_test_runtime_autonomy.ts:1111`（SUP-B1，31min 边界）、`:1131`（SUP-B3，t0/t0+5min/t0+61min 三帧节流；账本为 `{runId: ts}` 映射）、`:1151`（SUP-B4，`BLOCKED_USER` 不越界成 `stagnation`）。
 
@@ -220,8 +234,9 @@ to:   localMasterAddress(localMasterScope(project)),
 ### 2.6 1h 去重（不刷屏）
 
 `run.ts:184` `dedupHit(breaker, dedupKey, now)`；`dedupKey = rule:class:project`（`run.ts:152`）；`breaker.ts:129-134` 判 `now - last < BUDGET.hourMs`（1h）。
-⇒ 与 frontier 的 `blockedOverdueLastAt`（per-runId 1h 节流账）**同一量级**（1h），两层都拦得住。
-> 注意两层粒度不同：frontier 层按 **runId**（`blockedOverdueLastAt: Record<runId, ts>`），actions 层按 **`rule:class:project`**（项目级）。⇒ 最保守（1h 内同项目同 rule 至多动作一次）。
+⇒ 与 frontier 的 `blockedOverdueThrottle`（per-runId 1h 节流账，快照顶层）**同一量级**（1h），两层都拦得住。
+> 注意两层粒度不同：frontier 层按 **runId**（`blockedOverdueThrottle[project]: Record<runId, ts>`），actions 层按 **`rule:class:project`**（项目级）。⇒ 最保守（1h 内同项目同 rule 至多动作一次）。
+> **这也是 R3 的缓解事实**：即便 frontier 层账本全丢（`frontier.json` 被删）导致 trigger 重出，actions 层 1h 去重仍会 `SKIP(cooldown)` ⇒ **不会真发第二封信**，只是多一次无效唤醒。
 **测试证据**：`_test_runtime_autonomy_actions.ts:1618`（G1-1(d)：第二 tick +60s ⇒ `skipped(reason==="cooldown")`，且 mailbox 仍只有 1 封）。
 
 ### 2.7 生产配置下的实际可达性（诚实标注）
