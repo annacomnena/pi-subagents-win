@@ -1231,6 +1231,36 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 	];
 	const odRunIds = (d: { triggers: FrontierTrigger[] }): string[] =>
 		d.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId as string);
+	/**
+	 * 逐帧跑 blocked_overdue 帧序（每帧一次 buildFrontier），打印「超龄集 / 发射 / 账本」并返回逐帧读数。
+	 * `baseNow` + `baseTabs` = 基线帧（prev=null ⇒ 零触发），之后才轮到 steps。
+	 */
+	const runOdFrames = (
+		tag: string,
+		baseNow: number,
+		baseTabs: FrontierSourceTab[],
+		steps: Array<{ label: string; now: number; tabs: FrontierSourceTab[] }>,
+	): Array<{ label: string; emit: string[]; ledger: Record<string, number> | undefined; runIds: string[] }> => {
+		let snap: FrontierSnapshot = buildFrontier({
+			snapshot: makeSnapshot(baseTabs),
+			backlog: [],
+			prev: null,
+			now: baseNow,
+			supervision: odLedgers,
+		}).next;
+		const out: Array<{ label: string; emit: string[]; ledger: Record<string, number> | undefined; runIds: string[] }> = [];
+		for (const s of steps) {
+			const r = buildFrontier({ snapshot: makeSnapshot(s.tabs), backlog: [], prev: snap, now: s.now, supervision: odLedgers });
+			const p = r.next.projects[0]!;
+			const emit = odRunIds(r.diff);
+			out.push({ label: s.label, emit, ledger: p.blockedOverdueLastAt, runIds: p.blockedOverdueRunIds ?? [] });
+			console.log(
+				`    ${tag} ${s.label.padEnd(7)} 超龄集=[${(p.blockedOverdueRunIds ?? []).join(",")}] 发射=[${emit.join(",")}] 账本=${JSON.stringify(p.blockedOverdueLastAt ?? {})}`,
+			);
+			snap = r.next;
+		}
+		return out;
+	};
 
 	check("SUP-B8 交替最重：per-runId 节流生效（帧5 不得窗内重发 B）", () => {
 		const T0 = NOW;
@@ -1260,33 +1290,122 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 		assert.deepEqual(actual[2], [], "帧3（t0+20m，只有 B，B 窗内）⇒ 不发");
 		assert.deepEqual(actual[4], [], "帧5（t0+40m，最重 B，B 距 t0 仅 40min）⇒ 不得窗内重发（本条在修复前会误发 B）");
 		assert.deepEqual(actual[5], [BOD], "帧6（t0+65m，最重 B，距 t0 已 65min）⇒ 发 B");
-		// 帧2/帧4：与 §2.1 期望序列不同（§2.1 写「不发」/「发 A」）—— 详见报告「偏离 D2」：
-		// 实现按 §1.1 §3 + 任务要求②「遍历超龄 runId、跳过窗内的、每帧最多 1 条」⇒ 帧2 A(40min，无账本) 首发；
-		// 帧3 只有 B ⇒ A 被账本收缩剔除（§1.1 §4）⇒ 帧4 A 再次首次（R-5「宁可重发」方向）。
+		// 帧2：与 §2.1 期望序列不同（§2.1 写「不发」）—— 详见报告「偏离 D2」：
+		// 实现按 §1.1 §3 + 任务要求②「遍历超龄 runId、跳过窗内的、每帧最多 1 条」⇒ 帧2 A(40min，无账本) 首发。
 		assert.deepEqual(actual[1], [ATAB], "帧2（B 窗内 ⇒ 顺延到本小时未提醒的 A）⇒ 发 A（§2.1 期望为空；偏离 D2）");
-		assert.deepEqual(actual[3], [ATAB], "帧4（B 及 A 均窗内？A 已在帧3 出账）⇒ 发 A（§2.1 期望为 A）");
+		// 帧4：返工 R2 后节流账改为**按时间窗裁剪** ⇒ A 在帧3（当时只有 B 超龄）不再被剔除；
+		// 帧4 时 A 距 t0+10m 仅 20min、B 距 t0 仅 30min ⇒ 两者均在窗内 ⇒ **不发**（与 R2 规格 §2.1 B9a 帧4 同语义）。
+		assert.deepEqual(actual[3], [], "帧4（A 距 t0+10m 20min、B 距 t0 30min 均在窗内）⇒ 不得发（R2 按时间窗裁剪后）");
 		console.log(
 			`    SUP-B8 逐帧对照 §2.1：${steps.map((s, i) => `${s.label} 实际=[${actual[i]!.join(",")}] §2.1=[${s.spec.join(",")}]${JSON.stringify(actual[i]) === JSON.stringify(s.spec) ? "✅" : "⚠️"}`).join(" | ")}`,
 		);
 	});
 
-	check("SUP-B9 节流账收缩：不再超龄的 runId 从账本里移除（防无界增长）", () => {
+	// ── SUP-B9a / SUP-B9b：节流账按**时间窗**裁剪（返工 R2 核心）──
+	// 旧 SUP-B9 断言「B 恢复 ⇒ B 的键必须被移除」**本身就是错的**（正是 R2 缺陷的成因）：
+	// tab 短暂活动（idle 掉回阈值下）会使键被剔除，之后再度超龄 ⇒ 在 1h 窗内重发。
+	// 现拆为两条：B9a 钉「窗内不因暂离超龄集合而丢节流」，B9b 钉「窗过期才出账（上界仍成立）」。
+	// 帧序逐字照抄 R2 规格 §2.1。
+	check("SUP-B9a 窗内不因暂离超龄集合而丢节流（4 帧；帧4 = R2 修复前的窗内重发红点）", () => {
 		const T0 = NOW;
-		const base = buildFrontier({ snapshot: makeSnapshot(mkAB(90, 35)), backlog: [], prev: null, now: T0 - 60_000, supervision: odLedgers }).next;
-		// 帧1：A(90min)+B(35min) 都超龄 ⇒ 发 A（最重）⇒ 账本 {A: t0}
-		const f1 = buildFrontier({ snapshot: makeSnapshot(mkAB(90, 35)), backlog: [], prev: base, now: T0, supervision: odLedgers });
-		assert.deepEqual(odRunIds(f1.diff), [ATAB], "帧1 发 A");
-		assert.deepEqual(f1.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0 }, "帧1 账本只有 A");
-		// 帧2：B(105min) 反超 A(100min) ⇒ B 首次 ⇒ 发 B ⇒ 账本 {A, B}
-		const f2 = buildFrontier({ snapshot: makeSnapshot(mkAB(100, 105)), backlog: [], prev: f1.next, now: T0 + 10 * 60_000, supervision: odLedgers });
-		assert.deepEqual(odRunIds(f2.diff), [BOD], "帧2 发 B（B 首次）");
-		assert.deepEqual(f2.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0, [BOD]: T0 + 10 * 60_000 }, "帧2 账本含 A 与 B");
-		// 帧3：只剩 A（B 恢复/终态 ⇒ 不再超龄）⇒ B 的键必须被剔除
-		const f3 = buildFrontier({ snapshot: makeSnapshot(mkAB(110, null)), backlog: [], prev: f2.next, now: T0 + 20 * 60_000, supervision: odLedgers });
-		assert.deepEqual(odRunIds(f3.diff), [], "帧3 A 窗内 ⇒ 不发");
-		assert.deepEqual(f3.next.projects[0]!.blockedOverdueRunIds, [ATAB], "帧3 超龄集只剩 A");
-		assert.deepEqual(f3.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0 }, "账本收缩：B 的键被移除，A 沿用");
-		assert.equal(Object.hasOwn(f3.next.projects[0]!.blockedOverdueLastAt ?? {}, BOD), false, "B 不得残留在账本里（无界增长防护）");
+		const rows = runOdFrames("SUP-B9a", T0 - 60_000, mkAB(90, 35), [
+			{ label: "t0", now: T0, tabs: mkAB(90, 35) },
+			{ label: "t0+10m", now: T0 + 10 * 60_000, tabs: mkAB(100, 105) },
+			{ label: "t0+20m", now: T0 + 20 * 60_000, tabs: mkAB(110, null) }, // B 已恢复（不再超龄）
+			{ label: "t0+25m", now: T0 + 25 * 60_000, tabs: mkAB(115, 32) }, // B 又超龄
+		]);
+		// ── 先断「发射」（红点本质），再断账本 ──
+		// 断言顺序是刻意的：旧 keep 规则下帧3 的账本断言会先红，会掩盖「帧4 真的误发了」这个缺陷本质；
+		// 变异验证要求红点落在**帧4 的 emit 断言**（actual ["tab_od_b"] vs expected []）。
+		// 帧1：A(90)+B(35) 都超龄 ⇒ 发 A
+		assert.deepEqual(rows[0]!.emit, [ATAB], "帧1（t0，最重 A）⇒ 发 A");
+		// 帧2：B(105) 反超 A(100) ⇒ B 首次 ⇒ 发 B
+		assert.deepEqual(rows[1]!.emit, [BOD], "帧2（t0+10m，最重 B 且首次）⇒ 发 B");
+		// 帧3：只剩 A（B 已恢复）⇒ A 窗内 ⇒ 不发
+		assert.deepEqual(rows[2]!.runIds, [ATAB], "帧3 超龄集只剩 A");
+		assert.deepEqual(rows[2]!.emit, [], "帧3 A 窗内 ⇒ 不发");
+		// 帧4：B 又超龄(32min) + A(115min) ⇒ 最重 A 但 A 窗内；顺延到 B ⇒ B 窗内 ⇒ **不发** ← 红点
+		assert.deepEqual(
+			rows[3]!.emit,
+			[],
+			`帧4（t0+25m：A 距 t0 25min、B 距 t0+10m 15min 均在窗内）⇒ 不得发（R2 修复前会误发 ${BOD}）`,
+		);
+		// ── 再断账本（窗内不因暂离超龄集合而丢节流）──
+		assert.deepEqual(rows[0]!.ledger, { [ATAB]: T0 }, "帧1 账本只有 A");
+		assert.deepEqual(rows[1]!.ledger, { [ATAB]: T0, [BOD]: T0 + 10 * 60_000 }, "帧2 账本含 A 与 B");
+		assert.deepEqual(
+			rows[2]!.ledger,
+			{ [ATAB]: T0, [BOD]: T0 + 10 * 60_000 },
+			"帧3 账本必须**仍含 B**（B 距 t0+10m 仅 10min，未满 1h）—— 这正是 R2 缺陷的根",
+		);
+		assert.equal(Object.hasOwn(rows[2]!.ledger ?? {}, BOD), true, "B 不得因「暂离超龄集合」而被剔除");
+		assert.deepEqual(
+			rows[3]!.ledger,
+			{ [ATAB]: T0, [BOD]: T0 + 10 * 60_000 },
+			"帧4 未发射 ⇒ 账本原封沿用（不被刷成新值，也不被裁掉）",
+		);
+	});
+
+	check("SUP-B9b 窗过期才出账（上界仍成立）：t0+75m 时 B 的条目已过期 ⇒ 被剔除", () => {
+		const T0 = NOW;
+		const rows = runOdFrames("SUP-B9b", T0 - 60_000, mkAB(90, 35), [
+			{ label: "t0", now: T0, tabs: mkAB(90, 35) },
+			{ label: "t0+10m", now: T0 + 10 * 60_000, tabs: mkAB(100, 105) },
+			{ label: "t0+20m", now: T0 + 20 * 60_000, tabs: mkAB(110, null) },
+			{ label: "t0+25m", now: T0 + 25 * 60_000, tabs: mkAB(115, 32) },
+			{ label: "t0+75m", now: T0 + 75 * 60_000, tabs: mkAB(165, null) }, // B 早恢复；B 的账本条目(t0+10m)已 65min
+		]);
+		assert.deepEqual(rows[4]!.runIds, [ATAB], "帧5 超龄集只剩 A");
+		assert.deepEqual(rows[4]!.emit, [ATAB], "帧5（t0+75m：A 距 t0 已 75min）⇒ 发 A");
+		assert.deepEqual(
+			rows[4]!.ledger,
+			{ [ATAB]: T0 + 75 * 60_000 },
+			"帧5 账本：A 刷新为 now，B（t0+10m ⇒ 已 65min）过期出账",
+		);
+		assert.equal(Object.hasOwn(rows[4]!.ledger ?? {}, BOD), false, "B 的条目已过 1h 窗 ⇒ 必须出账（账本不无界增长）");
+	});
+
+	// ── SUP-B10：单 tab 短暂活动后不得窗内重发（主会话实测的那条，
+	//    即 R2 规格 §0 的 4 帧序列，加第五帧验证窗过期）──
+	// 帧序逐字照抄 R2 规格 §2.2。夹具 = 单 tab A（mkOdTab 默认 stop=error ⇒ BLOCKED_USER）。
+	check("SUP-B10 单 tab 短暂活动（idle 掉回 20min）后不得在 1h 窗内重发（帧4 = 修复前必红）", () => {
+		const T0 = NOW;
+		const aOnly = (aMin: number): FrontierSourceTab[] => [mkOdTab({ runId: ATAB, idleMs: aMin * 60_000 })];
+		const rows = runOdFrames("SUP-B10", T0 - 60_000, aOnly(20), [
+			{ label: "t0", now: T0, tabs: aOnly(20) }, // 基线帧：A idle 20min 不超龄 ⇒ 压制（零发射）
+			{ label: "t0+10m", now: T0 + 10 * 60_000, tabs: aOnly(45) }, // A idle 45min ⇒ **发 A**
+			{ label: "t0+15m", now: T0 + 15 * 60_000, tabs: aOnly(20) }, // 掉回阈值下（tab 又活动）⇒ 不发；账本仍含 A
+			{ label: "t0+20m", now: T0 + 20 * 60_000, tabs: aOnly(31) }, // 再超龄；距上次仅 10min ⇒ **不发**（修复前会误发）
+			{ label: "t0+71m", now: T0 + 71 * 60_000, tabs: aOnly(82) }, // 距上次 61min > 1h ⇒ 发 A
+		]);
+		// ── 先断「发射」（红点本质），再断账本（同 B9a：保证变异红点落在帧4 emit）──
+		// 帧1：t0 基线（A idle 20min 不超龄）⇒ 零发射
+		assert.deepEqual(rows[0]!.emit, [], "帧1（t0，A idle20min 不超龄）⇒ 不发");
+		assert.deepEqual(rows[0]!.runIds, [], "帧1 超龄集为空");
+		// 帧2：t0+10m A idle 45min 首次超龄 ⇒ 发 A
+		assert.deepEqual(rows[1]!.emit, [ATAB], "帧2（t0+10m，A idle45min 首次超龄）⇒ 发 A");
+		// 帧3：A 短暂活动（idle 掉回 20min<30min）⇒ 不超龄 ⇒ 不发
+		assert.deepEqual(rows[2]!.runIds, [], "帧3 A idle 20min ⇒ 不在超龄集合");
+		assert.deepEqual(rows[2]!.emit, [], "帧3 不超龄 ⇒ 不发");
+		// 帧4：又超龄 ⇒ 距上次发射仅 10min ⇒ **必须不发** ← 红点
+		assert.deepEqual(
+			rows[3]!.emit,
+			[],
+			`帧4（t0+20m：A 距上次发射仅 10min）⇒ 不得重发（R2 修复前会误发 ${ATAB}）`,
+		);
+		// 帧5：距上次 61min>1h ⇒ 发 A
+		assert.deepEqual(rows[4]!.emit, [ATAB], "帧5（t0+71m，距上次 61min）⇒ 发 A");
+		// ── 再断账本（「短暂活动」不得剔除键）──
+		assert.equal(rows[0]!.ledger, undefined, "帧1 无账本（未发射且 prev 无记录）");
+		assert.deepEqual(rows[1]!.ledger, { [ATAB]: T0 + 10 * 60_000 }, "帧2 账本 {A: t0+10m}");
+		assert.deepEqual(
+			rows[2]!.ledger,
+			{ [ATAB]: T0 + 10 * 60_000 },
+			"帧3 账本必须**仍含 A**（距上次发射 5min，未满 1h）—— R2 缺陷就在这里把 A 剔除",
+		);
+		assert.equal(Object.hasOwn(rows[2]!.ledger ?? {}, ATAB), true, "A 不得因「短暂活动」而被剔除");
+		assert.deepEqual(rows[3]!.ledger, { [ATAB]: T0 + 10 * 60_000 }, "帧4 未发射 ⇒ 账本原封沿用");
+		assert.deepEqual(rows[4]!.ledger, { [ATAB]: T0 + 71 * 60_000 }, "帧5 账本刷新为 now");
 	});
 }
 

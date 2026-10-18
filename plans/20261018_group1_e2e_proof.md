@@ -145,7 +145,7 @@ if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.l
 }
 ```
 - `BLOCKED_OVERDUE_THROTTLE_MS = 3_600_000`（`frontier.ts:100`）
-- 节流账落 `next.projects[].blockedOverdueLastAt`（`frontier.ts:651-672`）：本帧发射的 runId 记 `now`（`:666`）；其余**沿用 prev**（`:661-665`）；**只保留仍在本帧超龄集合里的键**（`:660/:662`，防无界增长；SUP-B9 钉住）
+- 节流账落 `next.projects[].blockedOverdueLastAt`（`frontier.ts:651-672`）：本帧发射的 runId 记 `now`（`:668`）；其余**沿用 prev**（`:663-667`）；**按 1h 时间窗裁剪**（`:665`：`now - ts >= BLOCKED_OVERDUE_THROTTLE_MS` 才出账，防无界增长；**不按「本帧是否仍超龄」裁剪** —— 返工 R2 修掉了按超龄集合裁剪导致的窗内重发；SUP-B9a/B9b/B10 钉住）
 - **基线帧压制**：整段在 `if (!baseline) {`（`frontier.ts:537`）之内 ⇒ 冷启动/快照丢失不会风暴
 
 ### 1.5 8 小时的具体读数（按代码推理，非真机演练）
@@ -155,7 +155,7 @@ if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.l
 - `28_800_000 > 1_800_000` ⇒ `blockedOverdue = true`，`blockedOverdueRunIds = [tab.id]`（单 tab 时与 `blockedOverdueRunId` 同值）
 - 首帧（账本里该 runId 无记录）⇒ **立刻发一次** `blocked_overdue`
 - 之后每 **1 小时**（`now - ledger[runId] >= 3_600_000`）再发一次 ⇒ 8 小时内约 8 次提醒，且每次都带同一个 runId
-- **多 tab 情形（返工 R1）**：同项目内 A/B 两个超龄 tab 交替成为「最重」时，**各自独立**计 1h 窗（`blockedOverdueLastAt: { A: tA, B: tB }`）⇒ 任一 runId 不得在窗内被重复提醒。**测试证据**：`extensions/_test_runtime_autonomy.ts:1235`（SUP-B8，6 帧交替最重序列；帧 5 = 修复前的窗内重发红点）、`:1273`（SUP-B9，账本收缩/无界增长防护）
+- **多 tab 情形（返工 R1）**：同项目内 A/B 两个超龄 tab 交替成为「最重」时，**各自独立**计 1h 窗（`blockedOverdueLastAt: { A: tA, B: tB }`）⇒ 任一 runId 不得在窗内被重复提醒。账本**按 1h 时间窗裁剪**（返工 R2）⇒ tab 短暂活动（idle 掉回阈值下）不会把它的键剔除。**测试证据**：`extensions/_test_runtime_autonomy.ts:1265`（SUP-B8，6 帧交替最重序列；帧 5 = 修复前的窗内重发红点）、`:1309`（SUP-B9a，4 帧：窗内不因暂离超龄集合而丢节流）、`:1349`（SUP-B9b，窗过期才出账/上界）、`:1371`（SUP-B10，单 tab 短暂活动 5 帧）
 
 **这一步的测试证据**：`extensions/_test_runtime_autonomy.ts:1111`（SUP-B1，31min 边界）、`:1131`（SUP-B3，t0/t0+5min/t0+61min 三帧节流；账本为 `{runId: ts}` 映射）、`:1151`（SUP-B4，`BLOCKED_USER` 不越界成 `stagnation`）。
 

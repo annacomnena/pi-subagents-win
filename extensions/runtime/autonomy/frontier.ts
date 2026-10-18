@@ -649,18 +649,20 @@ export function buildFrontier(inputs: FrontierInputs): { next: FrontierSnapshot;
 				? 1
 				: pv.meaningfulStateVersion + ((triggerCountByRepo.get(key) ?? 0) > 0 || newOverdue ? 1 : 0);
 		// ⑨b 节流账（per-runId，只落在这份派生缓存上；frontier.json 被删 ⇒ 最多多提醒一次）。
-		// 本帧发射的那个 runId 记 now；其余**沿用 prev**；只保留「仍在本帧超龄集合里」的键
-		// （tab 恢复/终态/被静默后自动出账，账本不无界增长）。
+		// 写入：本帧发射的 runId 记 now；其余**沿用 prev**。
+		// 裁剪：**按时间窗**（只留 now-ts < THROTTLE 的条目），**不按「本帧是否仍超龄」**——
+		//   按超龄集合裁剪会把「tab 短暂活动（idle 掉回阈值下）」误当成节流到期：
+		//   键被剔除后 tab 再超龄就会在 1h 窗内重发（返工 R2，主会话实测 t0+10 发、t0+20 又发）。
+		//   时间窗裁剪同时天然给出上界（账本只含最近 1h 的条目，不无界增长）。
 		// 与 spec §3.1.6 的字面差异（未发射且 prev 无记录 ⇒ 不预置 now）见 plans/20261018_group1_impl.md §7 D1：
 		//   预置 now 会把「首次发现」自己静默 1h（漏发）；这里不预置 ⇒ 下帧必发，不可能风暴也不可能漏发。
 		const emittedRid = blockedOverdueEmitted.get(key);
 		const prevLedger =
 			pv && pv.blockedOverdueLastAt && typeof pv.blockedOverdueLastAt === "object" ? pv.blockedOverdueLastAt : undefined;
 		let nextLedger: Record<string, number> | undefined;
-		const keep = new Set(Array.isArray(core.blockedOverdueRunIds) ? core.blockedOverdueRunIds : []);
 		for (const [rid, ts] of Object.entries(prevLedger ?? {})) {
-			if (!keep.has(rid)) continue;
 			if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
+			if (now - ts >= BLOCKED_OVERDUE_THROTTLE_MS) continue; // 窗已过期 ⇒ 出账（上界由此保证）
 			(nextLedger ??= {})[rid] = ts;
 		}
 		if (emittedRid) (nextLedger ??= {})[emittedRid] = now;
