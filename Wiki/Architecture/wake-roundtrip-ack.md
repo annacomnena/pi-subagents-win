@@ -2,13 +2,14 @@
 title: Wake 回信（round-trip 回执）
 kind: concept
 status: current
-updated: 2026-09-25
+updated: 2026-10-18
 source_paths:
   - extensions/runtime/wake.ts#L49-L64
   - extensions/runtime/wake.ts#L221
-  - extensions/runtime/wake.ts#L228-L250
-  - extensions/runtime/wake.ts#L255-L285
-  - extensions/runtime/wake.ts#L326-L343
+  - extensions/runtime/wake.ts#L227-L250
+  - extensions/runtime/wake.ts#L302-L340
+  - extensions/runtime/wake.ts#L376-L400
+  - extensions/runtime/wake.ts#L188-L226
   - extensions/runtime/scope.ts#L248-L263
   - extensions/runtime/scope.ts#L400-L428
   - extensions/runtime/protocol.ts#L157-L179
@@ -43,13 +44,15 @@ tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方
 
 ### 回执触发条件（prompt 形状）
 
-`buildWakePrompt`（`wake.ts#L255`）/ `buildScopeWakePrompt`（`scope.ts#L400`）逻辑一致：取前 10 封展示信，其中**存在 `requiresAck===true` 且 `from`/`to` 均非空**的 message 帧时，prompt 才出现「回执（round-trip…）」块：
+`buildWakePrompt`（`wake.ts#L302`）/ `buildScopeWakePrompt`（`scope.ts#L432`）回执逻辑一致：取前 10 封展示信，其中**存在 `requiresAck===true` 且 `from`/`to` 均非空**的 message 帧时，prompt 才出现「回执（round-trip…）」块：
 
 - 每封一行：`回执：<messageId> → 用 deliverLetter 回 kind=RESULT 到 <原信 from>（from=<原信 to>, inReplyTo=<messageId>）`
 - 紧跟完整 recipe（`buildReplyRecipe`，见下）
 - 末尾硬规则行（两 prompt 文案同构）：「处理完必须逐封用 deliverLetter 回 kind=RESULT 给来信者；禁止只依赖 tab-report（它是派发者归属通道，…来信者收不到）；command 帧不要求回信。」
 
 无回信件时该块与硬规则行**整段缺席**（prompt 逐字节保持旧形状）。
+
+**与监管块（P1）互不影响**：`buildWakePrompt` 自 `2a4024a` 起有**第三可选参** `supervision?: WakeSupervisionItem[]`（停滞监管块，仅 workstream 侧有；`buildScopeWakePrompt` 尚未加）。它插在通信列表与回执块之间，`undefined`/`[]` 时输出逐字节不变；回执块逻辑与位置零改动。内容见 [[主动性套件（Autonomy Suite）]]「主动推动 supervise-push」。
 
 ### buildReplyRecipe（内嵌的可执行 recipe）
 

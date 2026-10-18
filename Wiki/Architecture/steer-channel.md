@@ -2,11 +2,12 @@
 title: Steer 通道（立即插入消息）
 kind: concept
 status: current
-updated: 2026-10-13
+updated: 2026-10-18
 source_paths:
   - extensions/steer.ts
   - extensions/steer-consumer.ts
   - extensions/steer-runtime.ts
+  - extensions/supervision-runtime.ts::supervisePush
   - extensions/injection-gate.ts
   - extensions/index.ts
   - extensions/_test_steer.ts
@@ -82,6 +83,7 @@ Steer 通道让**主会话（Master）向某个正在运行的标签页会话立
 | `steer-status` | `{ tabRunId?, id? }` | 读回执并按需过滤；顺带做一次惰性 sweep |
 
 - **scope**：主会话可写/查任意 tab；**标签页只能给自己**（`validateSteerRequest` 的 `myRunId` 自限 + `steer-status` 身份自限）；**subagent 一律拒绝**（execute 首行 `isSubagent()`）。
+- **监管理推动复用本通道**：主会话工具 `supervise-push` 不新建投递机制，直接 `newSteerId` + `writeSteerAtomic` 写 `source:"supervise-push"` 的 steer 记录（`mode` 缺省 `"steer"`）。因此**本页的两档投递语义就是推动的语义**：对已 settled 的 idle tab，`steer` 档无下一个 tool 边界 ⇒ 不起新 turn，需显式用 `abort` 档。详见 [[主动性套件（Autonomy Suite）]]「主动推动 supervise-push」。
 - **写前守卫（拒绝而非写后清理）**：`tabRunId` 非法 → 拒；无派发账本（`readTabDispatch` 为空）→ `unknown tab`；已终态（`readTabResultFile` 非空或 `readTabState().terminal===true`）→ `tab already terminal`；`message` 空/超长、`mode` 非法 → 拒。以上一律返回 `isError` 且**不产生任何文件**。
 - 路径注入（如 `tabRunId:"../../evil"`）由安全组件守卫拒绝。
 
