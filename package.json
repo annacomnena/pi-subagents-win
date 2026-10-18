@@ -153,6 +153,7 @@
 		"test:p3-provenance": "node --experimental-strip-types extensions/_test_p3_provenance.ts",
 		"test:mailbox-retry-budget": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_retry_budget.ts",
 		"test:model-failure-classify": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_failure_classify.ts",
+		"test:model-retry": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_retry.ts",
 		"test:gui-composer": "npm run test:gui-composer --prefix gui"
 	},
 	"dependencies": {

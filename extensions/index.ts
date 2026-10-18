@@ -492,6 +492,101 @@ export function classifyModelFailure(
 	return { retryable: false, kind: "other", label: "OTHER" };
 }
 
+// ── 同模型有界重试（2026-10-18）────────────────────────────────────
+// 背景：`runWithFallback` 旧逻辑里 `retryable:true` 的唯一语义是「可以试**下一个候选**」，
+// **从不重试同一个模型**。`general` 不在 config.json 的 fallbackModels 里 ⇒ 候选数=1
+// ⇒ `index(0) < 0` 恒 false ⇒ 第一次失败就终止、零重试。而 R-7b 实测的 Cloudflare 封禁
+// 是 **45–60s 自愈**的 ⇒ 不重试就等于把可自愈的瞬时故障当终态上报给用户。
+// 用户裁决：**不给 general 加 fallback 链**，只做「同模型有界重试 + 耗尽转用户」。
+
+/** 同模型有界重试参数（集中一处，便于测试注入/审查）。 */
+export const SAME_MODEL_RETRY = {
+	/** 同模型最多额外重试次数（不含首次）。0 = 关闭（回退旧行为）。 */
+	maxSameModel: 2,
+	/** usage_cap 的退避倍数（额度型错误恢复更慢：60s/120s）。 */
+	usageCapMultiplier: 2,
+	/** 递增退避（毫秒）：第 n 次重试等待 backoffMs(n)。R-7b：同 provider 连败必须冷却 ≥30s。 */
+	backoffMs: (n: number) => Math.min(30_000 * n, 60_000),
+};
+
+/** 永不重试的失败类别（显式黑名单）：wall_budget/stall 换模型也救不回；auth 需要人改凭据。
+ *  注意 classifyModelFailure 对 auth 返回 retryable:true（既有语义，勿改），所以这里必须再挡一次。 */
+export const SAME_MODEL_NEVER_RETRY: ReadonlySet<string> = new Set(["wall_budget", "stall", "auth"]);
+
+/**
+ * 有效重试上限：`SAME_MODEL_RETRY.maxSameModel`，可被 env `PI_SUBAGENT_RETRY_MAX` 覆盖（测试缝隙，
+ * 与 `PI_MODEL_COST_TIERS_PATH` / `PI_COST_TIER_ENFORCE` 同风格：env 只做注入，不改 config.json）。
+ * 非法值（空串/非数字/负数）⇒ 忽略并保留常量值（不崩、不静默采用怪值）；结果 clamp 到 [0,4]（禁止无限重试）。
+ */
+export function resolveSameModelRetryMax(): number {
+	const clamp = (n: number): number => Math.max(0, Math.min(4, Math.trunc(n)));
+	const raw = process.env.PI_SUBAGENT_RETRY_MAX;
+	if (raw === undefined || raw.trim() === "") return clamp(SAME_MODEL_RETRY.maxSameModel);
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) return clamp(SAME_MODEL_RETRY.maxSameModel);
+	return clamp(n);
+}
+
+/**
+ * 有效退避（毫秒）：默认 `SAME_MODEL_RETRY.backoffMs(n)`（30s/60s，上限 60s）；
+ * env `PI_SUBAGENT_RETRY_BACKOFF_MS` 给基准值时 `min(base*n, base*2)`（测试缝隙，非数字/负数/空串忽略）；
+ * `usage_cap` 再乘 `usageCapMultiplier`（额度型恢复更慢：60s/120s）。
+ */
+function retryBackoffMs(kind: string, n: number): number {
+	let ms: number;
+	const raw = process.env.PI_SUBAGENT_RETRY_BACKOFF_MS;
+	const base = raw !== undefined && raw.trim() !== "" ? Number(raw) : Number.NaN;
+	if (Number.isFinite(base) && base >= 0) {
+		ms = Math.min(base * n, base * 2);
+	} else {
+		ms = SAME_MODEL_RETRY.backoffMs(n);
+	}
+	if (kind === "usage_cap") ms *= SAME_MODEL_RETRY.usageCapMultiplier;
+	return Math.max(0, Math.trunc(ms));
+}
+
+/** 可被 AbortSignal 打断的 sleep：完成返回 true；被 abort 返回 false（监听器必 remove，不泄漏）。 */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<boolean> {
+	return new Promise<boolean>((resolve_) => {
+		if (signal?.aborted) {
+			resolve_(false);
+			return;
+		}
+		let done = false;
+		const finish = (ok: boolean) => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve_(ok);
+		};
+		const onAbort = () => finish(false);
+		const timer = setTimeout(() => finish(true), ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
+ * 同模型重试耗尽的终态文案：把每次尝试写进 error（含 `retries=<n>/<max>` 字样，供主 agent 判断）。
+ * 接在被包装的原始 error 之后（原始 error 一字不改，只在尾部追加记录块）。
+ */
+export function describeSameModelRetries(args: {
+	attempts: Array<{ attempt: number; label: string; error: string }>;
+	retries: number;
+	max: number;
+	label: string;
+	fallbackCount: number;
+}): string {
+	const lines: string[] = [
+		`--- 同模型重试记录 retries=${args.retries}/${args.max}（${args.label}）---`,
+	];
+	for (const a of args.attempts) lines.push(`[${a.attempt}] ${a.error}`);
+	lines.push(
+		`建议：等 30–60s 用同一 model 重派，或改 model= 覆盖（fallback 候选 ${args.fallbackCount} 个）。`,
+	);
+	return lines.join("\n");
+}
+
 /**
  * Build a main-agent-facing failure block: original error + what was tried +
  * explicit instruction to switch the main session model when usage is capped.
@@ -772,6 +867,11 @@ interface AttemptFailure {
 	kind: string;
 	/** Error message from the failed attempt. */
 	error: string;
+	/**
+	 * 同模型重试的序号（2026-10-18，**仅在被重试的条目上才出现**）：首次尝试不带此键，
+	 * 以保持 `maxSameModel=0`（关闭重试）时与旧行为逐字节一致。
+	 */
+	attempt?: number;
 }
 
 interface SubagentResult {
@@ -1517,11 +1617,29 @@ export function costTierGate(args: {
 }
 
 /** Human-readable fallback chain, e.g. "cli:claude ✗ PROVIDER → miaomiao/...". Empty if no fallback occurred. */
+function sameModelRetryFailure(fails: AttemptFailure[], failure: AttemptFailure): boolean {
+	return failure.attempt !== undefined || fails.some((other) => other !== failure && other.model === failure.model && other.attempt !== undefined);
+}
+
+/** A retry is not a fallback: only a failure on a different model proves the chain advanced. */
+function hasActualFallback(result: SubagentResult): boolean {
+	const finalModel = result.requestedModel ?? result.model;
+	return Boolean(finalModel && result.priorFailures?.some((failure) => failure.model !== finalModel));
+}
+
+/** Human-readable attempt chain; coalesce same-model retries so they cannot masquerade as distinct fallbacks. */
 function fallbackChainText(result: SubagentResult): string {
 	const fails = result.priorFailures ?? [];
 	if (fails.length === 0) return "";
 	const ok = result.requestedModel ?? result.model ?? "?";
-	const segs = fails.map((f) => `${f.model} ✗(${f.kind})`);
+	const segs: string[] = [];
+	for (let i = 0; i < fails.length;) {
+		const first = fails[i];
+		let count = 1;
+		while (i + count < fails.length && fails[i + count].model === first.model) count += 1;
+		segs.push(`${first.model} ✗(${first.kind}${count > 1 ? `；同模型重试×${count - 1}` : ""})`);
+		i += count;
+	}
 	return `${segs.join(" → ")} → ${ok}`;
 }
 
@@ -1644,24 +1762,63 @@ export async function runWithFallback(
 		}
 		tried.push(candidate);
 		__anySpawned = true;
-		const result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, opts);
-		result.requestedModel = candidate;
-		result.triedModels = [...tried];
-		allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
-		lastResult = result;
-		if (result.status === "completed" || result.status === "cancelled") {
-			return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
-		}
-		const cls = result.error
-			? classifyModelFailure(result.error, result.requestedModel ?? result.model)
-			: null;
-		// Record this failed attempt so downstream (main agent + TUI) can see WHY a fallback happened.
-		if (result.error) {
-			priorFailures.push({
-				model: candidate,
-				kind: cls?.label ?? "OTHER",
-				error: result.error,
-			});
+		// ── 内层：同一候选的有界重试（2026-10-18）───────────────────────
+		// 旧代码「试一次 → 换下一个候选」：`general` 候选数=1 ⇒ 第一次失败即终态。
+		// 现在：可重试类别先在同一 model 上重试至多 `resolveSameModelRetryMax()` 次（递增退避，
+		// 遵守 R-7b 的「同 provider 连败必须冷却 ≥30s」），耗尽后才走原有 fallback 判断。
+		const maxSameModel = resolveSameModelRetryMax();
+		let sameRetries = 0;
+		/** 本候选每次尝试的原始记录（供 describeSameModelRetries 写终态文案；attempt 从 1 起）。 */
+		const sameModelAttempts: Array<{ attempt: number; label: string; error: string }> = [];
+		let cls: ReturnType<typeof classifyModelFailure> | null = null;
+		let result: SubagentResult;
+		for (let attemptNo = 1; ; attemptNo++) {
+			result = await runSingle(agent, task, systemPrompt, candidate, timeoutMs, signal, onUpdate, opts);
+			result.requestedModel = candidate;
+			result.triedModels = [...tried];
+			allUsageEvents.push(...result.usageEvents.map((event) => ({ ...event, runId: dispatchRunId })));
+			lastResult = result;
+			if (result.status === "completed" || result.status === "cancelled") {
+				return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
+			}
+			cls = result.error
+				? classifyModelFailure(result.error, result.requestedModel ?? result.model)
+				: null;
+			const clsKind = cls?.kind;
+			const clsLabel = cls?.label ?? "OTHER";
+			// Record this failed attempt so downstream (main agent + TUI) can see WHY a fallback happened.
+			// 硬约束：首次尝试的形状必须与旧行为逐字节相同（仅 model/kind/error 三键）；
+			// 只有重试条目（attemptNo > 1）才追加 attempt 字段 ⇒ maxSameModel=0 时零行为变化。
+			if (result.error) {
+				const failure: AttemptFailure = {
+					model: candidate,
+					kind: clsLabel,
+					error: result.error,
+				};
+				if (attemptNo > 1) failure.attempt = attemptNo;
+				priorFailures.push(failure);
+				sameModelAttempts.push({ attempt: attemptNo, label: clsLabel, error: result.error });
+			}
+			// 继续重试的判据（显式黑名单再挡一次：wall_budget/stall 换模型也救不回，auth 需人改凭据）。
+			const canRetrySame = Boolean(
+				cls && cls.retryable && clsKind !== undefined
+				&& !SAME_MODEL_NEVER_RETRY.has(clsKind)
+				&& !signal?.aborted && sameRetries < maxSameModel,
+			);
+			if (!canRetrySame) break;
+			sameRetries += 1;
+			const waitMs = retryBackoffMs(clsKind ?? "other", sameRetries);
+			onUpdate?.(
+				`⟳ 同模型重试 ${sameRetries}/${maxSameModel}（${clsLabel}）`,
+				`${candidate} · 等待 ${Math.round(waitMs / 1000)}s`,
+			);
+			const slept = await sleepAbortable(waitMs, signal);
+			if (!slept) {
+				// 退避被 abort 打断 ⇒ 立即中断（不再 spawn、不睡满）——信号优先于重试。
+				result.status = "cancelled";
+				onUpdate?.("⛔ cancelled（退避等待被中断）", candidate);
+				return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
+			}
 		}
 		const more = index < candidates.length - 1 && isRetryableModelFailure(result);
 		if (more) {
@@ -1673,6 +1830,17 @@ export async function runWithFallback(
 				candidate,
 			);
 			continue;
+		}
+		// 同模型重试耗尽且无 fallback 可用 ⇒ 把「重试了几次、每次什么错」写进 error（不改其他键）。
+		if (sameRetries > 0 && result.status === "failed") {
+			const record = describeSameModelRetries({
+				attempts: sameModelAttempts,
+				retries: sameRetries,
+				max: maxSameModel,
+				label: cls?.label ?? "OTHER",
+				fallbackCount: candidates.length - 1,
+			});
+			result.error = result.error ? `${result.error}\n\n${record}` : record;
 		}
 		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
 	}
@@ -3664,11 +3832,11 @@ export default function (pi: ExtensionAPI) {
 						c.addChild(new Spacer(1));
 						const rIcon = r.status === "completed" ? theme.fg("success", "✓") : r.status === "cancelled" ? theme.fg("warning", "⛔") : theme.fg("error", "✗");
 						const modelTag = (r.requestedModel ?? r.model) ? ` ${theme.fg("muted", r.requestedModel ?? r.model)}` : "";
-						const fbMark = r.priorFailures?.length ? ` ${theme.fg("warning", `↺fallback×${r.priorFailures.length}`)}` : "";
+						const fbMark = r.priorFailures?.length ? ` ${theme.fg("warning", `↺attempt×${r.priorFailures.length}`)}` : "";
 						c.addChild(new Text(`${rIcon} ${theme.fg("accent", r.agent ?? "?")}${modelTag}${fbMark}`, 0, 0));
 						c.addChild(new Text(theme.fg("dim", r.text?.slice(0, 200) ?? r.error ?? ""), 0, 0));
 						if (r.priorFailures?.length) {
-							for (const f of r.priorFailures) c.addChild(new Text(theme.fg("error", `fallback: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 200)}`), 0, 0));
+							for (const f of r.priorFailures) c.addChild(new Text(theme.fg("error", `${sameModelRetryFailure(r.priorFailures!, f) ? "same-model attempt" : "fallback"}: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 200)}`), 0, 0));
 						}
 						if (r.usage?.turns) c.addChild(new Text(theme.fg("dim", `↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}`), 0, 0));
 					}
@@ -3724,7 +3892,7 @@ export default function (pi: ExtensionAPI) {
 				c.addChild(new Text(statusLine, 0, 0));
 				if (r.priorFailures?.length) {
 					for (const f of r.priorFailures) {
-						c.addChild(new Text(theme.fg("error", `fallback: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 300)}`), 0, 0));
+						c.addChild(new Text(theme.fg("error", `${sameModelRetryFailure(r.priorFailures!, f) ? "same-model attempt" : "fallback"}: ${f.model} failed (${f.kind}) — ${String(f.error).slice(0, 300)}`), 0, 0));
 					}
 				}
 				if (r.error) c.addChild(new Text(theme.fg("error", r.error), 0, 0));
@@ -3738,7 +3906,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (r.priorFailures?.length) {
 				for (const f of r.priorFailures) {
-					c.addChild(new Text(theme.fg("warning", `  ⚠ 候选回退: ${f.model} (${f.kind})`), 0, 0));
+					c.addChild(new Text(theme.fg("warning", `  ⚠ ${sameModelRetryFailure(r.priorFailures!, f) ? "同模型重试" : "候选回退"}: ${f.model} (${f.kind})`), 0, 0));
 				}
 			}
 			if (r.error && !isOk) {
@@ -4204,9 +4372,9 @@ export default function (pi: ExtensionAPI) {
 					result.model && result.model !== result.requestedModel ? `reported=${result.model}` : null,
 					p.model ? "source=call-override" : "source=agent-default",
 					result.triedModels?.length ? `tried=${result.triedModels.join(",")}` : null,
-					fallbackBits ? `fallback_from=${fallbackBits}` : null,
+					fallbackBits ? `attempt_failures=${fallbackBits}` : null,
 				].filter(Boolean).join(" ");
-				const fallbackHint = result.priorFailures?.length
+				const fallbackHint = hasActualFallback(result)
 					? `⚠ Requested model failed and a fallback was used: ${fallbackChainText(result)}\n`
 					: "";
 				const modelLine = (modelBits || fallbackHint) ? `[subagent ${modelBits}]\n\n${fallbackHint}` : "";
