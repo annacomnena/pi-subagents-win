@@ -8,7 +8,11 @@
  *   cutover/owner 双门 → status active + policy.enabled（pause 全跳过）
  *   → cooldown（先查，后扫信，省 IO）→ mailbox 有信 → debounce（最新信龄）
  *   → maxSpawns 滚动 24h → in-flight（wake-state tab 无终态且 dispatch 年轻）
- *   → claim 全 inbox → fire（含 prompt）
+ *   → claim 全 inbox → 派生监管块（P1 修正 ③：读 supervision 账本 + tab 账本）→ fire（含 prompt）
+ *
+ * 依赖方向（无循环）：本模块 import `./supervision.ts`（纯库）与 `../tab-runs.ts`；
+ * 而 `supervision.ts` 只 import `../tab-runs.ts` + `./journal.ts` + `frontier.ts` 类型，
+ * 两者都**不** import 本模块 ⇒ 不成环。本模块**不得** import `../supervision-runtime.ts`（Pi tool 层）。
  *
  * 确认（调用方 spawn 成功后）：confirmWakeSpawn 写 wake-state + ack 同 holder 信
  *   + 审计 wake.spawn。spawn 抛错 → 审计 wake.spawn-failed，信留 claimed（stale 恢复）。
@@ -29,7 +33,8 @@ import {
 	listLetters,
 	type Letter,
 } from "./mailbox.ts";
-import { defaultTabRunsDir, readTabDispatch } from "../tab-runs.ts";
+import { defaultTabRunsDir, readTabDispatch, readTabResultFile, readTabState, composeTabStatus } from "../tab-runs.ts";
+import { listOpenSupervisionEntries, thresholdsOf, type SupervisionEntry } from "./supervision.ts";
 import { evaluateAutonomyWakeGate } from "./autonomy/gate.ts";
 import { runAutonomyActions } from "./autonomy/action/run.ts";
 import {
@@ -180,7 +185,108 @@ function evaluateOne(
 	if (!claimed.length) return skip("no-mail"); // list→claim 窗口被他人取走（防御性）
 
 	const letters: WakeLetter[] = claimed.map(describeLetter);
-	return { workstreamId: ws.id, fire: true, letters, prompt: buildWakePrompt(ws, letters) };
+	// P1 主动推动（2026-10-18 修正 ③）：把「需推动的 tab」派生进 wake prompt。
+	// 无监管账本 / 读失败 / 无匹配 ⇒ undefined ⇒ buildWakePrompt 输出**逐字节不变**（既有保证）。
+	const supervision = deriveSupervisionItems({
+		stateDir: opts.stateDir,
+		runsDir: opts.runsDir ?? defaultTabRunsDir(),
+		now: opts.now,
+	});
+	return { workstreamId: ws.id, fire: true, letters, prompt: buildWakePrompt(ws, letters, supervision) };
+}
+
+// ── P1：停滞监管派发（供 buildWakePrompt 第三参）────────────────────
+
+/** 每 epoch 推动上限缺省（与 `supervision-runtime.ts::SUPERVISION_MAX_PUSHES` **双写**，见下）。 */
+const WAKE_PUSH_MAX_DEFAULT = 2;
+
+/**
+ * 本 epoch 推动计数（**与 `supervision-runtime.ts::countPushes` 同口径，双写**）。
+ *
+ * 为什么不直接 import：`supervision-runtime.ts` 是 **Pi tool 层**（import `@earendil-works/pi-coding-agent`
+ * / `pi-tui` / typebox），wake 是 runtime 纯库层 —— 反向 import 会把 tool 层拖进 wake 的依赖闭包
+ * （且 mailbox-consumer 已在 Pi 宿主外跑）。口径只有两行逻辑（`at > max(epoch.startedAt, lastActivityAt)`），
+ * 双写成本低于破层成本；两边改动必须同步（本注释 = 双写登记点）。
+ */
+function pushesThisEpochOf(entry: SupervisionEntry, stateLastActivityAt: string | undefined): number {
+	const started = Date.parse(String(entry?.epoch?.startedAt ?? ""));
+	const activity = Date.parse(String(stateLastActivityAt ?? ""));
+	const epochStartMs = Math.max(Number.isFinite(started) ? started : 0, Number.isFinite(activity) ? activity : 0);
+	const pushes = Array.isArray(entry?.epoch?.pushes) ? entry.epoch.pushes : [];
+	let n = 0;
+	for (const p of pushes) {
+		const t = Date.parse(String((p as { at?: unknown })?.at ?? ""));
+		if (Number.isFinite(t) && t > epochStartMs) n++;
+	}
+	return n;
+}
+
+/** maxPushes 钳制（**与 `supervision-runtime.ts::clampMaxPushes` 同口径，双写**）。 */
+function clampPushMax(v: unknown): number {
+	const n = typeof v === "number" && Number.isFinite(v) ? Math.round(v) : WAKE_PUSH_MAX_DEFAULT;
+	return Math.min(3, Math.max(1, n));
+}
+
+/**
+ * 从监管账本 + tab 账本派生 `WakeSupervisionItem[]`（P1 修正 ③：让第三参真正有生产调用方）。
+ *
+ * 取两类（任务书 §③）：
+ *   - `stopReason === "error"` —— BLOCKED_USER 里**唯一该被推**的子类（瞬时错误，推一次可复活）；
+ *   - STALLED 形状 —— `phase === "waiting" ∧ idleMs > thresholdsOf(entry).pushMs ∧ stop ∉ {toolUse,error,aborted}`。
+ * 其余（terminal / working / 短 idle / 跑工具）不进块：wake prompt 越短，被唤醒的 master 越不容易跑偏。
+ *
+ * **整段 never-throw**：任何读失败/异常 ⇒ 返回 `undefined`（保持 buildWakePrompt 逐字节不变的既有保证）。
+ */
+function deriveSupervisionItems(opts: { stateDir: string; runsDir: string; now: number }): WakeSupervisionItem[] | undefined {
+	try {
+		const entries = listOpenSupervisionEntries({ stateDir: opts.stateDir });
+		if (!entries.length) return undefined;
+		const items: WakeSupervisionItem[] = [];
+		for (const entry of entries) {
+			try {
+				if (entry.status !== "active" || entry.optOut === true) continue; // paused / 静默：不问不动
+				const dispatch = readTabDispatch(opts.runsDir, entry.runId);
+				const state = readTabState(opts.runsDir, entry.runId);
+				const result = readTabResultFile(opts.runsDir, entry.runId);
+				const view = composeTabStatus({
+					runId: entry.runId,
+					dispatch,
+					state,
+					result,
+					probe: null,
+					dispatchedAt: dispatch?.dispatchedAt,
+					now: opts.now,
+				});
+				if (view.terminal === true) continue; // 已终态：该回收而非推动
+				const stopReason = state?.lastStopReason ?? "unknown";
+				const actMs = Date.parse(String(state?.lastActivityAt ?? ""));
+				const idleMs = Number.isFinite(actMs) ? Math.max(0, opts.now - actMs) : 0;
+				const errored = stopReason === "error";
+				const stalled =
+					view.phase === "waiting" &&
+					idleMs > thresholdsOf(entry).pushMs &&
+					stopReason !== "toolUse" &&
+					stopReason !== "error" &&
+					stopReason !== "aborted";
+				if (!errored && !stalled) continue;
+				items.push({
+					runId: entry.runId,
+					taskId: entry.taskId || dispatch?.taskId || "unknown",
+					repoPath: dispatch?.cwd ?? entry.repoPath ?? "",
+					idleMs,
+					stopReason,
+					summary: state?.lastAssistantText ?? "",
+					pushesUsed: pushesThisEpochOf(entry, state?.lastActivityAt),
+					maxPushes: clampPushMax((entry as { maxPushes?: unknown }).maxPushes), // 账本 v1 无此字段 ⇒ 缺省 2（clamp [1,3]）
+				});
+			} catch {
+				continue; // 单条失败只影响单条（不让一条坏账本吃掉整块）
+			}
+		}
+		return items.length > 0 ? items : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 // ── 确认（调用方 spawn 成功后）──────────────────────────────────────
@@ -260,7 +366,9 @@ export function buildReplyRecipe(mailboxUrl: string): string {
 
 /**
  * 停滞监管块的单条输入（P1：`plans/20261017_stagnation_supervision_plan.md` §C.4/C.5）。
- * 由调用方从监管账本 + tab 账本派生后传入；本模块只做渲染，不读账本（保持纯函数）。
+ * 由 `deriveSupervisionItems`（本文件，读监管账本 + tab 账本派生）产出；`buildWakePrompt` 只负责渲染。
+ * （2026-10-18 修正 ③：旧注释说「本模块不读账本」，但第三参因此永远没有生产调用方——
+ *   监管块在生产上从未出现过。现在读账本就在 `evaluateOne` 的 fire 分支里，仍全部 never-throw。）
  */
 export interface WakeSupervisionItem {
 	runId: string;

@@ -17,9 +17,20 @@
  * - 写监管账本：`runtime/supervision.ts::writeSupervisionEntry`（不自写文件）
  * - 判态：`tab-runs.ts::composeTabStatus` + `tab-runs-runtime.ts::classifyForReclaim`（与 frontier 同口径）
  *
- * ## 档位（C.1 / C.3 末句）
- * `mode` 缺省 `"steer"`；`abort` **必须显式传入**，绝不自动升级——「绝不用 abort 档自动杀工具」。
+ * ## 档位（C.1 / C.3 末句）——2026-10-18 修正为「按相位自动选档」
+ * `mode` 的取值顺序：**显式传入永远优先**；否则按派生相位自动选——`phase === "working"` ⇒ `"steer"`
+ * （不打断在跑的工具），其余（waiting / 其它空闲相位）⇒ `"abort"`。
  * 本工具只写记录，真实执行（abort → 等 idle → 发消息）仍在 `steer-consumer.ts::runAbortTier`。
+ *
+ * ### C.3「绝不自动升级」的解读边界（**这一段是修正，P1 原注释是误读**）
+ * C.3 原文「绝不用 abort 档自动杀工具」约束的是**不打断正在运行的工具**。这条已由 `tool-use` 门
+ * 机械保证（`phase=working ∧ stop=toolUse` ⇒ 拒绝，根本不会推），**与档位选择无关**。
+ * 它**不**约束「idle tab 也不许用 abort」：idle tab 没有 run 可打断，abort 只是无害前置
+ * （`steer-consumer.ts`：abort → 等 idle ≤30s → 发消息起新 turn），而且**是 idle tab 唯一能起新 turn 的档**
+ * （`steer` 档带 `deliverAs:"steer"`，要等下一个 tool 边界；已 settled 的 tab 没有 tool 边界 ⇒ 永不起 turn）。
+ * P1 交付时把「缺省 steer、abort 必须显式传入」当成 C.3 的要求是**误读**：STALLED 的定义（idle 超阈值）
+ * 与缺省档位互相抵消 ⇒ 本工具对它唯一的目标场景完全无效（P1-1 报告已如实登记该症状）。
+ * 边界：`working ∧ stop≠toolUse` 自动选 steer ⇒ 不打断；`working` 且确实在跑工具 ⇒ 被 tool-use 门挡掉。
  *
  * ## 失败语义（spec §1.4 裁定）
  * 七条策略门各自独立 reason；**基础设施失败不是策略门**，单独 `reason:"io-error"`（不计入七条），
@@ -96,7 +107,10 @@ export interface PushGuardInput {
 	stopReason: string;
 	/** result.json 存在 ∨ state.terminal。 */
 	terminal: boolean;
-	/** 聚合：`reclaim==="awaitingInput"` ∨ `gate==="awaiting"` ∨ `attention>0` ∨ `stop==="error"`。 */
+	/**
+	 * 「真的在等人」（只告不推）：`gate==="awaiting"` ∨ `attention>0`。
+	 * **`stop="error"` 不属于此项**（2026-10-18 修正：那是「出错了要重试」，由 4b 单独判定）。
+	 */
 	needsHuman: boolean;
 	attention: number;
 	gate: string;
@@ -126,8 +140,12 @@ export function clampMaxPushes(v: unknown): number {
  *                       与 `deriveTabSupervisionState` 的 NOT_MONITORED 同口径）
  *   2. `paused`      —— 用户显式停：最优先的**意图**否决
  *   3. `terminal`    —— 已终态：该回收而不是推
- *   4. `needs-human` —— 在等人（C.4「BLOCKED_USER 只告不推」）
+ *   4. `needs-human` —— 在等人（C.4「BLOCKED_USER 只告不推」）；含 4b「stop=error 且已推过」
  *   5. `budget-exhausted` —— 策略预算（含 1h 节流）
+ *
+ * 4b 的设计（2026-10-18 修正）：`stop=error` **不是**「在等人」，是「出错了，需要重试」，因此
+ * 第一次（本 epoch 未推过）**放行**去试复活；推过一次仍 error ⇒ 才升级给人（`needs-human`）。
+ * 放行路径不受任何豁免：预算门（2 次/epoch、4 次/1h）、pid-dead、tool-use 照旧约束。
  *   6. `pid-dead`    —— 推是写空气
  *   7. `tool-use`    —— 在跑工具（最弱的软门：只挡 idle 假象）
  */
@@ -147,12 +165,25 @@ export function evaluatePushGuards(input: PushGuardInput): PushGuardResult {
 	if (input.terminal === true) {
 		return { ok: false, reason: "terminal", detail: "tab 已终态（result.json 存在或 state.terminal）→ 该回收而非推动" };
 	}
-	// 4) 在等人（BLOCKED_USER 只告不推）
-	if (input.needsHuman === true) {
+	// 4) 在等人（BLOCKED_USER 只告不推）。这里也复核 gate/attention（不只信调用方的聚合值），
+	//    保证「有人在等」这条**永不被** stop=error 的放行路径稀释（任务书硬约束）。
+	const hardBlocked = input.needsHuman === true || input.gate === "awaiting" || input.attention > 0;
+	if (hardBlocked) {
 		return {
 			ok: false,
 			reason: "needs-human",
 			detail: `需人介入（attention=${input.attention} gate=${input.gate} stop=${input.stopReason}）→ 只告不推`,
+		};
+	}
+	// 4b) 瞬时错误：stop=error 是「出错了，要重试」而非「在等人」。
+	//     - 本 epoch 未推过 ⇒ 放行去试复活（继续走 budget/pid-dead/tool-use 门，预算照旧兜住）
+	//     - 已推过 ≥1 次仍 error ⇒ 错误不是瞬时的，升级给人（needs-human，不新增 reason）
+	const errored = input.stopReason === "error";
+	if (errored && input.pushesThisEpoch >= 1) {
+		return {
+			ok: false,
+			reason: "needs-human",
+			detail: `stop=error 且本 epoch 已推 ${input.pushesThisEpoch} 次仍出错（非瞬时错误→升级给人）`,
 		};
 	}
 	// 5) 预算（本 epoch 满 或 1h 超节流）
@@ -239,7 +270,11 @@ export interface SupervisionRuntimeOptions {
 
 export interface SupervisePushInput {
 	runId: string;
-	/** 缺省 `"steer"`；`"abort"` **必须显式传入**（绝不自动升级）。 */
+	/**
+	 * 显式档位（**永远优先**）。缺省 ⇒ 按派生相位自动选：`working` ⇒ `steer`，其余 ⇒ `abort`。
+	 * 见文件头「C.3 解读边界」：自动选 abort 只对**没有 run 可打断**的场合（idle/waiting）发生，
+	 * 而真正在跑工具（`working ∧ stop=toolUse`）已被 tool-use 门挡掉，不会被 abort 打断。
+	 */
 	mode?: "steer" | "abort";
 }
 
@@ -309,7 +344,10 @@ export function supervisePush(
 		}
 	};
 	const runId = typeof input?.runId === "string" ? input.runId.trim() : "";
-	const mode: SteerMode = input?.mode === "abort" ? "abort" : "steer";
+	const requestedMode = input?.mode;
+	/** 显式传入优先；null ⇒ 等 view 派生后再按相位自动选（见下方 2.5）。 */
+	const explicitMode: SteerMode | null =
+		requestedMode === "abort" || requestedMode === "steer" ? requestedMode : null;
 	const nowDate = (() => {
 		try {
 			return deps.now ? deps.now() : new Date();
@@ -346,17 +384,27 @@ export function supervisePush(
 			now: nowMs,
 		});
 
-		// 3) needsHuman 聚合。这里刻意不把 reclaim=awaitingInput 纳入：tab-runs 将 settled 的
-		// phase=waiting 映射为 awaitingInput（「等人给下一句」），但这正是 C.4 要机械推动的 STALLED 形状；
-		// 真正需人介入由 gate/attention/stop=error 挡住。与 frontier-carriers 的展示口径不同：
-		// frontier 的 BLOCKED_USER 沿用既有广义 reclaim 判据（P0 已定稿），本工具按 C.3 只告不推的
-		// 实质阻塞载体聚合，不改变 P0 状态机。
+		// 2.5) 档位：显式传入优先；否则按相位自动选（2026-10-18 修正）。
+		//   working ⇒ steer（不打断工具；真在跑工具时 stop=toolUse 会被 tool-use 门挡掉，见 evaluatePushGuards 7）
+		//   其余   ⇒ abort（idle/waiting 无 run 可打断，且是唯一能给已 settled 的 tab 起新 turn 的档）
+		const mode: SteerMode = explicitMode ?? (view.phase === "working" ? "steer" : "abort");
+
+		// 3) needsHuman 聚合 = **只含「真的在等人」**（gate=awaiting / attention>0）。
+		// 刻意不把 reclaim=awaitingInput 纳入：tab-runs 将 settled 的 phase=waiting 映射为 awaitingInput
+		//（「等人给下一句」），但这正是 C.4 要机械推动的 STALLED 形状。
+		// 2026-10-18 修正：`stop=error` 也已移出本聚合——它是「出错了要重试」，由 evaluatePushGuards 的
+		// 4b 门单独判定（首次放行、推过仍错才升级给人）。原先把 error 算进 needsHuman ⇒ error tab 永不推，
+		// 而 error 恰恰是最该推的一类（今天 SBS / P1-1 / RF-1 都是被瞬时 Connection error 卡住的）。
+		// 与 frontier-carriers 的展示口径不同：frontier 的 BLOCKED_USER 沿用既有广义 reclaim 判据（P0 已定稿），
+		// 本工具按 C.3 只告不推的实质阻塞载体聚合，不改变 P0 状态机。
 		classifyForReclaim(view); // 保留真实分类链调用，便于与 P0 判态保持同一视图；不作为 needsHuman 判据。
 		const repoPath = dispatch?.cwd ?? ledger?.repoPath ?? "";
 		const gate = safeGate(deps.gateFor, repoPath);
 		const attention = safeAttention(deps.attentionFor, repoPath);
 		const stopReason = state?.lastStopReason ?? "unknown";
-		const needsHuman = gate === "awaiting" || attention > 0 || stopReason === "error";
+		const needsHuman = gate === "awaiting" || attention > 0;
+		/** stop=error 的放行标记：**只进 audit 行**（不新增账本字段，不动 validateEntry 校验）。 */
+		const erroredRetry = stopReason === "error";
 		const terminal = view.terminal === true || result !== null;
 		const pidAlive = typeof state?.pid === "number" && Number.isFinite(state.pid)
 			? safePidAlive(state.pid)
@@ -445,7 +493,7 @@ export function supervisePush(
 		// 7) 审计一行（事后可追责：方案 §D.3 第 ⑤ 层防线）
 		const remainingBudget = maxPushes - pushIndex;
 		audit(
-			`supervision-push ok runId=${runId} steerId=${steerId} push=${pushIndex}/${maxPushes} remaining=${remainingBudget} mode=${mode} task=${nextEntry.taskId} idle=${Math.round(idleMsOf(state?.lastActivityAt, nowMs) / 60_000)}min`,
+			`supervision-push ok runId=${runId} steerId=${steerId} push=${pushIndex}/${maxPushes} remaining=${remainingBudget} mode=${mode} task=${nextEntry.taskId} idle=${Math.round(idleMsOf(state?.lastActivityAt, nowMs) / 60_000)}min${erroredRetry ? " erroredRetry=1" : ""}`,
 		);
 		return { ok: true, steerId, pushIndex, remainingBudget, mode };
 	} catch (e) {
@@ -496,7 +544,7 @@ const REJECT_HINT: Record<PushRejectReason | "io-error", string> = {
 	"no-mandate": "该 tab 未被登记监管（或已 optout）⇒ 不推（先 /supervise on <runId>）",
 	paused: "用户显式暂停了该 tab 的监管 ⇒ 不推",
 	terminal: "该 tab 已终态 ⇒ 不推，该回收（reclaim-tabs）",
-	"needs-human": "该 tab 在等人（BLOCKED_USER）⇒ 只告不推",
+	"needs-human": "该 tab 在等人（gate=awaiting / attention>0），或 stop=error 且已推过一次 ⇒ 只告不推",
 	"budget-exhausted": "推动预算已尽 ⇒ 停止推，升级用户并附时间线",
 	"pid-dead": "该 tab 进程已死 ⇒ 推是写空气，转用户/master 决策重派",
 	"tool-use": "该 tab 正在跑工具 ⇒ 不推（避免打断/无效排队）",
@@ -516,8 +564,9 @@ export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRunt
 		label: "Supervise Push",
 		description: [
 			"对**停滞（STALLED）**的标签页推一次有界提醒（C.2 模板），并把它记进监管账本的 pushes[]。",
-			"参数：runId（目标标签页，必填）；mode（\"steer\" 缺省 / \"abort\"，abort 必须显式给，不会自动升级）。",
-			"七条拒绝路径（各自独立 reason，先命中先返回）：no-mandate（无账本/optout）、paused（用户暂停）、terminal（已终态）、needs-human（在等人：attention/gate awaiting/stop=error）、budget-exhausted（本 epoch 满 maxPushes=2 或近 1h≥4 次）、pid-dead（进程死）、tool-use（phase=working∧stop=toolUse）。",
+			"参数：runId（目标标签页，必填）；mode（可选 \"steer\"/\"abort\"；**不传时按相位自动选**：phase=working ⇒ steer（不打断工具），其余 ⇒ abort（idle tab 唯一能起新 turn 的档）。显式传入永远优先）。",
+			"七条拒绝路径（各自独立 reason，先命中先返回）：no-mandate（无账本/optout）、paused（用户暂停）、terminal（已终态）、needs-human（真的在等人：attention/gate awaiting；**或** stop=error 且本 epoch 已推过 1 次）、budget-exhausted（本 epoch 满 maxPushes=2 或近 1h≥4 次）、pid-dead（进程死）、tool-use（phase=working∧stop=toolUse）。",
+			"stop=error 且本 epoch 未推过 ⇒ **放行**推一次试复活（推过的记录只标记 audit 行 erroredRetry=1，不新增账本字段）；预算门照旧兜住。",
 			"基础设施失败（读/写文件异常）单独用 reason=io-error，不计入七条策略门。",
 			"预算是机械强制的：推满 maxPushes 后一律 budget-exhausted —— 此时应升级用户（附账本 pushes[] 时间线），不要换 runId 绕过。",
 			"仅主会话可用（子 agent / 标签页身份调用一律拒绝）。",
@@ -525,11 +574,11 @@ export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRunt
 		parameters: Type.Object({
 			runId: Type.String({ description: "目标标签页 runId（tab_xxx）" }),
 			mode: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("abort")], {
-				description: "steer（缺省）= 下一个 tool 边界送达；abort = 打断当前 run 等空闲后再发。abort 必须显式给，绝不自动升级",
+				description: "不传 = 按相位自动选（working ⇒ steer；其余 ⇒ abort）；steer = 下一个 tool 边界送达；abort = 打断当前 run 等空闲后再发。显式传入永远优先",
 			})),
 		}),
 		renderCall(args, theme) {
-			const mode = typeof args.mode === "string" ? args.mode : "steer";
+			const mode = typeof args.mode === "string" ? args.mode : "auto";
 			return new Text(
 				`${theme.fg("toolTitle", theme.bold("supervise-push"))} ${theme.fg("accent", `→${String(args.runId ?? "")}`)} ${theme.fg("dim", `[${mode}]`)}`,
 				0,
@@ -546,14 +595,16 @@ export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRunt
 			const p = (rawParams ?? {}) as { runId?: unknown; mode?: unknown };
 			const runId = typeof p.runId === "string" ? p.runId.trim() : "";
 			if (!runId) return text("supervise-push: runId required（目标标签页 runId）", true);
-			const mode: "steer" | "abort" = p.mode === "abort" ? "abort" : "steer";
+			// 不传 mode 时**不得**在此处补缺省——自动选档在 supervisePush 内部按派生相位做（见文件头 C.3 解读边界）
+			const explicitMode: "steer" | "abort" | undefined =
+				p.mode === "abort" || p.mode === "steer" ? p.mode : undefined;
 
-			const res = supervisePush({ runId, mode }, opts);
+			const res = supervisePush({ runId, mode: explicitMode }, opts);
 			if (!res.ok) {
 				return text(
 					[
 						`❌ supervise-push 拒绝: reason=${res.reason}`,
-						`  target=tab:${runId} mode=${mode}`,
+						`  target=tab:${runId} mode=${explicitMode ?? "auto"}`,
 						`  detail=${res.detail}`,
 						`  ⇒ ${REJECT_HINT[res.reason] ?? "不推"}`,
 					].join("\n"),

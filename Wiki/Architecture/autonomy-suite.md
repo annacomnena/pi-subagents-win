@@ -214,7 +214,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 | 1 | `no-mandate` | `ledger === null` **或** `ledger.optOut === true` | 连监管意图都没有，后面所有判据都无载体。`optOut` 并入此门（与 `deriveTabSupervisionState` 的 `NOT_MONITORED` 同口径，不新增第 8 条语义） |
 | 2 | `paused` | `ledger.status === "paused"` | 用户**显式意图**否决优先于一切机械判据（比「已终态」还优先：用户说停就停） |
 | 3 | `terminal` | `view.terminal === true || result !== null` | 已终态 ⇒ 该回收（reclaim-tabs）而不是推 |
-| 4 | `needs-human` | `gate === "awaiting" ∨ attention > 0 ∨ stop === "error"` | 在等人 ⇒ **只告不推**（C.4）。**判定口径见下方「口径差异」** |
+| 4 | `needs-human` | `gate === "awaiting" ∨ attention > 0`（`hardBlocked`：除调用方 `needsHuman` 布尔外**再独立复核** gate/attention） | 真的在等人 ⇒ **只告不推**（C.4）。**判定口径见下方「口径差异」** |
+| 4b | `needs-human`（同一 reason 字符串，不新增） | `stopReason === "error"` **∧** `pushesThisEpoch >= 1` | `stop=error` 不是「在等人」，是「出错了要重试」。**首次（本 epoch 未推过）放行**去试复活；推过一次仍 error ⇒ 错误不是瞬时的，才升级给人。放行路径**不豁免**任何门：预算（2/epoch、4/1h）、`pid-dead`、`tool-use` 照旧约束 |
 | 5 | `budget-exhausted` | `pushesThisEpoch >= maxPushes` **∨** `pushesLastHour >= 4` | 预算在活性判据之前：预算已尽时推不推都没意义，先给出可行动结论（升级用户） |
 | 6 | `pid-dead` | `pidAlive === false` | 推是写空气 ⇒ 转重派决策。`pidAlive === null`（无 pid 字段/探活抛错）**不拒**（不猜） |
 | 7 | `tool-use` | `phase === "working" ∧ stopReason === "toolUse"` | 最弱的软门：只挡「在跑工具被误当 idle」 |
@@ -240,7 +241,9 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **epoch 计数是读侧重置，不写盘**：`effectiveEpochStart = max(epoch.startedAt, state.lastActivityAt)`（`epochStartMsOf`）⇒ tab 在上次推动后有过活动，那些 push 不再计入本 epoch；`countPushes` 同时算 `thisEpoch` 与 `lastHour`。理由：`supervise-push` 是窄路径，多一次账本写就多一个竞态窗口（同 AGENTS R-3 多写者纪律）。代价：账本 `epoch.pushes[]` 只增（当前无人显式重置 `epoch.startedAt`），且 frontier 的 `epochPushes`（`collect.ts:395`，全量 `pushes.length`）与这里的 `pushesThisEpoch`（读侧重置后）**口径不同，未合并**。
 - **返回形状**（`SupervisePushResult`）：成功 `{ok:true, steerId, pushIndex, remainingBudget, mode}`；失败 `{ok:false, reason: PushRejectReason | "io-error", detail}`。`supervisePush` **never-throw**（所有异常收敛 `io-error`；审计注入抛错也被吞，同 `autoRegisterDispatchedTabs` 纪律）。
 - **七步编排**（`supervisePush`）：读账本+dispatch+state+result → `composeTabStatus` 组判态（`probe: null`，不猜 JSONL）→ 聚合 needsHuman/terminal/pid → `evaluatePushGuards` → `pushTemplate` + `writeSteerAtomic`（**复用** `steer.ts::newSteerId` / `writeSteerAtomic`，不自造 id/文件）→ `epoch.pushes` 回写（**复用** `writeSupervisionEntry`）→ audit 一行。
-- **档位**：`mode` 缺省 `"steer"`，`"abort"` **只能显式传入，绝不自动升级**（C.3 末句「绝不用 abort 档自动杀工具」）。
+- **档位（按相位自动选，显式优先）**：`mode` 取值顺序 = **显式传入永远优先**；否则 `phase === "working"` ⇒ `"steer"`，其余（`waiting` 等空闲相位）⇒ `"abort"`。
+  - **为什么这样切**：`STALLED` 的定义就是 idle 超阈值 ⇒ 必然 `waiting` ⇒ 自动档必须是 `abort`；而 `steer` 档带 `deliverAs:"steer"`（等下一个 tool 边界），对已 settled 的 tab **永不起新 turn** ⇒ 缺省 `steer` 会让工具对它唯一的目标场景完全无效。
+  - **C.3「绝不自动升级」的解读边界**（关键，勿再误读）：C.3 原文约束的是**不打断正在运行的工具**——这一条已由 `tool-use` 门机械保证（`working ∧ stop=toolUse` ⇒ 拒绝，根本不会推），**与档位选择无关**。它**不**约束「idle tab 也不许用 abort」：idle tab 没有 run 可打断，abort 只是无害前置（`steer-consumer.ts`：abort → 等 idle ≤30s → 发消息起新 turn）。把「缺省 steer、abort 必须显式传入」当成 C.3 的要求是**误读**。
 - **账本推动记录**：`push = {at, mode, steerId, reason:"stalled", outcome:"pending"}`——`mode`/`reason` 是 `SupervisionPushRecord` 的**运行时超集**（读侧宽容，v1 形状不变）。
 - **身份门**：`registerSupervisionTools` 的 execute 开头两道拦截——`isSubagent()` → 拒；`getTabRunId()` 存在（标签页会话）→ 拒。tab 不得推动别的 tab，也不得自我推动（与 `/supervise` 手动运维命令同口径）。
 - **审计行**：成功 `supervision-push ok runId=… steerId=… push=N/M remaining=… mode=… task=… idle=…min`；拒绝 `supervision-push reject runId=… reason=… detail=…`；基础设施失败 `supervision-push io-error …`（经 `index.ts` 注入的 `appendAuditLine` 落 `state/autonomy/audit.jsonl`）。
@@ -252,25 +255,30 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 | 侧 | 判据 | 源码 |
 |---|---|---|
 | `frontier` → `BLOCKED_USER`（P0 定稿，**未改**） | `tab.needsHuman` ∨ `gate==="awaiting"` ∨ `attention>0`，再 ∨ `stop==="error"`；而 `tab.needsHuman = reclaim === "awaitingInput" \|\| gate === "awaiting"`（**广义 reclaim**） | `frontier-carriers.ts:332` → `frontier.ts:309/313` |
-| `supervise-push` → `needs-human`（P1 **收窄**） | `gate === "awaiting"` ∨ `attention > 0` ∨ `stop === "error"`（**不含 `awaitingInput`**） | `supervision-runtime.ts:359` |
+| `supervise-push` → `needs-human`（**两次收窄**） | ① `gate === "awaiting"` ∨ `attention > 0`；② **或** `stop === "error" ∧ pushesThisEpoch >= 1`（**不含 `awaitingInput`**；`stop=error` 首推放行） | `supervision-runtime.ts::evaluatePushGuards` 门 4 / 4b |
 
 理由（关键）：`tab-runs-runtime.ts:382` 的 `classifyForReclaim` 把 `phase === "waiting"` 映射成 `awaitingInput`，而 **`waiting` 正是已 `agent_settled` 的 idle tab 的形状 = STALLED 的形状**。若把 `awaitingInput` 计入 `needs-human`，则**真实 idle tab 恒被拒** ⇒ `STALLED` 永不触发 ⇒ P1 核心交付在真实盘面完全不可用（已用独立探针实测证明：把聚合改回含 `awaitingInput` 后，真实端到端成功用例实红且命中预期断言）。
 
-因此：`supervision-runtime.ts` 的 `supervisePush` 仍**调用** `classifyForReclaim(view)`（保持与 P0 同一视图，便于对照），但**不把它的返回值当 `needsHuman` 判据**。真正需人介入由 `gate` / `attention` / `stop==="error"` 三个实质阻塞载体挡住。
+因此：`supervision-runtime.ts` 的 `supervisePush` 仍**调用** `classifyForReclaim(view)`（保持与 P0 同一视图，便于对照），但**不把它的返回值当 `needsHuman` 判据**。真正需人介入只由 `gate === "awaiting"` / `attention > 0` 两个实质载体挡住。
+
+**`stop="error"` 已移出 `needsHuman`**（第二次收窄）：它是「出错了，需要重试」，不是「在等人」。原先把 error 并入 `needsHuman` ⇒ error tab 被 `needs-human` 永久拒绝 ⇒ **永不推**，而 error 恰恰是最该推的一类（瞬时 `Connection error` 卡死的 tab）。现在：本 epoch 未推过 ⇒ 放行推一次试复活；推过一次仍 error ⇒ 才以 `needs-human` 升级给人。**`gate=awaiting` / `attention>0` 永不走这条放行路径**（`hardBlocked` 在 4b 之前判定，且 `evaluatePushGuards` 独立复核 gate/attention，不只信调用方的聚合布尔）。
 
 > 若将来要统一两侧口径，正确方向是**收窄 frontier 的 `needsHuman`**（把 `awaitingInput` 从 `tab.needsHuman` 里拆出去，另给「空闲待聊」单独语义），而不是放宽 `supervise-push`——放宽会让 P1 失效。
 
 #### 相关字段与接线
 
-- `extensions/runtime/wake.ts::buildWakePrompt(ws, letters, supervision?)`——**第三可选参** `WakeSupervisionItem[]`（`{runId, taskId, repoPath, idleMs, stopReason, summary, pushesUsed, maxPushes}`），非空时插入「停滞监管」块（最多 10 条，每条带 `用 supervise-push({runId:"…"}) 推动` 指令；摘要截断 120）。`undefined` / `[]` ⇒ **输出逐字节不变**（`Array.isArray(supervision) && length > 0` 才调用 `buildSupervisionBlock`）；现有调用方 `wake.ts:183` 仍传两参。
+- `extensions/runtime/wake.ts::buildWakePrompt(ws, letters, supervision?)`——**第三可选参** `WakeSupervisionItem[]`（`{runId, taskId, repoPath, idleMs, stopReason, summary, pushesUsed, maxPushes}`），非空时插入「停滞监管」块（最多 10 条，每条带 `用 supervise-push({runId:"…"}) 推动` 指令；摘要截断 120）。`undefined` / `[]` ⇒ **输出逐字节不变**（`Array.isArray(supervision) && length > 0` 才调用 `buildSupervisionBlock`）。
+- **派生接线（生产已有调用方）**：`wake.ts::deriveSupervisionItems`（`evaluateOne` 的 fire 分支内调用，读监管账本 + tab 账本）产出条目后传入 `buildWakePrompt(ws, letters, supervision)`。取两类：`stopReason === "error"`（BLOCKED_USER 里唯一该被推的子类）与 STALLED 形状（`phase === "waiting" ∧ idleMs > thresholdsOf(entry).pushMs ∧ stop ∉ {toolUse,error,aborted}`）；跳过 `status !== "active"` / `optOut === true` / `view.terminal === true`（后者必被 `terminal` 门拒，不进 prompt 以免噪声）。**整段 never-throw**：读失败/为空 ⇒ `undefined`（保持逐字节不变的既有保证）。
+- **依赖方向（不得反向）**：`wake.ts` 只 import 纯库 `./supervision.ts`（`listOpenSupervisionEntries` / `thresholdsOf`）+ `../tab-runs.ts`；**不得** import `../supervision-runtime.ts`（Pi tool 层，import `@earendil-works/pi-coding-agent` / `pi-tui` / typebox，反向会把它拖进 wake 的依赖闭包）。已实测无循环依赖。
+- **双写登记点**：`wake.ts::pushesThisEpochOf` / `WAKE_PUSH_MAX_DEFAULT` / `clampPushMax` 与 tool 层 `supervision-runtime.ts::countPushes` / `SUPERVISION_MAX_PUSHES` / `clampMaxPushes` **同口径双写**（各仅两行逻辑，双写成本低于破层成本）。**改动任一侧必须同步另一侧**——这是唯一登记点。
 - `extensions/tab-runs.ts::TabState.currentToolStartedAt?: string`（ISO 时刻）：**写入** `tool_execution_start`；**清除** `tool_execution_end` / `agent_settled` / `session_shutdown`（`tab-runs-runtime.ts:96-107/140`）。配套新增 `tool_execution_end` 监听（原先只有 start）⇒ `lastActivityAt` 在**每个工具完成时**也刷新（不只是开始时）。目的：让 HANG 判据（`working ∧ stop=toolUse` 满分 60min）能区分「一个工具跑了 55min」vs「一连串工具各跑几分钟」。
 - `extensions/index.ts:2543`：`collect(registerSupervisionTools(pi, { audit: (line) => appendAuditLine(line) }))`，紧跟 `registerSteerTools`。
-- **验证入口**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`，60 checks）。
+- **验证入口**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`，**69 checks**）。
 
 #### 未闭合边界（勿当成已完成）
 
-1. **`buildWakePrompt` 第三参无生产调用方**：spec 只要求「加可选参 + 现有调用方零改动」，`wake.ts:183` 仍 `buildWakePrompt(ws, letters)` ⇒ **监管块在生产路径上还不会出现**。要生效需在 `evaluateWakes` 里从「监管账本 + tab 账本」派生 `WakeSupervisionItem[]` 再传入。
-2. **steer 档对 idle tab 不起新 turn**：`steer.ts::sendSteerDetailed` 硬编码 `deliverAs:"steer"`，语义是「下一个 **tool 边界**送达」；已 settled（`agent_settled` → `waiting`）的 tab 没有下一个 tool 边界 ⇒ 消息只留在 steering 队列、**不会起新 turn** = 无效推动。唯一能起新 turn 的路径是 `abort` 档（`steer-consumer.ts::sendAbortMessage` 的 `send(body)` **不带** `deliverAs` ⇒ 空闲态走 `prompt()` 正常路径）。但按「绝不自动升级」，本工具**不会**按 `phase` 自动切档 ⇒ **对已 settled tab 应显式传 `mode:"abort"`**（对空闲 tab 的 abort 是无害前置：没有 run 可打断）。是否把缺省档按 `phase` 分流，留主会话裁决（当前**故意**不做）。
+1. ~~`buildWakePrompt` 第三参无生产调用方~~ **已闭合**：`evaluateOne` 的 fire 分支经 `deriveSupervisionItems` 派生后传入（见「相关字段与接线」）。
+2. ~~steer 档对 idle tab 不起新 turn~~ **已闭合**：缺省档改为按相位自动选（`waiting` ⇒ `abort`），显式传入仍优先。
 3. **`currentToolStartedAt` 不做嵌套计数**：并行工具时 `tool_execution_start` 只保留**最后一个**起始时刻，任一 `tool_execution_end` 就清空 ⇒ 并行工具批次里 HANG 判据可能**提前归零**。要修需计数器/栈（改 `TabState` 形状 + bump 版本）。
 4. **`io-error` 形状借用了空 `runId` 的收敛口**：空/非法 `runId` 也走 `io-error`（不是第 8 条策略门）⇒ 调用方无法从 `reason` 区分「参数错」与「磁盘满」，只能读 `detail`（前缀 `invalid-input:`）。另：`writeSteerAtomic` 成功但 `writeSupervisionEntry` 失败 ⇒ 返回 `io-error` 而 **steer 已落盘**（真实推动已发生），`detail` 带 `steerId=` 便于追责；取舍同 AGENTS R-5「宁可重发不可漏发」（重试会多一条推动，1h ≤4 上限兜住），未做成显式 `partial` reason（那会变成第 8 条语义，与 spec 冲突）。
 
@@ -315,7 +323,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 ## Evidence
 
-- **P1 主动推动（`2a4024a`，2026-10-18 实测）**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`）→ **all 60 checks passed**（七条拒绝路径逐条 + `io-error` 两条 + 模板逐字 + 预算/读侧重置 + `buildWakePrompt` 第三参 undefined/[] 与手写冻结字面量逐字节相等 + 工具注册与身份门 + 真实 `writeTabState(waiting)` 端到端成功）；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks passed**；`npm run test:autonomy-actions` → **87 checks passed**。源码：`extensions/supervision-runtime.ts::{evaluatePushGuards,pushTemplate,supervisePush,registerSupervisionTools,countPushes,clampMaxPushes}`、`extensions/runtime/wake.ts::{buildWakePrompt,WakeSupervisionItem}`、`extensions/tab-runs.ts::TabState.currentToolStartedAt` + `extensions/tab-runs-runtime.ts#L96-L107`、接线 `extensions/index.ts#L2543`。**口径差异的证据链**：`needs-human` 含 `awaitingInput` 时真实端到端成功用例实红（命中预期断言，8 组）⇒ 收窄为 `gate==="awaiting" ∨ attention>0 ∨ stop==="error"`（`supervision-runtime.ts:359`）；`frontier-carriers.ts:332` / `frontier.ts:309,313` 的 P0 广义 reclaim 判据**零改动**。
+- **P1 主动推动 + 三处修正（`2a4024a` + 后续 commit，2026-10-18 实测）**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`）→ **all 69 checks passed**（七条拒绝路径逐条 + 门 4b `stop=error` 首推放行 + `io-error` 两条 + 模板逐字 + 预算/读侧重置 + `buildWakePrompt` 第三参 undefined/[] 与手写冻结字面量逐字节相等 + 工具注册与身份门 + 真实 `writeTabState(waiting)` 端到端成功 + 相位自动选档三例 + `evaluateWakes` 真派发监管块两例）；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks passed**；`npm run test:autonomy-actions` → **87 checks passed**；`npm run test:model-retry` → **8 组**；`npm run test:model-failure-classify` → **3 组**；`npm run test:runtime-wake` → all assertions passed。源码：`extensions/supervision-runtime.ts::{evaluatePushGuards,pushTemplate,supervisePush,registerSupervisionTools,countPushes,clampMaxPushes}`、`extensions/runtime/wake.ts::{buildWakePrompt,deriveSupervisionItems,WakeSupervisionItem}`、`extensions/tab-runs.ts::TabState.currentToolStartedAt` + `extensions/tab-runs-runtime.ts#L96-L107`、接线 `extensions/index.ts#L2543`。**接线变异验证**：将 `buildWakePrompt(ws, letters, supervision)` 变异回两参 ⇒ 监管块断言实红（1 failed / 68 passed），字节级还原后 sha256 一致 ⇒ 断言确实经由真实接线而非直调纯函数。**口径差异的证据链**：`needs-human` 含 `awaitingInput` 时真实端到端成功用例实红（命中预期断言，8 组）⇒ 第一次收窄为 `gate==="awaiting" ∨ attention>0`；随后 `stop="error"` 移出 `needsHuman`、由门 4b（`pushesThisEpoch>=1` 才升 needs-human）单独判定 ⇒ 第二次收窄。`frontier-carriers.ts:332` / `frontier.ts:309,313` 的 P0 广义 reclaim 判据**零改动**。
 
 - **监管账本默认开启（2026-10-18 实测）**：`npx tsx extensions/_test_runtime_supervision_default_on.ts` → **all 26 checks passed**（自动登记两接线点 / `optout` 与 `off` 语义 / `stop=error→BLOCKED_USER` 不限 phase / 重复登记不清 optOut / 用法串含 optout）；`npx tsx extensions/_test_runtime_autonomy.ts` → **all 66 checks passed**（SUP-P0 六态组未回归）；`npm run test:autonomy-actions` → **all 87 checks passed**；`npm run smoke:extension-load` → extension load OK；`npm run test:master-dispatch` → **# pass 16**。源码：`extensions/runtime/supervision.ts::{autoRegisterDispatchedTabs,setSupervisionStatus,setSupervisionOptOut,handleSuperviseCommand}`、`extensions/runtime/autonomy/frontier.ts::deriveTabSupervisionState`、`extensions/runtime/autonomy/collect.ts::readSupervisionInputs`、接线 `extensions/index.ts`（launch-tabs execute + `dispatchTab` 闭包）、`extensions/master-tools.ts#L731`；phase 派生 `extensions/tab-runs.ts#L356-L369`（`error|aborted → unconfirmed`）。
 
@@ -342,8 +350,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 ## Open Questions
 
 - **open 账本无 GC**：`autoRegisterDispatchedTabs` 使账本条目随每次派发增长，`closed/` 只在 `/supervise off` 时产生；无自动关账、无过期清理，长期运行会积累不过问的 open 条目（派生面仍正确——`DONE`/`NOT_MONITORED` 不报——只是文件数单调增长）。
-- **监管块在生产上还不会出现**：`buildWakePrompt` 第三参已就位但无调用方（见「主动推动」节未闭合边界 1）——「被唤醒的 master 知道哪个 tab 停滞」这一环尚缺派生接线。
-- **对已 settled tab，缺省 `steer` 档是无效推动**：需 master 显式传 `mode:"abort"`（见未闭合边界 2）。缺省档是否按 `phase` 分流待裁决。
+- ~~监管块在生产上还不会出现~~ **已闭合**：`evaluateWakes` 经 `deriveSupervisionItems` 真派发（见「相关字段与接线」）。
+- ~~对已 settled tab，缺省 `steer` 档是无效推动~~ **已闭合**：缺省档按相位自动选（`waiting` ⇒ `abort`），显式传入优先。
 - **账本 `epoch.pushes[]` 只增**：`epoch.startedAt` 当前无人重置，读侧重置只在 `countPushes` 内部生效 ⇒ 账本体积单调增长；且 frontier `epochPushes`（全量）与 `push` 判定用的 `pushesThisEpoch`（读侧重置后）口径不同，未合并。
 - **两侧 `needs-human` 口径差是刻意的**（frontier 广义 reclaim vs `supervise-push` 收窄），未统一；统一时应收窄 frontier 侧而非放宽推动侧。
 - **三条派发路径尚未接自动登记**：`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab —— 这些 tab 仍落在旧默认（无账本 ⇒ `NOT_MONITORED`）。

@@ -46,15 +46,27 @@ import {
 	readSupervisionLedger,
 	setSupervisionOptOut,
 	setSupervisionStatus,
+	writeSupervisionEntry,
 	type SupervisionEntry,
 } from "./runtime/supervision.ts";
 import { appendAuditLine } from "./runtime/autonomy/collect.ts";
-import { buildWakePrompt, type WakeLetter } from "./runtime/wake.ts";
+import { buildWakePrompt, evaluateWakes, type WakeLetter } from "./runtime/wake.ts";
+import { attachMaster, setCutover } from "./runtime/registry.ts";
+import { deliverLetter } from "./runtime/mailbox.ts";
+import { newEnvelopeId } from "./runtime/ids.ts";
+import { newMessageFrame } from "./runtime/protocol.ts";
+import { createWorkstream } from "./runtime/workstreams.ts";
+import { workstreamAddress } from "./runtime/address.ts";
 import { readSteerRecord, sendSteerDetailed } from "./steer.ts";
 import { composeTabStatus, readTabDispatch, readTabState, writeTabDispatch, writeTabState, type TabDispatchRecord, type TabState } from "./tab-runs.ts";
 import { classifyForReclaim } from "./tab-runs-runtime.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** no-key autonomy config（9(h)/9(i) 注入：避开生产 config.json，同 autonomy_wiring R10 纪律）。 */
+const CFG_TMP = mkdtempSync(join(tmpdir(), "runtime-sup-push-cfg-"));
+const cfgNoKey = join(CFG_TMP, "no-key.json");
+writeFileSync(cfgNoKey, JSON.stringify({ masterSuccession: { auto: true } }), "utf8");
 
 let passed = 0;
 let failed = 0;
@@ -668,13 +680,15 @@ console.log("7. supervisePush 端到端：策略门经真实读路径（账本/s
 			assert.equal((r as { reason: string }).reason, "needs-human");
 		} finally { iso7.dispose(); }
 	});
-	check("7(f) stop=error ⇒ needs-human（BLOCKED_USER 只告不推）", () => {
+	check("7(f) stop=error ∧ 本 epoch 已推过 1 次 ⇒ needs-human（行为变更：旧断言是「stop=error 即 needs-human」）", () => {
 		const iso7 = mkIsolated("needs-human-stop");
 		try {
 			const RUN = "tab_nh3";
 			writeTabDispatch(iso7.runsDir, mkDispatch(RUN, "T", "G:/x"));
 			writeTabState(iso7.runsDir, RUN, mkState(RUN, { lastStopReason: "error" }));
-			seedLedger(mkLedger(RUN, { stateDir: iso7.stateDir, runsDir: iso7.runsDir }), iso7.stateDir);
+			// 2026-10-18 修正 ①：stop=error 首次（0 次）是**放行**的；推过一次仍 error 才升级给人。
+			// 因此本反例必须补 pushes: 1（数量不变，仍是 1 条 check）。
+			seedLedger(mkLedger(RUN, { stateDir: iso7.stateDir, runsDir: iso7.runsDir, pushes: 1 }), iso7.stateDir);
 			const r = supervisePush({ runId: RUN }, { stateDir: iso7.stateDir, runsDir: iso7.runsDir, steerDir: iso7.steerDir, now: () => NOW });
 			assert.equal((r as { reason: string }).reason, "needs-human");
 		} finally { iso7.dispose(); }
@@ -795,7 +809,8 @@ console.log("8. waiting 真实端到端成功推动；stop=error / gate / attent
 	} finally { iso8.dispose(); }
 
 	for (const [label, opts] of [
-		["stop=error", { state: { lastStopReason: "error" } }],
+		// 2026-10-18 修正 ①：stop=error 的首推是放行的 ⇒ 反例必须补“已推过一次”才仍是 needs-human
+		["stop=error", { state: { lastStopReason: "error" }, pushes: 1 }],
 		["gate=awaiting", { gateFor: () => "awaiting" }],
 		["attention>0", { attentionFor: () => 1 }],
 	] as const) {
@@ -805,12 +820,263 @@ console.log("8. waiting 真实端到端成功推动；stop=error / gate / attent
 				const id = `tab_counter_${label.replace(/[^a-z]/gi, "")}`;
 				writeTabDispatch(iso8.runsDir, mkDispatch(id, "T", "G:/x"));
 				writeTabState(iso8.runsDir, id, mkState(id, { phase: "waiting", ...opts.state }));
-				seedLedger(mkLedger(id, { stateDir: iso8.stateDir, runsDir: iso8.runsDir }), iso8.stateDir);
+				const pushes = "pushes" in opts ? opts.pushes : 0;
+				seedLedger(mkLedger(id, { stateDir: iso8.stateDir, runsDir: iso8.runsDir, pushes }), iso8.stateDir);
 				const res = supervisePush({ runId: id }, { stateDir: iso8.stateDir, runsDir: iso8.runsDir, steerDir: iso8.steerDir, now: () => NOW, ...opts });
 				assert.equal((res as { reason: string }).reason, "needs-human", `预期 needs-human，实际 ${JSON.stringify(res)}`);
 			} finally { iso8.dispose(); }
 		});
 	}
+}
+
+// ════════════════════ 9. P1 修正（2026-10-18）：needsHuman 拆分 / 自动选档 / wake 监管块派发 ══
+// 任务书：`plans/20261018_P1_push_fix_task_brief.md`；实现报告：`plans/20261018_P1_push_fix_impl.md`
+console.log("9. P1 修正：① stop=error 首推放行 ② mode 按相位自动选 ③ evaluateWakes 真派发监管块");
+{
+	// ── 9(a) stop=error 且本 epoch 未推过 ⇒ 放行（推成功 + steer 真落盘 + pushes+1）
+	check("9(a) stop=error ∧ pushesThisEpoch=0（无 gate/attention、不传 mode）⇒ ok:true + steer 真落盘 + pushes+1", () => {
+		const iso9 = mkIsolated("err-first-push");
+		try {
+			const RUN = "tab_err_first";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T-ERR", "G:/code/GreenCAD"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const auditLines: string[] = [];
+			const res = supervisePush({ runId: RUN }, {
+				stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW,
+				audit: (l) => auditLines.push(l),
+			});
+			assert.equal(res.ok, true, `stop=error 首推必须放行，实得 ${JSON.stringify(res)}`);
+			const ok = res as Extract<SupervisePushResult, { ok: true }>;
+			assert.ok(readSteerRecord(iso9.steerDir, RUN, ok.steerId), "steer 必须真落盘");
+			assert.equal(readSupervisionLedger(RUN, { stateDir: iso9.stateDir })!.epoch.pushes.length, 1, "账本 pushes 必须 +1");
+			// errored-retry 标记只写进 audit 行（不新增账本字段）
+			assert.ok(
+				auditLines.some((l) => l.includes(`supervision-push ok runId=${RUN}`) && l.includes("erroredRetry=1")),
+				`audit 行必须带 erroredRetry=1：${auditLines.join(" | ")}`,
+			);
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(b) stop=error 且已推过 1 次 ⇒ needs-human
+	check("9(b) stop=error ∧ pushesThisEpoch=1 ⇒ 拒绝 needs-human", () => {
+		const iso9 = mkIsolated("err-already-pushed");
+		try {
+			const RUN = "tab_err_pushed";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T-ERR2", "G:/code/GreenCAD"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir, pushes: 1 }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN }, { stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW });
+			assert.equal((res as { reason: string }).reason, "needs-human", `实得 ${JSON.stringify(res)}`);
+			assert.match((res as { detail: string }).detail, /stop=error/, "detail 必须说明是 stop=error 升级");
+			assert.equal(existsSync(join(iso9.steerDir, RUN)), false, "被拒时不得落盘 steer");
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(c) gate=awaiting 不受 ① 影响
+	check("9(c) gate=awaiting（gateFor）+ stop=error + 0 次推送 ⇒ 仍 needs-human（不受 ① 放行影响）", () => {
+		const iso9 = mkIsolated("gate-still-blocks");
+		try {
+			const RUN = "tab_gate_err";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T", "G:/repo"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN }, {
+				stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW,
+				gateFor: () => "awaiting",
+			});
+			assert.equal((res as { reason: string }).reason, "needs-human", `实得 ${JSON.stringify(res)}`);
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(d) attention>0 不受 ① 影响
+	check("9(d) attention=1（attentionFor）+ stop=error + 0 次推送 ⇒ 仍 needs-human（不受 ① 放行影响）", () => {
+		const iso9 = mkIsolated("attn-still-blocks");
+		try {
+			const RUN = "tab_attn_err";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T", "G:/repo"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN }, {
+				stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW,
+				attentionFor: () => 1,
+			});
+			assert.equal((res as { reason: string }).reason, "needs-human", `实得 ${JSON.stringify(res)}`);
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(e) phase=waiting ∧ 未传 mode ⇒ 自动 abort（真读 steer 记录）
+	check("9(e) phase=waiting ∧ 未传 mode ⇒ 落盘 steer 记录 mode===\"abort\"（自动选档）", () => {
+		const iso9 = mkIsolated("auto-abort");
+		try {
+			const RUN = "tab_auto_abort";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T-AUTO", "G:/code/x"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "stop" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN }, { stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW });
+			assert.equal(res.ok, true, `实得 ${JSON.stringify(res)}`);
+			const ok = res as Extract<SupervisePushResult, { ok: true }>;
+			assert.equal(ok.mode, "abort", "waiting 未传 mode ⇒ abort（唯一能起新 turn 的档）");
+			const rec = readSteerRecord(iso9.steerDir, RUN, ok.steerId);
+			assert.ok(rec, "steer 记录必须存在");
+			assert.equal(rec!.mode, "abort", "落盘记录 mode 必须 abort");
+			const ledger = readSupervisionLedger(RUN, { stateDir: iso9.stateDir });
+			const last = ledger!.epoch.pushes[ledger!.epoch.pushes.length - 1] as unknown as Record<string, unknown>;
+			assert.equal(last.mode, "abort", "pushes[] 里也记 abort");
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(f) phase=working ∧ stop=stop ∧ 未传 mode ⇒ steer
+	check("9(f) phase=working ∧ stopReason=stop ∧ 未传 mode ⇒ 落盘 mode===\"steer\"（不打断工具）", () => {
+		const iso9 = mkIsolated("auto-steer");
+		try {
+			const RUN = "tab_auto_steer";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T-AUTO2", "G:/code/x"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "working", lastStopReason: "stop" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN }, { stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW });
+			assert.equal(res.ok, true, `实得 ${JSON.stringify(res)}`);
+			const ok = res as Extract<SupervisePushResult, { ok: true }>;
+			assert.equal(ok.mode, "steer");
+			assert.equal(readSteerRecord(iso9.steerDir, RUN, ok.steerId)!.mode, "steer");
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(g) 显式 mode=steer ∧ phase=waiting ⇒ steer（显式优先）
+	check("9(g) 显式 mode=\"steer\" ∧ phase=waiting ⇒ 落盘 mode===\"steer\"（显式优先，不被自动选覆盖）", () => {
+		const iso9 = mkIsolated("explicit-wins");
+		try {
+			const RUN = "tab_explicit_steer";
+			writeTabDispatch(iso9.runsDir, mkDispatch(RUN, "T-EXP", "G:/code/x"));
+			writeTabState(iso9.runsDir, RUN, mkState(RUN, { phase: "waiting", lastStopReason: "stop" }));
+			seedLedger(mkLedger(RUN, { stateDir: iso9.stateDir, runsDir: iso9.runsDir }), iso9.stateDir);
+			const res = supervisePush({ runId: RUN, mode: "steer" }, { stateDir: iso9.stateDir, runsDir: iso9.runsDir, steerDir: iso9.steerDir, now: () => NOW });
+			assert.equal(res.ok, true, `实得 ${JSON.stringify(res)}`);
+			const ok = res as Extract<SupervisePushResult, { ok: true }>;
+			assert.equal(ok.mode, "steer", "显式 steer 不得被 waiting 的自动 abort 覆盖");
+			assert.equal(readSteerRecord(iso9.steerDir, RUN, ok.steerId)!.mode, "steer");
+		} finally { iso9.dispose(); }
+	});
+
+	// ── 9(h)/(i)：走 evaluateWakes 真实入口（setCutover + attachMaster + createWorkstream + deliverLetter）
+	await (async () => {
+		const T = NOW.getTime();
+		const SESS = "sess-p1-fix";
+
+		/** evaluateWakes 真实入口（同 `_test_autonomy_wiring.ts` W1 写法）。 */
+		function fireViaEvaluateWakes(label: string): { root: string; stateDir: string; runsDir: string; prompt: string; wsId: string; ws: unknown; messageId: string; dispose: () => void } {
+			const rt = mkIsolated(label);
+			mkdirSync(rt.stateDir, { recursive: true });
+			mkdirSync(rt.runsDir, { recursive: true });
+			const root = dirname(rt.stateDir);
+			process.env.PI_RUNTIME_DIR = root; // registry/cutover + mailbox 都走 temp
+			const mailboxDir = join(root, "mailbox");
+			setCutover(true, `${label}-test`);
+			attachMaster({ sessionId: SESS });
+			const ws = createWorkstream({
+				stateDir: rt.stateDir, session: SESS, mission: `P1 修正 ${label}`,
+				wakePolicy: { enabled: true, cooldownMs: 60_000 },
+			});
+			const messageId = `msg_p1fix_${label.replace(/[^a-z0-9]/gi, "")}`;
+			const frame = newMessageFrame({
+				// kind=ACK ⇒ requiresAck=false ⇒ prompt 无回执块 ⇒ 可逐字节手写冻结字面量（见 9(h)）
+				id: messageId, kind: "ACK", from: "agent://a", to: workstreamAddress(ws.id),
+				subject: `run://tab/${label}`, sentAt: new Date(T - 5_000).toISOString(),
+				summary: "do the thing", details: { tabRunId: "t", status: "completed" },
+			});
+			deliverLetter(frame, { mailboxDir });
+			const decisions = evaluateWakes({
+				stateDir: rt.stateDir, mailboxDir, runsDir: rt.runsDir, sessionId: SESS, now: T,
+				autonomyConfigPath: cfgNoKey, // temp no-key config：避开生产 config.json（R-1 / R10）
+			});
+			assert.equal(decisions.length, 1, `evaluateWakes 必须评估 1 个 ws，实得 ${decisions.length}`);
+			assert.equal(decisions[0]!.fire, true, `必须 fire，实得 ${JSON.stringify(decisions[0])}`);
+			return {
+				root, stateDir: rt.stateDir, runsDir: rt.runsDir,
+				prompt: decisions[0]!.prompt ?? "", wsId: ws.id, ws, messageId,
+				// 注意：旧进程级去重集合（auditedSkip）按 ws:<reason> 键去重，每场景独立 ws ⇒ 无需重置
+				dispose: () => { rt.dispose(); },
+			};
+		}
+
+		await checkAsync("9(h) evaluateWakes 无监管账本 ⇒ fire prompt 与手写冻结字面量/baseline 逐字节相等且不含 supervise-push", async () => {
+			const r = fireViaEvaluateWakes("evaluateWakes-none");
+			try {
+				// 手写冻结字面量（**不是**调两次比两次）：与第 4 组 FROZEN 同形，subject/summary 按本场景填。
+				// 来信 kind=ACK ⇒ requiresAck=false ⇒ 无回执块 ⇒ 全文可人工写死（含 ws id 与 messageId）。
+				const FROZEN = [
+					`你是 workstream ${r.wsId} 的 Sub-Master（runtime wake 层唤醒，有终态的一次执行）。`,
+					"mission=P1 修正 evaluateWakes-none",
+					"待处理输入（1）：",
+					"- [run://tab/evaluateWakes-none] do the thing",
+					"规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经 wake 层；",
+					"无 actionable 输入时立即 tab-finish 报 no-op，不许挂等；",
+					"workstream 暂停时你不会被唤醒（由 wake 层保证）。",
+				].join("\n");
+				assert.equal(r.prompt, FROZEN, `无账本 ⇒ prompt 必须与冻结字面量逐字节相同：\n${r.prompt}`);
+
+				// 第二道：与 buildWakePrompt(ws, letters) 基线逐字节相等（letters 按 describeLetter 同字段手写）
+				const LETTERS: WakeLetter[] = [{
+					messageId: r.messageId,
+					subject: "run://tab/evaluateWakes-none",
+					summary: "do the thing",
+					sentAt: new Date(T - 5_000).toISOString(),
+					from: "agent://a" as never,
+					to: workstreamAddress(r.wsId) as never,
+					requiresAck: false,
+				}];
+				assert.equal(r.prompt, buildWakePrompt(r.ws as never, LETTERS), "evaluateWakes 输出必须等于 buildWakePrompt 基线（无第三参）");
+				assert.ok(!r.prompt.includes("supervise-push"), "无账本时 prompt 不得出现 supervise-push");
+				assert.ok(!r.prompt.includes("停滞监管"), "无账本时 prompt 不得出现监管块");
+			} finally { r.dispose(); }
+		});
+
+		await checkAsync("9(i) 有 STALLED 账本（真 writeSupervisionEntry + 真 writeTabState waiting/idle>pushMs）⇒ fire prompt 含 supervise-push 与 runId", async () => {
+			// 先建 runtime 与 ws（fireViaEvaluateWakes 内部会跑 evaluateWakes，所以账本必须预先落盘）
+			const rt = mkIsolated("evaluateWakes-stalled");
+			mkdirSync(rt.stateDir, { recursive: true });
+			mkdirSync(rt.runsDir, { recursive: true });
+			const root = dirname(rt.stateDir);
+			process.env.PI_RUNTIME_DIR = root;
+			const mailboxDir = join(root, "mailbox");
+			const RUN_ID = "tab_wake_stalled";
+			try {
+				// STALLED 形状：active ∧ waiting ∧ stop=stop ∧ idle 20min > pushMs 15min
+				writeTabDispatch(rt.runsDir, mkDispatch(RUN_ID, "T-WAKE-STALL", "G:/code/GreenCAD"));
+				writeTabState(rt.runsDir, RUN_ID, mkState(RUN_ID, {
+					phase: "waiting", lastStopReason: "stop", lastActivityAt: iso(20 * 60_000),
+					lastAssistantText: "卡在 RF-1 测试",
+				}));
+				const entry = mkLedger(RUN_ID, { stateDir: rt.stateDir, runsDir: rt.runsDir });
+				const w = writeSupervisionEntry(entry, { stateDir: rt.stateDir });
+				assert.equal(w.ok, true, `writeSupervisionEntry 必须成功：${JSON.stringify(w)}`);
+
+				setCutover(true, "evaluateWakes-stalled-test");
+				attachMaster({ sessionId: SESS });
+				const ws = createWorkstream({
+					stateDir: rt.stateDir, session: SESS, mission: "P1 修正 stalled",
+					wakePolicy: { enabled: true, cooldownMs: 60_000 },
+				});
+				deliverLetter(newMessageFrame({
+					id: newEnvelopeId("msg"), kind: "REPORT", from: "agent://a", to: workstreamAddress(ws.id),
+					subject: "run://tab/tab_wake_stalled", sentAt: new Date(T - 5_000).toISOString(),
+					summary: "do the thing", details: { tabRunId: "t", status: "completed" },
+				}), { mailboxDir });
+				const decisions = evaluateWakes({
+					stateDir: rt.stateDir, mailboxDir, runsDir: rt.runsDir, sessionId: SESS, now: T,
+					autonomyConfigPath: cfgNoKey,
+				});
+				assert.equal(decisions.length, 1);
+				const prompt = decisions[0]!.prompt ?? "";
+				assert.equal(decisions[0]!.fire, true, `必须 fire：${JSON.stringify(decisions[0])}`);
+				assert.ok(prompt.includes("supervise-push"), `prompt 必须含 supervise-push：\n${prompt}`);
+				assert.ok(prompt.includes(RUN_ID), `prompt 必须含 runId ${RUN_ID}：\n${prompt}`);
+				assert.ok(prompt.includes("停滞监管"), "prompt 必须含监管块标题");
+				assert.ok(prompt.includes("已停 20min"), `监管行必须带真实 idle 分钟：\n${prompt}`);
+				assert.ok(prompt.includes("push=0/2"), `监管行必须带预算：\n${prompt}`);
+			} finally { rt.dispose(); }
+		});
+	})();
 }
 
 // ── 清理 + 汇总 ─────────────────────────────────────────────────────
