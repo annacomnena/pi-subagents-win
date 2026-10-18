@@ -47,7 +47,7 @@ import {
 	type ActionEvent,
 	type ActionKind,
 } from "./ledger.ts";
-import { discoverRepoRoot, gitPostcheck, gitPrecheck } from "./gitguard.ts";
+import { discoverRepoRoot, discoverRepoRootForProject, gitPostcheck, gitPrecheck } from "./gitguard.ts";
 
 export interface RunActionsOpts {
 	stateDir?: string;
@@ -55,9 +55,10 @@ export interface RunActionsOpts {
 	sessionId: string | undefined;
 	/** fake clock（毫秒，测试用；缺省 Date.now()）。 */
 	now?: number;
-	/** git 纪律检查的目标仓根（§A ③ / §6.3）；缺省 = 自动发现（`git rev-parse --show-toplevel`，
-	 *  cwd = 进程 cwd）；发现失败 / `git status` 读失败 ⇒ fail-closed DENY（「读不到 = 拒绝」）。
-	 *  调用方（wake.ts）无需显式传。 */
+	/** git 纪律检查的目标仓根（§A ③ / §6.3）；缺省 = 三路解析（R4）：
+	 *  `trigger.project`（路径形状 ∧ 真 git 仓）→ 进程 cwd（`git rev-parse --show-toplevel`）兜底；
+	 *  三路都读不到 / `git status` 读失败 ⇒ fail-closed DENY（「读不到 = 拒绝」）。
+	 *  调用方（wake.ts）无需显式传；测试注入时优先级最高。 */
 	repoRoot?: string;
 }
 
@@ -230,10 +231,14 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 		return "skipped"; // HUMAN 仅上层呈现，非许可（P1 无 HUMAN 出口）
 	}
 
-	// ── git 纪律前置（§A ③ / §6.3）：默认路径自动发现仓根；读不到 = fail-closed DENY ──
-	// repoRoot 缺省时 `git rev-parse --show-toplevel`（cwd = 进程 cwd）自动发现；
-	// 发现失败 / `git status` 读失败 ⇒ DENY（§6.3「读不到 = 拒绝」；调用方无需显式传）。
-	const repoRoot = ctx.repoRoot ?? discoverRepoRoot();
+	// ── git 纪律前置（§A ③ / §6.3）：优先用本次动作影响的**项目仓**；三路都读不到 = fail-closed DENY ──
+	// 2026-10-19 R4（生产实测根因）：旧实现 `ctx.repoRoot ?? discoverRepoRoot()` 用**进程 cwd** 发现仓根，
+	// 而扩展宿主的 cwd 常不是 git 仓（主会话 cwd=C:/Users/Annacomnena ⇒ 非仓）⇒ notify-local-master 在生产上
+	// 100% 被 `git-repo-not-found(fail-closed)` 拒绝（实测：needs_user 6 次 + blocked_overdue 3 次全 rejected）。
+	// `trigger.project` 已经是**该仓的归一路径**（frontier 的 project 键），它才是 §A ③ 要检查的对象。
+	// 三路优先级：显式 ctx.repoRoot（测试/调用方注入）→ trigger.project（路径形状 ∧ 真 git 仓）→ 进程 cwd 兜底。
+	// 三条都拿不到 ⇒ 仍 DENY（fail-closed 语义**不变**：读不到就是拒绝，只是不再读错对象）。
+	const repoRoot = ctx.repoRoot ?? discoverRepoRootForProject(t.project) ?? discoverRepoRoot();
 	let gitBaseline: string[] | null = null;
 	if (repoRoot) {
 		const pre = gitPrecheck(repoRoot, { tracked: false }); // P1 报告 = untracked/仓外

@@ -245,6 +245,30 @@ to:   localMasterAddress(localMasterScope(project)),
 - `notify-local-master` 还需要**目标仓 scope 有 owner**（`policy.ts:151-155`）⇒ 该仓没人 `master-attach local` 过 ⇒ 这封信会被 DENY(`scope-ownerless`)。
 - 这两条都不在本任务范围内（前者是既有拓扑，后者是方案 A 的刻意设计：不给无主仓投"无人看"的信）。
 
+### 2.8 git 纪律的 repoRoot 解析（返工 R4：三路优先级）
+
+**旧实现有生产缺陷**（`run.ts` 原 `const repoRoot = ctx.repoRoot ?? discoverRepoRoot()`）：`discoverRepoRoot()` 用**进程 cwd** 发现仓根。扩展宿主的 cwd 常不是 git 仓（主会话实测 cwd=`C:/Users/Annacomnena`，`git rev-parse` ⇒ `fatal: not a git repository`）⇒ `null` ⇒ **所有 `notify-local-master` 动作一律** `rejected(git-repo-not-found(fail-closed))`。
+
+生产读数（`~/.pi/agent/runtime/state/autonomy/actions/actions.jsonl`，主会话解析）：`needs_user` **6 次** + `blocked_overdue` **3 次**，**全部 rejected**。三条 `trigger.project` 都是有效 git 仓（`g:/code/greencad` / `g:/code/battlesandbox` / `c:/users/annacomnena/pi-packages/subagent-win`）。
+
+⇒ 语义错位：§A ③ 要查的是「**这次动作影响的那个项目仓**」，不是「宿主进程碰巧所在的仓」。fail-closed 本身没错，错在喂了错误输入。
+
+**现解析链路（三路优先级），`run.ts:241`**：
+```ts
+const repoRoot = ctx.repoRoot ?? discoverRepoRootForProject(t.project) ?? discoverRepoRoot();
+```
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| ① | `ctx.repoRoot` | 测试/调用方显式注入（仅测试用；生产 `wake.ts:120` 不传） |
+| ② | `discoverRepoRootForProject(t.project)` | **本任务修法**：`trigger.project` 是路径形状（Windows 盘符 / UNC / POSIX 绝对，`gitguard.ts:65` `isLocalRepoPath`）∧ `git -C <project> rev-parse --show-toplevel` 成功（`gitguard.ts:80`）⇒ 用该仓 |
+| ③ | `discoverRepoRoot()` | 进程 cwd 兜底（**行为与改动前逐字相同**，零参调用不变） |
+
+三路都拿不到 ⇒ 仍 `rejected(git-repo-not-found(fail-closed))`（`run.ts:252`）—— **fail-closed 语义未放宽**，只是不再读错对象。
+
+证据：`_test_runtime_autonomy_actions.ts` G1-1(e)(f)(g)（真实入口 `runAutonomyActions`，`process.chdir` 到非仓目录 + `try/finally` 还原）；变异把 `run.ts` 改回旧写法 ⇒ **G1-1(e) 实红**（`postverified` → `rejected(git-repo-not-found(fail-closed))`），详见 impl 报告「返工 R4」。
+
+> **分层事实（勿误读）**：`notify-local-master` 遇到**非路径** project 时，在**更早的 L2 closure 门**（`policy.ts:151` `surface-open`，因 `notify.ts:76` 对非路径 project 返回哨兵路径）就被拒，根本到不了 git 段。所以「非路径 project ⇒ `git-repo-not-found`」这句在 notify 类上**不成立**（是 `surface-open`）；git 段的可达性用 report 类（`working_to_failed`）断言。
+
 ---
 
 ## 3. 步骤 3：执行者被拉起（含监管块）
@@ -440,5 +464,6 @@ async execute(_toolCallId, rawParams) {
 
 1. 本文是**代码级完整路径论证 + 单测覆盖**，**不是真机演练**（任务书 §D 明确"真机演练不在本任务内"）。
 2. 第 ③ 环的"执行者被拉起"我**没有**起真 WT tab 验证（`spawnPiTab` 需要 `wt.exe` 与真实 GUI 会话，且 AGENTS §9 禁止在用户不在场时操作 GUI）。测试证据止于 `evaluateScopeWake` 返回的 `prompt`（`_test_runtime_supervision_push.ts:1281`）+ 生产 wiring 的静态读出（`index.ts:2657-2672`）。
-3. 第 ② 环在生产上还有两道未验证的前置：全局 master owner 在位（`wake.ts:106`）、目标仓 scope owner 在位（`policy.ts:151-155`）。二者不满足时信不会发出，`actions.jsonl` 会留 `rejected(not-owner)` / `rejected(scope-ownerless)`。**我没有对本机生产运行态做这些读数的实测**（避免与正在跑的会话互相干扰），因此"生产上此刻真的会发信"这一点**未被本次证据覆盖**。
+3. 第 ② 环在生产上还有两道未验证的前置：全局 master owner 在位（`wake.ts:106`）、目标仓 scope owner 在位（`policy.ts:143-148`）。二者不满足时信不会发出，`actions.jsonl` 会留 `rejected(not-owner)` / `rejected(scope-ownerless)`。**我没有对本机生产运行态做这些读数的实测**（避免与正在跑的会话互相干扰），因此"生产上此刻真的会发信"这一点**未被本次证据覆盖**。
+   > **返工 R4 修正（2026-10-19）**：这里原先隐含的第三道前置「git 纪律会拦住」**已不成立** —— 第一版实现的 repoRoot 取进程 cwd，在主会话（cwd 非 git 仓）上确实拦掉了 **全部** notify 动作（生产读数 `needs_user` 6 + `blocked_overdue` 3 全 `rejected(git-repo-not-found(fail-closed))`）。R4 后 repoRoot 改取 `trigger.project`（三路优先级，见 §2.8），**git 纪律不再是 notify 的生产断点**；`git-repo-not-found` 只在「`trigger.project` 非路径/非仓 **且** 进程 cwd 也非仓」时出现（此时仍应拒绝，fail-closed 不变）。
 4. `blocked_overdue` 的 1h 节流状态存在派生缓存 `frontier.json`；该文件被删/损坏 ⇒ 最多多提醒一次（`frontier.ts:94-100` 注释登记）。

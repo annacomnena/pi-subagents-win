@@ -36,16 +36,51 @@ export function gitPorcelain(repoRoot: string): string[] | null {
  * 默认路径自动发现仓根（§6.3 / 计划 P1 返修）：`git rev-parse --show-toplevel`（spawnSync，
  * cwd = 进程 cwd）。调用方（wake.ts）无需显式传 repoRoot。never-throw；
  * 发现失败（非 git 仓 / git 缺失 / 超时 / 空输出）= null = 读不到 = fail-closed 拒绝。
+ *
+ * 2026-10-19 R4：加**可选 cwd**（走 `git -C <cwd>`）。零参调用 = 用进程 cwd，行为**逐字节不变**。
+ * ⚠ 缺省 cwd 只适用于 run.ts 的**兜底**路径：扩展宿主的进程 cwd 常不是 git 仓
+ * （实测主会话 cwd=C:/Users/Annacomnena ⇒ 非仓），拿它当 §A ③ 的检查对象会读错仓。
  */
-export function discoverRepoRoot(): string | null {
+export function discoverRepoRoot(cwd?: string): string | null {
 	try {
-		const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5_000 });
+		const r = cwd
+			? spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5_000 })
+			: spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 5_000 });
 		if (r.error || r.status !== 0) return null;
 		const top = (r.stdout ?? "").trim();
 		return top.length > 0 ? top : null;
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * project 是否为「本地仓路径」形状（Windows 盘符 / UNC / POSIX 绝对）。
+ * 与 `classes/notify.ts::isRepoProjectPath` **同口径双写**（此处不 import 该文件：
+ * gitguard 是 git 纪律层，不该依赖具体动作类；两处必须同步改）。
+ *
+ * 为什么需要这个谓词：`trigger.project` 既可能是仓路径，也可能是 `mailbox:agent___master_default`
+ * 这类**非路径标识**。后者拿去 `git -C` 只会得到无意义的失败，绝不能当成「仓库读不到」。
+ */
+export function isLocalRepoPath(project: string): boolean {
+	if (/^[A-Za-z]:[\\/]/.test(project)) return true; // Windows 绝对：C:/…  C:\…
+	if (project.startsWith("\\\\")) return true; // UNC：\\server\share
+	if (project.startsWith("/")) return true; // POSIX 绝对
+	return false;
+}
+
+/**
+ * 从 `trigger.project` 解析 git 仓根（§A ③ 的正确对象 = 本次动作影响的**那个项目仓**）。
+ * never-throw。
+ *  - 非字符串 / 空白 ⇒ null（不猜）。
+ *  - 非路径形状（`mailbox:…` / `repo:X`）⇒ null（不猜；由 run.ts 回落进程 cwd）。
+ *  - 路径形状但 git 不可达 / 非仓 / 目录不存在 ⇒ null（同样回落，回落链见 run.ts）。
+ * 「三路都拿不到」才 DENY —— fail-closed 语义不变，只是不再读错对象。
+ */
+export function discoverRepoRootForProject(project: string): string | null {
+	if (typeof project !== "string" || !project.trim()) return null;
+	if (!isLocalRepoPath(project)) return null;
+	return discoverRepoRoot(project);
 }
 
 export interface GitPreResult {

@@ -52,7 +52,7 @@ import {
 	type ActionEvent,
 	type ActionKind,
 } from "./runtime/autonomy/action/ledger.ts";
-import { gitPostcheck, gitPorcelain, gitPrecheck } from "./runtime/autonomy/action/gitguard.ts";
+import { discoverRepoRootForProject, gitPostcheck, gitPorcelain, gitPrecheck, isLocalRepoPath } from "./runtime/autonomy/action/gitguard.ts";
 import { diagnosticReportClass, type FileSnapshot } from "./runtime/autonomy/action/classes/report.ts";
 import { notifyLocalMasterClass, resolveNotifyTarget } from "./runtime/autonomy/action/classes/notify.ts";
 import { getActionClassRegistry, getClass } from "./runtime/autonomy/action/registry.ts";
@@ -1634,6 +1634,217 @@ console.log("G1-1 blocked_overdue 动作面接线（只 notify / 默认关闭零
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+}
+
+// ═════════════════════ 2026-10-19 G1-1 返工 R4：repoRoot 三路解析（trigger.project 优先）════════════════════
+// 缺陷（生产实测）：`ctx.repoRoot ?? discoverRepoRoot()` 用**进程 cwd** 发现仓根，而扩展宿主的 cwd
+// 常不是 git 仓（主会话 cwd=C:/Users/Annacomnena ⇒ 非仓）⇒ notify-local-master 100% 被
+// `git-repo-not-found(fail-closed)` 拒绝（生产读数：needs_user 6 次 + blocked_overdue 3 次全 rejected）。
+// 本组证明：repoRoot 取 **trigger.project**（§A ③ 的正确对象），且三路都拿不到时 fail-closed 仍成立。
+//
+// ⚠ 与 R4 规格 §2.1 的一处**实测偏离**（不是放宽，是分层事实，须记录）：
+//   规格的 (e)-对照 与 (f) 期望「project 非路径 ⇒ rejected(git-repo-not-found)」。实测：notify-local-master
+//   的非路径 project 在**更早的 L2 closure 门**就被拒（`notify.ts::resolveNotifyTarget` 非路径 ⇒
+//   targetPath 返回哨兵 "" ⇒ withinSurface false ⇒ `policy.ts:151` DENY `surface-open`），根本到不了
+//   run.ts 的 git 段。故：
+//     · (e)-对照A 保留 notify 同 rule 的 A/B（证明"不是 cwd 变了"），断言 `rejected` + reason 属 fail-closed 家族；
+//     · 需要在 git 段落地的断言（(e)-对照B / (f)）改用 `working_to_failed` 的 **diagnostic-report** 分支
+//       （report 的 targetPath 不要求路径形状 ⇒ 能走到 git 段；git 三路解析与动作类无关）；
+//     · (g) 的 project 是**路径形状**（存在但无 .git）⇒ notify closure 通过 ⇒ 原样走 git 段，与规格一致。
+//
+// 夹具要点：`process.chdir` 会**全局**影响同进程后续 check ⇒ 一律 `try/finally` 严格还原（AGENTS R-4 隔离先例）。
+console.log("G1-1 R4 repoRoot 三路解析（trigger.project → 进程 cwd → fail-closed）");
+{
+	/** chdir 到 dir 跑 fn，finally 严格还原（即使断言抛错也必须还原）。 */
+	function withCwd<T>(dir: string, fn: () => T): T {
+		const prev = process.cwd();
+		try {
+			process.chdir(dir);
+			return fn();
+		} finally {
+			process.chdir(prev);
+		}
+	}
+
+	/** 写一份含 blocked_overdue 触发的快照，project 可指定（沿用 G1-1(b)(c)(d) 的形状）。 */
+	function writeBlockedOverdueFrontierProj(state: string, asof: number, project: string, runId = "r1"): void {
+		writeFrontierSnapshot(
+			{
+				asof,
+				baseline: false,
+				projects: [
+					{
+						project, state: "Working", variant: "waiting", gate: "ok", runs: { [runId]: "waiting" },
+						needsUser: true, resultMissing: false, stagnation: false, blockedOverdue: true,
+						blockedOverdueRunId: runId,
+						supervision: { state: "BLOCKED_USER", idleMs: 31 * 60_000, epochPushes: 0 },
+						overdue: 0, overdueRequests: [], meaningfulStateVersion: 1,
+					},
+				],
+				triggers: [
+					{ rule: "blocked_overdue", project, evidence: `blocked_overdue:run=${runId}:idleMin=31`, approximate: false, runId },
+				],
+			},
+			{ stateDir: state },
+		);
+	}
+
+	check("G1-1(e) trigger.project 是真 git 仓 + 进程 cwd 非仓 ⇒ postverified（取 project，不是 cwd）", () => {
+		const repo = makeGitRepo("bo-r4-proj");
+		const { root, state, cfgOn } = freshState("bo-r4-proj-run");
+		try {
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(repo)) });
+			writeBlockedOverdueFrontierProj(state, NOW, repo);
+			// cwd = temp 根（无 .git）⇒ 非仓；老实现会在这里 discoverRepoRoot() = null ⇒ rejected
+			const ev = withCwd(root, () => {
+				runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+				return readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.trigger?.rule === "blocked_overdue");
+			});
+			assert.equal(
+				ev.some((e) => e.kind === "postverified"),
+				true,
+				`repoRoot 必须取 trigger.project（真仓）⇒ postverified；实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`,
+			);
+			assert.equal(
+				ev.some((e) => e.reason === "git-repo-not-found(fail-closed)"),
+				false,
+				`不得出现 git-repo-not-found(fail-closed)；实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`,
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(e-对照A) 同一 cwd / 同一 rule，project 改非路径（repo:X）⇒ rejected（证明是 project 救的，不是 cwd 变了）", () => {
+		const { root, state, cfgOn } = freshState("bo-r4-proj-ctl");
+		try {
+			const ev = withCwd(root, () => {
+				const sid = ownerSession();
+				attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope("repo:X")) });
+				writeBlockedOverdueFrontierProj(state, NOW, "repo:X");
+				runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+				return readActionsTail({ stateDir: state, limit: 50 });
+			});
+			assert.equal(ev.some((e) => e.kind === "postverified"), false, `不得 postverified；实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`);
+			assert.equal(ev.some((e) => e.kind === "rejected"), true, `必须 rejected；实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`);
+			// 实测记录：notify 非路径 project 在更早的 L2 closure 门被拒（surface-open），到不了 git 段
+			const reasons = ev.filter((e) => e.kind === "rejected").map((e) => e.reason);
+			assert.ok(
+				reasons.includes("surface-open") || reasons.includes("git-repo-not-found(fail-closed)"),
+				`rejected 原因须属 fail-closed 家族；实得 ${JSON.stringify(reasons)}`,
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(e-对照B) 能走到 git 段的分支（working_to_failed→report）：project 非路径 + cwd 非仓 ⇒ rejected(git-repo-not-found)", () => {
+		const { root, state, cfgOn } = freshState("bo-r4-git-ctl");
+		try {
+			const sid = ownerSession();
+			writeFrontier(state, "working_to_failed", "repo:X", NOW); // report 分支 targetPath 不要求路径形状
+			const ev = withCwd(root, () => {
+				runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+				return readActionsTail({ stateDir: state, limit: 50 });
+			});
+			assert.equal(
+				ev.some((e) => e.kind === "rejected" && e.reason === "git-repo-not-found(fail-closed)"),
+				true,
+				`project 非路径 + cwd 非仓 ⇒ 必须 fail-closed 拒绝（git 段）；实得 ${JSON.stringify(ev.map((e) => [e.kind, e.reason]))}`,
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(f) project 非路径 + cwd 真仓 ⇒ 回落 cwd ⇒ postverified；cwd 非仓 ⇒ rejected(git-repo-not-found)", () => {
+		const repo = makeGitRepo("bo-r4-cwd");
+		const { root, state, cfgOn } = freshState("bo-r4-cwd-run");
+		const { root: root2, state: state2, cfgOn: cfgOn2 } = freshState("bo-r4-cwd-run2");
+		const proj = "mailbox:agent___master_default"; // 非路径形状 ⇒ discoverRepoRootForProject = null
+		try {
+			const sid = ownerSession();
+			writeFrontier(state, "working_to_failed", proj, NOW); // report 分支（notify 会被 closure 先拒，见上方论述）
+			const evA = withCwd(repo, () => {
+				runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+				return readActionsTail({ stateDir: state, limit: 50 });
+			});
+			assert.equal(
+				evA.some((e) => e.kind === "postverified"),
+				true,
+				`project 非路径 + cwd 真仓 ⇒ 回落 cwd ⇒ postverified；实得 ${JSON.stringify(evA.map((e) => [e.kind, e.reason]))}`,
+			);
+			const sid2 = ownerSession();
+			writeFrontier(state2, "working_to_failed", proj, NOW);
+			const evB = withCwd(root2, () => {
+				runAutonomyActions({ stateDir: state2, configPath: cfgOn2, sessionId: sid2, now: NOW });
+				return readActionsTail({ stateDir: state2, limit: 50 });
+			});
+			assert.equal(
+				evB.some((e) => e.kind === "rejected" && e.reason === "git-repo-not-found(fail-closed)"),
+				true,
+				`project 非路径 + cwd 非仓 ⇒ 必须 rejected(git-repo-not-found)；实得 ${JSON.stringify(evB.map((e) => [e.kind, e.reason]))}`,
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(root2, { recursive: true, force: true });
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(g) project 是路径但非 git 仓 + cwd 真仓 ⇒ 回落 cwd ⇒ postverified；cwd 也非仓 ⇒ rejected（fail-closed 仍成立）", () => {
+		const repo = makeGitRepo("bo-r4-fallback");
+		const nonRepoProj = mkdtempSync(join(tmpdir(), "autonomy-actions-r4-norepo-proj-")); // 存在但无 .git
+		const { root, state, cfgOn } = freshState("bo-r4-fb-run");
+		const { root: root2, state: state2, cfgOn: cfgOn2 } = freshState("bo-r4-fb-run2");
+		try {
+			// ① 回落 cwd = 真仓
+			const sid = ownerSession();
+			attachMaster({ sessionId: sid, agent: localMasterAddress(localMasterScope(nonRepoProj)) });
+			writeBlockedOverdueFrontierProj(state, NOW, nonRepoProj);
+			const evA = withCwd(repo, () => {
+				runAutonomyActions({ stateDir: state, configPath: cfgOn, sessionId: sid, now: NOW });
+				return readActionsTail({ stateDir: state, limit: 50 }).filter((e) => e.trigger?.rule === "blocked_overdue");
+			});
+			assert.equal(
+				evA.some((e) => e.kind === "postverified"),
+				true,
+				`路径形状但非仓 + cwd 真仓 ⇒ 回落 ⇒ postverified；实得 ${JSON.stringify(evA.map((e) => [e.kind, e.reason]))}`,
+			);
+			// ② cwd 也非仓 ⇒ fail-closed 仍成立
+			const sid2 = ownerSession();
+			attachMaster({ sessionId: sid2, agent: localMasterAddress(localMasterScope(nonRepoProj)) });
+			writeBlockedOverdueFrontierProj(state2, NOW, nonRepoProj);
+			const evB = withCwd(root2, () => {
+				runAutonomyActions({ stateDir: state2, configPath: cfgOn2, sessionId: sid2, now: NOW });
+				return readActionsTail({ stateDir: state2, limit: 50 }).filter((e) => e.trigger?.rule === "blocked_overdue");
+			});
+			assert.equal(
+				evB.some((e) => e.kind === "rejected" && e.reason === "git-repo-not-found(fail-closed)"),
+				true,
+				`三路皆空 ⇒ 必须 rejected(git-repo-not-found)；实得 ${JSON.stringify(evB.map((e) => [e.kind, e.reason]))}`,
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(root2, { recursive: true, force: true });
+			rmSync(nonRepoProj, { recursive: true, force: true });
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	check("G1-1(h) isLocalRepoPath 口径（与 notify.ts::isRepoProjectPath 双写一致）+ discoverRepoRootForProject 不猜", () => {
+		for (const p of ["C:/x", "c:\\x", "/posix/x", "\\\\srv\\share"]) {
+			assert.equal(isLocalRepoPath(p), true, `${p} 应判为路径`);
+		}
+		for (const p of ["repo:X", "mailbox:agent___master_default", "relative/x", ""]) {
+			assert.equal(isLocalRepoPath(p), false, `${p} 应判为非路径`);
+		}
+		assert.equal(discoverRepoRootForProject("repo:X"), null, "非路径 ⇒ null（不猜）");
+		assert.equal(discoverRepoRootForProject(""), null, "空 ⇒ null");
+		assert.equal(discoverRepoRootForProject("c:/tmp/definitely-not-a-dir-r4"), null, "路径但不存在 ⇒ null");
 	});
 }
 
