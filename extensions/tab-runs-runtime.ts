@@ -94,7 +94,16 @@ export function registerTabTelemetry(
 	});
 
 	pi.on("tool_execution_start", () => {
-		writeState("working", "working");
+		// P1：记下工具起始时刻，供「HANG 60min（working ∧ stop=toolUse）」判据算已跑多久。
+		// 注意：并行工具时只保留最后一个起始时刻（spec §3 的字面实现，未做嵌套计数）。
+		writeState("working", "working", { currentToolStartedAt: new Date().toISOString() });
+	});
+
+	// P1 新增：工具结束时清 currentToolStartedAt（lastActivityAt 由 writeState 自动刷新）。
+	// 没有这个事件时，一个已结束的工具会留下真相不明的「起始时刻」
+	// ⇒ working ∧ toolUse 会永久表现为「在跑工具已 N 小时」（HANG 误判）。
+	pi.on("tool_execution_end", () => {
+		writeState("working", "working", { currentToolStartedAt: undefined });
 	});
 
 	pi.on("message_end", (event) => {
@@ -128,7 +137,7 @@ export function registerTabTelemetry(
 
 	// agent_settled = 权威「等待输入」信号（无重试/压缩/排队后续）
 	pi.on("agent_settled", () => {
-		writeState("waiting", "idle");
+		writeState("waiting", "idle", { currentToolStartedAt: undefined });
 	});
 
 	pi.on("session_shutdown", () => {
@@ -141,6 +150,8 @@ export function registerTabTelemetry(
 				turn: "unknown",
 				terminal: false,
 				lastActivityAt: new Date().toISOString(),
+				// 会话结束：没有工具在跑了（不留幻影起始时刻）
+				currentToolStartedAt: undefined,
 				lastAssistantText: lastAssistantText || undefined,
 				lastStopReason,
 				usage: { ...usageAccum },

@@ -38,8 +38,16 @@ import {
 } from "./runtime/wake.ts";
 import { writeTabDispatch } from "./tab-runs.ts";
 
+// 测试隔离（2026-10-18 P1）：本测试只验证 legacy 唤醒链（cutover/owner/policy/cooldown/in-flight）。
+// `evaluateWakes` 在 legacy 链**之前**还有 v2 autonomy 总门（README: 「enabled!==true → 完全旁路」），
+// 而生产 `config.json` 现在是 `autonomy.enabled=true` ⇒ 本测试会读到真实包根 config，被
+// wake-gate 的 15s cooldown 压制 ⇒ d.fire 永远 false（依赖开发机配置的假红）。
+// 固定为显式关闭的临时 config，恢复「只测 legacy 链」的测试本意。
+const AUTONOMY_CFG = join(RUNTIME, "autonomy-off.json");
+writeFileSync(AUTONOMY_CFG, JSON.stringify({ autonomy: { enabled: false } }), "utf8");
+
 const master = masterAddress();
-const S = { stateDir: STATE, session: "sess-W" };
+const S = { stateDir: STATE, session: "sess-W", autonomyConfigPath: AUTONOMY_CFG };
 const BASE = Date.now();
 const iso = (ms: number): string => new Date(ms).toISOString();
 

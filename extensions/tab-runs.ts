@@ -456,6 +456,12 @@ export interface TabState {
 	sessionPath?: string;
 	pid?: number;
 	lastActivityAt?: string;
+	/**
+	 * 当前正在执行的工具起始时刻（ISO；P1「HANG 60min 判据」的时基）。
+	 * 写入：`tool_execution_start`；清除：`tool_execution_end` / `agent_settled` / `session_shutdown`。
+	 * 缺失 = 当前没在跑工具（缺省不写，不是空串）。
+	 */
+	currentToolStartedAt?: string;
 	lastAssistantText?: string;
 	lastStopReason?: string;
 	usage?: TabUsage;
@@ -693,6 +699,8 @@ export function validateTabState(raw: unknown): { ok: boolean; errors: string[];
 	if (typeof record.pid === "number") value.pid = record.pid;
 	const lastActivityAt = str(record.lastActivityAt);
 	if (lastActivityAt !== undefined) value.lastActivityAt = lastActivityAt;
+	const currentToolStartedAt = str(record.currentToolStartedAt);
+	if (currentToolStartedAt !== undefined) value.currentToolStartedAt = currentToolStartedAt;
 	const lastAssistantText = str(record.lastAssistantText);
 	if (lastAssistantText !== undefined) value.lastAssistantText = lastAssistantText;
 	const lastStopReason = str(record.lastStopReason);

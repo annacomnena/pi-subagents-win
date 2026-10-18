@@ -18,7 +18,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 import { masterAddress, workstreamAddress, type ObjectAddress } from "./address.ts";
 import { readAttachment, readCutover } from "./registry.ts";
@@ -258,8 +258,51 @@ export function buildReplyRecipe(mailboxUrl: string): string {
 	].join("\n");
 }
 
-export function buildWakePrompt(ws: WorkstreamRecord, letters: WakeLetter[]): string {
+/**
+ * 停滞监管块的单条输入（P1：`plans/20261017_stagnation_supervision_plan.md` §C.4/C.5）。
+ * 由调用方从监管账本 + tab 账本派生后传入；本模块只做渲染，不读账本（保持纯函数）。
+ */
+export interface WakeSupervisionItem {
+	runId: string;
+	taskId: string;
+	repoPath: string;
+	idleMs: number;
+	stopReason: string;
+	summary: string;
+	pushesUsed: number;
+	maxPushes: number;
+}
+
+/** 摘要截断（与 C.2 模板同口径：≤120 字符）。 */
+const WAKE_SUMMARY_MAX = 120;
+
+/**
+ * 停滞监管块（仅在 `supervision` 非空时插入；空/undefined ⇒ 完全不调用本函数）。
+ *
+ * 为什么要塞进 wake prompt：C.5 的执行主体是**被唤醒的 master**——它没有别的渠道知道
+ * 「哪个 tab 停了多久、还能推几次」，只能由 wake prompt 带过去。
+ */
+function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): string[] {
+	const shown = items.slice(0, 10);
+	return [
+		`停滞监管（需推动的 tab，按 budget 余量决定是否推）：`,
+		...shown.map((s) => {
+			const repo = basename(s.repoPath || "") || "unknown";
+			const idleMin = Math.max(0, Math.round((Number.isFinite(s.idleMs) ? s.idleMs : 0) / 60_000));
+			const summary = s.summary.length > WAKE_SUMMARY_MAX ? s.summary.slice(0, WAKE_SUMMARY_MAX) : s.summary;
+			const stop = s.stopReason && s.stopReason.length > 0 ? s.stopReason : "unknown";
+			return [
+				`- ${s.runId} task=${s.taskId} repo=${repo} 已停 ${idleMin}min stop=${stop} push=${s.pushesUsed}/${s.maxPushes} 摘要：${summary}`,
+				`  用 supervise-push({runId:"${s.runId}"}) 推动（预算耗尽则升级用户，勿 abort）。`,
+			].join("\n");
+		}),
+	];
+}
+
+export function buildWakePrompt(ws: WorkstreamRecord, letters: WakeLetter[], supervision?: WakeSupervisionItem[]): string {
 	const shown = letters.slice(0, 10);
+	// 硬要求（spec §2）：undefined / [] ⇒ 与旧输出逐字节相同（现有调用方零改动）。
+	const supervisionBlock = Array.isArray(supervision) && supervision.length > 0 ? buildSupervisionBlock(supervision) : [];
 	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
 	const replyBlock: string[] = [];
 	if (replies.length) {
@@ -277,6 +320,7 @@ export function buildWakePrompt(ws: WorkstreamRecord, letters: WakeLetter[]): st
 		ws.successCriteria ? `criteria=${ws.successCriteria}` : null,
 		`待处理输入（${letters.length}）：`,
 		...shown.map((l) => `- [${l.subject ?? "no-subject"}] ${l.summary.slice(0, 200)}`),
+		...supervisionBlock,
 		...replyBlock,
 		`规则：单次有界执行，做完即 tab-finish（天然 sleep）；禁止设 timer 自续命，再入只能经 wake 层；`,
 		...(replies.length

@@ -48,6 +48,7 @@ import { restartRuntimeDaemon } from "./runtime-host/daemon-lifecycle.ts";
 import { registerTimers } from "./timers-runtime.ts";
 import { registerSteerConsumer } from "./steer-consumer.ts";
 import { registerSteerTools } from "./steer-runtime.ts";
+import { registerSupervisionTools } from "./supervision-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { localAgentFromCwd, localMasterEnsureGate, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import {
@@ -2537,6 +2538,9 @@ export default function (pi: ExtensionAPI) {
 	// 立即插入消息（2026-10-12 steer 通道）：Master 侧工具（tab-steer/steer-status + sweep）
 	// 与标签页侧常驻消费者（fs.watch + tick，只消费自己目录）。子 agent 已在上方 early-return。
 	collect(registerSteerTools(pi));
+	// 主动推动（P1，2026-10-18）：主会话工具 supervise-push —— 七条拒绝路径的机械强制点
+	// （方案 §C.3）。audit 注入 appendAuditLine，推动决定全部进 audit.jsonl。
+	collect(registerSupervisionTools(pi, { audit: (line) => appendAuditLine(line) }));
 	collect(registerSteerConsumer(pi));
 
 	// 后台异步子 agent 面板（opencode 风格：widget + 状态栏 + 完成通知）
