@@ -25,6 +25,7 @@ export interface FrontierInputOptions {
  * `pidAlive === null`（无 state.pid）**合法**，原样保留（同 v2）。
  * 例外：`stop`/`idleMs` 缺失时回退 `"unknown"`/`null`（与 v2 carrier7 口径对齐；
  * `stop="unknown"` 与 `idleMs=null` 均**不入** STALLED 判据 ⇒ 降级方向安全）。
+ * RF-1（2026-10-18）：`resultMissing` 同理回退 `phase === "unconfirmed"`（v2 同形状口径）。
  */
 function toTab(view: GraphProjectView, ref: GraphRunRef): FrontierSourceTab | null {
 	// 成员资格：无归属 / 无相位 / 无 carrier → 不 emit。
@@ -45,6 +46,10 @@ function toTab(view: GraphProjectView, ref: GraphRunRef): FrontierSourceTab | nu
 		staleOver,
 		overdue,
 		pidAlive: ref.pidAlive ?? null,
+		// RF-1（2026-10-18）：resultMissing 进详情 —— 监管 DONE/BLOCKED_USER 的分界载体。
+		// 无载体时回退 `phase === "unconfirmed"`（v2 `collectGlobalView` 对同形状给出 resultMissing=true），
+		// 其余缺载体场景取 false（不猜：宁可漏报一次待审，也不把已完成 tab 报成未回报）。
+		resultMissing: typeof ref.resultMissing === "boolean" ? ref.resultMissing : ref.phase === "unconfirmed",
 	};
 }
 

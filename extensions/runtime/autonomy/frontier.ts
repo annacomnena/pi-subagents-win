@@ -182,6 +182,12 @@ export interface FrontierSourceTab {
 	gate: GateStatus;
 	staleOver: boolean;
 	overdue: number;
+	/**
+	 * 结果缺失：`composeTabStatus().resultMissing` 透传（terminal ∧ resultMissing = 「终态但没结果」待审）。
+	 * 2026-10-18 RF-1：监管 DONE 与 BLOCKED_USER 的分界必须由它区分 —— 只看 `phase` 无法区分
+	 * 「tab-finish 写了 completed」与「state 自称 completed 但 result.json 不存在」。
+	 */
+	resultMissing: boolean;
 	/** MF3：watchdog 检查 6（autonomy/collect.ts#L153-L154）消费；无 state.pid → null。 */
 	pidAlive: boolean | null;
 }
@@ -284,14 +290,25 @@ const SUPERVISION_RANK: Record<SupervisionState, number> = {
  *   1. 无账本条目                     → NOT_MONITORED（**治今天 3/3 全 true 的关键门**）
  *   1b. 账本 optOut=true              → NOT_MONITORED（用户显式「这个别管」，静默留档）
  *   2. 账本 status="paused"           → PAUSED_USER（用户显式停：不报、不推）
- *   3. 账本 active ∧ 已 terminal      → DONE（提示主会话回收关账，不报停滞）
- *   4. 账本 active ∧ 需人 / attention → BLOCKED_USER（在等人：提醒但不推动）
- *   4b. 账本 active ∧ stop="error"    → BLOCKED_USER（已报错卡死，需人介入重派）
- *   5. 账本 active ∧ stop=toolUse     → ACTIVE（**toolUse 豁免**：在跑长工具，即使 idle 50min）
- *   6. 账本 active ∧ phase=waiting ∧ stop=stop ∧ idle>pushMs → STALLED
- *   7. 其余（working/attached/dispatched / idle 未超线 / idle 无载体）→ ACTIVE（不猜＝不报）
+ *   3. 账本 active ∧ phase=unconfirmed ∧ stop≠aborted → BLOCKED_USER（RF-1：未回报，需人核实）
+ *   3b. 账本 active ∧ 终态 phase ∧ resultMissing=true → BLOCKED_USER（同上：终态但无结果）
+ *   4. 账本 active ∧ 已 terminal      → DONE（提示主会话回收关账，不报停滞）
+ *   5. 账本 active ∧ 需人 / attention → BLOCKED_USER（在等人：提醒但不推动）
+ *   5b. 账本 active ∧ stop="error"    → BLOCKED_USER（已报错卡死，需人介入重派）
+ *   6. 账本 active ∧ stop=toolUse     → ACTIVE（**toolUse 豁免**：在跑长工具，即使 idle 50min）
+ *   7. 账本 active ∧ phase=waiting ∧ stop=stop ∧ idle>pushMs → STALLED
+ *   8. 其余（working/attached/dispatched / idle 未超线 / idle 无载体）→ ACTIVE（不猜＝不报）
  *
- * 注（方案 §A.2 边角）：phase=waiting ∧ stop=toolUse 落入第 5 条 → ACTIVE（保守，不报停滞）。
+ * 注（方案 §A.2 边角）：phase=waiting ∧ stop=toolUse 落入第 6 条 → ACTIVE（保守，不报停滞）。
+ *
+ * ## 3 / 3b 的插入位置为何在「DONE 之后之前、toolUse 豁免之前」（2026-10-18 RF-1）
+ * - 必须在 2（paused）之后：用户显式暂停优先于一切自动判定（否则暂停的 tab 又被报成待审）。
+ * - 必须**在 4（DONE）之前**：DONE 的语义是「已完成，该回收关账」；而「终态但没 result」恰恰
+ *   是“不确定是否真完成”。若先判 DONE，就会把『没回报』伪装成『完成』（RF-1 硬约束 1 的反例）。
+ * - 必须在 6（toolUse 豁免）之前：豁免的前提是「在跑长工具」，而 terminal/兜底形状已经**不再跑了**；
+ *   若排在后面，一个残留 stop=toolUse 的终态 tab 会被豁免成 ACTIVE，需人核实的信号又消失。
+ * - `stop==="aborted"` 例外保留在 3 之外：aborted = 用户/上层**主动中断**本回合，"没回报"是预期结果，
+ *   不是静默卡死（`_test_runtime_supervision_default_on` 5(d) 已冻结该语义）。
  */
 export function deriveTabSupervisionState(input: {
 	tab: FrontierSourceTab;
@@ -305,6 +322,11 @@ export function deriveTabSupervisionState(input: {
 	// 显式静默（`/supervise optout`）：账本仍留档，但派生面与「未登记」等价（不问不动）。
 	if (ledger.optOut === true) return "NOT_MONITORED";
 	if (ledger.status === "paused") return "PAUSED_USER";
+	// 3) RF-1：兜底结果（tab 回合结束但没 tab-finish）⇒ 不是 DONE、也不是 STALLED，而是「需人核实」。
+	// `aborted` 例外：用户/上层主动中断本回合，"没回报"是预期，不是静默卡死（见上方优先级注释）。
+	if (tab.phase === "unconfirmed" && tab.stop !== "aborted") return "BLOCKED_USER";
+	// 3b) RF-1：终态 phase 但 result.json 缺失 ⇒ 不是 DONE（DONE = 可以回收关账）。
+	if (tab.resultMissing === true && mapPhaseToProjectState(tab.phase).terminal) return "BLOCKED_USER";
 	if (mapPhaseToProjectState(tab.phase).terminal) return "DONE";
 	if (tab.needsHuman || tab.gate === "awaiting" || attention > 0) return "BLOCKED_USER";
 	// stop="error" ⇒ BLOCKED_USER（需人介入重派）。**不限定 phase**：真实形状是 `tab.stop=error` 的 tab

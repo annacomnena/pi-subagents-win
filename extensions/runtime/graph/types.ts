@@ -70,6 +70,8 @@ export interface GraphRunRef {
 	overdue?: number | null;
 	/** state.pid + process.kill 探活；无 state.pid → null。 */
 	pidAlive?: boolean | null;
+	/** RF-1（2026-10-18）：`composeTabStatus().resultMissing` 透传（监管 DONE/BLOCKED_USER 分界载体）。 */
+	resultMissing?: boolean | null;
 }
 
 /** E2.0：单 run 的 carrier 输入（collect 层用共享归约填充；缺 → GraphRunRef 对应字段 null）。 */
@@ -79,6 +81,8 @@ export interface GraphRunCarrier {
 	staleOver: boolean;
 	overdue: number;
 	pidAlive: boolean | null;
+	/** RF-1：`composeTabStatus().resultMissing`（GraphRunRef.resultMissing 的源头）。 */
+	resultMissing: boolean;
 }
 
 /**

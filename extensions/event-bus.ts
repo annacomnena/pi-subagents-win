@@ -295,7 +295,8 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	const taskId = result?.taskId ? ` task=${result.taskId}` : "";
 
 	if (opts.toast !== false) {
-		const icon = status === "completed" ? "✅" : "❌";
+		// RF-1：兜底结果不是「完成」，图标/标题不得给完成暗示（⏱ = 待核实）。
+		const icon = status === "completed" ? "✅" : status === "unconfirmed" ? "⏱" : "❌";
 		sendWindowsToast({ title: `${icon} tab ${runId} ${status}${taskId}${cost}`, body: summary.slice(0, 100), duration: "long" });
 	}
 
@@ -304,8 +305,12 @@ export function onTabResultFile(runsDir: string, fileName: string, opts: EventBu
 	if (opts.autoReclaim !== false) {
 		try {
 			// 注入用户消息唤醒模型去回收（followUp：主会话忙碌时排队，不打断工具循环）
+			// RF-1：unconfirmed（兜底生成）绝不能显示成「已完成」—— 它恰恰是「没回报，需核实」。
+			const headline = status === "unconfirmed"
+				? `⏱ Tab ${runId} 回合已结束但未调用 tab-finish（状态 unconfirmed${taskId}${cost}）——不是完成，需核实`
+				: `⏱ Tab ${runId} 已完成（${status}${taskId}${cost}）`;
 			const body = [
-				`⏱ Tab ${runId} 已完成（${status}${taskId}${cost}）`,
+				headline,
 				`摘要: ${summary}`,
 				artifacts ? `交付物:\n${artifacts}` : null,
 				reportPath || null,

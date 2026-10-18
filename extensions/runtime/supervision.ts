@@ -32,7 +32,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
-import { defaultTabRunsDir, readTabDispatch } from "../tab-runs.ts";
+import { defaultTabRunsDir, isUnconfirmedFallback, readTabDispatch, readTabResultFile } from "../tab-runs.ts";
 import type { FrontierSnapshot, ProjectSupervision } from "./autonomy/frontier.ts";
 
 // ── 常量 ───────────────────────────────────────────────────────────
@@ -475,7 +475,7 @@ export function autoRegisterDispatchedTabs(
 // ── 显示（/autonomy status + /supervise status 共用）────────────────
 
 /** 账本现状行（纯读；供命令渲染，不参与任何判据）。 */
-export function supervisionLedgerLines(opts: { root?: string; stateDir?: string } = {}): string[] {
+export function supervisionLedgerLines(opts: { root?: string; stateDir?: string; tabRunsDir?: string } = {}): string[] {
 	const entries = listOpenSupervisionEntries(opts);
 	if (entries.length === 0) return ["supervision: (无监管条目——所有 tab 均为 NOT_MONITORED)"];
 	const lines = [`supervision: ${entries.length} 条 active 账本`];
@@ -483,9 +483,28 @@ export function supervisionLedgerLines(opts: { root?: string; stateDir?: string 
 		const th = thresholdsOf(e);
 		const paused = e.status === "paused" ? ` ⏸ paused${e.pauseReason ? `(${e.pauseReason})` : ""} @${(e.pausedAt ?? e.setAt).slice(0, 19)}` : "";
 		const optOut = e.optOut === true ? " ⏭ optout" : ""; // 纯展示；判据在 frontier.deriveTabSupervisionState
-		lines.push(`  ${e.runId} task=${e.taskId} ${paused || "active"}${optOut} push=${Math.round(th.pushMs / 60_000)}m${e.repoPath ? ` repo=${basename(e.repoPath)}` : ""}`);
+		lines.push(
+			`  ${e.runId} task=${e.taskId} ${paused || "active"}${optOut} push=${Math.round(th.pushMs / 60_000)}m${e.repoPath ? ` repo=${basename(e.repoPath)}` : ""}` +
+				unreportedMark(e.runId, opts.tabRunsDir),
+		);
 	}
 	return lines;
+}
+
+/**
+ * RF-1：`/supervise status` 行尾的「⚠未回报」标记（纯读，never-throw）。
+ *
+ * 判据与展示分离：是否 BLOCKED_USER 由 `frontier.deriveTabSupervisionState` 决定；
+ * 这里只给**人看的**一行附加标记，因此**不参与任何判据**（不得被测试当作状态机的一部分）。
+ * 读不到/读到真 tab-finish 结果 ⇒ 不标记（不猜、不误报）。
+ */
+function unreportedMark(runId: string, tabRunsDir?: string): string {
+	try {
+		const result = readTabResultFile(tabRunsDir ?? defaultTabRunsDir(), runId);
+		return isUnconfirmedFallback(result) ? " ⚠未回报" : "";
+	} catch {
+		return ""; // 读不到就不标记（不猜，不污染行格式）
+	}
 }
 
 // ── 命令体（/supervise）────────────────────────────────────────────
@@ -528,7 +547,7 @@ export function handleSuperviseCommand(args: string, ctx: SuperviseCommandCtx, d
 	const usage = (): void => ctx.ui.notify(SUPERVISE_USAGE, "warning");
 
 	if (sub === "status") {
-		ctx.ui.notify(supervisionLedgerLines({ stateDir: deps.stateDir }).join("\n"), "info");
+		ctx.ui.notify(supervisionLedgerLines({ stateDir: deps.stateDir, tabRunsDir: deps.tabRunsDir }).join("\n"), "info");
 		return;
 	}
 	if (sub !== "on" && sub !== "off" && sub !== "pause" && sub !== "resume" && sub !== "optout") return usage();

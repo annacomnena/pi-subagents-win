@@ -856,6 +856,10 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// 验证 audit.jsonl 真落一行 → 需要 import runtime/autonomy 字面量 → 排除
 				//（ALLOW 不动：仍是测试文件、非生产接线点）
 				if (p === join(EXT_ROOT, "_test_runtime_supervision_push.ts")) continue;
+				// RF-1（20261018）：该测试直接断言 `deriveTabSupervisionState`（BLOCKED_USER 判据）
+				// → 需要 import runtime/autonomy/frontier.ts 字面量 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
+				if (p === join(EXT_ROOT, "_test_tab_report_fallback.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}

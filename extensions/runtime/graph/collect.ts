@@ -188,6 +188,8 @@ function readTabRunRefs(runsDir: string, sessionsRoot: string, timersDir: string
 				gate: carrier.gate, needsHuman: carrier.needsHuman, staleOver: carrier.staleOver,
 				overdue: carrier.overdue, pidAlive: carrier.pidAlive,
 				stop: carrier.stop, idleMs: carrier.idleMs,
+				// RF-1（2026-10-18）：resultMissing 必须进 carrier，否则 graph 源下监管 DONE/BLOCKED_USER 无法分界。
+				resultMissing: carrier.resultMissing,
 			};
 			if (note.attention) {
 				const k = normalizeRepoKey(repoPath);
