@@ -36,7 +36,13 @@ function expectClass(error: string, kind: string, retryable: boolean, modelHint?
 	expectClass("ECONNRESET", "provider_network", true);
 	expectClass("EAI_AGAIN", "provider_network", true);
 	expectClass("fetch failed", "provider", true);
-	ok("C1 连接类 ⇒ provider_network/retryable（terminated / 5xx-no-body / socket 族）");
+	// 2026-10-18 新增（异步派发 3 连挂的真因）：pi 内核 fetch 层把连接故障包装成
+	// `Connection error.`，它原本**两个正则都不匹配** ⇒ 落 other(retryable:false) ⇒
+	// onFatalFailure ⇒ 子进程被立即 SIGTERM（turns=1 / input=0，请求未发出）。
+	expectClass("Connection error.", "provider_network", true);
+	expectClass("Connection reset by peer", "provider_network", true);
+	expectClass("connection closed before message completed", "provider_network", true);
+	ok("C1 连接类 ⇒ provider_network/retryable（terminated / 5xx-no-body / socket 族 / Connection error）");
 }
 
 // ── C2：既有语义不被这次修复改动（回退保护）──

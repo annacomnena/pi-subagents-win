@@ -469,8 +469,14 @@ export function classifyModelFailure(
 	// 2026-10-16 实测：今日 3 条长跑的 `error==="terminated"`（undici socket 提前关闭）与
 	// `503 status code (no body)` 均为此形；见 `plans/20261016_terminated_provenance_investigation.md`。
 	// 归入 retryable 后：不再 fatal-kill，交由 fallback 链/有界重试处理，终态时明写连接类。
+	// 2026-10-18 补：`Connection error.` 是本仓最常见的异步派发失败文案（pi 内核 fetch 层包装），
+	// 但它此前**两个正则都不匹配** ⇒ 落 `other`（retryable:false）⇒ `onFatalFailure` ⇒ 子进程
+	// 被**立即 SIGTERM，零重试零产出**。实测：同一 argv + 同一 env 手动跑成功、sync 派发成功，
+	// 唯独 async 3 连挂，全部 `turns=1 / input=0`（请求根本没发出去就被杀）。
+	// 归入 retryable 后不再 fatal-kill，交由 fallback 链/有界重试处理。
+	// 注：`fetch failed` 已由下方 `providerish` 命中并归类 `provider`（既有语义，勿动）。
 	const connectionish =
-		/(\bterminated\b|socket hang ?up|other side closed|premature close|undici|socket closed|\bECONNRESET\b|ECONNREFUSED|\bEPIPE\b|EAI_AGAIN|\bETIMEDOUT\b|\b50[0-4]\b|bad gateway|service unavailable|no body|network error)/i.test(
+		/(\bterminated\b|socket hang ?up|other side closed|premature close|undici|socket closed|\bECONNRESET\b|ECONNREFUSED|\bEPIPE\b|EAI_AGAIN|\bETIMEDOUT\b|\b50[0-4]\b|bad gateway|service unavailable|no body|network error|connection error|connection (?:reset|closed|aborted|refused|timed ?out|error))/i.test(
 			error,
 		);
 	if (connectionish) {
