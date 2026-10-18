@@ -2,7 +2,7 @@
 title: Local Master Ensure（幂等确保）
 kind: concept
 status: current
-updated: 2026-10-01
+updated: 2026-10-18
 source_paths:
   - extensions/runtime/local-master-launch.ts
   - extensions/master-tools.ts
@@ -14,6 +14,9 @@ source_paths:
   - extensions/runtime/scope.ts#listScopeWakeLetters
   - extensions/runtime/scope.ts#evaluateScopeWake
   - extensions/runtime/mailbox.ts#claimLetters
+  - extensions/tab-runs-runtime.ts::writeSettlementFallback
+  - extensions/tab-runs-runtime.ts::classifyForReclaim
+  - extensions/tab-runs.ts::composeTabStatus
   - extensions/_test_local_master.ts
 ---
 
@@ -109,7 +112,7 @@ source_paths:
 4. **`no-liveness` / `identity-mismatch` 僵尸救不回**：新会话 skip → 不认领 → 不注册 → ensure 只能如实 `stalled`，修 = 扩权，符合裁定。
 5. **人工 attach 不注册消费循环是既有缺陷**（本能力未引入也未修复）；建议另案给 attach 成功路径补一次 scope 消费循环重注册（与全局 watcher 补注册同构），或落盘"消费端已注册"标记供机器判据读取。
 6. **端到端真 spawn 手测未做**（计划 §3 验收第 3 项 / L4-S6）：需真实开 WT tab + 写真实 attachment，留用户一次性手测（建议对死仓如 `computer-use` 执行）。
-7. **tab 回收交互未实测**（计划 Q4）：master-bootstrap tab 有 `tab-run-id`、无终态 → 可能被 `tab-status`/`reclaim-tabs` 标 orphaned/unconfirmed（transfer 后继同先例）。
+7. **tab 回收交互：部分已闭合、回收分类仍未实测**（计划 Q4）。**已闭合的部分**：master-bootstrap tab 的账本 `taskId` 恒为 `lms-<scope>`（`ensureTaskId`，`local-master-launch.ts:277`），而 `tab-runs-runtime.ts::writeSettlementFallback` 对 `lms-`/`master-` 前缀走 **`skip-persistent-identity`** 豁免、不再写盘 ⇒ 常驻 local master tab **不会**被兜底写成 `unconfirmed`，也就不会因其 `attention:true`（`frontier-carriers.ts:203`）把该仓抬成 `BLOCKED_USER`、把 `STALLED` 变成不可达（这条污染路径已断）。**仍未闭合的部分**：`phase` 判态本身照旧——无 result 时 `composeTabStatus` 走 state/JSONL 分支，idle 的常驻 tab 呈 `waiting`（`classifyForReclaim` ⇒ `awaitingInput`，语义是「等待输入，不是完成」，不再失真为失败），会话死/超 grace 后呈 `orphaned`；真实 master bootstrap tab 跑一次 `tab-status`/`reclaim-tabs` 的端到端观测仍**未做**（同残余 6 的手测窗口）。**边界**：豁免只认 `lms-`（唯一构造点 `ensureTaskId`）与 `master-`（调用方自由传入的命名约定）两个 taskId 前缀，不是「凡是常驻会话都豁免」。
 
 ## Evidence
 
@@ -123,6 +126,7 @@ source_paths:
 - `extensions/event-bus.ts:121` — `triggerOwnershipRecheck()` 只 `startWatch?.()`（全局 watcher）；`extensions/master-tools.ts:521`、`extensions/index.ts:2125` — `master-attach` 成功只调它。
 - 测试 `extensions/_test_local_master_launch.ts`（script `npm run test:local-master-ensure`）— **23 组断言块全绿**（2026-09-25 复跑）：四层逐层拒绝 / `already-running` 幂等 / invalid-cwd 零写 / in-flight F–F4（含 `windowEndsAt` first-wins、fail-closed）/ ready 与 stalled 不猜 / claim 观测 H / #A J1–J3 / 审计六字段 / K 组双入口 + 注册点静态耦合 / L 组 slash 解析 4 例。L4 变异 4/4 被捕获（`plans/0924_local_master_ensure_l4_review.md`，本地 gitignored）。
 - 提交：`0586030`（feat，7 files）+ `f5a9b90`（fix：L4-M1 slash 参数解析 + S1/S2/S3/S4/S5/S7，3 files）。
+- 常驻身份豁免（残余 7 的闭合部分）：`extensions/tab-runs-runtime.ts::writeSettlementFallback`（`:105-131`，`skip-persistent-identity` 在「已有 result 检查」之后、「写盘」之前；`SettlementFallbackOutcome` `:69-83`）+ `extensions/runtime/local-master-launch.ts::ensureTaskId`（`:277`，`lms-<scope>`）+ `extensions/runtime/local-master-launch.ts:249`（bootstrap prompt 明令「不要 tab-finish、不要退出」）；测试 `extensions/_test_tab_report_fallback.ts` 第 10 组（`lms-*`/`master-*` 免写、普通 taskId 对照、`skip-persistent-identity` 且未落盘）。
 
 ## Links Out
 
@@ -144,4 +148,4 @@ source_paths:
 - 授权档位（L2-Q1/Q6「能力即扩散面」）：本轮用户裁定**免二次确认**，但**无全局并发/速率上限**的根治（如 ask 档 / config 开关 `localMasterLaunch.confirm`）仍待裁定。
 - 手动 attach 补注册 scope 消费循环（残余 5）与"消费端已注册"盘上标记——另案修法待排期。
 - 无头常驻形态（L2-Q3）：可见 tab 占终端窗口，去 `--no-session`/`PI_SUBAGENT` 的专用启动 profile 会改身份矩阵，另案。
-- 端到端真 spawn 手测（残余 6）与 master-bootstrap tab × `reclaim-tabs` 交互（残余 7）待人工执行一次。
+- 端到端真 spawn 手测（残余 6）与 master-bootstrap tab 上真跑一次 `tab-status`/`reclaim-tabs` 的相位观测（残余 7 的未闭合部分）待人工执行一次；残余 7 的「被兜底写成 unconfirmed」已由 `lms-` 前缀豁免闭合。
