@@ -175,6 +175,71 @@
 
 ---
 
+## 9c. 系统资源纪律：全盘搜索必须带超时（R-13，2026-10-18 事故）
+
+### 事故：一条 `find` 挂了 2.7 小时，撑爆内存，间接造成 pi 包反复损坏
+
+**我做了什么**：为找 `cli.js`，在**根目录**跑：
+```bash
+find / -maxdepth 8 -name cli.js -path *pi-coding-agent/dist*
+```
+**没加 `timeout`**，它从 22:10 挂到 00:40（**2.7 小时**）。
+
+**后果链**：
+```
+扫全盘 → 打开 696 万个文件句柄（实测 HandleCount=6,984,230）
+  ↓
+内核非分页池 3282MB（正常 <1000）+ 分页池 3978MB（正常 <800）
+  ↓
+物理内存 99.4%（31.1GB 总量，可用仅 0.2GB）
+  ↓
+★ 内存/句柄枯竭下，文件写操作随机失败（EBUSY / 半途失败）
+  ↓
+★ pi 包「反复部分损坏」4 次 —— dist 消失 / 子包丢失 / pi-tui/dist 缺失
+```
+
+**归因教训**：我先前把损坏归因为「npm EBUSY」，**只对了一半** —— EBUSY 是现象，
+**内存枯竭才是根因**。而内存枯竭是**我自己那条 find** 造成的。
+
+### 规则
+
+1. **禁止在 `/`、`C:/`、`G:/` 等盘根跑无超时的 `find` / `grep -r` / `du`**。
+   必须带超时且限定目录：
+   ```bash
+   timeout 30 find <具体目录> -maxdepth 4 -name 'x'   # 正确
+   timeout 30 find / -maxdepth 8 -name 'x'            # 禁止
+   ```
+2. **长命令一律 `timeout N`**（本仓 bash 工具支持 `timeout` 参数，优先用它）。
+3. **后台进程要有归属**：任何 >1 分钟的命令，必须知道它在哪、怎么停。
+4. **诊断「文件写失败」前先查资源**：
+   ```powershell
+   Get-CimInstance Win32_OperatingSystem | Select TotalVisibleMemorySize,FreePhysicalMemory
+   Get-Process | Sort HandleCount -Desc | Select -First 5 Name,Id,HandleCount
+   ```
+   **句柄 TOP1 远超 10 万 ⇒ 先杀掉它再看文件问题。**
+5. **`pi --version` 不足以判断包健康**（见 R-14）。
+
+### R-14 pi 包健康检查：`--version` 会骗人
+
+**事故**：第 4 次损坏时 `pi --version` 正常报 `0.99.1`，但 `pi-tui/dist/index.js` 缺失 ——
+只有实际执行 subagent 时才炸 `ERR_MODULE_NOT_FOUND`。
+
+**规则**：健康检查必须验 **import 图**，不是版本号：
+```bash
+node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
+# 期望：HEALTHY_IMPORT_GRAPH + IMPORT_OK（TUI + main 两个）+ earendilPackages=7
+```
+
+### 环境事实（别再搞错）
+
+- `C:\nvm4w\nodejs` 是 **Junction** → `C:\Users\Annacomnena\AppData\Local\nvm\v22.19.0`
+  ⇒ 「两处安装路径」**是同一实体**，改一即改二。
+- 独立安装在 `C:/pi-standalone/`（完好，已用于恢复 4 次）。
+- `subagent-win/node_modules/@earendil-works/` 下**已是真实副本**（原来的两个指向全局的软链接
+  已于 2026-10-18 删除）。
+
+---
+
 ## 10. 已知未闭合项（勿当成已完成）
 
 | 项 | 状态 |
