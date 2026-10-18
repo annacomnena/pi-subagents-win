@@ -112,46 +112,52 @@ if (cfg.enabled !== true) return { engaged: false, proceed: true, reason: "auton
 对 `stop=error` 的 tab：`frontier.ts:357`（`if (tab.stop === "error") return "BLOCKED_USER";`）。
 > 注意：这条在 `phase === "unconfirmed"`（兜底结果）时**更早**命中 —— `frontier.ts:349` `if (tab.phase === "unconfirmed" && tab.stop !== "aborted") return "BLOCKED_USER";`。SBS-B1 形状（`stop=error` + 兜底 `unconfirmed`）走的是 `:349`，结果同为 `BLOCKED_USER`。
 
-**b) 项目级累计（本任务新增）** — `extensions/runtime/autonomy/frontier.ts:409-431`
+**b) 项目级累计（本任务新增；2026-10-18 返工 R1 改为收集全部命中）** — `extensions/runtime/autonomy/frontier.ts:421-448`
 ```ts
-let blockedOverdue = false;                       // :410
-let blockedOverdueRunId: string | undefined;      // :411
-let blockedOverdueIdleMs = -1;                    // :412
-for (const t of tabs) {                           // :413  ← 既有循环，与六态派生同一处
-    const st = deriveTabSupervisionState(...);    // :415  ← 复用派生结果，不重写判据
-    const userMs = typeof ledger?.userMs === "number" && ... > 0 ? ledger.userMs : SUPERVISION_THRESHOLDS.userMs;  // :419-422
-    if (st === "BLOCKED_USER" && typeof t.idleMs === "number" && Number.isFinite(t.idleMs) && t.idleMs > userMs) {  // :423
-        blockedOverdue = true;                    // :424
-        if (t.idleMs > blockedOverdueIdleMs) { blockedOverdueIdleMs = t.idleMs; blockedOverdueRunId = t.runId; }   // :425-428
+const odHits: Array<{ runId: string; idleMs: number }> = [];   // :423（返工 R1：不再只记最重一个）
+for (const t of tabs) {                           // :424  ← 既有循环，与六态派同一处
+    const st = deriveTabSupervisionState(...);    // :426  ← 复用派生结果，不重写判据
+    const userMs = typeof ledger?.userMs === "number" && ... > 0 ? ledger.userMs : SUPERVISION_THRESHOLDS.userMs;  // :431-435
+    if (st === "BLOCKED_USER" && typeof t.idleMs === "number" && Number.isFinite(t.idleMs) && t.idleMs > userMs) {  // :435
+        odHits.push({ runId: t.runId, idleMs: t.idleMs });  // :436
     }
 }
+odHits.sort((a, b) => b.idleMs - a.idleMs || a.runId.localeCompare(b.runId));  // :445（idle 降序 + runId 升序幂等）
+const blockedOverdue = odHits.length > 0;                  // :446
+const blockedOverdueRunId = odHits[0]?.runId;              // :447（本帧默认候选：最重）
+const blockedOverdueRunIds = odHits.length > 0 ? odHits.map((h) => h.runId) : undefined;  // :448（全部超龄 runId）
 ```
 阈值 `SUPERVISION_THRESHOLDS.userMs = 30 * 60_000`（`frontier.ts:89`）。
 
-**c) 触发发射（level + 1h/runId 节流）** — `extensions/runtime/autonomy/frontier.ts:582-601`
+**c) 触发发射（level + **per-runId** 1h 节流）** — `extensions/runtime/autonomy/frontier.ts:599-622`
+> 返工 R1：旧形状是 `prevSameRun`（只在 prev.runId === cur.runId 时读 lastAt）⇒ 最重者交替时两条 runId 的节流记录互相覆盖，同一 runId 可在窗内重发。现改为遍历 `blockedOverdueRunIds`，每个 runId 各自查自己的账本时刻。
 ```ts
-if (cur.blockedOverdue && cur.blockedOverdueRunId) {                                        // :585
-    const prevSameRun = pv.blockedOverdue === true && pv.blockedOverdueRunId === cur.blockedOverdueRunId;  // :586
-    const lastAt = prevSameRun && typeof pv.blockedOverdueLastAt === "number" ? pv.blockedOverdueLastAt : null;  // :587
-    if (lastAt === null || now - lastAt >= BLOCKED_OVERDUE_THROTTLE_MS) {                   // :588
-        triggers.push({ rule: "blocked_overdue", project: key, runId: cur.blockedOverdueRunId, ... });        // :593-599
-        blockedOverdueEmitted.add(key);                                                      // :600
+const blockedOverdueEmitted = new Map<string, string>();                                    // :529（project → 本帧发射的 runId）
+if (cur.blockedOverdue && cur.blockedOverdueRunIds && cur.blockedOverdueRunIds.length > 0) {  // :602
+    const prevLedger = pv.blockedOverdueLastAt && typeof pv.blockedOverdueLastAt === "object" ? pv.blockedOverdueLastAt : {};  // :603-604
+    for (const rid of cur.blockedOverdueRunIds) {                                           // :605
+        const last = prevLedger[rid];                                                       // :606
+        if (typeof last === "number" && Number.isFinite(last) && now - last < BLOCKED_OVERDUE_THROTTLE_MS) continue;  // :607（该 runId 窗内）
+        triggers.push({ rule: "blocked_overdue", project: key, runId: rid, ... });          // :612-618
+        blockedOverdueEmitted.set(key, rid);                                                // :619
+        break;  // 每项目每帧最多 1 条（:620）
     }
 }
 ```
 - `BLOCKED_OVERDUE_THROTTLE_MS = 3_600_000`（`frontier.ts:100`）
-- 节流状态落 `next.projects[].blockedOverdueLastAt`（`frontier.ts:631-646`）
-- **基线帧压制**：整段在 `if (!baseline) {`（`frontier.ts:523`）之内 ⇒ 冷启动/快照丢失不会风暴
+- 节流账落 `next.projects[].blockedOverdueLastAt`（`frontier.ts:651-672`）：本帧发射的 runId 记 `now`（`:666`）；其余**沿用 prev**（`:661-665`）；**只保留仍在本帧超龄集合里的键**（`:660/:662`，防无界增长；SUP-B9 钉住）
+- **基线帧压制**：整段在 `if (!baseline) {`（`frontier.ts:537`）之内 ⇒ 冷启动/快照丢失不会风暴
 
 ### 1.5 8 小时的具体读数（按代码推理，非真机演练）
 
 一个 `stop=error` + 兜底 `unconfirmed` 的 tab，`idleMs = 8 * 3600_000 = 28_800_000`：
 - `:349` 命中 ⇒ `BLOCKED_USER`
-- `28_800_000 > 1_800_000` ⇒ `blockedOverdue = true`，`blockedOverdueRunId = tab.id`
-- 首帧（`lastAt=null`）⇒ **立刻发一次** `blocked_overdue`
-- 之后每 **1 小时**（`now - lastAt >= 3_600_000`）再发一次 ⇒ 8 小时内约 8 次提醒，且每次都带同一个 runId
+- `28_800_000 > 1_800_000` ⇒ `blockedOverdue = true`，`blockedOverdueRunIds = [tab.id]`（单 tab 时与 `blockedOverdueRunId` 同值）
+- 首帧（账本里该 runId 无记录）⇒ **立刻发一次** `blocked_overdue`
+- 之后每 **1 小时**（`now - ledger[runId] >= 3_600_000`）再发一次 ⇒ 8 小时内约 8 次提醒，且每次都带同一个 runId
+- **多 tab 情形（返工 R1）**：同项目内 A/B 两个超龄 tab 交替成为「最重」时，**各自独立**计 1h 窗（`blockedOverdueLastAt: { A: tA, B: tB }`）⇒ 任一 runId 不得在窗内被重复提醒。**测试证据**：`extensions/_test_runtime_autonomy.ts:1235`（SUP-B8，6 帧交替最重序列；帧 5 = 修复前的窗内重发红点）、`:1273`（SUP-B9，账本收缩/无界增长防护）
 
-**这一步的测试证据**：`extensions/_test_runtime_autonomy.ts:1110`（SUP-B1，31min 边界）、`:1130`（SUP-B3，t0/t0+5min/t0+61min 三帧节流）、`:1151`（SUP-B4，`BLOCKED_USER` 不越界成 `stagnation`）。
+**这一步的测试证据**：`extensions/_test_runtime_autonomy.ts:1111`（SUP-B1，31min 边界）、`:1131`（SUP-B3，t0/t0+5min/t0+61min 三帧节流；账本为 `{runId: ts}` 映射）、`:1151`（SUP-B4，`BLOCKED_USER` 不越界成 `stagnation`）。
 
 ---
 
@@ -214,7 +220,8 @@ to:   localMasterAddress(localMasterScope(project)),
 ### 2.6 1h 去重（不刷屏）
 
 `run.ts:184` `dedupHit(breaker, dedupKey, now)`；`dedupKey = rule:class:project`（`run.ts:152`）；`breaker.ts:129-134` 判 `now - last < BUDGET.hourMs`（1h）。
-⇒ 与 frontier 的 `blockedOverdueLastAt` 节流**同一量级**（1h），两层都拦得住。
+⇒ 与 frontier 的 `blockedOverdueLastAt`（per-runId 1h 节流账）**同一量级**（1h），两层都拦得住。
+> 注意两层粒度不同：frontier 层按 **runId**（`blockedOverdueLastAt: Record<runId, ts>`），actions 层按 **`rule:class:project`**（项目级）。⇒ 最保守（1h 内同项目同 rule 至多动作一次）。
 **测试证据**：`_test_runtime_autonomy_actions.ts:1618`（G1-1(d)：第二 tick +60s ⇒ `skipped(reason==="cooldown")`，且 mailbox 仍只有 1 封）。
 
 ### 2.7 生产配置下的实际可达性（诚实标注）

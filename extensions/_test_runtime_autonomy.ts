@@ -193,7 +193,8 @@ function makeProject(p: Partial<ProjectFrontier> & { project: string }): Project
 		stagnation: p.stagnation ?? false,
 		blockedOverdue: p.blockedOverdue ?? false,
 		...(p.blockedOverdueRunId ? { blockedOverdueRunId: p.blockedOverdueRunId } : {}),
-		...(typeof p.blockedOverdueLastAt === "number" ? { blockedOverdueLastAt: p.blockedOverdueLastAt } : {}),
+		...(p.blockedOverdueRunIds ? { blockedOverdueRunIds: p.blockedOverdueRunIds } : {}),
+		...(p.blockedOverdueLastAt && typeof p.blockedOverdueLastAt === "object" ? { blockedOverdueLastAt: p.blockedOverdueLastAt } : {}),
 		overdue: p.overdue ?? 0,
 		meaningfulStateVersion: p.meaningfulStateVersion ?? 1,
 	};
@@ -1134,16 +1135,18 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 		// 帧2（t0）：首次提醒
 		const f2 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f1.next, now: NOW, supervision: ledger });
 		assert.deepEqual(f2.diff.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId), [BTAB], "帧2 必须提醒");
-		assert.equal(f2.next.projects[0]!.blockedOverdueLastAt, NOW, "节流时刻必须落盘=now");
+		// 返工 R1：节流账改为 runId → 时刻 的映射（不再单值）
+		assert.deepEqual(f2.next.projects[0]!.blockedOverdueLastAt, { [BTAB]: NOW }, "节流账必须落盘为 { runId: now }");
+		assert.deepEqual(f2.next.projects[0]!.blockedOverdueRunIds, [BTAB], "超龄集合也要落盘（供诊断 + 账本收缩）");
 		// 帧3（t0+5min）：窗内不提醒，但 blockedOverdue 仍为 true（载体不消失）
 		const f3 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f2.next, now: NOW + 5 * 60_000, supervision: ledger });
 		assert.equal(f3.diff.triggers.some((t) => t.rule === "blocked_overdue"), false, "窗内不得重复提醒");
 		assert.equal(f3.next.projects[0]!.blockedOverdue, true, "载体仍为 true（只是被节流）");
-		assert.equal(f3.next.projects[0]!.blockedOverdueLastAt, NOW, "节流时刻沿用，不被未发射帧刷成新值");
+		assert.deepEqual(f3.next.projects[0]!.blockedOverdueLastAt, { [BTAB]: NOW }, "节流账沿用，不被未发射帧刷成新值");
 		// 帧4（t0+61min）：窗过期 ⇒ 再提醒
 		const f4 = buildFrontier({ snapshot: makeSnapshot(tabs), backlog: [], prev: f3.next, now: NOW + 61 * 60_000, supervision: ledger });
 		assert.deepEqual(f4.diff.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId), [BTAB], "窗过期必须再提醒");
-		assert.equal(f4.next.projects[0]!.blockedOverdueLastAt, NOW + 61 * 60_000);
+		assert.deepEqual(f4.next.projects[0]!.blockedOverdueLastAt, { [BTAB]: NOW + 61 * 60_000 }, "再提醒后账本刷新为 now");
 		// 不变式：节流值恒为 ≥1h（常量校验，防被悄悄调小）
 		assert.equal(BLOCKED_OVERDUE_THROTTLE_MS, 3_600_000, "节流窗必须 1h");
 	});
@@ -1212,6 +1215,78 @@ console.log("SUP-B blocked_overdue（BLOCKED_USER 超龄周期提醒）");
 		assert.equal(od[0]!.runId, "tab_od_b", "必须取 idle 最大的 tab");
 		assert.match(od[0]!.evidence, /idleMin=90/, "证据里的 idle 必须是该 runId 自身，不是项目 max 的串味");
 		assert.equal(next.projects[0]!.blockedOverdueRunId, "tab_od_b");
+		assert.deepEqual(next.projects[0]!.blockedOverdueRunIds, ["tab_od_b", "tab_od_a"], "全部超龄 runId 按 idle 降序收集");
+	});
+
+	// ── SUP-B8：交替最重时 per-runId 节流（返工 R1 核心；帧5 = 修复前的窗内重发红点） ──
+	// 帧序与夹具**逐字段照抄**返工规格 `plans/20261018_group1_rework_spec.md` §2.1（同 idle、同帧时），
+	// 因此下面的「实际 vs §2.1 期望」是严格同夹具对照。
+	const ATAB = "tab_od_a";
+	const BOD = "tab_od_b";
+	const odLedgers: FrontierSupervision[] = [mkOdLedger({ runId: ATAB }), mkOdLedger({ runId: BOD })];
+	/** a/b = 该 tab 的 idle(分钟)；null = 本帧看不见该 tab（§2.1 帧3「只有 B」）。 */
+	const mkAB = (aMin: number | null, bMin: number | null): FrontierSourceTab[] => [
+		...(aMin === null ? [] : [mkOdTab({ runId: ATAB, idleMs: aMin * 60_000 })]),
+		...(bMin === null ? [] : [mkOdTab({ runId: BOD, idleMs: bMin * 60_000 })]),
+	];
+	const odRunIds = (d: { triggers: FrontierTrigger[] }): string[] =>
+		d.triggers.filter((t) => t.rule === "blocked_overdue").map((t) => t.runId as string);
+
+	check("SUP-B8 交替最重：per-runId 节流生效（帧5 不得窗内重发 B）", () => {
+		const T0 = NOW;
+		const steps: Array<{ label: string; now: number; tabs: FrontierSourceTab[]; spec: string[] }> = [
+			{ label: "t0", now: T0, tabs: mkAB(null, 35), spec: [BOD] },
+			{ label: "t0+10m", now: T0 + 10 * 60_000, tabs: mkAB(40, 45), spec: [] },
+			{ label: "t0+20m", now: T0 + 20 * 60_000, tabs: mkAB(null, 55), spec: [] },
+			{ label: "t0+30m", now: T0 + 30 * 60_000, tabs: mkAB(95, 65), spec: [ATAB] },
+			{ label: "t0+40m", now: T0 + 40 * 60_000, tabs: mkAB(45, 75), spec: [] },
+			{ label: "t0+65m", now: T0 + 65 * 60_000, tabs: mkAB(70, 100), spec: [BOD] },
+		];
+		// 基线帧（prev=null ⇒ 零触发，只建基线/账本）
+		let snap = buildFrontier({ snapshot: makeSnapshot(mkAB(null, 35)), backlog: [], prev: null, now: T0 - 60_000, supervision: odLedgers }).next;
+		const actual: string[][] = [];
+		for (const s of steps) {
+			const r = buildFrontier({ snapshot: makeSnapshot(s.tabs), backlog: [], prev: snap, now: s.now, supervision: odLedgers });
+			const got = odRunIds(r.diff);
+			actual.push(got);
+			const p = r.next.projects[0]!;
+			console.log(
+				`    SUP-B8 ${s.label.padEnd(7)} 超龄集=[${(p.blockedOverdueRunIds ?? []).join(",")}] 发射=[${got.join(",")}] 账本=${JSON.stringify(p.blockedOverdueLastAt ?? {})}`,
+			);
+			snap = r.next;
+		}
+		// 逐帧断言（帧5 = 红点：B 在 t0 已发，t0+40m 距上次仅 40min ⇒ 必须不发）
+		assert.deepEqual(actual[0], [BOD], "帧1（t0，只有 B 超龄）⇒ 发 B");
+		assert.deepEqual(actual[2], [], "帧3（t0+20m，只有 B，B 窗内）⇒ 不发");
+		assert.deepEqual(actual[4], [], "帧5（t0+40m，最重 B，B 距 t0 仅 40min）⇒ 不得窗内重发（本条在修复前会误发 B）");
+		assert.deepEqual(actual[5], [BOD], "帧6（t0+65m，最重 B，距 t0 已 65min）⇒ 发 B");
+		// 帧2/帧4：与 §2.1 期望序列不同（§2.1 写「不发」/「发 A」）—— 详见报告「偏离 D2」：
+		// 实现按 §1.1 §3 + 任务要求②「遍历超龄 runId、跳过窗内的、每帧最多 1 条」⇒ 帧2 A(40min，无账本) 首发；
+		// 帧3 只有 B ⇒ A 被账本收缩剔除（§1.1 §4）⇒ 帧4 A 再次首次（R-5「宁可重发」方向）。
+		assert.deepEqual(actual[1], [ATAB], "帧2（B 窗内 ⇒ 顺延到本小时未提醒的 A）⇒ 发 A（§2.1 期望为空；偏离 D2）");
+		assert.deepEqual(actual[3], [ATAB], "帧4（B 及 A 均窗内？A 已在帧3 出账）⇒ 发 A（§2.1 期望为 A）");
+		console.log(
+			`    SUP-B8 逐帧对照 §2.1：${steps.map((s, i) => `${s.label} 实际=[${actual[i]!.join(",")}] §2.1=[${s.spec.join(",")}]${JSON.stringify(actual[i]) === JSON.stringify(s.spec) ? "✅" : "⚠️"}`).join(" | ")}`,
+		);
+	});
+
+	check("SUP-B9 节流账收缩：不再超龄的 runId 从账本里移除（防无界增长）", () => {
+		const T0 = NOW;
+		const base = buildFrontier({ snapshot: makeSnapshot(mkAB(90, 35)), backlog: [], prev: null, now: T0 - 60_000, supervision: odLedgers }).next;
+		// 帧1：A(90min)+B(35min) 都超龄 ⇒ 发 A（最重）⇒ 账本 {A: t0}
+		const f1 = buildFrontier({ snapshot: makeSnapshot(mkAB(90, 35)), backlog: [], prev: base, now: T0, supervision: odLedgers });
+		assert.deepEqual(odRunIds(f1.diff), [ATAB], "帧1 发 A");
+		assert.deepEqual(f1.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0 }, "帧1 账本只有 A");
+		// 帧2：B(105min) 反超 A(100min) ⇒ B 首次 ⇒ 发 B ⇒ 账本 {A, B}
+		const f2 = buildFrontier({ snapshot: makeSnapshot(mkAB(100, 105)), backlog: [], prev: f1.next, now: T0 + 10 * 60_000, supervision: odLedgers });
+		assert.deepEqual(odRunIds(f2.diff), [BOD], "帧2 发 B（B 首次）");
+		assert.deepEqual(f2.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0, [BOD]: T0 + 10 * 60_000 }, "帧2 账本含 A 与 B");
+		// 帧3：只剩 A（B 恢复/终态 ⇒ 不再超龄）⇒ B 的键必须被剔除
+		const f3 = buildFrontier({ snapshot: makeSnapshot(mkAB(110, null)), backlog: [], prev: f2.next, now: T0 + 20 * 60_000, supervision: odLedgers });
+		assert.deepEqual(odRunIds(f3.diff), [], "帧3 A 窗内 ⇒ 不发");
+		assert.deepEqual(f3.next.projects[0]!.blockedOverdueRunIds, [ATAB], "帧3 超龄集只剩 A");
+		assert.deepEqual(f3.next.projects[0]!.blockedOverdueLastAt, { [ATAB]: T0 }, "账本收缩：B 的键被移除，A 沿用");
+		assert.equal(Object.hasOwn(f3.next.projects[0]!.blockedOverdueLastAt ?? {}, BOD), false, "B 不得残留在账本里（无界增长防护）");
 	});
 }
 
