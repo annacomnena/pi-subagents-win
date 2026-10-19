@@ -138,6 +138,7 @@ import {
 	type LaunchMode,
 } from "./launch.ts";
 import { launchWorkflowTab, masterDispatchLaunch } from "./launch-workflow.ts";
+import { spawnOneShotTab as spawnOneShotTabCore } from "./one-shot-tab.ts";
 import { runSystemGc } from "./gc-cleaner.ts";
 import {
 	applyKillOutcome,
@@ -2588,8 +2589,9 @@ export default function (pi: ExtensionAPI) {
 	// G6 L3：GUI 自动拉起（opt-in，gui.autoStart=true 才有动作；subagent 早退分支不达此处，tick 内 isMainSession 双保险）
 	collect(registerGuiAutoStart(pi));
 
-	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共用账本序列：
-	// dispatch → journal → link → spawn → failed 回写；wt 缺席在生成 runId 之前返回 error）。
+	// 一次性 Sub-Master tab spawn（workstream wake 与 local master v1 共有账本序列）：
+	// 实现在 `one-shot-tab.ts`（2026-10-19 抽出：原先内联在此，导致「未登记监管账本」这个
+	// 断点只能靠读源码验证；抽出后 W5/W6 可直接用假 spawn 驱动真实副作用）。
 	const spawnOneShotTab = (args: {
 		sessionId: string;
 		taskId: string;
@@ -2601,36 +2603,13 @@ export default function (pi: ExtensionAPI) {
 		const wtPath = findWindowsTerminal();
 		if (!wtPath) return { runId: "", error: "no wt.exe" };
 		const piCli = findPiCli();
-		const runId = newTabRunId();
-		const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
-		const prompt = buildWorkflowTabPrompt(
-			{ taskId: args.taskId, title: args.title, prompt: args.prompt, model: undefined },
-			skillRef,
-			"execute",
-		);
-		const runsDir = defaultTabRunsDir();
-		const dispatch: TabDispatchRecord = {
-			id: runId, version: 1, taskId: args.taskId, mode: "execute", title: args.title, cwd: args.cwd,
-			dispatchedAt: new Date().toISOString(), dispatchStatus: "dispatched",
-		};
-		const markFailed = (err: Error): void => {
-			const failed = { ...dispatch, dispatchStatus: "launch_failed" as const, error: err.message };
-			writeTabDispatch(runsDir, failed);
-			emitRuntimeEventOnce(tabDispatchToRuntimeEvent(failed));
-		};
-		writeTabDispatch(runsDir, dispatch);
-		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
-		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: args.linkDetail });
-		// 角色区间门适用域：Sub-Master 一次性 tab（master 无角色归属），costTier 角色区间门不适用。
-		const result = spawnPiTab({
-			wtPath, piCli, cwd: args.cwd, title: args.title, prompt, tabRunId: runId, runsDir,
-			onSpawnError: (err) => markFailed(err),
+		return spawnOneShotTabCore(args, {
+			wtPath,
+			piCli,
+			runsDir: defaultTabRunsDir(),
+			skillFile: existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined,
+			audit: (line) => appendAuditLine(line),
 		});
-		if (result.error) {
-			markFailed(new Error(result.error));
-			return { runId, error: result.error };
-		}
-		return { runId };
 	};
 
 	// Sub-Master 唤醒循环（Phase 5c）：评估与消费同门；无 ws/无信/未切换时空转。

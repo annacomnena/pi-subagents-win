@@ -133,6 +133,7 @@
 		"test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts",
 		"test:supervision-default-on": "npx tsx extensions/_test_runtime_supervision_default_on.ts",
 		"test:supervision-push": "npx tsx extensions/_test_runtime_supervision_push.ts",
+		"test:supervise-gate": "npx tsx extensions/_test_supervise_gate.ts",
 		"test:gate-dialects": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_gate_dialects.ts",
 		"test:tiers": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tiers.ts",
 		"test:tiers-usage": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tiers_usage.ts",
