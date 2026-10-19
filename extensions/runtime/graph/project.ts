@@ -216,6 +216,8 @@ export function projectGraph(input: GraphInput): GraphSnapshot {
 			needsHuman: carrier?.needsHuman ?? null,
 			staleOver: carrier?.staleOver ?? null,
 			overdue: carrier?.overdue ?? null,
+			stop: carrier?.stop ?? null,
+			idleMs: carrier?.idleMs ?? null,
 			pidAlive: carrier?.pidAlive ?? null,
 			// RF-1（2026-10-18）：resultMissing 透传（缺载体 → null，不猜；toFrontierInput 负责回退）
 			resultMissing: carrier?.resultMissing ?? null,

@@ -68,6 +68,10 @@ export interface GraphRunRef {
 	needsHuman?: boolean | null;
 	staleOver?: boolean | null;
 	overdue?: number | null;
+	/** 最后一条 assistant stopReason（监管 P0：区分 toolUse 与真停）。 */
+	stop?: string | null;
+	/** 距最后活动毫秒数（监管 P0：SOFT/PUSH/USER 分档时间基）；无载体 → null。 */
+	idleMs?: number | null;
 	/** state.pid + process.kill 探活；无 state.pid → null。 */
 	pidAlive?: boolean | null;
 	/** RF-1（2026-10-18）：`composeTabStatus().resultMissing` 透传（监管 DONE/BLOCKED_USER 分界载体）。 */
@@ -81,6 +85,10 @@ export interface GraphRunCarrier {
 	staleOver: boolean;
 	overdue: number;
 	pidAlive: boolean | null;
+	/** 监管 P0：stopReason（GraphRunRef.stop 的源头）。 */
+	stop: string;
+	/** 监管 P0：idle 毫秒（GraphRunRef.idleMs 的源头）。 */
+	idleMs: number | null;
 	/** RF-1：`composeTabStatus().resultMissing`（GraphRunRef.resultMissing 的源头）。 */
 	resultMissing: boolean;
 }
@@ -108,7 +116,7 @@ export interface GraphProjectView {
 }
 
 export interface GraphSnapshot {
-	version: 2;
+	version: typeof GRAPH_SNAPSHOT_VERSION;
 	/** journal 最后有效 seq（diff 游标）。 */
 	headSeq: number;
 	logEpoch: string;
@@ -168,7 +176,7 @@ export interface GraphInput {
 
 // ── 冻结常量 ───────────────────────────────────────────────────────
 
-export const GRAPH_SNAPSHOT_VERSION = 2 as const;
+export const GRAPH_SNAPSHOT_VERSION = 3 as const;
 
 /** Graph 认识的 journal 事件词表 = projector.ts 冻结的 run 五型（L1 §1）。 */
 export const GRAPH_RUN_EVENT_TYPES: readonly string[] = [

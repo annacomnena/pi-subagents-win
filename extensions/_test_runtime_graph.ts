@@ -32,6 +32,7 @@ import { writeTabDispatch } from "./tab-runs.ts";
 import { collectGraphInput, readGraphSnapshot } from "./runtime/graph/collect.ts";
 import { diffGraph } from "./runtime/graph/diff.ts";
 import { isPathShapedRef, normalizeRepoKey, projectGraph } from "./runtime/graph/project.ts";
+import { GRAPH_SNAPSHOT_VERSION } from "./runtime/graph/types.ts";
 import type { GraphInput, GraphNode, GraphRunCarrier } from "./runtime/graph/types.ts";
 
 // ── 辅助 ───────────────────────────────────────────────────────────
@@ -90,7 +91,7 @@ try {
 		assert.deepEqual(s.edges, []);
 		assert.deepEqual(s.projects, []);
 		assert.equal(s.headSeq, 0);
-		assert.equal(s.version, 2);
+		assert.equal(s.version, GRAPH_SNAPSHOT_VERSION);
 		assert.deepEqual(s.skipped, { badLines: 0, unknownEventTypes: [] });
 		// 缺省 masters = [master_default]（plan §3）：恰一个 master 节点、无边
 		const sDefault = projectGraph(gi());
@@ -315,7 +316,7 @@ try {
 			assert.equal(projectGraph(ci).nodes.find((n) => n.kind === "run")!.status, "completed");
 			// 手构期望快照（替换原恒等断言 readGraphSnapshot ≡ projectGraph∘collectGraphInput）：显式固化 collect→project 完整装配结果
 			const expectedSnapshot = {
-				version: 2,
+				version: GRAPH_SNAPSHOT_VERSION,
 				headSeq: 2,
 				logEpoch: scan.logEpoch,
 				nodes: [

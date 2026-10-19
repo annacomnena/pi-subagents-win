@@ -34,6 +34,7 @@ import { readGraphSnapshot } from "./runtime/graph/collect.ts";
 import { toFrontierInput } from "./runtime/graph/frontier-input.ts";
 import { collectGlobalView } from "./runtime/global-view.ts";
 import { buildFrontier, RECORD_ONLY_NOCARRIER } from "./runtime/autonomy/frontier.ts";
+import { GRAPH_SNAPSHOT_VERSION } from "./runtime/graph/types.ts";
 import type { GraphProjectView, GraphRunRef, GraphSnapshot } from "./runtime/graph/types.ts";
 import type { FrontierSourceSnapshot } from "./runtime/autonomy/frontier.ts";
 
@@ -60,6 +61,9 @@ function mkRef(o: Partial<GraphRunRef> & { runId: string }): GraphRunRef {
 		needsHuman: null,
 		staleOver: null,
 		overdue: null,
+		// 监管 P0（2026-10-18）：stop/idleMs 进 ref ⇒ 无载体时 null（toTab 落到 "unknown"/null）。
+		stop: null,
+		idleMs: null,
 		pidAlive: null,
 		...o,
 	};
@@ -69,7 +73,7 @@ function mkView(project: string, attention: number, runs: GraphRunRef[]): GraphP
 }
 function mkSnap(projects: GraphProjectView[], over: Partial<GraphSnapshot> = {}): GraphSnapshot {
 	return {
-		version: 2,
+		version: GRAPH_SNAPSHOT_VERSION,
 		headSeq: 0,
 		logEpoch: "",
 		nodes: [],
@@ -176,7 +180,7 @@ try {
 	check("T2 单仓单 run：逐字段 + attention>0 写键", () => {
 		const out = toFrontierInput(mkSnap([mkView("c:/repo/a", 2, [carrier("r1", "c:/repo/a", "working", { gate: "awaiting", needsHuman: true, staleOver: true, overdue: 3, pidAlive: false })])]), { now: NOW });
 		assert.deepEqual(out.attentionByRepo, { "c:/repo/a": 2 });
-		assert.deepEqual(out.details, [{ runId: "r1", repoPath: "c:/repo/a", phase: "working", needsHuman: true, gate: "awaiting", staleOver: true, overdue: 3, pidAlive: false }]);
+		assert.deepEqual(out.details, [{ runId: "r1", repoPath: "c:/repo/a", phase: "working", stop: "unknown", idleMs: null, needsHuman: true, gate: "awaiting", staleOver: true, overdue: 3, pidAlive: false, resultMissing: false }]);
 		assert.deepEqual(out.history, []);
 	});
 
