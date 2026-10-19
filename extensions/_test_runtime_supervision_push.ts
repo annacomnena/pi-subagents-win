@@ -596,12 +596,17 @@ console.log("0. registerSupervisionTools（真实接线：fake pi 捕获 registe
 				delete process.env.PI_SUBAGENT;
 			}
 		});
-		await checkAsync("0(d) 标签页身份（PI_TAB_RUN_ID 存在）⇒ isError「仅主会话可用」", async () => {
+		// 2026-10-19（断点 #4 / 方案 C）：本用例原先钉死「一切 tab 身份恒拒」的旧行为——那正是本次要修的
+		// 缺陷。现在断言改为「tab 非本仓 owner ⇒ 仍拒」（fail-closed 不放宽），但拒绝理由随身份而定：
+		// 本用例未传 ctx ⇒ durableSessionIdentity=unknown ⇒ 门回 unknown-session（不是放行）。
+		// 完整的 owner 放行/目标约束矩阵见 `_test_supervise_gate.ts`（G1–G9）。
+		await checkAsync("0(d) 标签页身份 + 拿不到会话身份（无 ctx）⇒ isError 拒绝（fail-closed，不放行）", async () => {
 			process.env.PI_TAB_RUN_ID = "tab_self";
 			try {
 				const res = (await tool!.execute("", { runId: RUN })) as { isError?: boolean; content: Array<{ text: string }> };
-				assert.equal(res.isError, true);
-				assert.match(res.content[0]!.text, /监管推动仅主会话可用/);
+				assert.equal(res.isError, true, "tab 身份 + unknown session 绝不得放行");
+				assert.match(res.content[0]!.text, /why=unknown-session/, "无 ctx ⇒ 身份不可定，必须显式可定位");
+				assert.match(res.content[0]!.text, /拒绝/, "必须明确拒绝（不得静默 no-op）");
 			} finally {
 				delete process.env.PI_TAB_RUN_ID;
 			}
@@ -1188,7 +1193,7 @@ console.log("11. scope wake prompt 监管块（第四参 + repo 过滤 + 逐字�
 		const FROZEN_NO_CWD = SCOPE_FROZEN.split("\n").filter((l) => !l.startsWith("工作目录：")).join("\n");
 		assert.equal(buildScopeWakePrompt(SCOPE11, L11, null), FROZEN_NO_CWD);
 	});
-	check("11(c) 真账本（本仓 tab + stop=error）⇒ prompt 含 停滞监管 / runId / supervise-push", () => {
+	check("11(c) 真账本（本仓 tab + stop=error）⇒ prompt 含 停滞监管 / runId；**不含**命令式推动指令（l2 非 owner）", () => {
 		const rt = mkIsolated("scope-block");
 		try {
 			process.env.PI_RUNTIME_DIR = dirname(rt.stateDir);
@@ -1204,7 +1209,15 @@ console.log("11. scope wake prompt 监管块（第四参 + repo 过滤 + 逐字�
 			const p = buildScopeWakePrompt(SCOPE11, L11, REPO11, items);
 			assert.ok(p.includes("停滞监管"), `prompt 必须含监管块标题：\n${p}`);
 			assert.ok(p.includes(RUN_ID), "prompt 必须含 runId");
-			assert.ok(p.includes('supervise-push({runId:"' + RUN_ID + '"})'), `prompt 必须含 supervise-push 指令：\n${p}`);
+			// 2026-10-19 返工（L4 §5.1）**有意变更**：scope 路执行者 `l2-*` 不是本仓 owner ⇒ 推不动。
+			// 旧断言要求此处出现 `supervise-push({runId:"..."})` 命令式指令，那是「说能推、实际被拒」
+			// 的误导（execute 层 ownership 门会以 tab-session 拒）。改为「必须**不**含」，
+			// 且用下一行钉死「停滞信息仍完整」——不是删除断言，是把断言改成正确行为。
+			assert.ok(!p.includes("supervise-push"), `scope 路（非 owner）不得渲染推动指令：\n${p}`);
+			assert.ok(
+				/已停 \d+min stop=error push=0\/2 摘要：连接错误卡住/.test(p),
+				`停滞信息必须保留（已停 Nmin / stop= / push=x/y / 摘要）：\n${p}`,
+			);
 			assert.notEqual(p, SCOPE_FROZEN, "非空监管必须与冻结字面量不同");
 			// 位置：待处理输入 之后 / 规则 之前（与 buildWakePrompt 同位置）
 			const atInput = p.indexOf("待处理输入（1）");
@@ -1213,6 +1226,15 @@ console.log("11. scope wake prompt 监管块（第四参 + repo 过滤 + 逐字�
 			assert.ok(atInput >= 0 && atSup > atInput && atRule > atSup, `顺序不符 input=${atInput} sup=${atSup} rule=${atRule}`);
 			// 其余行零改动：去掉监管块返回冻结字面量
 			assert.equal(p.replace(p.slice(atSup, atRule), ""), SCOPE_FROZEN, "插入监管块不得改动任何既有行");
+			// 补偿：`executorIsOwner=true`（保留给未来的"推动指令重路由给真 owner"）时**必须**渲染推动指令
+			const pOwner = buildScopeWakePrompt(SCOPE11, L11, REPO11, items, true);
+			assert.ok(pOwner.includes(`supervise-push({runId:"${RUN_ID}"})`), `executorIsOwner=true 必须渲染推动指令：\n${pOwner}`);
+			// 「只差那一行」证明：owner 输出去掉推动指令行 ⇒ 与默认（fail-closed）输出逐字节相等
+			const ownerMinusInstruction = pOwner
+				.split("\n")
+				.filter((l) => !l.includes("用 supervise-push("))
+				.join("\n");
+			assert.equal(ownerMinusInstruction, p, "owner 与非 owner 的输出必须**只差推动指令那一行**（无其它漂移）");
 		} finally {
 			rt.dispose();
 		}
@@ -1244,6 +1266,29 @@ console.log("11. scope wake prompt 监管块（第四参 + repo 过滤 + 逐字�
 			seedLedger(mkLedger(SUB_RUN, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
 			const subItems = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime(), repoPath: REPO11 });
 			assert.ok(subItems && subItems.length === 1 && subItems[0]!.runId === SUB_RUN, "子目录中的 tab 必须算作本仓");
+		} finally {
+			rt.dispose();
+		}
+	});
+
+	// 2026-10-19 返工（L4 §8）：同一个 `repoPathMatches` 也被 scope 路的 repo 过滤消费
+	// （`wake.ts:311`）。此用例钉死「`..` 跨仓条目不得被当成**本仓**条目混进 scope prompt」。
+	check("11(e) 他仓条目写成 `<本仓>/../other`（路径穿越）⇒ 被 repo 过滤掉（不混进本仓 scope prompt）", () => {
+		const rt = mkIsolated("scope-dotdot-filter");
+		try {
+			process.env.PI_RUNTIME_DIR = dirname(rt.stateDir);
+			const DD_RUN = "tab_dotdot_other";
+			writeTabDispatch(rt.runsDir, mkDispatch(DD_RUN, "T-DD", REPO11 + "/../battlesandbox"));
+			writeTabState(rt.runsDir, DD_RUN, mkState(DD_RUN, { phase: "waiting", lastStopReason: "error" }));
+			seedLedger(mkLedger(DD_RUN, { stateDir: rt.stateDir, runsDir: rt.runsDir }), rt.stateDir);
+
+			// 不过滤 ⇒ 看得见（workstream 路零变化）
+			const all = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime() });
+			assert.ok(all && all.length === 1, `不过滤时必须看得见，实得 ${JSON.stringify(all)}`);
+			// 过滤到本仓 ⇒ **必须**被过滤掉（旧实现会把 `g:/code/greencad/../battlesandbox` 误判为本仓）
+			const mine = deriveSupervisionItems({ stateDir: rt.stateDir, runsDir: rt.runsDir, now: NOW.getTime(), repoPath: REPO11 });
+			assert.equal(mine, undefined, `路径穿越的他仓条目必须被过滤掉，实得 ${JSON.stringify(mine)}`);
+			assert.equal(buildScopeWakePrompt(SCOPE11, L11, REPO11, mine), SCOPE_FROZEN, "过滤后 ⇒ prompt 逐字节回到冻结字面量");
 		} finally {
 			rt.dispose();
 		}
@@ -1335,8 +1380,14 @@ console.log("12. 端到端（到执行者之前）：frontier → actions → sc
 			assert.equal(d.repoCwd, PROJECT12, "repoCwd 读回 attachment.detail");
 			assert.ok(d.prompt!.includes("blocked_overdue"), `prompt 必须带回本规则名：\n${d.prompt}`);
 			assert.ok(d.prompt!.includes("停滞监管"), `prompt 必须含监管块：\n${d.prompt}`);
-			assert.ok(d.prompt!.includes(RUN12), "prompt 必须含目标 runId（执行者据此调 supervise-push）");
-			assert.ok(d.prompt!.includes("supervise-push"), "prompt 必须含 supervise-push 指令");
+			assert.ok(d.prompt!.includes(RUN12), "prompt 必须含目标 runId（停滞信息用）");
+			// 2026-10-19 返工（L4 §5.1）**有意变更**：这一条走的是 scope 路（`evaluateScopeWake`），
+			// 执行者是 `l2-*` 一次性 tab，不是本仓 owner ⇒ 推不动 ⇒ 不得渲染命令式指令。
+			// 旧断言 `includes("supervise-push")` 要求把不可执行的指令交给执行者，是本返工要修的误导。
+			// 改为「必须**不**含」，同时保留「必须含停滞信息」（下一行已断言 停滞监管 与 runId）。
+			assert.ok(!d.prompt!.includes("supervise-push"), `scope 路（非 owner）不得渲染推动指令（会误导执行者）：\n${d.prompt}`);
+			assert.ok(d.prompt!.includes("stop=error"), `停滞信息必须保留（stop=）：\n${d.prompt}`);
+			assert.ok(/push=\d+\/\d+/.test(d.prompt!), `停滞信息必须保留（push=x/y）：\n${d.prompt}`);
 		} finally {
 			rt.dispose();
 		}

@@ -22,7 +22,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, posix, win32 } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 import { masterAddress, workstreamAddress, type ObjectAddress } from "./address.ts";
 import { readAttachment, readCutover } from "./registry.ts";
@@ -228,22 +228,62 @@ function clampPushMax(v: unknown): number {
 }
 
 /**
- * 路径归一（仅用于 repo 过滤比较）：反斜杠 → 斜杠、去尾斜杠、小写。
- * 本地小函数（不引新依赖，也不复用 `frontier.ts::normalizeExactPath`：那个还要规范化盘符大小写，
- * 且会把 `C:` 单独降小写；这里只要「同仓判等」这一个语义，多带行为反而难推理）。
+ * 路径归一（仅用于 repo 过滤比较）：**先 canonicalize**（消解 `.` / `..`，盘符与分隔符按 Windows 语义），
+ * 再 反斜杠 → 斜杠、去尾斜杠、小写。
+ *
+ * ## 为什么必须 canonicalize（2026-10-19 返工，L4 §8 实测漏洞）
+ * 旧实现只做「反斜杠→斜杠 / 去尾斜杠 / 小写」，于是
+ * `C:/repo/../OtherRepo` 归一成 `c:/repo/../otherrepo`，仍满足 `startsWith("c:/repo/")`
+ * ⇒ `supervise-push` 的「本仓子树」目标约束被**跨仓绕过**（真实调用返回
+ * `{"ok":true,"via":"owner"}`）。文件系统把它解析到 `C:/OtherRepo`。
+ * 因此判据必须在**比较前**做路径代数消解，不能指望上游已规范化
+ * （`dispatch.cwd` 是派发时写入的原始字符串，不保证规范化）。
+ *
+ * ## 平台语义（显式，不用宿主 `path.resolve`）
+ * 用 `node:path` 的 `win32` / `posix` 两个**平台无关**实现，按输入形状择一，不依赖宿主 OS：
+ *   - `C:/…`（盘符绝对）或 `//server/share/…`（UNC）⇒ `win32.resolve`（盘符大小写不敏感、`\` ≡ `/`）；
+ *   - `/…`（POSIX 绝对）⇒ `posix.resolve`；
+ *   - 其余（相对路径、盘符相对 `C:repo`、空串）⇒ 返回 `""`，由调用方**fail-closed**。
+ * 关键：**绝不对相对路径调 `resolve`** —— 那会吃 `process.cwd()`，把「相对路径」变成
+ * 某个仓内的路径，正好是越权放行的形状。
+ *
+ * 已知边界（不在本函数职责内，如实登记）：不做 8.3 短名 / 符号链接 / 硬链接的实体解析
+ * （那需要 IO，且会让判据变成「盘上存在才判」，与纯函数纪律冲突）。
+ *
+ * 2026-10-19 export：`supervise-gate.ts`（execute 层 ownership 门的「本仓子树」目标约束）
+ * 复用同一判据，禁止另写一份（两份判据漂移 = 监管块与门各认一套仓）。
  */
-function normRepoPath(p: string): string {
-	return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export function normRepoPath(p: string): string {
+	const raw = typeof p === "string" ? p.trim() : "";
+	if (!raw) return "";
+	const slashed = raw.replace(/\\/g, "/");
+	const driveAbs = /^[A-Za-z]:\//.test(slashed);
+	const unc = slashed.startsWith("//");
+	const posixAbs = slashed.startsWith("/") && !unc;
+	if (!driveAbs && !unc && !posixAbs) return ""; // 相对路径 ⇒ fail-closed（不猜 cwd）
+	const resolved = driveAbs || unc ? win32.resolve(slashed) : posix.resolve(slashed);
+	// 根（`C:/` ⇒ `C:\`、`/`）保留：只去掉**非根**的尾斜杠，否则 `C:/` 会变成 `c:` 之外的空串形态。
+	const trimmed = resolved.length > 1 ? resolved.replace(/\/+$/, "") : resolved;
+	return trimmed.replace(/\\/g, "/").toLowerCase();
 }
 
 /**
  * 仓归属判据：相等 ∨ 候选在该仓**子目录**下（dispatch.cwd 可能是 repo 子目录）。
- * `filter` 必须是已经 `normRepoPath` 过的值。
+ *
+ * **两端都 canonicalize**（`normRepoPath` 幂等；调用方传已归一值也无副作用）。
+ * 任一端拿不到可判定的绝对路径 ⇒ `false`（fail-closed，绝不「不放过滤」地放行）。
+ *
+ * 2026-10-19 export：理由同 `normRepoPath`（`supervise-gate.ts` 复用）。
  */
-function repoPathMatches(candidate: string, filter: string): boolean {
+export function repoPathMatches(candidate: string, filter: string): boolean {
 	const c = normRepoPath(candidate);
-	if (!c) return false; // 无仓载体 ⇒ 不命中（不猜）
-	return c === filter || c.startsWith(`${filter}/`);
+	const f = normRepoPath(filter);
+	if (!c || !f) return false; // 无仓载体 / 仓根不可判定 ⇒ 不命中（不猜）
+	if (c === f) return true;
+	// 仓根本身是「根」（POSIX `/`、盘符 `c:/`、UNC 共享根）：整个该树都是子树。
+	// 非根仓根：必须按 `/` 分段判（`c:/repo2` 不得当成 `c:/repo` 的子目录）。
+	if (f.endsWith("/")) return c.startsWith(f);
+	return c.startsWith(`${f}/`);
 }
 
 /**
@@ -271,6 +311,8 @@ export function deriveSupervisionItems(opts: {
 }): WakeSupervisionItem[] | undefined {
 	try {
 		const entries = listOpenSupervisionEntries({ stateDir: opts.stateDir });
+		// 给了 repoPath 但拿不到可判定的绝对路径（相对路径）⇒ repoFilter="" ⇒ 下方 `repoPathMatches`
+		// 恒 false ⇒ 过滤为空 ⇒ 返回 undefined（fail-closed：宁可不出块，也不「不过滤」地越权展示）。
 		const repoFilter = opts.repoPath ? normRepoPath(opts.repoPath) : null;
 		if (!entries.length) return undefined;
 		const items: WakeSupervisionItem[] = [];
@@ -424,8 +466,23 @@ const WAKE_SUMMARY_MAX = 120;
  *
  * 为什么要塞进 wake prompt：C.5 的执行主体是**被唤醒的 master**——它没有别的渠道知道
  * 「哪个 tab 停了多久、还能推几次」，只能由 wake prompt 带过去。
+ *
+ * ## `executorIsOwner`（2026-10-19 返工，L4 §5.1）
+ * 停滞信息（`已停 Nmin` / `stop=` / `push=x/y` / 摘要）**恒渲染**；
+ * 但「用 supervise-push(...) 推动」那一行是**命令式指令**——它只对**本仓 owner** 可执行。
+ * 今天两条 wake 路（workstream `wake-*` / scope `l2-*`）的执行者都是一次性 tab，
+ * 推不动任何东西（execute 层的 ownership 门会拒）⇒ 把那一行继续渲染给它们，
+ * 就是「说能推、实际被拒」的持续误导（浪费一个工具调用 + 一个模型回合，并向执行者报错）。
+ *
+ * **缺省 = 不渲染推动指令（fail-closed）**：新增调用方忘传参数时，得到的是「诚实但不完整」的
+ * 提示（不会教执行者去做一件做不到的事），而不是反过来。
+ * 唯一的「恒渲染」调用方是 `buildWakePrompt`（workstream 路）——为了**逐字节不变**，它显式传 `true`。
  */
-export function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): string[] {
+export function buildSupervisionBlock(
+	items: readonly WakeSupervisionItem[],
+	opts: { executorIsOwner?: boolean } = {},
+): string[] {
+	const showPushInstruction = opts.executorIsOwner === true;
 	const shown = items.slice(0, 10);
 	return [
 		`停滞监管（需推动的 tab，按 budget 余量决定是否推）：`,
@@ -434,10 +491,10 @@ export function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): st
 			const idleMin = Math.max(0, Math.round((Number.isFinite(s.idleMs) ? s.idleMs : 0) / 60_000));
 			const summary = s.summary.length > WAKE_SUMMARY_MAX ? s.summary.slice(0, WAKE_SUMMARY_MAX) : s.summary;
 			const stop = s.stopReason && s.stopReason.length > 0 ? s.stopReason : "unknown";
-			return [
-				`- ${s.runId} task=${s.taskId} repo=${repo} 已停 ${idleMin}min stop=${stop} push=${s.pushesUsed}/${s.maxPushes} 摘要：${summary}`,
-				`  用 supervise-push({runId:"${s.runId}"}) 推动（预算耗尽则升级用户，勿 abort）。`,
-			].join("\n");
+			const line = `- ${s.runId} task=${s.taskId} repo=${repo} 已停 ${idleMin}min stop=${stop} push=${s.pushesUsed}/${s.maxPushes} 摘要：${summary}`;
+			return showPushInstruction
+				? [line, `  用 supervise-push({runId:"${s.runId}"}) 推动（预算耗尽则升级用户，勿 abort）。`].join("\n")
+				: line;
 		}),
 	];
 }
@@ -445,7 +502,12 @@ export function buildSupervisionBlock(items: readonly WakeSupervisionItem[]): st
 export function buildWakePrompt(ws: WorkstreamRecord, letters: WakeLetter[], supervision?: WakeSupervisionItem[]): string {
 	const shown = letters.slice(0, 10);
 	// 硬要求（spec §2）：undefined / [] ⇒ 与旧输出逐字节相同（现有调用方零改动）。
-	const supervisionBlock = Array.isArray(supervision) && supervision.length > 0 ? buildSupervisionBlock(supervision) : [];
+	// `executorIsOwner: true` 是**保持 workstream 路逐字节不变**的显式选择（见 buildSupervisionBlock 注释）；
+	// 该路的重路由（把推动指令交给真 owner）属独立任务。
+	const supervisionBlock =
+		Array.isArray(supervision) && supervision.length > 0
+			? buildSupervisionBlock(supervision, { executorIsOwner: true })
+			: [];
 	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
 	const replyBlock: string[] = [];
 	if (replies.length) {
