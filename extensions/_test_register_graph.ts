@@ -10,6 +10,9 @@
  *
  * 环境隔离：开头删除 PI_SUBAGENT / PI_TAB_RUN_ID / PI_TAB_RUNS_DIR，
  * 使 factory 以「主会话」身份执行（launch-tabs 工具与 /launch 命令才会注册）。
+ * 2026-10-19 补充：launch-tabs 现在**无条件注册**（local owner 例外需要它在 workflow-tab
+ * 下可见，见 plans/20261019_local_master_dispatch_plane_plan.md §8.2.1）；本快照仍以主会话
+ * 身份拍，workflow-tab 下的注册面另由 `_test_local_owner_gate.ts` W0(d) 断言。
  *
  * fake pi 补的方法：getFlag（惰性身份读取；返回空串 → 判定为主会话）、
  * sendUserMessage / sendMessage / exec（事件/命令 handler 里才用到，注册期不触发，
@@ -86,6 +89,11 @@ for (const n of flagNames) console.log(`  ${n}`);
 // 2026-09-19 master 工具组 8 个（attach/cutover/detach/dispatch/handoff/
 // pressure/status/transfer/transfer-confirm——Phase 5.5 S1）。
 // 2026-09-23：修复存量快照漂移（补 global-view，master-tools.ts 注册）；Task 2006 v2 autonomy 不动 tools（无新增 tool，D-I）。
+// 2026-10-19：补入**两笔各自独立的存量漂移**（逐项注明来源，勿归到同一提交）：
+//   · `supervise-push` 工具 ← 引入于 `2a4024a`（10-18 17:42「P1 主动推动」），不是 `5652acf`；
+//     `5652acf`（10-19 断点 #4 方案 C）只是改了它的身份门，未新增注册。
+//   · `/supervise` 命令 ← 引入于 `2a23a94`（10-17 21:26「停滞监管 P0」），注册在 `index.ts`。
+// 两者均未同步本快照 ⇒ 存量漂移。本任务（local owner 派发平面）只**校实**快照，不改注册面。
 // 2026-10-12：steer 通道（立即插入消息 M1）新增 2 tool——tab-steer / steer-status（steer-runtime.ts）。
 // 同批修复存量漂移（补 local-master-ensure，index.ts 0923 后注册的本地 master 工具，此前被 tool 断言漏项遮挡）。
 assert.deepEqual(toolNames, [
@@ -108,6 +116,7 @@ assert.deepEqual(toolNames, [
 	"set-timer",
 	"steer-status",
 	"subagent-win",
+	"supervise-push",
 	"tab-finish",
 	"tab-report",
 	"tab-status",
@@ -156,6 +165,7 @@ assert.deepEqual(commandNames, [
 	"sub-models",
 	"sub-presets",
 	"subagent-gc",
+	"supervise",
 	"tabs",
 	"task-close",
 	"task-create",
