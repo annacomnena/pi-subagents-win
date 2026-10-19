@@ -52,6 +52,13 @@ import { registerSupervisionTools } from "./supervision-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
 import { localAgentFromCwd, localMasterEnsureGate, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import {
+	LOCAL_OWNER_GATE_TEXT,
+	localOwnerAddressForCwd,
+	localOwnerGate,
+	localOwnerStillFresh,
+	readLocalOwnerAttachmentStrict,
+} from "./local-owner-gate.ts";
+import {
 	auditLocalMasterEnsure,
 	ensureLocalMaster,
 	ensureResultIsError,
@@ -109,7 +116,7 @@ import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
 import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
-import { assertDelegationAllowed, capabilities, isTraceWorker, registerCapabilityFlags } from "./capabilities.ts";
+import { assertDelegationAllowed, capabilities, isTraceWorker, isWorkflowTab, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
 import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
 import { resolveForceReplayMount } from "./force-replay-mount.ts";
@@ -3298,6 +3305,11 @@ export default function (pi: ExtensionAPI) {
 	// master-dispatch（0918 计划）：dispatchTab 闭包只做 findWindowsTerminal/findPiCli 解析 +
 	// 注入 readAttachment（owner 路径最终 fencing 用），其余（wt 缺席在生成 runId 之前返回 error
 	// 不落账本 + 账本/spawn）委托 masterDispatchLaunch。
+	// 2026-10-19（计划 §8.3.5，阻断 #2）：最终 reader **必须读 gate 固定选中的那个地址**
+	//（`args.owner.agentAddress`），不得换成 `masterAddress()`（纯全局）。否则 local owner
+	// 在 gate 里通过、到了最终 fencing 就变 stale ⇒ 仍然零派发。
+	// `owner` 是 gate 第二读返回的可信快照，不接受工具参数指定 address。
+	// main 路径（owner=null）不读附件（主会话恒可派，不依赖归属）。
 	const dispatchTab: DispatchTab = (args) => {
 		const wtPath = findWindowsTerminal();
 		let piCli: string | undefined;
@@ -3307,7 +3319,14 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			piErr = `未找到 pi CLI: ${err instanceof Error ? err.message : String(err)}`;
 		}
-		const res = masterDispatchLaunch(args, { wtPath, piCli, piErr, env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() }, readAttachment: () => readAttachment(masterAddress()) });
+		const pinnedAddress = args.owner?.agentAddress;
+		const res = masterDispatchLaunch(args, {
+			wtPath,
+			piCli,
+			piErr,
+			env: { runsDir: defaultTabRunsDir(), timersDir: defaultTimersDir() },
+			readAttachment: pinnedAddress ? () => readAttachment(pinnedAddress) : undefined,
+		});
 		// 监管默认开启（2026-10-18 用户指令）：派发成功即自动建账本；stale/error 不登记，
 		// 写失败绝不影响派发结果（autoRegisterDispatchedTabs 自身 never-throw）。
 		if (!res.stale && !res.error && res.runId) {
@@ -3393,9 +3412,9 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"【会话与派发硬规则】subagent 是无头子 agent；tab 是可见的独立 pi 标签页。两者都可能有 runId，但 runId 不是同一种东西。",
 			"1. `subagent-win` = 无头子 agent：sync、parallel、async 三种模式都不会打开 Windows Terminal 标签页。async subagent 的 runId 只能用 `subagent-win({ action: \"status\", runId })` 查询；不要使用 `tab-status`、`reclaim-tabs`、`tab-finish` 或 `set-timer`。",
-			"2. `launch-tabs` = 可见任务 tab：只允许主会话调用，用于长时间、独立、需要可见 TUI 或跨主会话重启存活的工作。tab 的 runId 只能用 `tab-status` / `reclaim-tabs` 管理，完成用 `tab-finish`。",
-			"3. 已派发的任务 tab 严禁再调用 `launch-tabs` / `/launch`；tab 内的角色委派只能使用 `subagent-win`。",
-			"4. 选择规则：本轮需要结果 → `subagent-win`；长时间且需要可见/独立回收 → 主会话调用 `launch-tabs`。不要因为 subagent 使用 async 就把它当成 tab。",
+			"2. `launch-tabs` = 可见任务 tab：只允许主会话或**本仓 local owner**（workflow-tab 形态的 local master）调用，用于长时间、独立、需要可见 TUI 或跨主会话重启存活的工作；local owner 只能派本仓子树内的 cwd（缺省为当前目录）。tab 的 runId 只能用 `tab-status` / `reclaim-tabs` 管理，完成用 `tab-finish`。",
+			"3. 非 owner 的任务 tab 严禁再调用 `launch-tabs` / `/launch`；tab 内的角色委派只能使用 `subagent-win`。",
+			"4. 选择规则：本轮需要结果 → `subagent-win`；长时间且需要可见/独立回收 → 主会话或本仓 local owner 调用 `launch-tabs`（local owner 只能派本仓子树内 cwd）。不要因为 subagent 使用 async 就把它当成 tab。",
 			"5. timer 不是 async subagent 的配套机制：主会话可按需为 tab 编排巡检，subagent 不得设置 timer。",
 			"",
 		];
@@ -3459,14 +3478,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const canOrchestrateTabs = capabilities().launchTabs; // 主会话专属；trace-worker/subagent 禁止（矩阵见 capabilities.ts，现阶段与 isMainSession() 等价）
-	if (!canOrchestrateTabs) {
-		// 标签页 / 子 agent：跳过 launch-tabs 工具注册（防止孙 tab 派发）
-	} else {
+	// 2026-10-19（计划 §8.2.1，阻塞 #1）：**只**解开包围 launch-tabs 的注册条件。
+	// 原写法 `if (!canOrchestrateTabs) { 跳过注册 }` 使 local master（profile=workflow-tab）
+	// 连工具都拿不到 —— 只改 execute 等于白改。现在 launch-tabs 统一注册、由 execute 当前授权；
+	// `canOrchestrateTabs` 仍按原语义供 trace-fusion 注册分支（下方 /trace-fusion-loop）使用。
+	// 不在工厂期读 sid/attachment 决定 owner：本处身份可能尚未就绪，且 takeover 后不可依赖陈旧布尔。
+	// 下面的裸块只是保留原 else 分支的缩进（把整个 registerTool 重缩进会让本任务 diff 淹没在空白里），
+	// 语义上等价于无块。
+	{
 	pi.registerTool({
 		name: "launch-tabs",
 		label: "Launch Pi Tabs",
 		description: [
-			"这是可见任务 tab 编排工具，只允许主会话调用；不会启动无头 subagent。任务 tab 内也严禁再次调用 launch-tabs。",
+			"这是可见任务 tab 编排工具：**主会话**或**本仓 local owner**（workflow-tab 形态的 local master）可调用；不会启动无头 subagent。子 agent 恒禁；非 owner 任务 tab 严禁再调用 launch-tabs（用 subagent-win 委派角色，或用 tab-finish 回报主会话）。",
+			"local owner 例外只限**本仓**：每项 cwd（缺省为当前目录）必须落在 owner 仓根子树内，否则整批拒绝（零派发）。trace-worker 等即使持有 owner 附件也不在此例外内。",
 			"在 Windows Terminal 中并行打开一个或多个可见、独立的 pi 交互标签页。",
 			"先分析当前会话并只提交彼此独立、启动条件已满足的任务；不要为编排请求本身打开标签页。",
 			"每项必须提供 taskId、具体 prompt；prompt 会自动以 `根据workflow进行工作<taskId>` 开头，并附加 workflow-orchestrator 强制约束块（先 read 技能、委派 subagent-win 各角色执行、禁止单 agent 一路干完）。",
@@ -3510,11 +3535,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(`${theme.fg(ok === results.length ? "success" : "warning", `launch-tabs ${ok}/${results.length}`)}${lines.length ? `\\n${lines.join("\\n")}` : ""}`, 0, 0);
 		},
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, _ctx) {
-			// 运行时防护：只允许主会话调用 launch-tabs
-			if (!capabilities().launchTabs) {
-				return { content: [{ type: "text", text: "launch-tabs 只允许主会话调用；标签页会话请用 subagent-win 委派各角色，或用 tab-finish 回报主会话。" }], isError: true };
-			}
-
+			// §8.2.3：保留空批 / MAX_CONCURRENCY（**单次调用任务数**，不是全局并发上限）校验，且先于任何 IO。
 			const params = rawParams as { tasks?: Array<{ taskId?: string; title?: string; prompt?: string; cwd?: string; model?: string; mode?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }> }> };
 			const input = params.tasks ?? [];
 			if (input.length === 0) {
@@ -3522,6 +3543,54 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (input.length > MAX_CONCURRENCY) {
 				return { content: [{ type: "text", text: `launch-tabs supports at most ${MAX_CONCURRENCY} tabs per call` }], isError: true };
+			}
+
+			// 运行时防护（§8.2.2）：原能力档（main）走**原路径**逐字节不变；能力档为 false 时
+			// 不再一律拒，而是「本仓 local owner」例外（profile 必须 workflow-tab、实际是 tab、非 sub）。
+			// 一次性调用完成身份 + 整批 cwd 校验（先整批校验再写任何账本/spawn，任一不符整批拒）。
+			const ctxIdentity = _ctx as never;
+			let ownerCwds: ReadonlyArray<string> | null = null;
+			if (!capabilities().launchTabs) {
+				const trustedCwd = (() => {
+					const c = (_ctx as unknown as { cwd?: unknown } | undefined)?.cwd;
+					return typeof c === "string" && c.trim() ? c.trim() : process.cwd();
+				})();
+				const localAgent = localOwnerAddressForCwd(trustedCwd);
+				const gate = localOwnerGate({
+					isSub: isSubagent(),
+					isTab: isTabSession(),
+					isWorkflowTabProfile: isWorkflowTab(),
+					// 权限身份用 **durable** sid（runId 优先的 sessionIdentity 会拿不到持久 UUID）
+					sessionId: durableSessionIdentity(ctxIdentity),
+					ownerCwd: trustedCwd,
+					readAttachment: () => readLocalOwnerAttachmentStrict(localAgent),
+					targetCwds: input.map((item) => item.cwd),
+				});
+				if (!gate.ok) {
+					return {
+						content: [{ type: "text", text: LOCAL_OWNER_GATE_TEXT[gate.reason] }],
+						isError: true,
+						details: { reason: gate.reason, detail: gate.detail },
+					};
+				}
+				if (gate.via !== "owner") {
+					// 非 tab（只可能在 ctx 缺失的边缘）：按旧行为走原路径（不收紧主会话）。
+					ownerCwds = null;
+				} else {
+					ownerCwds = gate.checkedCwds.map((c) => c ?? "");
+					// 写入前重读（§8.2.6）：owner 已变 ⇒ 整批拒绝。不声称是跨进程原子 lease。
+					const ownerAddress = gate.attachment?.agentAddress;
+					const stillFresh = ownerAddress
+						? localOwnerStillFresh({ attachment: gate.attachment, readAttachment: () => readAttachment(ownerAddress) })
+						: false;
+					if (!stillFresh) {
+						return {
+							content: [{ type: "text", text: LOCAL_OWNER_GATE_TEXT["stale-owner"] }],
+							isError: true,
+							details: { reason: "stale-owner" },
+						};
+					}
+				}
 			}
 
 			const wtPath = findWindowsTerminal();
@@ -3538,7 +3607,7 @@ export default function (pi: ExtensionAPI) {
 			const runsDir = defaultTabRunsDir();
 			const timersDir = defaultTimersDir();
 
-			const results = input.map((item) => {
+			const results = input.map((item, idx) => {
 				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : item.mode === "adaptive" ? "adaptive" : "workflow";
 				return launchWorkflowTab(
 					{
@@ -3546,9 +3615,11 @@ export default function (pi: ExtensionAPI) {
 						title: item.title,
 						prompt: item.prompt ?? "",
 						model: item.model,
-						cwd: item.cwd,
+						// owner 路径：用已校验的绝对路径（非空）；main 路径：原 item.cwd 语义不变。
+						cwd: ownerCwds ? ownerCwds[idx] || undefined : item.cwd,
 						mode,
 						timers: item.timers,
+						// 溯源身份仍用 sessionIdentity（runId 优先，links 口径），权限身份用 durableSessionIdentity。
 						sessionId: sessionIdentity(_ctx as never),
 						timerSource: "launch-tabs",
 					},
