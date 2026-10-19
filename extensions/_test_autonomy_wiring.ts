@@ -58,6 +58,7 @@ import {
 	writeWakeGateState,
 } from "./runtime/autonomy/collect.ts";
 import { evaluateAutonomyWakeGate, maintainBatchAnchor } from "./runtime/autonomy/gate.ts";
+import { collectAutonomyInputs } from "./runtime/autonomy/collect.ts";
 import type { WakeGateState } from "./runtime/autonomy/wake-gate.ts";
 
 // ── 微型 harness ─────────────────────────────────────────────────────
@@ -145,7 +146,7 @@ check("W1b masterStatusLogic 纯净默认态无 autonomy 行（逐字节不变�
 	try {
 		setCutover(true, "w1b-test");
 		attachMaster({ sessionId: "sess-W1b" });
-		const out = masterStatusLogic(undefined, { cwd: rt.root });
+		const out = masterStatusLogic(undefined, { cwd: rt.root, configPath: cfgOff });
 		assert.ok(!out.text.includes("autonomy:"), `默认态 master-status 无 autonomy 行：\n${out.text}`);
 	} finally {
 		rmSync(rt.root, { recursive: true, force: true });
@@ -233,20 +234,28 @@ console.log("W2 kill 演练（两层断言）");
 	});
 
 	check("W2.3 clear：gate 直调（temp agentDir 确定性）首帧/二帧 + wake-gate state 持久化往返", () => {
-		assert.equal(clearKillSwitch({ stateDir: rt.state }), true);
-		assert.equal(readKillSwitch({ stateDir: rt.state }), null, "kill 文件消失");
+		// 用例间隔离（非 gate 逻辑缺陷；已用独立 stateDir 探针验证干净盘面首帧确为 record-only）：
+		//   W2.1/W2.2 与本组共享 rt.state，但 W2.1 走 evaluateWakes —— 该函数按**生产设计**
+		//   不接收 agentDir（wake.ts:114 只传 stateDir+configPath+now）⇒ 它读的是真实
+		//   ~/.pi/agent（本机有 4 个活 tab），并把该「真实世界」的 frontier 基线写进 rt.state。
+		//   本组用**空** agentDir ⇒ 与那条基线对比 ⇒ 产生真 diff ⇒ maintainBatchAnchor 置
+		//   batchFirstSeenAt=now ⇒ debounce 命中。故本组改用独立 stateDir 取得真正的空盘面。
+		const w23state = join(rt.root, "state-w23");
+		const w23mb = join(rt.root, "mailbox-w23"); // W2.1 往 rt.mailbox 投过 pending 信 ⇒ 必须用全新空目录
+		assert.equal(clearKillSwitch({ stateDir: w23state }), true);
+		assert.equal(readKillSwitch({ stateDir: w23state }), null, "kill 文件消失");
 		const T2 = T + 10_000;
-		const g1 = evaluateAutonomyWakeGate({ stateDir: rt.state, configPath: cfgOn, agentDir: rt.agent, now: T2 });
+		const g1 = evaluateAutonomyWakeGate({ stateDir: w23state, configPath: cfgOn, agentDir: rt.agent, mailboxDir: w23mb, now: T2 });
 		assert.deepEqual(g1, { engaged: true, proceed: false, reason: "record-only" }, "空盘面帧 = record-only（复核事实 8）");
-		const g2 = evaluateAutonomyWakeGate({ stateDir: rt.state, configPath: cfgOn, agentDir: rt.agent, now: T2 + 30_000 });
+		const g2 = evaluateAutonomyWakeGate({ stateDir: w23state, configPath: cfgOn, agentDir: rt.agent, mailboxDir: w23mb, now: T2 + 30_000 });
 		// 与计划原文偏差（原预期 no-meaningful-change）：frontier.ts:281 no-carrier 常量每帧输出，
 		// recordOnly 恒非空 → 规则 2 不可达，规则 3（record-only）先命中。见 impl 报告。
 		assert.deepEqual(g2, { engaged: true, proceed: false, reason: "record-only" }, "二帧空盘面仍 record-only（源码行为）");
-		const st = readWakeGateState({ stateDir: rt.state });
+		const st = readWakeGateState({ stateDir: w23state });
 		assert.ok(st !== null, "wake-gate.json 持久化往返");
 		assert.equal(st!.lastReason, "record-only");
 		assert.equal(st!.lastDecisionAt, T2 + 30_000, "lastDecisionAt 每次评估更新");
-		assert.equal(st!.batchFirstSeenAt, T, "锚点 = W2.1 首帧 now（本 stateDir 首个有 diff 帧）；非空不重覆不重置");
+		assert.equal(st!.batchFirstSeenAt, T2, "锚点 = 本组首帧 now（独立 stateDir 的首个有 diff 帧；非空不重覆不重置）");
 	});
 
 	check("W2.4 原子性：autonomy 目录无 .tmp 残留（tmp+rename 语义）", () => {
@@ -270,7 +279,7 @@ check("W3 无足迹→无行；frontier/kill/wake-gate 足迹→行出现且字�
 	const T = T0;
 	const isoT = new Date(T).toISOString().slice(0, 19);
 	try {
-		const run = (): string => masterStatusLogic(undefined, { cwd: rt.root }).text;
+		const run = (): string => masterStatusLogic(undefined, { cwd: rt.root, configPath: cfgOff }).text;
 		// (a) 无足迹 → 无行（前提 R10：包根 config 无 autonomy 键）
 		assert.ok(!run().includes("autonomy:"), "纯净默认态无 autonomy 行");
 		// (b) frontier 快照 → 行出现且含 asof/projects

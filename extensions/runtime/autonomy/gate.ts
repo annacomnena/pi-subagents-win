@@ -64,6 +64,8 @@ export function evaluateAutonomyWakeGate(opts?: {
 	stateDir?: string;
 	configPath?: string;
 	agentDir?: string;
+	/** test-only：不传 = defaultMailboxDir()（生产行为逐字节不变）。 */
+	mailboxDir?: string;
 	now?: number;
 }): AutonomyGateDecision {
 	try {
@@ -84,7 +86,7 @@ export function evaluateAutonomyWakeGate(opts?: {
 		}
 
 		const now = opts?.now ?? Date.now();
-		const inputs = collectAutonomyInputs({ stateDir: opts?.stateDir, configPath: opts?.configPath, agentDir: opts?.agentDir, now });
+		const inputs = collectAutonomyInputs({ stateDir: opts?.stateDir, configPath: opts?.configPath, agentDir: opts?.agentDir, mailboxDir: opts?.mailboxDir, now });
 		// never-throw；内部已产 v1 审计行 + frontier 快照。configPath/agentDir 全透传：否则 collect
 		// 无参 readAutonomyConfig() 双读真实包根 config → 判定分叉 + 误导性 "gating no-wake
 		// reason=autonomy-disabled" 杂行（工程约束 3 / W6 断言）。

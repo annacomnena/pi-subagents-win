@@ -143,7 +143,7 @@ function graphFrontierSnapshot(opts: { agentDir?: string; stateDir?: string; now
  *   pending 合计（recipient 目录名映射同 mailboxDirFor）；runStateMismatch = details 里 pidAlive===false
  *   且非终态（visible zombie）；heartbeatAgeMs 来自 readLiveness（null = no-liveness → 检查 7 unknown）。
  */
-export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: string; now?: number; configPath?: string }): AutonomyInputs {
+export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: string; now?: number; configPath?: string; mailboxDir?: string }): AutonomyInputs {
 	const stateDir = opts?.stateDir;
 	try {
 		const now = opts?.now ?? Date.now();
@@ -156,7 +156,10 @@ export function collectAutonomyInputs(opts?: { agentDir?: string; stateDir?: str
 			process.env.PI_AUTONOMY_FRONTIER_SOURCE?.trim() === "graph"
 				? graphFrontierSnapshot({ agentDir: opts?.agentDir, stateDir, now })
 				: collectGlobalView({ agentDir: opts?.agentDir, now });
-		const backlog = mailboxBacklog();
+		// mailboxDir 是 test-only 注入面（与 agentDir/configPath 同纪律）：不传 = defaultMailboxDir()，
+		// 生产行为逐字节不变。注入前本层永远读真实 mailbox ⇒ 单测里若有 pending 信就产生
+		// ws_mail_backlog 触发 ⇒ 锚点被置 now ⇒ 空盘面断言全失真（W2.3 实测踩中）。
+		const backlog = mailboxBacklog(opts?.mailboxDir);
 		const masterKey = masterAddress().replace(/[^A-Za-z0-9._-]/g, "_"); // mailboxDirFor 同款映射
 		const masterPending = backlog.filter((b) => b.recipient === masterKey).reduce((s, b) => s + b.pending, 0);
 

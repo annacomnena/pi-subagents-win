@@ -85,10 +85,10 @@ function localStatusLine(cwd: string): string {
  * → 无此行 → /master-status 与 master-status tool 输出逐字节一致。四读全 never-throw
  * （容忍读失败 → 视为无足迹；W3 断言）。
  */
-function autonomyFootprintExists(): boolean {
+function autonomyFootprintExists(opts?: { configPath?: string }): boolean {
 	try {
 		return (
-			readAutonomyConfig().enabled === true ||
+			readAutonomyConfig({ configPath: opts?.configPath }).enabled === true ||
 			readKillSwitch() !== null ||
 			readFrontierSnapshot() !== null ||
 			readWakeGateState() !== null
@@ -99,9 +99,9 @@ function autonomyFootprintExists(): boolean {
 }
 
 /** autonomy 状态行（D-B 四要素：enabled / kill / frontier 快照时间 / wake-gate 最近判定；容忍读，never-throw）。 */
-function autonomyStatusLine(): string {
+function autonomyStatusLine(opts?: { configPath?: string }): string {
 	try {
-		const cfg = readAutonomyConfig();
+		const cfg = readAutonomyConfig({ configPath: opts?.configPath });
 		const kill = readKillSwitch();
 		const frontier = readFrontierSnapshot();
 		const gate = readWakeGateState();
@@ -115,8 +115,15 @@ function autonomyStatusLine(): string {
 }
 
 /** 与 /master-status 同文案；带 cfg 时多一行 auto-handoff 观测（S3，缺省不显示）；
- * 末尾追加 local 归属行（cwd 缺省 process.cwd()，global 各行顺序与文案不变）。 */
-export function masterStatusLogic(cfg?: MasterSuccessionConfig, opts: { cwd?: string } = {}): ToolOutcome {
+ * 末尾追加 local 归属行（cwd 缺省 process.cwd()，global 各行顺序与文案不变）。
+ *
+ * opts.configPath 是 test-only 注入面（先例：autonomy/gate.ts 同名参数）：autonomy 足迹谓词读包根
+ * config.json，缺省不变；不注入则「默认态无 autonomy 行」只能依赖开发机 config.json 现状
+ * （R10 环境前提 —— 生产已启用 autonomy 后该断言假红）。 */
+export function masterStatusLogic(
+	cfg?: MasterSuccessionConfig,
+	opts: { cwd?: string; configPath?: string } = {},
+): ToolOutcome {
 	const { attachment: att, cutover: cut, snapshot: snap, backlog } = getMasterStatus();
 	const lines = [
 		`attachment: ${att ? `${att.sessionId.slice(0, 12)} gen=${att.generation} heartbeat=${att.lastHeartbeatAt.slice(11, 19)}` : "(none)"}`,
@@ -126,7 +133,7 @@ export function masterStatusLogic(cfg?: MasterSuccessionConfig, opts: { cwd?: st
 		...(cfg ? [autoHandoffLine(cfg)] : []),
 		localStatusLine(opts.cwd ?? process.cwd()),
 		// v2（Task 2006 D-B）：仅自治足迹出现后常驻一行（opt-in 可见性）；纯净默认态无此行（零行为）。
-		...(autonomyFootprintExists() ? [autonomyStatusLine()] : []),
+		...(autonomyFootprintExists(opts) ? [autonomyStatusLine(opts)] : []),
 	];
 	return { text: `Master status:\n${lines.join("\n")}` };
 }
