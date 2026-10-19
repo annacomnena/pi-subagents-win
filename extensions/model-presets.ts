@@ -35,6 +35,8 @@ export interface PresetConfigLike {
 	models: Record<string, string>;
 	fallbackModels: Record<string, string[]>;
 	thinking: Record<string, string>;
+	/** 角色 → 允许层级区间；宽松 string 避免与 tiers.ts 类型耦合（消费端用 normalizeRoleTier 归一化）。 */
+	roleTier?: Record<string, { min: string; max: string }>;
 }
 
 export interface ModelPreset extends PresetConfigLike {
@@ -59,6 +61,8 @@ function emptyStore(): PresetStore {
 function isPreset(value: unknown): value is ModelPreset {
 	if (!value || typeof value !== "object") return false;
 	const v = value as Partial<ModelPreset>;
+	// roleTier 为可选：缺失合法（旧预设兼容）；存在时须为对象（非数组）。
+	if (v.roleTier !== undefined && (!v.roleTier || typeof v.roleTier !== "object" || Array.isArray(v.roleTier))) return false;
 	return typeof v.name === "string" && typeof v.savedAt === "string"
 		&& !!v.models && typeof v.models === "object"
 		&& !!v.fallbackModels && typeof v.fallbackModels === "object"
@@ -88,13 +92,16 @@ function writeStore(store: PresetStore): void {
 // ── 纯函数 ──────────────────────────────────────────────────────────
 
 function snapshotFrom(cfg: PresetConfigLike, name: string): ModelPreset {
-	return {
+	const preset: ModelPreset = {
 		name,
 		savedAt: new Date().toISOString(),
 		models: { ...cfg.models },
 		fallbackModels: Object.fromEntries(Object.entries(cfg.fallbackModels).map(([agent, chain]) => [agent, [...chain]])),
 		thinking: { ...cfg.thinking },
 	};
+	// 仅当来源配置存在 roleTier 时才复制进快照（旧配置无该字段 → 快照也不带）。
+	if (cfg.roleTier) preset.roleTier = Object.fromEntries(Object.entries(cfg.roleTier).map(([role, iv]) => [role, { ...iv }]));
+	return preset;
 }
 
 function presetAgents(preset: PresetConfigLike): string[] {
@@ -104,7 +111,12 @@ function presetAgents(preset: PresetConfigLike): string[] {
 function configLines(cfg: PresetConfigLike, indent = "  "): string {
 	const lines = presetAgents(cfg).map((agent) =>
 		`${indent}${agent.padEnd(16)} model=${cfg.models[agent] ?? "(default)"}  fallback=${(cfg.fallbackModels[agent] ?? []).join(",") || "(none)"}  thinking=${cfg.thinking[agent] ?? "(default)"}`);
-	return lines.length > 0 ? lines.join("\n") : `${indent}(no per-agent model settings — all pi default)`;
+	if (lines.length === 0) lines.push(`${indent}(no per-agent model settings — all pi default)`);
+	const roleKeys = cfg.roleTier ? Object.keys(cfg.roleTier) : [];
+	lines.push(roleKeys.length > 0
+		? `${indent}roleTier: ${roleKeys.length} role(s) — ${roleKeys.map((role) => `${role}:[${cfg.roleTier![role].min}..${cfg.roleTier![role].max}]`).join(" ")}`
+		: `${indent}roleTier: (default)`);
+	return lines.join("\n");
 }
 
 function savedAtLabel(iso: string): string {
@@ -192,9 +204,11 @@ function applyPreset(ctx: ExtensionCommandContext, deps: CommandDeps, slot: numb
 	cfg.models = { ...preset.models };
 	cfg.fallbackModels = Object.fromEntries(Object.entries(preset.fallbackModels).map(([agent, chain]) => [agent, [...chain]]));
 	cfg.thinking = { ...preset.thinking };
+	// roleTier：快照含该字段才整体替换；旧预设无 roleTier 时保留当前配置（不删除）。
+	if (preset.roleTier) cfg.roleTier = Object.fromEntries(Object.entries(preset.roleTier).map(([role, iv]) => [role, { ...iv }]));
 	deps.writeConfig(cfg);
 	deps.reloadConfig();
-	ctx.ui.notify(`📥 已应用槽位 [${slot}] ${preset.name}（models/fallbacks/thinking 已整体替换）\n${configLines(preset)}`, "info");
+	ctx.ui.notify(`📥 已应用槽位 [${slot}] ${preset.name}（models/fallbacks/thinking${preset.roleTier ? " + roleTier" : ""} 已整体替换）\n${configLines(preset)}`, "info");
 }
 
 // ── 交互流程（TUI）──────────────────────────────────────────────────

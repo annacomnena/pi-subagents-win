@@ -132,6 +132,24 @@ const afterRace = JSON.parse(readFileSync(PRESETS_PATH, "utf8"));
 assert("并发：我方槽位4已写入", afterRace.slots["4"]?.name === "我方预设");
 assert("并发：他方槽位5未被覆盖", afterRace.slots["5"]?.name === "他会话的预设");
 
+// ── 4. roleTier 快照往返（计划矩阵 15）─────────────────────────────
+// 4a. save 带 roleTier → 改 config → load 还原
+cfg.roleTier = { planner: { min: "standard", max: "premium" } };
+await run("save 5 带层级");
+const snap5 = JSON.parse(readFileSync(PRESETS_PATH, "utf8")).slots["5"];
+assert("save 快照写入 roleTier", snap5?.roleTier?.planner?.min === "standard" && snap5?.roleTier?.planner?.max === "premium");
+cfg.roleTier = { searcher: { min: "free", max: "free" } };
+await run("load 5");
+assert("save→load 还原 roleTier", cfg.roleTier?.planner?.min === "standard" && cfg.roleTier?.planner?.max === "premium" && cfg.roleTier?.searcher === undefined);
+
+// 4b. 旧预设（无 roleTier）load 不动当前 roleTier
+const legacyStore = JSON.parse(readFileSync(PRESETS_PATH, "utf8"));
+legacyStore.slots["5"] = { name: "旧无层级", savedAt: new Date().toISOString(), models: { planner: "old/model" }, fallbackModels: {}, thinking: {} };
+writeFileSync(PRESETS_PATH, JSON.stringify(legacyStore, null, 2));
+cfg.roleTier = { planner: { min: "standard", max: "premium" } };
+await run("load 5");
+assert("旧预设 load 不动当前 roleTier", cfg.roleTier?.planner?.max === "premium" && cfg.models.planner === "old/model");
+
 // ── 恢复现场 ────────────────────────────────────────────────────────
 if (backup === null) unlinkSync(PRESETS_PATH); else writeFileSync(PRESETS_PATH, backup);
 console.log(failed === 0 ? "\nALL TESTS PASSED" : `\n${failed} TEST(S) FAILED`);

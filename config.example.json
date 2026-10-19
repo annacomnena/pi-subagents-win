@@ -25,5 +25,7 @@
   },
   "notifications": true,
   "searcherMode": "auto",
-  "liteMode": "off"
+  "liteMode": "off",
+  "loopGuard": { "enabled": false, "threshold": 3, "action": "warn" },
+  "costTier": { "enforce": false }
 }

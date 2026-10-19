@@ -28,11 +28,12 @@ const testDir = dirname(fileURLToPath(import.meta.url));
 const cfgPath = join(testDir, "..", "config.json");
 const backup = existsSync(cfgPath) ? readFileSync(cfgPath, "utf8") : null;
 
-/** 未枚举顶层键夹具：真实 config.json 的 gui/channels/autonomy + 两个纯未知键。 */
+/** 未枚举顶层键夹具：真实 config.json 的 gui/channels/autonomy + roleTier + 两个纯未知键。 */
 const KEPT: Record<string, unknown> = {
 	gui: { autoStart: true, x: 1 },
 	channels: { wechat: { enabled: false }, email: { enabled: true } },
 	autonomy: { enabled: true, other: "kept" },
+	roleTier: { planner: { min: "standard", max: "premium" }, searcher: { min: "free", max: "cheap" } },
 	keepTop: "me",
 	unknownSlice: { a: [1, 2, 3], nested: { b: null } },
 };
