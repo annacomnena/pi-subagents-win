@@ -2,20 +2,23 @@
 title: Wake 回信（round-trip 回执）
 kind: concept
 status: current
-updated: 2026-10-18
+updated: 2026-10-19
 source_paths:
-  - extensions/runtime/wake.ts#L49-L64
-  - extensions/runtime/wake.ts#L221
-  - extensions/runtime/wake.ts#L227-L250
-  - extensions/runtime/wake.ts#L302-L340
-  - extensions/runtime/wake.ts#L376-L400
-  - extensions/runtime/wake.ts#L188-L226
-  - extensions/runtime/scope.ts#L248-L263
-  - extensions/runtime/scope.ts#L400-L428
-  - extensions/runtime/protocol.ts#L157-L179
-  - extensions/runtime/mailbox.ts#L63
-  - extensions/_test_local_master.ts#L959
-  - extensions/_test_runtime_wake.ts#L194
+  - extensions/runtime/wake.ts::WakeLetter
+  - extensions/runtime/wake.ts::MAILBOX_MODULE_URL
+  - extensions/runtime/wake.ts::buildReplyRecipe
+  - extensions/runtime/wake.ts::buildSupervisionBlock
+  - extensions/runtime/wake.ts::buildWakePrompt
+  - extensions/runtime/wake.ts::deriveSupervisionItems
+  - extensions/runtime/wake.ts::describeLetter
+  - extensions/runtime/scope.ts::buildScopeWakePrompt
+  - extensions/runtime/scope.ts::describeLetter
+  - extensions/runtime/scope.ts::evaluateScopeWake
+  - extensions/runtime/protocol.ts::newMessageFrame
+  - extensions/runtime/mailbox.ts::deliverLetter
+  - extensions/runtime/mailbox.ts::mailboxDirFor
+  - extensions/_test_local_master.ts#L1002
+  - extensions/_test_runtime_wake.ts#L202
 ---
 
 # Wake 回信（round-trip 回执）
@@ -28,23 +31,23 @@ wake-spawn 出的 tab（workstream Sub-Master / per-repo local Sub-Master）**�
 
 ### 为什么必须走 deliverLetter（tab-report 不可达）
 
-tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方自己（workstream 的 master / scope 的 local master），tab-report 只回派发者——**来信者收不到**。因此跨 master 的回执必须走信箱通道 `deliverLetter`（`mailbox.ts#L63`）。协议层自动代投（`replyTo` / `inReplyTo` 字段触发协议层投递）**未采用**；回信责任在 spawn 出的 tab 自身，由 prompt 纪律约束。
+tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方自己（workstream 的 master / scope 的 local master），tab-report 只回派发者——**来信者收不到**。因此跨 master 的回执必须走信箱通道 `deliverLetter`（`mailbox.ts#L78`）。协议层自动代投（`replyTo` / `inReplyTo` 字段触发协议层投递）**未采用**；回信责任在 spawn 出的 tab 自身，由 prompt 纪律约束。
 
 ### WakeLetter 扩展字段（回信寻址来源）
 
-`WakeLetter`（`wake.ts#L49-L64`）在基本字段外带三个可选字段：
+`WakeLetter`（`wake.ts#L55-L68`）在基本字段外带三个可选字段：
 
 - `from`：原信发信方（message 帧 `frame.from` / command 帧 `issuedBy`）= **回信目标**
 - `to`：原信收件方（本收件地址）= **回信的 from**
 - `requiresAck`：仅 message 帧有（`kind !== "ACK"`）；`true` → prompt 要求回 RESULT
 
-`describeLetter`（`wake.ts#L326` 与 `scope.ts#L248`，两处规则一致）：message 帧逐字段取自原帧；command 帧只有 `from=issuedBy`、`to`，**没有 `requiresAck` → 永不回信**。
+`describeLetter`（`wake.ts#L519` 与 `scope.ts#L276`，两处规则一致）：message 帧逐字段取自原帧；command 帧只有 `from=issuedBy`、`to`，**没有 `requiresAck` → 永不回信**。
 
 `requiresAck` 由 `newMessageFrame` 工厂固化（`protocol.ts#L176`）：`requiresAck: input.kind !== "ACK"`——非 ACK 类缺省即为 true。
 
 ### 回执触发条件（prompt 形状）
 
-`buildWakePrompt`（`wake.ts#L302`）/ `buildScopeWakePrompt`（`scope.ts#L432`）回执逻辑一致：取前 10 封展示信，其中**存在 `requiresAck===true` 且 `from`/`to` 均非空**的 message 帧时，prompt 才出现「回执（round-trip…）」块：
+`buildWakePrompt`（`wake.ts#L445`）/ `buildScopeWakePrompt`（`scope.ts#L460`）回执逻辑一致：取前 10 封展示信，其中**存在 `requiresAck===true` 且 `from`/`to` 均非空**的 message 帧时，prompt 才出现「回执（round-trip…）」块：
 
 - 每封一行：`回执：<messageId> → 用 deliverLetter 回 kind=RESULT 到 <原信 from>（from=<原信 to>, inReplyTo=<messageId>）`
 - 紧跟完整 recipe（`buildReplyRecipe`，见下）
@@ -52,16 +55,18 @@ tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方
 
 无回信件时该块与硬规则行**整段缺席**（prompt 逐字节保持旧形状）。
 
-**与监管块（P1）互不影响**：`buildWakePrompt` 自 `2a4024a` 起有**第三可选参** `supervision?: WakeSupervisionItem[]`（停滞监管块，仅 workstream 侧有；`buildScopeWakePrompt` 尚未加）。它插在通信列表与回执块之间，`undefined`/`[]` 时输出逐字节不变；回执块逻辑与位置零改动。内容见 [[主动性套件（Autonomy Suite）]]「主动推动 supervise-push」。
+**与监管块（P1）互不影响**：两路 prompt 各有一个可选监管参数——`buildWakePrompt(ws, letters, supervision?)` **第三可选参**（`wake.ts#L445-L478`）、`buildScopeWakePrompt(scope, letters, repoCwd, supervision?)` **第四可选参**（`scope.ts#L460-L497`）。渲染**同源**：两路都调 `wake.ts::buildSupervisionBlock`（`wake.ts#L428-L443`；scope 侧从 `wake.ts` import，`scope.ts#L46`），不各自实现一份语法。插入位置两路一致——`待处理输入` 行之后、回执块之前；`undefined` / `[]` 时 `supervisionBlock` 为空数组 ⇒ 输出与不带该参调用的旧形状**逐字节相同**（`_test_runtime_supervision_push` 第 11 组冻结断言）。回执块逻辑与位置零改动。
+
+scope 路的派生点在 `evaluateScopeWake`（`scope.ts#L401-L411`）：**claim 成功后**才调 `wake.ts::deriveSupervisionItems`（`no-mail` / `claim-missed` 早退路径保持零 IO），`repoCwd` 非空时作为 `repoPath` 传给派生器做仓过滤（`wake.ts::deriveSupervisionItems` 的 `opts.repoPath`）。监管块内容见 [[主动性套件（Autonomy Suite）]]「主动推动 supervise-push」。
 
 ### buildReplyRecipe（内嵌的可执行 recipe）
 
-`buildReplyRecipe`（`wake.ts#L228-L250`；scope 侧复用同一函数，`scope.ts#L45` 从 wake.ts import）：
+`buildReplyRecipe`（`wake.ts#L375-L400`；scope 侧复用同一函数，`scope.ts#L45` 从 wake.ts import）：
 
-1. tab 无发信工具 → 用 bash + 临时 `.mjs`，`import { deliverLetter, mailboxDirFor } from "<mailbox.ts 的 file:// 绝对 URL>"`（URL 由 `MAILBOX_MODULE_URL` 提供，`wake.ts#L221`；脚本体刻意不用模板字符串，避免与外层 TS 模板字面量转义冲突）
+1. tab 无发信工具 → 用 bash + 临时 `.mjs`，`import { deliverLetter, mailboxDirFor } from "<mailbox.ts 的 file:// 绝对 URL>"`（URL 由 `MAILBOX_MODULE_URL` 提供，`wake.ts#L368`；脚本体刻意不用模板字符串，避免与外层 TS 模板字面量转义冲突）
 2. 回信帧字段：`kind: "RESULT"`、`from: <原信 to>`、`to: <原信 from>`、`inReplyTo: <原信 messageId>`、`requiresAck: true`、`body.summary` **≤512 字节**
 3. `node <脚本>` 运行（本机 node v22 类型剥离默认可用，能直接 import 该 `.ts`；报错时 `node --experimental-strip-types`；**不用 npx**，依赖网络）
-4. `ls <recipientDir>`（= `mailboxDirFor(REPLY.to)`，目录名规则：非 `[A-Za-z0-9._-]` 一律替换为 `_`，`mailbox.ts#L42`）断言出现新 `msg_*.json`
+4. `ls <recipientDir>`（= `mailboxDirFor(REPLY.to)`，目录名规则：非 `[A-Za-z0-9._-]` 一律替换为 `_`，`mailbox.ts#L43`）断言出现新 `msg_*.json`
 5. 删除临时脚本
 
 ### 约束
@@ -69,12 +74,13 @@ tab-report 是**派发者归属通道**：wake 场景的派发者就是唤醒方
 - **command 帧不回信**：`describeLetter` 对 command 帧不设 `requiresAck`，回信条件 `requiresAck===true` 恒不满足。
 - **`requiresAck=false`（ACK 帧）不回信**。
 - **逐封回**：prompt 要求对每封需回执的来信各回一封（每封一个独立 `inReplyTo`），不是一封回执合并多信。
-- 回执是普通 message 帧信件，投递语义走 `deliverLetter` 既有契约（帧校验、原子写、`dedupeId` at-least-once，`mailbox.ts#L63-L97`）；来信者侧如何消费 RESULT 信不在本契约范围。
+- 回执是普通 message 帧信件，投递语义走 `deliverLetter` 既有契约（帧校验、原子写、`dedupeId` at-least-once，`mailbox.ts::deliverLetter`）；来信者侧如何消费 RESULT 信不在本契约范围。
 
 ## Evidence
 
-- `extensions/_test_local_master.ts#L959`（RT 段）：`buildScopeWakePrompt` 直测——message 帧 + `requiresAck=true` → prompt 含 `deliverLetter` / `RESULT 到 <原信 from>` / `inReplyTo` / 确认步骤 / `mailboxDirFor`；command 帧与 `requiresAck=false` → 不含 `deliverLetter`；`evaluateScopeWake` 端到端（ESCALATION + `requiresAck=true` → fire，`letters[0].from`/`.to` 与原信一致）。
-- `extensions/_test_runtime_wake.ts#L194`（8. prompt 形状）：`buildWakePrompt` 同套断言（workstream 侧）。
+- `extensions/_test_local_master.ts#L1002`（RT 段）：`buildScopeWakePrompt` 直测——message 帧 + `requiresAck=true` → prompt 含 `deliverLetter` / `RESULT 到 <原信 from>` / `inReplyTo` / 确认步骤 / `mailboxDirFor`；command 帧与 `requiresAck=false` → 不含 `deliverLetter`；`evaluateScopeWake` 端到端（ESCALATION + `requiresAck=true` → fire，`letters[0].from`/`.to` 与原信一致）。
+- `extensions/_test_runtime_wake.ts#L202`（8. prompt 形状）：`buildWakePrompt` 同套断言（workstream 侧）。
+- `extensions/_test_runtime_supervision_push.ts` 第 11 组：`buildScopeWakePrompt` 第四参——非空插监管块、`undefined` / `[]` 与三参调用的冻结字面量逐字节相等、`repoPath` 过滤生效。
 - 协议层事实：`extensions/runtime/protocol.ts#L176`（`requiresAck = kind !== "ACK"`）。
 
 ## Links Out

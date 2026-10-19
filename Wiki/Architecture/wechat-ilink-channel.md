@@ -2,7 +2,7 @@
 title: 微信 iLink 通道
 kind: concept
 status: current
-updated: 2026-09-28
+updated: 2026-10-17
 source_paths:
   - scripts/wechat-ilink-probe.mjs
   - plans/0923_wechat_ilink_probe_checklist.md
@@ -396,35 +396,45 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - `channels.wechat.reply.mode`：**缺省 `"reply-only"`（0925 P0 复裁；0924 的缺省 `"broadcast"` 已作废）**；`"broadcast"` = 显式开播；**mode 取值非法或配置文件整体坏 → fail-closed `"reply-only"`**（`enabled` 仍按红线 true）。出处：`extensions/runtime-host/wechat-bind.ts#L313-L315`、`#L325-L328`。
 - `channels.wechat.reply.allowOut`：**出站订阅（授权集合第二位，0925 P0 新增）**，openid 数组，**缺省 `[]`**；非数组 → warn 后 `[]`，数组内只留 string（trim/去空/去重）；坏文件 → `[]`；**HTTP 面无任何端点可写，只能改配置文件**。出处：`wechat-bind.ts#L319-L323`、`#L328`。
 - `channels.wechat.reply.sessionScope`：缺省 **`"owner"`**（合法值 `owner|main|any`，非法/坏文件 → `owner`）；`main` = `isMainSession()`（tab 拒，审计 `not-main-session`）；`any` = 仅 subagent 门。出处：`extensions/runtime-host/wechat-bind.ts#L316-L318`。
-- **资格门（owner，fail-closed）**：只有 **global master 会话**广播——`readAttachment(masterAddress())?.sessionId === getCurrentSessionId()`；attachment 读不到 → 审计 `master-attachment-unavailable`、不匹配 → `not-master-owner`，两者均**丢弃暂存不广播**；且**本会话无暂存时资格门失败静默返回**（不落审计，防 audit jsonl 单向增长）。出处：`extensions/wechat-reply-hook.ts#L100-L105`。
-- subagent 一律不广播（`isSubagent()` 门，`flushWechatBroadcast` 首门）。出处：`extensions/wechat-reply-hook.ts#L93`。
+- **资格门（owner，fail-closed）**：只有 **global master 会话**广播——`readAttachment(masterAddress())?.sessionId === getCurrentSessionId()`；attachment 读不到 → 审计 `master-attachment-unavailable`、不匹配 → `not-master-owner`，两者均**丢弃暂存不广播**；且**本会话无暂存时资格门失败静默返回**（不落审计，防 audit jsonl 单向增长）。出处：`extensions/wechat-reply-hook.ts#L111-L116`。
+- subagent 一律不广播（`isSubagent()` 门，`flushWechatBroadcast` 首门）。出处：`extensions/wechat-reply-hook.ts#L103`。
 
 ### 触发时机（`agent_end` 暂存 / `agent_settled` flush）
 
-- `agent_end` = 一次低层 run 结束（重试/compaction/steering 后可继续），**只暂存不写意图**：mode=broadcast 时 `extractWechatReply` 走 broadcast 分支 → `stashWechatBroadcast`（每次覆盖 = 本轮最终态）；`agent_settled` = 权威终界，才 flush 出意图。出处：`extensions/wechat-reply-hook.ts#L146`、`#L163-L165`。
-- flush 无暂存（如 Esc 中断路径未产生 `agent_end` 暂存）→ 审计 **`no-stash`**、零动作（`wechat-reply-hook.ts#L110`）；**`agent_settled` 的 Esc/中断触发面未真机实测**（见 Open Questions）。
-- 暂存会话 ≠ 当前 settled 会话 → 丢弃 + 审计 `stash-session-mismatch`（防 tab 先暂存、master 后 settled 时张冠李戴）：`wechat-reply-hook.ts#L114-L117`。
-- mode 已翻回 `reply-only` / `enabled=false` → flush **丢弃暂存静默返回**（零 reply 侧副作用）：`wechat-reply-hook.ts#L96`。
+- `agent_end` = 一次低层 run 结束（重试/compaction/steering 后可继续），**只暂存不写意图**：mode=broadcast 时 `extractWechatReply` 走 broadcast 分支 → `stashWechatBroadcast`（每次覆盖 = 本轮最终态）；`agent_settled` = 权威终界，才 flush 出意图。出处：`extensions/wechat-reply-hook.ts#L177`、`#L236-L237`。
+- flush 无暂存（如 Esc 中断路径未产生 `agent_end` 暂存）→ 审计 **`no-stash`**、零动作（`wechat-reply-hook.ts#L120`）；**`agent_settled` 的 Esc/中断触发面未真机实测**（见 Open Questions）。
+- 暂存会话 ≠ 当前 settled 会话 → 丢弃 + 审计 `stash-session-mismatch`（防 tab 先暂存、master 后 settled 时张冠李戴）：`wechat-reply-hook.ts#L124-L127`。
+- mode 已翻回 `reply-only` / `enabled=false` → flush **丢弃暂存静默返回**（零 reply 侧副作用）：`wechat-reply-hook.ts#L106`。
+
+### reply-only 出站钩子的消息来源契约（`e7ca1f9` 起）
+
+缺省 `reply-only` 模式的 marker 路径同样挂在 `agent_end` 上（`registerWechatReplyHook` 的 `pi.on("agent_end")`，subagent 跳过），并在 `agent_end` 直接写 intent（不走 `agent_settled` flush）。其**消息来源**是长期契约：
+
+- **权威会话投影优先**：`registerWechatReplyHook` 向 `extractWechatReply` 注入 `transcript` = `ctx.sessionManager.buildSessionContext().messages`（含 compaction/`context_edit` 投影）；`extractWechatReply` 内 `deps.transcript?.()` 返回数组即**整体取代**传入的 `event.messages`（`ReplyHookDeps.transcript` 缺省 undefined = 只用传入 messages）。替换发生在 mode 分支之前 ⇒ broadcast 暂存同样基于投影。出处：`extensions/wechat-reply-hook.ts::registerWechatReplyHook`（`#L224-L234`）、`::extractWechatReply`（`#L169-L172`）、接口注 `#L32-L36`。
+- **为什么需要**：内核转发的 `AgentEndEvent.messages` 只是**本次 run 新增**的消息（pi 内核 `dist/core/agent-session.js:862` 转发 `event.messages`；pi bundle `runAgentLoop` 以 `emit({type:"agent_end",messages:newMessages})` 终界——`newMessages` 只含本 run 新增：fresh run 起步含触发 prompt，continuation run 起步为空），微信注入那条 user 属于上一轮时通常根本不在其中 ⇒ 只看 `agent_end.messages` 会对「注入轮 ≠ 答复 run」的会话恒 `marker-not-first`、出站永久失效。
+- **逐字回落**：`transcript` 取不到/抛错/非数组 ⇒ 回退只用传入的 `event.messages`（测试与异常路径，旧行为逐字不变）。
+- **marker 解析 = 主路径 + 有界回退**：主路径取**最近一条 user** 的 `dedupe:outbox:<64hex>` marker，解析 `state==="injected"` 的入站记录（原语义）；**仅当该 marker 存在但对不上任何已注入入站记录时**，才从新到旧扫描 user 消息、找第一条能对上入站记录的 marker，并落审计事件 **`resolved-older-wx-marker`**（掩码 msgId）；最近 user 无 marker ⇒ 仍 `marker-not-first`，扫描后仍无解析 ⇒ 仍 `no-inbox-match` ⇒ 可回复集合不变（防环红线）。出处：`extensions/wechat-reply-hook.ts::extractWechatReply`（`#L186-L211`）。
+- reply-only 的 intent 正文同样取（投影后的）**最近一条非空 assistant 文本**（`lastNonEmptyAssistantText`，>4000 截断）；intent id = `deriveReplyIntentId(outboxId)` 幂等（已存在 → `written:false`，不重写不重发）。出处：`extensions/wechat-reply-hook.ts#L47-L50`、`#L214-L221`。
 
 ### 收件人集合（0925 P0：候选池 ∩ 授权集合，与入站解耦）
 
 - **候选池**：`WechatStore.knownChats()` = `readInbox(0)`（receivedAt 降序全量）→ 滤空 `fromId`、滤 `@im.bot` 域 → 按 `fromId` 去重**保序**（首见 = 最近入站优先）。出处：`extensions/channel-wechat/store.ts#L349-L358`。**它只是「可寻址的历史 chat」，不再直接当收件人集合。**
-- **授权集合 = 绑定 owner ∪ `reply.allowOut`**（`credentials.ownerOpenId` ∪ 显式订阅，allowOut 缺省空）：`authorizeBroadcastRecipient(fromId, {ownerOpenId, allowOut})`；**入站 `input.allowFrom`、rejected 记录均不参与出站裁决**（`wechat-outbound-auth.ts` 全文不出现 `allowFrom`/`knownChats`）；owner 不可读 → owner 位缺席 → 授权只可能收缩（fail-closed，坏文件回 `allowOut:[]`）。出处：`extensions/runtime-host/wechat-outbound-auth.ts#L60`、`extensions/wechat-reply-hook.ts#L128-L136`。
-- **过滤在 flush 时执行**：授权全拒 → 审计 `no-authorized-recipients`、零 intent；部分拒 → 单行 `recipients-filtered{authorized,denied}`（明细留在发送侧 `denied` 审计）。出处：`wechat-reply-hook.ts#L137-L144`。
+- **授权集合 = 绑定 owner ∪ `reply.allowOut`**（`credentials.ownerOpenId` ∪ 显式订阅，allowOut 缺省空）：`authorizeBroadcastRecipient(fromId, {ownerOpenId, allowOut})`；**入站 `input.allowFrom`、rejected 记录均不参与出站裁决**（`wechat-outbound-auth.ts` 全文不出现 `allowFrom`/`knownChats`）；owner 不可读 → owner 位缺席 → 授权只可能收缩（fail-closed，坏文件回 `allowOut:[]`）。出处：`extensions/runtime-host/wechat-outbound-auth.ts#L60`、`extensions/wechat-reply-hook.ts#L137-L144`。
+- **过滤在 flush 时执行**：授权全拒 → 审计 `no-authorized-recipients`、零 intent；部分拒 → 单行 `recipients-filtered{authorized,denied}`（明细留在发送侧 `denied` 审计）。出处：`wechat-reply-hook.ts#L145-L149`。
 - **群消息天然不进 inbox**：parser 对 `group_id` 非空直接 quarantine（不落 inbox）⇒ 候选池只有私聊。出处：`extensions/channel-wechat/parser.ts#L134-L137`。
-- 候选池在 flush 时刻现算并由本轮 intent 文件冻结（轮内快照）：中途新入站的 chat **下一轮**才开始收；候选池空 → 审计 `no-known-chats`、零 intent（`wechat-reply-hook.ts#L121-L122`）。
+- 候选池在 flush 时刻现算并由本轮 intent 文件冻结（轮内快照）：中途新入站的 chat **下一轮**才开始收；候选池空 → 审计 `no-known-chats`、零 intent（`wechat-reply-hook.ts#L131-L132`）。
 - **发送前二次复核（非入队快照，0925 P0）**：watcher 每轮现读 owner+allowOut，入队后撤权/换绑的旧 pending 在出站前拦下 → `failed(broadcast-unauthorized)` + `attempts=0` + `event:"denied"`（掩码 fromId + `authz`）审计；**换绑后旧 owner 的 afterId intent 同样终态化**。出处：`extensions/runtime-host/wechat-reply.ts#L38-L65`。
 
 ### 内容
 
-- 该轮**末条非空 assistant 原文**（倒序扫描 `lastNonEmptyAssistantText`），`>4000` → `slice(0,4000)+"…[截断]"`（暂存时即截断）；全空 → 审计 `no-text`、零 intent。出处：`extensions/wechat-reply-hook.ts#L39-L41`、`#L72-L73`、`#L118`。
+- 该轮**末条非空 assistant 原文**（倒序扫描 `lastNonEmptyAssistantText`），`>4000` → `slice(0,4000)+"…[截断]"`（暂存时即截断）；全空 → 审计 `no-text`、零 intent。出处：`extensions/wechat-reply-hook.ts#L47-L50`、`#L81`、`#L128`。
 
 ### 身份派生（幂等与排队）
 
-- roundId = `sha256(`${sessionId}:${firstUserTs ?? "no-ts"}:sha256(firstUserText)}`)`——同会话同首问同时间戳 → 同 roundId。出处：`extensions/wechat-reply-hook.ts#L61-L64`。
-- **intent id** = `sha256("wechat-broadcast:"+roundId+":"+fromId)`；**一个 intent 一收件人**（`kind:"broadcast"` 字段，旧文件无 `kind` 按 reply 兼容——`valid()` 放宽）。出处：`extensions/runtime/wechat-reply.ts#L24-L27`、`#L31`、`extensions/wechat-reply-hook.ts#L125-L132`。
+- roundId = `sha256(`${sessionId}:${firstUserTs ?? "no-ts"}:sha256(firstUserText)}`)`——同会话同首问同时间戳 → 同 roundId。出处：`extensions/wechat-reply-hook.ts#L69-L73`。
+- **intent id** = `sha256("wechat-broadcast:"+roundId+":"+fromId)`；**一个 intent 一收件人**（`kind:"broadcast"` 字段，旧文件无 `kind` 按 reply 兼容——`valid()` 放宽）。出处：`extensions/runtime/wechat-reply.ts#L24-L27`、`#L31`、`extensions/wechat-reply-hook.ts#L152-L155`。
 - **per-recipient clientId** = `sha256("wechat-broadcast-client:"+roundId+":"+toUserId)`——**服务端 `client_id` 去重语义已人工确认（B + 人工确认）：同 id 双发只投 1 条**（见「`client_id` 去重语义」节）⇒ 跨收件人复用同一 id **必然**造成按 id 全局去重丢件，**per-recipient 是硬要求**，独立 id 同时成为 per-recipient 幂等键。出处：`extensions/channel-wechat/send.ts#L72-L74`。
-- **同轮幂等**：重复 flush → 同 id → `linkSync` EEXIST → 不重写不重发；**不同轮不覆盖**：不同 roundId → 不同文件，`listReplyIntents` 按 `createdAt` 升序排队串行消费。出处：`extensions/runtime/wechat-reply.ts#L41`、`extensions/wechat-reply-hook.ts#L127`。
+- **同轮幂等**：重复 flush → 同 id → `linkSync` EEXIST → 不重写不重发；**不同轮不覆盖**：不同 roundId → 不同文件，`listReplyIntents` 按 `createdAt` 升序排队串行消费。出处：`extensions/runtime/wechat-reply.ts#L41`、`extensions/wechat-reply-hook.ts#L154`。
 
 ### 发送门序（watcher 侧，顺序即契约；reply/command intent 不受 mode/TTL/connected 门约束）
 
@@ -460,7 +470,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 ### 验收
 
-- `npx tsx extensions/_test_wechat_broadcast.ts` → **18 组断言块全绿**（含 M1 回滚止发、S5 的 TTL 先于 connected 门序 + 真实 `readAttachment(masterAddress())` 缺省路径 + `currentSid=undefined`）；`extensions/_test_wechat_outbound_auth.ts` → **7 组全绿**（入站白名单不复用 / 撤订阅、换绑、旧 pending 终态 + `attempts=0` / mode 缺省 reply-only fail-closed / reply+command 回归），0925 P0 L4 报告 `plans/0925_p0_outbound_auth_l4_review.md` 另含 6 组变异全被抓；`_test_wechat_reply.ts` **22 组旧路径红线原样通过**；回归 `_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server`（含 status 面 denied 投影断言）全绿。npm test 族入口：`test:wechat-broadcast` / `test:wechat-outbound-auth`（0925 L4-S6 补登记）。0924 L4 报告：本地 `plans/0924_wechat_broadcast_l4_review.md`（PASS-with-fixes，M1 + S1–S5 已闭环 `0337aac`）。
+- `npx tsx extensions/_test_wechat_broadcast.ts` → **18 组断言块全绿**（含 M1 回滚止发、S5 的 TTL 先于 connected 门序 + 真实 `readAttachment(masterAddress())` 缺省路径 + `currentSid=undefined`）；`extensions/_test_wechat_outbound_auth.ts` → **7 组全绿**（入站白名单不复用 / 撤订阅、换绑、旧 pending 终态 + `attempts=0` / mode 缺省 reply-only fail-closed / reply+command 回归），0925 P0 L4 报告 `plans/0925_p0_outbound_auth_l4_review.md` 另含 6 组变异全被抓；`_test_wechat_reply.ts` **26 组断言块全绿**（含 A/B/C/D 四组：权威 transcript 正控 + 无 transcript 退化 / 无 marker / bot-domain 负控）；回归 `_test_message_outbox`/`_test_outbox_latency`/`_test_wechat_bind`/`_test_runtime_host_server`（含 status 面 denied 投影断言）全绿。npm test 族入口：`test:wechat-broadcast` / `test:wechat-outbound-auth`（0925 L4-S6 补登记）。0924 L4 报告：本地 `plans/0924_wechat_broadcast_l4_review.md`（PASS-with-fixes，M1 + S1–S5 已闭环 `0337aac`）。
 
 ## 远程斜杠命令（已实现 `488e942`，L4 修复 `ebb9e04`）
 
@@ -542,7 +552,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 ### 验收
 
-- `npx tsx extensions/_test_wechat_remote_command.ts` → **22 组断言块全绿**（含 BYPASS_MATRIX 15 条的 T14 分类/T15 端到端/T16 注入门、T17 冷启动、S1→T18、S2→T19、S3→T20）；回归 10/10：`_test_wechat_reply` 22 组 / `_test_wechat_broadcast` 18 组 / `_test_wechat_input` 14 组 / `input_set` / `message_outbox` / `outbox_latency` / `_test_wechat_receive` 7 组 / `_test_wechat_bind` 12 组 / `_test_runtime_host_server` / `check-extension-load`。
+- `npx tsx extensions/_test_wechat_remote_command.ts` → **22 组断言块全绿**（含 BYPASS_MATRIX 15 条的 T14 分类/T15 端到端/T16 注入门、T17 冷启动、S1→T18、S2→T19、S3→T20）；回归 10/10：`_test_wechat_reply` 26 组 / `_test_wechat_broadcast` 18 组 / `_test_wechat_input` 14 组 / `input_set` / `message_outbox` / `outbox_latency` / `_test_wechat_receive` 7 组 / `_test_wechat_bind` 12 组 / `_test_runtime_host_server` / `check-extension-load`。
 - **变异测试**：把 `classify` 还原成 `488e942` 版 → T14/T15/T16 FAIL；把 M2 `gate` 恒 false → T16/T17 FAIL（exit 1）——非恒绿假象。
 - L4 报告：本地 `plans/0924_wechat_remote_command_l4_review.md`（PASS-with-fixes，M1+M2+S1–S6 已闭环 `ebb9e04`）。
 
@@ -555,7 +565,8 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - 决策依据见 [[审批门策略]]；本地 `plans/0923_decisions.md` D1②、D2、D4。
 - 出站广播（commit `0a2b292`，L4 修复 `0337aac`）：`extensions/wechat-reply-hook.ts`（`stashWechatBroadcast`/`flushWechatBroadcast`/owner 资格门）、`extensions/runtime-host/wechat-reply.ts#L13-L61`（mode/TTL/connected 三门与顺序）、`extensions/runtime-host/wechat-bind.ts#L263-L278`（`{enabled, mode, sessionScope}` 与 fail-closed）、`extensions/runtime/wechat-reply.ts#L24-L27` + `extensions/channel-wechat/send.ts#L72-L74`（intent id / clientId 派生）、`extensions/channel-wechat/store.ts#L349-L358`（`knownChats()`）。
 - 广播验收：`extensions/_test_wechat_broadcast.ts`（18 组断言块，修复后实跑全绿）；L4 复核 `plans/0924_wechat_broadcast_l4_review.md`（本地 gitignored）。
-- **0925 P0 出站收件授权（commit `005410a` + L4 建议修）**：`extensions/runtime-host/wechat-outbound-auth.ts`（`authorizeBroadcastRecipient#L60`、`readOutboundOwnerOpenId#L47`）、`extensions/runtime-host/wechat-bind.ts#L308-L330`（`readWechatReplyConfig`：mode 缺省 reply-only、allowOut 三态 fail-closed）、`extensions/wechat-reply-hook.ts#L128-L144`（候选池 ∩ 授权集合、`no-authorized-recipients`/`recipients-filtered`）、`extensions/runtime-host/wechat-reply.ts#L49-L65`（发送前二次复核，门序 enabled → 授权 → mode）、`extensions/runtime-host/server.ts#L893-L900`+`#L928-L930`（status 面 denied/分类投影，L4-S1）；验收 `extensions/_test_wechat_outbound_auth.ts`（7 组，npm `test:wechat-outbound-auth`）+ `extensions/_test_runtime_host_server.ts`（denied 投影断言）；L4 复核 `plans/0925_p0_outbound_auth_l4_review.md`（PASS-with-fixes、0 阻断，S1–S6 已闭环；本地 gitignored）。
+- **0925 P0 出站收件授权（commit `005410a` + L4 建议修）**：`extensions/runtime-host/wechat-outbound-auth.ts`（`authorizeBroadcastRecipient#L60`、`readOutboundOwnerOpenId#L47`）、`extensions/runtime-host/wechat-bind.ts#L308-L330`（`readWechatReplyConfig`：mode 缺省 reply-only、allowOut 三态 fail-closed）、`extensions/wechat-reply-hook.ts#L137-L149`（候选池 ∩ 授权集合、`no-authorized-recipients`/`recipients-filtered`）、`extensions/runtime-host/wechat-reply.ts#L49-L65`（发送前二次复核，门序 enabled → 授权 → mode）、`extensions/runtime-host/server.ts#L893-L900`+`#L928-L930`（status 面 denied/分类投影，L4-S1）；验收 `extensions/_test_wechat_outbound_auth.ts`（7 组，npm `test:wechat-outbound-auth`）+ `extensions/_test_runtime_host_server.ts`（denied 投影断言）；L4 复核 `plans/0925_p0_outbound_auth_l4_review.md`（PASS-with-fixes、0 阻断，S1–S6 已闭环；本地 gitignored）。
+- **reply-only 出站消息来源契约（commit `e7ca1f9`，出站恒断根因修复）**：`extensions/wechat-reply-hook.ts`（`ReplyHookDeps.transcript` 接口注 `#L32-L36`、`extractWechatReply` 权威投影优先 `#L169-L172` + marker 主路径/有界回退 `#L186-L211`、`registerWechatReplyHook` 注入 `ctx.sessionManager.buildSessionContext().messages` `#L224-L234`）；内核依据：pi 内核 `dist/core/agent-session.js:862` 转发 `agent_end` 时只带 `event.messages`（= 本 run 新增消息，非会话投影）；验收 `extensions/_test_wechat_reply.ts`（A/B/C/D 四组，26 组断言块全绿）。
 - 远程斜杠命令（commit `488e942`，L4 修复 `ebb9e04`）：`extensions/runtime/wechat-remote-command.ts`（`normalizeForClassify#L118`、`classifyRemoteCommand#L227`、`ENTRIES#L166`、`DANGER_EXACT#L130`）、`extensions/wechat-command-consumer.ts`（`scanWechatRemoteCommands#L250`、`registerWechatRemoteCommands#L494`、`defaultRemoteCommandDeps#L404`、`buildWechatStatusText#L170`）、`extensions/runtime-host/wechat-input.ts#L39-L51`（M2 注入点门）、`extensions/runtime-host/wechat-bind.ts#L249-L257`（能力门 fail-closed）、`extensions/channel-wechat/store.ts#L57`+`#L332`（`consumed` 终态与透传）、`extensions/runtime/wechat-reply.ts#L34` + `extensions/channel-wechat/send.ts#L82`（intent id / clientId 派生）、`extensions/runtime-host/wechat-reply.ts#L36`+`#L44`（command 豁免 `reply.enabled` 门）、`extensions/index.ts#L1868`（接线）、`README.md#L71`（运行时 pi ≥ 0.87）。
 - 命令通道验收：`extensions/_test_wechat_remote_command.ts`（22 组断言块 + 15 条绕过矩阵，修复后实跑全绿）；L4 复核 `plans/0924_wechat_remote_command_l4_review.md`（本地 gitignored）。
 - 入站媒体与附件规格（媒体探针三轮，commit `6a72b19` + `9f52a4a` + `d724f6a`，仅 `scripts/wechat-ilink-probe.mjs`）：`scripts/wechat-ilink-probe.mjs`（`isHostAllowed`/`CDN_SUFFIX_ALLOW#L141-L149`、key 候选链 `#L202`、解密与判优 `#L276-L303`、`extractAttachments` 按 `media.full_url`/`media.aes_key`、`--replay-seq#L700`、`upload-probe`/`media-probe`）；本地 `plans/0925_wechat_media_probe_results.md` §9/§10（B 级权威）+ `plans/0924_wechat_media_gateway_research.md` §0/§3.4（P1–P8 判读口径与 M1/M4 依赖）；脱敏测量 `plans/.wechat-probe/items.jsonl`（43 行签名，type 1/2/3/4 全覆盖）、`key-format.json`（6 样本 + `conclusion{decryptOk:"6/6", magicOk:"6/6"}`）、`measure.jsonl`（`kind=attachment_download` 带 `magic/sha256_8/keyScheme`）。

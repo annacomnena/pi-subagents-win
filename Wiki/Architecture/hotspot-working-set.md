@@ -131,6 +131,7 @@ Hotspot v4（commit `8a9f09a`）是依附于工具事件的**短期工作集 pro
 ## Backlinks
 
 - [[Wiki 索引]]
+- [[Agent 记忆机制与 pi 能力边界]]
 
 ## Open Questions
 
