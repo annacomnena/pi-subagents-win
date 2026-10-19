@@ -128,6 +128,8 @@ const START_TOLERANCE_EARLY_MS = 300_000; // 允许登记前最多 5 分钟（�
 const START_TOLERANCE_LATE_MS = 180_000; // 允许登记后最多 3 分钟
 /** lastActivity 落盘节流：心跳 1s，但只在 >5s 时写一次文件。 */
 const ACTIVITY_PERSIST_INTERVAL_MS = 5_000;
+/** 运行中 recentCalls 明细落盘节流：≤1 次/5s（与心跳同频上限，避免 tool 事件风暴写盘）。 */
+export const RECENT_CALLS_PERSIST_INTERVAL_MS = 5_000;
 
 function readRecord(runsDir: string, runId: string): KillableRunRecord | null {
 	const file = join(runsDir, `${runId}.json`);
@@ -307,6 +309,52 @@ export function touchRunActivity(runId: string, runsDir: string = DEFAULT_RUNS_D
 	}
 	record.lastActivity = new Date(now).toISOString();
 	writeRecord(runsDir, record);
+}
+
+/**
+ * 增量合并写 run json（同步读-改-写，保留其它字段）。
+ *
+ * 用途：运行中的 async run 把最近工具调用明细（recentCalls/lastToolTurn/turnClock）同步回
+ * run json，供 `action:"recent-calls"` 在 run **运行期间**就能发现重复循环，
+ * 而不是等 close 后才由 result.recentCalls 快照写入（旧行为运行中只有 no-detail）。
+ *
+ * 合并安全（防与 killAsyncRun 竞态 / 防旧快照回滚）：写前**重新读盘**，再把 patch 覆盖到
+ * 盘上最新记录，而不是调用方持有的旧快照——因此 killAsyncRun / registerRunProcess /
+ * touchRunActivity 写入的 status/killedAt/pid/lastActivity 不会被旧快照回滚。
+ * 本函数与 markKilled 都是同步读-改-写，事件循环内不会相互穿插。
+ * patch 中值为 undefined 的键跳过；记录不存在（尚未落盘/已清理）→ no-op 返回 false。
+ */
+export function mergeRunRecord(
+	runId: string,
+	patch: Record<string, unknown>,
+	runsDir: string = DEFAULT_RUNS_DIR,
+): boolean {
+	const record = readRecord(runsDir, runId);
+	if (!record) return false;
+	for (const [key, value] of Object.entries(patch)) {
+		if (value === undefined) continue;
+		record[key] = value;
+	}
+	writeRecord(runsDir, record);
+	return true;
+}
+
+/**
+ * 节流版 mergeRunRecord：同一 run 内 ≤1 次 / intervalMs（缺省 5s）。
+ * 被节流时返回 false（未落盘）；真正写入返回 mergeRunRecord 结果。首调用立即落盘。
+ */
+export function createThrottledRunMerger(
+	runId: string,
+	runsDir: string = DEFAULT_RUNS_DIR,
+	intervalMs: number = RECENT_CALLS_PERSIST_INTERVAL_MS,
+): (patch: Record<string, unknown>) => boolean {
+	let lastPersistedMs = 0;
+	return (patch: Record<string, unknown>): boolean => {
+		const now = Date.now();
+		if (now - lastPersistedMs < intervalMs) return false;
+		lastPersistedMs = now;
+		return mergeRunRecord(runId, patch, runsDir);
+	};
 }
 
 /** 该 run 是否已被 kill（完成回调 finalize 时用于保留 cancelled）。 */
