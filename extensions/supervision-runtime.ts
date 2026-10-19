@@ -50,7 +50,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
 import { Type } from "typebox";
-import { getTabRunId, isSubagent } from "./identity.ts";
+import { durableSessionIdentity, getTabRunId, isSubagent } from "./identity.ts";
 import { isProcessAlive } from "./runtime/liveness.ts";
 import {
 	readSupervisionLedger,
@@ -74,6 +74,7 @@ import {
 	readTabState,
 } from "./tab-runs.ts";
 import { classifyForReclaim } from "./tab-runs-runtime.ts";
+import { readLocalOwnerAttachment, supervisePushGate } from "./supervise-gate.ts";
 
 // ── 常量 ───────────────────────────────────────────────────────────
 
@@ -558,11 +559,15 @@ const REJECT_HINT: Record<PushRejectReason | "io-error", string> = {
 };
 
 /**
- * 注册主会话工具 `supervise-push`。返回 cleanup（被 `index.ts` collect() 收集）。
+ * 注册 `supervise-push` 工具。返回 cleanup（被 `index.ts` collect() 收集）。
  *
- * 身份门（C.5：推理由被唤醒的 master 执行）：
+ * 身份门（C.5：推理由被唤醒的 master 执行；2026-10-19 方案 C 修订）：
  *   - 子 agent 进程 → 拒绝（同 `/supervise` 手动运维命令口径）
- *   - 标签页会话（`getTabRunId()` 存在）→ 拒绝（tab 不得推动其他 tab，也不得自我推动）
+ *   - **非 tab（主会话）→ 旧行为放行**（R3：不进 ownership 门，零额外 IO）
+ *   - tab 且是**本仓 local owner**（含双读 generation fencing）→ 放行，但目标必须在本仓子树内
+ *   - tab 非本仓 owner（普通 workflow tab / `l2-*` / `wake-*`）→ 拒绝
+ *   - owner 但目标是自身 / 他仓 / 无仓载体 → `self-push` / `cross-repo` 拒绝
+ * 判定本体在 `supervise-gate.ts::supervisePushGate`（纯函数，无 IO）。
  */
 export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRuntimeOptions = {}): () => void {
 	pi.registerTool({
@@ -575,7 +580,8 @@ export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRunt
 			"stop=error 且本 epoch 未推过 ⇒ **放行**推一次试复活（推过的记录只标记 audit 行 erroredRetry=1，不新增账本字段）；预算门照旧兜住。",
 			"基础设施失败（读/写文件异常）单独用 reason=io-error，不计入七条策略门。",
 			"预算是机械强制的：推满 maxPushes 后一律 budget-exhausted —— 此时应升级用户（附账本 pushes[] 时间线），不要换 runId 绕过。",
-			"仅主会话可用（子 agent / 标签页身份调用一律拒绝）。",
+			"身份：**主会话或本仓 owner** 可用（子 agent 恒拒；普通标签页/一次性 wake tab 非 owner ⇒ 拒）。",
+			"本仓 owner（local master）只能推**本仓子树内**的 tab：目标是自身（self-push）、他仓（cross-repo）或无派发仓载体 ⇒ 拒。这两类拒绝不在七条策略门内，但会写审计行。",
 		].join(" "),
 		parameters: Type.Object({
 			runId: Type.String({ description: "目标标签页 runId（tab_xxx）" }),
@@ -595,11 +601,48 @@ export function registerSupervisionTools(pi: ExtensionAPI, opts: SupervisionRunt
 			const t = result.content[0]?.type === "text" ? result.content[0].text : "";
 			return new Text(result.isError ? theme.fg("error", t) : theme.fg("success", t), 0, 0);
 		},
-		async execute(_toolCallId, rawParams) {
-			if (isSubagent()) return text("子 agent 中不可推动（supervise-push 仅主会话可用）", true);
-			if (getTabRunId()) return text("监管推动仅主会话可用（标签页会话不得推动）", true);
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
 			const p = (rawParams ?? {}) as { runId?: unknown; mode?: unknown };
 			const runId = typeof p.runId === "string" ? p.runId.trim() : "";
+			// ── 身份/目标门（方案 C：主会话 ∨ 本仓 owner；纯函数，判定体在 supervise-gate.ts）──
+			// R3：非 tab ⇒ `supervisePushGate` 直接 `via:"main"`，**不读 attachment、不读 dispatch**
+			// ⇒ 主会话路径（含 `ctx` 缺失的边缘）逐字节不变。
+			// R1：注入的是 **local** 地址（`readLocalOwnerAttachment(ctx.cwd)`），不是 `masterAddress()`。
+			const selfRunId = getTabRunId();
+			const isTab = Boolean(selfRunId);
+			// ctx 可能缺失（旧调用方 / 非会话内直调）——只有 tab 身份才需要它
+			const ctxCwd = typeof ctx?.cwd === "string" && ctx.cwd.trim() ? ctx.cwd : process.cwd();
+			const gate = supervisePushGate({
+				isSub: isSubagent(),
+				isTab,
+				selfRunId,
+				sessionId: durableSessionIdentity(ctx ?? null),
+				readAttachment: () => readLocalOwnerAttachment(ctxCwd),
+				ownerCwd: ctxCwd,
+				targetRunId: runId,
+				// 目标仓载体：`TabDispatchRecord.cwd`（派发时写死的绝对路径）；runsDir 口径与 supervisePush 一致
+				targetRepoPath: () => {
+					if (!runId) return null;
+					try {
+						const runsDir = opts.runsDir ?? (process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir());
+						return readTabDispatch(runsDir, runId)?.cwd ?? null;
+					} catch {
+						return null;
+					}
+				},
+			});
+			if (!gate.ok) {
+				// W7（R8）：身份/目标约束拒绝**必须**落 audit 行（否则「owner 被越权拒」生产不可追溯）。
+				// 注意：这四个 reason **不进**七条 `PushRejectReason`、**不进** `SupervisePushResult`。
+				try {
+					opts.audit?.(
+						`supervision-push reject-gate runId=${runId || "(empty)"} reason=${gate.reason} self=${selfRunId ?? "(main)"} via=${isTab ? "tab" : "main"} detail=${gate.detail}`,
+					);
+				} catch {
+					/* 审计失败不得阻止拒绝回执 */
+				}
+				return text(`❌ ${gate.text}\n  why=${gate.reason}: ${gate.detail}`, true);
+			}
 			if (!runId) return text("supervise-push: runId required（目标标签页 runId）", true);
 			// 不传 mode 时**不得**在此处补缺省——自动选档在 supervisePush 内部按派生相位做（见文件头 C.3 解读边界）
 			const explicitMode: "steer" | "abort" | undefined =
