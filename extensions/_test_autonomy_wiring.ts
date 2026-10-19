@@ -16,8 +16,11 @@
  *   W6 engaged 模式 audit 体积快照（一次完整评估 = frontier 摘要 1 + watchdog 1 + cat=wake 恰 1；
  *      无 v1 格式 autonomy-disabled 杂行——configPath 透传后 collect 与 gate 同源，工程约束 3）
  *
- * 前提（R10）：包根 config.json 无 autonomy 键——W1/W3 的 masterStatusLogic 断言读包根 config 无注入
- * 面（计划裁定保持最小不加参数）；若开发机将启用 autonomy，跑本测试前先读本条。
+ * R10 已闭合（2026-10-18）：包根 config.json 现为 `autonomy.enabled=true`（生产已启用 autonomy），
+ * 旧「默认态零足迹」断言曾依赖开发机配置（包根无 autonomy 键）而假红。`masterStatusLogic` 现接受
+ * test-only 注入面 `opts.configPath`（先例 autonomy/gate.ts 同名参数），W1b/W3 全部显式注入 temp
+ * config ⇒ 断言只依赖注入值，与包根 config.json 现状无关。W3 另加 (a2) 反向断言（注入 enabled
+ * config → 行出现且 enabled=on），证明注入面真的接到读路径（AGENTS §4.2：断言必须经真实入口）。
  *
  * 与计划原文的偏差（源码优先，见 plans/0923_autonomy_suite_v2_impl.md）：
  * 空盘面第二帧的 wake-gate reason 实际为 "record-only" 而非 "no-meaningful-change"——
@@ -280,8 +283,17 @@ check("W3 无足迹→无行；frontier/kill/wake-gate 足迹→行出现且字�
 	const isoT = new Date(T).toISOString().slice(0, 19);
 	try {
 		const run = (): string => masterStatusLogic(undefined, { cwd: rt.root, configPath: cfgOff }).text;
-		// (a) 无足迹 → 无行（前提 R10：包根 config 无 autonomy 键）
+		// (a) 无足迹 → 无行（R10 已闭合：显式注入 no-key config，不依赖包根 config.json 现状）
 		assert.ok(!run().includes("autonomy:"), "纯净默认态无 autonomy 行");
+		// (a2) 反向断言（AGENTS §4.2：断言必须经真实入口）：换注入面到 enabled config →
+		// 行出现且 enabled=on。证明 configPath 真的接到 autonomyFootprintExists/autonomyStatusLine
+		// 的读路径，而不是只被忽略（否则 (a) 在注入被忽略时仍会假绿）。
+		const runOn = masterStatusLogic(undefined, { cwd: rt.root, configPath: cfgOn }).text;
+		assert.ok(
+			runOn.includes("autonomy: enabled=on kill=off frontier=(none) wake-gate=(never)"),
+			`注入 enabled config → 行出现且 enabled=on（注入面接线证据）：
+${runOn}`,
+		);
 		// (b) frontier 快照 → 行出现且含 asof/projects
 		writeFrontierSnapshot({ asof: T, projects: [], triggers: [], baseline: true }, { stateDir: rt.state });
 		assert.ok(run().includes(`autonomy: enabled=off kill=off frontier=${isoT} (0 projects)`), `frontier 足迹行含 asof/projects：\n${run()}`);
