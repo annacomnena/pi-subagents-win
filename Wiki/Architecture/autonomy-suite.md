@@ -21,6 +21,7 @@ source_paths:
   - extensions/one-shot-tab.ts::spawnOneShotTab
   - extensions/runtime/wake.ts::normRepoPath
   - extensions/runtime/wake.ts::repoPathMatches
+  - extensions/runtime/wake.ts::buildSupervisionBlock
   - extensions/supervision-runtime.ts::countPushes
   - extensions/supervision-runtime.ts::clampMaxPushes
   - extensions/runtime/wake.ts::buildWakePrompt
@@ -363,6 +364,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 2. ~~steer 档对 idle tab 不起新 turn~~ **已闭合**：缺省档改为按相位自动选（`waiting` ⇒ `abort`），显式传入仍优先。
 3. **`currentToolStartedAt` 不做嵌套计数**：并行工具时 `tool_execution_start` 只保留**最后一个**起始时刻，任一 `tool_execution_end` 就清空 ⇒ 并行工具批次里 HANG 判据可能**提前归零**。要修需计数器/栈（改 `TabState` 形状 + bump 版本）。
 4. **`io-error` 形状借用了空 `runId` 的收敛口**：空/非法 `runId` 也走 `io-error`（不是第 8 条策略门）⇒ 调用方无法从 `reason` 区分「参数错」与「磁盘满」，只能读 `detail`（前缀 `invalid-input:`）。另：`writeSteerAtomic` 成功但 `writeSupervisionEntry` 失败 ⇒ 返回 `io-error` 而 **steer 已落盘**（真实推动已发生），`detail` 带 `steerId=` 便于追责；取舍同 AGENTS R-5「宁可重发不可漏发」（重试会多一条推动，1h ≤4 上限兜住），未做成显式 `partial` reason（那会变成第 8 条语义，与 spec 冲突）。
+5. **workstream 路（`wake-*`）仍渲染不可执行的推动指令**：`buildWakePrompt` 为保住逐字节冻结基线显式传 `{executorIsOwner: true}`，而执行者（`wake-*` 一次性 tab）不是本仓 owner ⇒ 仍会收到「用 supervise-push 推动」而实际被拒。**scope 路已修**（`l2-*` 不再收到）。真解是把推动指令重路由给 local master 自己（或采纳建议队列），属独立任务。
 
 ## 接线落点与边界（v2 已接线形态）
 
