@@ -182,18 +182,32 @@ export function masterDispatchLaunch(
 		sessionId: string;
 		/** gate 第二读的 owner 快照（owner 路径）；main 路径为 null（不依赖 attachment）。 */
 		owner: MasterAttachment | null;
+		// 不接收 ownerKind/ownerRoot（§8.3.4）：本函数只做 generation fencing 与账本/spawn；
+		// 目标仓约束由上游 gate 完成，并把「检查过的绝对 cwd」放进 args.cwd。
 	},
 	opts: { wtPath: string | null; piCli?: string; piErr?: string; env: WorkflowTabEnv; spawn?: WorkflowSpawnFn; readAttachment?: () => MasterAttachment | null },
 ): { runId?: string; title: string; error?: string; stale?: true } {
 	const title = args.title ?? args.taskId;
 	if (opts.wtPath === null) return { title, error: "未找到 Windows Terminal (wt.exe)，无法启动标签页" };
 	if (!opts.piCli || opts.piErr) return { title, error: opts.piErr ?? "未找到 pi CLI" };
-	// 最终 fencing（0918 审查 §1）：gate 返回后、生成 runId/写任何账本/spawn 之前紧贴重读 attachment，
-	// 与 gate 第二读比对 {sessionId, generation}；已变（detach/attach/generation bump）→ stale，零账本零 spawn。
+	// 最终 fencing（0918 审查 §1；2026-10-19 修订）：gate 返回后、生成 runId/写任何账本/spawn 之前
+	// 紧贴重读 attachment，与 gate 第二读比对 {sessionId, generation}；已变（detach/attach/generation bump）
+	// → stale，零账本零 spawn。
+	// 读哪个地址：**必须**是 gate 固定选中的那个地址（`args.owner.agentAddress`），
+	// 不能换成 `masterAddress()`（旧接线：局部 owner 会在这里变 stale ⇒ 仍然零派发，断点 #2），
+	// 也不能由工具参数指定 address（`owner` 是 gate 第二读返回的可信快照）。
+	// 额外校验快照 `agentAddress` 与读取地址一致：底层 registry.readAttachment 只验地址形状、
+	// 不验「与读取路径一致」，所以这一层不能依赖它代劳（审查 §9.1 W16）。
 	// main 路径（owner=null）不读 attachment（主会话恒可派，不依赖归属）。
 	if (args.owner) {
+		const ownerAddress = args.owner.agentAddress;
 		const fresh = opts.readAttachment?.() ?? null;
-		if (!fresh || fresh.sessionId !== args.owner.sessionId || fresh.generation !== args.owner.generation) {
+		if (
+			!fresh ||
+			fresh.agentAddress !== ownerAddress ||
+			fresh.sessionId !== args.owner.sessionId ||
+			fresh.generation !== args.owner.generation
+		) {
 			return { title, error: "Master 归属已变化（stale generation），拒绝派发", stale: true };
 		}
 	}

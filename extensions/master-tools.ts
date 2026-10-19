@@ -32,6 +32,7 @@ import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { globalViewLogic } from "./runtime/global-view.ts";
 import { masterAddress, type ObjectAddress } from "./runtime/address.ts";
+import { resolveOwnerTargetCwd, type OwnerTargetCwdReason } from "./runtime/target-cwd.ts";
 import { readScopeLiveness } from "./runtime/liveness.ts";
 import { judgeScopeOwnerStale, localMasterAddress, localMasterScope } from "./runtime/scope.ts";
 import {
@@ -61,6 +62,14 @@ export interface ToolOutcome {
 	isError?: boolean;
 	details?: Record<string, unknown>;
 }
+
+/** local owner 目标 cwd 政策被拒时的文案（master-dispatch 侧；与 launch-tabs 同一政策、分别措辞）。 */
+const MASTER_DISPATCH_LOCAL_CWD_TEXT: Record<OwnerTargetCwdReason, string> = {
+	"owner-root": "master-dispatch: 无法确定本仓 owner 的仓根（attachment.detail 与 ctx.cwd 均缺失/不可解析），拒绝",
+	blank: "master-dispatch: 本仓 owner 的 cwd 不得为空白字符串（省略 cwd 才使用当前目录），拒绝",
+	relative: "master-dispatch: 本仓 owner 的 cwd 必须是可解析的绝对路径（相对路径会吃 process.cwd()，拒绝）",
+	"cross-repo": "master-dispatch: 本仓 local owner 只能在本仓内派发（目标 cwd 不在本仓子树），拒绝",
+};
 
 /** 从可信会话 cwd 派生 local master 地址（工具与 /master-attach --local 共用；
  * 不接受用户传入 scope/路径/地址——防设置到别的仓库）。 */
@@ -268,6 +277,79 @@ export function masterDispatchGate(input: {
 	if (input.isMain) return { ok: true, via: "main", attachment: null };             // ④ 主会话恒可派
 	if (input.isTab) return { ok: false, reason: "tab-session" };                    // ⑤ 非 owner 的任务 tab
 	return { ok: false, reason: "not-owner" };                                      // ⑥ 其余（not-owner）
+}
+
+/** owner 归属种类（与 `local-owner-gate.ts::OwnerKind` 同一命名空间语义）。 */
+export type PinnedOwnerKind = "local" | "global";
+
+export interface PinnedOwnerSelection {
+	address: ObjectAddress;
+	kind: PinnedOwnerKind;
+}
+
+/**
+ * **本次调用私有**的惰性双地址 reader（计划 §8.3，2026-10-19 审查 P1 修订）。
+ *
+ * 为什么不能写 `candidates.find(a => a.sessionId === sid)`：
+ * `masterDispatchGate:260-267` 只比 `{sessionId, generation}`，**不比 `agentAddress`**；
+ * 而 global 与 local 两个地址的 generation 各自独立 ⇒ 「local(S,1) → global(S,1)」这种
+ * **跨地址接力**会让 gate 误判为「同一 lease 未被接管」（审查实测：
+ * `{"reads":2,"result":{"ok":true,"via":"owner"}}`）。
+ *
+ * 正确形状 = 先选地址、再固定地址读到底：
+ *   ① 第一次读（仅一次）：**global 优先**，否则 local；两者都不匹配 `sid` ⇒ null
+ *      （由原 gate 决定 main / tab 拒绝），并记住「已解析为无 owner」，后续读恒 null；
+ *   ② 匹配后保存 `{address, kind}`，此后**只读该 address**，不得改选候选；
+ *      generation 只在同一地址内有意义；未选中地址变化不误伤本次授权；
+ *   ③ 每次读都校验快照 `agentAddress` == 读取路径地址（registry 只验形状、不验路径）；
+ *      不符按 null 处理（fail-closed）。
+ *
+ * `ownerKind` 必须来自这个固定选择，**不能**gate 成功后再读一次附件推断。
+ */
+export function makePinnedOwnerReader(input: {
+	/** `durableSessionIdentity(ctx)`（持久会话 UUID）。 */
+	sessionId: string;
+	/** 可信 cwd（`ctx.cwd ?? process.cwd()`）：local 地址派生用。 */
+	cwd: string;
+	/** 按地址读附件（生产 = `runtime/registry.ts::readAttachment`；便于单测注入）。 */
+	readAttachment: (agent: ObjectAddress) => MasterAttachment | null;
+}): { read: () => MasterAttachment | null; pinned: () => PinnedOwnerSelection | null } {
+	const sid = input.sessionId;
+	const globalAddr: ObjectAddress = masterAddress();
+	const localAddr: ObjectAddress = localAgentFromCwd(input.cwd);
+	let pinned: PinnedOwnerSelection | null = null;
+	// 一次「不匹配」的解析结果要粘住：避免后续读又重新选地址（等价于跨地址接力）
+	let resolvedNone = false;
+
+	const readVerified = (address: ObjectAddress): MasterAttachment | null => {
+		let att: MasterAttachment | null = null;
+		try {
+			att = input.readAttachment(address);
+		} catch {
+			return null;
+		}
+		if (!att) return null;
+		// 地址形状校验：防止「文件放在 A 路径、正文写 B 地址」时把 B 的附件当 A 的 lease
+		return att.agentAddress === address ? att : null;
+	};
+
+	return {
+		read: () => {
+			if (pinned) return readVerified(pinned.address);
+			if (resolvedNone) return null;
+			// ① 首次：global 优先（同 sid 同时拥有 global/local 时保持全局编排能力），否则 local
+			for (const cand of [globalAddr, localAddr] as const) {
+				const att = readVerified(cand);
+				if (att && att.sessionId === sid) {
+					pinned = { address: cand, kind: cand === globalAddr ? "global" : "local" };
+					return att;
+				}
+			}
+			resolvedNone = true;
+			return null;
+		},
+		pinned: () => pinned,
+	};
 }
 
 /** 拒绝文案（isError:true）。not-owner 需 owner 附件以渲染「owner=…/无 owner」。 */
@@ -663,7 +745,8 @@ export function registerMasterTools(
 		name: "master-dispatch",
 		label: "Master Dispatch",
 		description: [
-			"Master 派单工具：仅主会话或 Master owner（agent://master_default 当前 attachment 的会话）可调用。",
+			"Master 派单工具：主会话、**全局 Master owner**（agent://master_default 当前 attachment 的会话）或**本仓 local master owner**（agent://master_local_<scope> 当前 attachment 的会话）可调用。",
+			"归属优先看全局地址（同 sid 同时拥有 global/local 时以 global 为准，保持全局编排能力）；本仓 local owner 的目标 cwd 必须在本仓子树内，全局 owner 不限仓（保留跨仓派发）。",
 			"派一个可见 pi 任务 tab，账本与回收链（tab-status / reclaim-tabs / tab-finish）与 launch-tabs 完全同构；journal source 记为 agent://master_default。",
 			"任务 tab 与 subagent 永不可调（门控硬挡）。不碰 succession（交接走 master-transfer）。",
 		].join(" "),
@@ -703,17 +786,41 @@ export function registerMasterTools(
 				taskId?: string; prompt?: string; title?: string; cwd?: string; mode?: string;
 				model?: string; timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }>;
 			};
+			// 可信 cwd（ctx.cwd ?? process.cwd()）：local 地址派生 + owner 仓根回退，两种职责不可混。
+			const trustedCwd = (() => {
+				const c = (ctx as unknown as { cwd?: unknown } | undefined)?.cwd;
+				return typeof c === "string" && c.trim() ? c.trim() : process.cwd();
+			})();
+			// 本调用私有的惰性双地址 reader（§8.3）：先选地址（global 优先），此后只读该地址。
+			const pinnedReader = makePinnedOwnerReader({ sessionId: sid, cwd: trustedCwd, readAttachment });
 			const gate = masterDispatchGate({
 				sessionId: sid,
 				isSub: isSubagent(),
 				isTab: isTabSession(),
 				isMain: isMainSession(),
-				readAttachment: () => readAttachment(masterAddress()),
+				readAttachment: pinnedReader.read,
 			});
 			if (!gate.ok) {
-				const att = gate.reason === "not-owner" ? readAttachment(masterAddress()) : null;
+				const att = gate.reason === "not-owner" ? pinnedReader.read() : null;
 				const text = masterDispatchRejectText(gate, att);
 				return textResult({ text, isError: true, details: { text, reason: gate.reason } });
+			}
+			// ownerKind 必须来自 gate 内固定选中的地址（§8.3.3）：不能 gate 通过后再读一次附件推断。
+			// **不**把 ownerKind/ownerRoot 传进派发 helper（§8.3.4）：本层已经把目标 cwd 检查完，
+			// 派发侧只需要那个已检查的绝对路径。
+			const pinned = gate.via === "owner" ? pinnedReader.pinned() : null;
+			const ownerKind = pinned ? pinned.kind : undefined;
+			// local owner ⇒ 目标 cwd 必须在**本仓子树**内（与 launch-tabs 同一政策，单处实现）；
+			// 检查在写任何账本/spawn 之前；检查后的绝对路径就是派发用的 cwd（不得下游另取）。
+			let cwdArg = params.cwd;
+			if (gate.via === "owner" && ownerKind === "local") {
+				const ownerRoot = ((gate.attachment?.detail ?? "").trim() || trustedCwd);
+				const verdict = resolveOwnerTargetCwd(params.cwd, ownerRoot, process.cwd());
+				if (!verdict.ok) {
+					const text = `${MASTER_DISPATCH_LOCAL_CWD_TEXT[verdict.reason]}（${verdict.detail}）`;
+					return textResult({ text, isError: true, details: { text, reason: `local-cwd:${verdict.reason}` } });
+				}
+				cwdArg = verdict.cwd;
 			}
 			const mode: "workflow" | "research" | "execute" | "adaptive" =
 				params.mode === "research" ? "research" : params.mode === "execute" ? "execute" : params.mode === "adaptive" ? "adaptive" : "workflow";
@@ -721,7 +828,7 @@ export function registerMasterTools(
 				taskId: (params.taskId ?? "").trim(),
 				prompt: (params.prompt ?? "").trim(),
 				title: params.title,
-				cwd: params.cwd,
+				cwd: cwdArg,
 				mode,
 				model: params.model,
 				timers: params.timers,
