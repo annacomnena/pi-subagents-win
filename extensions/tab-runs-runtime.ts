@@ -26,6 +26,7 @@ import {
 	defaultTabRunsDir,
 	defaultSessionsRoot,
 	emptyTabUsage,
+	isPersistentTabTaskId,
 	listTabDispatches,
 	messageText,
 	readTabDispatch,
@@ -97,6 +98,8 @@ export type SettlementFallbackOutcome =
  *   3b. **常驻身份豁免**：`taskId` 前缀为 `lms-`（local master）或 `master-`（master 派发）⇒ 返回
  *      `"skip-persistent-identity"`，**不写盘**。这两类 tab 明令不调 tab-finish、不退出
  *      （`runtime/local-master-launch.ts:249`），给它们写兜底只会造永久 unconfirmed 污染（详 ④）。
+ *      前缀判据的**唯一真相源** = `tab-runs.ts::isPersistentTabTaskId`（与 frontier-carriers 的
+ *      residentLms 豁免同口径，防三处判据漂移）。
  *   4. **never-throw**：任何异常只记 console.error 并返回 "error"。
  *
  * 可测性：`io` 注入是**函数参数**（不把 fs 调用散在事件体里），测试可直接注入会抛的写函数。
@@ -125,7 +128,7 @@ export function writeSettlementFallback(input: SettlementFallbackInput): Settlem
 		//    ⇒ 豁免即跳写（不写盘、不造文件）。**只豁免这两个前缀**，不得扩到其它 taskId。
 		//    位置：在「已有 result 检查」之后（幂等语义不变）、「写盘」之前（不浪费 IO）。
 		const persistentTaskId = typeof dispatch.taskId === "string" ? dispatch.taskId : "";
-		if (persistentTaskId.startsWith("lms-") || persistentTaskId.startsWith("master-")) {
+		if (isPersistentTabTaskId(persistentTaskId)) {
 			return "skip-persistent-identity";
 		}
 

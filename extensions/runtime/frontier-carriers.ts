@@ -20,6 +20,7 @@ import { normalizeExactPath } from "./recent-scopes.ts";
 import {
 	classifyTabStatus,
 	composeTabStatus,
+	isPersistentTabTaskId,
 	probeSessionFile,
 	readTabResultFile,
 	readTabState,
@@ -255,6 +256,63 @@ export interface TabCarrierInput {
 	result: TabResult | null;
 }
 
+// ── 常驻 local master 识别（autonomy 越界修法，2026-10-19）────────
+
+/**
+ * 是否「常驻 local master / master 派发」tab（`lms-*` / `master-*`）。
+ *
+ * 判据本身是共享的（`tab-runs.ts::isPersistentTabTaskId`，**唯一真相源**）：
+ * `lms-` 前缀的唯一产生点 = `runtime/local-master-launch.ts` `ensureTaskId(scope)`。
+ * 本模块只负责把它翻成 autonomy 语义（见 `computeNeedsHuman`）。禁止在此重写前缀字面量。
+ */
+export function isResidentLocalMasterTab(rec: Pick<TabDispatchRecord, "taskId">): boolean {
+	return isPersistentTabTaskId(rec.taskId);
+}
+
+/**
+ * carrier `needsHuman` 计算（**唯一计算点**，v1 与 graph 两源共用 reduceTabCarrier）。
+ *
+ * ## 为什么普通 tab 用 `reclaim === "awaitingInput"`
+ * `classifyForReclaim` 把 `phase==="waiting"` 归 `awaitingInput`（tab-runs-runtime.ts:547）——
+ * 对**任务 tab** 这是对的：这回合跑完了、在等主会话下一步。**该函数是共享的，不得为本修复改动**
+ * （`reclaim-tabs` / `tab-status` 依赖同一语义，见计划 §3.1）。
+ *
+ * ## 为什么常驻 tab 必须收紧（2026-10-19 越界事故）
+ * local master 的**正常态就是 `waiting`（等信）**，它有自己的 per-repo scope wake（30s tick）负责唤醒，
+ * **不由 autonomy 代管**（用户裁决：autonomy 只为主会话服务）。旧判据把它的「空闲」读成
+ * 「用户在等人决策」⇒ `needs_user` 边沿 ⇒ 拉起 `l2-*` ⇒ 无活可干 ⇒ 又回 waiting ⇒ **无限回声**。
+ *
+ * 常驻 tab 的 needsHuman 收紧为：
+ *   `gate === "awaiting"`  —— 仓级载体，与本收紧**正交**（仓在等人工与 tab 相位无关，不受影响）
+ *   `∨ stop === "error"`  —— 本回合真报错（唯一真实可命中的分支；lms 长期 `stop=stop`/`toolUse`）
+ *   `∨ pidAlive === false` —— 结构性保险。**不得声称它是主要发现手段**：`state.pid` 只在
+ *      `session_start` 写一次、下一回合即被整文件替换丢掉 ⇒ 实测 3/3 lms `pidAlive=null`（计划 §5.2）。
+ *
+ * **不得**加入的判据（审查已核实，勿再犯）：
+ *   - `phase === "waiting"`：常驻等待是常态，这正是回声源。
+ *   - `resultMissing`：carriers 层语义是「无 result 文件」（tab-runs.ts `composeTabStatus` 无条件 true），
+ *     而 local master 明令不调 tab-finish、兜底写入器对常驻身份豁免（`tab-runs-runtime.ts`）
+ *     ⇒ 真实 lms 恒 true ⇒ 等于没改。
+ *   - `idleMs` 超阈值：常驻等待数小时是常态，任何阈值都会成为新的边沿源（审查明确不建议）。
+ *
+ * 真「死了」的发现通道不在本判据（正交且已存在）：`local-master-ensure` 的 `owner-pid-dead`（读
+ * scope-liveness 真 pid）、mailbox 积压 → `ws_mail_backlog`。**已知边界**：无周期性 lms liveness 巡检。
+ */
+export function computeNeedsHuman(input: {
+	rec: Pick<TabDispatchRecord, "taskId">;
+	/** classifyForReclaim 结论（仅普通 tab 消费）。 */
+	reclaim: string;
+	gate: GateStatus;
+	stop: string;
+	pidAlive: boolean | null;
+}): boolean {
+	const { rec, reclaim, gate, stop, pidAlive } = input;
+	if (isResidentLocalMasterTab(rec)) {
+		return gate === "awaiting" || stop === "error" || pidAlive === false;
+	}
+	return reclaim === "awaitingInput" || gate === "awaiting";
+}
+
 /**
  * 可见 tab 的 tail-capped 会话探活（复用 probeSessionFile；只读 bucket 内 .jsonl）。
  * 失败→null（调用方降级 unknown）。
@@ -316,6 +374,7 @@ export function reduceTabCarrier(input: TabCarrierInput): TabDetail | null {
 		if (typeof state?.pid === "number" && Number.isFinite(state.pid)) {
 			try { process.kill(state.pid, 0); pidAlive = true; } catch { pidAlive = false; }
 		}
+		const computedNeedsHuman = computeNeedsHuman({ rec, reclaim, gate, stop, pidAlive });
 		let artifact = "-"; let artifactMtime = "?";
 		const cands = result?.reportPath ? [result.reportPath] : [...(result?.artifacts ?? [])];
 		const last = cands[cands.length - 1];
@@ -335,7 +394,7 @@ export function reduceTabCarrier(input: TabCarrierInput): TabDetail | null {
 			artifact, artifactMtime, resultMissing, terminal,
 			openIssues: Array.isArray(result?.openIssues) ? result.openIssues.length : null,
 			summary: truncateSummary(probe?.lastAssistantText ?? state?.lastAssistantText ?? result?.finalText ?? result?.summary ?? ""),
-			needsHuman: reclaim === "awaitingInput" || gate === "awaiting",
+			needsHuman: computedNeedsHuman,
 			gate, overdue: repoOverdue, pidAlive,
 		};
 	} catch { return null; }

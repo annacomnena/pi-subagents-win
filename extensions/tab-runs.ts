@@ -152,6 +152,27 @@ export function defaultTabRunsDir(agentDir: string = join(homedir(), ".pi", "age
 	return join(agentDir, "tab-runs");
 }
 
+/**
+ * 「常驻身份」taskId 前缀（**唯一真相源**，勿在别处自造：三处消费方必须同口径）。
+ *
+ * - `lms-`：local master 常驻 tab，唯一产生点 `runtime/local-master-launch.ts` `ensureTaskId(scope)`
+ *   = `` `lms-${scope}` ``，唯一消费点 `index.ts` `ensureLocalMasterTab`（同处落 dispatch.taskId +
+ *   title `local-master <scope>`）。明令「不要 tab-finish、不要退出」（local-master-launch.ts:244 prompt）。
+ * - `master-`：master 派发类常驻 tab。**当前盘上 0 实例**（successor spawn 不进 tab-runs 账本，
+ *   `index.ts` `clearTabIdentity: true`）；保留是因为 `tab-runs-runtime.ts` 的兜底豁免历来把它当常驻类，
+ *   判据必须一致（否则同一个 tab 在一个消费方是常驻、在另一个不是）。
+ *
+ * 语义：**常驻 = 每次 settle 都是设计行为，不是「忘了回报」**，且它有自己的唤醒机制
+ * （local master 有 per-repo 的 scope wake，30s tick），不由主会话/autonomy 代为判定「空闲=等人」。
+ */
+export const PERSISTENT_TAB_TASK_ID_PREFIXES = ["lms-", "master-"] as const;
+
+/** taskId 是否属于常驻身份（`lms-*` / `master-*`）；非字符串/空 → false（不猜）。 */
+export function isPersistentTabTaskId(taskId: unknown): boolean {
+	if (typeof taskId !== "string" || taskId.length === 0) return false;
+	return PERSISTENT_TAB_TASK_ID_PREFIXES.some((p) => taskId.startsWith(p));
+}
+
 // ── 纯函数：session JSONL 解析（无副作用）────────────────────────
 
 /** 解析单行 JSON；损坏/空行返回 null（与 pi parseSessionEntryLine 一致）。 */

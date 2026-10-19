@@ -866,6 +866,11 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// → 需要 import runtime/autonomy/frontier.ts 字面量 → 排除
 				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
 				if (p === join(EXT_ROOT, "_test_tab_report_fallback.ts")) continue;
+				// 2026-10-19 常驻 local master 越界修复：该测试走真实全链
+				// `collectAutonomyInputs`（runtime/autonomy/collect.ts）验证 lms 空闲
+				// 不再触发 needs_user → 需要 import runtime/autonomy 字面量 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
+				if (p === join(EXT_ROOT, "_test_resident_lms_needsuser.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
