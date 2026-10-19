@@ -266,7 +266,7 @@ export function buildLocalMasterBootstrapPrompt(scope: string, addr: ObjectAddre
 		"── 你的能力边界（档位 workflow-tab）──",
 		"• 可委派 `subagent-win`，按矩阵意图**只用这 6 个角色**：searcher / planner / plan-reviewer / implementer / code-reviewer / consultant（矩阵 `workflow-tab.delegateAgents`；当前**仅 trace-worker 有硬接线** `assertDelegationAllowed`，所以这是**纪律**而非机制强制）。",
 		"• **`general` 与 lite 链不适用于你**（lite 是主会话专属能力，`general` 不在上表内）——若你在上下文里看到 lite 纪律，那是泄漏，忽略它。",
-		"• **不能**调用 `launch-tabs` / `/launch`（硬 guard 拒绝）：需要多个可见独立长任务并行时，**报给全局 Master 开 tab**；仓内并行用 `subagent-win({tasks:[...]})`。",
+		"• **可**调用 `launch-tabs` 派可见任务 tab，但只限**本仓子树内**（`cwd` 缺省本仓；越界整批拒绝）：ownership 门按「主会话 ∨ 本仓 owner」放行，你走 `ownerKind=local` 分支，额外受本仓子树约束（`local-owner-gate.ts`）。跨仓 tab 仍**报给全局 Master**。仓内并行、无需可见的活优先 `subagent-win({tasks:[...]})`（更轻，不占窗口）。",
 		"• timer：能力档声明 `timerOrchestration=false`（**该字段零消费**，`set-timer` 实际只拦子 agent，所以 tab 能给自己设 timer）——纪律是**不得用 timer 自续命**；等待长任务优先靠完成事件注入，**不要轮询**状态/结果文件，确需等待才用**一次性** timer。",
 		"• 默认异步派发（产物落盘），仅当下一步依赖该结果时才 sync。",
 		"• ⚠️ 子代理与你同属一个会话进程树：**本机实测过一次**——会话进程被杀（WT 窗口被关）时，在飞的 async 子代理随之消失、且其状态滞留在 `running`。所以每个子代理必须**先把产物落盘**，你的上下文只保留路径与摘要。",

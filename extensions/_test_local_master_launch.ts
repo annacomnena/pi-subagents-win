@@ -67,6 +67,7 @@ import {
 	judgeLocalMasterEnsureReady,
 	parseLocalMasterEnsureArgs,
 	readLocalMasterEnsureAudit,
+	buildLocalMasterBootstrapPrompt,
 	readLocalMasterLaunchMarker,
 	type LocalMasterEnsureDeps,
 	type LocalMasterEnsureResult,
@@ -1130,6 +1131,36 @@ function wakeLetter(to: ObjectAddress): MessageFrame {
 	ok("M5 同 scope 并发 ensure：恰 1 dispatch + 1 in-flight");
 }
 
+
+// ── K bootstrap prompt 能力边界与 launch-tabs ownership 门一致性 ───────
+//
+// 2026-10-19 教学事故：62b33d3 放开了 local owner 派 tab（local-owner-gate.ts），
+// 但本文件的 prompt 仍写「不能调用 launch-tabs…报给全局 Master 开 tab」。
+// 结果：重启后新建的 local master 读完 prompt 就服从而不派 tab，主会话只好自己派 —— 能力放开了但没人用。
+// K 组锁住这条表述，防止代码与指令再次脱节。
+{
+	const addr = localMasterAddress(localMasterScope(mkCwd()));
+	const prompt = buildLocalMasterBootstrapPrompt("GreenCAD", addr, "G:/code/GreenCAD");
+
+	// K1 必须明确写"可调用 launch-tabs"（正向断言；只断言"没有不能"会漏掉整行被删的情况）
+	assert.match(prompt, /\*\*可\*\*调用 `launch-tabs`/, "K1 prompt 明确授予 launch-tabs（不再是禁止）");
+
+	// K2 旧表述必须消失（负向断言，锁住回归）
+	assert.doesNotMatch(prompt, /不能.*调用 `launch-tabs`/, "K2 旧「不能调用 launch-tabs」表述已清除");
+	assert.doesNotMatch(prompt, /报给全局 Master 开 tab/, "K2b 旧「报给全局 Master 开 tab」已清除");
+
+	// K3 本仓子树约束必须写明（只放开不加约束 = 与 local-owner-gate 的 ownerKind=local 分支不一致）
+	assert.match(prompt, /本仓子树内/, "K3 写明本仓子树约束");
+	assert.match(prompt, /越界.*拒绝/, "K3b 写明越界拒绝");
+
+	// K4 跨仓仍归全局 Master（不能因放开本仓而暗示可以跨仓）
+	assert.match(prompt, /跨仓.*全局 Master/, "K4 跨仓仍报全局 Master");
+
+	// K5 仍保留"不得用 timer 自续命"纪律（本次改动不得顺手删掉既有约束）
+	assert.match(prompt, /不得用 timer 自续命/, "K5 timer 自续命禁令仍在");
+
+	ok("K bootstrap prompt 与 ownership 门一致（K1 可派 / K2 旧表述清除 / K3 本仓约束 / K4 跨仓仍归全局 / K5 timer 禁令）");
+}
 
 // ── 清理（临时 runtimeDir + 目标目录；exit 钩子兑底，S3）──────
 cleanupAll();
