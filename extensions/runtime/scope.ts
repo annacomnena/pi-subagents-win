@@ -408,7 +408,12 @@ export function evaluateScopeWake(opts: ScopeWakeOptions): ScopeWakeDecision {
 		scope: opts.scope,
 		fire: true,
 		letters,
-		prompt: buildScopeWakePrompt(opts.scope, letters, repoCwd, supervision),
+		// 执行者 = `registerScopeWakeLoop` spawn 的 `l2-*` 一次性 tab：**不是**本仓 owner
+		// （`durableSessionIdentity` 是新会话 UUID，不等于 scope owner 的 sessionId）⇒
+		// `executorIsOwner=false`：不渲染「用 supervise-push 推动」的命令式指令。
+		// 注意：这是**当前事实**，不是永久契约——把推动指令重路由给真 owner（local master 自己）
+		// 是另立任务；那条路成功时，这里传 `true`。
+		prompt: buildScopeWakePrompt(opts.scope, letters, repoCwd, supervision, false),
 		repoCwd,
 	};
 }
@@ -456,12 +461,18 @@ export function auditScopeWakeSpawnFailed(scope: string, error: string, stateDir
  * 第四参 `supervision`（2026-10-18 G1-1，断点 ②）：监管块，**复用** `wake.ts::buildSupervisionBlock`
  * / `WakeSupervisionItem`（workstream 路与 scope 路必须同源，否则两路会漂成两份渲染语法）。
  * `undefined` / `[]` ⇒ 输出与三参调用**逐字节相同**（`_test_runtime_supervision_push` 第 11 组冻结断言）。
+ *
+ * 第五参 `executorIsOwner`（2026-10-19 返工，L4 §5.1）：scope 路的执行者是 `l2-*`（一次性 tab），
+ * **不是**本仓 owner ⇒ 推不动任何 tab。因此缺省/`false` 时**不渲染**命令式推动指令
+ * （只保留停滞信息），避免「说能推、实际被拒」的误导。
+ * **缺省值必须是 `false`（fail-closed）**：新增调用方忘传参数时，得到的是「不说做不到的事」。
  */
 export function buildScopeWakePrompt(
 	scope: string,
 	letters: WakeLetter[],
 	repoCwd: string | null,
 	supervision?: WakeSupervisionItem[],
+	executorIsOwner: boolean = false,
 ): string {
 	const shown = letters.slice(0, 10);
 	const replies = shown.filter((l) => l.requiresAck === true && Boolean(l.from) && Boolean(l.to));
@@ -476,7 +487,11 @@ export function buildScopeWakePrompt(
 		);
 	}
 	// 与 buildWakePrompt 同位置：`待处理输入` 行之后、`replyBlock` 之前（两路输出形态一致）。
-	const supervisionBlock = Array.isArray(supervision) && supervision.length > 0 ? buildSupervisionBlock(supervision) : [];
+	// 推动指令是否渲染由 `executorIsOwner` 决定（缺省 false：scope 路执行者 `l2-*` 不是 owner）。
+	const supervisionBlock =
+		Array.isArray(supervision) && supervision.length > 0
+			? buildSupervisionBlock(supervision, { executorIsOwner })
+			: [];
 	const lines = [
 		`你是仓库 ${scope} 的本地 Sub-Master（local master v1 唤醒，有终态的一次执行）。`,
 		repoCwd ? `工作目录：${repoCwd}（本仓）` : null,

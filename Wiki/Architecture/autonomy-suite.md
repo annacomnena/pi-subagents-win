@@ -16,6 +16,11 @@ source_paths:
   - extensions/supervision-runtime.ts::pushTemplate
   - extensions/supervision-runtime.ts::supervisePush
   - extensions/supervision-runtime.ts::registerSupervisionTools
+  - extensions/supervise-gate.ts::supervisePushGate
+  - extensions/supervise-gate.ts::readLocalOwnerAttachment
+  - extensions/one-shot-tab.ts::spawnOneShotTab
+  - extensions/runtime/wake.ts::normRepoPath
+  - extensions/runtime/wake.ts::repoPathMatches
   - extensions/supervision-runtime.ts::countPushes
   - extensions/supervision-runtime.ts::clampMaxPushes
   - extensions/runtime/wake.ts::buildWakePrompt
@@ -29,6 +34,7 @@ source_paths:
   - extensions/runtime/frontier-carriers.ts#L338
   - extensions/index.ts#L2543
   - extensions/_test_runtime_supervision_push.ts
+  - extensions/_test_supervise_gate.ts
   - extensions/runtime/supervision.ts::setSupervisionStatus
   - extensions/runtime/supervision.ts::setSupervisionOptOut
   - extensions/runtime/supervision.ts::autoRegisterDispatchedTabs
@@ -209,10 +215,11 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - 每条调 `setSupervisionStatus({ runId, status:"active", setBy, fromDispatch:true })`，`setBy = master:<sessionId>`；
 - **整体 never-throw**：单条写失败继续处理其余条目，失败只 `deps.audit(...)` 记一行（注入的 audit 自身抛异常也被 catch 住，不外泄给派发）；返回 `{registered, failed}`。
 
-两个接线点（同一原因：这两条派发都会产生 tab runId）：
+三个接线点（同一原因：这三条派发都会产生 tab runId）：
 
 - `extensions/index.ts` 的 `launch-tabs` tool execute（`const ok = results.filter(...)` 之后）：返回文本追加 `监管: N 个已自动登记（用 /supervise off <runId> 可取消，/supervise optout <runId> 可静默留档）`；`isError` 仍**只**由 `ok === 0` 决定——监管写失败**不得**把派发变成 error。
 - `extensions/index.ts` 的 `dispatchTab` 闭包（`master-dispatch` 通道，`masterDispatchLaunch` 之后）：仅 `!res.stale && !res.error && res.runId` 才登记；返回形状不变；`extensions/master-tools.ts` 的成功文本同样提示「监管: 已自动登记」。
+- **`extensions/one-shot-tab.ts::spawnOneShotTab`**（2026-10-19 补，`wake-*` / `l2-*` 一次性 wake tab 共用）：**spawn 成功之后**（`if (result.error) return` 之后）登记，与上面两处同语义——失败派发（已回写 `launch_failed`）不建账本。不补这一步，即使 ownership 门放行了本仓 owner，七门之 `no-mandate` 仍会先拒（`supervise-push` 推不动 `l2-*`）。
 
 **尚未接自动登记的派发路径**（已知缺口，勿声称已覆盖）：`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab。
 
@@ -277,7 +284,15 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
   - **为什么这样切**：`STALLED` 的定义就是 idle 超阈值 ⇒ 必然 `waiting` ⇒ 自动档必须是 `abort`；而 `steer` 档带 `deliverAs:"steer"`（等下一个 tool 边界），对已 settled 的 tab **永不起新 turn** ⇒ 缺省 `steer` 会让工具对它唯一的目标场景完全无效。
   - **C.3「绝不自动升级」的解读边界**（关键，勿再误读）：C.3 原文约束的是**不打断正在运行的工具**——这一条已由 `tool-use` 门机械保证（`working ∧ stop=toolUse` ⇒ 拒绝，根本不会推），**与档位选择无关**。它**不**约束「idle tab 也不许用 abort」：idle tab 没有 run 可打断，abort 只是无害前置（`steer-consumer.ts`：abort → 等 idle ≤30s → 发消息起新 turn）。把「缺省 steer、abort 必须显式传入」当成 C.3 的要求是**误读**。
 - **账本推动记录**：`push = {at, mode, steerId, reason:"stalled", outcome:"pending"}`——`mode`/`reason` 是 `SupervisionPushRecord` 的**运行时超集**（读侧宽容，v1 形状不变）。
-- **身份门**：`registerSupervisionTools` 的 execute 开头两道拦截——`isSubagent()` → 拒；`getTabRunId()` 存在（标签页会话）→ 拒。tab 不得推动别的 tab，也不得自我推动（与 `/supervise` 手动运维命令同口径）。
+- **身份门**（2026-10-19 方案 C 修订，`plans/20261019_supervise_push_gate_task_brief.md`）：`execute` 层**三档 fail-closed**，判定体在纯函数 `extensions/supervise-gate.ts::supervisePushGate`（零 IO；`readLocalOwnerAttachment(cwd)` 是唯一 IO 入口）：
+  - **子 agent**（`isSubagent()`）⇒ 拒（`subagent`）。
+  - **`getTabRunId()` 为空（主会话）⇒ 直接 `via:"main"` 放行，不进 ownership 门、不读 attachment/dispatch**（R3 硬规则：主会话路径逐字节不变；否则 `masterDispatchGate` 的 `unknown-session` 分支会误伤「拿不到 `ctx` 的主会话」）。
+  - **tab 且是本仓 local owner**（`sessionId === durableSessionIdentity(ctx)` + `masterDispatchGate` 的**双读 generation fencing**）⇒ 放行 `via:"owner"`，但**加目标约束**：目标 `dispatch.cwd` 必须落在本仓子树内（`runtime/wake.ts::repoPathMatches`，与监管块 repo 过滤**同一函数**）；目标是自身 ⇒ `self-push`，他仓/无仓载体 ⇒ `cross-repo`。
+  - **tab 非 owner**（普通 workflow tab / `l2-*` / `wake-*`）⇒ 拒（`tab-session`）。
+  - **注入地址必须是本仓 local**：`readAttachment(localAgentFromCwd(ctx.cwd))`。**禁止** `masterAddress()`（全局）——实盘全局 `agent://master_default` 与 `agent://master_local_<scope>` 是**不同 sessionId**，注入全局地址会让 owner 判定恒假 ⇒ 改门等于没改。
+  - `cross-repo` / `self-push` / `tab-session` / `generation-mismatch` / `unknown-session` / `subagent` 是 **execute 层**拒绝：**不进**七条 `PushRejectReason`、**不进** `SupervisePushResult`，但**写 audit 行**（`supervision-push reject-gate …`）。
+  - **能力边界**：本门修好的是 local master 的**推动能力**，**不是** autonomy 链的自动化——今天两条 wake 路的执行者（`wake-*` / `l2-*` 一次性 tab）**都不是 owner** ⇒ 它们仍推不动任何 tab。把推动指令真正送到 local master 手上属另一任务。
+- **派发即登记覆盖一次性 wake tab**（同批，2026-10-19）：`spawnOneShotTab`（`extensions/one-shot-tab.ts`，`wake-*` / `l2-*` 共用）在 spawn **成功后**调 `autoRegisterDispatchedTabs`。不补这一步，本仓 owner 即使过了 ownership 门也会被七门之 `no-mandate` 先拒。语义与另两处（`dispatchTab` = master-dispatch、`launch-tabs`）一致：**失败的派发不登记**。
 - **审计行**：成功 `supervision-push ok runId=… steerId=… push=N/M remaining=… mode=… task=… idle=…min`；拒绝 `supervision-push reject runId=… reason=… detail=…`；基础设施失败 `supervision-push io-error …`（经 `index.ts` 注入的 `appendAuditLine` 落 `state/autonomy/audit.jsonl`）。
 
 #### ⚠️ 口径差异（刻意，不是 bug）：`frontier` 的 `BLOCKED_USER` ≠ `supervise-push` 的 `needs-human`
@@ -319,14 +334,28 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 #### 相关字段与接线
 
-- `extensions/runtime/wake.ts::buildWakePrompt(ws, letters, supervision?)`——**第三可选参** `WakeSupervisionItem[]`（`{runId, taskId, repoPath, idleMs, stopReason, summary, pushesUsed, maxPushes}`），非空时插入「停滞监管」块（最多 10 条，每条带 `用 supervise-push({runId:"…"}) 推动` 指令；摘要截断 120）。`undefined` / `[]` ⇒ **输出逐字节不变**（`Array.isArray(supervision) && length > 0` 才调用 `buildSupervisionBlock`）。
-- `extensions/runtime/scope.ts::buildScopeWakePrompt(scope, letters, repoCwd, supervision?)`——**第四可选参**，与上一条**同源**（均调 `wake.ts::buildSupervisionBlock`，`scope.ts#L46` import）且同为「`待处理输入` 行之后、回执块之前」；`undefined` / `[]` 同上逐字节不变。scope 路的派生点在 `evaluateScopeWake`（`scope.ts#L401-L411`）——**claim 成功后**才调 `deriveSupervisionItems`（`no-mail` / `claim-missed` 早退路径零 IO），并传 `repoPath: repoCwd` 做仓过滤。
+- `extensions/runtime/wake.ts::buildWakePrompt(ws, letters, supervision?)`——**第三可选参** `WakeSupervisionItem[]`（`{runId, taskId, repoPath, idleMs, stopReason, summary, pushesUsed, maxPushes}`），非空时插入「停滞监管」块（最多 10 条；摘要截断 120）。`undefined` / `[]` ⇒ **输出逐字节不变**（`Array.isArray(supervision) && length > 0` 才调用 `buildSupervisionBlock`）。
+- `extensions/runtime/wake.ts::buildSupervisionBlock(items, opts?)`——**渲染层**，`opts.executorIsOwner`（缺省 `false`，fail-closed）决定是否渲染「`用 supervise-push({runId:"…"}) 推动`」那一行：
+  - 停滞信息行（`已停 Nmin` / `stop=` / `push=x/y` / 摘要）**恒渲染**；
+  - `executorIsOwner === true` ⇒ 追加上推动指令行；`false` / 缺省 ⇒ 只有停滞信息。
+  - 原因：执行者若不是本仓 owner（今天两条 wake 路的 `wake-*` / `l2-*` 都是一次性 tab），那条指令必被 execute 层 ownership 门拒 ⇒ 是「说能推、实际被拒」的误导。
+  - **`buildWakePrompt`（workstream 路）显式传 `{executorIsOwner: true}`** 以保持逐字节不变；该路的重路由属独立任务。
+- `extensions/runtime/scope.ts::buildScopeWakePrompt(scope, letters, repoCwd, supervision?, executorIsOwner = false)`——**第四可选参**（监管块）+ **第五参 `executorIsOwner`**（缺省 `false`，fail-closed）。与 `buildWakePrompt` **同源**（均调 `wake.ts::buildSupervisionBlock`，`scope.ts#L46` import）且同为「`待处理输入` 行之后、回执块之前」；`undefined` / `[]` 与三参调用**逐字节相同**。scope 路的派生点在 `evaluateScopeWake`（`scope.ts#L401-L416`）——**claim 成功后**才调 `deriveSupervisionItems`（`no-mail` / `claim-missed` 早退路径零 IO），并传 `repoPath: repoCwd` 做仓过滤。
+- **scope 路当前传 `executorIsOwner=false`**：执行者是 `registerScopeWakeLoop` spawn 的 `l2-*` 一次性 tab，`durableSessionIdentity` 是新会话 UUID，不等于 scope owner 的 sessionId ⇒ 推不动。这是**当前事实**，不是永久契约：若将来把推动指令重路由给真 owner，该处改传 `true`。
 - **派生接线（生产已有两个调用方）**：`wake.ts::deriveSupervisionItems`（读监管账本 + tab 账本 + tab result）产出条目后传入 prompt——workstream 路在 `evaluateOne` 的 fire 分支传入 `buildWakePrompt(ws, letters, supervision)`；**scope 路在 `evaluateScopeWake` 的 claim 成功后**传入 `buildScopeWakePrompt(scope, letters, repoCwd, supervision)`（`scope.ts#L401-L411`），并带 `repoPath: repoCwd` 做仓过滤。取两类：`stopReason === "error"`（BLOCKED_USER 里唯一该被推的子类）与 STALLED 形状（`phase === "waiting" ∧ idleMs > thresholdsOf(entry).pushMs ∧ stop ∉ {toolUse,error,aborted}`）；跳过 `status !== "active"` / `optOut === true` / `view.terminal === true`（后者必被 `terminal` 门拒，不进 prompt 以免噪声）。**整段 never-throw**：读失败/为空 ⇒ `undefined`（保持逐字节不变的既有保证）。
 - **依赖方向（不得反向）**：`wake.ts` 只 import 纯库 `./supervision.ts`（`listOpenSupervisionEntries` / `thresholdsOf`）+ `../tab-runs.ts`；**不得** import `../supervision-runtime.ts`（Pi tool 层，import `@earendil-works/pi-coding-agent` / `pi-tui` / typebox，反向会把它拖进 wake 的依赖闭包）。已实测无循环依赖。
 - **双写登记点**：`wake.ts::pushesThisEpochOf` / `WAKE_PUSH_MAX_DEFAULT` / `clampPushMax` 与 tool 层 `supervision-runtime.ts::countPushes` / `SUPERVISION_MAX_PUSHES` / `clampMaxPushes` **同口径双写**（各仅两行逻辑，双写成本低于破层成本）。**改动任一侧必须同步另一侧**——这是唯一登记点。
 - `extensions/tab-runs.ts::TabState.currentToolStartedAt?: string`（ISO 时刻）：**写入** `tool_execution_start`；**清除** `tool_execution_end` / `agent_settled` / `session_shutdown`（`tab-runs-runtime.ts:96-107/140`）。配套新增 `tool_execution_end` 监听（原先只有 start）⇒ `lastActivityAt` 在**每个工具完成时**也刷新（不只是开始时）。目的：让 HANG 判据（`working ∧ stop=toolUse` 满分 60min）能区分「一个工具跑了 55min」vs「一连串工具各跑几分钟」。
 - `extensions/index.ts:2543`：`collect(registerSupervisionTools(pi, { audit: (line) => appendAuditLine(line) }))`，紧跟 `registerSteerTools`。
-- **验证入口**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`，**76 checks**；第 10 组为「兜底 unconfirmed 不得作为 terminal 证据」10(a)/10(b)，第 11 组为 scope 路 `buildScopeWakePrompt` 第四参冻结/过滤，第 12 组为 end-to-end：frontier → actions → scope mailbox → scope wake prompt）。
+- **验证入口**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`，**77 checks**；第 10 组为「兜底 unconfirmed 不得作为 terminal 证据」10(a)/10(b)，第 11 组为 scope 路 `buildScopeWakePrompt` 第四/五参冻结/过滤/「非 owner 不渲染推动指令」11(a)–11(e)，第 12 组为 end-to-end：frontier → actions → scope mailbox → scope wake prompt）。ownership 门的矩阵与接线回归在 `extensions/_test_supervise_gate.ts`（**48 checks**，含 G1–G9、P0–P6 路径穿越反例、S1–S4 §5.1 fail-closed、W1–W7、R6 跨进程）。
+
+#### `repoPathMatches` / `normRepoPath`：路径穿越防护（安全边界，勿简化）
+
+- **`normRepoPath(p)`**：先 canonicalize（按输入形状显式择一：盘符绝对 / UNC ⇒ `node:path.win32.resolve`；POSIX 绝对 ⇒ `node:path.posix.resolve`），再 反斜杠→斜杠 / 去非根尾斜杠 / 小写。**相对路径（含 `C:repo`）⇒ 返回 `""`（fail-closed，绝不对相对路径调 `resolve`：那会吃 `process.cwd()` 并把相对路径变成某仓内的路径）。**
+- **`repoPathMatches(candidate, filter)`**：**两端**都 `normRepoPath` 后比较；任一端为空 ⇒ `false`。相等 ⇒ 命中；`filter` 是根（`/`、`c:/`、UNC 共享根，即归一后以 `/` 结尾）⇒ 整树子树；否则必须按 `/` 分段前缀（`c:/repo2` **不得**算 `c:/repo` 的子目录）。
+- **为什么必须 canonicalize**：旧实现只做斜杠/尾斜杠/小写 ⇒ `C:/repo/../OtherRepo` 归一成 `c:/repo/../otherrepo`，满足 `startsWith("c:/repo/")` ⇒ `supervise-push` 的跨仓约束被**绕过**（真调用返回 `{ok:true,via:"owner"}`，文件系统实际解析到 `C:/OtherRepo`）。`dispatch.cwd` 是派发时写入的原始字符串，**不保证已规范化** ⇒ 不能指望上游。
+- **两个消费方，同一判据**：`extensions/supervise-gate.ts`（execute 层「本仓子树」目标约束）+ `extensions/runtime/wake.ts::deriveSupervisionItems` 的 `repoPath` 过滤（scope 路）。改动此函数会同时影响两者——这是期望行为，改完必须跑 `_test_supervise_gate` + `_test_runtime_supervision_push` + `_test_runtime_wake` + `_test_local_master`。
+- **已知未覆盖（登记，非缺陷遗漏）**：8.3 短名 / 符号链接 / 硬链接 / 扩展长度前缀的**实体**解析。需要磁盘 IO，做了会把判据变成「盘上存在才判」。字形不同的后果方向是**误拒**（`cross-repo`），不是误放。
 
 #### 未闭合边界（勿当成已完成）
 
