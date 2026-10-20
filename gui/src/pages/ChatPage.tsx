@@ -204,15 +204,21 @@ function ReasoningRowView({ row, animate, streaming }: { row: Extract<Transcript
 	const userLockedRef = useRef(false);
 	/**
 	 * 自动展开/合上（2026-10-20 用户要求「当前执行的思考自动展开，完毕自动合上」）。
-	 * 判定由父级给：`streaming` = 本行是「当前正在流式的那段思考」。
+	 * 判定由父级给：`streaming` = 本行是「当前流式目标 / 刚结束的收尾窗口」。
 	 * 用户一旦手动操作过（userLockedRef），自动逻辑永久让位。
+	 *
+	 * ⚠️ 2026-10-20 修复（用户报「思考没能自动折叠」）：`wasRunning` 原来传的是
+	 * `streaming === true`，与 `isRunning` 同值 ⇒ 流式一结束两者同时变 false ⇒
+	 * 纯函数返回 null（不动）⇒ **展开后永远不合**。
+	 * 正确做法与工具卡一致：用 ref 记住「本行曾经被自动展开过」，结束后才能合上。
 	 */
+	const wasStreamingRef = useRef(streaming === true);
 	useEffect(() => {
-		// 思考没有「running 状态」：用「是否当前流式目标」当作 isRunning，
-		// 从未流式过的历史思考 wasRunning=false ⇒ 不动。
+		const nowStreaming = streaming === true;
+		if (nowStreaming) wasStreamingRef.current = true;
 		const want = autoExpandTarget({
-			isRunning: streaming === true,
-			wasRunning: streaming === true,
+			isRunning: nowStreaming,
+			wasRunning: wasStreamingRef.current,
 			userLocked: userLockedRef.current,
 		});
 		if (want === null) return;
@@ -546,7 +552,7 @@ export function ChatPage() {
 	}, [streaming]);
 	useEffect(() => {
 		if (!streamJustEnded) return;
-		const t = window.setTimeout(() => setStreamJustEnded(false), 4000);
+		const t = window.setTimeout(() => setStreamJustEnded(false), 1500);
 		return () => window.clearTimeout(t);
 	}, [streamJustEnded]);
 	const streamingRowId =

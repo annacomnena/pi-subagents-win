@@ -54,6 +54,20 @@ const ok = (name: string): void => {
 	ok("边界：error 与 done 同为终态 ⇒ 合上");
 }
 
+// ── R4 reasoning 序列：展开后必须能合上（2026-10-20 用户报的 bug）──────
+{
+	// 用户实测场景：思考流式结束 → 应自动折叠。曾因把 wasRunning 传成与 isRunning 同值
+	// ⇒ 结束后两者同时 false ⇒ 返回 null ⇒ 永远不合。下面按「有 ref 记忆」的正确序列断言：
+	const during = autoExpandTarget({ isRunning: true, wasRunning: true, userLocked: false });
+	assert.equal(during, true, "流式中 ⇒ 展开");
+	const after = autoExpandTarget({ isRunning: false, wasRunning: true, userLocked: false });
+	assert.equal(after, false, "流式结束（曾流式过）⇒ 必须合上");
+	// 反例：若 wasRunning 与 isRunning 同值（bug 形状），结束后会得到 null ⇒ 不合
+	const buggy = autoExpandTarget({ isRunning: false, wasRunning: false, userLocked: false });
+	assert.equal(buggy, null, "（bug 形状）同值时结束 ⇒ null ⇒ 不会合上 —— 这正是要避免的");
+	ok("R4 reasoning：流式结束必须合上（wasRunning 必须来自「曾经」而非「当前」）");
+}
+
 // ── 静态断言：接线形状（防止回退成「直接读 Map」或漏掉锁定）────────
 {
 	const src = readFileSync(new URL("./pages/ChatPage.tsx", import.meta.url), "utf8");
@@ -73,6 +87,18 @@ const ok = (name: string): void => {
 
 	// reasoning 自动展开只能来自「流式刚结束」这个信号，不能是「最后一行」这种常驻条件
 	assert.ok(src.includes("streamJustEnded"), "reasoning 自动展开依赖「流式刚结束」信号");
+	// 关键守卫（正向断言，不是字面量黑名单）：reasoning 的 wasRunning **必须**来自 ref。
+	// 曾经写成 `wasRunning: streaming === true` / `wasRunning: nowStreaming`（与 isRunning 同源）
+	// ⇒ 流式一结束两者同时 false ⇒ 返回 null ⇒ 展开后永远不合（用户实测报障）。
+	const reasoningBlock = src.slice(src.indexOf("function ReasoningRowView"), src.indexOf("// ── toolCall"));
+	assert.ok(
+		/wasRunning: wasStreamingRef\.current/.test(reasoningBlock),
+		"reasoning 的 wasRunning 必须来自 wasStreamingRef（「曾经流式过」）",
+	);
+	assert.ok(
+		!/wasRunning:\s*(nowStreaming|streaming)/.test(reasoningBlock),
+		"禁止 reasoning 的 wasRunning 用当前值（会导致结束后永不合上）",
+	);
 	assert.ok(!/streaming !== null && streaming\.kind === "reasoning" && rows\.length > 0/.test(src), "不得再退回「流式中取最后一行」的错误判定");
 	ok("静态：决策走纯函数 + 两处锁定 + 流式结束信号（无回退形状）");
 }
