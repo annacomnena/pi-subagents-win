@@ -299,6 +299,53 @@ writeTabDispatch(runsDir, dispatch);
 	rmSync(runsDirU, { recursive: true, force: true });
 }
 
+// ── pid 持久化 + heartbeatAt（2026-10-20 活体误判僵尸事故的回归锁）────
+//
+// 事故：一次长工具调用期间不写 state ⇒ lastActivityAt 冻住 61min ⇒ 外部把「活着」读成「死了」，
+// abort 后又重复派发同一任务，与原 tab 并发改写同批文件、出现 3 次不可编译中间态。
+// 两个修复的回归锁：
+//   H1 pid 每次写入都带（旧实现只在 session_start 带一次，之后重建对象时丢掉 ⇒ 实测全部 pid 缺失）
+//   H2 heartbeatAt 存在且能刷新（且**不得**篡改 lastActivityAt 的业务语义）
+{
+	const HB = "tab_hb_1";
+	writeTabDispatch(runsDir, { ...dispatch, id: HB, taskId: "hb" });
+	const pi = makeFakePi();
+	registerTabTelemetry(pi, { tabRunId: HB, runsDir, heartbeatMs: 40 });
+
+	// H1：session_start 后有 pid
+	pi.emit("session_start", {}, { sessionManager: { getSessionFile: () => "/tmp/s.jsonl" } });
+	const s1 = readTabState(runsDir, HB);
+	assert.equal(s1?.pid, process.pid, "H1 session_start 必须写 pid");
+
+	// H1b：后续 work 事件**不得**把 pid 丢掉（旧实现的核心缺陷）
+	pi.emit("agent_start", {});
+	const s2 = readTabState(runsDir, HB);
+	assert.equal(s2?.pid, process.pid, "H1b agent_start 之后 pid 仍必须在（旧实现此处已丢）");
+
+	pi.emit("tool_execution_start", { toolCallId: "c1", toolName: "bash" });
+	const s3 = readTabState(runsDir, HB);
+	assert.equal(s3?.pid, process.pid, "H1c tool_execution_start 之后 pid 仍必须在");
+	assert.ok(s3?.currentToolStartedAt, "H1c currentToolStartedAt 应已写入");
+
+	// H2：心跳刷新 heartbeatAt，且不动 lastActivityAt（不把空闲伪装成进展）
+	const actBefore = s3?.lastActivityAt;
+	await new Promise((r) => setTimeout(r, 120));
+	const s4 = readTabState(runsDir, HB);
+	assert.ok(s4?.heartbeatAt, "H2 心跳必须写 heartbeatAt");
+	assert.notEqual(s4?.heartbeatAt, undefined);
+	assert.equal(s4?.lastActivityAt, actBefore, "H2 心跳不得篡改 lastActivityAt（否则把空闲伪装成有进展）");
+	assert.ok(s4?.currentToolStartedAt, "H2 心跳读-改-写不得清掉 currentToolStartedAt");
+
+	// H2b：heartbeatAt 单调前进
+	const hb1 = s4?.heartbeatAt;
+	await new Promise((r) => setTimeout(r, 120));
+	const s5 = readTabState(runsDir, HB);
+	assert.ok(String(s5?.heartbeatAt) > String(hb1), "H2b heartbeatAt 必须单调前进");
+
+	rmSync(join(runsDir, `${HB}.state.json`), { force: true });
+	rmSync(join(runsDir, `${HB}.json`), { force: true });
+}
+
 rmSync(runsDir, { recursive: true, force: true });
 
 console.log("tab-runs-runtime tests passed");

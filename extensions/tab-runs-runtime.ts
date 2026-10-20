@@ -30,6 +30,7 @@ import {
 	listTabDispatches,
 	messageText,
 	readTabDispatch,
+	readTabState,
 	tabResultPath,
 	validateTabResult,
 	writeJsonAtomic,
@@ -181,6 +182,8 @@ export function registerTabTelemetry(
 		runsDir?: string;
 		/** RF-1：兜底写入器的注入点（测试用；缺省真实 fs）。 */
 		finishFallback?: SettlementFallbackIo & { now?: () => Date };
+		/** 心跳间隔 ms（测试用；缺省 30000）。传 0 关闭心跳。 */
+		heartbeatMs?: number;
 	},
 ): void {
 	// 不在此同步早退：CLI flag（--tab-run-id）在扩展加载完成后才就绪，
@@ -201,6 +204,11 @@ export function registerTabTelemetry(
 	let lastStopReason: string | undefined;
 	const usageAccum = emptyTabUsage();
 	const usageSeen = new Set<string>();
+	// 本进程 pid：**每次写入都带**（旧实现只在 session_start 带一次，后续重建对象时丢掉
+	// ⇒ 实测全部 tab state 的 pid 缺失，外部无法进程探活，只能信 lastActivityAt —— 已证明不可靠）
+	const ownPid = process.pid;
+	/** 最近一次心跳时刻；由 heartbeat timer 刷新，writeState 带上（不参与任何业务判据）。 */
+	let lastHeartbeatAt: string | undefined;
 
 	const writeState = (phase: TabState["phase"], turn: TabState["turn"], extra: Partial<TabState> = {}): void => {
 		if (finished) return; // 已终态不再覆盖
@@ -208,16 +216,41 @@ export function registerTabTelemetry(
 		if (!runId) return; // 非标签页进程：身份未就绪/无身份，跳过
 		writeTabState(runsDir, runId, {
 			id: runId,
+			pid: ownPid,
 			phase,
 			turn,
 			terminal: false,
 			lastActivityAt: new Date().toISOString(),
+			heartbeatAt: lastHeartbeatAt,
 			lastAssistantText: lastAssistantText || undefined,
 			lastStopReason,
 			usage: { ...usageAccum },
 			...extra,
 		});
 	};
+
+	// ── 心跳（2026-10-20）─────────────────────────────────────────────
+	//
+	// 一次长工具调用期间不写 state ⇒ `lastActivityAt` 冻住 ⇒ 外部把「活着」读成「死了」。
+	// 实测事故：一个正常工作的 tab 冻结 61min 后被判僵尸并 abort，又重复派发同一任务，
+	// 与原 tab 并发改写同一批文件，造成 3 次不可编译中间态。
+	//
+	// 设计取舍：心跳**只写 `heartbeatAt`**，不动 `lastActivityAt` —— 后者保持「真实业务事件」语义，
+	// 否则心跳会把「空闲」伪装成「有进展」，那就是另一种谎报。
+	// 判死正确口径：`pid` 探活 ∨ `heartbeatAt` 距今 > 90s。
+	const HEARTBEAT_MS = opts?.heartbeatMs ?? 30_000;
+	const heartbeatTimer = HEARTBEAT_MS > 0 ? setInterval(() => {
+		if (finished) return;
+		const runId = resolveRunId();
+		if (!runId) return;
+		lastHeartbeatAt = new Date().toISOString();
+		// 读-改-写：保留既有业务字段，只刷新 heartbeatAt（避免心跳把 currentToolStartedAt 等清掉）
+		const cur = readTabState(runsDir, runId);
+		if (!cur) return;
+		writeTabState(runsDir, runId, { ...cur, pid: ownPid, heartbeatAt: lastHeartbeatAt });
+	}, HEARTBEAT_MS) : undefined;
+	// 不因心跳钉住进程退出
+	(heartbeatTimer as unknown as { unref?: () => void } | undefined)?.unref?.();
 
 	pi.on("session_start", (_event, ctx) => {
 		const sessionPath = ctx.sessionManager?.getSessionFile?.() ?? undefined;

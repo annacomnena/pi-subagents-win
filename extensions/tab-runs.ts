@@ -521,6 +521,28 @@ export interface TabState {
 	pid?: number;
 	lastActivityAt?: string;
 	/**
+	 * 心跳时刻（ISO）：**仅证「进程活着 + 事件循环在跑」**，不证「有业务进展」。
+	 *
+	 * 为什么必须与 `lastActivityAt` 分开（2026-10-20 实测事故）：
+	 * 一次长工具调用（`tool_execution_start` → `tool_execution_end` 之间）不会写 state，
+	 * 期间 `lastActivityAt` 冻住。外部观察者（autonomy frontier / 督导 / global master）
+	 * 因此**无法区分「长工具」与「进程已死」** —— 实测有一个正在正常工作的 tab 因
+	 * `lastActivityAt` 冻结 61min 被误判为僵尸并 abort，随后重复派发同一任务造成并发冲突。
+	 *
+	 * 心跳每 30s 刷新一次；若事件循环被同步调用阻塞，心跳也不触发 —— 这本身是有用信号。
+	 * **判断死亡的正确方式：`pid` 探活 ∨ `heartbeatAt` 距今 > 90s（3 个心跳周期）。**
+	 */
+	heartbeatAt?: string;
+	/**
+	 * 标签页进程 pid（写入者自身）。
+	 *
+	 * 注意（2026-10-20 修）：此前只在 `session_start` 那一次写入时带 pid，
+	 * 后续 `writeState` 重建对象时把它丢掉 ⇒ 实测**全部** tab state 的 `pid` 均为缺失，
+	 * 外部无法做进程级探活，只能依赖已证明不可靠的 `lastActivityAt`。
+	 * 现改为模块级持有、每次写入都带上。
+	 */
+	pid?: number;
+	/**
 	 * 当前正在执行的工具起始时刻（ISO；P1「HANG 60min 判据」的时基）。
 	 * 写入：`tool_execution_start`；清除：`tool_execution_end` / `agent_settled` / `session_shutdown`。
 	 * 缺失 = 当前没在跑工具（缺省不写，不是空串）。
@@ -767,6 +789,8 @@ export function validateTabState(raw: unknown): { ok: boolean; errors: string[];
 	const sessionPath = str(record.sessionPath);
 	if (sessionPath !== undefined) value.sessionPath = sessionPath;
 	if (typeof record.pid === "number") value.pid = record.pid;
+	const heartbeatAt = str(record.heartbeatAt);
+	if (heartbeatAt !== undefined) value.heartbeatAt = heartbeatAt;
 	const lastActivityAt = str(record.lastActivityAt);
 	if (lastActivityAt !== undefined) value.lastActivityAt = lastActivityAt;
 	const currentToolStartedAt = str(record.currentToolStartedAt);
