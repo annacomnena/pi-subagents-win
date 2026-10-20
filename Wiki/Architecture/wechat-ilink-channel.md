@@ -2,8 +2,12 @@
 title: 微信 iLink 通道
 kind: concept
 status: current
-updated: 2026-10-17
+updated: 2026-10-20
 source_paths:
+  - extensions/runtime/liveness.ts
+  - extensions/runtime-host/channel-supervisor.ts
+  - extensions/runtime-host/server.ts
+  - extensions/_test_wechat_stale_worker.ts
   - scripts/wechat-ilink-probe.mjs
   - plans/0923_wechat_ilink_probe_checklist.md
   - plans/0923_ilink_channel_adapter_plan.md
@@ -114,6 +118,25 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 - Windows **Job Object 整树回收**未做（用显式 kill + pid 文件 + 看门狗替代）。
 - W3 出站回复已实现（W3a 协议发送、W3b 意图触发、W3c daemon 发送/审计、W3d 只读状态投影）；**出站广播**（`reply.mode="broadcast"` 显式开播，master 会话 → 授权收件人 = 绑定 owner ∪ `reply.allowOut`；**缺省 `reply-only` 停播**，0925 P0 复裁）已实现，见 [[#出站广播]]；typing、限流聚合、附件/媒体/解密/Artifact Plane 仍未做。
 - 真网 7 项未测（见本页 Open Questions）。
+
+### worker 存活判据与 /v1/health 通道读数（2026-10-20 事故后契约）
+
+**事故**：worker（pid 7016）死亡后 Windows 立刻把该 pid 复用给系统进程 `Memory Compression` ⇒ 旧判据「这个 pid 活着吗」恒真 ⇒ supervisor 恒 `skipped-stale`、永久拒 spawn ⇒ 通道静默死 **18.5 小时**；同期 supervisor `log` 未接线（`record()` 恒 no-op）⇒ 零日志，`/v1/health` 里也没有任何通道字段。
+
+**契约（现行）**：
+
+1. **pid 存活 ≠ 是我们的 worker**。`waitStaleWorkerGone()` 在 6s 有界等待后做**身份判定**（`extensions/runtime/liveness.ts::classifyStaleWorker`，纯函数三态）：
+   - 同代（`worker.json.daemonEpoch === 监督器 daemonEpoch`）⇒ `ours-alive` ⇒ 返回 pid，保持 fail-closed（防双跑）；
+   - 跨代 + 映像名**确定非 node**（`probeProcessImageName` 读 tasklist 第一列）⇒ `reused` ⇒ 放行 spawn；
+   - 跨代 + `node(.exe)` + 心跳新鲜（`state.json.updatedAt`\|`lastPollAt` < 5min）⇒ `ours-alive`；心跳陈旧/未知 ⇒ `reused`；
+   - 探针不可用/异常 ⇒ `unknown` ⇒ 不猜，fail-closed。
+2. **成本纪律**：tasklist 实测约 5s，`probeProcessImageName` **只在该罕见恢复路径调一次**（稳态 pid 已死不进这里）；`winPidEnumerated` 探针超时 2s→15s（2s 在本机负载高时会 ETIMEDOUT ⇒ fail-closed ⇒ 僵尸 host 永远无法接管）。
+3. **可观测性（R-2）**：`ChannelSupervisor` 现在**必须**传 `log`（否则 `record()` 是 no-op）；`/v1/health` 新增 `wechat` 段（`enabled`/`receiveEnabled`/`credsPresent`/`lastPollAt`/`lastPollAgeMs`/`stale`/`lastError`），读 **worker 自己写的 `state.json`**（独立于 supervisor 自述；`stale` 阈值 `WECHAT_POLL_STALE_MS=5min`，仅在「本该跑」时成立）。
+4. **状态不得自相矛盾**：成功轮询必须 `setStatus("connected", { lastError: null })`——否则 `state.json` 长期同时是 `connected` + 旧 `lastError`。
+
+**验收**：`npm run test:wechat-stale-worker`（4 断言块）、`npm run test:runtime-liveness`、`npm run test:runtime-host-server` 全绿；真入口探针（`ChannelSupervisor.sync()` / `buildHealthView()`）P1–P6 覆盖「跨代+非 node ⇒ spawned」「同代+存活 ⇒ skipped-stale」「跨代+node+心跳新鲜/陈旧」「探针不可用 ⇒ skipped-stale」「health 冷启动不阻塞 + stale 读数」，并对「`verdict === "reused"` 分支」做过变异验证（变异即红于预期断言，还原后 sha256 一致）。
+
+**已知残余（诚实清单）**：①`removePidFile()` 有 daemonEpoch 条件删保护 ⇒ 跨代被判定复用时**旧 `worker.json` 实际不删**，靠后续 spawn 覆盖；若 spawn 未给 pid（仅测试注入）旧文件残留 ⇒ 每 tick 重走 6s 等待 + 一次 tasklist。②回归门里的「接线/可观测性」断言仍是**源码正则**（未走真实入口），真入口覆盖目前只在未提交的探针脚本中。③`gui/src/api/types.ts` 手抄的 `HealthView` 尚未同步 `wechat` 段（服务端加法字段，GUI 侧未消费）。
 
 ## W2 准入：微信文本注入 master（决策 D15，**用户 2026-09-24 明确批准**）
 
