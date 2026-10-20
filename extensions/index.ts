@@ -68,6 +68,7 @@ import {
 } from "./runtime/local-master-launch.ts";
 import { appendAuditEvent, appendAuditLine, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
 import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
+import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2585,6 +2586,10 @@ export default function (pi: ExtensionAPI) {
 
 	// 回报通道：tab 主动回报（tab-report）→ 主会话感知并注入消息
 	collect(registerReportListener(pi));
+
+	// 流式快照（2026-10-20）：message_update → 节流覆盖写 state/streaming/<sid>.json
+	// 让 GUI 能实时看到「正在思考」，而不是等 message_end 落盘后一次性出现。
+	collect(registerStreamingSnapshot(pi));
 
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
