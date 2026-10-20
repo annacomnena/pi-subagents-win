@@ -16,6 +16,7 @@ import type {
 	InteractionsResponse,
 	RuntimeSnapshot,
 	SessionsBody,
+	StreamingSnapshot,
 	TimelineResponse,
 	TranscriptBody,
 	UploadResult,
@@ -257,6 +258,13 @@ export const api = {
 		const q = after !== undefined && after > 0 ? `?after=${after}` : tail !== undefined && tail > 0 ? `?tail=${tail}` : "";
 		return fetchJson<TranscriptBody>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${q}`, undefined, 8000);
 	},
+
+	/**
+	 * GET /v1/streaming/:sessionId：流式快照（节流 ~6.7 次/秒写入）。
+	 * 404 = 该会话当前没在流式（正常态，不是错误）。
+	 */
+	streaming: (sessionId: string): Promise<FetchResult<StreamingSnapshot>> =>
+		fetchJson<StreamingSnapshot>(`/v1/streaming/${encodeURIComponent(sessionId)}`, undefined, 4000),
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
 	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；

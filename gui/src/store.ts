@@ -21,6 +21,7 @@ import type {
 	RuntimeSnapshot,
 	SessionSummary,
 	TimelineItem,
+	StreamingSnapshot,
 	TranscriptHead,
 	TranscriptRow,
 } from "./api/types";
@@ -193,6 +194,8 @@ interface GuiState {
 	chatHasOlderBySession: Record<string, boolean>;
 	/** 会话 → 当前已请求的尾部行数（「加载更早」时翻倍）。 */
 	chatTailBySession: Record<string, number>;
+	/** 当前会话的流式快照（节流 ~6.7 次/秒；null = 没在流式）。L2/UX 2026-10-20。 */
+	chatStreaming: StreamingSnapshot | null;
 	chatConn: StreamState;
 	/** bump → useEventStream 立即重订阅（snapshot/resync 全量重拉完成后）。 */
 	chatResyncKey: number;
@@ -207,6 +210,8 @@ interface GuiState {
 	openChatSession: (id: string) => Promise<void>;
 	/** 首屏/全量重拉：缺省只取最新 TAIL_FIRST 行（`?tail=`）；传 tail 显式放大（「加载更早」）。 */
 	reloadChatSession: (id: string, tail?: number) => Promise<void>;
+	/** 拉一次流式快照（404 = 没在流式 → 置 null，不算错误）。 */
+		pollChatStreaming: (id: string | null) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
@@ -410,6 +415,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatSeqBySession: {},
 	chatHasOlderBySession: {},
 	chatTailBySession: {},
+	chatStreaming: null,
 	chatConn: "idle",
 	chatResyncKey: 0,
 	chatOutbox: {},
@@ -469,6 +475,28 @@ export const useGui = create<GuiState>((set, get) => ({
 				},
 			},
 		});
+	},
+
+	/**
+	 * 拉一次流式快照。
+	 *
+	 * 404 是**正常态**（会话没在流式）⇒ 置 null，不 markDown（否则健康度会被误判）。
+	 * 其他错误同样置 null：流式预览失败不该影响主数据面。
+	 */
+	pollChatStreaming: async (id) => {
+		if (id === null) {
+			if (get().chatStreaming !== null) set({ chatStreaming: null });
+			return;
+		}
+		const r = await api.streaming(id);
+		if (!r.ok) {
+			// 404（not-streaming）/ 网络失败：都当「没在流式」
+			if (get().chatStreaming !== null) set({ chatStreaming: null });
+			return;
+		}
+		// 防串台：响应必须属于当前会话
+		if (r.data.sessionId !== id) return;
+		set({ chatStreaming: r.data });
 	},
 
 	pollChatSessions: async () => {

@@ -45,6 +45,7 @@
 		"test:runtime-transcript": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_runtime_transcript.ts",
     "test:transcript-tail": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_transcript_tail.ts",
     "test:chat-collapse": "node --experimental-strip-types ./gui/src/_test_chat_collapse_state.ts",
+    "test:streaming-snapshot": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_streaming_snapshot.ts",
 		"test:session-title": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_title.ts",
 		"test:session-pin": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_pin.ts",
 		"test:recent-scopes": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_recent_scopes.ts",

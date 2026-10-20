@@ -439,6 +439,26 @@ export interface TranscriptBody {
 	hasOlder?: boolean;
 }
 
+/**
+/**
+ * 流式快照（2026-10-20，`GET /v1/streaming/:sessionId`）。
+ *
+ * pi 扩展在 `message_update` 时**节流覆盖写**（150ms ≈ 6.7 次/秒），GUI 轮询后渲染
+ * 「正在思考 / 正在输出」临时块；`message_end` 后快照被删，正式行从 transcript 投影进来替换。
+ * 不存在（404）或陈旧（>60s）时 GUI 视为「没在流式」。
+ */
+export interface StreamingSnapshot {
+	version: 1;
+	sessionId: string;
+	kind: "reasoning" | "text";
+	/** 当前段落的累积文本（快照，非最终值）。 */
+	text: string;
+	at: string;
+	pid: number;
+	/** 服务端算好的年龄（ms），GUI 不再自己算时钟差。 */
+	ageMs: number;
+}
+
 // ── G6-P1：WS /v1/events/stream 帧契约（runtime-host/ws.ts 手抄）──
 
 export interface StreamSubscribeMsg {

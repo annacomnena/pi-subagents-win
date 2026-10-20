@@ -333,6 +333,30 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	);
 }
 
+	/**
+	 * 流式临时块（2026-10-20）。
+	 *
+	 * 数据来自 pi 扩展节流覆盖写的快照（150ms ≈ 6.7 次/秒），GUI 200ms 拉一次。
+	 * 它只是**预览**：`message_end` 后快照消失，正式行从 transcript 投影进来替换。
+	 *
+	 * 动画填平：文本本身按 200ms 跳变，用一个呼吸光标 + 渐入遮罩让观感连续（不逐 token 渲染）。
+	 */
+	function StreamingPreview({ snap }: { snap: { kind: "reasoning" | "text"; text: string } }) {
+		const isReasoning = snap.kind === "reasoning";
+		return (
+			<div data-row-id="__streaming_preview__" data-streaming-preview="1" className="py-1">
+				<div className="mb-1 flex items-center gap-2 text-ui-xs text-foreground-subtlest">
+					<span className="inline-block size-1.5 animate-pulse rounded-full bg-accent" />
+					<span>{isReasoning ? "正在思考…" : "正在输出…"}</span>
+				</div>
+				<div className="whitespace-pre-wrap text-ui-sm text-foreground-subtle">
+					{snap.text}
+					<span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-foreground-subtlest align-middle" />
+				</div>
+			</div>
+		);
+	}
+
 /**
  * 行渲染（**memo**）：`applyTranscriptOp` 只替换真正变化的 row 对象（未变行保持同一引用），
  * 故按 `row` 引用 memo 后，一帧只重渲染变化的那一行。
@@ -453,6 +477,7 @@ export function ChatPage() {
 	// 避免「按钮点了没反应」——到顶后不再渲染入口。
 	const hasOlder = useGui((s) => (activeId !== null ? s.chatHasOlderBySession[activeId] === true : false));
 	const tailWant = useGui((s) => (activeId !== null ? (s.chatTailBySession[activeId] ?? 200) : 200));
+	const streaming = useGui((s) => s.chatStreaming);
 	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——
 	// 首屏只画尾部 200 行，贴底时分块补齐更早行。2-4k 行全量同步重挂载实测阻塞主线程
 	// 2s+（真机 CDP 复现），分块后切回首帧 ~100ms。hiddenHead = 头部未渲染行数。
@@ -688,6 +713,8 @@ export function ChatPage() {
 								{outboxEntries.map((e) => (
 									<OutboxStatusLine key={e.commandKey} e={e} />
 								))}
+								{/* 流式预览（2026-10-20）：仅当服务端有该会话的快照（= 正在生成）时显示 */}
+								{streaming !== null && <StreamingPreview snap={streaming} />}
 							</>
 						)}
 					</div>

@@ -438,6 +438,31 @@ function sampleMemory(now: Date, sessionsDir: string): HealthView["memory"] {
 	};
 }
 
+/**
+ * 读「流式快照」（2026-10-20）。由 pi 扩展在 `message_update` 时覆盖写（节流 150ms）。
+ *
+ * never-throw：不存在 / 坏 JSON / 陈旧 → null（GUI 当「没在流式」处理）。
+ * 陈旧阈值 60s：正常流式每 150ms 就刷新一次，60s 不更新只能是进程崩溃留下的残留。
+ */
+const STREAMING_STALE_MS = 60_000;
+
+function readStreamingSnapshot(sessionId: string): Record<string, unknown> | null {
+	const p = join(defaultRuntimeDir(), "state", "streaming", `${sessionId}.json`);
+	try {
+		const raw = readFileSync(p, "utf8");
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (parsed === null || typeof parsed !== "object") return null;
+		if (parsed.sessionId !== sessionId) return null;
+		const at = typeof parsed.at === "string" ? Date.parse(parsed.at) : Number.NaN;
+		if (!Number.isFinite(at)) return null;
+		const ageMs = Date.now() - at;
+		if (ageMs > STREAMING_STALE_MS || ageMs < -STREAMING_STALE_MS) return null; // 陈旧 / 时钟异常
+		return { ...parsed, ageMs };
+	} catch {
+		return null;
+	}
+}
+
 export function buildHealthView(opts: HealthOptions): HealthView {
 	const now = opts.now ?? new Date();
 	const timersDir = opts.timersDir ?? defaultTimersDir();
@@ -1625,6 +1650,18 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					return;
 				}
 				default: {
+					// 流式快照（2026-10-20）：pi 扩展在 message_update 时覆盖写 state/streaming/<sid>.json，
+					// 这里只读快照给 GUI 做「正在思考」的临时块。会话不在流式 → 404（GUI 静默忽略）。
+					// 陈旧保护：快照带 `at`，超过 STREAMING_STALE_MS 视为残留（进程崩溃）→ 404，不让幽灵块常驻。
+					const mstr = /^\/v1\/streaming\/([^/]+)$/.exec(u.pathname);
+					if (mstr !== null) {
+						const sid = decodeURIComponent(mstr[1]);
+						if (!/^[A-Za-z0-9_-]+$/.test(sid)) throw new HttpError(400, { error: "bad-session-id" });
+						const snap = readStreamingSnapshot(sid);
+						if (snap === null) throw new HttpError(404, { error: "not-streaming", sessionId: sid });
+						body = snap;
+						break;
+					}
 					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);

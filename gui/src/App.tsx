@@ -40,6 +40,9 @@ export default function App() {
 	usePoll(() => useGui.getState().pollTimeline(), 6000, activeTab === "timeline" || runtimeOverlay === "master");
 	// 会话为主重构 S2：sessions 轮询自 ChatPage 上移 App（第七路）——左栏会话列表常驻后徽标/状态槽任意页都活
 	usePoll(() => useGui.getState().pollChatSessions(), 6000);
+	// 流式快照（2026-10-20）：pi 扩展节流 150ms 覆盖写，这里 200ms 拉一次 ⇒ 观感 5 次/秒；
+	// GUI 用 CSS 动画填平间隙（不逐 token 渲染）。只在 chat 页且有活跃会话时拉。
+	usePoll(() => useGui.getState().pollChatStreaming(useGui.getState().chatActiveId), 200, activeTab === "chat");
 
 	const Page = PAGES[activeTab];
 
