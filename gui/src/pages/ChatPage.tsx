@@ -187,11 +187,28 @@ function AssistantTextRowView({ row, animate }: { row: Extract<TranscriptRow, { 
 	);
 }
 
-/** reasoning 折叠块：默认收起（streaming/complete 都收起 = zcode Reasoning 口径）。 */
+	/**
+	 * reasoning 折叠块：默认收起（streaming/complete 都收起 = zcode Reasoning 口径）。
+	 *
+	 * 2026-10-20 修「思考展不开」：原实现用 Radix 的**非受控** state。`RowView` 加了 `memo` 之后，
+	 * 行列表一旦重新切片（`hiddenHead` 分块渲染 / 回看滚动），行会**卸载再挂载** ⇒ 非受控 state
+	 * 随之丢失 ⇒ 点开的思考又变回收起，观感就是「点不开」。
+	 * 改为「本地 state + 模块级 Map 持久」（与 toolCall 卡同一范式）：
+	 *   - 本地 state 保证点击立刻重渲染（不依赖父级 re-render）；
+	 *   - Map 保证卸载重挂后展开态还在。
+	 */
 function ReasoningRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "reasoning" }>; animate?: boolean }) {
+	const [open, setOpen] = useState<boolean>(() => reasoningOpenState.get(row.rowId) ?? false);
 	return (
 		<RowShell rowId={row.rowId} animate={animate}>
-			<Collapsible className="w-full">
+			<Collapsible
+				open={open}
+				onOpenChange={(next) => {
+					reasoningOpenState.set(row.rowId, next);
+					setOpen(next);
+				}}
+				className="w-full"
+			>
 				<CollapsibleTrigger className="group/reasoning inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base text-foreground-subtlest transition-colors hover:text-foreground-subtle">
 					<ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/collapsible:rotate-90" />
 					<span className="font-medium">思考过程</span>
@@ -215,15 +232,24 @@ function ReasoningRowView({ row, animate }: { row: Extract<TranscriptRow, { kind
 // 展开态按 rowId 存内存 Map 持久（ToolLayout.tsx#L44-46）；收起延迟卸载 300ms（#L26）。
 
 const toolCardOpenState = new Map<string, boolean>();
+const reasoningOpenState = new Map<string, boolean>();
 
 function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "toolCall" }>; animate?: boolean }) {
-	const isOpen = toolCardOpenState.get(row.rowId) ?? false;
+	/**
+	 * 展开态：本地 state 为**渲染真相**，模块 Map 只做「卸载重挂后恢复」的持久层。
+	 *
+	 * 2026-10-20 修「工具调用合不上」：原来直接 `const isOpen = toolCardOpenState.get(...)`，
+	 * 而 `onOpenChange` 只在 `open === true` 时 setState ⇒ **关闭时没有任何 re-render**。
+	 * 加 `memo` 之前靠父级每 2-6s 的轮询重渲染「顺带」刷回来（观感是慢），加 `memo` 之后
+	 * 父级不再重渲染 ⇒ 永久停在展开态。实测：点开后 h=102，再点 600ms/2.1s 后仍是 open。
+	 */
+	const [open, setOpen] = useState<boolean>(() => toolCardOpenState.get(row.rowId) ?? false);
 	// shouldRenderContent：收起后延迟 300ms 再卸载展开体（Radix closed 动画要读高度变量）
-	const [shouldRenderContent, setShouldRenderContent] = useState(isOpen);
+	const [shouldRenderContent, setShouldRenderContent] = useState(open);
 	const unmountDelayRef = useRef<number | null>(null);
 
 	useEffect(() => {
-		if (isOpen) {
+		if (open) {
 			if (unmountDelayRef.current !== null) {
 				window.clearTimeout(unmountDelayRef.current);
 				unmountDelayRef.current = null;
@@ -242,7 +268,7 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 				unmountDelayRef.current = null;
 			}
 		};
-	}, [isOpen, shouldRenderContent]);
+	}, [open, shouldRenderContent]);
 
 	const isRunning = row.status === "running";
 	const isError = row.status === "error";
@@ -251,10 +277,11 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	return (
 		<RowShell rowId={row.rowId} animate={animate} className="py-0">
 			<Collapsible
-				open={isOpen}
-				onOpenChange={(open) => {
-					toolCardOpenState.set(row.rowId, open);
-					if (open) setShouldRenderContent(true);
+				open={open}
+				onOpenChange={(next) => {
+					toolCardOpenState.set(row.rowId, next);
+					setOpen(next); // 关键：关闭也必须触发重渲染（否则受控 open 永远停在上一次的值）
+					if (next) setShouldRenderContent(true);
 				}}
 				className="w-full flex flex-col"
 				data-zcode-tool-stream-animate="true"
