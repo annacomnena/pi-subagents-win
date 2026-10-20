@@ -69,6 +69,7 @@ import {
 import { appendAuditEvent, appendAuditLine, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "./runtime/autonomy/collect.ts";
 import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
 import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
+import { registerSessionControl } from "./runtime/session-control-register.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2590,6 +2591,9 @@ export default function (pi: ExtensionAPI) {
 	// 流式快照（2026-10-20）：message_update → 节流覆盖写 state/streaming/<sid>.json
 	// 让 GUI 能实时看到「正在思考」，而不是等 message_end 落盘后一次性出现。
 	collect(registerStreamingSnapshot(pi));
+
+	// 会话控制（2026-10-20 停止按钮）：消费 state/session-control/ 的 abort 请求 → ctx.abort()
+	collect(registerSessionControl(pi));
 
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
