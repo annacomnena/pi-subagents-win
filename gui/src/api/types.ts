@@ -55,6 +55,14 @@ export interface HealthView {
 		sampledAt: string;
 		sampleAgeMs: number;
 		rssWarn: boolean;
+		/** 最大会话文件（stat-only 扫描；已知事故元凶是单个 152MB 的 .jsonl）。 */
+		maxSessionFile: {
+			bytes: number;
+			mb: number;
+			sessionId: string | null;
+			relPath: string;
+			warn: boolean;
+		} | null;
 	};
 	generatedAt: string;
 }

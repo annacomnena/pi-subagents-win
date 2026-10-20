@@ -106,6 +106,12 @@ export function RuntimePage() {
 						</dd>
 						<dt className="text-foreground-subtle">堆外</dt>
 						<dd className="text-foreground">{health?.memory ? `${health.memory.externalMb} MB` : "暂无"}</dd>
+						<dt className="text-foreground-subtle">最大会话文件</dt>
+						<dd className={health?.memory?.maxSessionFile?.warn === true ? "text-destructive" : "text-foreground"}>
+							{health?.memory?.maxSessionFile
+								? `${health.memory.maxSessionFile.mb} MB${health.memory.maxSessionFile.warn ? " ⚠️ 超 8MB" : ""}`
+								: "暂无"}
+						</dd>
 						<dt className="text-foreground-subtle">采样</dt>
 						<dd className="text-foreground">
 							<RelTime at={health?.memory?.sampledAt ?? null} className="text-foreground" />

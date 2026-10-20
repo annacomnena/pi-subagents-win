@@ -268,6 +268,21 @@ try {
 				assert.ok(m.sampleAgeMs >= 0 && m.sampleAgeMs < 5000, `采样年龄合理（实得 ${m.sampleAgeMs}）`);
 				assert.equal(typeof m.rssWarn, "boolean", "rssWarn 是布尔");
 				assert.equal(m.rssWarn, false, `测试进程 RSS 不应触发告警（实得 ${m.rssMb}MB）`);
+				// maxSessionFile：只做 stat 扫描（不读内容），指向「哪个会话文件最大」——
+				// 已知事故元凶是单个 152MB 的 .jsonl，此前只能翻目录才发现。
+				assert.ok("maxSessionFile" in m, "memory 带 maxSessionFile 字段");
+				const mf = m.maxSessionFile;
+				if (mf === null) {
+					assert.equal(mf, null, "空 sessionsDir ⇒ maxSessionFile=null（不编造）");
+				} else {
+					assert.equal(typeof mf.bytes, "number", "maxSessionFile.bytes 是数字");
+					assert.ok(mf.bytes > 0, "maxSessionFile.bytes > 0");
+					assert.equal(typeof mf.mb, "number", "maxSessionFile.mb 是数字");
+					assert.ok(Math.abs(mf.mb - Math.round((mf.bytes / 1048576) * 10) / 10) < 0.05, "mb 与 bytes 同源换算");
+					assert.equal(typeof mf.relPath, "string", "maxSessionFile.relPath 是字符串");
+					assert.equal(typeof mf.warn, "boolean", "maxSessionFile.warn 是布尔");
+					assert.equal(mf.warn, mf.mb >= 8, "warn 与阈值 8MB 一致");
+				}
 			}
 		}
 		// T1 有 attachment + 新鲜心跳（14s）→ alive=true；mailbox 计数（拍板④）

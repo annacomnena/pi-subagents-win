@@ -238,6 +238,24 @@ export interface HealthView {
 		sampleAgeMs: number;
 		/** 是否超过告警阈值（当前阈值见 MEMORY_WARN_RSS_MB）。 */
 		rssWarn: boolean;
+		/**
+		 * 最大会话文件（additive，2026-10-20）。
+		 *
+		 * 动因：已知事故（GUI 卡顿 / daemon 单请求耗时暴涨）的元凶往往是**单个巨型会话文件**
+		 * （本机实测有一个 152MB 的 .jsonl，其中 151MB 是 1273 条 message 行）。
+		 * 此前只能翻目录才发现，这里直接暴露「多大 + 是谁」，并把体积超阈值标出来。
+		 * 口径：只做 stat 扫描（不读内容），与 /v1/sessions 同源目录；失败 → null（never-throw）。
+		 */
+		maxSessionFile: {
+			bytes: number;
+			mb: number;
+			/** 会话 id（从文件名解析；解析不出 → null）。 */
+			sessionId: string | null;
+			/** 相对会话根目录的路径（含 cwd 子目录），便于定位。 */
+			relPath: string;
+			/** 是否超过告警阈值（当前阈值见 SESSION_FILE_WARN_MB）。 */
+			warn: boolean;
+		} | null;
 	};
 	generatedAt: string;
 }
@@ -262,6 +280,8 @@ export interface HealthOptions {
 	journalPath?: string;
 	/** mailbox 根目录（缺省 defaultMailboxDir()）。 */
 	mailboxDir?: string;
+	/** 会话目录（缺省 defaultSessionsDir()；`maxSessionFileBytes` 的扫描根，测试注入隔离）。 */
+	sessionsDir?: string;
 	now?: Date;
 }
 
@@ -281,8 +301,113 @@ function iso(d: Date | null | undefined): string {
  */
 const MEMORY_WARN_RSS_MB = 1536;
 
+/**
+ * 单个会话文件的告警阈值（MB）。本机实测最大 152MB（1273 条 message 占 151MB）。
+ * 8MB 是「p99 会话（9.3MB）」量级的分界：超过它，首屏尾窗解析就会到百毫秒级，
+ * 且这类文件只会越长越大（pi 只追加写）。
+ */
+const SESSION_FILE_WARN_MB = 8;
+
+/**
+ * 扫会话目录找最大 .jsonl（stat-only，不读内容）。never-throw：任何 IO 失败 → null。
+ *
+ * 为什么单独做而不是复用 `listPiSessions`：那个函数会**读每个文件的头**（939 个文件 ≈ 25ms 起，
+ * 冷缓存更贵），而 health 每 2s 一次。这里只要 size，用 stat 即可；一次 readdir + N 次 stat。
+ */
+/**
+ * 最大会话文件扫描缓存（2026-10-20）。实测：941 个文件 stat-only = **41-52ms**，
+ * 而 health 每 2s 一次 ⇒ 不加缓存就是新一处 stat 风暴（与刚删掉的 `/v1/sessions` 指纹同类）。
+ *
+ * 失效条件：会话根目录与一层子目录的 `(mtimeMs, size)` 指纹变化 —— pi 新建会话 / 追加写
+ * 都会改目录 mtime（子目录条目变化）或文件 size；两者都不变时最大值不可能变。
+ * 额外加 TTL 兜底（60s）：NTFS 目录 mtime 在某些写模式下可能延迟刷新。
+ */
+const SESSION_SCAN_TTL_MS = 60_000;
+let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["maxSessionFile"] } | null = null;
+
+/** 会话根 + 一层子目录的 `(mtimeMs,size)` 指纹（stat-only，O(目录数) 而非 O(文件数)）。失败 → null。 */
+function sessionsDirFingerprint(sessionsDir: string): string | null {
+	try {
+		const parts: string[] = [];
+		const root = statSync(sessionsDir);
+		parts.push(`.|${root.mtimeMs}|${root.size}`);
+		for (const name of readdirSync(sessionsDir)) {
+			const full = join(sessionsDir, name);
+			let st: Stats;
+			try {
+				st = statSync(full);
+			} catch {
+				continue;
+			}
+			if (st.isDirectory()) parts.push(`${name}|${st.mtimeMs}|${st.size}`);
+		}
+		return parts.join(String.fromCharCode(10));
+	} catch {
+		return null;
+	}
+}
+
+function largestSessionFileCached(sessionsDir: string, now: Date): HealthView["memory"]["maxSessionFile"] {
+	const fp = sessionsDirFingerprint(sessionsDir);
+	const nowMs = now.getTime();
+	if (
+		sessionScanCache !== null &&
+		fp !== null &&
+		sessionScanCache.fp === fp &&
+		nowMs - sessionScanCache.at < SESSION_SCAN_TTL_MS
+	) {
+		return sessionScanCache.value;
+	}
+	const value = largestSessionFile(sessionsDir);
+	if (fp !== null) sessionScanCache = { fp, at: nowMs, value };
+	return value;
+}
+
+function largestSessionFile(sessionsDir: string): HealthView["memory"]["maxSessionFile"] {
+	let best: { bytes: number; relPath: string } | null = null;
+	const walk = (dir: string, rel: string, depth: number): void => {
+		let entries: string[];
+		try {
+			entries = readdirSync(dir);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			const full = join(dir, name);
+			let st: Stats;
+			try {
+				st = statSync(full);
+			} catch {
+				continue; // 扫描间隙消失的条目：跳过（与 listPiSessions 容错一致）
+			}
+			if (st.isDirectory()) {
+				if (depth < 1) walk(full, `${rel}${name}/`, depth + 1); // 与 listPiSessions 同构：只下一层
+				continue;
+			}
+			if (!name.endsWith(".jsonl")) continue;
+			if (best === null || st.size > best.bytes) best = { bytes: st.size, relPath: `${rel}${name}` };
+		}
+	};
+	try {
+		walk(sessionsDir, "", 0);
+	} catch {
+		return null;
+	}
+	if (best === null) return null;
+	const mb = Math.round((best.bytes / (1024 * 1024)) * 10) / 10;
+	// 文件名形状 `<ts>_<sessionId>.jsonl`；解析不出就给 null（不猜）
+	const m = /_([0-9a-f-]{36})\.jsonl$/i.exec(best.relPath);
+	return {
+		bytes: best.bytes,
+		mb,
+		sessionId: m !== null ? m[1]! : null,
+		relPath: best.relPath,
+		warn: mb >= SESSION_FILE_WARN_MB,
+	};
+}
+
 /** 采样进程内存（never-throw：memoryUsage 本身不抛，这里只是防御性包裹）。 */
-function sampleMemory(now: Date): HealthView["memory"] {
+function sampleMemory(now: Date, sessionsDir: string): HealthView["memory"] {
 	const sampledAt = iso(now);
 	let rss = 0;
 	let heapUsed = 0;
@@ -309,6 +434,7 @@ function sampleMemory(now: Date): HealthView["memory"] {
 		// 将来若改成缓存采样（避免每 2s 都调 memoryUsage），这里会自然变成非零年龄。
 		sampleAgeMs: 0,
 		rssWarn: rssMb >= MEMORY_WARN_RSS_MB,
+		maxSessionFile: largestSessionFileCached(sessionsDir, now),
 	};
 }
 
@@ -401,7 +527,7 @@ export function buildHealthView(opts: HealthOptions): HealthView {
 		sessionHeartbeats,
 		journalTail,
 		mailboxPending,
-		memory: sampleMemory(now),
+		memory: sampleMemory(now, opts.sessionsDir ?? defaultSessionsDir()),
 		generatedAt: iso(now),
 	};
 }

@@ -23,6 +23,8 @@
 
 - **内存可观测（2026-10-20，AGENTS.md R-2 落地）**：`/v1/health` 新增 `memory` 段（`rssMb/heapUsedMb/heapTotalMb/externalMb/sampledAt/sampleAgeMs/rssWarn`，告警阈值 1536MB）。此前 health **一个内存字段都没有** —— 本机曾因内存耗尽崩过一次并致 pi 包损坏 4 次，而异常完全不可观测。按 R-2.2 一并给「采样年龄」而不是只给绝对值。GUI 运行时页新增「进程内存」卡片（超阈值标红）。验证：`test:runtime-host-server` T1b（字段存在/量纲/rss≥heapUsed/年龄合理/不误告警）；线上实测 `rssMb 157.6 / heapUsed 45.8 / external 13`。
 
+- **health 增 `maxSessionFile`（2026-10-20）**：`/v1/health` 的 `memory` 段新增「最大会话文件」（`bytes/mb/sessionId/relPath/warn`，阈值 8MB）。动因：已知卡顿事故的元凶是**单个 152MB 的 .jsonl**（其中 151MB 是 1273 条 message 行），此前只能翻目录才发现。实现为 **stat-only 扫描 + 按目录 mtime/size 指纹缓存（TTL 60s）** —— 直接扫 941 个文件实测 **41-52ms**，而 health 每 2s 一次，不加缓存就是新一处 stat 风暴（与刚删掉的 `/v1/sessions` 指纹同类）；缓存后热路径 **18ms**（加字段前 14ms）。GUI 运行时页同步显示并标红。验证：`test:runtime-host-server` T1b 扩展（字段存在/量纲同源/warn 与阈值一致/null 不编造）；线上实测 `maxSessionFile.mb=152.4 warn=true`。
+
 ## [0.8.0] — 2026-10-17
 > 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
 
