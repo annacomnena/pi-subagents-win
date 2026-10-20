@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 58 | P1 | **ChatPage 虚拟化时间线（独立任务，未开工）**：只渲染视口内行，替掉「首屏 200 行 + 贴底分块补齐」；需处理滚动锚定 / 贴底判定 / toolCall 展开高度缓存。动机：CDP 实测首屏长任务 90ms（200 行 DOM + markdown 全渲染） | Item 56/57 | 待排期开工；先写计划再实现（滚动行为回归风险高，需 CDP 复测基线） | 本区 |
 | 57 | P1 | **OpenCode v2 借鉴评估 + 读取路径常数成本三项**（删 `/v1/sessions` 指纹 stat 风暴 130-146ms/拍；`validateStreamGen` 整文件 sha1 → 采样指纹；WS 订阅无新行快路）。sessions 145-178→44-46ms、`?after=` 1251→111ms | none | 已落 3 commit；下一候选：虚拟化时间线（首屏长任务 90ms） | 本区 |
 | 56 | P1 | **GUI 读投影提速（两轮）**：①`/v1/sessions` 131ms→**33ms**（会话 head/台账/标题三级缓存）；②`/v1/snapshot` 60-71ms→**17-21ms**、单拍文件读 776→207（wake-state O(n·m) 去重 + journal 一拍一读 + 信箱一拍一扫）。含 T11 失效门 + 2 处变异验证 + 1 个既有时间炸弹修复 | none | 待 `/runtime-host restart` 生效；下一候选：health 的 journal 增量 tail、snapshot/sessions 体积裁剪（契约变更） | 本区 |
 | 55 | P2 | **GUI 默认主题改暖亮 + 顶栏开关 tooltip 精简**（`DEFAULT_THEME` warm-dark→warm-light；`title` 长描述→`主题亮/暗`，当前档/目标档保留在 `aria-label`；含 4 个测试断言同步 + dist 重建） | none | —（已完成；`gui:build` 已重建，刷新页面生效） | 本区 |
@@ -73,6 +74,26 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+
+<a id="item-58"></a>
+### Item 58 - ChatPage 虚拟化时间线（独立任务，登记于 2026-10-20，未开工）
+
+- **来源**：OpenCode v2 借鉴评估（Item 57）里唯一「有价值但未做」的一项；用户明确要求**单独作为一个任务 id 完整做**。
+- **要解决的问题**：当前实现是「首屏只画尾部 200 行（`HISTORY_CHUNK`）+ 贴底分块补齐更早行」。
+  CDP 实测首屏长任务 **90ms**（200 行 DOM + 每行 markdown 渲染）；行数上限随「加载更早」翻倍增长。
+- **目标**：只渲染视口内的行（虚拟化），长任务降到 20-30ms 量级；`rows` 再多也不影响首屏成本。
+- **必须处理的难点（这是它不能顺手做的原因）**：
+  1. **滚动锚定**：行高不定（markdown/工具卡展开高度可变）⇒ 需要「锚点行 + 偏移」维持视觉位置，
+     否则加载更早/收到新行时会跳动。
+  2. **贴底判定**：现有 `atBottom` 语义（贴底才自动补历史/自动滚动）必须保持；虚拟化后
+     「是否贴底」要靠滚动容器的 scrollTop + 估算总高判定。
+  3. **toolCall 展开高度**：`Collapsible` 展开会改变行高 ⇒ 需要 height 测量/缓存
+     （`toolCardOpenState` 已是模块级 Map，可复用）。
+  4. **RowView 已是 memo**（Item 56 的第二轮）：虚拟化必须与 memo 共存，不能把 memo 白做。
+  5. **回归风险**：滚动、贴底、加载更早、跳转到某行、搜索高亮 —— 都要有可复测的基线。
+- **验收标准（拟）**：CDP 复测首屏长任务 < 30ms；2000 行会话滚动不掉帧；「加载更早」后视口位置不跳；
+  现有 `test:gui-*` 全绿 + 新增虚拟化单测（可视窗口计算为纯函数，可 Node 直测）。
+- **状态**：未开工。开工前先写 `plans/*_plan.md` 并做 CDP 基线复测。
 
 <a id="item-57"></a>
 ### Item 57 - OpenCode v2 借鉴评估 + 读取路径常数成本（2026-10-20）

@@ -422,6 +422,8 @@ export function ChatPage() {
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
 	// L2 perf（2026-10-20）：首屏只取最新 TAIL_FIRST 行 ⇒ 若还有更早的行，给一个「加载更早」入口
+	// G1 防御（2026-10-20）：服务端在 want 达到上限时返回 hasOlder=false；这里再兜一层，
+	// 避免「按钮点了没反应」——到顶后不再渲染入口。
 	const hasOlder = useGui((s) => (activeId !== null ? s.chatHasOlderBySession[activeId] === true : false));
 	const tailWant = useGui((s) => (activeId !== null ? (s.chatTailBySession[activeId] ?? 200) : 200));
 	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——

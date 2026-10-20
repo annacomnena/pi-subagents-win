@@ -213,6 +213,26 @@ try {
 		ok("T6 行索引增量：文件追加后 tail 仍与全量等价（head/turnIndex 正确）");
 	}
 
+	// ── T7 hasOlder 到上限必须为 false（G1：按钮永不消失的 bug）──────────
+	{
+		const d = tmpDir("tail-t7-");
+		// 造一个超过 TAIL_ROWS_MAX(5000) 行的会话：每轮 3 行 ⇒ 1800 轮 = 5400+ 行
+		const file = writeSession(d, "big.jsonl", 1800);
+		const full = projectSession(file, 0);
+		assert.ok(full.rows.length > 5000, `夹具需 > 5000 行（实得 ${full.rows.length}）`);
+		// 未到上限：还有更早的行 ⇒ true
+		const small = projectSessionTail(file, { rows: 200 });
+		assert.equal(small.hasOlder, true, "未到上限且有更早行 ⇒ hasOlder=true");
+		// 到上限：服务端不可能再给更多 ⇒ 必须 false（否则 GUI 按钮永久显示 + 每次全量重建）
+		const capped = projectSessionTail(file, { rows: 5000 });
+		assert.equal(capped.rows.length, 5000, "want=5000 ⇒ 返回 5000 行");
+		assert.equal(capped.hasOlder, false, "want 已达上限 ⇒ hasOlder=false（G1）");
+		const over = projectSessionTail(file, { rows: 999999 });
+		assert.equal(over.rows.length, 5000, "want 超上限 ⇒ 夹到 5000");
+		assert.equal(over.hasOlder, false, "want 超上限 ⇒ hasOlder=false（G1）");
+		ok("T7 hasOlder 到上限为 false（G1：修复「加载更早」按钮永不消失）");
+	}
+
 	// ── T4 尾部巨行（窗内 0 行）⇒ 回退全量，结果仍正确 ────────────────
 	{
 		const d = tmpDir("tail-t4-");

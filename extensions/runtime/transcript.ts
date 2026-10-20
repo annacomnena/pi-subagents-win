@@ -1164,6 +1164,13 @@ function readSessionHeaderLine(path: string): Record<string, unknown> | null {
 /** GET /v1/sessions/:id/transcript?tail=N 的投影入口（只读尾部字节窗）。 */
 export function projectSessionTail(path: string, opts: ProjectSessionTailOptions = {}): ProjectSessionTailResult {
 	const want = Math.min(TAIL_ROWS_MAX, Math.max(1, Math.trunc(opts.rows ?? TAIL_ROWS_DEFAULT)));
+	/**
+	 * G1 修复（2026-10-20）：`want` 已被夹到上限时，服务端**不可能再返回更早的行**
+	 * ⇒ `hasOlder` 必须是 false，否则 GUI 的「加载更早」按钮永远不消失，每次点击都会
+	 * 全量重拉 + 整个数组换新引用（memo 全失效、整棵 DOM 重建）。
+	 * 实测（6379 行会话）：修复前 `want=5000 → rows=5000 hasOlder=true`、`want=999999 → 同样 true`。
+	 */
+	const canGiveMore = want < TAIL_ROWS_MAX;
 	if (!existsSync(path)) {
 		return {
 			found: false, sessionId: null, cwd: null, startedAt: null, logEpoch: "", head: 0,
@@ -1196,7 +1203,7 @@ export function projectSessionTail(path: string, opts: ProjectSessionTailOptions
 				return {
 					...proj,
 					rows: sliced,
-					hasOlder: proj.rows.length > want || win.windowStart > 0,
+					hasOlder: canGiveMore && (proj.rows.length > want || win.windowStart > 0),
 					windowStartOffset: win.windowStart,
 				};
 			}
@@ -1235,7 +1242,7 @@ export function projectSessionTail(path: string, opts: ProjectSessionTailOptions
 				return {
 					...proj,
 					rows: sliced,
-					hasOlder: proj.rows.length > want || windowStart > 0,
+					hasOlder: canGiveMore && (proj.rows.length > want || windowStart > 0),
 					windowStartOffset: windowStart,
 				};
 			}
@@ -1248,7 +1255,7 @@ export function projectSessionTail(path: string, opts: ProjectSessionTailOptions
 	return {
 		...full,
 		rows: sliced,
-		hasOlder: full.rows.length > want,
+		hasOlder: canGiveMore && full.rows.length > want,
 		windowStartOffset: 0,
 	};
 }
