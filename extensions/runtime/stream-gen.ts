@@ -35,7 +35,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 
@@ -46,8 +46,15 @@ export interface StreamGenEntry {
 	firstId: string;
 	/** 校验时文件字节数。 */
 	size: number;
-	/** 校验时整文件 sha1 hex。 */
+	/** 内容指纹（fpVersion=2 起为**采样**指纹；旧记录是整文件 sha1）。 */
 	fullHash: string;
+	/**
+	 * 指纹版本（缺省=1 旧记录）。
+	 * v2（2026-10-20）：大文件改用「均匀采样窗口」指纹 —— 原实现每次校验 `readFileSync` 整文件
+	 * 再全量 sha1，实测 152MB 会话 = **~120ms/请求**（每次 GET transcript / WS 订阅都付）。
+	 * 采样后只需读 ~256KB。旧记录（无该字段）首次校验**不 bump**，仅换算法重记。
+	 */
+	fpVersion?: number;
 	/** 代际号（检测到非追加变更 → +1；从 1 起）。 */
 	gen: number;
 	/** ISO 时间（诊断用）。 */
@@ -80,7 +87,15 @@ export function readStreamGenState(path: string = streamGenPath()): StreamGenSta
 				typeof e.fullHash === "string" &&
 				typeof e.gen === "number" && e.gen >= 1 && Number.isInteger(e.gen)
 			) {
-				out[k] = { firstId: e.firstId, size: e.size, fullHash: e.fullHash, gen: e.gen, updatedAt: typeof e.updatedAt === "string" ? e.updatedAt : "" };
+				out[k] = {
+					firstId: e.firstId,
+					size: e.size,
+					fullHash: e.fullHash,
+					gen: e.gen,
+					updatedAt: typeof e.updatedAt === "string" ? e.updatedAt : "",
+					// fpVersion 必须透传：逐字段重建时漏掉它 ⇒ 每次校验都误判「旧记录」而永不 bump
+					...(typeof e.fpVersion === "number" ? { fpVersion: e.fpVersion } : {}),
+				};
 			}
 		}
 		return { version: 1, streams: out };
@@ -117,6 +132,64 @@ function sha1hex(buf: Buffer): string {
 }
 
 /**
+ * 内容指纹（fpVersion=2）：小文件整文件 sha1（精确，保证既有语义）；
+ * 大文件取 8 个 32KB 采样窗（首/尾/均布中间）+ 长度一起哈希 —— 只需读 ~256KB。
+ *
+ * 为什么可替换「整文件 sha1」：本机制要检的是**重写/轮转**（首行变或前缀不再完好），
+ * 这类变更必然触及首窗；而「纯追加」判定用「按旧长度重算同一组采样窗」即可等价验证。
+ * 已知不设防：只改动未被采样覆盖的中段、且 size 与首行都不变（实测 pi 只追加写，不会发生）。
+ */
+const FP_WINDOW = 32 * 1024;
+const FP_SAMPLES = 8;
+const FP_MAX_EXACT = FP_WINDOW * FP_SAMPLES; // ≤256KB 走整文件精确哈希
+
+function contentFingerprint(path: string, length: number): string | null {
+	if (length < 0) return null;
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const h = createHash("sha1");
+		h.update(`len=${length};`);
+		if (length <= FP_MAX_EXACT) {
+			const buf = Buffer.allocUnsafe(length);
+			let read = 0;
+			while (read < length) {
+				const got = readSync(fd, buf, read, length - read, read);
+				if (got <= 0) break;
+				read += got;
+			}
+			h.update(buf.subarray(0, read));
+			return h.digest("hex");
+		}
+		const win = Buffer.allocUnsafe(FP_WINDOW);
+		const span = length - FP_WINDOW;
+		for (let i = 0; i < FP_SAMPLES; i += 1) {
+			const offset = Math.round((i * span) / (FP_SAMPLES - 1));
+			let read = 0;
+			while (read < FP_WINDOW) {
+				const got = readSync(fd, win, read, FP_WINDOW - read, offset + read);
+				if (got <= 0) break;
+				read += got;
+			}
+			h.update(win.subarray(0, read));
+		}
+		return h.digest("hex");
+	} catch {
+		return null;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/**
  * 校验并推进流代际：对比 sidecar 记录与文件现状，检出「保留首行的重写/轮转」等非追加变更
  * → gen+1；纯追加/未变 → gen 不变。返回当前 gen。never-throw（IO 失败落兜底 gen）。
  *
@@ -127,36 +200,43 @@ function sha1hex(buf: Buffer): string {
 export function validateStreamGen(key: string, path: string, firstId: string, opts?: ValidateStreamGenOptions): number {
 	const statePath = opts?.statePath ?? streamGenPath();
 	try {
-		let buf: Buffer;
+		// L2 perf（2026-10-20）：不再 readFileSync 整文件（152MB 会话实测 ~120ms/请求）。
+		// 改为 stat 拿长度 + 采样指纹（小文件仍整文件精确哈希）。
+		let size = 0;
 		try {
-			buf = readFileSync(path);
+			size = statSync(path).size;
 		} catch {
-			buf = Buffer.alloc(0);
+			size = 0;
 		}
-		const size = buf.length;
-		const fullHash = sha1hex(buf);
+		const fullHash = contentFingerprint(path, size) ?? "";
 
 		const state = readStreamGenState(statePath);
 		const entry = state.streams[key];
 		if (entry === undefined) {
-			state.streams[key] = { firstId, size, fullHash, gen: 1, updatedAt: new Date().toISOString() };
+			state.streams[key] = { firstId, size, fullHash, gen: 1, updatedAt: new Date().toISOString(), fpVersion: 2 };
 			writeStreamGenState(state, statePath);
 			return 1;
+		}
+		// 旧记录（整文件 sha1）与新指纹不可比：**不 bump**，只换算法重记（避免升级瞬间全体重拉）。
+		if (entry.fpVersion !== 2) {
+			state.streams[key] = { firstId, size, fullHash, gen: entry.gen, updatedAt: new Date().toISOString(), fpVersion: 2 };
+			writeStreamGenState(state, statePath);
+			return entry.gen;
 		}
 		if (entry.size === size && entry.fullHash === fullHash) return entry.gen; // 未变（不写盘）
 
 		let bump: boolean;
 		if (entry.firstId !== "" && firstId !== entry.firstId) {
 			bump = true; // 首记录 id 变（轮转/重写换首行；epoch 本也变，bump 保持一致）
-		} else if (entry.firstId !== "" && size > entry.size && sha1hex(buf.subarray(0, entry.size)) === entry.fullHash) {
-			bump = false; // 纯追加：前缀逐字节完好
+		} else if (entry.firstId !== "" && size > entry.size && contentFingerprint(path, entry.size) === entry.fullHash) {
+			bump = false; // 纯追加：旧前缀的采样指纹仍吻合
 		} else if (entry.firstId !== "") {
 			bump = true; // 前缀不再完好：等长替换 / 变长重写 / 截断重写（核心检出）
 		} else {
 			bump = false; // 上次无完整记录，无从判代（正常从空增长）
 		}
 		const gen = bump ? entry.gen + 1 : entry.gen;
-		state.streams[key] = { firstId, size, fullHash, gen, updatedAt: new Date().toISOString() };
+		state.streams[key] = { firstId, size, fullHash, gen, updatedAt: new Date().toISOString(), fpVersion: 2 };
 		writeStreamGenState(state, statePath);
 		return gen;
 	} catch {

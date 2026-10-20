@@ -402,49 +402,6 @@ function respondNotModified(res: ServerResponse, etag: string): void {
 	}
 }
 
-/**
- * /v1/sessions 指纹快路的指纹（additive，内部实现细节，不出现在任何响应形状中）。
- * 覆盖 body 的全部外部输入，缺一即误缓存：
- *   1. sessions 目录 stat-only 扫描（与 listPiSessions 同构：顶层 + 一层子目录、仅 *.jsonl、
- *      [rel, mtimeMs, size]）；
- *   2. 台账目录顶层 *.json（排除 .state.json/.result.json，与 loadTabLedger 读集一致；
- *      gc-cleaner 移入 _archived/ 表现为顶层条目消失，天然生效）；
- *   3. registry/attachments 目录（computeSessionPinFlags 的 isMaster/isScopeMaster 输入）；
- *   4. masterProtected sessionId（getMasterStatus 内存读，调用方拼入返回串）。
- * 实测 ~20ms/800 会话 vs 全量重建 ~313ms。纯读 never-throw：任何 IO 失败 → null（调用方
- * 走全量重建路径且该拍不落缓存）。响应 ETag 另算（对最终 JSON 串哈希，含 title 解析结果）。
- */
-function sessionsBodyFingerprint(sessionsDir: string, runsDir: string, registryDir: string, protectedSid: string | null): string | null {
-	const parts: string[] = [];
-	const scan = (dir: string, rel: string, fileFilter: (name: string) => boolean): boolean => {
-		let entries: string[];
-		try {
-			entries = readdirSync(dir);
-		} catch {
-			return false;
-		}
-		for (const name of entries) {
-			const full = join(dir, name);
-			let st: Stats;
-			try {
-				st = statSync(full);
-			} catch {
-				continue; // 与 listPiSessions 容错一致：扫描间隙消失的条目跳过
-			}
-			if (st.isDirectory()) {
-				if (!scan(full, `${rel}${name}/`, fileFilter)) return false;
-			} else if (fileFilter(name)) {
-				parts.push(`${rel}${name}|${st.mtimeMs}|${st.ctimeMs}|${st.size}`);
-			}
-		}
-		return true;
-	};
-	if (!scan(sessionsDir, "", (n) => n.endsWith(".jsonl"))) return null;
-	if (!scan(runsDir, "tab-runs/", (n) => n.endsWith(".json") && !n.endsWith(".state.json") && !n.endsWith(".result.json"))) return null;
-	if (!scan(registryDir, "registry-attachments/", () => true)) return null;
-	return `${parts.sort().join("\n")}\n#protected=${protectedSid ?? ""}`;
-}
-
 // ── /v1/events 增量读（raw 透传，服务端无状态）────────────────────
 
 export interface ReadEventsAfterOptions {
@@ -655,7 +612,6 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	};
 
 	// L2 perf：/v1/sessions 指纹快路缓存（server 实例生命周期；单线程无锁；body 串 ~330KB 量级）。
-	let sessionsCache: { fp: string; bodyJson: string; etag: string } | null = null;
 
 	// G4：POST /v1/commands——唯一命令入口（body 异步读取后同步执行、同步回执；never-throw）
 	// G6-P2：认证补强（fail-closed，同 P1 token）：X-Command-Token header（curl/测试等价通道）
@@ -1417,22 +1373,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// + 标题解析链，诊断实测 ~313ms → ~20ms/拍）；未命中 → 原路径全量构建并更新缓存。
 					// 响应恒带 ETag；If-None-Match 命中 → 304 空体（旧客户端不带该头 → 照常 200 全量）。
 					const sessDir = opts.sessionsDir ?? defaultSessionsDir();
-					const runsDirFp = opts.tabRunsDir ?? tabRunsDir();
-					const registryDirFp = join(defaultRuntimeDir(), "registry", "attachments");
-					let protectedSidFp: string | null = null;
-					try {
-						protectedSidFp = getMasterStatus().attachment?.sessionId ?? null;
-					} catch {
-						protectedSidFp = null;
-					}
-					const fp = sessionsBodyFingerprint(sessDir, runsDirFp, registryDirFp, protectedSidFp);
+					// L2 perf（2026-10-20 第二轮）：**删掉指纹快路**。实测 `sessionsBodyFingerprint` 要 stat
+					// 约 1071(sessions) + 3177(tab-runs) + 21(registry) = **130-146ms/拍**（每 6s 一次，在事件循环上）；
+					// 而它想省掉的「全量重建」在 readHead/标题缓存落地后只要 ~33ms ⇒ 指纹已是**纯开销**，
+					// 还多一类陈旧缓存风险。条件请求（ETag/304）保留：带宽节省不变。
 					let bodyJson: string | null = null;
 					let bodyEtag: string | null = null;
-					if (fp !== null && sessionsCache !== null && sessionsCache.fp === fp) {
-						bodyJson = sessionsCache.bodyJson;
-						bodyEtag = sessionsCache.etag;
-					}
-					if (bodyJson === null || bodyEtag === null) {
+					{
 							const sessions = listPiSessions(sessDir);
 						// 会话可读标题解析链（P1 台账 → P2 首条 user 剥前缀 → P3 shortId 兜底）；
 						// firstUserText 是解析链副产品，仅服务端内部用，不上线（契约只加 title/titleSource）
@@ -1471,7 +1418,6 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						};
 							bodyJson = JSON.stringify(body);
 							bodyEtag = sha1Etag(bodyJson);
-						sessionsCache = fp !== null ? { fp, bodyJson, etag: bodyEtag } : null;
 					}
 					if (matchEtag(req, bodyEtag)) {
 						respondNotModified(res, bodyEtag);

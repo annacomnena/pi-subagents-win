@@ -620,11 +620,57 @@ export interface ProjectSessionOpsResult {
 	cursor: SessionTailCursor;
 }
 
+/**
+ * WS 订阅「无新行」快路（L2 perf，2026-10-20）。
+ *
+ * 动因（真机 CDP 实测）：GUI 打开会话后立刻订阅 `transcript:<sid>`，服务端 `projectSessionOps`
+ * 会**全量重投影**整个文件（152MB ⇒ 实测把事件循环堵 ~500ms），而常见情形是「根本没有新行」。
+ * 与 `emptyDeltaIfNothingNew` 同源：用行索引（stat 缓存）判断 `afterSeq >= 总行数` ⇒ ops=[]，
+ * head/logEpoch 仍是绝对值，cursor 直接给 EOF（live tail 起点）。
+ *
+ * 与全量路径的等价性：原路径此时也产出 `ops=[]`（没有 seq > afterSeq 的条目），
+ * 差别仅 `skippedBadLines`（原路径是全会话计数，此处 0）—— WS 侧不消费该字段。
+ */
+function emptyOpsIfNothingNew(path: string, afterSeq: number): ProjectSessionOpsResult | null {
+	if (afterSeq <= 0) return null;
+	const idx = lineIndexFor(path);
+	if (idx === null) return null;
+	if (afterSeq < idx.total) return null;
+	const header = readSessionHeaderLine(path);
+	const logEpoch = header !== null && typeof header.id === "string" ? header.id : "";
+	// cursor 必须是「最后一个完整行之后」：文件末尾若无换行，把半截行留给后续 tail 重读
+	let offset = idx.size;
+	try {
+		const fd = openSync(path, "r");
+		try {
+			if (idx.size > 0) {
+				const last = Buffer.allocUnsafe(1);
+				readSync(fd, last, 0, 1, idx.size - 1);
+				if (last[0] !== 0x0a) offset = idx.starts[idx.starts.length - 1] ?? 0;
+			}
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		offset = idx.size;
+	}
+	return {
+		found: true,
+		logEpoch,
+		head: idx.total,
+		ops: [],
+		skippedBadLines: 0,
+		cursor: { offset, nextLineNo: idx.total + 1 },
+	};
+}
+
 /** WS 续传补发：全量重投影（确定性），只回 seq > afterSeq 的 op。 */
 export function projectSessionOps(path: string, afterSeq: number): ProjectSessionOpsResult {
 	if (!existsSync(path)) {
 		return { found: false, logEpoch: "", head: 0, ops: [], skippedBadLines: 0, cursor: SESSION_TAIL_CURSOR_START };
 	}
+	const fast = emptyOpsIfNothingNew(path, afterSeq);
+	if (fast !== null) return fast;
 	const r = readAllSessionLines(path);
 	const projector = createTranscriptProjector();
 	const ops: { seq: number; op: TranscriptOp }[] = [];
