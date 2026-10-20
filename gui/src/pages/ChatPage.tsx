@@ -15,6 +15,7 @@
  */
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { autoExpandTarget } from "../chatAutoExpand";
 import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench, X } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
@@ -197,13 +198,37 @@ function AssistantTextRowView({ row, animate }: { row: Extract<TranscriptRow, { 
 	 *   - 本地 state 保证点击立刻重渲染（不依赖父级 re-render）；
 	 *   - Map 保证卸载重挂后展开态还在。
 	 */
-function ReasoningRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "reasoning" }>; animate?: boolean }) {
+function ReasoningRowView({ row, animate, streaming }: { row: Extract<TranscriptRow, { kind: "reasoning" }>; animate?: boolean; streaming?: boolean }) {
 	const [open, setOpen] = useState<boolean>(() => reasoningOpenState.get(row.rowId) ?? false);
+	/** 用户手动点过 → 锁定，不再被自动逻辑抢回（自动只做「默认行为」）。 */
+	const userLockedRef = useRef(false);
+	/**
+	 * 自动展开/合上（2026-10-20 用户要求「当前执行的思考自动展开，完毕自动合上」）。
+	 * 判定由父级给：`streaming` = 本行是「当前正在流式的那段思考」。
+	 * 用户一旦手动操作过（userLockedRef），自动逻辑永久让位。
+	 */
+	useEffect(() => {
+		// 思考没有「running 状态」：用「是否当前流式目标」当作 isRunning，
+		// 从未流式过的历史思考 wasRunning=false ⇒ 不动。
+		const want = autoExpandTarget({
+			isRunning: streaming === true,
+			wasRunning: streaming === true,
+			userLocked: userLockedRef.current,
+		});
+		if (want === null) return;
+		if (want !== open) {
+			reasoningOpenState.set(row.rowId, want);
+			setOpen(want);
+		}
+		// open 故意不进依赖：只在 streaming 变化时决策，避免与用户点击互相拉扯
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [streaming, row.rowId]);
 	return (
 		<RowShell rowId={row.rowId} animate={animate}>
 			<Collapsible
 				open={open}
 				onOpenChange={(next) => {
+					userLockedRef.current = true; // 用户手动操作 ⇒ 自动逻辑让位
 					reasoningOpenState.set(row.rowId, next);
 					setOpen(next);
 				}}
@@ -244,6 +269,32 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	 * 父级不再重渲染 ⇒ 永久停在展开态。实测：点开后 h=102，再点 600ms/2.1s 后仍是 open。
 	 */
 	const [open, setOpen] = useState<boolean>(() => toolCardOpenState.get(row.rowId) ?? false);
+	/** 用户手动点过 → 锁定，不再被自动逻辑抢回。 */
+	const userLockedRef = useRef(false);
+	/**
+	 * 自动展开/合上（2026-10-20 用户要求「当前执行的工具调用自动展开，完毕自动合上」）。
+	 *
+	 * 只在「本行**经历过** running」时才自动合上 —— 否则会把用户之前手动展开的历史卡片也一起合掉。
+	 * 用户一旦手动操作过，自动逻辑永久让位。
+	 */
+	const wasRunningRef = useRef(row.status === "running");
+	useEffect(() => {
+		const isRunningNow = row.status === "running";
+		if (isRunningNow) wasRunningRef.current = true;
+		const want = autoExpandTarget({
+			isRunning: isRunningNow,
+			wasRunning: wasRunningRef.current,
+			userLocked: userLockedRef.current,
+		});
+		if (want === null) return;
+		if (want !== open) {
+			toolCardOpenState.set(row.rowId, want);
+			setOpen(want);
+			if (want) setShouldRenderContent(true);
+		}
+		// open 故意不进依赖：只在 status 变化时决策，避免与用户点击互相拉扯
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [row.status, row.rowId]);
 	// shouldRenderContent：收起后延迟 300ms 再卸载展开体（Radix closed 动画要读高度变量）
 	const [shouldRenderContent, setShouldRenderContent] = useState(open);
 	const unmountDelayRef = useRef<number | null>(null);
@@ -279,6 +330,7 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 			<Collapsible
 				open={open}
 				onOpenChange={(next) => {
+					userLockedRef.current = true; // 用户手动操作 ⇒ 自动逻辑让位
 					toolCardOpenState.set(row.rowId, next);
 					setOpen(next); // 关键：关闭也必须触发重渲染（否则受控 open 永远停在上一次的值）
 					if (next) setShouldRenderContent(true);
@@ -362,7 +414,7 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
  * 故按 `row` 引用 memo 后，一帧只重渲染变化的那一行。
  * 不加 memo 时（2026-10-20 前）每来一帧 200 行全部重渲染、每行重跑 markdown 渲染。
  */
-const RowView = memo(function RowView({ row, animate }: { row: TranscriptRow; animate?: boolean }) {
+const RowView = memo(function RowView({ row, animate, streaming }: { row: TranscriptRow; animate?: boolean; streaming?: boolean }) {
 	switch (row.kind) {
 		case "turnHeader":
 			return <TurnHeaderRowView row={row} animate={animate} />;
@@ -371,7 +423,7 @@ const RowView = memo(function RowView({ row, animate }: { row: TranscriptRow; an
 		case "assistantText":
 			return <AssistantTextRowView row={row} animate={animate} />;
 		case "reasoning":
-			return <ReasoningRowView row={row} animate={animate} />;
+			return <ReasoningRowView row={row} animate={animate} streaming={streaming} />;
 		case "toolCall":
 			return <ToolCallRowView row={row} animate={animate} />;
 	}
@@ -478,6 +530,29 @@ export function ChatPage() {
 	const hasOlder = useGui((s) => (activeId !== null ? s.chatHasOlderBySession[activeId] === true : false));
 	const tailWant = useGui((s) => (activeId !== null ? (s.chatTailBySession[activeId] ?? 200) : 200));
 	const streaming = useGui((s) => s.chatStreaming);
+	/**
+	 * 自动展开「刚落盘的那条思考」（2026-10-20 用户要求「当前执行的思考自动展开，完毕自动合上」）。
+	 *
+	 * 关键事实（CDP 实测）：流式中的思考在 JSONL 里**还不存在**（pi 只在 message_end 落盘），
+	 * 它由 `StreamingPreview` 单独渲染（自带实时文本，本身就是展开态）。所以「自动展开」
+	 * 要解决的是**流式刚结束、正式 reasoning 行刚落盘**的那一下：让刚看完的思考保持可见。
+	 * 4s 后自动失效（回到默认收起），避免历史会话被强行展开。
+	 */
+	const prevStreamingRef = useRef(streaming);
+	const [streamJustEnded, setStreamJustEnded] = useState(false);
+	useEffect(() => {
+		if (prevStreamingRef.current !== null && streaming === null) setStreamJustEnded(true);
+		prevStreamingRef.current = streaming;
+	}, [streaming]);
+	useEffect(() => {
+		if (!streamJustEnded) return;
+		const t = window.setTimeout(() => setStreamJustEnded(false), 4000);
+		return () => window.clearTimeout(t);
+	}, [streamJustEnded]);
+	const streamingRowId =
+		streamJustEnded && rows.length > 0 && rows[rows.length - 1]!.kind === "reasoning"
+			? rows[rows.length - 1]!.rowId
+			: null;
 	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——
 	// 首屏只画尾部 200 行，贴底时分块补齐更早行。2-4k 行全量同步重挂载实测阻塞主线程
 	// 2s+（真机 CDP 复现），分块后切回首帧 ~100ms。hiddenHead = 头部未渲染行数。
@@ -705,6 +780,7 @@ export function ChatPage() {
 										key={row.rowId}
 										row={row}
 										animate={hiddenHead + i >= animateFromIndex}
+										streaming={row.rowId === streamingRowId}
 									/>
 								))}
 								{/* 2026-10-19 用户裁决：**不再画第二条气泡**。
