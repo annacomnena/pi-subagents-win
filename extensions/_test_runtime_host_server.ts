@@ -253,6 +253,22 @@ try {
 			assert.deepEqual(r.body.journalTail, { lastEnvelopeAt: null, lastRecordedAt: null, totalEvents: 0 });
 			assert.equal(r.body.mailboxPending, 0);
 			assert.ok(!Number.isNaN(Date.parse(r.body.generatedAt)), "generatedAt 合法 ISO");
+			// T1b（2026-10-20）内存可观测：AGENTS.md R-2「静默失效不可接受」——
+			// 本机曾因内存耗尽崩过一次并致 pi 包损坏 4 次，而此前 health 一个内存字段都没有。
+			{
+				const m = r.body.memory;
+				assert.ok(m && typeof m === "object", "health 带 memory 段");
+				for (const k of ["rssMb", "heapUsedMb", "heapTotalMb", "externalMb"]) {
+					assert.equal(typeof m[k], "number", `${k} 是数字`);
+					assert.ok(m[k] > 0, `${k} > 0（实得 ${m[k]}）`);
+				}
+				assert.ok(m.rssMb >= m.heapUsedMb, "rss 应 >= heapUsed（同一进程口径）");
+				assert.ok(!Number.isNaN(Date.parse(m.sampledAt)), "sampledAt 合法 ISO");
+				assert.equal(typeof m.sampleAgeMs, "number", "sampleAgeMs 是数字（R-2.2 要求给年龄）");
+				assert.ok(m.sampleAgeMs >= 0 && m.sampleAgeMs < 5000, `采样年龄合理（实得 ${m.sampleAgeMs}）`);
+				assert.equal(typeof m.rssWarn, "boolean", "rssWarn 是布尔");
+				assert.equal(m.rssWarn, false, `测试进程 RSS 不应触发告警（实得 ${m.rssMb}MB）`);
+			}
 		}
 		// T1 有 attachment + 新鲜心跳（14s）→ alive=true；mailbox 计数（拍板④）
 		{

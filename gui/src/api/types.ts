@@ -43,6 +43,19 @@ export interface HealthView {
 	sessionHeartbeats: { sessionId: string; lastActiveAt: string; alive: boolean }[];
 	journalTail: { lastEnvelopeAt: string | null; lastRecordedAt: string | null; totalEvents: number };
 	mailboxPending: number;
+	/**
+	 * 进程内存（additive，2026-10-20；AGENTS.md R-2：状态必须可观测 + 给年龄）。
+	 * 单位 MB（服务端已除好，前端不要再算）。
+	 */
+	memory?: {
+		rssMb: number;
+		heapUsedMb: number;
+		heapTotalMb: number;
+		externalMb: number;
+		sampledAt: string;
+		sampleAgeMs: number;
+		rssWarn: boolean;
+	};
 	generatedAt: string;
 }
 

@@ -21,6 +21,8 @@
 
 - **读取路径常数成本（2026-10-20，借鉴 OpenCode v2 评估）**：`/v1/sessions` 删掉 stat 指纹快路（4269 次 stat = 130-146ms/拍，而重建只要 33ms ⇒ 纯开销）→ 热路径 145-178ms → **44-46ms**；`validateStreamGen` 从「整文件 readFileSync + sha1」改为「≤256KB 精确 / 大文件 8×32KB 采样指纹 + fpVersion:2，旧记录首次不 bump」（152MB 会话 ~120ms → ~1ms）；`projectSessionOps` 增「无新行」快路（`after >= 总行数` ⇒ ops=[] + 绝对 head + EOF cursor），152MB 订阅 ~500ms 阻塞 → 直返，`?after=` 端到端 1251ms → **111ms**。评估结论：文档「快」的四条地基本仓已有，差距只在读取路径；「不抄」清单（SQLite 投影表 / Effect HttpApi / 远程配对 / exactly-once / delta 不落盘）与理由见 `Wiki/Decisions/opencode-v2-borrow.md`。
 
+- **内存可观测（2026-10-20，AGENTS.md R-2 落地）**：`/v1/health` 新增 `memory` 段（`rssMb/heapUsedMb/heapTotalMb/externalMb/sampledAt/sampleAgeMs/rssWarn`，告警阈值 1536MB）。此前 health **一个内存字段都没有** —— 本机曾因内存耗尽崩过一次并致 pi 包损坏 4 次，而异常完全不可观测。按 R-2.2 一并给「采样年龄」而不是只给绝对值。GUI 运行时页新增「进程内存」卡片（超阈值标红）。验证：`test:runtime-host-server` T1b（字段存在/量纲/rss≥heapUsed/年龄合理/不误告警）；线上实测 `rssMb 157.6 / heapUsed 45.8 / external 13`。
+
 ## [0.8.0] — 2026-10-17
 > 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
 

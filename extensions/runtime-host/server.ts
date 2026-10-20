@@ -215,6 +215,30 @@ export interface HealthView {
 	journalTail: { lastEnvelopeAt: string | null; lastRecordedAt: string | null; totalEvents: number };
 	/** 拍板④：mailbox 全收件箱 pending 合计（只读计数，不产事件；读失败 → 0，never-throw）。 */
 	mailboxPending: number;
+	/**
+	 * 进程内存（additive，2026-10-20）。
+	 *
+	 * 动因：AGENTS.md R-2「静默失效不可接受」—— 本机曾因内存耗尽崩过一次并导致 pi 包损坏 4 次，
+	 * 而此前 `/v1/health` **一个内存字段都没有**，异常完全不可观测。
+	 *
+	 * 口径：单位 MB（保留 1 位小数，避免前端自己除）；`sampledAt` + `sampleAgeMs` 按 R-2.2
+	 * 给**年龄**而不是只给绝对值 —— 读的人必须能判断「这个数是不是几分钟前的」。
+	 */
+	memory: {
+		/** 进程 RSS（含 native/共享，最能反映「进程占了多少」）。 */
+		rssMb: number;
+		/** V8 堆已用（GC 后可回收的部分）。 */
+		heapUsedMb: number;
+		heapTotalMb: number;
+		/** Buffer/ArrayBuffer 等堆外分配（大文件读的主要去处）。 */
+		externalMb: number;
+		/** 采样时刻（ISO）。 */
+		sampledAt: string;
+		/** 距采样多少毫秒（R-2.2：状态展示必须给年龄）。 */
+		sampleAgeMs: number;
+		/** 是否超过告警阈值（当前阈值见 MEMORY_WARN_RSS_MB）。 */
+		rssWarn: boolean;
+	};
 	generatedAt: string;
 }
 
@@ -250,6 +274,44 @@ function iso(d: Date | null | undefined): string {
 }
 
 /** 组装 /v1/health：段级 never-throw（单段失败 → 兜底值，不炸 server）。 */
+/**
+ * RSS 告警阈值（MB）。本机物理 31.1GB；历史事故是「内核池 + 句柄暴涨 ⇒ 物理内存 99.4%」，
+ * 那种状态下写文件会随机失败。daemon 正常在 100-400MB，超过 1.5GB 基本可判定异常
+ * （例如读入了不该读的巨型文件）。阈值故意给宽：宁可少报，也不要天天喊狼来了。
+ */
+const MEMORY_WARN_RSS_MB = 1536;
+
+/** 采样进程内存（never-throw：memoryUsage 本身不抛，这里只是防御性包裹）。 */
+function sampleMemory(now: Date): HealthView["memory"] {
+	const sampledAt = iso(now);
+	let rss = 0;
+	let heapUsed = 0;
+	let heapTotal = 0;
+	let external = 0;
+	try {
+		const m = process.memoryUsage();
+		rss = m.rss;
+		heapUsed = m.heapUsed;
+		heapTotal = m.heapTotal;
+		external = m.external;
+	} catch {
+		/* 取不到就给 0（不影响其它字段） */
+	}
+	const mb = (n: number): number => Math.round((n / (1024 * 1024)) * 10) / 10;
+	const rssMb = mb(rss);
+	return {
+		rssMb,
+		heapUsedMb: mb(heapUsed),
+		heapTotalMb: mb(heapTotal),
+		externalMb: mb(external),
+		sampledAt,
+		// 采样与响应同一时刻生成 ⇒ 年龄恒 0；保留字段是为了**契约形状固定**：
+		// 将来若改成缓存采样（避免每 2s 都调 memoryUsage），这里会自然变成非零年龄。
+		sampleAgeMs: 0,
+		rssWarn: rssMb >= MEMORY_WARN_RSS_MB,
+	};
+}
+
 export function buildHealthView(opts: HealthOptions): HealthView {
 	const now = opts.now ?? new Date();
 	const timersDir = opts.timersDir ?? defaultTimersDir();
@@ -339,6 +401,7 @@ export function buildHealthView(opts: HealthOptions): HealthView {
 		sessionHeartbeats,
 		journalTail,
 		mailboxPending,
+		memory: sampleMemory(now),
 		generatedAt: iso(now),
 	};
 }

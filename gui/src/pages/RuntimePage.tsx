@@ -93,6 +93,27 @@ export function RuntimePage() {
 					</dl>
 				</Card>
 
+				<Card title={<Term zh="进程内存" en="memory" hint="daemon 进程 RSS / V8 堆 / 堆外；超阈值会标红（AGENTS.md R-2 可观测性）" />}>
+					<dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-ui-sm">
+						<dt className="text-foreground-subtle">RSS</dt>
+						<dd className={health?.memory?.rssWarn === true ? "text-destructive" : "text-foreground"}>
+							{health?.memory ? `${health.memory.rssMb} MB` : "暂无"}
+							{health?.memory?.rssWarn === true ? " ⚠️ 超阈值" : ""}
+						</dd>
+						<dt className="text-foreground-subtle">V8 堆</dt>
+						<dd className="text-foreground">
+							{health?.memory ? `${health.memory.heapUsedMb} / ${health.memory.heapTotalMb} MB` : "暂无"}
+						</dd>
+						<dt className="text-foreground-subtle">堆外</dt>
+						<dd className="text-foreground">{health?.memory ? `${health.memory.externalMb} MB` : "暂无"}</dd>
+						<dt className="text-foreground-subtle">采样</dt>
+						<dd className="text-foreground">
+							<RelTime at={health?.memory?.sampledAt ?? null} className="text-foreground" />
+							{health?.memory && health.memory.sampleAgeMs > 5000 ? `（${Math.round(health.memory.sampleAgeMs / 1000)}s 前，可能陈旧）` : ""}
+						</dd>
+					</dl>
+				</Card>
+
 				<Card title={<Term zh={`会话心跳（${health?.sessionHeartbeats.length ?? 0}）`} en="session heartbeats" />}>
 					{!health || health.sessionHeartbeats.length === 0 ? (
 						<EmptyState
