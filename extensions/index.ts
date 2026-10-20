@@ -2313,6 +2313,36 @@ function listAsyncRuns(): AsyncRunRecord[] {
 		.sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""));
 }
 
+/**
+ * 单 run 直读（2026-10-20 性能）：`status`/`kill` 带 runId 时**只读这一个文件**，
+ * 不扫整个 RUNS_DIR。原实现先 `listAsyncRuns()` 全量读+parse 再 `.find()`，
+ * 开销随历史 run 数线性增长（实测 92 个 run / 2.03 MB ≈ 22 ms 热读）。
+ *
+ * 边界：runId 来自调用方，必须挡住路径穿越（只接受 `run_...` 形态的文件名）。
+ * 返回 undefined 表示不存在或 json 损坏——调用方按「not found」处理（与原 `.find()` 语义一致）。
+ */
+function readAsyncRun(runId: string): AsyncRunRecord | undefined {
+	if (!/^[A-Za-z0-9_-]+$/.test(runId)) return undefined;
+	const p = join(RUNS_DIR, `${runId}.json`);
+	if (!existsSync(p)) return undefined;
+	try { return JSON.parse(readFileSync(p, "utf8")) as AsyncRunRecord; } catch { return undefined; }
+}
+
+/**
+ * 写盘瘦身（2026-10-20）：run json 只服务 status/list/kill 的**只读查询**，
+ * 这些读取方从不使用 `result.usageEvents`（逐轮事件，长任务可达 70+ KB，
+ * 实测占单个 run json 的 **83–93%**：85KB 文件里 usageEvents 74.5KB）。
+ * 逐轮明细在 pi 会话 JSONL 中已有权威副本，这里只需保留聚合 `usage`。
+ *
+ * 注意：**只瘦身"写进磁盘的那份"**，不改内存对象——并行路径仍要用
+ * 内存里的 usageEvents 做跨任务汇总（见 runParallel 的 allUsageEvents）。
+ */
+function slimRunRecordForDisk(record: AsyncRunRecord): AsyncRunRecord {
+	if (!record.result) return record;
+	if (!record.result.usageEvents || record.result.usageEvents.length === 0) return record;
+	return { ...record, result: { ...record.result, usageEvents: [] } };
+}
+
 /** 本会话派发的 async run（status 缺省目标 / kill 缺省目标的共同判定，按入参顺序取第一个）。 */
 function resolveSessionRun(runs: AsyncRunRecord[]): AsyncRunRecord | undefined {
 	const myIds = new Set([sessionScopeKey(), getCurrentSessionId()].filter((v): v is string => Boolean(v)));
@@ -4055,7 +4085,12 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					try { reapZombiesInDir(RUNS_DIR, { limit: 10, runIds: scopedRunIds() }); } catch { /* 静默 */ }
 				}
-				const runs = listAsyncRuns();
+				// 性能（2026-10-20）：带 runId 时**只读该文件**，不扫全目录。原实现先 listAsyncRuns()
+				// 全量读+parse 再 .find()，开销随历史 run 数线性增长（实测 92 个 run/2.03MB ≈ 22ms 热读）。
+				// 无参仍需全量——要按会话归属过滤。语义不变：runId 仍是全局查找（不按会话过滤）。
+				const runs: AsyncRunRecord[] = p.runId
+					? (() => { const one = readAsyncRun(p.runId as string); return one ? [one] : []; })()
+					: listAsyncRuns();
 				// L3 status 默认会话隔离（2026-09-23）：无参只返回本会话派发的 run（按时间最新的一个）；
 				// 跨会话查看须显式带 runId（全局查找不变）。归属判定复用 async-result-watcher 范式：
 				// links 首个可信 async 记录的 sessionId 与 sessionScopeKey()/getCurrentSessionId() 任一相等即放行。
@@ -4274,13 +4309,13 @@ export default function (pi: ExtensionAPI) {
 					if (t.agent && !agentDef) {
 						const record: AsyncRunRecord = { id: runId, agent: t.agent, task: t.task ?? "", model: effModel, status: "failed", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined,
 							result: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId, error: `unknown agent: ${t.agent}`, agent: t.agent } };
-						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 						recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${t.agent} unknown` });
 						asyncLines.push(`${runId} [${label}] failed: unknown agent: ${t.agent}`);
 						return;
 					}
 					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined, ...(__wallMs !== undefined ? { maxWallMs: __wallMs, maxWallSource: __wallSrc } : {}) };
-					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
 					// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
 					const persistRecentCalls = createThrottledRunMerger(runId, RUNS_DIR);
@@ -4304,7 +4339,7 @@ export default function (pi: ExtensionAPI) {
 						applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 						recordUsage(agentDef?.name, result);
 						clearRunProcess(runId);
-						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 						refreshAsyncPanel();
 						notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: t.task ?? "", status: record.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });
 					});
@@ -4365,7 +4400,7 @@ export default function (pi: ExtensionAPI) {
 				const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
-				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 				// 溯源：记录「本会话唤起了这个异步子 agent」
 				recordLink({
 					sessionId: sessionIdentity(_ctx as never),
@@ -4378,9 +4413,9 @@ export default function (pi: ExtensionAPI) {
 				const __wb1 = resolveWallBudget(p.maxWallMs);
 				const __wallMs1 = __wb1.ms;
 				const __wallSrc1 = __wb1.source;
-				if (__wallMs1 !== undefined) { record.maxWallMs = __wallMs1; record.maxWallSource = __wallSrc1; writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record)); }
+				if (__wallMs1 !== undefined) { record.maxWallMs = __wallMs1; record.maxWallSource = __wallSrc1; writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record))); }
 				// L3 Model 披露（纯加法）：dispatch 时把 effective model 写入记录，供 status 的 Model: 行展示。
-				if (!record.model) { try { record.model = resolveCallModel(p.model, agentDef) ?? undefined; } catch { /* 保持无 model */ } writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record)); }
+				if (!record.model) { try { record.model = resolveCallModel(p.model, agentDef) ?? undefined; } catch { /* 保持无 model */ } writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record))); }
 				// 方案 B：面板可视化 —— 绑定当前 UI，派发即刷新（opencode 风格常驻任务列表）
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				refreshAsyncPanel();
@@ -4405,7 +4440,7 @@ export default function (pi: ExtensionAPI) {
 					applyKillOutcome(record); // 已 kill 则保留 cancelled，不被 result.status 覆盖
 					recordUsage(agentDef?.name, result);
 					clearRunProcess(runId);
-					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(record));
+					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 					// 方案 B：完成时刷新面板 + toast 通知
 					refreshAsyncPanel();
 					notifyAsyncCompletion({ id: runId, agent: agentDef?.name, task: p.task ?? "", status: record.status, result: { error: result.error, usage: result.usage }, startedAt: record.startedAt });

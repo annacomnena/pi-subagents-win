@@ -27,6 +27,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isProcessAlive } from "./discovery.ts";
+import { classifyStaleWorker, probeProcessImageName, type StaleWorkerVerdict } from "../runtime/liveness.ts";
 import { readWechatCreds, readWechatEnabled, readWechatReceiveEnabled, wechatCredsPath } from "./wechat-bind.ts";
 import { WechatStore } from "../channel-wechat/store.ts";
 import { traceSpawn } from "../spawn-trace.ts";
@@ -58,6 +59,8 @@ export interface ChannelSupervisorOptions {
 	killWaitMs?: number;
 	/** 周期对账节拍（缺省 30s；start() 后启用，unref 定时器，ws.ts:615 先例）。 */
 	reconcileMs?: number;
+	/** 残留 worker 映像名探针（缺省 probeProcessImageName；测试注入 fake）。 */
+	probeImageName?: (pid: number) => string | null | undefined;
 }
 
 export interface ChannelSupervisorStatus {
@@ -281,9 +284,12 @@ private removePidFile(): void {
 			return null;
 		}
 		let pid: number | null = null;
+		let epochMatches = false;
 		try {
-			const raw = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown };
+			const raw = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown; daemonEpoch?: unknown };
 			if (typeof raw.pid === "number" && raw.pid > 0) pid = raw.pid;
+			// 同代 = 可能是本监督器自己的子进程；跨代 = 上一代残留（其看门狗早该让它自退）
+			epochMatches = raw.daemonEpoch === this.daemonEpoch;
 		} catch {
 			pid = null;
 		}
@@ -299,7 +305,50 @@ private removePidFile(): void {
 				this.removePidFile();
 				return null;
 			}
-			if (Date.now() - t0 > waitMs) return pid;
+			if (Date.now() - t0 > waitMs) break;
+		}
+		// 2026-10-20 修（微信通道静默死 18.5 小时）：**pid 存活 ≠ 是我们的 worker**。
+		// 上一代 worker 有父死亡看门狗（isProcessAlive(process.ppid) 假则自退），
+		// 跨代 pid 在 6s 后还活着几乎只能是 Windows 把这个号复用给了别的进程
+		// （实测：worker pid 7016 死后被系统进程 "Memory Compression" 接管 ⇒ 恒 skipped-stale ⇒
+		//  supervisor 永久拒绝 spawn ⇒ 通道静默死亡，且零日志）。
+		const verdict = this.classifyStale(pid, epochMatches);
+		if (verdict === "reused") {
+			this.record(
+				`stale-worker-reused: pid=${pid} 不是本通道 worker（PID 被系统复用），清理 pid 文件后照常 spawn`,
+			);
+			this.removePidFile();
+			return null;
+		}
+		return pid;
+	}
+
+	/**
+	 * 残留 worker 身份判定。probe 成本高（tasklist ≈ 5s），只在「跨代 + pid 存活」这条
+	 * 罕见恢复路径调一次；steady state（pid 已死）根本不进这里。
+	 */
+	private classifyStale(pid: number, epochMatches: boolean): StaleWorkerVerdict {
+		try {
+			const imageName = (this.opts.probeImageName ?? probeProcessImageName)(pid);
+			return classifyStaleWorker({ epochMatches, imageName, heartbeatAgeMs: this.workerHeartbeatAgeMs() });
+		} catch {
+			return "unknown"; // never-throw：不猜，保持 fail-closed（沿用原行为）
+		}
+	}
+
+	/** worker 自身心跳年龄（state.json.updatedAt 优先，退回 lastPollAt）；不可读 → null。 */
+	private workerHeartbeatAgeMs(): number | null {
+		try {
+			const raw = JSON.parse(readFileSync(join(this.storeDir, "state.json"), "utf8")) as {
+				updatedAt?: unknown;
+				lastPollAt?: unknown;
+			};
+			const at = (v: unknown): number | null =>
+				typeof v === "string" && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : null;
+			const ts = at(raw.updatedAt) ?? at(raw.lastPollAt);
+			return ts === null ? null : Date.now() - ts;
+		} catch {
+			return null;
 		}
 	}
 

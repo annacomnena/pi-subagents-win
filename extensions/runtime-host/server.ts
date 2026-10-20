@@ -258,6 +258,34 @@ export interface HealthView {
 			warn: boolean;
 		} | null;
 	};
+	/**
+	 * 微信接收通道存活信号（2026-10-20，落实 AGENTS.md R-2「静默失效不可接受」）。
+	 *
+	 * 事故背景：worker 死后 pid 被系统复用 ⇒ supervisor 永久 skipped-stale ⇒ 通道静默死
+	 * 18.5 小时，而 /v1/health 里**一个字都没有**，没人发现。
+	 * 这里给出独立的存活读数（不依赖 supervisor 自己报告 running）：
+	 *   - lastPollAgeMs：worker 最后一次成功轮询距今（**真实活性**，不是状态文件里的 status 字符串）
+	 *   - stale：超过 WECHAT_POLL_STALE_MS 未轮询 ⇒ true（GUI 应显式告警）
+	 *
+	 * 注意：**故意不放 supervisor 的 running**（那需要把实例传进来）。理由：本段存在的全部意义是
+	 * 「独立于 supervisor 自述的证据」；塞一个恒为 false 的字段比没有字段更糟（2026-10-20 自查发现
+	 * 第一版就有这个恒假字段，已删）。要看 supervisor 自述请用 GET /v1/wechat/worker/status。
+	 */
+	wechat: {
+		/** config: channels.wechat.enabled */
+		enabled: boolean;
+		/** config: channels.wechat.receive.enabled */
+		receiveEnabled: boolean;
+		/** 凭据在位（能跑的前提） */
+		credsPresent: boolean;
+		/** worker 最后一次轮询时刻（state.json.lastPollAt）；null = 从未 */
+		lastPollAt: string | null;
+		/** 最后一次轮询距今（ms）；null = 从未轮询 */
+		lastPollAgeMs: number | null;
+		/** 超阈值未轮询（enabled && receiveEnabled && credsPresent 时才有意义） */
+		stale: boolean;
+		lastError: string | null;
+	};
 	generatedAt: string;
 }
 
@@ -283,6 +311,10 @@ export interface HealthOptions {
 	mailboxDir?: string;
 	/** 会话目录（缺省 defaultSessionsDir()；`maxSessionFileBytes` 的扫描根，测试注入隔离）。 */
 	sessionsDir?: string;
+	/** 配置路径（缺省 defaultPkgConfigPath()；wechat 通道存活读数用）。 */
+	configPath?: string;
+	/** runtime 目录（缺省 defaultRuntimeDir()；wechat 凭据/state 读数用）。 */
+	runtimeDir?: string;
 	now?: Date;
 }
 
@@ -348,20 +380,47 @@ function sessionsDirFingerprint(sessionsDir: string): string | null {
 	}
 }
 
+/** 后台刷新在飞标记（防同一时刻多个 health 请求各自起一次扫描）。 */
+let sessionScanRefreshing = false;
+
+/**
+ * 最大会话文件（**永不阻塞**）。
+ *
+ * 2026-10-20 实测修：原实现冷启动时在 health 请求线程里同步扫 941 个文件 ——
+ * 正常 41-52ms，I/O 饥饿时 **9.8s**，而 health 探针超时只有 1500ms ⇒ 新建实例
+ * 被判 `stale`（`test:runtime-host-server` T8 实测红：'stale' !== 'alive'）。
+ * health 是**探活**端点，绝不能被一次目录扫描拖到超时。
+ *
+ * 现在的语义：
+ *   - 缓存有效（指纹一致且未过 TTL）⇒ 直接返回；
+ *   - 否则返回**上一次已知值**（冷启动首帧为 null），并用 setImmediate 后台刷新。
+ * ⇒ health 永远只付「指纹」的成本；扫描成本落在后台，不阻塞任何请求。
+ */
 function largestSessionFileCached(sessionsDir: string, now: Date): HealthView["memory"]["maxSessionFile"] {
 	const fp = sessionsDirFingerprint(sessionsDir);
 	const nowMs = now.getTime();
-	if (
+	const fresh =
 		sessionScanCache !== null &&
 		fp !== null &&
 		sessionScanCache.fp === fp &&
-		nowMs - sessionScanCache.at < SESSION_SCAN_TTL_MS
-	) {
-		return sessionScanCache.value;
+		nowMs - sessionScanCache.at < SESSION_SCAN_TTL_MS;
+	if (fresh) return sessionScanCache!.value;
+	// 需要刷新：后台做，本次返回上次已知值
+	if (!sessionScanRefreshing) {
+		sessionScanRefreshing = true;
+		setImmediate(() => {
+			try {
+				const value = largestSessionFile(sessionsDir);
+				const fp2 = fp ?? sessionsDirFingerprint(sessionsDir);
+				if (fp2 !== null) sessionScanCache = { fp: fp2, at: Date.now(), value };
+			} catch {
+				/* never-throw：后台刷新失败保留旧值 */
+			} finally {
+				sessionScanRefreshing = false;
+			}
+		});
 	}
-	const value = largestSessionFile(sessionsDir);
-	if (fp !== null) sessionScanCache = { fp, at: nowMs, value };
-	return value;
+	return sessionScanCache?.value ?? null;
 }
 
 function largestSessionFile(sessionsDir: string): HealthView["memory"]["maxSessionFile"] {
@@ -494,6 +553,57 @@ function readBusySnapshot(sessionId: string): Record<string, unknown> | null {
 	}
 }
 
+/** 微信通道「多久没轮询算死」：长轮询单次可达 30-60s，取 5 分钟（宽裕但能抓住真死）。 */
+const WECHAT_POLL_STALE_MS = 5 * 60 * 1000;
+
+/**
+ * 采样微信接收通道存活状态（2026-10-20）。
+ *
+ * 为什么必须单独给读数：supervisor 的 running 是它**自己**的内存视图，
+ * 而 2026-10-20 的事故正是「supervisor 认为有残留 worker 所以不 spawn，而 worker 早死了」——
+ * 自己报告的状态不可自证。这里读 worker 真正写的 state.json.lastPollAt（独立证据）。
+ *
+ * never-throw：任何读失败都降级为 null/false，不让 health 500。
+ */
+function sampleWechatChannel(now: Date, configPath: string, runtimeDir: string): HealthView["wechat"] {
+	const base: HealthView["wechat"] = {
+		enabled: false,
+		receiveEnabled: false,
+		credsPresent: false,
+		lastPollAt: null,
+		lastPollAgeMs: null,
+		stale: false,
+		lastError: null,
+	};
+	try {
+		base.enabled = readWechatEnabled(configPath);
+		base.receiveEnabled = readWechatReceiveEnabled(configPath);
+		base.credsPresent = readWechatCreds(wechatCredsPath(runtimeDir)) !== null;
+	} catch {
+		return base;
+	}
+	try {
+		const statePath = join(WechatStore.resolveDir(runtimeDir), "state.json");
+		const raw = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+		const lastPollAt = typeof raw.lastPollAt === "string" ? raw.lastPollAt : null;
+		base.lastPollAt = lastPollAt;
+		if (lastPollAt !== null) {
+			const at = Date.parse(lastPollAt);
+			if (Number.isFinite(at)) base.lastPollAgeMs = Math.max(0, now.getTime() - at);
+		}
+		base.lastError = typeof raw.lastError === "string" ? raw.lastError : null;
+	} catch {
+		/* 无 state.json：视为从未轮询 */
+	}
+	// stale 只在「本该跑」时才成立：没开/没凭据不告警（否则噪音）
+	base.stale =
+		base.enabled &&
+		base.receiveEnabled &&
+		base.credsPresent &&
+		(base.lastPollAgeMs === null || base.lastPollAgeMs > WECHAT_POLL_STALE_MS);
+	return base;
+}
+
 /**
  * 读「会话可用命令」快照（2026-10-20 GUI 斜杠命令）。
  *
@@ -611,6 +721,7 @@ export function buildHealthView(opts: HealthOptions): HealthView {
 		journalTail,
 		mailboxPending,
 		memory: sampleMemory(now, opts.sessionsDir ?? defaultSessionsDir()),
+		wechat: sampleWechatChannel(now, opts.configPath ?? defaultPkgConfigPath(), opts.runtimeDir ?? defaultRuntimeDir()),
 		generatedAt: iso(now),
 	};
 }
@@ -866,7 +977,14 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	// GUI 图片输入 S1：上传落盘根目录（`<dir>/uploads`；缺省 defaultRuntimeDir()；测试注入隔离）。
 	const uploadsRuntimeDir = opts.uploadsRuntimeDir !== undefined ? opts.uploadsRuntimeDir : defaultRuntimeDir();
 	const wechatStore = new WechatStore(WechatStore.resolveDir(wechatRuntimeDir));
-	const channelSupervisor = new ChannelSupervisor({ runtimeDir: wechatRuntimeDir, configPath });
+	const channelSupervisor = new ChannelSupervisor({
+		runtimeDir: wechatRuntimeDir,
+		configPath,
+		// 2026-10-20 修（可观测性）：原来不传 log ⇒ record() 恒为 no-op ⇒ supervisor 的所有动作
+		// （spawn / skipped-stale / auth-required-hold / sync-error）**零日志**。
+		// 微信通道静默死 18.5 小时期间，日志里一条记录都没有，正是这个缺口。
+		log: (m: string): void => { try { console.error(m); } catch { /* ignore */ } },
+	});
 	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 	const stopWechatReply = startWechatReplyWatcher({ runtimeDir: wechatRuntimeDir, configPath, stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 

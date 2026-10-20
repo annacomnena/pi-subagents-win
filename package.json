@@ -46,6 +46,7 @@
     "test:transcript-tail": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_transcript_tail.ts",
     "test:chat-collapse": "node --experimental-strip-types ./gui/src/_test_chat_collapse_state.ts",
     "test:chat-auto-expand": "node --experimental-strip-types ./gui/src/_test_chat_auto_expand.ts",
+    "test:wechat-stale-worker": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_wechat_stale_worker.ts",
     "test:slash-commands": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_slash_commands.ts",
     "test:session-control": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_control.ts",
     "test:streaming-snapshot": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_streaming_snapshot.ts",

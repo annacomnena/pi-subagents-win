@@ -151,7 +151,11 @@ export interface PidProbeResult {
  *  execFileSync 会抛错 ⇒ 只能读到「查不出」而拿不到「确定不在」（实测踩坑）。 */
 function winPidEnumerated(pid: number): boolean | undefined {
 	const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
-		timeout: 2000,
+		// 2026-10-20：2000ms 太紧 —— 本机负载高时 tasklist 实测 >2s（ETIMEDOUT），
+		// 会让探针返回 undefined ⇒ 调用方 fail-closed ⇒ 僵尸 host 永远无法接管
+		// （实测：test:runtime-host-server T12「僵尸 host 覆盖」因此红）。
+		// 探针本身只用于罕见恢复路径，放宽到 15s 不影响稳态（稳态根本不调）。
+		timeout: 15000,
 		windowsHide: true,
 		encoding: "utf8",
 	});
@@ -182,6 +186,77 @@ export function probePidState(
 	const present = (deps.enumerate ?? winPidEnumerated)(pid);
 	if (present === undefined) return { state: "unknown", basis: "unknown" };
 	return { state: present ? "alive" : "dead", basis: "enumerate" };
+}
+
+/**
+ * 进程映像名（Windows）：tasklist 第一列。
+ *
+ * 用途：**PID 复用检测**。`isProcessAlive(pid)` 只答「这个号有没有进程」，不答
+ * 「是不是我那个进程」。2026-10-20 实测事故：wechat worker（pid 7016）死掉后，
+ * Windows 立刻把 7016 复用给系统进程 "Memory Compression" ⇒ 存活检查恒为 true ⇒
+ * supervisor 永远 skipped-stale ⇒ 微信通道静默死 18.5 小时。
+ *
+ * 返回三态：string = 映像名；null = 进程不存在；undefined = 查询不可用（不猜，调用方 fail-closed）。
+ *
+ * 成本实测（2026-10-20 本机）：tasklist 约 5s，**不能每 tick 调**；
+ * 只在「跨代 pid 文件 + pid 存活」这条罕见恢复路径上调一次。
+ */
+export function probeProcessImageName(
+	pid: number,
+	deps: { run?: (pid: number) => string | undefined } = {},
+): string | null | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	const run = deps.run ?? winImageName;
+	const out = run(pid);
+	if (out === undefined) return undefined;
+	if (out === "") return null;
+	return out;
+}
+
+function winImageName(pid: number): string | undefined {
+	const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
+		timeout: 15000,
+		windowsHide: true,
+		encoding: "utf8",
+	});
+	if (r.error || typeof r.stdout !== "string") return undefined;
+	const lines = r.stdout.split(/\r?\n/).map((x) => x.trim());
+	const line = lines.find((x) => x.startsWith('"'));
+	if (line === undefined) return "";
+	const m = /^"([^"]*)"/.exec(line);
+	return m !== null ? m[1]! : undefined;
+}
+
+/** 残留 worker 判定三态。 */
+export type StaleWorkerVerdict = "ours-alive" | "reused" | "unknown";
+
+/**
+ * 残留 worker 的**身份**判定（纯函数，可单测）。
+ *
+ * 背景：worker.json 里记的 pid 来自**上一代 daemon**（daemonEpoch 不同）。
+ * worker 有父死亡看门狗（channel-wechat/index.ts：isProcessAlive(process.ppid) 为假就自退），
+ * 所以「上一代的 pid 在若干秒后还活着」几乎只能是 **PID 被系统复用**。
+ *
+ * 判据（全部基于可观测事实，不猜）：
+ * - 同代（epochMatches）⇒ 可能是自己的子进程 ⇒ ours-alive（保持原 fail-closed 等待）
+ * - 跨代 + 映像名不是 node.exe ⇒ **确定复用** ⇒ reused（必须放行 spawn，否则永久卡死）
+ * - 跨代 + 映像名不可用 ⇒ unknown（不猜，保持原行为）
+ * - 跨代 + 是 node.exe + 心跳新鲜（< 5min）⇒ ours-alive
+ * - 跨代 + 是 node.exe + 心跳陈旧/未知 ⇒ reused
+ */
+export const STALE_WORKER_HEARTBEAT_MS = 5 * 60 * 1000;
+
+export function classifyStaleWorker(input: {
+	epochMatches: boolean;
+	imageName: string | null | undefined;
+	heartbeatAgeMs: number | null;
+}): StaleWorkerVerdict {
+	if (input.epochMatches) return "ours-alive";
+	if (input.imageName === null) return "reused";
+	if (input.imageName === undefined) return "unknown";
+	if (!/^node(\.exe)?$/i.test(input.imageName)) return "reused";
+	if (input.heartbeatAgeMs !== null && input.heartbeatAgeMs <= STALE_WORKER_HEARTBEAT_MS) return "ours-alive";
+	return "reused";
 }
 
 export interface MasterLiveness {

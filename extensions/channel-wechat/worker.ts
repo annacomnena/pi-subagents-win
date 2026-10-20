@@ -293,7 +293,10 @@ export function startWechatWorker(opts: WechatWorkerOptions): WechatWorkerHandle
 				buf = res.buf;
 				attempt = 0;
 				protocolStreak = 0;
-				store.setStatus("connected");
+				// 2026-10-20 修：成功路径必须**清掉** lastError。原来只 setStatus("connected")，
+				// 导致 state.json 长期同时是「connected + lastError: getupdates 网络错误」——
+				// 读 health 的人会以为通道坏了（实测事故后就是这个矛盾状态）。
+				store.setStatus("connected", { lastError: null });
 				log(`batch ok: items=${parsed.items.length} quarantined=${parsed.quarantined.length}`);
 			} catch (e) {
 				if (controller.signal.aborted) break;
