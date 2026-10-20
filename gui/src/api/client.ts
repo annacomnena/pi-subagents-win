@@ -18,6 +18,7 @@ import type {
 	SessionsBody,
 	SessionControlBody,
 	BusySnapshot,
+	CommandsSnapshot,
 	StreamingSnapshot,
 	TimelineResponse,
 	TranscriptBody,
@@ -297,6 +298,34 @@ export const api = {
 	 */
 	sessionBusy: (sessionId: string): Promise<FetchResult<BusySnapshot>> =>
 		fetchJson<BusySnapshot>(`/v1/session-busy/${encodeURIComponent(sessionId)}`, undefined, 4000),
+
+	/**
+	 * 会话可用斜杠命令（2026-10-20）：命令面板与补全用。
+	 * 404（no-commands-snapshot）= 扩展未加载/未 reload ⇒ GUI 回退到「只给自由输入」。
+	 */
+	sessionCommands: (sessionId: string): Promise<FetchResult<CommandsSnapshot>> =>
+		fetchJson<CommandsSnapshot>(`/v1/session-commands/${encodeURIComponent(sessionId)}`, undefined, 4000),
+
+	/**
+	 * session.slash（2026-10-20）：派发一条 `/name args`。
+	 *
+	 * 诚实口径：accepted = 请求已排队；`dispatched` / `unknown-command` / `commands-unavailable`
+	 * 由会话进程回写，GUI 经 `sessionControl()` 读（与 abort 共用同一回执通道）。
+	 */
+	sessionSlash: (
+		sessionId: string,
+		name: string,
+		args: string,
+		commandKey?: string,
+	): Promise<FetchResult<CommandOutcomeBody>> =>
+		postJson<CommandOutcomeBody>("/v1/commands", {
+			frame: "command",
+			type: "session.slash",
+			to: `pi://${sessionId}`,
+			commandKey: commandKey ?? newCommandKey("slash"),
+			issuedAt: new Date().toISOString(),
+			payload: { name, ...(args.length > 0 ? { args } : {}) },
+		} satisfies CommandFrameInput, 8000),
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
 	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；

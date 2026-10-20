@@ -28,8 +28,16 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 
-/** 控制动作白名单（封闭；新增动作必须同时改这里 + 会话进程的 handler）。 */
-export const CONTROL_ACTIONS = ["abort"] as const;
+/**
+ * 控制动作白名单（封闭；新增动作必须同时改这里 + 会话进程的 handler）。
+ *
+ * - `abort`：停止当前 turn（ctx.abort()）
+ * - `slash`：派发一条**斜杠命令**（`pi.sendUserMessage("/name args", {expandPromptTemplates:true})`）
+ *   为什么走这里而不是 message-outbox：outbox 的正文会被 `buildOutboxInjectBody`
+ *   追加 eventId 标记/附件块 ⇒ 会破坏命令解析（`/model xxx [eventId:…]` 直接失效）。
+ *   控制通道的正文是**原样**交出去的。
+ */
+export const CONTROL_ACTIONS = ["abort", "slash"] as const;
 export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 
 export const CONTROL_STATUSES = ["pending", "running", "done", "failed"] as const;
@@ -43,7 +51,10 @@ export type ControlResult =
 	| "aborted" // 已调用 ctx.abort()（当时确实在流式）
 	| "not-streaming" // 当时已空闲（明确告知，不静默 no-op）
 	| "stale-ctx" // 会话进程的 ctx 已失效（例如 /reload 之后旧 runner）
-	| "unknown-action"; // 动作不在白名单（防旧 GUI 打新 daemon）
+	| "unknown-action" // 动作不在白名单（防旧 GUI 打新 daemon）
+	| "dispatched" // slash：命令已交给 pi（**不等于命令执行成功**，命令成败在 pi 事件流里）
+	| "unknown-command" // slash：命令名不在该会话的命令快照里（防 /typo 被当正文发给 LLM）
+	| "commands-unavailable"; // slash：命令快照缺失（扩展未加载 / 未 /reload）
 
 export interface ControlRequest {
 	version: 1;
@@ -61,6 +72,11 @@ export interface ControlRequest {
 	result?: ControlResult;
 	/** failed 时的错误摘要（≤512 字节）。 */
 	error?: string;
+	/**
+	 * `action: "slash"` 的载荷（原样交给 pi，不做任何正文装饰）。
+	 * 其它动作不带 payload。
+	 */
+	payload?: { name: string; args: string };
 }
 
 /**
@@ -91,6 +107,7 @@ export function newControlRequest(input: {
 	action: ControlAction;
 	commandKey: string;
 	now?: Date;
+	payload?: { name: string; args: string };
 }): ControlRequest {
 	return {
 		version: 1,
@@ -100,6 +117,7 @@ export function newControlRequest(input: {
 		commandKey: input.commandKey,
 		status: "pending",
 		requestedAt: (input.now ?? new Date()).toISOString(),
+		...(input.payload !== undefined ? { payload: input.payload } : {}),
 	};
 }
 

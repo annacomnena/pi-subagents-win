@@ -20,7 +20,7 @@
  * - 终态只写一次（`completeControlRequest` 拒绝覆盖）。
  */
 
-import { watch as fsWatch, type FSWatcher } from "node:fs";
+import { mkdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isSubagent } from "../identity.ts";
 import {
@@ -31,6 +31,7 @@ import {
 	type ControlRequest,
 	type ControlResult,
 } from "./session-control.ts";
+import { commandsDir, normalizeCommands, readCommandNames, writeCommandsSnapshot } from "./commands-snapshot.ts";
 
 /** 宽松 ctx 形状（避免对 pi 内部类型强耦合；只用到这三样）。 */
 interface LooseCtx {
@@ -40,8 +41,10 @@ interface LooseCtx {
 }
 
 export interface RegisterSessionControlOptions {
-	/** 控制盘面目录（缺省 controlDir()；测试注入隔离）。 */
+	/** 控制盘面目录（缺省 defaultControlDir()；测试注入隔离）。 */
 	dir?: string;
+	/** 命令快照目录（缺省 commandsDir()；测试注入隔离）。 */
+	cmdsDir?: string;
 	/** tick 间隔（缺省 2000ms；测试可调小）。 */
 	tickMs?: number;
 }
@@ -53,11 +56,45 @@ export interface SessionControlHandle {
 	dispose: () => void;
 }
 
+/** 动作执行所需的进程内能力（测试可注入 fake）。 */
+export interface ControlActionDeps {
+	/** `pi.sendUserMessage`（slash 用）。缺失 ⇒ slash 回 stale-ctx。 */
+	sendUserMessage?: (body: string, opts?: { expandPromptTemplates?: boolean }) => void;
+	/** 该会话可用命令名集合；null = 快照不可用。 */
+	commandNames?: Set<string> | null;
+}
+
 /** 执行一条控制动作（纯分支，便于测试直接调）。 */
 export function executeControlAction(
 	req: ControlRequest,
 	ctx: LooseCtx | null,
+	deps: ControlActionDeps = {},
 ): { ok: true; result: ControlResult } | { ok: false; error: string } {
+	if (req.action === "slash") {
+		// slash：命令名必须在快照白名单里。为什么必须校验（读 pi 源码 agent-session.js:1568-1575）：
+		// `_tryExecuteExtensionCommand` 找不到命令就 `return false` ⇒ 继续走 prompt ⇒
+		// `/typo` 会被当正文发给 LLM，污染上下文并白烧 token。
+		const payload = req.payload;
+		if (payload === undefined || typeof payload.name !== "string" || payload.name.length === 0) {
+			return { ok: false, error: "slash 请求缺少 payload.name" };
+		}
+		if (deps.commandNames === null || deps.commandNames === undefined) {
+			// 快照不可用（扩展未加载 / 未 /reload）⇒ 明确拒绝，不放行
+			return { ok: true, result: "commands-unavailable" };
+		}
+		if (!deps.commandNames.has(payload.name)) return { ok: true, result: "unknown-command" };
+		const send = deps.sendUserMessage;
+		if (typeof send !== "function") return { ok: true, result: "stale-ctx" };
+		const body = payload.args.length > 0 ? `/${payload.name} ${payload.args}` : `/${payload.name}`;
+		try {
+			// expandPromptTemplates **必须显式 true**：`sendUserMessage` 默认 false
+			// （agent-session.js:1803），不传的话命令会被当正文发出去。
+			send(body, { expandPromptTemplates: true });
+		} catch (e) {
+			return { ok: false, error: e instanceof Error ? e.message : String(e) };
+		}
+		return { ok: true, result: "dispatched" };
+	}
 	if (req.action !== "abort") return { ok: true, result: "unknown-action" };
 	if (ctx === null || typeof ctx.abort !== "function") return { ok: true, result: "stale-ctx" };
 	// isIdle 缺失时按「可能在跑」处理：宁可调一次 abort（空闲时 abort 是安全 no-op，
@@ -79,6 +116,18 @@ export function executeControlAction(
 
 export function registerSessionControl(pi: ExtensionAPI, opts: RegisterSessionControlOptions = {}): () => void {
 	const dir = opts.dir ?? defaultControlDir();
+	const cmdsDir = opts.cmdsDir;
+	/** `pi.sendUserMessage`（slash 用）。按需绑定一次，避免每次消费都 bind。 */
+	const sendUserMessage = (() => {
+		try {
+			const fn = (pi as unknown as { sendUserMessage?: unknown }).sendUserMessage;
+			return typeof fn === "function"
+				? (fn as (body: string, o?: { expandPromptTemplates?: boolean }) => void).bind(pi)
+				: undefined;
+		} catch {
+			return undefined;
+		}
+	})();
 	let ctxRef: LooseCtx | null = null;
 	let sid: string | null = null;
 	let watcher: FSWatcher | null = null;
@@ -90,12 +139,22 @@ export function registerSessionControl(pi: ExtensionAPI, opts: RegisterSessionCo
 	const consume = (): number => {
 		if (sid === null) return 0;
 		let n = 0;
+		// watch 自愈：首次启动时目录可能还不存在（daemon 写第一条才 mkdir）
+		if (watcher === null) startWatcher();
 		try {
 			for (const req of listControlRequests(sid, dir)) {
 				if (req.status !== "pending" && req.status !== "running") continue;
 				const claimed = claimControlRequest(req.id, `session-control:${sid}`, { dir });
 				if (claimed === null) continue; // 别人在飞 / 已终态
-				const outcome = executeControlAction(claimed, ctxRef);
+				// slash 需要命令名白名单：快照缺失 ⇒ null ⇒ 回 commands-unavailable（不放行）
+				const commandNames =
+					claimed.action === "slash"
+						? readCommandNames(claimed.sessionId, cmdsDir !== undefined ? cmdsDir : commandsDir())
+						: undefined;
+				const outcome = executeControlAction(claimed, ctxRef, {
+					...(sendUserMessage !== undefined ? { sendUserMessage } : {}),
+					...(commandNames !== undefined ? { commandNames } : {}),
+				});
 				completeControlRequest(claimed.id, outcome, { dir });
 				n++;
 			}
@@ -120,6 +179,37 @@ export function registerSessionControl(pi: ExtensionAPI, opts: RegisterSessionCo
 		}
 	};
 
+	/**
+	 * 启动 watch。**可重试**（2026-10-20 修，由 consume 自愈调用）：
+	 * 扩展启动时 `state/session-control/` 往往还不存在（daemon 写第一条请求时才 mkdir），
+	 * 一次性尝试失败后若永不重试，就永久退化成 2s tick —— 用户点停止会有 2s 延迟。
+	 * 现在 `consume()` 里发现 `watcher === null` 就重试（那时目录已存在）。
+	 */
+	const startWatcher = (): void => {
+		if (watcher !== null || sid === null) return;
+		try {
+			// 目录可能还不存在（daemon 写第一条请求时才 mkdir）⇒ 先建再 watch。
+			// 否则 watch 抛错 → 只能等 2s tick，而 tick 又要等 consume…
+			// 同 outbox-bridge 的先例（"create it so watch is active before that write"）。
+			mkdirSync(dir, { recursive: true });
+			const w = fsWatch(dir, { persistent: false }, (_ev, filename) => {
+				if (!filename || !filename.endsWith(".json")) return;
+				if (debounce !== null) clearTimeout(debounce);
+				debounce = setTimeout(() => {
+					debounce = null;
+					consume();
+				}, 200);
+				(debounce as { unref?: () => void }).unref?.();
+			});
+			w.on("error", () => {
+				stopWatcher();
+			});
+			watcher = w;
+		} catch {
+			watcher = null; // 目录还不存在 / watch 不可用 → tick 兜底（下次 consume 再试）
+		}
+	};
+
 	const start = (nextCtx: LooseCtx | null): void => {
 		const nextSid = nextCtx?.sessionManager?.sessionId;
 		if (typeof nextSid !== "string" || nextSid.length === 0) return;
@@ -136,30 +226,32 @@ export function registerSessionControl(pi: ExtensionAPI, opts: RegisterSessionCo
 		run();
 		interval = setInterval(run, opts.tickMs ?? 2000);
 		(interval as { unref?: () => void }).unref?.();
+		startWatcher();
+	};
+
+	/**
+	 * 刷新命令快照（V3 实测风险：`bindExtensions` 里 `emit(session_start)` 在
+	 * `extendResourcesFromExtensions` **之前** ⇒ 只在 session_start 写会漏掉 skill 命令）。
+	 * 故两处都写：session_start 给基线，agent_start 懒刷新（那时资源肯定已加载）。
+	 */
+	const refreshCommands = (sessionId: string): void => {
 		try {
-			const w = fsWatch(dir, { persistent: false }, (_ev, filename) => {
-				if (!filename || !filename.endsWith(".json")) return;
-				if (debounce !== null) clearTimeout(debounce);
-				debounce = setTimeout(() => {
-					debounce = null;
-					run();
-				}, 200);
-				(debounce as { unref?: () => void }).unref?.();
-			});
-			w.on("error", () => {
-				stopWatcher();
-			});
-			watcher = w;
+			const raw = (pi as unknown as { getCommands?: () => unknown }).getCommands;
+			if (typeof raw !== "function") return;
+			const list = raw.call(pi);
+			writeCommandsSnapshot(sessionId, normalizeCommands(list), cmdsDir !== undefined ? { dir: cmdsDir } : {});
 		} catch {
-			watcher = null; // 目录还不存在 / watch 不可用 → tick 兜底
+			/* never-throw */
 		}
 	};
 
 	try {
 		pi.on("session_start", ((_event: unknown, ctx: LooseCtx) => {
 			try {
-				if (isSubagent()) return;
+					if (isSubagent()) return;
 				start(ctx);
+				const startSid = ctx?.sessionManager?.sessionId;
+				if (typeof startSid === "string" && startSid.length > 0) refreshCommands(startSid);
 			} catch {
 				/* never-throw */
 			}
@@ -174,7 +266,11 @@ export function registerSessionControl(pi: ExtensionAPI, opts: RegisterSessionCo
 		pi.on("message_start", ((_event: unknown, ctx: LooseCtx) => {
 			try {
 				if (isSubagent()) return;
-				if (ctx !== null && typeof ctx === "object") ctxRef = ctx;
+				if (ctx !== null && typeof ctx === "object") {
+					ctxRef = ctx;
+					const sidNow = ctx.sessionManager?.sessionId;
+					if (typeof sidNow === "string" && sidNow.length > 0) refreshCommands(sidNow);
+				}
 			} catch {
 				/* never-throw */
 			}

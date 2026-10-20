@@ -337,7 +337,9 @@ export interface CommandFrameInput {
 		| "master.handoff.prepare"
 		| "session.message"
 		/** 2026-10-20 停止按钮：让目标会话停止当前 turn（payload 空或 {reason?}）。 */
-		| "session.abort";
+		| "session.abort"
+		/** 2026-10-20 斜杠命令：payload {name, args?}。 */
+		| "session.slash";
 	to: string;
 	issuedBy?: string;
 	commandKey: string;
@@ -482,6 +484,28 @@ export interface BusySnapshot {
 }
 
 /**
+ * 会话可用斜杠命令（2026-10-20）：`GET /v1/session-commands/:sid`。
+ *
+ * `source` 语义不同，UI 必须区分：
+ *   - `extension`：真命令，**不落对话记录**；
+ *   - `skill` / `prompt`：会被**展开成正文** ⇒ 在对话流里留下一条消息。
+ * 混在一起显示会让用户以为 `/skill:xxx` 是命令（语义欺骗）。
+ */
+export interface CommandsSnapshot {
+	version: 1;
+	sessionId: string;
+	at: string;
+	pid: number;
+	/** 服务端算好的快照年龄（ms）。 */
+	ageMs: number;
+	commands: {
+		name: string;
+		description?: string;
+		source: "extension" | "prompt" | "skill" | "builtin" | "other";
+	}[];
+}
+
+/**
  * 会话控制指令回执（2026-10-20 停止按钮）：`GET /v1/session-control/:sid`。
  *
  * 只反映**最近一条**请求。`status` 是盘面状态机：pending（已排队）→ running（会话进程已领取）
@@ -502,8 +526,10 @@ export interface SessionControlBody {
 		claimedBy?: string;
 		claimedAt?: string;
 		completedAt?: string;
-		result?: "aborted" | "not-streaming" | "stale-ctx" | "unknown-action";
+		result?: "aborted" | "not-streaming" | "stale-ctx" | "unknown-action" | "dispatched" | "unknown-command" | "commands-unavailable";
 		error?: string;
+		/** slash 请求的载荷（原样交给 pi）。 */
+		payload?: { name: string; args: string };
 	};
 	/** 请求年龄（ms），服务端算。 */
 	ageMs: number;

@@ -16,6 +16,14 @@
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { autoExpandTarget } from "../chatAutoExpand";
+import {
+	applyCommandSelection,
+	filterCommands,
+	moveIndex,
+	parseSlashDraft,
+	slashKeyAction,
+	sourceHint,
+} from "../slashCommands";
 import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench, X } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
@@ -540,6 +548,9 @@ export function ChatPage() {
 	const chatAborting = useGui((s) => s.chatAborting);
 	const chatControl = useGui((s) => s.chatControl);
 	const chatBusyFlag = useGui((s) => s.chatBusyFlag);
+	/** 可用斜杠命令（2026-10-20）：null = 快照不可用（扩展未加载/未 reload）。 */
+	const chatCommands = useGui((s) => s.chatCommands);
+	const [slashIndex, setSlashIndex] = useState(-1);
 	/**
 	 * 「会话在跑」的判据（三条独立信号，任一成立即视为忙）：
 	 *  1. **turn 级 busy 标记**（扩展在 `agent_start` 写、`agent_settled` 删）——
@@ -799,9 +810,44 @@ export function ChatPage() {
 		setAttachHint(null);
 	};
 
+	/**
+	 * 斜杠命令补全（2026-10-20）。
+	 *
+	 * 只在「draft 以 / 开头且未输入空格」时激活；候选来自命令快照（30s 轮询）。
+	 * 快照不可用时不弹面板 —— 但输入框仍可自由输入（不做硬拦截：
+	 * 用户可能想发一条以 / 开头的普通消息，那是他的自由）。
+	 */
+	const slashState = useMemo(() => parseSlashDraft(draft), [draft]);
+	const slashCandidates = useMemo(
+		() => (slashState.active && chatCommands !== null ? filterCommands(chatCommands.commands, slashState.prefix) : []),
+		[slashState.active, slashState.prefix, chatCommands],
+	);
+	const slashOpen = slashState.active && slashCandidates.length > 0;
+	// 候选变化时把选中位重置（否则会指向已不存在的下标）
+	useEffect(() => {
+		setSlashIndex(-1);
+	}, [slashState.prefix, chatCommands]);
+
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
 		if (activeId === null || !canSendMessage(draft, attachments)) return;
+		// 斜杠命令（2026-10-20）：`/name args` 走 session.slash 通道（正文原样交给 pi）。
+		// 为什么不让它当普通消息发：pi 的 prompt() 对 `/` 开头文本会先试命令
+		// （agent-session.js:1458），命令名打错就**退回当正文发给 LLM**，污染上下文。
+		// 走命令通道 + 快照白名单，拼错会被明确拒（unknown-command）而不是白烧 token。
+		if (text.startsWith("/") && text.length > 1) {
+			const body = text.slice(1);
+			const sp = body.indexOf(" ");
+			const name = sp === -1 ? body : body.slice(0, sp);
+			const args = sp === -1 ? "" : body.slice(sp + 1);
+			if (!/^[a-z][a-z0-9-]*$/.test(name)) {
+				setAttachHint("命令名只能是小写字母开头、由 a-z 0-9 - 组成");
+				return;
+			}
+			setDraft("");
+			await useGui.getState().sendChatSlash(activeId, name, args);
+			return;
+		}
 		const ids = attachmentIds(attachments);
 		setDraft("");
 		for (const a of attachments) URL.revokeObjectURL(a.previewUrl);
@@ -888,6 +934,45 @@ export function ChatPage() {
 								>
 									↓ 回到底部
 								</Button>
+							)}
+							{/* 斜杠命令补全（2026-10-20）：贴在输入壳上方。
+							    只在「draft 以 / 开头且未输空格」且有候选时出现。
+							    source 为 skill/prompt 的条目标「插入正文」—— 它们会被展开成正文写进对话，
+							    不是「不落记录的真正命令」，不标就是语义欺骗。 */}
+							{slashOpen && (
+								<div
+									role="listbox"
+									aria-label="斜杠命令"
+									className="absolute bottom-full left-0 z-30 mb-2 max-h-64 w-full overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg"
+								>
+									{slashCandidates.slice(0, 40).map((c, i) => {
+										const hint = sourceHint(c.source);
+										return (
+											<button
+												key={`${c.source}:${c.name}`}
+												type="button"
+												role="option"
+												aria-selected={i === slashIndex}
+												onMouseEnter={() => setSlashIndex(i)}
+												onMouseDown={(e) => {
+													e.preventDefault(); // 不抢 textarea 焦点
+													setDraft(applyCommandSelection(c.name));
+												}}
+												className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-ui-sm ${i === slashIndex ? "bg-accent/12 text-foreground" : "text-foreground-subtle"}`}
+											>
+												<span className="font-mono text-ui-sm text-foreground">/{c.name}</span>
+												{hint !== null && (
+													<span className="shrink-0 rounded border border-border px-1 text-ui-xs text-foreground-subtlest">
+														{hint}
+													</span>
+												)}
+												{c.description !== undefined && (
+													<span className="truncate text-ui-xs text-foreground-subtlest">{c.description}</span>
+												)}
+											</button>
+										);
+									})}
+								</div>
 							)}
 							{/* 输入壳三态边框（hover / focus-within / 拖拽占位） */}
 							<div
@@ -978,6 +1063,26 @@ export function ChatPage() {
 										setAttachHint(res.notice);
 									}}
 									onKeyDown={(e) => {
+										// 斜杠命令补全优先（2026-10-20）：上/下选择、Tab/Enter 接受、Esc 关闭。
+										// 为什么要在 Enter 发送之前拦：补全面板开着时 Enter 应该是「选中命令」
+										// 而不是「把半截 `/mod` 当消息发出去」。
+										const act = slashKeyAction(e.key, { open: slashOpen, candidateCount: slashCandidates.length });
+										if (act === "dismiss") {
+											e.preventDefault();
+											setSlashIndex(-1);
+											return;
+										}
+										if (act === "accept") {
+											e.preventDefault();
+											const pick = slashCandidates[slashIndex >= 0 ? slashIndex : 0];
+											if (pick !== undefined) setDraft(applyCommandSelection(pick.name));
+											return;
+										}
+										if (act === "up" || act === "down") {
+											e.preventDefault();
+											setSlashIndex((cur) => moveIndex(cur, act === "up" ? -1 : 1, slashCandidates.length));
+											return;
+										}
 										if (e.key === "Enter" && !e.shiftKey) {
 											e.preventDefault();
 											void send();

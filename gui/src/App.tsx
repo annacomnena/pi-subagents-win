@@ -47,6 +47,8 @@ export default function App() {
 	// 「工具跑完→下一段输出」两段的空白（那两段里停止按钮本来应该是可点的）。
 	// 400ms 足够（心跳 15s；这里只关心「忙/不忙」两值，不需要跟流式同频）。
 	usePoll(() => useGui.getState().pollChatBusy(useGui.getState().chatActiveId), 400, activeTab === "chat");
+	// 命令快照（2026-10-20）：命令集在会话期内基本不变，30s 拉一次足够（也把 skill 命令的晚加载带走）。
+	usePoll(() => useGui.getState().pollChatCommands(useGui.getState().chatActiveId), 30000, activeTab === "chat");
 	// 停止回执（2026-10-20）：只在「刚点过停止」时拉（chatAborting）——
 	// 平常不轮询：404 常态不占带宽；点完后靠这条 500ms 轮询把 aborted/not-streaming 读回来。
 	usePoll(

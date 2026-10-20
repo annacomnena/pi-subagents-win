@@ -494,6 +494,33 @@ function readBusySnapshot(sessionId: string): Record<string, unknown> | null {
 	}
 }
 
+/**
+ * 读「会话可用命令」快照（2026-10-20 GUI 斜杠命令）。
+ *
+ * 由 pi 扩展写（`session_start` 基线 + 每轮 `message_start` 懒刷新）。
+ * 陈旧阈值 1h：命令集在会话期内基本不变；过期太狠只说明进程早没了。
+ *
+ * never-throw：缺失 / 坏 JSON → null（GUI 回退到「只给自由输入」）。
+ */
+const COMMANDS_STALE_MS = 60 * 60 * 1000;
+
+function readCommandsSnapshot(sessionId: string): Record<string, unknown> | null {
+	const p = join(defaultRuntimeDir(), "state", "commands", `${sessionId}.json`);
+	try {
+		const raw = readFileSync(p, "utf8");
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (parsed === null || typeof parsed !== "object") return null;
+		if (parsed.sessionId !== sessionId) return null;
+		if (!Array.isArray(parsed.commands)) return null;
+		const at = typeof parsed.at === "string" ? Date.parse(parsed.at) : Number.NaN;
+		const ageMs = Number.isFinite(at) ? Date.now() - at : Number.POSITIVE_INFINITY;
+		if (ageMs > COMMANDS_STALE_MS) return null;
+		return { ...parsed, ageMs };
+	} catch {
+		return null;
+	}
+}
+
 export function buildHealthView(opts: HealthOptions): HealthView {
 	const now = opts.now ?? new Date();
 	const timersDir = opts.timersDir ?? defaultTimersDir();
@@ -1684,6 +1711,17 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 流式快照（2026-10-20）：pi 扩展在 message_update 时覆盖写 state/streaming/<sid>.json，
 					// 这里只读快照给 GUI 做「正在思考」的临时块。会话不在流式 → 404（GUI 静默忽略）。
 					// 陈旧保护：快照带 `at`，超过 STREAMING_STALE_MS 视为残留（进程崩溃）→ 404，不让幽灵块常驻。
+					// 会话可用命令（2026-10-20 GUI 斜杠命令）：给命令面板与补全用。
+					// 快照缺失（扩展未加载 / 未 /reload）→ 404 ⇒ GUI 回退到「只给自由输入」。
+					const mcmd = /^\/v1\/session-commands\/([^/]+)$/.exec(u.pathname);
+					if (mcmd !== null) {
+						const sid = decodeURIComponent(mcmd[1]);
+						if (!/^[A-Za-z0-9_-]+$/.test(sid)) throw new HttpError(400, { error: "bad-session-id" });
+						const cs = readCommandsSnapshot(sid);
+						if (cs === null) throw new HttpError(404, { error: "no-commands-snapshot", sessionId: sid });
+						body = cs;
+						break;
+					}
 					// 会话正忙标记（2026-10-20 停止按钮）：turn 级信号，覆盖「点发送 → 第一个 token」
 					// 与「工具跑完 → 下一段输出」两段空白（流式快照在这两段都是 404）。
 					// 忙 → 200；空闲/陈旧 → 404（GUI 当「空闲」处理）。

@@ -17,6 +17,7 @@ import type {
 	HealthView,
 	InteractionItem,
 	OutboxEventPayload,
+	CommandsSnapshot,
 	RuntimeEnvelope,
 	SessionControlBody,
 	RuntimeSnapshot,
@@ -237,6 +238,19 @@ interface GuiState {
 	pollChatControl: (id: string | null) => Promise<void>;
 	/** 拉一次「会话正忙」标记（404 = 空闲 → false，不算错误）。 */
 	pollChatBusy: (id: string | null) => Promise<void>;
+	/**
+	 * 当前会话可用斜杠命令（2026-10-20）。null = 快照不可用（扩展未加载/未 reload）
+	 * ⇒ GUI 回退到「只给自由输入」，并在输入框提示原因。
+	 */
+	chatCommands: CommandsSnapshot | null;
+	/** 拉一次命令快照（404 = 不可用 → null，不算错误）。 */
+	pollChatCommands: (id: string | null) => Promise<void>;
+	/**
+	 * 派发一条斜杠命令（2026-10-20）。
+	 * 诚实口径：POST accepted 只代表「已排队」；真实结果（dispatched / unknown-command /
+	 * commands-unavailable）由 `pollChatControl` 读回执。
+	 */
+	sendChatSlash: (sessionId: string, name: string, args: string) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
@@ -443,6 +457,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatStreaming: null,
 	chatControl: null,
 	chatBusyFlag: false,
+	chatCommands: null,
 	chatAborting: false,
 	chatConn: "idle",
 	chatResyncKey: 0,
@@ -609,6 +624,64 @@ export const useGui = create<GuiState>((set, get) => ({
 		}
 		if (r.data.sessionId !== id) return; // 防串台
 		if (!get().chatBusyFlag) set({ chatBusyFlag: true });
+	},
+
+	/**
+	 * 拉一次命令快照（2026-10-20）。404（no-commands-snapshot）= 不可用 ⇒ null。
+	 * 不可用不是错误（扩展可能未 reload），但 UI 必须能区分「没有命令」与「拿不到命令」。
+	 */
+	pollChatCommands: async (id) => {
+		if (id === null) {
+			if (get().chatCommands !== null) set({ chatCommands: null });
+			return;
+		}
+		const r = await api.sessionCommands(id);
+		if (!r.ok) {
+			if (get().chatCommands !== null) set({ chatCommands: null });
+			return;
+		}
+		if (r.data.sessionId !== id) return; // 防串台
+		set({ chatCommands: r.data });
+	},
+
+	/**
+	 * 派发斜杠命令（2026-10-20）。
+	 *
+	 * 诚实口径：POST accepted ≠ 命令已执行。真实结果由 `pollChatControl` 读回执：
+	 *   dispatched（已交给 pi）/ unknown-command（命令名不在快照里）/ commands-unavailable。
+	 */
+	sendChatSlash: async (sessionId, name, args) => {
+		const key = newCommandKey("slash");
+		set({ chatAborting: true }); // 复用「等回执」锁：防连点重复派发
+		try {
+			const r = await api.sessionSlash(sessionId, name, args, key);
+			if (!r.ok) {
+				set({
+					chatAborting: false,
+					chatControl: {
+						version: 1,
+						sessionId,
+						request: {
+							version: 1,
+							id: key,
+							sessionId,
+							action: "abort", // 仅借用形状（UI 只看 status/error）
+							commandKey: key,
+							status: "failed",
+							requestedAt: new Date().toISOString(),
+							error: r.status === 401 ? "未授权（401）" : `命令请求失败（${r.status}）`,
+						},
+						ageMs: 0,
+					},
+				});
+				return;
+			}
+			void get().pollChatControl(sessionId);
+		} finally {
+			setTimeout(() => {
+				if (get().chatAborting) set({ chatAborting: false });
+			}, 4000);
+		}
 	},
 
 	pollChatSessions: async () => {

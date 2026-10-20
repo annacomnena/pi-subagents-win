@@ -75,6 +75,7 @@ export const IMPLEMENTED_COMMAND_TYPES = [
 	"master.handoff.prepare",
 	"session.message",
 	"session.abort",
+	"session.slash",
 ] as const;
 
 export type ImplementedCommandType = (typeof IMPLEMENTED_COMMAND_TYPES)[number];
@@ -258,6 +259,9 @@ function commandPayloadOk(frame: CommandFrame): boolean {
 		case "session.abort":
 			// 停止指令不需要任何参数；只允许可选 reason（与 pause/resume 同形状）
 			return payloadShapeOk(frame.payload, {}, { reason: "string" });
+		case "session.slash":
+			// 必需 name（命令名，无斜杠前缀）+ 可选 args；多余字段拒绝
+			return payloadShapeOk(frame.payload, { name: "string" }, { args: "string" });
 		default:
 			return true; // not-implemented 层已拒，无 handler type 的 payload 留待对应批次
 	}
@@ -344,6 +348,8 @@ function dispatchHandler(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 			return runSessionMessage(frame, opts);
 		case "session.abort":
 			return runSessionAbort(frame, opts);
+		case "session.slash":
+			return runSessionSlash(frame, opts);
 		default:
 			return reject("not-implemented");
 	}
@@ -723,6 +729,97 @@ function runSessionAbort(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 		summary: written
 			? `abort queued → pi://${sessionId}（control ${req.id.slice(0, 8)}；结果由会话进程回写）`
 			: `abort 已存在（control ${req.id.slice(0, 8)}；同 commandKey 幂等，未重复排队）`,
+		replayed: !written,
+	};
+}
+
+// ── 2.8 session.slash（2026-10-20 GUI 斜杠命令）──
+
+/** 命令名形状：小写字母开头，允许 a-z0-9-；不含斜杠前缀（那是 GUI 的展示形式）。 */
+const SLASH_NAME_RE = /^[a-z][a-z0-9-]*$/;
+const SLASH_NAME_MAX = 64;
+const SLASH_ARGS_MAX_BYTES = 8000;
+
+/**
+ * session.slash handler —— 派发一条斜杠命令到目标会话。
+ *
+ * ## 为什么必须校验命令名（读 pi 源码 `agent-session.js:1568-1575`）
+ * ```js
+ * async _tryExecuteExtensionCommand(text) {
+ *     const command = this._extensionRunner.getCommand(commandName);
+ *     if (!command) return false;     // ← 找不到就 return false
+ *     ...
+ * }
+ * // 调用处：if (handled) return; 否则继续走 prompt ⇒ 正文发给 LLM
+ * ```
+ * ⇒ 命令名打错（`/modle`）会被**当成普通正文发给 LLM**，污染上下文并白烧 token。
+ * 所以 executor 这里先做形状校验（快速拒），真正的白名单校验在会话进程
+ * （那里才有 `getCommands()` 的权威快照，见 `session-control-register.ts`）。
+ *
+ * ## 为什么走 session-control 而不是 message-outbox
+ * outbox 的正文会被 `buildOutboxInjectBody` 追加 eventId 标记/附件块 ⇒
+ * `/model xxx [eventId:…]` 会**直接失效**（命令解析只认第一段）。
+ * 控制通道的正文原样交给 `pi.sendUserMessage`。
+ *
+ * ## 回执
+ * accepted = 请求已排队；`dispatched` / `unknown-command` / `commands-unavailable`
+ * 由会话进程回写（GUI 经 `GET /v1/session-control/:sid` 读）。
+ */
+function runSessionSlash(frame: CommandFrame, opts: ExecuteCommandOptions): CommandOutcome {
+	const parsed = parseObjectAddress(frame.to);
+	if (!parsed || parsed.scheme !== "pi" || parsed.value.length === 0) return reject("invalid-payload");
+	const sessionId = parsed.value;
+
+	const payload = frame.payload as { name?: unknown; args?: unknown } | undefined;
+	const name = typeof payload?.name === "string" ? payload.name : "";
+	const args = typeof payload?.args === "string" ? payload.args : "";
+	if (!SLASH_NAME_RE.test(name) || name.length > SLASH_NAME_MAX) return reject("invalid-payload");
+	if (Buffer.byteLength(args, "utf8") > SLASH_ARGS_MAX_BYTES) return reject("invalid-payload");
+	// 控制字符（C0 除 TAB/LF/CR + DEL）拒绝：命令参数不该带控制序列
+	if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(args)) return reject("invalid-payload");
+
+	// 目标存在性校验（与 session.message / session.abort 同口径）
+	const sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
+	if (findSessionFile(sessionsDir, sessionId) === null) return reject("no-session");
+
+	const req = newControlRequest({
+		sessionId,
+		action: "slash",
+		commandKey: frame.commandKey,
+		now: opts.now ?? new Date(),
+		payload: { name, args },
+	});
+	let written = false;
+	try {
+		written = writeControlRequest(req, controlDir(stateRoot(opts))).written;
+	} catch (e) {
+		return { status: "failed", reason: "io-error", error: `write session-control: ${msg(e)}`, replayed: false };
+	}
+
+	try {
+		const at = (opts.now ?? new Date()).toISOString();
+		appendRuntimeEnvelopeSafe(
+			newEventEnvelope({
+				type: "session.slash.requested",
+				source: frame.issuedBy,
+				subject: frame.to,
+				at,
+				recordedAt: at,
+				// 只记命令名，不记 args（args 可能含敏感值，如 token/路径）
+				payload: { commandKey: frame.commandKey, controlId: req.id, sessionId, name, duplicate: !written },
+				dedupeKey: `session.slash.requested:${req.id}`,
+			}),
+			opts.journalPath ?? defaultJournalPath(),
+		);
+	} catch {
+		/* safe wrapper 自吞 */
+	}
+
+	return {
+		status: "accepted",
+		summary: written
+			? `slash /${name} queued → pi://${sessionId}（control ${req.id.slice(0, 8)}；结果由会话进程回写）`
+			: `slash /${name} 已存在（control ${req.id.slice(0, 8)}；同 commandKey 幂等）`,
 		replayed: !written,
 	};
 }

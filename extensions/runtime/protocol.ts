@@ -65,6 +65,8 @@ export const COMMAND_TYPES = [
 	"session.message",
 	/** 2026-10-20 停止按钮：让目标 pi 会话停止当前 turn（经独立 session-control 盘面转交）。 */
 	"session.abort",
+	/** 2026-10-20 斜杠命令：派发一条 `/name args`（经同一控制盘面，正文原样交给 pi）。 */
+	"session.slash",
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
