@@ -16,6 +16,7 @@ import type {
 	InteractionsResponse,
 	RuntimeSnapshot,
 	SessionsBody,
+	SessionControlBody,
 	StreamingSnapshot,
 	TimelineResponse,
 	TranscriptBody,
@@ -265,6 +266,29 @@ export const api = {
 	 */
 	streaming: (sessionId: string): Promise<FetchResult<StreamingSnapshot>> =>
 		fetchJson<StreamingSnapshot>(`/v1/streaming/${encodeURIComponent(sessionId)}`, undefined, 4000),
+
+	/**
+	 * session.abort（2026-10-20 停止按钮）：请求目标会话停止当前 turn。
+	 *
+	 * 语义（诚实口径）：**只表示「请求已排队」**，不表示「已停止」——
+	 * 真实结果由会话进程回写 `state/session-control/`，GUI 经 `sessionControl()` 读。
+	 * `commandKey` 由调用方传入（重试同键幂等，不会重复排队）。
+	 */
+	sessionAbort: (sessionId: string, commandKey?: string): Promise<FetchResult<CommandOutcomeBody>> =>
+		postJson<CommandOutcomeBody>("/v1/commands", {
+			frame: "command",
+			type: "session.abort",
+			to: `pi://${sessionId}`,
+			commandKey: commandKey ?? newCommandKey("abort"),
+			issuedAt: new Date().toISOString(),
+		} satisfies CommandFrameInput, 8000),
+
+	/**
+	 * 会话控制指令回执（2026-10-20）：该会话**最近一条**请求。
+	 * 404（no-control-request）= 从没点过停止 ⇒ GUI 不显示任何状态（正常态，不 markDown）。
+	 */
+	sessionControl: (sessionId: string): Promise<FetchResult<SessionControlBody>> =>
+		fetchJson<SessionControlBody>(`/v1/session-control/${encodeURIComponent(sessionId)}`, undefined, 4000),
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
 	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；

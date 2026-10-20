@@ -167,6 +167,7 @@ import { readAttachment } from "../runtime/registry.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
+import { latestControlRequest } from "../runtime/session-control.ts";
 import {
 	RUNTIME_SCHEMA_VERSION,
 	answerChallenge,
@@ -1660,6 +1661,18 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						const snap = readStreamingSnapshot(sid);
 						if (snap === null) throw new HttpError(404, { error: "not-streaming", sessionId: sid });
 						body = snap;
+						break;
+					}
+					// 会话控制指令回执（2026-10-20 停止按钮）：读 `state/session-control/` 里
+					// 该会话**最近一条**请求（abort 的 aborted / not-streaming / stale-ctx）。
+					// 无请求 → 404（GUI 当「没点过停止」处理，不显示状态）。
+					const mctl = /^\/v1\/session-control\/([^/]+)$/.exec(u.pathname);
+					if (mctl !== null) {
+						const sid = decodeURIComponent(mctl[1]);
+						if (!/^[A-Za-z0-9_-]+$/.test(sid)) throw new HttpError(400, { error: "bad-session-id" });
+						const latest = latestControlRequest(sid);
+						if (latest === null) throw new HttpError(404, { error: "no-control-request", sessionId: sid });
+						body = { version: 1, sessionId: sid, request: latest, ageMs: Date.now() - Date.parse(latest.requestedAt) };
 						break;
 					}
 					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，

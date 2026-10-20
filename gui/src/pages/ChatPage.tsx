@@ -536,6 +536,38 @@ export function ChatPage() {
 	const hasOlder = useGui((s) => (activeId !== null ? s.chatHasOlderBySession[activeId] === true : false));
 	const tailWant = useGui((s) => (activeId !== null ? (s.chatTailBySession[activeId] ?? 200) : 200));
 	const streaming = useGui((s) => s.chatStreaming);
+	/** 停止按钮（2026-10-20）：本地瞬时态 + 回执。 */
+	const chatAborting = useGui((s) => s.chatAborting);
+	const chatControl = useGui((s) => s.chatControl);
+	/**
+	 * 「会话在跑」的判据（两条独立信号，任一成立即视为忙）：
+	 *  1. 流式快照存在（扩展在写 `state/streaming/`）—— 最直接；
+	 *  2. 最后一行是 `status="running"` 的工具卡 —— 不依赖扩展，从 transcript 投影来。
+	 * 两条都失效时（例如扩展未加载且刚发完消息还没落盘），停止钮不可点 ——
+	 * 宁可不可点，也不给一个点了没反应的钮（那是静默失效）。
+	 */
+	const lastRowRunning = useMemo(() => {
+		const last = rows[rows.length - 1];
+		return last !== undefined && last.kind === "toolCall" && last.status === "running";
+	}, [rows]);
+	const chatBusy = streaming !== null || lastRowRunning;
+	/**
+	 * 停止回执的人话（只对**需要告知**的结果出字）：
+	 *   - aborted ⇒ 不显示（预期行为，流式预览消失就是反馈）；
+	 *   - not-streaming ⇒ 「会话已空闲」（用户点了但没东西可停，得告知）
+	 *   - stale-ctx ⇒ 「会话可能已重启」（真故障）
+	 *   - failed ⇒ 带 error
+	 */
+	const controlHint = useMemo(() => {
+		if (chatControl === null) return null;
+		const req = chatControl.request;
+		if (req.status === "failed") return `停止失败：${req.error ?? "未知错误"}`;
+		if (req.status !== "done") return null;
+		if (req.result === "not-streaming") return "停止请求已送达，但会话当时已空闲（无需停止）";
+		if (req.result === "stale-ctx") return "停止请求已送达，但会话上下文已失效（可能已重启，请刷新）";
+		if (req.result === "unknown-action") return "停止请求被拒：动作不被支持（版本不匹配？）";
+		return null; // aborted：预期行为，不出字
+	}, [chatControl]);
 	/**
 	 * 自动展开「刚落盘的那条思考」（2026-10-20 用户要求「当前执行的思考自动展开，完毕自动合上」）。
 	 *
@@ -829,6 +861,11 @@ export function ChatPage() {
 								))}
 								{/* 流式预览（2026-10-20）：仅当服务端有该会话的快照（= 正在生成）时显示 */}
 								{streaming !== null && <StreamingPreview snap={streaming} />}
+								{/* 停止回执（2026-10-20）：只在「有值得说的结果」时显示——
+								    aborted 是预期行为（不扑喷），not-streaming / stale-ctx / failed 必须告知。 */}
+								{controlHint !== null && (
+									<div className="py-1 text-ui-xs text-foreground-subtlest">{controlHint}</div>
+								)}
 							</>
 						)}
 					</div>
@@ -994,17 +1031,36 @@ export function ChatPage() {
 													Master 会话拒绝远程输入已放宽：经本机受信通道注入（浏览器上下文被注入内容时等于驱动 master）
 												</p>
 											)}
-											{/* Stop 钮灰显占位（无 interrupt 命令；zcode 口径 variant=secondary + Square fill-current） */}
+											{/*
+												Stop 钮（2026-10-20 接入）：POST /v1/commands `session.abort`
+												→ daemon 写 `state/session-control/` → 会话进程 fs.watch 领取 → `ctx.abort()`。
+												诚实口径：点击只表示「请求已发出」，真实结果（aborted / not-streaming）
+												由 500ms 回执轮询读回；abort 会丢弃本轮未完成产出，所以 tooltip 明说。
+											*/}
 											<Tooltip>
 												<TooltipTrigger asChild>
-													{/* 同上：仅让 Tooltip 可达，Stop 仍为 disabled 且无 interrupt 副作用。 */}
 													<span className="inline-flex">
-														<Button type="button" variant="secondary" size="icon-md" disabled aria-label="停止（未接入）">
-															<Square className="size-4 fill-current" />
+														<Button
+															type="button"
+															variant="secondary"
+															size="icon-md"
+															disabled={activeId === null || !chatBusy || chatAborting}
+															onClick={() => {
+																if (activeId !== null) void useGui.getState().abortChatSession(activeId);
+															}}
+															aria-label={chatAborting ? "正在停止…" : "停止当前输出"}
+														>
+															<Square className={`size-4 fill-current ${chatAborting ? "animate-pulse" : ""}`} />
 														</Button>
 													</span>
 												</TooltipTrigger>
-												<TooltipContent>未接入（无 interrupt 命令）</TooltipContent>
+												<TooltipContent>
+													{chatAborting
+														? "已发送停止请求，等待会话确认…"
+														: chatBusy
+															? "停止当前输出（会丢弃本轮未完成的产出）"
+															: "会话空闲"}
+												</TooltipContent>
 											</Tooltip>
 											{/* 发送钮（ConversationComposer.tsx#L2082-2095 整条 class） */}
 											<Button

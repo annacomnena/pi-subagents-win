@@ -335,7 +335,9 @@ export interface CommandFrameInput {
 		| "master.handoff.accept"
 		| "master.auto-handoff.set"
 		| "master.handoff.prepare"
-		| "session.message";
+		| "session.message"
+		/** 2026-10-20 停止按钮：让目标会话停止当前 turn（payload 空或 {reason?}）。 */
+		| "session.abort";
 	to: string;
 	issuedBy?: string;
 	commandKey: string;
@@ -456,6 +458,34 @@ export interface StreamingSnapshot {
 	at: string;
 	pid: number;
 	/** 服务端算好的年龄（ms），GUI 不再自己算时钟差。 */
+	ageMs: number;
+}
+
+/**
+ * 会话控制指令回执（2026-10-20 停止按钮）：`GET /v1/session-control/:sid`。
+ *
+ * 只反映**最近一条**请求。`status` 是盘面状态机：pending（已排队）→ running（会话进程已领取）
+ * → done（有 result）/ failed（有 error）。
+ * `result` 是诚实回执：aborted（确实在流式）/ not-streaming（已空闲）/ stale-ctx（ctx 失效）。
+ */
+export interface SessionControlBody {
+	version: 1;
+	sessionId: string;
+	request: {
+		version: 1;
+		id: string;
+		sessionId: string;
+		action: "abort";
+		commandKey: string;
+		status: "pending" | "running" | "done" | "failed";
+		requestedAt: string;
+		claimedBy?: string;
+		claimedAt?: string;
+		completedAt?: string;
+		result?: "aborted" | "not-streaming" | "stale-ctx" | "unknown-action";
+		error?: string;
+	};
+	/** 请求年龄（ms），服务端算。 */
 	ageMs: number;
 }
 

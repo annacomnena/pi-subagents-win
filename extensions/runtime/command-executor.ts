@@ -58,6 +58,7 @@ import {
 } from "./message-outbox.ts";
 import { decideProposal, maybePropose, readProposal } from "./master-succession.ts";
 import { readAttachment } from "./registry.ts";
+import { controlDir, newControlRequest, writeControlRequest } from "./session-control.ts";
 import { auditMasterInjection } from "./master-injection.ts";
 import { defaultSessionsDir, findSessionFile } from "./transcript.ts";
 import { validateCommandFrame, type CommandFrame } from "./protocol.ts";
@@ -73,6 +74,7 @@ export const IMPLEMENTED_COMMAND_TYPES = [
 	"master.auto-handoff.set",
 	"master.handoff.prepare",
 	"session.message",
+	"session.abort",
 ] as const;
 
 export type ImplementedCommandType = (typeof IMPLEMENTED_COMMAND_TYPES)[number];
@@ -253,6 +255,9 @@ function commandPayloadOk(frame: CommandFrame): boolean {
 			return payloadShapeOk(frame.payload, { auto: "boolean" }, { reason: "string" });
 		case "session.message":
 			return sessionMessagePayloadOk(frame.payload);
+		case "session.abort":
+			// 停止指令不需要任何参数；只允许可选 reason（与 pause/resume 同形状）
+			return payloadShapeOk(frame.payload, {}, { reason: "string" });
 		default:
 			return true; // not-implemented 层已拒，无 handler type 的 payload 留待对应批次
 	}
@@ -337,6 +342,8 @@ function dispatchHandler(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 			return runHandoffPrepare(opts);
 		case "session.message":
 			return runSessionMessage(frame, opts);
+		case "session.abort":
+			return runSessionAbort(frame, opts);
 		default:
 			return reject("not-implemented");
 	}
@@ -650,6 +657,73 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 		status: "accepted",
 		summary: `message queued → pi://${sessionId}（outbox ${item.id.slice(0, 8)}；两段式：扩展桥注入后回写 delivered/failed）`,
 		replayed: false,
+	};
+}
+
+// ── 2.7 session.abort（2026-10-20 GUI 停止按钮）──
+
+/**
+ * session.abort handler —— 让目标会话**停止当前 turn**。
+ *
+ * ## 为什么不用 outbox（与 session.message 的关键差异）
+ * - `session.message` 是「投递一条内容」：需要两段式 + at-least-once 重投；
+ * - `abort` 是「控制指令」：重复执行无副作用（幂等即语义），且必须**立刻**生效 ——
+ *   走 outbox 的 10s tick 兜底路径太慢，用户点「停止」等 10 秒不可接受。
+ * 因此写入独立的 `state/session-control/` 盘面（见 runtime/session-control.ts），
+ * 由会话进程内 `fs.watch`（200ms debounce）+ 2s tick 领取并调用 `ctx.abort()`。
+ *
+ * ## 回执语义（诚实口径）
+ * 本函数只承诺「请求已排队」（accepted）。真实结果（aborted / not-streaming / stale-ctx）
+ * 由会话进程回写，GUI 经 `GET /v1/session-control/:sid` 读。
+ * **不声称「已停止」** —— 那只有会话进程知道。
+ */
+function runSessionAbort(frame: CommandFrame, opts: ExecuteCommandOptions): CommandOutcome {
+	const parsed = parseObjectAddress(frame.to);
+	if (!parsed || parsed.scheme !== "pi" || parsed.value.length === 0) return reject("invalid-payload");
+	const sessionId = parsed.value;
+
+	// 目标存在性校验（与 session.message 同口径：读盘面后的业务拒绝可重放）
+	const sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
+	if (findSessionFile(sessionsDir, sessionId) === null) return reject("no-session");
+
+	const req = newControlRequest({
+		sessionId,
+		action: "abort",
+		commandKey: frame.commandKey,
+		now: opts.now ?? new Date(),
+	});
+	let written = false;
+	try {
+		written = writeControlRequest(req, controlDir(stateRoot(opts))).written;
+	} catch (e) {
+		return { status: "failed", reason: "io-error", error: `write session-control: ${msg(e)}`, replayed: false };
+	}
+
+	// journal（safe wrapper：写失败不影响回执；不含任何会话内容）
+	try {
+		const at = (opts.now ?? new Date()).toISOString();
+		appendRuntimeEnvelopeSafe(
+			newEventEnvelope({
+				type: "session.abort.requested",
+				source: frame.issuedBy,
+				subject: frame.to,
+				at,
+				recordedAt: at,
+				payload: { commandKey: frame.commandKey, controlId: req.id, sessionId, duplicate: !written },
+				dedupeKey: `session.abort.requested:${req.id}`,
+			}),
+			opts.journalPath ?? defaultJournalPath(),
+		);
+	} catch {
+		/* safe wrapper 自吞，双保险 */
+	}
+
+	return {
+		status: "accepted",
+		summary: written
+			? `abort queued → pi://${sessionId}（control ${req.id.slice(0, 8)}；结果由会话进程回写）`
+			: `abort 已存在（control ${req.id.slice(0, 8)}；同 commandKey 幂等，未重复排队）`,
+		replayed: !written,
 	};
 }
 

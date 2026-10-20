@@ -43,6 +43,13 @@ export default function App() {
 	// 流式快照（2026-10-20）：pi 扩展节流 150ms 覆盖写，这里 200ms 拉一次 ⇒ 观感 5 次/秒；
 	// GUI 用 CSS 动画填平间隙（不逐 token 渲染）。只在 chat 页且有活跃会话时拉。
 	usePoll(() => useGui.getState().pollChatStreaming(useGui.getState().chatActiveId), 200, activeTab === "chat");
+	// 停止回执（2026-10-20）：只在「刚点过停止」时拉（chatAborting）——
+	// 平常不轮询：404 常态不占带宽；点完后靠这条 500ms 轮询把 aborted/not-streaming 读回来。
+	usePoll(
+		() => useGui.getState().pollChatControl(useGui.getState().chatActiveId),
+		500,
+		activeTab === "chat" && useGui.getState().chatAborting,
+	);
 
 	const Page = PAGES[activeTab];
 

@@ -63,6 +63,8 @@ export const COMMAND_TYPES = [
 	"master.auto-handoff.set",
 	"master.handoff.prepare",
 	"session.message",
+	/** 2026-10-20 停止按钮：让目标 pi 会话停止当前 turn（经独立 session-control 盘面转交）。 */
+	"session.abort",
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];

@@ -18,6 +18,7 @@ import type {
 	InteractionItem,
 	OutboxEventPayload,
 	RuntimeEnvelope,
+	SessionControlBody,
 	RuntimeSnapshot,
 	SessionSummary,
 	TimelineItem,
@@ -196,6 +197,13 @@ interface GuiState {
 	chatTailBySession: Record<string, number>;
 	/** 当前会话的流式快照（节流 ~6.7 次/秒；null = 没在流式）。L2/UX 2026-10-20。 */
 	chatStreaming: StreamingSnapshot | null;
+	/**
+	 * 当前会话最近一条**控制指令**回执（2026-10-20 停止按钮）。
+	 * null = 没点过停止（或已过展示期）；status=done + result=aborted ⇒ 已停下。
+	 */
+	chatControl: SessionControlBody | null;
+	/** 停止按钮的本地瞬时态（点击后 → 回执未到前的禁用保护，防连点排队多条）。 */
+	chatAborting: boolean;
 	chatConn: StreamState;
 	/** bump → useEventStream 立即重订阅（snapshot/resync 全量重拉完成后）。 */
 	chatResyncKey: number;
@@ -212,6 +220,15 @@ interface GuiState {
 	reloadChatSession: (id: string, tail?: number) => Promise<void>;
 	/** 拉一次流式快照（404 = 没在流式 → 置 null，不算错误）。 */
 		pollChatStreaming: (id: string | null) => Promise<void>;
+	/**
+	 * 请求停止当前 turn（2026-10-20）。
+	 *
+	 * 诚实口径：POST 成功只代表「请求已排队」；真实结果靠 `pollChatControl` 读回执。
+	 * 幂等：commandKey 在这里生成一次，失败重试同键（不会重复排队）。
+	 */
+	abortChatSession: (sessionId: string) => Promise<void>;
+	/** 拉一次控制回执（404 = 没点过 → 置 null，不算错误）。 */
+	pollChatControl: (id: string | null) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
@@ -416,6 +433,8 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatHasOlderBySession: {},
 	chatTailBySession: {},
 	chatStreaming: null,
+	chatControl: null,
+	chatAborting: false,
 	chatConn: "idle",
 	chatResyncKey: 0,
 	chatOutbox: {},
@@ -497,6 +516,71 @@ export const useGui = create<GuiState>((set, get) => ({
 		// 防串台：响应必须属于当前会话
 		if (r.data.sessionId !== id) return;
 		set({ chatStreaming: r.data });
+	},
+
+	/**
+	 * 请求停止当前 turn（2026-10-20 停止按钮）。
+	 *
+	 * 诚实口径：POST accepted **不等于已停止**。这里只负责「把请求递进去」，
+	 * 真实结果由 `pollChatControl` 从 `state/session-control/` 读回执（aborted / not-streaming）。
+	 *
+	 * 幂等：`commandKey` 只生成一次并留在 `chatControlKeyBySession`，重试同键不会重复排队。
+	 */
+	abortChatSession: async (sessionId) => {
+		if (get().chatAborting) return; // 防连点（回执未到前不再发第二条）
+		set({ chatAborting: true });
+		try {
+			const key = newCommandKey("abort");
+			const r = await api.sessionAbort(sessionId, key);
+			if (!r.ok) {
+				// 不静默：把失败原因写进 chatControl 的形状（status=failed），UI 直接展示
+				set({
+					chatAborting: false,
+					chatControl: {
+						version: 1,
+						sessionId,
+						request: {
+							version: 1,
+							id: key,
+							sessionId,
+							action: "abort",
+							commandKey: key,
+							status: "failed",
+							requestedAt: new Date().toISOString(),
+							error: r.status === 401 ? "未授权（401）" : `请求失败（${r.status}）`,
+						},
+						ageMs: 0,
+					},
+				});
+				return;
+			}
+			// accepted：立刻拉一次回执（会话进程 watch 200ms 内就会领取）
+			void get().pollChatControl(sessionId);
+		} finally {
+			// 给回执一点时间；pollChatControl 自己会在拿到终态后清掉 chatAborting
+			setTimeout(() => {
+				if (get().chatAborting) set({ chatAborting: false });
+			}, 4000);
+		}
+	},
+
+	/**
+	 * 拉一次控制回执。404（从没点过停止）= 正常态 ⇒ 置 null，不 markDown。
+	 * 拿到终态（done/failed）后清掉 chatAborting，让按钮回到可用态。
+	 */
+	pollChatControl: async (id) => {
+		if (id === null) {
+			if (get().chatControl !== null) set({ chatControl: null });
+			return;
+		}
+		const r = await api.sessionControl(id);
+		if (!r.ok) {
+			if (get().chatControl !== null) set({ chatControl: null });
+			return;
+		}
+		if (r.data.sessionId !== id) return; // 防串台
+		const done = r.data.request.status === "done" || r.data.request.status === "failed";
+		set({ chatControl: r.data, ...(done ? { chatAborting: false } : {}) });
 	},
 
 	pollChatSessions: async () => {
