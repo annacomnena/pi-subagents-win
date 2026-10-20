@@ -170,6 +170,49 @@ try {
 		ok("T3 大文件（字节窗路径）：等价性 + 绝对 head + hasOlder");
 	}
 
+	// ── T5 空增量快路：after ≥ 总行数 ⇒ rows=[] 且 head 仍绝对 ────────
+	{
+		const d = tmpDir("tail-t5-");
+		const file = writeSession(d, "s.jsonl", 20);
+		const full = projectSession(file, 0);
+		const delta = projectSession(file, full.head);
+		assert.deepEqual(delta.rows, [], "after = head ⇒ 增量为空");
+		assert.equal(delta.head, full.head, "空增量仍返回绝对 head（客户端可继续接续）");
+		assert.equal(delta.logEpoch, full.logEpoch, "空增量仍返回 logEpoch（代际校验用）");
+		assert.equal(delta.found, true, "空增量 found=true（不是 404）");
+		// 追加后同一 after 必须不再命中快路
+		writeFileSync(
+			file,
+			JSON.stringify({ type: "message", id: "u900", timestamp: "2026-10-20T03:00:00.000Z", message: { role: "user", content: [{ type: "text", text: "新的一轮" }] } }) + String.fromCharCode(10),
+			{ flag: "a" },
+		);
+		const delta2 = projectSession(file, full.head);
+		assert.ok(delta2.rows.length > 0, "文件追加后同一 after 返回真实增量");
+		assert.ok(delta2.head > full.head, "head 前进");
+		ok("T5 空增量快路：无新行时 rows=[] 且 head/logEpoch 仍是绝对值；追加后自动失效");
+	}
+
+	// ── T6 行索引增量：文件追加后 tail 仍等价（含 turnIndex 偏移）──────
+	{
+		const d = tmpDir("tail-t6-");
+		const file = writeSession(d, "s.jsonl", 15);
+		const first = projectSessionTail(file, { rows: 10 });
+		const fullA = projectSession(file, 0);
+		assert.deepEqual(first.rows, fullA.rows.slice(-first.rows.length), "首次 tail 等价");
+		// 追加两轮（含 toolCall/toolResult 回填）
+		for (const i of [90, 91]) {
+			const at = `2026-10-20T04:0${i % 10}:00.000Z`;
+			writeFileSync(file, JSON.stringify({ type: "message", id: `u${i}`, timestamp: at, message: { role: "user", content: [{ type: "text", text: `追加轮 ${i}` }] } }) + String.fromCharCode(10), { flag: "a" });
+			writeFileSync(file, JSON.stringify({ type: "message", id: `a${i}`, timestamp: at, message: { role: "assistant", content: [{ type: "text", text: `追加答 ${i}` }, { type: "toolCall", id: `c${i}`, name: "read", arguments: {} }] } }) + String.fromCharCode(10), { flag: "a" });
+			writeFileSync(file, JSON.stringify({ type: "message", id: `r${i}`, timestamp: at, message: { role: "toolResult", toolCallId: `c${i}`, isError: false, content: [{ type: "text", text: `ok ${i}` }] } }) + String.fromCharCode(10), { flag: "a" });
+		}
+		const fullB = projectSession(file, 0);
+		const tailB = projectSessionTail(file, { rows: 10 });
+		assert.deepEqual(tailB.rows, fullB.rows.slice(-tailB.rows.length), "追加后 tail 仍等价（索引增量正确）");
+		assert.equal(tailB.head, fullB.head, "追加后 head 一致");
+		ok("T6 行索引增量：文件追加后 tail 仍与全量等价（head/turnIndex 正确）");
+	}
+
 	// ── T4 尾部巨行（窗内 0 行）⇒ 回退全量，结果仍正确 ────────────────
 	{
 		const d = tmpDir("tail-t4-");
