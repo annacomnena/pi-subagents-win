@@ -464,6 +464,36 @@ function readStreamingSnapshot(sessionId: string): Record<string, unknown> | nul
 	}
 }
 
+/**
+ * 读「会话正忙」标记（2026-10-20，停止按钮可点性）。
+ *
+ * 由 pi 扩展在 `agent_start`/`turn_start` 写、`agent_settled`/`agent_end` 删，
+ * 忙期间每 15s 心跳刷新 `at`。这里只读。
+ *
+ * never-throw：不存在 / 坏 JSON / 陈旧 → null。
+ * 陈旧阈值 45s（= 心跳 15s 的 3 倍）：长工具期间靠心跳续命，超过 45s 不更新
+ * 只能是进程崩溃留下的残留 ⇒ 不认（否则按钮永远可点）。
+ */
+const BUSY_STALE_MS = 45_000;
+
+function readBusySnapshot(sessionId: string): Record<string, unknown> | null {
+	const p = join(defaultRuntimeDir(), "state", "session-busy", `${sessionId}.json`);
+	try {
+		const raw = readFileSync(p, "utf8");
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (parsed === null || typeof parsed !== "object") return null;
+		if (parsed.sessionId !== sessionId) return null;
+		if (parsed.busy !== true) return null;
+		const at = typeof parsed.at === "string" ? Date.parse(parsed.at) : Number.NaN;
+		if (!Number.isFinite(at)) return null;
+		const ageMs = Date.now() - at;
+		if (ageMs > BUSY_STALE_MS || ageMs < -BUSY_STALE_MS) return null;
+		return { ...parsed, ageMs };
+	} catch {
+		return null;
+	}
+}
+
 export function buildHealthView(opts: HealthOptions): HealthView {
 	const now = opts.now ?? new Date();
 	const timersDir = opts.timersDir ?? defaultTimersDir();
@@ -1654,6 +1684,18 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 流式快照（2026-10-20）：pi 扩展在 message_update 时覆盖写 state/streaming/<sid>.json，
 					// 这里只读快照给 GUI 做「正在思考」的临时块。会话不在流式 → 404（GUI 静默忽略）。
 					// 陈旧保护：快照带 `at`，超过 STREAMING_STALE_MS 视为残留（进程崩溃）→ 404，不让幽灵块常驻。
+					// 会话正忙标记（2026-10-20 停止按钮）：turn 级信号，覆盖「点发送 → 第一个 token」
+					// 与「工具跑完 → 下一段输出」两段空白（流式快照在这两段都是 404）。
+					// 忙 → 200；空闲/陈旧 → 404（GUI 当「空闲」处理）。
+					const mbz = /^\/v1\/session-busy\/([^/]+)$/.exec(u.pathname);
+					if (mbz !== null) {
+						const sid = decodeURIComponent(mbz[1]);
+						if (!/^[A-Za-z0-9_-]+$/.test(sid)) throw new HttpError(400, { error: "bad-session-id" });
+						const bz = readBusySnapshot(sid);
+						if (bz === null) throw new HttpError(404, { error: "not-busy", sessionId: sid });
+						body = bz;
+						break;
+					}
 					const mstr = /^\/v1\/streaming\/([^/]+)$/.exec(u.pathname);
 					if (mstr !== null) {
 						const sid = decodeURIComponent(mstr[1]);

@@ -17,6 +17,7 @@ import type {
 	RuntimeSnapshot,
 	SessionsBody,
 	SessionControlBody,
+	BusySnapshot,
 	StreamingSnapshot,
 	TimelineResponse,
 	TranscriptBody,
@@ -289,6 +290,13 @@ export const api = {
 	 */
 	sessionControl: (sessionId: string): Promise<FetchResult<SessionControlBody>> =>
 		fetchJson<SessionControlBody>(`/v1/session-control/${encodeURIComponent(sessionId)}`, undefined, 4000),
+
+	/**
+	 * 会话正忙标记（2026-10-20，停止按钮可点性）：turn 级信号。
+	 * 404（not-busy）= 空闲 ⇒ 正常态，不 markDown。
+	 */
+	sessionBusy: (sessionId: string): Promise<FetchResult<BusySnapshot>> =>
+		fetchJson<BusySnapshot>(`/v1/session-busy/${encodeURIComponent(sessionId)}`, undefined, 4000),
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
 	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；

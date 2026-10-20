@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +28,7 @@ import {
 	writeControlRequest,
 } from "./runtime/session-control.ts";
 import { executeControlAction, registerSessionControl } from "./runtime/session-control-register.ts";
+import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
 
 let n = 0;
 const ok = (m: string): void => {
@@ -160,6 +161,55 @@ try {
 		ok("T3 真实接线：session_start 注册 → 真实 fs.watch 触发 → ctx.abort() → 回写终态");
 	}
 
+	// ── T5 会话正忙标记：真实事件接线（停止按钮可点性）────────────────
+	{
+		const sdir = join(tmp, "t5-streaming");
+		const bdir = join(tmp, "t5-busy");
+		const handlers = new Map<string, (event: unknown, ctx?: unknown) => void>();
+		const pi = {
+			on: (event: string, cb: (e: unknown, c?: unknown) => void) => {
+				handlers.set(event, cb);
+				return () => handlers.delete(event);
+			},
+		} as never;
+		const dispose = registerStreamingSnapshot(pi, { dir: sdir, busyDir: bdir });
+
+		// 注册形状：turn 开始/结束四个事件都必须订阅（缺一个就是半条链路）
+		for (const ev of ["agent_start", "turn_start", "agent_settled", "agent_end"]) {
+			assert.ok(handlers.has(ev), `注册了 ${ev}`);
+		}
+
+		const ctx = { sessionManager: { sessionId: "b1" } };
+		const busyPath = join(bdir, "b1.json");
+
+		// 用户实测的空白段：agent_start 后、第一个 delta 之前
+		assert.equal(existsSync(busyPath), false, "turn 开始前没有 busy 文件");
+		handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		assert.equal(existsSync(busyPath), true, "agent_start ⇒ 立刻有 busy 文件（首个 token 之前就能按停）");
+		const snap = JSON.parse(readFileSync(busyPath, "utf8")) as Record<string, unknown>;
+		assert.equal(snap.busy, true);
+		assert.equal(snap.sessionId, "b1");
+		assert.equal(typeof snap.since, "string", "带 since（能看出这轮跑了多久）");
+
+		// 工具跑完 → 下一段输出之间的空白：agent_settled 才该清，message_end 不该清
+		handlers.get("message_end")!({ message: { role: "assistant" } }, ctx);
+		assert.equal(existsSync(busyPath), true, "message_end **不**清 busy（否则工具跑完后按钮又灰了）");
+
+		handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
+		assert.equal(existsSync(busyPath), false, "agent_settled ⇒ 清 busy");
+
+		// 幂等：begin 两次只一个文件；settle 两次不报错
+		handlers.get("agent_start")!({}, ctx);
+		handlers.get("turn_start")!({}, ctx);
+		assert.equal(existsSync(busyPath), true, "turn_start 也写（多轮 turn 不会漏）");
+		handlers.get("agent_end")!({}, ctx);
+		handlers.get("agent_end")!({}, ctx);
+		assert.equal(existsSync(busyPath), false, "agent_end 清 busy（重复调用安全）");
+
+		dispose();
+		ok("T5 busy：agent_start 写 / message_end 不清 / agent_settled·agent_end 清（真实事件派发）");
+	}
+
 	// ── T4 静态守卫：通道隔离 + 接线位置 ──────────────────────────────
 	{
 		const executor = readFileSync(new URL("./runtime/command-executor.ts", import.meta.url), "utf8");
@@ -183,7 +233,8 @@ try {
 		// 服务端读投影
 		const server = readFileSync(new URL("./runtime-host/server.ts", import.meta.url), "utf8");
 		assert.ok(/\/v1\\\/session-control/.test(server), "server.ts 暴露 GET /v1/session-control/:sid");
-		ok("T4 静态：白名单 + 分派 + 通道隔离 + index 接线 + 服务端端点");
+		assert.ok(/\/v1\\\/session-busy/.test(server), "server.ts 暴露 GET /v1/session-busy/:sid（停止按钮可点性）");
+		ok("T4 静态：白名单 + 分派 + 通道隔离 + index 接线 + 两个服务端端点");
 	}
 } finally {
 	rmSync(tmp, { recursive: true, force: true });

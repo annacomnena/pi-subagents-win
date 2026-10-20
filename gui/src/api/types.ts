@@ -462,6 +462,26 @@ export interface StreamingSnapshot {
 }
 
 /**
+ * 会话正忙标记（2026-10-20，停止按钮可点性）：`GET /v1/session-busy/:sid`。
+ *
+ * turn 级信号：`agent_start` 写、`agent_settled` 删，忙期间每 15s 心跳。
+ * 它补的是流式快照的空白：从「点发送」到「第一个 token」、以及「工具跑完 → 下一段输出」
+ * 这两段里流式快照都是 404，但会话确实在跑。
+ */
+export interface BusySnapshot {
+	version: 1;
+	sessionId: string;
+	busy: true;
+	/** 最近一次心跳时刻（ISO）。 */
+	at: string;
+	/** turn 开始时刻（ISO）—— 能看出这一轮跑了多久。 */
+	since: string;
+	pid: number;
+	/** 服务端算好的心跳年龄（ms）。 */
+	ageMs: number;
+}
+
+/**
  * 会话控制指令回执（2026-10-20 停止按钮）：`GET /v1/session-control/:sid`。
  *
  * 只反映**最近一条**请求。`status` 是盘面状态机：pending（已排队）→ running（会话进程已领取）

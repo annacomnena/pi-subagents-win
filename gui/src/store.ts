@@ -202,6 +202,12 @@ interface GuiState {
 	 * null = 没点过停止（或已过展示期）；status=done + result=aborted ⇒ 已停下。
 	 */
 	chatControl: SessionControlBody | null;
+	/**
+	 * 会话是否正忙（2026-10-20，停止按钮可点性）。turn 级权威信号：
+	 * 由扩展在 agent_start 写、agent_settled 删，补上流式快照的两段空白
+	 * （点发送→首个 token、工具跑完→下一段输出）。
+	 */
+	chatBusyFlag: boolean;
 	/** 停止按钮的本地瞬时态（点击后 → 回执未到前的禁用保护，防连点排队多条）。 */
 	chatAborting: boolean;
 	chatConn: StreamState;
@@ -229,6 +235,8 @@ interface GuiState {
 	abortChatSession: (sessionId: string) => Promise<void>;
 	/** 拉一次控制回执（404 = 没点过 → 置 null，不算错误）。 */
 	pollChatControl: (id: string | null) => Promise<void>;
+	/** 拉一次「会话正忙」标记（404 = 空闲 → false，不算错误）。 */
+	pollChatBusy: (id: string | null) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
@@ -434,6 +442,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatTailBySession: {},
 	chatStreaming: null,
 	chatControl: null,
+	chatBusyFlag: false,
 	chatAborting: false,
 	chatConn: "idle",
 	chatResyncKey: 0,
@@ -581,6 +590,25 @@ export const useGui = create<GuiState>((set, get) => ({
 		if (r.data.sessionId !== id) return; // 防串台
 		const done = r.data.request.status === "done" || r.data.request.status === "failed";
 		set({ chatControl: r.data, ...(done ? { chatAborting: false } : {}) });
+	},
+
+	/**
+	 * 拉一次「会话正忙」标记（2026-10-20）。404（not-busy）= 空闲 ⇒ false，不 markDown。
+	 * 这是 turn 级权威信号，补上流式快照在「点发送→首个 token」与
+	 * 「工具跑完→下一段输出」两段的空白。
+	 */
+	pollChatBusy: async (id) => {
+		if (id === null) {
+			if (get().chatBusyFlag) set({ chatBusyFlag: false });
+			return;
+		}
+		const r = await api.sessionBusy(id);
+		if (!r.ok) {
+			if (get().chatBusyFlag) set({ chatBusyFlag: false });
+			return;
+		}
+		if (r.data.sessionId !== id) return; // 防串台
+		if (!get().chatBusyFlag) set({ chatBusyFlag: true });
 	},
 
 	pollChatSessions: async () => {

@@ -539,18 +539,23 @@ export function ChatPage() {
 	/** 停止按钮（2026-10-20）：本地瞬时态 + 回执。 */
 	const chatAborting = useGui((s) => s.chatAborting);
 	const chatControl = useGui((s) => s.chatControl);
+	const chatBusyFlag = useGui((s) => s.chatBusyFlag);
 	/**
-	 * 「会话在跑」的判据（两条独立信号，任一成立即视为忙）：
-	 *  1. 流式快照存在（扩展在写 `state/streaming/`）—— 最直接；
-	 *  2. 最后一行是 `status="running"` 的工具卡 —— 不依赖扩展，从 transcript 投影来。
-	 * 两条都失效时（例如扩展未加载且刚发完消息还没落盘），停止钮不可点 ——
-	 * 宁可不可点，也不给一个点了没反应的钮（那是静默失效）。
+	 * 「会话在跑」的判据（三条独立信号，任一成立即视为忙）：
+	 *  1. **turn 级 busy 标记**（扩展在 `agent_start` 写、`agent_settled` 删）——
+	 *     最权威，覆盖「点发送 → 第一个 token」与「工具跑完 → 下一段输出」两段空白；
+	 *  2. 流式快照存在（当前这一段正在产出）；
+	 *  3. 最后一行是 `status="running"` 的工具卡（不依赖扩展，从 transcript 投影来）。
+	 *
+	 * 2026-10-20 用户实测报障：前两条都只在助手**已产出**后才成立 ⇒ 点发送后到首个 token
+	 * 之间、以及工具跑完到下一段输出之间，按钮是灰的 —— 而那正是最想按停的时刻。
+	 * 加第 1 条后这两段空白被填上。
 	 */
 	const lastRowRunning = useMemo(() => {
 		const last = rows[rows.length - 1];
 		return last !== undefined && last.kind === "toolCall" && last.status === "running";
 	}, [rows]);
-	const chatBusy = streaming !== null || lastRowRunning;
+	const chatBusy = chatBusyFlag || streaming !== null || lastRowRunning;
 	/**
 	 * 停止回执的人话（只对**需要告知**的结果出字）：
 	 *   - aborted ⇒ 不显示（预期行为，流式预览消失就是反馈）；
