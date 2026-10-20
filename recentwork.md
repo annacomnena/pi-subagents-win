@@ -23,6 +23,8 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 56 | P1 | **GUI 读投影提速（两轮）**：①`/v1/sessions` 131ms→**33ms**（会话 head/台账/标题三级缓存）；②`/v1/snapshot` 60-71ms→**17-21ms**、单拍文件读 776→207（wake-state O(n·m) 去重 + journal 一拍一读 + 信箱一拍一扫）。含 T11 失效门 + 2 处变异验证 + 1 个既有时间炸弹修复 | none | 待 `/runtime-host restart` 生效；下一候选：health 的 journal 增量 tail、snapshot/sessions 体积裁剪（契约变更） | 本区 |
+| 55 | P2 | **GUI 默认主题改暖亮 + 顶栏开关 tooltip 精简**（`DEFAULT_THEME` warm-dark→warm-light；`title` 长描述→`主题亮/暗`，当前档/目标档保留在 `aria-label`；含 4 个测试断言同步 + dist 重建） | none | —（已完成；`gui:build` 已重建，刷新页面生效） | 本区 |
 | 54 | P1 | **僵尸死角 / 认领后 liveness 不刷新（B 线）**：`registry/.lease` 为全局单文件 ⇒ 跨 scope 假竞争（实证 6ms `lease-contended`）；非强接路径不消费 pid；`writeScopeLiveness` 不在认领路径 ⇒ 新 owner 至首个 agent turn 前 liveness 为旧代 | Item 47 / 53 | **待裁 D-5（升级门窗口定义）+ D-1/D-2**；已交付：可采纳项 (b) 认领即刷 liveness（`f042d53`）+ Wiki 三条缺口 | 本区 |
 | 53 | P0 | **唤醒必达（交付真账本 + C-3 判定层切换）**：终态事件阶段机 pending→leased→attempted→received→consumed + 租约/incident；A 快通道改绕 event/ACK；B 独立进程对账（独立 PID、公平分页）；**4 个注入调用点全部切换**（`undefined ⇒ unconfirmed`，delivered 仅由 consumed ACK 写）；R7/R8 故障矩阵用例 | none | 已 15 commit；L4 PASS 待补（luna 可作验收；F-1/F-2 已修）；**未决**：`effectiveStage` 在 incident 后不报 failed_delivery（消费侧口径待裁） | 本区 |
 | 52 | P0 | **失败必达终态 + 僵尸看门狗**：额度/认证类不可恢复失败立即终止子进程（否则上游死等 100min，2026-10-15 事故 6 个僵尸）；新增宿主侧看门狗（pid 死 / pid 重用 ⇒ 落 `failed(zombie)`）；on-read 惰性 + watcher 10s tick 双路回收；`stderrBuf` 提前清空致额度线索丢失的 bug | none | 已 11 commit（`e22fd96`…`c450509`）；L4 五轮 PASS-WITH-NITS；**未解决**：等待仍无界（P0，可分离）+ 无 pid 僵尸默认观察模式 | 本区 |
@@ -70,6 +72,29 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+
+<a id="item-56"></a>
+### Item 56 - GUI 读投影提速：会话投影三级缓存（2026-10-20）
+
+- **触发**：用户「再看看 GUI 端性能能不能再提升一些」。
+- **实测现状**（运行中 host，port 61714）：`/v1/sessions` **131ms/拍（连 304 也 131ms）**、392KB/939 会话；`/v1/snapshot` 64ms、429KB；`/v1/timeline` 22ms/90KB（门控）；`/v1/health` 20ms。
+- **根因证据**：并发打 sessions+snapshot 时 health p50 **20.9ms → 160.5ms**、p95 **43.3ms → 704.8ms** ⇒ 每拍同步投影卡住 host 事件循环（WS 推送/命令下发跟着抖）。分阶段计时：`listPiSessions` 341ms（939 个 .jsonl 逐个 open+read+close）、`resolveSessionTitles` 191ms（939 会话 × 191 台账条目的前缀判定）、stat 扫描只 25ms、stringify 7.6ms。
+- **改了什么**：① `extensions/runtime/transcript.ts` 新增 `readHeadCached`（按 `(mtimeMs,size)` 命中，与已有 statSync 同源、零额外 IO）；② `extensions/runtime-host/session-title.ts` `loadTabLedger` 加 stat-only 指纹缓存（返回同引用）、`resolveSessionTitles` 加标题缓存（键 `file|mtimeMs|sizeBytes` + 台账**数组引用身份**参与失效）。两处均有上限清空，无 TTL、无陈旧窗口。
+- **效果**：同一批 939 会话下整条 `/v1/sessions` 路径 **474ms（冷）/131ms（温）→ 33-37ms**。
+- **验证**：`test:session-title`（35 组，含新增 T11 缓存失效门）、`test:runtime-transcript`、`test:runtime-host-server`、`test:gui-session-first`、`test:gui-workspace-group` 全绿；**变异验证**：缓存键改为 `sessionId` ⇒ T11 精确命中预期断言而红，还原后 `sha256` 前后一致（`63fb4f9d…ca9d5`）。
+- **第二轮（同日晚）**：`/v1/snapshot` **60-71ms → 17-21ms**，单拍 readFileSync **776 → 207** 次。三个根因全是「同一份只读数据一拍内被多消费方各读一遍」：①`timeline.ts::enrichRunDispatched` 在逐条事件循环里 `readWakeState`（同一 wake-state 文件读 **193 次**，O(n·m)）；②journal 一拍读 4 次（runs/runtime 全量/runtime recent/timeline）；③信箱一拍扫 3 遍（master 段/workstreams/attention，189 封×3）。修法：wake-state 提到循环外按 ws 读一次；`readJournalShared` 一拍一读三段共享（读失败各段回退自扫，sectionErrors 口径不变）；`scanMailboxLetters`+`backlogFromScan`+`AttentionOptions.letters` 一拍一扫四处共享；`readLetterCached` 按 `(mtimeMs,ctimeMs,size)` 缓存信件解析（rename 必改 ctime ⇒ 状态迁移必失效）。
+- **顺带修既有时间炸弹**：`_test_mailbox_retry_budget.ts` 2026-10-20 实测恒红（`实得 0`），根因是 `setCutover(true)` 的 `enabledAt` 取真实 now、而信件 `sentAt` 硬编码 2026-10-16 ⇒ 被判 `pre-cutover-legacy` 跳过；改 `T0 = Date.now()` + 信件 `sentAt` 取当前时刻后 `all 2 groups passed`。
+- **未闭合**：① 运行中 host 仍是旧代码，需 `/runtime-host restart` 生效；② `/v1/health` 仍全量读 journal（~8ms/2s），候选增量 tail 解析；③ snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，未动。
+- **报告**：`plans/20261020_gui_perf_sessions_cache.md`（两轮全部实测数字、探针脚本、变异验证与下一步 ROI）。
+
+<a id="item-55"></a>
+### Item 55 - GUI 默认主题改暖亮 + 开关 tooltip 精简（2026-10-20）
+
+- **用户诉求**：① 默认用亮主题；② 鼠标悬停主题按钮不要长描述，只留一个「主题亮/暗」。
+- **改了什么**：`gui/src/theme.ts` `DEFAULT_THEME` → `warm-light`（原「暖暗优先」口径作废，暖暗降为可切次选）；`gui/src/pages/TopBar.tsx` `title` 从「界面主题：当前X——点击切到Y（仅本次会话，不持久化，不改 config.json）」改为 `title="主题亮/暗"`（**当前档/目标档仍由 `aria-label` 表达**，无障碍不降级）；`AppearancePage.tsx` 选项顺序改为暖亮在前并标「（默认）」、导语/提示同步；`index.css`/`main.tsx`/`useTheme.ts` 头注同步。
+- **测试同步**：`_test_gui_theme.ts`（默认档断言 + 新增「tooltip 是短词」与「长描述不得回潮」两条静态断言）、`_test_zcode_replica.ts`（`DEFAULT_THEME` 字符串断言）、`_test_contrast.ts`（注释口径）。
+- **验证（实测）**：`npm run test:gui-theme` 7 组全过；`test:gui-zcode-replica` 9 组；`test:gui-theme-contract` 4 组；`test:gui-contrast` 118 对比对全达标；`npm run gui:build`（`tsc --noEmit && vite build`）通过，`gui/dist/assets/index-gOBV64HO.js` 含 `主题亮/暗`、旧长文案 0 命中；运行中的 host（`127.0.0.1:61714`）`GET /` 已返回新 bundle（200 / 451013B），刷新页面即生效。
+- **未闭合**：`gui/dist` 是构建产物，**未提交**（与本次一起留在工作树）；host 的 `releaseId` 是启动时按旧 dist 算的，本次未重启 host（静态托管按请求读盘，故功能不受影响，但 `releaseId` 与实际 dist 不一致）。
 
 <a id="item-54"></a>
 ### Item 54 - 僵尸死角 / 认领后 liveness 不刷新（B 线）

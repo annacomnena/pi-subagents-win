@@ -372,6 +372,44 @@ assert.deepEqual(titles.get(byPrefix("66666666")!.sessionId), { title: "直开�
 assert.deepEqual(titles.get(byPrefix("77777777")!.sessionId), { title: byPrefix("77777777")!.sessionId, source: "id" });
 ok("T10 批量解析：P1/P2/P3 各归其位（cwd 桶隔离生效）");
 
+// ── T11 缓存失效（L2 perf 回归门，2026-10-20）────────────────────
+// 动因：listPiSessions 加了 head 缓存、resolveSessionTitles 加了标题缓存（按 file|mtime|size +
+// 台账引用身份失效）。缓存正确性的**唯一**保证是「文件变了就要重算」，故这里走真实入口
+// （listPiSessions / resolveSessionTitles）断言：重写文件 → 新标题生效；台账新增匹配条目 → P2 让位 P1。
+{
+	const t11file = "t11_cache.jsonl";
+	writeSession(t11file, CWD_B, "88888888-aaaa-bbbb-cccc-dddddddddddd", [userMsg("旧标题文字")]);
+	const first = listPiSessions(SESSIONS).find((s) => s.sessionId.startsWith("88888888"));
+	assert.ok(first, "T11 首次枚举命中会话");
+	assert.equal(first.firstUserText, "旧标题文字", "T11 首次 firstUserText");
+	const t11runs = tmp("session-title-t11-runs-");
+	const t1 = resolveSessionTitles(listPiSessions(SESSIONS), t11runs).get(first.sessionId);
+	assert.deepEqual(t1, { title: "旧标题文字", source: "first-user" }, "T11 首次解析 = P2 首条 user");
+
+	// ① 文件内容变化（size/mtime 变） ⇒ 必须重算
+	writeSession(t11file, CWD_B, "88888888-aaaa-bbbb-cccc-dddddddddddd", [userMsg("新标题文字（更长一点）")]);
+	const second = listPiSessions(SESSIONS).find((s) => s.sessionId.startsWith("88888888"));
+	assert.ok(second, "T11 重写后仍能枚举");
+	assert.equal(second.firstUserText, "新标题文字（更长一点）", "T11 文件变化后 firstUserText 不得命中旧缓存");
+	const t2 = resolveSessionTitles(listPiSessions(SESSIONS), t11runs).get(second.sessionId);
+	assert.deepEqual(t2, { title: "新标题文字（更长一点）", source: "first-user" }, "T11 文件变化后标题不得命中旧缓存");
+
+	// ② 台账新增匹配条目（同一文件快照，输入变化来自 ledger） ⇒ 必须重算
+	writeLedger(t11runs, {
+		id: "run_t11",
+		taskId: "T11",
+		mode: "workflow",
+		title: "台账标题",
+		cwd: CWD_B,
+		dispatchedAt: "2026-09-22T09:59:00Z",
+	});
+	const sessionsT11 = listPiSessions(SESSIONS);
+	const t3 = resolveSessionTitles(sessionsT11, t11runs).get(second.sessionId);
+	// 台账命中需 firstUserText 带 mode 前缀；本用例正文无前缀 ⇒ 仍 P2（证明缓存不误升 P1，也不误降）
+	assert.deepEqual(t3, { title: "新标题文字（更长一点）", source: "first-user" }, "T11 台账新增不匹配条目 ⇒ 仍 P2（不误命中）");
+	ok("T11 缓存失效：文件变化必重算；台账引用身份参与失效判定");
+}
+
 // 清理
 for (const d of dirs) rmSync(d, { recursive: true, force: true });
 console.log(`_test_session_title: all assertions passed (${n})`);

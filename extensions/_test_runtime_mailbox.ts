@@ -28,12 +28,15 @@ import {
 	deliverCommand,
 	deliverLetter,
 	expireSweep,
+	backlogFromScan,
 	listLetters,
 	mailboxBacklog,
 	markDelivered,
 	releaseClaimed,
+	scanMailboxLetters,
 } from "./runtime/mailbox.ts";
 import { newCommandFrame, newMessageFrame } from "./runtime/protocol.ts";
+import { buildAttentionItems } from "./runtime-host/attention.ts";
 
 const MAILBOX = join(process.env.PI_RUNTIME_DIR!, "mailbox");
 const master = masterAddress();
@@ -202,6 +205,33 @@ try {
 		const retaken = claimLetters(master, { claimedBy: holder, mailboxDir: MAILBOX, ids: [mid], limit: 1 });
 		assert.equal(retaken.length, 1, "释放后可重新领取（下 tick 重试收敛）");
 		assert.ok(ackLetter(master, mid, { mailboxDir: MAILBOX }), "收尾：置终态不干扰后续枚举");
+	}
+	// ── 共享扫描等价性（L2 perf 2026-10-20）──────────────────────────
+	// 动因：/v1/snapshot 一拍内 master/workstreams/attention 三处原本各扫一遍全信箱；
+	// 现改为共享 scanMailboxLetters 一份。这里钉住「共享产物与各消费方自扫逐字段等价」，
+	// 否则降本会静默改变 backlog / attention 结果。
+	{
+		const scan = scanMailboxLetters(MAILBOX);
+		const dirs = new Set(scan.keys());
+		assert.ok(dirs.size > 0, "扫描到 spool 目录");
+		// ① backlogFromScan == mailboxBacklog（按 recipient 排序后逐字段比）
+		const norm = (rows: { recipient: string; pending: number; claimed: number }[]) =>
+			[...rows].sort((a, b) => a.recipient.localeCompare(b.recipient));
+		assert.deepEqual(norm(backlogFromScan(scan)), norm(mailboxBacklog(MAILBOX)), "backlogFromScan 与 mailboxBacklog 等价");
+		// ② 共享信件集 == 各目录自扫（listLetters 全状态）逐条比 id
+		for (const recipient of dirs) {
+			const sharedIds = (scan.get(recipient) ?? []).map((l) => l.id).sort();
+			const direct = listLetters(recipient as never, undefined, MAILBOX).map((l) => l.id).sort();
+			assert.deepEqual(sharedIds, direct, `目录 ${recipient}：共享扫描与 listLetters 信件集一致`);
+		}
+		// ③ attention 用共享扫描与自扫输出一致（同一批 fixture 下）
+		const viaShared = buildAttentionItems({ stateDir: join(process.env.PI_RUNTIME_DIR!, "state"), mailboxDir: MAILBOX, letters: scan });
+		const viaDirect = buildAttentionItems({ stateDir: join(process.env.PI_RUNTIME_DIR!, "state"), mailboxDir: MAILBOX });
+		assert.deepEqual(
+			viaShared.map((a) => a.id).sort(),
+			viaDirect.map((a) => a.id).sort(),
+			"buildAttentionItems：共享信件扫描与自扫输出一致",
+		);
 	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });

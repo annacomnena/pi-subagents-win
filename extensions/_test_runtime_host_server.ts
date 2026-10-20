@@ -674,6 +674,33 @@ try {
 			assert.ok(entry, "非默认 sessionsDir 会话可列表");
 			assert.equal(entry.masterProtected, undefined, "无 attachment → 非受保护");
 			assert.equal(lst.body.masterProtectedSessionId, null);
+			// T14b（2026-10-20）：`GET /v1/sessions/:id/transcript?tail=N` 只返回最新 N 行 + hasOlder，
+			// 且与全量快照的尾部切片逐字段一致（首屏不再拉全量；用户诉求「从最新消息开始读」）。
+			{
+				const sidTail = "c2222222-3333-4444-5555-666666666666";
+				const lines: string[] = [JSON.stringify({ type: "session", version: 3, id: sidTail, timestamp: "2026-09-22T15:00:00.000Z", cwd: "C:\ws\t14" })];
+				for (let i = 1; i <= 6; i += 1) {
+					const at = `2026-09-22T15:0${i}:00.000Z`;
+					lines.push(JSON.stringify({ type: "message", id: `tu${i}`, timestamp: at, message: { role: "user", content: [{ type: "text", text: `轮 ${i}` }] } }));
+					lines.push(JSON.stringify({ type: "message", id: `ta${i}`, timestamp: at, message: { role: "assistant", content: [{ type: "text", text: `答 ${i}` }] } }));
+				}
+				writeFileSync(join(sessionsDirCustom, `2026-09-22T15-00-00-000Z_${sidTail}.jsonl`), lines.join(String.fromCharCode(10)) + String.fromCharCode(10), "utf8");
+				const fullT = await getJson(base, `/v1/sessions/${sidTail}/transcript`);
+				assert.equal(fullT.status, 200, "全量 transcript 200");
+				assert.equal((fullT.body as any).tail, undefined, "全量模式不出现 tail 标记（契约向后兼容）");
+				const tailT = await getJson(base, `/v1/sessions/${sidTail}/transcript?tail=4`);
+				assert.equal(tailT.status, 200, "tail transcript 200");
+				const tb = tailT.body as any;
+				assert.equal(tb.tail, true, "tail 模式标记");
+				assert.equal(tb.hasOlder, true, "还有更早的行");
+				assert.equal(tb.rows.length, 4, `只返回最新 4 行（实得 ${tb.rows.length}）`);
+				assert.deepEqual(tb.rows, (fullT.body as any).rows.slice(-4), "tail 行 == 全量尾部切片");
+				assert.equal(tb.head.seq, (fullT.body as any).head.seq, "head.seq 仍是绝对值（增量可接续）");
+				const big = await getJson(base, `/v1/sessions/${sidTail}/transcript?tail=9999`);
+				assert.equal((big.body as any).hasOlder, false, "tail 超出总数 ⇒ hasOlder=false");
+				assert.equal((big.body as any).rows.length, (fullT.body as any).rows.length, "tail 超出总数 ⇒ 返回全部");
+			}
+
 
 			// 可 POST：session.message → accepted（修复前误判 no-session 404）
 			const post1 = await post(sm("t14-post-1", `pi://${sidCustom}`), h.info.token);

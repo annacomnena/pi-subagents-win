@@ -105,6 +105,7 @@ import {
 	findSessionFile,
 	listPiSessions,
 	projectSession,
+	projectSessionTail,
 } from "../runtime/transcript.ts";
 import { resolveSessionTitles, tabRunsDir } from "./session-title.ts";
 import { computeSessionPinFlags } from "./session-pin.ts";
@@ -1502,7 +1503,13 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					}
 					const afterRaw = u.searchParams.get("after");
 					const after = afterRaw !== null && /^\d+$/.test(afterRaw) ? parseInt(afterRaw, 10) : 0;
-					const proj = projectSession(file, after);
+					// L2 perf（2026-10-20，用户诉求「从最新消息开始读，别一下拉全部」）：
+					// `?tail=N` ⇒ 只返回最新 N 行（尾部字节窗投影，不整文件解析）。
+					// 缺省（无 tail、after=0）行为**逐字节不变**（全量快照）；after>0 仍是增量，与 tail 互斥。
+					const tailRaw = u.searchParams.get("tail");
+					const tail = tailRaw !== null && /^[0-9]+$/.test(tailRaw) ? parseInt(tailRaw, 10) : 0;
+					const useTail = tail > 0 && after === 0;
+					const proj = useTail ? projectSessionTail(file, { rows: tail }) : projectSession(file, after);
 					// G6-P1 L4：head 带持久代际 gen（同首行重写/轮转检出；客户端重订阅带 base.gen）
 					const gen = validateStreamGen(`session:${sessionId}`, file, proj.logEpoch);
 					body = {
@@ -1514,6 +1521,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						rows: proj.rows,
 						skippedUnknown: proj.skippedUnknown,
 						name: proj.name,
+						// additive（2026-10-20）：tail 模式下的窗口元信息；缺省/全量时不出现在响应里
+						...(useTail ? { tail: true as const, hasOlder: (proj as { hasOlder?: boolean }).hasOlder === true } : {}),
 					};
 				}
 			}

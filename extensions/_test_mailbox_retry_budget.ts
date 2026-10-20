@@ -36,7 +36,11 @@ const iso = (ms: number): string => new Date(ms).toISOString();
 const MAILBOX = join(ROOT, "mailbox");
 const DELIVERY = join(ROOT, "delivery");
 const master = masterAddress();
-const T0 = Date.parse("2026-10-16T04:00:00Z");
+// 2026-10-20 修：原为硬编码 2026-10-16T04:00:00Z。本测试用 setCutover(true)（enabledAt = **真实 now**）
+// 而信件 sentAt = T0 ⇒ 一旦真实时间越过 T0，信被判 `pre-cutover-legacy` 而跳过，注入次数恒 0
+// （实测 2026-10-20：`consumed=[{action:"skipped",reason:"pre-cutover-legacy"}]`、sent=0）。
+// 改为以测试启动时刻为基准 ⇒ 与 cutover 时间同源，退避节律断言（纯相对量）不受影响。
+const T0 = Date.now();
 
 try {
 	mkdirSync(MAILBOX, { recursive: true });
@@ -69,7 +73,9 @@ try {
 	{
 		deliverLetter(newMessageFrame({
 			id: newEnvelopeId("msg"), kind: "REPORT", from: "agent://agent_worker_d1", to: master,
-			subject: "run://tab/tab_d1", sentAt: iso(T0), summary: "D-1 预算", details: { tabRunId: "tab_d1", status: "completed" },
+			// sentAt 必须 ≥ cutover.enabledAt（后者是 setCutover 时的真实 now）⇒ 用真实当前时刻，
+			// 否则被判 pre-cutover-legacy 而跳过（原写 iso(T0)，T0 是硬编码过去时刻 ⇒ 时间炸弹）。
+			subject: "run://tab/tab_d1", sentAt: new Date().toISOString(), summary: "D-1 预算", details: { tabRunId: "tab_d1", status: "completed" },
 		}), { mailboxDir: MAILBOX });
 
 		const sent: string[] = [];

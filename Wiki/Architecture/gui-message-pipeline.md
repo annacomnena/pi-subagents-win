@@ -2,9 +2,11 @@
 title: GUI 消息管道与延迟贡献项
 kind: concept
 status: current
-updated: 2026-09-30
+updated: 2026-10-20
 source_paths:
   - gui/src/useEventStream.ts
+  - extensions/runtime/transcript.ts
+  - extensions/runtime-host/session-title.ts
   - gui/src/store.ts
   - gui/src/api/client.ts
   - gui/src/App.tsx
@@ -44,6 +46,45 @@ source_paths:
 - **timeline 按需门控**（`gui/src/App.tsx:40`）：`usePoll(pollTimeline, 6000, activeTab === "timeline" || runtimeOverlay === "master")`——`/v1/timeline?limit=200` 全量尾窗（实测 97KB/拍、稳态 17.5KB/s）只在两消费方（主路由 TimelinePage / 覆盖层 MasterPage）任一在场才拉；不空屏（另有 2s events 轮询 + WS journal 供数），门控打开时 `usePoll` effect 立即补一拍。`usePoll` 三参签名：`enabled = true`（`gui/src/usePoll.ts:12`）。
 
 **不重不漏的机制**：增量帧按 `rowId` 幂等 upsert（回填保位、新行按投影序追加）；`frame.seq` 倒退防御（丢弃）；HTTP resync 响应若 `seq` 低于已收帧 seq 则丢弃（**避免旧响应覆盖新状态**——这是独立 L4 复核发现并修掉的竞态）。
+
+## 会话投影缓存（2026-10-20）：/v1/sessions 131ms → 33ms
+
+实测（939 会话，运行中 host）：`/v1/sessions` 稳态 **131ms/拍，连 304 也 131ms**（指纹快路在 Windows 上等于全量代价）；
+并发打 sessions+snapshot 时同进程 `/v1/health` p50 **20.9→160.5ms**、p95 **43.3→704.8ms** ⇒ **同步投影阻塞事件循环**。
+
+分阶段计时定位：stat-only 扫描只 25ms，真热点是 **每拍重读 939 个会话头**（`listPiSessions` 341ms 冷）
++ **每拍 939×191 次台账前缀判定**（`resolveSessionTitles` 191ms 冷）。
+
+三级缓存（均已落地）：
+
+| 层 | 位置 | 键 / 命中条件 | 失效方式 |
+|---|---|---|---|
+| 会话头 | `extensions/runtime/transcript.ts::readHeadCached` | 路径；命中需 `(mtimeMs,size)` 与既有 statSync 读数一致 | 文件大小/时间变（追加写必变 size）；上限 4000 清空 |
+| 台账 | `extensions/runtime-host/session-title.ts::loadTabLedger` | 目录名集 + 每文件 `(mtimeMs,size)` 指纹；命中返回**同一数组引用** | 指纹变即重建（无 TTL） |
+| 标题 | 同上 `resolveSessionTitles` | `${file}|${mtimeMs}|${sizeBytes}` + **台账数组引用身份** | 台账重建 = 新引用 ⇒ 整表失效；上限 5000 清空 |
+
+效果：整条 `/v1/sessions` 路径 **474ms（冷）/131ms（温）→ 33-37ms**；无 TTL ⇒ 无陈旧窗口（缓存正确性由
+`_test_session_title.ts` 的 T11 门 + 变异验证钉住：键改成 `sessionId` 即红）。
+
+### 第二轮：snapshot / health 的「一拍多读」去重（2026-10-20）
+
+`readFileSync` 计数探针（`plans/_perf/fsprobe*.cjs`）实测**单次 `/v1/snapshot` 读 776 次文件**，
+其中三类是「同一份只读数据在一拍内被多个消费方各读一遍」：
+
+| 浪费形态 | 实测 | 修法（均 additive，缺省行为不变） |
+|---|---|---|
+| wake-state 在**逐条事件**循环里读（`timeline.ts::enrichRunDispatched`，O(n·m)） | 同一 `state/wake-state/ws_*.json` 读 **193 次** | 提到循环外，每 ws 读一次（`wakeByWs` Map） |
+| journal 一拍读 4 次（runs / runtime 全量 / runtime recent / timeline） | 786KB·1075 行，~7ms/次 | `snapshot.ts::readJournalShared` 一拍一读，三段共享；`TimelineOptions.envelopes?` 注入；**读失败 → null ⇒ 各段各自回退自读**（sectionErrors 口径逐字不变） |
+| 信箱一拍扫 3 遍（master 段 `getMasterStatus().backlog` / workstreams / attention） | 189 封 × 3 | `scanMailboxLetters` + `backlogFromScan` + `AttentionOptions.letters` + `getMasterStatus({backlog})` 一拍一扫四处共享 |
+
+另加 `mailbox.ts::readLetterCached`：信件解析按 `(mtimeMs,ctimeMs,size)` 缓存（`writeJsonAtomic` = tmp+rename
+⇒ rename 必改 ctime ⇒ 状态迁移必失效；**无 TTL**）。
+
+效果：`/v1/snapshot` **60-71ms → 17-21ms**，单拍文件读 **776 → 207**（≈ 去重后 distinct 数）。
+
+**仍未做**：`/v1/health` 仍全量读 journal（~8ms/2s，只需 tail + 计数，候选 stat 增量解析）；
+snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，未动（`file` 134KB 仅用于 tooltip，
+`runs[].summary` 143KB、`timeline` 93KB 与 `/v1/timeline` 重复）。
 
 ## 输入编码契约（intake 侧）
 

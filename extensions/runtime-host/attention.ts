@@ -78,6 +78,12 @@ export interface AttentionOptions {
 	mailboxDir?: string;
 	/** 含 resolved 条目（默认 false；server /v1/attention?includeResolved=1）。 */
 	includeResolved?: boolean;
+	/**
+	 * L2 perf（2026-10-20）：调用方已扫好的全信箱（`scanMailboxLetters` 产物：spool 目录名 → 信件）。
+	 * 传入则不再自行 readdir+readFileSync；缺省保持原行为。`/v1/snapshot` 一拍内与 master/workstreams
+	 * 段共享同一次扫描（原本三处各扫一遍全信箱）。
+	 */
+	letters?: Map<string, Letter[]>;
 }
 
 const SEV_RANK: Record<AttentionSeverity, number> = { critical: 3, warning: 2, info: 1 };
@@ -147,7 +153,7 @@ function pushProposal(stateDir: string, out: Candidate[]): void {
 	});
 }
 
-function pushMailbox(mailboxDir: string, out: Candidate[]): void {
+function pushMailbox(mailboxDir: string, out: Candidate[], shared?: Map<string, Letter[]>): void {
 	if (!existsSync(mailboxDir)) return;
 	for (const d of readdirSync(mailboxDir, { withFileTypes: true })) {
 		if (!d.isDirectory()) continue;
@@ -156,7 +162,11 @@ function pushMailbox(mailboxDir: string, out: Candidate[]): void {
 		// 路径分隔符也被 sanitize 成 `_`，不可逆；此时从信封的 to 字段恢复真实 recipient，
 		// 而不是静默漏掉该收件箱的 attention。
 		let letters: Letter[];
-		if (recoveredRecipient) {
+		const sharedLetters = shared?.get(d.name);
+		if (sharedLetters !== undefined) {
+			// 共享扫描已含该目录全部信件（含非 pending）⇒ 这里按原 listLetters(…, "pending") 语义过滤。
+			letters = sharedLetters.filter((l) => l.status === "pending");
+		} else if (recoveredRecipient) {
 			letters = listLetters(recoveredRecipient, "pending", mailboxDir);
 		} else {
 			letters = [];
@@ -264,7 +274,7 @@ export function buildAttentionItems(opts: AttentionOptions = {}): AttentionItem[
 		/* 段降级 */
 	}
 	try {
-		pushMailbox(mailboxDir, out);
+		pushMailbox(mailboxDir, out, opts.letters);
 	} catch {
 		/* 段降级 */
 	}

@@ -30,14 +30,19 @@ export interface MasterStatusView {
 	backlog: { recipient: string; pending: number; claimed: number }[];
 }
 
-/** 只读装配：attachment / cutover / resolver 快照 / mailbox 积压。 */
-export function getMasterStatus(): MasterStatusView {
+/**
+ * 只读装配：attachment / cutover / resolver 快照 / mailbox 积压。
+ *
+ * L2 perf（2026-10-20）：`backlog` 可注入（additive，缺省仍自己扫信箱）。`/v1/snapshot` 一拍内
+ * master 段与 workstreams/runtime 段都要同一份积压 ⇒ 由调用方扫一次传入，避免同拍重复全量扫信件。
+ */
+export function getMasterStatus(opts: { backlog?: { recipient: string; pending: number; claimed: number }[] } = {}): MasterStatusView {
 	const master = masterAddress();
 	return {
 		attachment: readAttachment(master),
 		cutover: readCutover(),
 		snapshot: resolveRecipient(master),
-		backlog: mailboxBacklog(),
+		backlog: opts.backlog ?? mailboxBacklog(),
 	};
 }
 

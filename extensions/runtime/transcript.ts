@@ -265,8 +265,17 @@ function parseTs(v: unknown): number | null {
 	return Number.isFinite(ms) ? ms : null;
 }
 
+/**
+ * 投影器选项（尾窗投影用）。
+ * - `turnCountBase`：窗口从文件中段开始时的「已关闭 turn 数」偏移 —— 保证 `turnIndex`
+ *   仍是**全会话序号**（GUI 的「对话轮 N」直接显示它，不能从 1 重数）。
+ */
+export interface TranscriptProjectorOptions {
+	turnCountBase?: number;
+}
+
 /** 构造投影器（每 session 文件一个实例；seq = 物理行号，只要求单调）。 */
-export function createTranscriptProjector(): TranscriptProjector {
+export function createTranscriptProjector(opts: TranscriptProjectorOptions = {}): TranscriptProjector {
 	let sessionId: string | null = null;
 	let cwd: string | null = null;
 	let startedAt: string | null = null;
@@ -278,7 +287,7 @@ export function createTranscriptProjector(): TranscriptProjector {
 	const callIdToRowId = new Map<string, string>();
 	const rowTurn = new Map<string, number>();
 	let openTurn: OpenTurn | null = null;
-	let turnCount = 0;
+	let turnCount = opts.turnCountBase !== undefined && Number.isFinite(opts.turnCountBase) ? Math.max(0, Math.trunc(opts.turnCountBase)) : 0;
 	let skippedUnknown = 0;
 	const info: Record<string, unknown> = {};
 
@@ -684,6 +693,317 @@ export function projectSession(path: string, afterSeq = 0): ProjectSessionRowsRe
 	};
 }
 
+// ── 尾窗投影（GET ?tail=N：只读文件尾部，不整文件解析）──────────────
+
+/**
+ * 尾窗投影（L2 perf，2026-10-20）。用户诉求：「读取会话很慢——改成从最新消息开始读，不要一下拉全部」。
+ *
+ * 动因（实测）：`projectSession` 对整文件 `readAllSessionLines` + 逐行 `JSON.parse`。
+ * 本机 940 个会话里 p99 = 9.3MB、最大 **152MB**：15.4MB 会话 = 152ms/6315 行/6.5MB body，
+ * 152MB 会话 = **557ms**。而 GUI 首屏只画尾部 200 行 ⇒ 前面的解析与传输全是白费。
+ *
+ * 做法：从文件尾部读一个**按需放大的字节窗**，只解析窗内行；绝对 `seq`（物理行号）与
+ * `turnIndex` 偏移靠对前缀做**纯字节扫描**（数 `
+` 与 `"role":"user"` 出现次数）得到，
+ * 不解析前缀 JSON。152MB 文件的前缀扫描实测 ~106ms（vs 全量 557ms）。
+ *
+ * 契约保证（与全量投影的关系）：
+ * - `rows` == 全量投影 `rows` 的**尾部切片**（同一 rowId / 同一 turnIndex / 同一 seq）；
+ *   唯一允许的差异是**窗口首行所在 turn 的 `durationMs`**（其关闭事件在窗外，故该 turnHeader 无时长），
+ *   以及「toolCall 在窗外、toolResult 在窗内」的孤立结果（无锚可回填 → 计入 skippedUnknown，与既有语义一致）。
+ * - `head` / `logEpoch` 仍是**绝对**值（WS 增量 `after=` 可直接接续）。
+ * - `hasOlder` 表示窗口之外还有更早的行（客户端据此显示「加载更早」）。
+ */
+export interface ProjectSessionTailOptions {
+	/** 需要的最新行数（缺省 200；夹紧到 [1, 5000]）。 */
+	rows?: number;
+}
+
+export interface ProjectSessionTailResult extends ProjectSessionRowsResult {
+	/** 窗口之外是否还有更早的行（= 本次未返回的行数 > 0）。 */
+	hasOlder: boolean;
+	/** 窗口起始字节偏移（诊断/测试用；0 = 读的是整文件）。 */
+	windowStartOffset: number;
+}
+
+/** 试投影窗初值（1MB：本仓 p99 会话 9.3MB，1MB 尾部通常已含数百行）。 */
+const TAIL_WINDOW_INITIAL_BYTES = 1024 * 1024;
+/** 单次试投影窗上限（防「尾部巨行」把窗口撑到整文件白读）。 */
+const TAIL_WINDOW_MAX_BYTES = 16 * 1024 * 1024;
+/** 小于此体积的文件直接走全量（小文件全量本身只有几毫秒，尾窗无收益）。 */
+const TAIL_WINDOW_MIN_FILE = 2 * 1024 * 1024;
+
+const TAIL_ROWS_DEFAULT = 200;
+const TAIL_ROWS_MAX = 5000;
+const USER_ROLE_PATTERN = Buffer.from('"role":"user"');
+const MESSAGE_TYPE_PATTERN = Buffer.from('"type":"message"');
+
+/**
+ * 数文件尾部 probeBytes 字节里的「换行数」与「`"type":"message"` 出现次数」（零解析，只用来估密度）。
+ *
+ * 用 **message 条数**而不是行数做密度分子：行数在「少量超长行」文件里会严重高估密度
+ * （实测 42.6MB 会话只有 128 行 / 155 个投影行），据此定窗会白扫 + 白解析一个大窗后仍然不够。
+ * 失败 → null（调用方走全量）。
+ */
+function scanTailBytes(path: string, probeBytes: number): { lines: number; messages: number } | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const size = statSync(path).size;
+		const start = Math.max(0, size - probeBytes);
+		const len = Math.max(1, size - start);
+		const buf = Buffer.allocUnsafe(len);
+		let read = 0;
+		while (read < len) {
+			const got = readSync(fd, buf, read, len - read, start + read);
+			if (got <= 0) break;
+			read += got;
+		}
+		const view = buf.subarray(0, read);
+		let lines = 0;
+		for (let i = 0; i < view.length; i += 1) if (view[i] === 0x0a) lines += 1;
+		let messages = 0;
+		let from = 0;
+		for (;;) {
+			const idx = view.indexOf(MESSAGE_TYPE_PATTERN, from);
+			if (idx < 0) break;
+			messages += 1;
+			from = idx + 1;
+		}
+		return { lines, messages };
+	} catch {
+		return null;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** 扫描 [0, end) 字节：数换行数（= 已完整行数）与 `"role":"user"` 出现次数。分块读，零解析。 */
+function scanPrefix(path: string, end: number): { lines: number; userMessages: number } | null {
+	if (end <= 0) return { lines: 0, userMessages: 0 };
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const CHUNK = 4 * 1024 * 1024;
+		const buf = Buffer.allocUnsafe(CHUNK + USER_ROLE_PATTERN.length);
+		let pos = 0;
+		let lines = 0;
+		let userMessages = 0;
+		let carry = 0; // 上一块末尾未匹配完的 pattern 前缀长度（跨块匹配用）
+		while (pos < end) {
+			const want = Math.min(CHUNK, end - pos);
+			const got = readSync(fd, buf, carry, want, pos);
+			if (got <= 0) break;
+			const view = buf.subarray(0, carry + got);
+			for (let i = 0; i < got; i += 1) if (buf[carry + i] === 0x0a) lines += 1;
+			let from = 0;
+			for (;;) {
+				const idx = view.indexOf(USER_ROLE_PATTERN, from);
+				if (idx < 0) break;
+				userMessages += 1;
+				from = idx + 1;
+			}
+			// 跨块：把末尾 pattern.length-1 字节挪到块首，下一块接上继续匹配
+			carry = Math.min(USER_ROLE_PATTERN.length - 1, view.length);
+			if (carry > 0) view.copy(buf, 0, view.length - carry, view.length);
+			pos += got;
+		}
+		return { lines, userMessages };
+	} catch {
+		return null;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** 读文件首行（session 头）——只为 sessionId/cwd/startedAt/logEpoch 三件套，不读全文。 */
+function readSessionHeaderLine(path: string): Record<string, unknown> | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const buf = Buffer.allocUnsafe(64 * 1024);
+		const got = readSync(fd, buf, 0, buf.length, 0);
+		if (got <= 0) return null;
+		const nl = buf.subarray(0, got).indexOf(0x0a);
+		const text = buf.subarray(0, nl >= 0 ? nl : got).toString("utf8").trim();
+		if (text.length === 0) return null;
+		const parsed: unknown = JSON.parse(text);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+		return parsed as Record<string, unknown>;
+	} catch {
+		return null;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** GET /v1/sessions/:id/transcript?tail=N 的投影入口（只读尾部字节窗）。 */
+export function projectSessionTail(path: string, opts: ProjectSessionTailOptions = {}): ProjectSessionTailResult {
+	const want = Math.min(TAIL_ROWS_MAX, Math.max(1, Math.trunc(opts.rows ?? TAIL_ROWS_DEFAULT)));
+	if (!existsSync(path)) {
+		return {
+			found: false, sessionId: null, cwd: null, startedAt: null, logEpoch: "", head: 0,
+			rows: [], skippedUnknown: 0, skippedBadLines: 0, name: null, hasOlder: false, windowStartOffset: 0,
+		};
+	}
+	let size = 0;
+	try {
+		size = statSync(path).size;
+	} catch {
+		size = 0;
+	}
+
+	// 定窗（v3，实测调优）：先用一个**小窗试投影**拿到「真实行密度」，最多试 2 轮；
+	// 定下窗口后才做一次前缀字节扫描（只为绝对 seq / turnIndex 偏移），再正式投影一次。
+	// 顺序很关键：前缀扫描是 O(文件大小)（152MB ≈ 90ms），绝不能在一个注定失败的窗口上先付。
+	let windowStart = 0;
+	if (size >= TAIL_WINDOW_MIN_FILE) {
+		let window = TAIL_WINDOW_INITIAL_BYTES;
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const start = Math.max(0, size - window);
+			if (start === 0) break;
+			const probe = projectWindow(path, start, 0, 0); // seq/turnIndex 此处无所谓，只看行数
+			const rowsInWindow = probe !== null ? probe.rows.length : 0;
+			if (rowsInWindow >= want) {
+				windowStart = start;
+				break;
+			}
+			if (rowsInWindow === 0) break; // 尾部没有可投影行 ⇒ 走全量
+			// 用**实测密度**重算窗口（1.3× 余量）；估到「需要大半个文件」就不折腾了
+			const needed = Math.ceil((want / rowsInWindow) * window * 1.3);
+			if (needed >= size * 0.6) break;
+			// 单次尝试上限 16MB：文件尾部若有「单行上百 MB」的巨行，放太大只会白读白解析
+			window = Math.min(needed, TAIL_WINDOW_MAX_BYTES);
+		}
+	}
+	if (windowStart > 0) {
+		const scanned = scanPrefix(path, windowStart);
+		if (scanned !== null) {
+			const proj = projectWindow(path, windowStart, scanned.lines, scanned.userMessages);
+			// 定窗后仍不够（密度突变）⇒ 退回全量：**永不比全量更少**
+			if (proj !== null && proj.rows.length >= want) {
+				const sliced = proj.rows.length > want ? proj.rows.slice(-want) : proj.rows;
+				return {
+					...proj,
+					rows: sliced,
+					hasOlder: proj.rows.length > want || windowStart > 0,
+					windowStartOffset: windowStart,
+				};
+			}
+		}
+	}
+
+	// 整文件路径
+	const full = projectSession(path, 0);
+	const sliced = full.rows.length > want ? full.rows.slice(-want) : full.rows;
+	return {
+		...full,
+		rows: sliced,
+		hasOlder: full.rows.length > want,
+		windowStartOffset: 0,
+	};
+}
+
+/** 投影 [windowStart, EOF) 字节窗；header 单独补喂一次（只为 logEpoch/元数据）。失败 → null。 */
+function projectWindow(
+	path: string,
+	windowStart: number,
+	prefixLines: number,
+	prefixUserMessages: number,
+): Omit<ProjectSessionTailResult, "hasOlder" | "windowStartOffset"> | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	let buf: Buffer;
+	try {
+		const size = statSync(path).size;
+		const len = Math.max(0, size - windowStart);
+		buf = Buffer.allocUnsafe(len);
+		let read = 0;
+		while (read < len) {
+			const got = readSync(fd, buf, read, len - read, windowStart + read);
+			if (got <= 0) break;
+			read += got;
+		}
+		buf = buf.subarray(0, read);
+	} catch {
+		return null;
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+	// 对齐到行首：跳过窗口首行的残片（它的换行在窗口内但开头不完整）
+	let aligned = 0;
+	if (windowStart > 0) {
+		const nl = buf.indexOf(0x0a);
+		if (nl < 0) return null;
+		aligned = nl + 1;
+	}
+	const { lines } = splitCompleteLines(buf, aligned, prefixLines + (windowStart > 0 ? 2 : 1));
+	const projector = createTranscriptProjector({ turnCountBase: prefixUserMessages });
+	const header = windowStart > 0 ? readSessionHeaderLine(path) : null;
+	if (header !== null) projector.ingestEntry(header, 1); // 只补元数据；seq=1 < 窗内 seq（单调）
+	let bad = 0;
+	for (const l of lines) {
+		if (l.text.length === 0) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(l.text);
+		} catch {
+			bad += 1;
+			continue;
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			bad += 1;
+			continue;
+		}
+		projector.ingestEntry(parsed as Record<string, unknown>, l.lineNo);
+	}
+	const snap = projector.snapshot();
+	return {
+		found: true,
+		sessionId: snap.sessionId,
+		cwd: snap.cwd,
+		startedAt: snap.startedAt,
+		logEpoch: snap.logEpoch,
+		head: snap.head,
+		rows: snap.rows,
+		skippedUnknown: snap.skippedUnknown,
+		skippedBadLines: bad,
+		name: typeof snap.info.name === "string" ? snap.info.name : null,
+	};
+}
+
 // ── 会话列表 / 文件定位 ──────────────────────────────────────────
 
 export interface SessionSummary {
@@ -807,6 +1127,27 @@ function readHead(path: string): SessionHead {
 	}
 }
 
+/** 会话头读缓存（L2 perf，2026-10-20）：key=绝对路径，值=文件身份 + 解析结果。
+ *
+ * 命中条件严格按 `(mtimeMs,size)` —— 与 `listPiSessions` 已有的 `statSync` 读数同源，
+ * **零额外 IO**。失效自然发生：会话追加写必变 size（同 size 同 mtimeMs 而内容不同在本仓不可达）。
+ * 动因：实测 939 会话时 `listPiSessions` 冷跑 341ms / 进程内温跑仍要重读全部 head（open+read+close ×939，
+ * Windows 单次 ~0.3ms）⇒ 每个 6s 轮询都在重复同样的 939 次打开。缓存后仅「本拍有变化的会话」才重读。
+ * 上限粗粒度清空（不引 LRU 依赖）：本仓实测 939 会话，上限 4000 留 4× 余量。
+ */
+const HEAD_CACHE = new Map<string, { stamp: string; head: SessionHead }>();
+const HEAD_CACHE_MAX = 4000;
+
+function readHeadCached(full: string, mtimeMs: number, size: number): SessionHead {
+	const stamp = `${mtimeMs}|${size}`;
+	const hit = HEAD_CACHE.get(full);
+	if (hit !== undefined && hit.stamp === stamp) return hit.head;
+	const head = readHead(full);
+	if (HEAD_CACHE.size >= HEAD_CACHE_MAX) HEAD_CACHE.clear();
+	HEAD_CACHE.set(full, { stamp, head });
+	return head;
+}
+
 /** 枚举 pi 会话（sessionsDir 的直接 .jsonl + 一层 cwd 子目录）；startedAt 降序。never-throw。 */
 export function listPiSessions(sessionsDir: string = defaultSessionsDir()): SessionSummary[] {
 	const out: SessionSummary[] = [];
@@ -826,7 +1167,7 @@ export function listPiSessions(sessionsDir: string = defaultSessionsDir()): Sess
 		} catch {
 			return;
 		}
-		const { header, firstUserText } = readHead(full);
+		const { header, firstUserText } = readHeadCached(full, st.mtimeMs, st.size);
 		const id = (header !== null ? str(header.id) : null) ?? sessionFileId(dir, file);
 		if (id === null) return;
 		out.push({

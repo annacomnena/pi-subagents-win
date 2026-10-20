@@ -16,8 +16,8 @@
  * 本模块只服务 Message/Command 帧（protocol.ts）；Event 走 journal.ts，不混用。
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 import { isObjectAddress, type ObjectAddress } from "./address.ts";
 import {
@@ -354,6 +354,47 @@ export function expireSweep(recipient?: ObjectAddress, opts: { mailboxDir?: stri
 
 // ── 查询 ───────────────────────────────────────────────────────────
 
+/**
+ * 信件解析缓存（L2 perf，2026-10-20）。
+ *
+ * 动因（实测）：`/v1/health` 每 2s、`/v1/snapshot` 每 6s 都会全量扫信箱（本机 189 封未清理信件），
+ * 每封 = readdir + readFileSync + JSON.parse；`/v1/health` 单拍 20ms 里大头就是它。
+ * 命中条件 = `(mtimeMs, ctimeMs, size)`：`writeJsonAtomic` 走 tmp+rename ⇒ **rename 必改 ctime**，
+ * 状态迁移（pending→claimed→acked）一定失效；无 TTL ⇒ 无陈旧窗口。
+ * 上限 2000 封（本机 189，10× 余量），超限整体清空（不引 LRU 依赖）。
+ */
+const LETTER_CACHE = new Map<string, { stamp: string; letter: Letter }>();
+const LETTER_CACHE_MAX = 2000;
+
+/** 读一封并解析（带身份缓存）；不存在/读失败/坏 JSON → null（与各调用方 skip 语义一致）。 */
+function readLetterCached(path: string): Letter | null {
+	let stamp: string;
+	try {
+		const st = statSync(path);
+		stamp = `${st.mtimeMs}|${st.ctimeMs}|${st.size}`;
+	} catch {
+		return null;
+	}
+	const hit = LETTER_CACHE.get(path);
+	if (hit !== undefined && hit.stamp === stamp) return hit.letter;
+	let raw: string;
+	try {
+		raw = readFileSync(path, "utf8");
+	} catch {
+		return null;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	const letter = parsed as Letter;
+	if (LETTER_CACHE.size >= LETTER_CACHE_MAX) LETTER_CACHE.clear();
+	LETTER_CACHE.set(path, { stamp, letter });
+	return letter;
+}
+
 export function listLetters(
 	recipient: ObjectAddress,
 	status?: DeliveryStatus,
@@ -364,14 +405,39 @@ export function listLetters(
 	const out: Letter[] = [];
 	for (const f of readdirSync(dir)) {
 		if (!f.endsWith(".json")) continue;
-		try {
-			const letter = JSON.parse(readFileSync(join(dir, f), "utf8")) as Letter;
-			if (!status || letter.status === status) out.push(letter);
-		} catch {
-			continue;
-		}
+		const letter = readLetterCached(join(dir, f));
+		if (letter === null) continue;
+		if (!status || letter.status === status) out.push(letter);
 	}
 	return out.sort((a, b) => frameTime(a).localeCompare(frameTime(b)));
+}
+
+/**
+ * L2 perf（2026-10-20）：**一次**扫描全部 spool，返回 目录名 → 信件数组（坏信跳过，never-throw）。
+ *
+ * 动因（实测）：`/v1/snapshot` 一拍内三个消费方各扫一遍全信箱（master 段 `getMasterStatus()`、
+ * workstreams/runtime 的 `mailboxBacklog`、attention 的 `pushMailbox`）——本机 189 封未清理信件
+ * ⇒ 单拍 ~567 次小文件读（readFileSync 计数探针实测）。共享一次扫描即可，语义不变。
+ */
+export function scanMailboxLetters(mailboxDir: string = defaultMailboxDir()): Map<string, Letter[]> {
+	const out = new Map<string, Letter[]>();
+	for (const dir of listRecipientDirs(mailboxDir)) {
+		out.set(basename(dir), listLettersSynthetic(dir));
+	}
+	return out;
+}
+
+/** 由共享扫描派生 backlog 行（与 `mailboxBacklog` 逐字段等价：spool 目录名 + pending/claimed 计数）。 */
+export function backlogFromScan(scan: Map<string, Letter[]>): { recipient: string; pending: number; claimed: number }[] {
+	const out: { recipient: string; pending: number; claimed: number }[] = [];
+	for (const [recipient, letters] of scan) {
+		out.push({
+			recipient,
+			pending: letters.filter((l) => l.status === "pending").length,
+			claimed: letters.filter((l) => l.status === "claimed").length,
+		});
+	}
+	return out;
 }
 
 /** 全部 recipient 的未 ack 计数（GUI Attention/§35.4 Runtime 投影的消费入口之一）。 */
@@ -404,11 +470,8 @@ function listLettersSynthetic(dir: string): Letter[] {
 	const out: Letter[] = [];
 	for (const f of readdirSync(dir)) {
 		if (!f.endsWith(".json")) continue;
-		try {
-			out.push(JSON.parse(readFileSync(join(dir, f), "utf8")) as Letter);
-		} catch {
-			continue;
-		}
+		const letter = readLetterCached(join(dir, f));
+		if (letter !== null) out.push(letter);
 	}
 	return out;
 }

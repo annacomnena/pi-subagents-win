@@ -43,9 +43,10 @@ import { buildAttentionItems } from "./attention.ts";
 import { buildTimelineItems } from "./timeline.ts";
 import { workstreamAddress } from "../runtime/address.ts";
 import type { RuntimeEnvelope } from "../runtime/envelope.ts";
-import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
+import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes, type JournalReadResult } from "../runtime/journal.ts";
 import { readLiveness, type MasterLiveness } from "../runtime/liveness.ts";
-import { defaultMailboxDir, mailboxBacklog, mailboxDirFor } from "../runtime/mailbox.ts";
+import { backlogFromScan, defaultMailboxDir, mailboxBacklog, mailboxDirFor, scanMailboxLetters } from "../runtime/mailbox.ts";
+import type { Letter } from "../runtime/protocol.ts";
 import { normalizeMasterSuccession, type MasterSuccessionConfig } from "../runtime/master-auto.ts";
 import { getMasterStatus, type MasterStatusView } from "../runtime/master-control.ts";
 import type { TaskRecord, WorkstreamRecord } from "../runtime/objects.ts";
@@ -200,9 +201,16 @@ function err(section: string, e: unknown): string {
 	return `${section}: ${e instanceof Error ? e.message : String(e)}`;
 }
 
-function buildMasterSection(now: Date, stateDir: string, configPath: string, sectionErrors: string[]): MasterView {
+function buildMasterSection(
+	now: Date,
+	stateDir: string,
+	configPath: string,
+	sectionErrors: string[],
+	sharedBacklog: MailboxBacklogRow[] | null = null,
+): MasterView {
 	try {
-		const s = getMasterStatus();
+		// L2 perf（2026-10-20）：积压可由一拍共享扫描注入（缺省仍由 getMasterStatus 自扫）。
+		const s = getMasterStatus(sharedBacklog !== null ? { backlog: sharedBacklog } : {});
 		const age = s.attachment ? now.getTime() - Date.parse(s.attachment.lastHeartbeatAt) : NaN;
 		// G5.2 additive（各自 tolerant，失败只记子段、不拖垮 master 段）：
 		let liveness: MasterLiveness | null = null;
@@ -229,13 +237,22 @@ function buildMasterSection(now: Date, stateDir: string, configPath: string, sec
 	}
 }
 
-function buildWorkstreamsSection(stateDir: string, mailboxDir: string, now: Date, sectionErrors: string[]): WorkstreamView[] {
+function buildWorkstreamsSection(
+	stateDir: string,
+	mailboxDir: string,
+	now: Date,
+	sectionErrors: string[],
+	sharedBacklog: MailboxBacklogRow[] | null = null,
+): WorkstreamView[] {
 	try {
 		// G5.2 additive：per-ws 信箱积压一次全量扫描按 spool 目录名匹配（mailboxDirFor 同源
 		// sanitize；mailbox 读失败只记子段，工作流清单照常出）。
+		// L2 perf（2026-10-20）：sharedBacklog 非空时复用一拍内的同一次扫描（见 readMailboxShared）。
 		let backlogByDir = new Map<string, { pending: number; claimed: number }>();
 		try {
-			backlogByDir = new Map(mailboxBacklog(mailboxDir).map((r) => [r.recipient, { pending: r.pending, claimed: r.claimed }]));
+			backlogByDir = new Map(
+				(sharedBacklog ?? mailboxBacklog(mailboxDir)).map((r) => [r.recipient, { pending: r.pending, claimed: r.claimed }]),
+			);
 		} catch (e) {
 			sectionErrors.push(err("workstreams.mailboxBacklog", e));
 		}
@@ -260,10 +277,45 @@ function buildTasksSection(stateDir: string, sectionErrors: string[]): TaskView[
 	}
 }
 
-/** 单数据源 = journal 全量 rebuild（§0 拍板 (a)）；输出按 subject 排序（展示序稳定）。 */
-function buildRunsSection(journalPath: string, sectionErrors: string[]): RunView[] {
+/** mailboxBacklog 的行类型（一拍共享用）。 */
+type MailboxBacklogRow = { recipient: string; pending: number; claimed: number };
+
+/**
+ * L2 perf（2026-10-20）：一拍共享的信箱扫描。never-throw：失败 → null（调用方各自回退到
+ * 「自己扫一遍」，保留各自 sectionErrors 口径）。实测本机 189 封未清理信件 / 6 个 spool 目录。
+ *
+ * 单拍内三个消费方共用这一份：master 段（`getMasterStatus().backlog`）、workstreams/runtime
+ * （积压计数）、attention（`pushMailbox` 的 pending 信件）。原本三处各扫一遍全信箱
+ * ⇒ 实测单拍 ~567 次小文件读（readFileSync 计数探针）。
+ */
+function scanMailboxShared(mailboxDir: string): Map<string, Letter[]> | null {
 	try {
-		const { envelopes } = listRuntimeEnvelopes({ path: journalPath });
+		return scanMailboxLetters(mailboxDir);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * L2 perf（2026-10-20）：一拍共享的 journal 读。never-throw：读失败 → null（调用方各段自行回退，
+ * 保留各自 sectionErrors 口径）。不做缓存 —— journal 每次事件都在追加，跨请求缓存命中率低且引入陈旧风险。
+ */
+function readJournalShared(journalPath: string): JournalReadResult | null {
+	try {
+		return listRuntimeEnvelopes({ path: journalPath });
+	} catch {
+		return null;
+	}
+}
+
+/** 单数据源 = journal 全量 rebuild（§0 拍板 (a)）；输出按 subject 排序（展示序稳定）。 */
+function buildRunsSection(
+	journalPath: string,
+	sectionErrors: string[],
+	shared: JournalReadResult | null = null,
+): RunView[] {
+	try {
+		const envelopes = shared !== null ? shared.envelopes : listRuntimeEnvelopes({ path: journalPath }).envelopes;
 		const { state } = rebuildFromEnvelopes(envelopes);
 		return [...state.runs.values()].sort((a, b) => a.subject.localeCompare(b.subject));
 	} catch (e) {
@@ -273,16 +325,28 @@ function buildRunsSection(journalPath: string, sectionErrors: string[]): RunView
 }
 
 function buildRuntimeSection(
-	opts: { mailboxDir: string; journalPath: string },
+	opts: {
+		mailboxDir: string;
+		journalPath: string;
+		shared?: JournalReadResult | null;
+		sharedBacklog?: MailboxBacklogRow[] | null;
+	},
 	counts: { workstreams: number; tasks: number; runs: number },
 	sectionErrors: string[],
 ): RuntimeView {
 	try {
 		// 两次读（§2 表）：一次无 limit 供 rebuild 计数，一次 limit 供 recent；10k 行两次仍是毫秒级（T5）。
-		const full = listRuntimeEnvelopes({ path: opts.journalPath });
+		// L2 perf（2026-10-20）：shared 非空时两次读都从同一份 envelopes 派生（recent = slice(-N)，
+		// 与 listRuntimeEnvelopes 的 limit 语义逐字节等价：`envelopes.slice(-limit)`）。
+		const shared = opts.shared ?? null;
+		const full = shared !== null ? shared : listRuntimeEnvelopes({ path: opts.journalPath });
 		const { applied, skipped } = rebuildFromEnvelopes(full.envelopes);
-		const recent = listRuntimeEnvelopes({ path: opts.journalPath, limit: RECENT_LIMIT }).envelopes;
-		const pendingMailbox = mailboxBacklog(opts.mailboxDir).reduce((n, r) => n + r.pending, 0);
+		const recent =
+			shared !== null
+				? shared.envelopes.slice(-RECENT_LIMIT)
+				: listRuntimeEnvelopes({ path: opts.journalPath, limit: RECENT_LIMIT }).envelopes;
+		// L2 perf（2026-10-20）：复用一拍内已做的信箱扫描（原本 workstreams 与 runtime 各扫一遍全量信件）。
+		const pendingMailbox = (opts.sharedBacklog ?? mailboxBacklog(opts.mailboxDir)).reduce((n, r) => n + r.pending, 0);
 		return {
 			host: null, // G2 server 注入自信息；G1 无 host 进程
 			counts: { ...counts, pendingMailbox },
@@ -325,12 +389,18 @@ export function buildRuntimeSnapshot(opts: SnapshotOptions = {}): RuntimeSnapsho
 	const sectionErrors: string[] = [];
 	let body: Omit<RuntimeSnapshot, "generatedAt" | "sectionErrors">;
 	try {
-		const master = buildMasterSection(now, stateDir, configPath, sectionErrors);
-		const workstreams = buildWorkstreamsSection(stateDir, mailboxDir, now, sectionErrors);
+		const sharedScan = scanMailboxShared(mailboxDir);
+		const sharedBacklog = sharedScan !== null ? backlogFromScan(sharedScan) : null;
+		const master = buildMasterSection(now, stateDir, configPath, sectionErrors, sharedBacklog);
+		const workstreams = buildWorkstreamsSection(stateDir, mailboxDir, now, sectionErrors, sharedBacklog);
 		const tasks = buildTasksSection(stateDir, sectionErrors);
-		const runs = buildRunsSection(journalPath, sectionErrors);
+		// L2 perf（2026-10-20）：一拍只读一次 journal（原 runs/runtime/timeline 各自 readFileSync+parse
+		// 同一文件 4 次，实测 786KB journal ~7ms/次 ⇒ 每拍白烧 ~21ms）。读失败 → null ⇒ 各段
+		// 各自回退到「自己读」，段级 sectionErrors 语义与旧版逐字一致（不是静默降级）。
+		const shared = readJournalShared(journalPath);
+		const runs = buildRunsSection(journalPath, sectionErrors, shared);
 		const runtime = buildRuntimeSection(
-			{ mailboxDir, journalPath },
+			{ mailboxDir, journalPath, shared, sharedBacklog },
 			{ workstreams: workstreams.length, tasks: tasks.length, runs: runs.length },
 			sectionErrors,
 		);
@@ -338,13 +408,22 @@ export function buildRuntimeSnapshot(opts: SnapshotOptions = {}): RuntimeSnapsho
 		// 理论上的一切意外抛点 → 段级降级 [] + sectionErrors（与 G1 段纪律一致）。
 		let att: AttentionItem[] = [];
 		try {
-			att = buildAttentionItems({ stateDir, mailboxDir });
+			att = buildAttentionItems({
+				stateDir,
+				mailboxDir,
+				...(sharedScan !== null ? { letters: sharedScan } : {}),
+			});
 		} catch (e) {
 			sectionErrors.push(err("attention", e));
 		}
 		let tl: TimelineItem[] = [];
 		try {
-			tl = buildTimelineItems({ stateDir, journalPath, linksPath: opts.linksPath });
+			tl = buildTimelineItems({
+				stateDir,
+				journalPath,
+				linksPath: opts.linksPath,
+				...(shared !== null ? { envelopes: shared.envelopes } : {}),
+			});
 		} catch (e) {
 			sectionErrors.push(err("timeline", e));
 		}

@@ -62,6 +62,12 @@ export interface TimelineOptions {
 	/** 尾部 N 条（at 升序）；默认 200；非法值回退默认；上限 10000（防大 journal 一次回爆）。 */
 	limit?: number;
 	/**
+	 * L2 perf（2026-10-20）：调用方已读好的 journal 全量 envelopes（`/v1/snapshot` 一拍内
+	 * runs/runtime/timeline 三段共享一次读）。传入则不再自己 readFileSync+parse；缺省保持原行为。
+	 * **传空数组 ≠ 不传**（空 journal 与读失败要区分）。
+	 */
+	envelopes?: RuntimeEnvelope[];
+	/**
 	 * G5.2 历史翻页：排他上界（排序全序中该 id 位置的严格前缀）。空串/undefined = 不启用；
 	 * id 不在集内（缺失/越界）→ 返回 []（客户端据此停用「加载更早」）。
 	 */
@@ -186,6 +192,18 @@ function enrichRunDispatched(items: TItem[], stateDir: string, linksPath: string
 	} catch {
 		workstreams = [];
 	}
+	// L2 perf（2026-10-20）：wake-state 提到循环外**每个 workstream 读一次**。
+	// 事故形态（实测）：原实现在「逐条 run.dispatched 事件」里对每个 ws 调 readWakeState ⇒
+	// 同一次 snapshot 把同一份 `state/wake-state/ws_*.json` 读了 **193 次**（readFileSync 计数探针），
+	// 是本段 ~34% 文件读开销的主因。语义不变：wake-state 在单次调用内本就是常量。
+	const wakeByWs = new Map<string, ReturnType<typeof readWakeState>>();
+	for (const ws of workstreams) {
+		try {
+			wakeByWs.set(ws.id, readWakeState(ws.id, stateDir)); // tolerant：缺失 → 默认态（lastTabRunId 无）
+		} catch {
+			/* 单 ws 读失败：等同缺失（不附 woke 后缀） */
+		}
+	}
 	for (const it of items) {
 		if (it.kind !== "event" || it.type !== "run.dispatched") continue;
 		const rid = runIdFromSubject(it.subject);
@@ -195,7 +213,8 @@ function enrichRunDispatched(items: TItem[], stateDir: string, linksPath: string
 			if (link && link.sessionId !== "unknown") it.actor = link.sessionId;
 			if (it.subject?.startsWith("run://tab/")) {
 				for (const ws of workstreams) {
-					const wake = readWakeState(ws.id, stateDir); // tolerant：缺失 → 默认态（lastTabRunId 无）
+					const wake = wakeByWs.get(ws.id);
+					if (wake === undefined) continue;
 					if (wake.lastTabRunId === rid) {
 						it.summary = `${it.summary}（ws ${ws.id} woke）`;
 						break;
@@ -220,7 +239,7 @@ export function buildTimelineItems(opts: TimelineOptions = {}): TimelineItem[] {
 
 	// 1) 事件条目：journal 全事件（tolerant：坏行跳过、文件保持原样；缺失 → 0 条）
 	try {
-		const { envelopes } = listRuntimeEnvelopes({ path: journalPath });
+		const envelopes = opts.envelopes ?? listRuntimeEnvelopes({ path: journalPath }).envelopes;
 		envelopes.forEach((e, seq) => {
 			items.push({ ...describeEvent(e), seq });
 		});

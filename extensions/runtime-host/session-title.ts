@@ -18,7 +18,7 @@
  * 禁止 import tab-runs.ts（该文件携并行会话未提交改动）。只读、容错损坏行/缺失目录。
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SessionSummary } from "../runtime/transcript.ts";
@@ -61,6 +61,30 @@ function modePrefixLike(taskId: string, mode: string): string {
 }
 
 /**
+ * 台账读缓存（L2 perf，2026-10-20）：key=runsDir，值=指纹 + 解析结果。
+ *
+ * 动因（实测）：`/v1/sessions` 每拍都调本函数，191 个 run json 逐个 readFileSync+JSON.parse 实测冷跑 ~190ms；
+ * 而这些文件内容只在本拍某 run 变化时才变。指纹 = 目录名集 + 每个文件 `(mtimeMs,size)`（stat-only，~5-10ms），
+ * 与逐文件读相比降一个量级；**无 TTL** ⇒ 不存在陈旧窗口。
+ * 返回的数组是**共享引用**：调用方只读（本仓现有调用点均为只读），不得就地改写。
+ */
+const LEDGER_CACHE = new Map<string, { fp: string; entries: TabLedgerEntry[] }>();
+
+/** 目录名集 + 每文件 `(mtimeMs,size)` 的指纹；任一 stat 失败拼 `gone`（条目消失/创建都会改变指纹）。 */
+function ledgerFingerprint(runsDir: string, names: string[]): string {
+	const parts: string[] = [];
+	for (const name of names) {
+		try {
+			const st = statSync(join(runsDir, name));
+			parts.push(`${name}|${st.mtimeMs}|${st.size}`);
+		} catch {
+			parts.push(`${name}|gone`);
+		}
+	}
+	return parts.join("\n");
+}
+
+/**
  * 读台账目录：仅顶层 `<runId>.json` 派发记录（排除 `.state.json`/`.result.json`/子目录）。
  * 损坏行 / 形状不符 / 读取失败 → skip（never-throw）。
  */
@@ -80,6 +104,9 @@ export function loadTabLedger(runsDir: string): TabLedgerEntry[] {
 	} catch {
 		return out;
 	}
+	const fp = ledgerFingerprint(runsDir, entries);
+	const cached = LEDGER_CACHE.get(runsDir);
+	if (cached !== undefined && cached.fp === fp) return cached.entries;
 	for (const name of entries) {
 		let raw: string;
 		try {
@@ -111,6 +138,7 @@ export function loadTabLedger(runsDir: string): TabLedgerEntry[] {
 			dispatchedAtMs: Number.isNaN(dispatchedMs) ? 0 : dispatchedMs,
 		});
 	}
+	LEDGER_CACHE.set(runsDir, { fp, entries: out });
 	return out;
 }
 
@@ -253,10 +281,35 @@ export function resolveSessionTitle(
 	return { title: session.sessionId, source: "id" };
 }
 
+/** 标题解析结果缓存（L2 perf，2026-10-20）。
+ *
+ * 动因（实测）：`resolveSessionTitles` 在 939 会话 × 191 台账条目时跑 **~180ms/拍**——每个会话都要
+ * 对整张台账做 `hasLedgerPrefix`（对可能数 KB 的 firstUserText 做前缀比对）+ 两段正则剥离。
+ * 但这些输入对**同一文件快照**是不变的：`resolveSessionTitle` 的入参 = (cwd, firstUserText, startedAt, ledger)，
+ * 前三者均派生自同一 `(file, mtimeMs, sizeBytes)`，第四者用**台账数组引用身份**判定（`loadTabLedger` 命中缓存时
+ * 返回同一引用，重建时是新引用）⇒ 失效条件精确、无 TTL、无陈旧窗口。
+ */
+let titleCache = new Map<string, SessionTitle>();
+let titleCacheLedger: TabLedgerEntry[] | null = null;
+const TITLE_CACHE_MAX = 5000;
+
 /** 批量解析：台账整目录读一次（缺失/全损 = 空台账，P2/P3 照常）。 */
 export function resolveSessionTitles(sessions: SessionSummary[], runsDir: string = tabRunsDir()): Map<string, SessionTitle> {
 	const ledger = loadTabLedger(runsDir);
+	if (ledger !== titleCacheLedger) {
+		titleCache = new Map();
+		titleCacheLedger = ledger;
+	}
 	const map = new Map<string, SessionTitle>();
-	for (const s of sessions) map.set(s.sessionId, resolveSessionTitle(s, ledger));
+	for (const s of sessions) {
+		const key = `${s.file}|${s.mtimeMs}|${s.sizeBytes}`;
+		let t = titleCache.get(key);
+		if (t === undefined) {
+			t = resolveSessionTitle(s, ledger);
+			if (titleCache.size >= TITLE_CACHE_MAX) titleCache.clear();
+			titleCache.set(key, t);
+		}
+		map.set(s.sessionId, t);
+	}
 	return map;
 }

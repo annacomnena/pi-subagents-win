@@ -13,8 +13,13 @@
 - **验证**：`npx tsx extensions/_test_runtime_supervision_default_on.ts` → **26 checks**；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks**；`npm run test:autonomy-actions` → **87 checks**；`npx tsx extensions/_test_model_failure_classify.ts` → **3 groups**；`npm run smoke:extension-load` → OK；`npm run test:master-dispatch` → **16 pass**。
 - **未闭合**：① `open/` 账本**无 GC**（派发越多条目越多；`closed/` 只在 `/supervise off` 时产生，无自动关账/过期清理）；② **三条派发路径尚未接自动登记**——`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab，这些 tab 仍落在旧默认（无账本 ⇒ `NOT_MONITORED`）；③ P1 推动（`supervise-push` / wake prompt 注入）仍未实现，`epoch.pushes` 恒空。
 
-## [0.8.0] — 2026-10-17
+- **GUI 默认主题改暖亮（2026-10-20）**：`gui/src/theme.ts::DEFAULT_THEME` 由 `warm-dark` 改为 `warm-light`（原「暖暗优先」口径作废，暖暗仍可一键切）；顶栏主题按钮 `title` 由长描述改为短词 `主题亮/暗`（当前档/目标档仍由 `aria-label` 表达）。纯 UI 态，不持久化、不写 `config.json`。验证：`test:gui-theme` 7 组 + `test:gui-zcode-replica` 9 组 + `test:gui-theme-contract` 4 组 + `test:gui-contrast` 118 对全过，`npm run gui:build` 通过。
 
+- **GUI 读投影提速（2026-10-20）**：`/v1/sessions` 稳态 **131ms → 33ms**。根因不是 stat 扫描（25ms），而是每拍重读 939 个会话头（`listPiSessions` 341ms 冷）+ 939×191 次标题前缀判定（`resolveSessionTitles` 191ms 冷）。改为三级缓存：会话头按 `(mtimeMs,size)`、台账按 stat-only 指纹、标题按 `file|mtime|size` + 台账数组引用身份（无 TTL、无陈旧窗口）。实测并发下 health p50 20.9→160.5ms 的同步阻塞随之缓解。验证：`test:session-title` 35 组（含新增 T11 缓存失效门 + 变异验证）、`test:runtime-host-server` 等全绿。
+
+- **GUI 读投影提速第二轮（2026-10-20）**：`/v1/snapshot` **60-71ms → 17-21ms**，单拍 `readFileSync` **776 → 207** 次。根因是「同一份只读数据一拍内被多个消费方各读一遍」：wake-state 在逐条事件循环里读（同一文件 **193 次**，O(n·m)）、journal 一拍读 4 次、信箱一拍扫 3 遍（189 封 × 3）。修法：wake-state 提到循环外、`readJournalShared` 一拍一读三段共享、`scanMailboxLetters`/`backlogFromScan`/`AttentionOptions.letters` 一拍一扫四处共享、`readLetterCached` 按 `(mtimeMs,ctimeMs,size)` 缓存信件解析（rename 必改 ctime ⇒ 状态迁移必失效，无 TTL）。等价性由 `test:runtime-mailbox` 新增三条共享扫描断言钉住，两处变异验证（去掉 pending 过滤 / 去掉 wake 预读）均精确红且还原后 sha256 一致。顺带修掉既有时间炸弹 `_test_mailbox_retry_budget.ts`（`setCutover` 的 enabledAt 取真实 now、信件 sentAt 硬编码 10-16 ⇒ `pre-cutover-legacy` 跳过，恒红）。
+
+## [0.8.0] — 2026-10-17
 > 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
 
 - **心跳（修「静默死亡 29h」）**：`writeAutonomyHeartbeat()` 在 wake tick **开头无条件**写 `state/autonomy/heartbeat.json`
