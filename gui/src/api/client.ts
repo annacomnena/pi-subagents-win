@@ -121,7 +121,8 @@ function postJson<T>(path: string, body: unknown, timeoutMs?: number): Promise<F
 	);
 }
 
-function newCommandKey(prefix: string): string {
+/** 命令去重 key（`gui_<ts>_<prefix>_<rand>`）。导出以便调用方与本地记录共用同一 key。 */
+export function newCommandKey(prefix: string): string {
 	const rand = Math.random().toString(36).slice(2, 8);
 	return `gui_${Date.now().toString(36)}_${prefix}_${rand}`;
 }
@@ -201,12 +202,29 @@ export const api = {
 
 	/** G6-P2：session.message（to=pi://<sessionId>；payload {text} 1..8000 字节）。
 	 *  同源 cookie 认证（P2 起写端点 fail-closed；dev 由 vite proxy 注入）。 */
-	sessionMessage: (sessionId: string, text: string, attachments?: string[]): Promise<FetchResult<CommandOutcomeBody>> =>
+	/**
+	 * 发送一条会话消息。
+	 *
+	 * 2026-10-19（关键修复）：`commandKey` 可由调用方传入，**不得在这里另生成一个**。
+	 *
+	 * 事故：store 先用 `gui_msg_<ts>_<rand>` 作本地 `chatOutbox` 的 key，
+	 * 而本函数又用 `gui_<ts>_msg_<rand>` 另造一个发出去 ⇒ **两个 key 不同** ⇒
+	 * `outboxId = sha256("session.message:" + commandKey)` 算出的 id 与真实 outbox 对不上 ⇒
+	 * GUI 本地回显「已提交·等待注入」永远无法退场（用户：「一直排在 GUI 最下边一条」）。
+	 * 现在由调用方传入同一个 key，保证「本地记录 ↔ 服务端 outbox ↔ transcript 标记」三者同源。
+	 * 缺省仍自造一个（向后兼容：无本地回显需求的调用方不受影响）。
+	 */
+	sessionMessage: (
+		sessionId: string,
+		text: string,
+		attachments?: string[],
+		commandKey?: string,
+	): Promise<FetchResult<CommandOutcomeBody>> =>
 		postJson<CommandOutcomeBody>("/v1/commands", {
 			frame: "command",
 			type: "session.message",
 			to: `pi://${sessionId}`,
-			commandKey: newCommandKey("msg"),
+			commandKey: commandKey ?? newCommandKey("msg"),
 			issuedAt: new Date().toISOString(),
 			// GUI 图片输入 S2：attachments = 上传 id 列表（图不内联；服务端落 outbox 时转绝对路径）
 			payload: attachments !== undefined && attachments.length > 0 ? { text, attachments } : { text },
@@ -229,13 +247,16 @@ export const api = {
 	/** GET /v1/sessions：pi 会话列表（startedAt 降序）。L2 perf：条件请求（ETag/304，additive）。 */
 	sessions: (): Promise<FetchResult<SessionsBody>> => fetchJson<SessionsBody>("/v1/sessions", undefined, DEFAULT_TIMEOUT_MS, "/v1/sessions"),
 
-	/** GET /v1/sessions/:id/transcript?after=：首屏全量（after 缺省/0）或增量触及行终态。 */
-	transcript: (sessionId: string, after?: number): Promise<FetchResult<TranscriptBody>> =>
-		fetchJson<TranscriptBody>(
-			`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${after !== undefined && after > 0 ? `?after=${after}` : ""}`,
-			undefined,
-			8000,
-		),
+	/**
+	 * GET /v1/sessions/:id/transcript：三态
+	 *   - `after>0`：增量（触及行终态），用于 WS 重连补差
+	 *   - `tail>0`：**只取最新 N 行**（L2 perf 2026-10-20：首屏不再拉全量；响应带 hasOlder）
+	 *   - 都不传：全量快照（旧行为，逐字节不变）
+	 */
+	transcript: (sessionId: string, after?: number, tail?: number): Promise<FetchResult<TranscriptBody>> => {
+		const q = after !== undefined && after > 0 ? `?after=${after}` : tail !== undefined && tail > 0 ? `?tail=${tail}` : "";
+		return fetchJson<TranscriptBody>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${q}`, undefined, 8000);
+	},
 
 	// ── 0923 微信 iLink 绑定（v1）：同源 cookie 鉴权（dev proxy 注入 sw_host_token；
 	//  生产 sw_gui_token 派生凭据）；绑定 5 端点 fail-closed（无/错 → 401；

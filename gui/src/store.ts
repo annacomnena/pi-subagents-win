@@ -8,7 +8,7 @@
  */
 
 import { create } from "zustand";
-import { api, type ConnState, type FetchErr } from "./api/client";
+import { api, newCommandKey, type ConnState, type FetchErr } from "./api/client";
 import { applyTranscriptOp } from "./api/transcript";
 import type {
 	AttentionItem,
@@ -189,6 +189,10 @@ interface GuiState {
 	chatJournalHead: TranscriptHead | null;
 	/** 会话 → 已见最大帧 seq（防重放倒退；重放去重由 appended 幂等兑底）。 */
 	chatSeqBySession: Record<string, number>;
+	/** 会话 → 是否还有更早的行未加载（L2 perf 2026-10-20：首屏只取最新 TAIL_FIRST 行）。 */
+	chatHasOlderBySession: Record<string, boolean>;
+	/** 会话 → 当前已请求的尾部行数（「加载更早」时翻倍）。 */
+	chatTailBySession: Record<string, number>;
 	chatConn: StreamState;
 	/** bump → useEventStream 立即重订阅（snapshot/resync 全量重拉完成后）。 */
 	chatResyncKey: number;
@@ -201,13 +205,17 @@ interface GuiState {
 	sendChatMessage: (sessionId: string, text: string, attachments?: string[]) => Promise<void>;
 	pollChatSessions: () => Promise<void>;
 	openChatSession: (id: string) => Promise<void>;
-	reloadChatSession: (id: string) => Promise<void>;
+	/** 首屏/全量重拉：缺省只取最新 TAIL_FIRST 行（`?tail=`）；传 tail 显式放大（「加载更早」）。 */
+	reloadChatSession: (id: string, tail?: number) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
 	setChatConn: (s: StreamState) => void;
 	bumpChatResync: () => void;
 }
+
+/** 首屏尾部行数（L2 perf：一屏约 200 行；「加载更早」时翻倍）。 */
+const TAIL_FIRST = 200;
 
 function isResync(e: FetchErr): boolean {
 	return e.resync === true;
@@ -400,17 +408,23 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatHeadBySession: {},
 	chatJournalHead: null,
 	chatSeqBySession: {},
+	chatHasOlderBySession: {},
+	chatTailBySession: {},
 	chatConn: "idle",
 	chatResyncKey: 0,
 	chatOutbox: {},
 	chatOutboxHead: null,
 
 	sendChatMessage: async (sessionId, text, attachments) => {
-		const commandKey = `gui_msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+		// 2026-10-19：commandKey **只生成一次**，既作本地 chatOutbox 的 key，也传给 api.sessionMessage
+		// 作为真正发出去的 commandKey。两者必须同值，否则
+		// `outboxId = sha256("session.message:" + commandKey)` 算不出真实 outbox id ⇒
+		// 本地「已提交·等待注入」回显无法按 outboxId 配对退场（用户真机反馈的「永远赖在最下边」）。
+		const commandKey = newCommandKey("msg");
 		// GUI 图片输入 S2：附件只带 id（图已落盘；正文由服务端拼路径）；两段回执行仍展示正文
 		const entry: ChatOutboxEntry = { commandKey, sessionId, text, status: "sending", at: new Date().toISOString() };
 		set({ chatOutbox: { ...get().chatOutbox, [commandKey]: entry } });
-		const r = await api.sessionMessage(sessionId, text, attachments);
+		const r = await api.sessionMessage(sessionId, text, attachments, commandKey);
 		const cur = get().chatOutbox[commandKey];
 		if (cur === undefined) return; // 已被裁剪（理论不发生）
 		if (!r.ok) {
@@ -468,13 +482,20 @@ export const useGui = create<GuiState>((set, get) => ({
 	},
 
 	/** 进入会话/全量重拉（首屏 GET 播种；head 为后续 WS 续传 base）。 */
-	reloadChatSession: async (id) => {
-		const r = await api.transcript(id);
+	reloadChatSession: async (id, tail) => {
+		// L2 perf（2026-10-20，用户诉求「从最新消息开始读，不要一下拉全部」）：首屏只取最新
+		// TAIL_FIRST 行（`?tail=`）；响应带 hasOlder ⇒ GUI 显示「加载更早」，点一次 tail 翻倍。
+		// 实测（15.4MB / 6315 行会话）：服务端 104ms → 32-45ms，响应体 6.5MB → ~200KB。
+		const want = tail ?? get().chatTailBySession[id] ?? TAIL_FIRST;
+		const r = await api.transcript(id, undefined, want);
 		if (!r.ok) return;
+		const rows = r.data.rows;
 		set({
-			chatRowsBySession: { ...get().chatRowsBySession, [id]: r.data.rows },
+			chatRowsBySession: { ...get().chatRowsBySession, [id]: rows },
 			chatHeadBySession: { ...get().chatHeadBySession, [id]: r.data.head },
 			chatSeqBySession: { ...get().chatSeqBySession, [id]: r.data.head?.seq ?? 0 },
+			chatHasOlderBySession: { ...get().chatHasOlderBySession, [id]: r.data.hasOlder === true },
+			chatTailBySession: { ...get().chatTailBySession, [id]: Math.max(want, rows.length) },
 		});
 		get().markUp(r.at);
 	},

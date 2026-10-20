@@ -553,9 +553,13 @@ try {
 	}
 
 	// ── GUI 图片输入 S3：注入正文带附件**路径块**（不内联 base64）──
+	// 2026-10-19（B 檔）：`attachmentBlock` 现在**校验存在性**。本组用假路径测「全有效」文案，
+	// 故显式注入 `exists: () => true`（等价于旧行为）；失效降级另开一组真造文件。
+	// 夹具纪律（AGENTS R-4）：真实运行时用的是真盘面路径，所以「全有效」和「部分失效」两组都要有。
 	{
 		const dir = mkdtempSync(join(tmpdir(), "msg-outbox-att-"));
 		DIRS.push(dir);
+		const ALWAYS = { exists: (): boolean => true };
 		const withAtt = newOutboxItem({
 			dedupeKey: "session.message:att-1",
 			commandKey: "att-1",
@@ -566,13 +570,19 @@ try {
 			now: new Date(),
 		});
 		writeOutboxItem(dir, withAtt);
-		const body = buildOutboxInjectBody(withAtt, undefined, "ev_att");
+		const body = buildOutboxInjectBody(withAtt, undefined, "ev_att", ALWAYS);
 		assert.ok(body.includes("看一下这张图"), "正文保留");
 		assert.ok(body.includes("[用户上传图片 2 张"), `附件块头存在：${body}`);
 		assert.ok(body.includes("1. C:\\rt\\uploads\\up_a1.png"), "附件路径 1 逐字出现");
 		assert.ok(body.includes("2. C:\\rt\\uploads\\up_b2.jpg"), "附件路径 2 逐字出现");
 		assert.ok(!/base64|data:image/i.test(body), "正文无 base64/data:image（用户口径：不进 jsonl）");
 		assert.ok(body.includes("read"), "明确告知用 read 工具取图");
+		// 全有效 ⇒ 与旧实现逐字相同（回归锚，一字不改）
+		assert.equal(
+			attachmentBlock(withAtt.attachments, ALWAYS),
+			`\n\n[用户上传图片 2 张；图片未内联在会话里，需要时用 read 工具按下列路径读取]\n1. C:\\rt\\uploads\\up_a1.png\n2. C:\\rt\\uploads\\up_b2.jpg`,
+			"全有效 ⇒ 旧文案逐字节不变",
+		);
 		// 反例：无附件时正文与旧式**逐字相同**（零行为变更，向后兼容）
 		const noAtt = newOutboxItem({
 			dedupeKey: "session.message:att-0",
@@ -585,6 +595,65 @@ try {
 		assert.equal(buildOutboxInjectBody(noAtt, "Web Console 远程输入"), `（Web Console 远程输入｜dedupe:outbox:${noAtt.id}）\n纯文本`, "无附件 → 旧格式逐字不变");
 		assert.equal(attachmentBlock(undefined), "", "attachmentBlock(undefined) = 空串");
 		assert.equal(attachmentBlock([]), "", "attachmentBlock([]) = 空串");
+	}
+
+	// ── D-4 失效降级（2026-10-19 B 檔）：真造文件，不靠注入 ──
+	// 事故背景：注入正文无条件写「N 张…用 read 读取」，但文件可能已被 pruneUploads
+	// （TTL 7 天）删掉 ⇒ 模型 read 才 ENOENT。实测复现：outbox 2a95841e。
+	// 对齐 ZCode `attachment-placeholder.ts`：失效必须降级成可见形状，不得伪造可读。
+	{
+		const dir = mkdtempSync(join(tmpdir(), "msg-outbox-miss-"));
+		DIRS.push(dir);
+		// 真造一个存在的文件 + 一个不存在的路径（不 mock 盘面）
+		const realPath = join(dir, "up_real.png");
+		writeFileSync(realPath, Buffer.from("89504e470d0a1a0a", "hex"));
+		const gonePath = join(dir, "up_gone.jpg");
+		assert.equal(existsSync(gonePath), false, "前提：待测路径确实不存在");
+
+		// (a) 全部失效 ⇒ 不写「用 read 读取」的假承诺
+		const allGone = attachmentBlock([gonePath]);
+		assert.ok(!allGone.includes("需要时用 read 工具"), `全失效不得承诺可读：${allGone}`);
+		assert.ok(allGone.includes("已失效"), "全失效要明说已失效");
+		assert.ok(allGone.includes("重新发送"), "要给出可操作建议（重发）");
+		assert.ok(allGone.includes(gonePath), "仍保留路径供诊断");
+
+		// (b) 部分失效 ⇒ 可用部分照常承诺，失效部分单列
+		const mixed = attachmentBlock([realPath, gonePath]);
+		assert.ok(mixed.includes("[用户上传图片 1 张可用"), `部分失效：可用数要准确：${mixed}`);
+		assert.ok(mixed.includes(realPath), "可用路径在");
+		assert.ok(mixed.includes("另有 1 张图片附件已失效"), "失效数量要准确");
+		assert.ok(mixed.includes("2. " + gonePath) || mixed.includes(gonePath), "失效路径保留且编号续排");
+		assert.ok(!mixed.includes("2 张；图片未内联"), "不得把 2 张都说成可用");
+
+		// (c) 全有效（默认 existsSync 真盘面）⇒ 与旧文案逐字一致
+		assert.equal(
+			attachmentBlock([realPath]),
+			`\n\n[用户上传图片 1 张；图片未内联在会话里，需要时用 read 工具按下列路径读取]\n1. ${realPath}`,
+			"全有效（真 existsSync）⇒ 旧文案逐字节不变",
+		);
+
+		// (d) 探测函数抛错 ⇒ “无法确认”而非“已过期”（S1：不得把 IO 错误报成文件不存在）
+		const throwing = attachmentBlock([realPath], { exists: () => { throw new Error("EBUSY"); } });
+		assert.ok(!throwing.includes("需要时用 read 工具"), "探测抛错不得承诺可读");
+		assert.ok(throwing.includes("暂时无法确认"), "探测抛错应归入无法确认档");
+		assert.ok(!throwing.includes("已失效（文件不存在"), "不得把探测失败报成已过期（S1）");
+		assert.ok(!throwing.includes("向用户说明需重新发送"), "无法确认档不得直接断言需重发");
+
+		// (e) 注入全文端到端：失效时正文仍保留 dedupe 标记与原文
+		const missItem = newOutboxItem({
+			dedupeKey: "session.message:att-miss",
+			commandKey: "att-miss",
+			to: piSessionAddress("sid-att"),
+			sessionId: "sid-att",
+			text: "看看这个",
+			attachments: [gonePath],
+			now: new Date(),
+		});
+		const missBody = buildOutboxInjectBody(missItem, undefined, "ev_miss");
+		assert.ok(missBody.includes("看看这个"), "正文保留");
+		assert.ok(missBody.includes(`dedupe:outbox:${missItem.id}`), "dedupe 标记保留");
+		assert.ok(missBody.includes("[evt:ev_miss]"), "eventMarker 保留（C-3 ACK 依赖）");
+		assert.ok(missBody.includes("已失效"), "端到端也是失效形状");
 	}
 } finally {
 	for (const d of DIRS) {

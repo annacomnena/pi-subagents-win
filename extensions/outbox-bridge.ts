@@ -47,7 +47,7 @@
  */
 
 import { join } from "node:path";
-import { mkdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./runtime/journal.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import {
@@ -135,14 +135,75 @@ function claimKeyFor(item: OutboxItem): string {
  * 重投逐字相同）——目标端据此幂等去重（at-least-once 的对偶约束）。正文逐字保留
  * （控制字符已由 executor payload 白名单拒绝）。
  */
-export function attachmentBlock(paths: string[] | undefined): string {
+/**
+ * 附件路径块（注入正文的一部分）。
+ *
+ * 2026-10-19（B 档）：**必须校验存在性**。
+ * 旧实现无条件写「N 张…用 read 工具按下列路径读取」——但图片可能已被
+ * `pruneUploads`（TTL 7 天）或任何原因删除 ⇒ 正文做出**假承诺**，模型 read 才 ENOENT。
+ * 实测复现：outbox 2a95841e 注入「1 张」后文件已不在，read → ENOENT。
+ *
+ * 对齐 ZCode 的口径（`core/src/runtime/helpers/attachment-placeholder.ts`）：
+ * 失效不能伪造内容，必须降级成**可见的形状**并标记失效。
+ *
+ * 三条硬约束（既有锚，**不得破**）：
+ *   1. `undefined` / `[]` ⇒ `""`（无附件时注入正文逐字节不变）
+ *   2. 全部有效 ⇒ 旧文案**逐字节不变**（`_test_message_outbox` 的 S3 组锚）
+ *   3. 缺省 `exists` = 真实 `existsSync`（生产路径；测试可注入以免依赖真实盘面）
+ */
+export function attachmentBlock(paths: string[] | undefined, opts?: { exists?: (p: string) => boolean }): string {
 	if (paths === undefined || paths.length === 0) return "";
-	const lines = paths.map((p, i) => `${i + 1}. ${p}`).join("\n");
-	return `\n\n[用户上传图片 ${paths.length} 张；图片未内联在会话里，需要时用 read 工具按下列路径读取]\n${lines}`;
+	const exists = opts?.exists ?? existsSync;
+	const valid: string[] = [];
+	const missing: string[] = [];
+	const unprobed: string[] = [];
+	for (const p of paths) {
+		try {
+			(exists(p) ? valid : missing).push(p);
+		} catch {
+			// 探测本身抛错（EBUSY/权限/IO）⇒ **无法断定**文件不在。
+			// S1（L4，2026-10-19）：不得把「暂时探测失败」报成「已过期被清理」——
+			// 那会误导用户重传一张其实还在的图。单独一档，只说“读不了”。
+			unprobed.push(p);
+		}
+	}
+	if (missing.length === 0 && unprobed.length === 0) {
+		// 全有效：文案与旧实现逐字一致（回归锚）
+		const lines = valid.map((p, i) => `${i + 1}. ${p}`).join("\n");
+		return `\n\n[用户上传图片 ${valid.length} 张；图片未内联在会话里，需要时用 read 工具按下列路径读取]\n${lines}`;
+	}
+	// 有失效/无法探测：不写「可 read」的假承诺，改成显式形状（仍保留路径供诊断）
+	const parts: string[] = [];
+	if (valid.length > 0) {
+		parts.push(
+			`[用户上传图片 ${valid.length} 张可用；图片未内联在会话里，需要时用 read 工具按下列路径读取]`,
+			valid.map((p, i) => `${i + 1}. ${p}`).join("\n"),
+		);
+	}
+	let nextIndex = valid.length + 1;
+	if (missing.length > 0) {
+		parts.push(
+			`[另有 ${missing.length} 张图片附件已失效（文件不存在，可能已过期被清理）；不要尝试 read，向用户说明需重新发送]`,
+			missing.map((p, i) => `${nextIndex + i}. ${p}`).join("\n"),
+		);
+		nextIndex += missing.length;
+	}
+	if (unprobed.length > 0) {
+		parts.push(
+			`[另有 ${unprobed.length} 张图片附件暂时无法确认（读取探测失败，不等同于已过期）；不要尝试 read，向用户说明可能需重新发送]`,
+			unprobed.map((p, i) => `${nextIndex + i}. ${p}`).join("\n"),
+		);
+	}
+	return `\n\n${parts.join("\n")}`;
 }
 
-export function buildOutboxInjectBody(item: OutboxItem, sourceLabel = "Web Console 远程输入", eventId?: string): string {
-	const base = `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}${attachmentBlock(item.attachments)}`;
+export function buildOutboxInjectBody(
+	item: OutboxItem,
+	sourceLabel = "Web Console 远程输入",
+	eventId?: string,
+	attachmentOpts?: { exists?: (p: string) => boolean },
+): string {
+	const base = `（${sourceLabel}｜dedupe:outbox:${item.id}）\n${item.text}${attachmentBlock(item.attachments, attachmentOpts)}`;
 	// C-3：正文携带 eventId 标记 —— 接收端 `pi.on("context")` 才能检出它并写 `consumed` ACK。
 	return eventId ? `${base}\n${eventMarker(eventId)}` : base;
 }

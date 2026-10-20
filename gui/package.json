@@ -9,7 +9,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test:gui-theme": "node --experimental-strip-types src/_test_gui_theme.ts",
-    "test:gui-composer": "node --experimental-strip-types src/_test_composer_attachments.ts"
+    "test:gui-composer": "node --experimental-strip-types src/_test_composer_attachments.ts",
+    "test:outbox-envelope": "node --experimental-strip-types src/_test_outbox_envelope.ts"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

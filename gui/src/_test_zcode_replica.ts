@@ -53,13 +53,13 @@ assert.ok(css.includes("@custom-variant data-active"), "shadcn 语义 variant �
 assert.ok(css.includes('@import "tw-animate-css"'), "tw-animate-css 接入");
 ok("1 主题底座：暖色契约 token / 14px / 滚动条 / 动画 / @custom-variant 全对锚");
 
-// main.tsx 按 localStorage 偏好选主题（读优先，默认暖暗）
+// main.tsx 经 theme.ts 应用默认主题（内存态；2026-10-19 默认改为暖亮）
 const mainSrc = read("main.tsx");
 assert.ok(mainSrc.includes('from "./theme"') && mainSrc.includes("applyTheme(root, DEFAULT_THEME)"), "main.tsx 经 theme.ts 应用主题（非硬编码 class）");
-assert.ok(read("theme.ts").includes('DEFAULT_THEME: GuiTheme = "warm-dark"'), "默认值 = 暖暗（风格指南口径）");
+assert.ok(read("theme.ts").includes('DEFAULT_THEME: GuiTheme = "warm-light"'), "默认值 = 暖亮（2026-10-19 用户口径）");
 // 2026-10-16：主题改为**内存态**（K3 断言禁止 gui/src 全量 WebStorage）⇒ 不再断言 localStorage 键
 assert.ok(!/localStorage|sessionStorage/.test(read("theme.ts")), "theme.ts 零 WebStorage（K3 口径）");
-ok("1b main.tsx 经 theme.ts 应用主题（默认暖暗；内存态、零 WebStorage）");
+ok("1b main.tsx 经 theme.ts 应用主题（默认暖亮；内存态、零 WebStorage）");
 
 // ── 2. 依赖 + ui 14 件 ─────────────────────────────────────────────
 const pkg = JSON.parse(read("../package.json")) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };
@@ -112,7 +112,12 @@ ok("3 左栏：容器/列表项 class 串逐字对齐；分组/置顶/dnd 不渲
 const chat = read("pages/ChatPage.tsx");
 assert.ok(chat.includes("rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3"), "user 气泡（rounded-tr-xs 缺角必抄；§7 A-8① 暖沙底角色 token）");
 assert.ok(chat.includes("group/user-row flex flex-col items-end"), "user 行右对齐壳");
-assert.ok(chat.includes("mt-1 text-right text-ui-sm"), "outbox 回执状态行（气泡下）");
+// 2026-10-19 用户裁决：**不再画第二条「已提交·等待注入」气泡**（那是视觉重复）。
+// 契约从「气泡 + 状态行」改成「只有极简状态小字，且已送达时静默」。
+// 这里守护的是**新契约**：状态行存在、但不再复述正文、且 delivered 静默。
+assert.ok(chat.includes("function OutboxStatusLine"), "outbox 状态改为极简状态行（不再画第二条气泡）");
+assert.ok(chat.includes('e.status === "delivered"') && chat.includes("return null"), "已送达 ⇒ 静默（不产生噪音）");
+assert.ok(chat.includes("text-right text-ui-xs"), "状态行仍右对齐小字（失败/排队仍可见）");
 assert.ok(chat.includes('className="group/assistant-row"') && chat.includes("whitespace-pre-wrap"), "assistant 行式纯文本");
 assert.ok(chat.includes("animated-gradient-text"), "工具卡运行中扫光（≈流式，无光标字符）");
 assert.ok(!chat.includes("▌") && !chat.includes("█"), "无光标字符");
@@ -174,7 +179,13 @@ assert.deepEqual(offenders, [], `raw 调色板类全退役（zinc-/amber-/blue-9
 const store = read("store.ts");
 assert.ok(store.includes("sidebarCollapsed"), "store 附加 sidebarCollapsed（折叠动画数据源）");
 // 2026-10-16 S4：发送链签名新增可选 attachments（图片输入）——契约仍成立：仍是 sendChatMessage → api.sessionMessage。
-assert.ok(store.includes("sendChatMessage: async (sessionId, text, attachments)") && store.includes("api.sessionMessage(sessionId, text, attachments)"), "发送链 P2 契约（+S4 可选 attachments）");
+// 2026-10-16 S4：+ 可选 attachments；2026-10-19：+ 第 4 参 commandKey（单一来源，修「回显永不退场」）。
+// 契约核心不变：仍是 sendChatMessage → api.sessionMessage 一条链，没有旁路发送。
+assert.ok(
+	store.includes("sendChatMessage: async (sessionId, text, attachments)") &&
+		store.includes("api.sessionMessage(sessionId, text, attachments, commandKey)"),
+	"发送链 P2 契约（+S4 attachments / +commandKey 单一来源）",
+);
 ok("7 收尾：raw palette=0 / store 折叠字段 / 发送链零改动");
 
 console.log(`\nall ${n} groups passed — ZCode 1:1 复刻布局冒烟`);

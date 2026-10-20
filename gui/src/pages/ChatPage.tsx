@@ -32,12 +32,16 @@ import {
 	attachmentIds,
 	canSendMessage,
 	candidatesFrom,
+	applyOversizePaste,
 	formatBytes,
 	pickAttachments,
+	pickPastePlan,
 	rejectHint,
 	type AttachmentItem,
+	type ClipboardLike,
 	type FileListLike,
 } from "../composerAttachments";
+import { echoedOutboxIds, outboxIdForCommandKey, parseOutboxEnvelope } from "../outboxEnvelope";
 
 // 回看 mask 渐隐常数（ConversationTimeline.tsx#L99-100）
 const COMPOSER_MESSAGE_MASK_FADE_PX = 24;
@@ -85,14 +89,75 @@ function TurnHeaderRowView({ row }: { row: Extract<TranscriptRow, { kind: "turnH
 	);
 }
 
-/** user 右对齐气泡全套（#L1190,1252-1270）：rounded-tr-xs 缺角必抄。 */
+/**
+ * user 右对齐气泡全套（#L1190,1252-1270）：rounded-tr-xs 缺角必抄。
+ *
+ * 2026-10-19：远程注入（Web Console）的正文带**投递信封**
+ * （`（来源｜dedupe:outbox:<hex>）` + 附件块 + `[evt:async:…]`）。
+ * 之前直接把原文渲出来 ⇒ 用户看到一大坨内部元数据，且与下方本地回显重复成两条。
+ *
+ * 用户裁决：**TUI 里保留信封可以接受**（不改注入正文 —— 那会断
+ * `async-result-watcher` 的 consumed ACK 与 `wechat-reply-hook` 的微信回路）。
+ * 所以这里只做**渲染层**处理：
+ *   - 信封细节收进默认折叠的「投递详情」
+ *   - 正文与附件 chip 常显
+ *   - 普通手输消息（无信封）**渲染逐字节不变**
+ */
 function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userInput" }> }) {
+	const parsed = useMemo(() => parseOutboxEnvelope(row.text), [row.text]);
+	if (parsed === null) {
+		// 无信封 ⇒ 旧渲染路径（零行为变化）
+		return (
+			<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
+				<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
+					<div className="whitespace-pre-wrap">
+						{row.text.length > 0 ? row.text : <span className="opacity-60">（非文本输入）</span>}
+					</div>
+				</div>
+			</RowShell>
+		);
+	}
 	return (
 		<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
 			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
 				<div className="whitespace-pre-wrap">
-					{row.text.length > 0 ? row.text : <span className="opacity-60">（非文本输入）</span>}
+					{parsed.text.length > 0 ? parsed.text : <span className="opacity-60">（空白消息）</span>}
 				</div>
+				{parsed.attachmentPaths.length > 0 && (
+					<div className="flex flex-wrap gap-1.5" data-user-attachment-chips="1">
+						{parsed.attachmentPaths.map((p, i) => (
+							<span
+								key={`${p}-${i}`}
+								title={p}
+								className="inline-flex items-center gap-1 rounded-md border border-border bg-background/40 px-1.5 py-0.5 text-ui-xs text-foreground-subtlest"
+							>
+								🖼 图片 {i + 1}
+							</span>
+						))}
+					</div>
+				)}
+				{/* 投递详情：默认折叠（用户不想看内部 id，但排障时要有） */}
+				<Collapsible className="w-full">
+					<CollapsibleTrigger className="group/outbox inline-flex cursor-pointer items-center gap-1 text-ui-xs text-foreground-subtlest transition-colors hover:text-foreground-subtle">
+						<ChevronRight className="size-3 shrink-0 transition-transform group-data-[state=open]/collapsible:rotate-90" />
+						<span>投递详情</span>
+						<span className="font-mono opacity-70">{parsed.outboxId.slice(0, 8)}</span>
+					</CollapsibleTrigger>
+					<CollapsibleContent className="outline-none">
+						<div className="mt-1 space-y-1 rounded-md border border-border/60 bg-background/30 p-2 font-mono text-ui-xs text-foreground-subtlest">
+							{parsed.source !== undefined && <div>来源：{parsed.source}</div>}
+							<div className="break-all">outboxId：{parsed.outboxId}</div>
+							{parsed.eventIds.length > 0 && (
+								<div className="break-all">eventId：{parsed.eventIds.join(", ")}</div>
+							)}
+							{parsed.attachmentPaths.map((p, i) => (
+								<div key={`${p}-detail-${i}`} className="break-all">
+									附件 {i + 1}：{p}
+								</div>
+							))}
+						</div>
+					</CollapsibleContent>
+				</Collapsible>
 			</div>
 		</RowShell>
 	);
@@ -347,6 +412,9 @@ export function ChatPage() {
 	}, 3000);
 
 	const rows = activeId !== null ? (rowsMap[activeId] ?? []) : [];
+	// L2 perf（2026-10-20）：首屏只取最新 TAIL_FIRST 行 ⇒ 若还有更早的行，给一个「加载更早」入口
+	const hasOlder = useGui((s) => (activeId !== null ? s.chatHasOlderBySession[activeId] === true : false));
+	const tailWant = useGui((s) => (activeId !== null ? (s.chatTailBySession[activeId] ?? 200) : 200));
 	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——
 	// 首屏只画尾部 200 行，贴底时分块补齐更早行。2-4k 行全量同步重挂载实测阻塞主线程
 	// 2s+（真机 CDP 复现），分块后切回首帧 ~100ms。hiddenHead = 头部未渲染行数。
@@ -360,13 +428,30 @@ export function ChatPage() {
 	// Master 禁输入标识 = /v1/sessions masterProtected flag（服务端权威；POST 403 是最后防线）。
 	const activeSession = activeId !== null ? chatSessions.find((s) => s.sessionId === activeId) : undefined;
 	const isMasterSession = activeSession?.masterProtected === true;
+	// 2026-10-19：本地回显**退场**。
+	// 用户的原始抱怨是「一条消息画了两遍，下面那条永远赖着」——上一条是 transcript 的
+	// userInput（注入信封全文），下一条是本地的「已提交·等待注入」。
+	// 现在 transcript 那条已折叠成正常气泡，本地那条只在**尚未注入**时才有价值
+	// （它告知「已提交，正在排队」）。配对用 outboxId 确定性判等
+	// （`outboxId = sha256("session.message:" + commandKey)`，与 message-outbox.ts 同口径）。
+	// L4 S3：一次解析 transcript 建 Set（O(m)），再对每条 outbox 做 O(1) 查找。
+	// 旧写法对每条 outbox 都全量解析 transcript ⇒ O(n×m×文本长)，长会话下不必要。
+	const echoedIds = useMemo(
+		() =>
+			echoedOutboxIds(
+				rows.filter((r) => r.kind === "userInput").map((r) => (r as Extract<TranscriptRow, { kind: "userInput" }>).text),
+			),
+		[rows],
+	);
 	const outboxEntries = useMemo(
 		() =>
 			Object.values(outboxMap)
 				.filter((e) => e.sessionId === activeId)
+				// 已出现在 transcript ⇒ 不必再画一条本地回显（按 outboxId 确定性配对）
+				.filter((e) => !echoedIds.has(outboxIdForCommandKey(e.commandKey)))
 				.sort((a, b) => a.at.localeCompare(b.at))
 				.slice(-20),
-		[outboxMap, activeId],
+		[outboxMap, activeId, echoedIds],
 	);
 	// 贴底锚定 + 回看锁定（原 S5 逻辑保留）：单 scroll handler 判 nearBottom（≤48px）；
 	// 贴底→新内容自动锚定吸底；离开底部→锁定阅读位 + 浮出「回到底部」钮 + 消息层 mask 渐隐。
@@ -516,6 +601,18 @@ export function ChatPage() {
 							</div>
 						) : (
 							<>
+									{hasOlder && hiddenHead === 0 && (
+										<div className="py-1 text-center">
+											<button
+											type="button"
+											onClick={() => void useGui.getState().reloadChatSession(activeId!, tailWant * 2)}
+											className="text-ui-xs text-foreground-subtle underline decoration-foreground-subtle decoration-dashed underline-offset-4 transition-colors hover:text-foreground"
+											title="只读取更早的历史（首屏不一次拉全部）"
+											>
+											加载更早消息
+											</button>
+										</div>
+									)}
 								{hiddenHead > 0 && (
 									<div className="py-1 text-center text-ui-xs text-foreground-subtlest">
 										正在补齐较早消息（{hiddenHead} 条）…
@@ -524,9 +621,11 @@ export function ChatPage() {
 								{visibleRows.map((row) => (
 									<RowView key={row.rowId} row={row} />
 								))}
-								{/* 发送两段回执：挂 user 气泡下的状态行（mt-1 text-right text-ui-sm） */}
+								{/* 2026-10-19 用户裁决：**不再画第二条气泡**。
+								    只在「已发出但还没进 transcript」且非终态成功时给一行极简状态
+								    （排队中/失败/被拒 才有价值；已进 transcript 的条目已被上面过滤掉）。 */}
 								{outboxEntries.map((e) => (
-									<OutboxRowView key={e.commandKey} e={e} />
+									<OutboxStatusLine key={e.commandKey} e={e} />
 								))}
 							</>
 						)}
@@ -603,13 +702,36 @@ export function ChatPage() {
 								<textarea
 									value={draft}
 									onChange={(e) => setDraft(e.target.value)}
-									onPaste={(e) => {
-										// GUI 图片输入 S4：Ctrl+V 粘贴图片（剪贴板有图 → 拦截默认；纯文字 → 放行给浏览器）
-										const files = e.clipboardData?.files ?? null;
-										if (files !== null && files.length > 0) {
+										onPaste={(e) => {
+										// 粘贴决策（对齐 ZCode v4 composer：files+items 并集、Excel 文本优先）：
+										// 旧实现只读 `clipboardData.files`，而微信/截图工具/跨应用复制图的场景下
+										// files 为空、图只在 items 里 ⇒ 不拦截也不提示 = 静默失效（AGENTS R-2）。
+										const plan = pickPastePlan(e.clipboardData as unknown as ClipboardLike);
+										if (plan.preferText) {
+											// 表格文本获胜（Excel 会同时给 text/html/合成 PNG）⇒ 放行给浏览器默认粘贴
+											setAttachHint("检测到表格内容，已按文本粘贴（未作为图片附件）");
+											return;
+									}
+										if (plan.files.length > 0) {
 											e.preventDefault();
-											acceptFiles(files);
+											acceptFiles(plan.files);
+											return;
 										}
+										// 无图：默认走浏览器文本粘贴；但**超长必须接管**（L4 M2）。
+										// 只靠 `maxLength` 让浏览器默默截断 = 静默丢失用户内容（AGENTS R-2）。
+										// 这里自己 preventDefault 并按剩余容量插入，把丢弃量明确告知。
+										const pastedText = e.clipboardData?.getData("text/plain") ?? "";
+										const el = e.currentTarget;
+										const res = applyOversizePaste(
+											draft,
+											el.selectionStart ?? draft.length,
+											el.selectionEnd ?? draft.length,
+											pastedText,
+										);
+										if (res.notice === null) return; // 未超限：放行默认粘贴
+										e.preventDefault();
+										setDraft(res.next);
+										setAttachHint(res.notice);
 									}}
 									onKeyDown={(e) => {
 										if (e.key === "Enter" && !e.shiftKey) {
@@ -715,20 +837,28 @@ const OUTBOX_STATUS: Record<ChatOutboxEntry["status"], { label: string; destruct
 	rejected: { label: "被拒绝", destructive: true },
 };
 
-function OutboxRowView({ e }: { e: ChatOutboxEntry }) {
+/**
+ * 极简发送状态行（2026-10-19 用户裁决：**不要再来一条「已提交·等待注入」气泡**）。
+ *
+ * 旧实现画的是完整 user 气泡 + 状态标签 ⇒ 与 transcript 那条视觉重复，
+ * 用户原话：「会一直排在 GUI 的最下边一条，这是一个重大的用户体验缺陷」。
+ *
+ * 现在：不画气泡、不复述正文，只在真有必要时给一行小字：
+ *   - `sending`   → 发送中
+ *   - `pending`   → 排队中（还没进 transcript）
+ *   - 失败/过期/被拒 → 红字 + 原因（这些**必须**可见，否则是静默失败，AGENTS R-2）
+ *   - `delivered` → **什么都不显示**（transcript 已有那条，多了就是噪音）
+ */
+function OutboxStatusLine({ e }: { e: ChatOutboxEntry }) {
+	if (e.status === "delivered") return null; // 已送达且进 transcript ⇒ 静默
 	const s = OUTBOX_STATUS[e.status];
 	return (
-		<div className="group/user-row flex flex-col items-end">
-			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
-				<div className="whitespace-pre-wrap">{e.text}</div>
-			</div>
-			<div
-				className={`mt-1 text-right text-ui-sm ${s.destructive ? "text-destructive" : "text-foreground-subtlest"}`}
-				title={e.detail ?? s.label}
-				aria-live="polite"
-			>
-				{s.label}
-			</div>
+		<div
+			className={`text-right text-ui-xs ${s.destructive ? "text-destructive" : "text-foreground-subtlest"}`}
+			title={e.detail ?? s.label}
+			aria-live="polite"
+		>
+			{s.label}
 		</div>
 	);
 }
