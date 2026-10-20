@@ -14,7 +14,7 @@
  *   （ConversationTimeline.tsx#L882-909 公式，FADE=24 / TRANSPARENT=96）+ 回到底部浮钮。
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronRight, Plus, ShieldCheck, Square, Wrench, X } from "lucide-react";
 import { useGui } from "../store";
 import { streamUrl, useEventStream } from "../useEventStream";
@@ -61,14 +61,17 @@ function fmtDuration(ms: number): string {
 function RowShell({
 	rowId,
 	className,
+	animate,
 	children,
 }: {
 	rowId: string;
 	className?: string;
+	/** 是否播放入场动画（只给「本次新增」的行；整批历史不打，见 ChatPage 的 animateFromIndex）。 */
+	animate?: boolean;
 	children: React.ReactNode;
 }) {
 	return (
-		<div data-row-id={rowId} data-zcode-stream-animate="true" className={className}>
+		<div data-row-id={rowId} {...(animate === true ? { "data-zcode-stream-animate": "true" } : {})} className={className}>
 			{children}
 		</div>
 	);
@@ -77,9 +80,10 @@ function RowShell({
 // ── 5 种行 → zcode 行型 ───────────────────────────────────────────
 
 /** 调试 turn header 行（ConversationRowView.tsx#L1622-1628）。 */
-function TurnHeaderRowView({ row }: { row: Extract<TranscriptRow, { kind: "turnHeader" }> }) {
+function TurnHeaderRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "turnHeader" }>; animate?: boolean }) {
 	return (
 		<RowShell
+			animate={animate}
 			rowId={row.rowId}
 			className="border-b border-[var(--color-border)] py-1 text-ui-sm text-[var(--color-foreground-subtle)]"
 		>
@@ -103,12 +107,12 @@ function TurnHeaderRowView({ row }: { row: Extract<TranscriptRow, { kind: "turnH
  *   - 正文与附件 chip 常显
  *   - 普通手输消息（无信封）**渲染逐字节不变**
  */
-function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userInput" }> }) {
+function UserInputRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "userInput" }>; animate?: boolean }) {
 	const parsed = useMemo(() => parseOutboxEnvelope(row.text), [row.text]);
 	if (parsed === null) {
 		// 无信封 ⇒ 旧渲染路径（零行为变化）
 		return (
-			<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
+			<RowShell rowId={row.rowId} animate={animate} className="group/user-row flex flex-col items-end">
 				<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
 					<div className="whitespace-pre-wrap">
 						{row.text.length > 0 ? row.text : <span className="opacity-60">（非文本输入）</span>}
@@ -118,7 +122,7 @@ function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userIn
 		);
 	}
 	return (
-		<RowShell rowId={row.rowId} className="group/user-row flex flex-col items-end">
+		<RowShell rowId={row.rowId} animate={animate} className="group/user-row flex flex-col items-end">
 			<div className="flex max-w-full flex-col gap-2 rounded-xl rounded-tr-xs border border-border bg-bubble-user px-4 py-3 text-ui-base text-bubble-user-foreground @min-[624px]/conversation:max-w-xl">
 				<div className="whitespace-pre-wrap">
 					{parsed.text.length > 0 ? parsed.text : <span className="opacity-60">（空白消息）</span>}
@@ -165,9 +169,9 @@ function UserInputRowView({ row }: { row: Extract<TranscriptRow, { kind: "userIn
 
 /** assistant 行式正文（#L1512,1518）：0923 2003 正文换 <Markdown>（自研零依赖渲染器，
  *  替换 whitespace-pre-wrap 纯文本；外层 className 布局类保留）+ 注脚。 */
-function AssistantTextRowView({ row }: { row: Extract<TranscriptRow, { kind: "assistantText" }> }) {
+function AssistantTextRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "assistantText" }>; animate?: boolean }) {
 	return (
-		<RowShell rowId={row.rowId} className="group/assistant-row">
+		<RowShell rowId={row.rowId} animate={animate} className="group/assistant-row">
 			<div className="w-full text-ui-base">
 				<div className="whitespace-pre-wrap">
 					<Markdown text={row.text} />
@@ -184,9 +188,9 @@ function AssistantTextRowView({ row }: { row: Extract<TranscriptRow, { kind: "as
 }
 
 /** reasoning 折叠块：默认收起（streaming/complete 都收起 = zcode Reasoning 口径）。 */
-function ReasoningRowView({ row }: { row: Extract<TranscriptRow, { kind: "reasoning" }> }) {
+function ReasoningRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "reasoning" }>; animate?: boolean }) {
 	return (
-		<RowShell rowId={row.rowId}>
+		<RowShell rowId={row.rowId} animate={animate}>
 			<Collapsible className="w-full">
 				<CollapsibleTrigger className="group/reasoning inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base text-foreground-subtlest transition-colors hover:text-foreground-subtle">
 					<ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/collapsible:rotate-90" />
@@ -212,7 +216,7 @@ function ReasoningRowView({ row }: { row: Extract<TranscriptRow, { kind: "reason
 
 const toolCardOpenState = new Map<string, boolean>();
 
-function ToolCallRowView({ row }: { row: Extract<TranscriptRow, { kind: "toolCall" }> }) {
+function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "toolCall" }>; animate?: boolean }) {
 	const isOpen = toolCardOpenState.get(row.rowId) ?? false;
 	// shouldRenderContent：收起后延迟 300ms 再卸载展开体（Radix closed 动画要读高度变量）
 	const [shouldRenderContent, setShouldRenderContent] = useState(isOpen);
@@ -245,7 +249,7 @@ function ToolCallRowView({ row }: { row: Extract<TranscriptRow, { kind: "toolCal
 	const statusLabel = isRunning ? "执行中" : isError ? "出错" : "完成";
 
 	return (
-		<RowShell rowId={row.rowId} className="py-0">
+		<RowShell rowId={row.rowId} animate={animate} className="py-0">
 			<Collapsible
 				open={isOpen}
 				onOpenChange={(open) => {
@@ -302,20 +306,25 @@ function ToolCallRowView({ row }: { row: Extract<TranscriptRow, { kind: "toolCal
 	);
 }
 
-function RowView({ row }: { row: TranscriptRow }) {
+/**
+ * 行渲染（**memo**）：`applyTranscriptOp` 只替换真正变化的 row 对象（未变行保持同一引用），
+ * 故按 `row` 引用 memo 后，一帧只重渲染变化的那一行。
+ * 不加 memo 时（2026-10-20 前）每来一帧 200 行全部重渲染、每行重跑 markdown 渲染。
+ */
+const RowView = memo(function RowView({ row, animate }: { row: TranscriptRow; animate?: boolean }) {
 	switch (row.kind) {
 		case "turnHeader":
-			return <TurnHeaderRowView row={row} />;
+			return <TurnHeaderRowView row={row} animate={animate} />;
 		case "userInput":
-			return <UserInputRowView row={row} />;
+			return <UserInputRowView row={row} animate={animate} />;
 		case "assistantText":
-			return <AssistantTextRowView row={row} />;
+			return <AssistantTextRowView row={row} animate={animate} />;
 		case "reasoning":
-			return <ReasoningRowView row={row} />;
+			return <ReasoningRowView row={row} animate={animate} />;
 		case "toolCall":
-			return <ToolCallRowView row={row} />;
+			return <ToolCallRowView row={row} animate={animate} />;
 	}
-}
+});
 
 // ── 页面 ─────────────────────────────────────────────────────────
 
@@ -425,6 +434,25 @@ export function ChatPage() {
 		return Math.max(0, n - HISTORY_CHUNK);
 	});
 	const visibleRows = hiddenHead > 0 ? rows.slice(hiddenHead) : rows;
+
+	/**
+	 * 入场动画只给「本次新增」的行（L2 perf，2026-10-20）。
+	 *
+	 * 事故形态：`data-zcode-stream-animate` 挂每一行 + CSS `will-change: opacity` ⇒ 首屏 200 行
+	 * 一次性建 200 个合成层、并发 900ms 动画，实测点击会话后主线程长任务 93ms 且掉帧。
+	 * 判定：首行 rowId 未变（同一会话）且行数变多 ⇒ 从上次行数起的新行才播动画；
+	 * 换会话 / 加载更早（首行变了）⇒ 整批不打动画。
+	 */
+	const animRef = useRef<{ firstRowId: string | null; len: number }>({ firstRowId: null, len: 0 });
+	let animateFromIndex = rows.length;
+	{
+		const prev = animRef.current;
+		const first = rows[0]?.rowId ?? null;
+		if (prev.firstRowId !== null && first === prev.firstRowId && rows.length > prev.len) animateFromIndex = prev.len;
+	}
+	useEffect(() => {
+		animRef.current = { firstRowId: rows[0]?.rowId ?? null, len: rows.length };
+	}, [rows]);
 	// Master 禁输入标识 = /v1/sessions masterProtected flag（服务端权威；POST 403 是最后防线）。
 	const activeSession = activeId !== null ? chatSessions.find((s) => s.sessionId === activeId) : undefined;
 	const isMasterSession = activeSession?.masterProtected === true;
@@ -618,8 +646,12 @@ export function ChatPage() {
 										正在补齐较早消息（{hiddenHead} 条）…
 									</div>
 								)}
-								{visibleRows.map((row) => (
-									<RowView key={row.rowId} row={row} />
+								{visibleRows.map((row, i) => (
+									<RowView
+										key={row.rowId}
+										row={row}
+										animate={hiddenHead + i >= animateFromIndex}
+									/>
 								))}
 								{/* 2026-10-19 用户裁决：**不再画第二条气泡**。
 								    只在「已发出但还没进 transcript」且非终态成功时给一行极简状态
