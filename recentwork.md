@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 60 | P1 | **折叠块自动展开/合上**：`running` 工具卡自动展开、结束自动合上；思考用「流式刚结束 4s」信号展开。三态判定（true/false/null）保护历史卡片与用户手动操作。真实链路 CDP 实测通过 | Item 59 | 已落 commit；`streamJustEnded` 那半边待真实流式复测 | 本区 |
 | 59 | P1 | **GUI 流式打印「正在思考」**：pi 扩展 `message_update` → 节流 150ms 覆盖写 `state/streaming/<sid>.json` → `GET /v1/streaming/:sid` → GUI 200ms 轮询渲染临时块（CSS 动画填平）。含 8 组单测（含真实接线 + 变异验证）+ CDP 端到端 5 态 | none | 已落 2 commit；**需 `/reload` 或新会话才生效**（扩展在启动时加载） | 本区 |
 | 58 | P1 | **ChatPage 虚拟化时间线（独立任务，未开工）**：只渲染视口内行，替掉「首屏 200 行 + 贴底分块补齐」；需处理滚动锚定 / 贴底判定 / toolCall 展开高度缓存。动机：CDP 实测首屏长任务 90ms（200 行 DOM + markdown 全渲染） | Item 56/57 | 待排期开工；先写计划再实现（滚动行为回归风险高，需 CDP 复测基线） | 本区 |
 | 57 | P1 | **OpenCode v2 借鉴评估 + 读取路径常数成本三项**（删 `/v1/sessions` 指纹 stat 风暴 130-146ms/拍；`validateStreamGen` 整文件 sha1 → 采样指纹；WS 订阅无新行快路）。sessions 145-178→44-46ms、`?after=` 1251→111ms | none | 已落 3 commit；下一候选：虚拟化时间线（首屏长任务 90ms） | 本区 |
