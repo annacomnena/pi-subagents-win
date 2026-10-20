@@ -113,7 +113,9 @@
   transcript-tail(6) / runtime-transcript 全绿；CDP 端到端复测 tail 586→432ms(冷)/181ms(热)。
 - **两次自伤（已修，留档）**：`readStreamGenState` 逐字段重建会丢新字段（fpVersion）⇒ 永不 bump；
   首版「旧记录不 bump」写成无条件分支 ⇒ 等长替换漏检。均被 `test:runtime-stream-gen` A4 抓到。
-- **R4 已落地（同日）**：`/v1/health` 增 `memory` 段（rssMb/heapUsedMb/heapTotalMb/externalMb/sampledAt/sampleAgeMs/rssWarn，阈值 1536MB），
+- **R4 已落地（同日）**：`/v1/health` 增 `memory` 段 + `maxSessionFile`（最大会话文件 + 8MB 阈值告警，
+  stat-only 扫描 + 目录 mtime 指纹缓存 60s ⇒ 热路径 18ms）。线上实测 `maxSessionFile.mb=152.4 warn=true`。
+  原段落：`/v1/health` 增 `memory` 段（rssMb/heapUsedMb/heapTotalMb/externalMb/sampledAt/sampleAgeMs/rssWarn，阈值 1536MB），
   直接落实 AGENTS.md R-2「静默失效不可接受」；GUI 运行时页新增「进程内存」卡片（超阈值标红 + 采样年龄）。
   线上实测：`rssMb 157.6 / heapUsed 45.8 / heapTotal 78.6 / external 13`。
 - **未闭合**：虚拟化时间线未做（首屏长任务 90ms）；极端 152MB/119KB-per-line 会话尾窗 181ms 属解析下限；
