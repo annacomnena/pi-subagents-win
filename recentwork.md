@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 57 | P1 | **OpenCode v2 借鉴评估 + 读取路径常数成本三项**（删 `/v1/sessions` 指纹 stat 风暴 130-146ms/拍；`validateStreamGen` 整文件 sha1 → 采样指纹；WS 订阅无新行快路）。sessions 145-178→44-46ms、`?after=` 1251→111ms | none | 已落 3 commit；下一候选：虚拟化时间线（首屏长任务 90ms） | 本区 |
 | 56 | P1 | **GUI 读投影提速（两轮）**：①`/v1/sessions` 131ms→**33ms**（会话 head/台账/标题三级缓存）；②`/v1/snapshot` 60-71ms→**17-21ms**、单拍文件读 776→207（wake-state O(n·m) 去重 + journal 一拍一读 + 信箱一拍一扫）。含 T11 失效门 + 2 处变异验证 + 1 个既有时间炸弹修复 | none | 待 `/runtime-host restart` 生效；下一候选：health 的 journal 增量 tail、snapshot/sessions 体积裁剪（契约变更） | 本区 |
 | 55 | P2 | **GUI 默认主题改暖亮 + 顶栏开关 tooltip 精简**（`DEFAULT_THEME` warm-dark→warm-light；`title` 长描述→`主题亮/暗`，当前档/目标档保留在 `aria-label`；含 4 个测试断言同步 + dist 重建） | none | —（已完成；`gui:build` 已重建，刷新页面生效） | 本区 |
 | 54 | P1 | **僵尸死角 / 认领后 liveness 不刷新（B 线）**：`registry/.lease` 为全局单文件 ⇒ 跨 scope 假竞争（实证 6ms `lease-contended`）；非强接路径不消费 pid；`writeScopeLiveness` 不在认领路径 ⇒ 新 owner 至首个 agent turn 前 liveness 为旧代 | Item 47 / 53 | **待裁 D-5（升级门窗口定义）+ D-1/D-2**；已交付：可采纳项 (b) 认领即刷 liveness（`f042d53`）+ Wiki 三条缺口 | 本区 |
@@ -72,6 +73,27 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+
+<a id="item-57"></a>
+### Item 57 - OpenCode v2 借鉴评估 + 读取路径常数成本（2026-10-20）
+
+- **触发**：用户给了 `opencode-v2-架构与实现说明.md`，要求评估是否有值得借鉴处并实现。
+- **评估结论**：文档「快」的四条地基本仓**已有**（准入只登记 / 增量不落盘 / 慢客户端可丢 / 先订阅再重放+水位）；
+  差距在**读取路径**——每次读都付 O(文件大小)。逐条对照与「不抄」清单见 `Wiki/Decisions/opencode-v2-borrow.md`
+  与 `plans/20261020_opencode_v2_borrow_eval.md`。
+- **落地三项（都有实测）**：
+  1. 删 `/v1/sessions` 指纹快路 —— 它 stat 4269 个文件（含 tab-runs 3177）= **130-146ms/拍**，
+     而它想省的重建只要 33ms ⇒ 纯开销；热路径 145-178ms → **44-46ms**。
+  2. `stream-gen.ts::validateStreamGen` 整文件 `readFileSync`+sha1 → ≤256KB 精确 / 大文件 8×32KB 采样指纹
+     （`fpVersion: 2`，旧记录首次不 bump）；152MB 会话 ~120ms → ~1ms。
+  3. `transcript.ts::projectSessionOps` 无新行快路（`after >= 总行数` ⇒ ops=[] + 绝对 head + EOF cursor）；
+     152MB 订阅阻塞 ~500ms → 直返。`?after=` 端到端 **1251ms → 111ms**。
+- **验证**：runtime-host-server / stream-gen / host-ws / host-projections / snapshot / session-title(35) /
+  transcript-tail(6) / runtime-transcript 全绿；CDP 端到端复测 tail 586→432ms(冷)/181ms(热)。
+- **两次自伤（已修，留档）**：`readStreamGenState` 逐字段重建会丢新字段（fpVersion）⇒ 永不 bump；
+  首版「旧记录不 bump」写成无条件分支 ⇒ 等长替换漏检。均被 `test:runtime-stream-gen` A4 抓到。
+- **未闭合**：虚拟化时间线未做（首屏长任务 90ms）；极端 152MB/119KB-per-line 会话尾窗 181ms 属解析下限；
+  `/v1/health` 仍全量读 journal；体积裁剪属契约+UI 变更。
 
 <a id="item-56"></a>
 ### Item 56 - GUI 读投影提速：会话投影三级缓存（2026-10-20）

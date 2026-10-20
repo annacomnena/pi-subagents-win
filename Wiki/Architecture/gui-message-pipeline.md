@@ -82,6 +82,20 @@ source_paths:
 
 效果：`/v1/snapshot` **60-71ms → 17-21ms**，单拍文件读 **776 → 207**（≈ 去重后 distinct 数）。
 
+### 第三轮：读取路径的常数成本（2026-10-20，借鉴 OpenCode v2）
+
+按 [[OpenCode v2 借鉴评估]] 的口径核对：本仓**已具备**其「快」的前四条（准入只登记 / 增量不落盘 /
+慢客户端可丢 / 断线只补差），差距在**读取**——每次读都在付 O(文件大小) 的常数成本。三处修正：
+
+| 位置 | 原实现 | 问题（实测） | 改法 |
+|---|---|---|---|
+| `/v1/sessions` | stat 全目录算「指纹」决定要不要重建 | 1071+**3177**+21 = 4269 次 stat = **130-146ms/拍**，而重建只要 33ms ⇒ 纯开销 | **删掉指纹快路**；ETag/304 保留 |
+| `stream-gen.ts::validateStreamGen` | `readFileSync` 整文件 + 全量 sha1 | 152MB 会话 = **~120ms/请求**（GET transcript 与 WS 订阅都付） | ≤256KB 整文件精确哈希；大文件 8×32KB 采样窗 + `fpVersion: 2`（旧记录首次不 bump） |
+| `transcript.ts::projectSessionOps` | 无视 base.seq 全量重投影 | 152MB = 堵事件循环 ~500ms，而常见情形是「无新行」 | 新增 `emptyOpsIfNothingNew`（`after >= 总行数` ⇒ ops=[] + 绝对 head + EOF cursor） |
+
+实测：`/v1/sessions` 145-178ms → **44-46ms**；`?after=` 121ms/1251ms → **31ms/111ms**；
+`?tail=200`（152MB）586ms → **432ms 冷 / 181ms 热**；`/v1/snapshot` 64ms → 19-27ms。
+
 **仍未做**：`/v1/health` 仍全量读 journal（~8ms/2s，只需 tail + 计数，候选 stat 增量解析）；
 snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，未动（`file` 134KB 仅用于 tooltip，
 `runs[].summary` 143KB、`timeline` 93KB 与 `/v1/timeline` 重复）。

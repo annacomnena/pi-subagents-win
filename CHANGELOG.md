@@ -19,6 +19,8 @@
 
 - **GUI 读投影提速第二轮（2026-10-20）**：`/v1/snapshot` **60-71ms → 17-21ms**，单拍 `readFileSync` **776 → 207** 次。根因是「同一份只读数据一拍内被多个消费方各读一遍」：wake-state 在逐条事件循环里读（同一文件 **193 次**，O(n·m)）、journal 一拍读 4 次、信箱一拍扫 3 遍（189 封 × 3）。修法：wake-state 提到循环外、`readJournalShared` 一拍一读三段共享、`scanMailboxLetters`/`backlogFromScan`/`AttentionOptions.letters` 一拍一扫四处共享、`readLetterCached` 按 `(mtimeMs,ctimeMs,size)` 缓存信件解析（rename 必改 ctime ⇒ 状态迁移必失效，无 TTL）。等价性由 `test:runtime-mailbox` 新增三条共享扫描断言钉住，两处变异验证（去掉 pending 过滤 / 去掉 wake 预读）均精确红且还原后 sha256 一致。顺带修掉既有时间炸弹 `_test_mailbox_retry_budget.ts`（`setCutover` 的 enabledAt 取真实 now、信件 sentAt 硬编码 10-16 ⇒ `pre-cutover-legacy` 跳过，恒红）。
 
+- **读取路径常数成本（2026-10-20，借鉴 OpenCode v2 评估）**：`/v1/sessions` 删掉 stat 指纹快路（4269 次 stat = 130-146ms/拍，而重建只要 33ms ⇒ 纯开销）→ 热路径 145-178ms → **44-46ms**；`validateStreamGen` 从「整文件 readFileSync + sha1」改为「≤256KB 精确 / 大文件 8×32KB 采样指纹 + fpVersion:2，旧记录首次不 bump」（152MB 会话 ~120ms → ~1ms）；`projectSessionOps` 增「无新行」快路（`after >= 总行数` ⇒ ops=[] + 绝对 head + EOF cursor），152MB 订阅 ~500ms 阻塞 → 直返，`?after=` 端到端 1251ms → **111ms**。评估结论：文档「快」的四条地基本仓已有，差距只在读取路径；「不抄」清单（SQLite 投影表 / Effect HttpApi / 远程配对 / exactly-once / delta 不落盘）与理由见 `Wiki/Decisions/opencode-v2-borrow.md`。
+
 ## [0.8.0] — 2026-10-17
 > 主题：**自主化（autonomy）从「会悄悄死」变成「死不了、看得见、判得准」**；README 重写重点章节（§11）。
 

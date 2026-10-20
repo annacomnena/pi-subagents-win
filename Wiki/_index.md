@@ -25,6 +25,7 @@ source_paths:
 - [[GUI 解锁 Master]] — 本机受信 GUI 注入 master 的三证据合取窄路径 + B 案凭据作用域化（`status: current`）
 - [[Local Master 认领与接管]] — local/global 认领合同、僵尸接管、已知缺口（`status: current`）
 - [[Master 交接继任者形态]] — 继任者改为非标签页常驻会话（能力档/自启/心跳自写）+ 异步失败收尾（`status: current`）
+- [[OpenCode v2 借鉴评估]] — 逐条对照：本仓已具备 6 条地基，差距在读取路径常数成本；含「不抄」清单（`status: current`）
 
 ### 架构（Architecture）
 
