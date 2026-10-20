@@ -1,8 +1,20 @@
 import { Collapsible as CollapsiblePrimitive } from "radix-ui";
 import { cn } from "./lib/utils";
 
-function Collapsible({ ...props }: React.ComponentProps<typeof CollapsiblePrimitive.Root>) {
-  return <CollapsiblePrimitive.Root data-slot="collapsible" {...props} />;
+function Collapsible({ className, ...props }: React.ComponentProps<typeof CollapsiblePrimitive.Root>) {
+  return (
+    <CollapsiblePrimitive.Root
+      data-slot="collapsible"
+      // `group/collapsible` 是**必需**的：ChatPage 里三处 chevron 用
+      // `group-data-[state=open]/collapsible:rotate-90` 驱动箭头旋转。
+      // 2026-10-20 修：此前根只有 `data-slot`，没有任何元素带 `group/collapsible`
+      // ⇒ 选择器 `:where(.group\/collapsible)[data-state=open] *` 永不匹配
+      // ⇒ 三处箭头（用户输入 / 思考 / 工具卡）**永远指向右（收起）**，
+      // 即使内容已展开。用户截图实测：280 个 collapsible 根、`group/collapsible` 命中 0。
+      className={cn("group/collapsible", className)}
+      {...props}
+    />
+  );
 }
 
 function CollapsibleTrigger({

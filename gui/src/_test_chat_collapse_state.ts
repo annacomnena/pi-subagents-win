@@ -77,4 +77,26 @@ const src = readFileSync(new URL("./pages/ChatPage.tsx", import.meta.url), "utf8
 	ok("④ 默认收起口径保持不变");
 }
 
+// ── ⑤ chevron 的 group 名必须有声明处（2026-10-20 用户截图实测的 bug）────
+{
+	// 事故：ChatPage 三处 chevron 用 `group-data-[state=open]/collapsible:rotate-90`，
+	// 但 `Collapsible` 根只有 data-slot，没有任何元素带 `group/collapsible` 类
+	// ⇒ 选择器 `:where(.group\/collapsible)[data-state=open] *` 永不匹配
+	// ⇒ 三个箭头永远指向右（收起），即使内容已展开。CDP 实测：
+	//     collapsibleRoots=280, elementsWithGroupCollapsible=0, chevronRotate="none"
+	const ui = readFileSync(new URL("./ui/collapsible.tsx", import.meta.url), "utf8");
+	assert.ok(
+		/cn\("group\/collapsible",\s*className\)/.test(ui),
+		"Collapsible 根必须声明 `group/collapsible` 类（否则 chevron 选择器永不匹配）",
+	);
+	assert.ok(
+		!/className="group\/collapsible"/.test(ui),
+		"group/collapsible 必须经 cn() 与外部 className 合并，不能写死覆盖外部类",
+	);
+	const chat = readFileSync(new URL("./pages/ChatPage.tsx", import.meta.url), "utf8");
+	const uses = (chat.match(/group-data-\[state=open]\/collapsible:/g) ?? []).length;
+	assert.ok(uses >= 3, `ChatPage 至少三处 chevron 依赖该 group（实得 ${uses}）`);
+	ok(`⑤ chevron 的 group/collapsible 有声明处（${uses} 处使用）`);
+}
+
 console.log(`\n_test_chat_collapse_state: all assertions passed (${n})`);

@@ -87,6 +87,17 @@ const ok = (name: string): void => {
 
 	// reasoning 自动展开只能来自「流式刚结束」这个信号，不能是「最后一行」这种常驻条件
 	assert.ok(src.includes("streamJustEnded"), "reasoning 自动展开依赖「流式刚结束」信号");
+	// 定位必须是「差集」，不能是「最后一行是 reasoning」。
+	// 2026-10-20 二次修复：assistant 消息落盘时 thinking 与 tool_use 同批产出，
+	// 最后一行永远是 toolCall ⇒ 原条件永不成立（采样实测 R:open 命中 0 次）。
+	assert.ok(
+		src.includes("reasoningIdsAtStreamStartRef"),
+		"用「流式开始时的 reasoning id 快照」做差集定位新落盘的思考行",
+	);
+	assert.ok(
+		!/rows\[rows\.length - 1\]!\.kind === "reasoning"/.test(src),
+		"禁止回退成「取最后一行当思考」（该条件在真实序列下永不成立）",
+	);
 	// 关键守卫（正向断言，不是字面量黑名单）：reasoning 的 wasRunning **必须**来自 ref。
 	// 曾经写成 `wasRunning: streaming === true` / `wasRunning: nowStreaming`（与 isRunning 同源）
 	// ⇒ 流式一结束两者同时 false ⇒ 返回 null ⇒ 展开后永远不合（用户实测报障）。

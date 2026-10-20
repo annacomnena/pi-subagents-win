@@ -545,9 +545,32 @@ export function ChatPage() {
 	 * 4s 后自动失效（回到默认收起），避免历史会话被强行展开。
 	 */
 	const prevStreamingRef = useRef(streaming);
+	/**
+	 * 流式开始那一刻已存在的 reasoning rowId 集合 —— 用于事后精确识别
+	 * 「哪一条 reasoning 是本次流式刚生成的」。
+	 *
+	 * ⚠️ 2026-10-20 二次修复（后台 170s × 250ms 采样实测）：原判定是
+	 * `streamJustEnded && rows[最后一行].kind === "reasoning"`，而该条件
+	 * **实际永不成立** —— assistant 消息落盘时，thinking 与 tool_use 来自同一条
+	 * message 记录，投影会同时产出 reasoning 行和 toolCall 行，**最后一行永远是
+	 * toolCall**。采样日志里 `R:open` 命中 **0 次**（同期工具卡 `·:open` 正常），
+	 * 证明「思考自动展开」从来没生效过。
+	 * 现改为「差集判定」：流式开始时快照 reasoning id，结束后找新出现的那些。
+	 */
+	const reasoningIdsAtStreamStartRef = useRef<Set<string> | null>(null);
+	/** 最新 rows 的 ref（effect 只依赖 streaming，不能因 rows 变化而重跑）。 */
+	const rowsRef = useRef(rows);
+	rowsRef.current = rows;
 	const [streamJustEnded, setStreamJustEnded] = useState(false);
 	useEffect(() => {
-		if (prevStreamingRef.current !== null && streaming === null) setStreamJustEnded(true);
+		const prev = prevStreamingRef.current;
+		if (prev === null && streaming !== null) {
+			// 流式开始：记下当时已有哪些 reasoning 行
+			reasoningIdsAtStreamStartRef.current = new Set(
+				rowsRef.current.filter((r) => r.kind === "reasoning").map((r) => r.rowId),
+			);
+		}
+		if (prev !== null && streaming === null) setStreamJustEnded(true);
 		prevStreamingRef.current = streaming;
 	}, [streaming]);
 	useEffect(() => {
@@ -555,10 +578,19 @@ export function ChatPage() {
 		const t = window.setTimeout(() => setStreamJustEnded(false), 1500);
 		return () => window.clearTimeout(t);
 	}, [streamJustEnded]);
-	const streamingRowId =
-		streamJustEnded && rows.length > 0 && rows[rows.length - 1]!.kind === "reasoning"
-			? rows[rows.length - 1]!.rowId
-			: null;
+	const streamingRowId = useMemo(() => {
+		if (!streamJustEnded) return null;
+		const before = reasoningIdsAtStreamStartRef.current;
+		if (before === null) return null;
+		// 取最后一条 reasoning；只有它是「流式开始后才出现的」才认定为本轮刚落盘的。
+		// 若它早已存在（本次是纯文本流 / 纯工具流），返回 null ⇒ 不动任何历史行。
+		for (let i = rows.length - 1; i >= 0; i--) {
+			const r = rows[i]!;
+			if (r.kind !== "reasoning") continue;
+			return before.has(r.rowId) ? null : r.rowId;
+		}
+		return null;
+	}, [streamJustEnded, rows]);
 	// D4（plans/20260930_timeline_switch_latency_d4.md）：大 transcript 分块渲染——
 	// 首屏只画尾部 200 行，贴底时分块补齐更早行。2-4k 行全量同步重挂载实测阻塞主线程
 	// 2s+（真机 CDP 复现），分块后切回首帧 ~100ms。hiddenHead = 头部未渲染行数。
