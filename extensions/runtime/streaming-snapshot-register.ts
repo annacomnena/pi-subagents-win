@@ -24,7 +24,14 @@ import {
 type AnyEvent = Record<string, unknown>;
 type AnyCtx = { sessionManager?: { sessionId?: string } } | null | undefined;
 
-export function registerStreamingSnapshot(pi: ExtensionAPI): () => void {
+export interface RegisterStreamingSnapshotOptions {
+	/** 快照目录（缺省 streamingDir()；测试注入隔离用）。 */
+	dir?: string;
+}
+
+export function registerStreamingSnapshot(pi: ExtensionAPI, opts: RegisterStreamingSnapshotOptions = {}): () => void {
+	const dir = opts.dir;
+	const writerFor = (sessionId: string) => streamingWriterFor(sessionId, dir !== undefined ? { dir } : {});
 	try {
 		pi.on("message_update", ((event: AnyEvent, ctx: AnyCtx) => {
 			try {
@@ -32,7 +39,7 @@ export function registerStreamingSnapshot(pi: ExtensionAPI): () => void {
 				if (sessionId === null) return;
 				const delta = extractDelta(event.assistantMessageEvent);
 				if (delta === null) return;
-				streamingWriterFor(sessionId).push(delta.kind, delta.delta);
+				writerFor(sessionId).push(delta.kind, delta.delta);
 			} catch {
 				/* never-throw */
 			}
@@ -50,7 +57,7 @@ export function registerStreamingSnapshot(pi: ExtensionAPI): () => void {
 				const sessionId = resolveSessionId(ctx);
 				if (sessionId === null) return;
 				// finish() 会从 writers 里摘除，下次流式重新建
-				streamingWriterFor(sessionId).finish();
+				writerFor(sessionId).finish();
 			} catch {
 				/* never-throw */
 			}

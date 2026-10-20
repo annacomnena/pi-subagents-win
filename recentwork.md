@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 59 | P1 | **GUI 流式打印「正在思考」**：pi 扩展 `message_update` → 节流 150ms 覆盖写 `state/streaming/<sid>.json` → `GET /v1/streaming/:sid` → GUI 200ms 轮询渲染临时块（CSS 动画填平）。含 8 组单测（含真实接线 + 变异验证）+ CDP 端到端 5 态 | none | 已落 2 commit；**需 `/reload` 或新会话才生效**（扩展在启动时加载） | 本区 |
 | 58 | P1 | **ChatPage 虚拟化时间线（独立任务，未开工）**：只渲染视口内行，替掉「首屏 200 行 + 贴底分块补齐」；需处理滚动锚定 / 贴底判定 / toolCall 展开高度缓存。动机：CDP 实测首屏长任务 90ms（200 行 DOM + markdown 全渲染） | Item 56/57 | 待排期开工；先写计划再实现（滚动行为回归风险高，需 CDP 复测基线） | 本区 |
 | 57 | P1 | **OpenCode v2 借鉴评估 + 读取路径常数成本三项**（删 `/v1/sessions` 指纹 stat 风暴 130-146ms/拍；`validateStreamGen` 整文件 sha1 → 采样指纹；WS 订阅无新行快路）。sessions 145-178→44-46ms、`?after=` 1251→111ms | none | 已落 3 commit；下一候选：虚拟化时间线（首屏长任务 90ms） | 本区 |
 | 56 | P1 | **GUI 读投影提速（两轮）**：①`/v1/sessions` 131ms→**33ms**（会话 head/台账/标题三级缓存）；②`/v1/snapshot` 60-71ms→**17-21ms**、单拍文件读 776→207（wake-state O(n·m) 去重 + journal 一拍一读 + 信箱一拍一扫）。含 T11 失效门 + 2 处变异验证 + 1 个既有时间炸弹修复 | none | 待 `/runtime-host restart` 生效；下一候选：health 的 journal 增量 tail、snapshot/sessions 体积裁剪（契约变更） | 本区 |
@@ -74,6 +75,33 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+
+<a id="item-59"></a>
+### Item 59 - GUI 流式打印「正在思考」（2026-10-20）
+
+- **用户诉求**：思考块现在是「思考完才出现」，希望 GUI 上流式打印；并明确要求**内建在本插件内**、
+  **不逐 token**、**每秒 5-10 次**、用动画填平以压缩开销。
+- **根因**：pi core 只在 `message_end` 把 assistant 消息写进会话 JSONL（`session-manager.js::appendMessage`），
+  流式期间文件无新行 ⇒ daemon 投影拿不到增量。**数据源不存在**，不是投影慢。
+- **数据源**：pi 官方扩展事件 `pi.on("message_update")`，`assistantMessageEvent` 含
+  `{ type: "thinking_delta" | "text_delta", delta }`（已读 `types.d.ts` + chunk 实证）。
+- **实现（三段）**：
+  1. `runtime/streaming-snapshot.ts`：写入端状态机 —— 节流 150ms（≈6.7 次/秒）、**覆盖写**（不写 journal，
+     避免 delta 炸日志）、段落切换立刻落盘、`finish/dispose` 删快照、never-throw、定时器 unref。
+  2. `runtime/streaming-snapshot-register.ts`：只做事件注册（message_update / message_end / session_shutdown），
+     独立成文件以避开 `index.ts` 的他人未提交改动；`index.ts` 只加 2 行。
+  3. daemon `GET /v1/streaming/:sessionId`（404=没在流式；**陈旧 60s → 404** 防幽灵块；`ageMs` 服务端算）
+     + GUI（`api.streaming` / store `chatStreaming` / App 200ms 轮询 / ChatPage `StreamingPreview` 呼吸点+脉冲光标）。
+- **验证**：
+  - `test:streaming-snapshot` **8 组**：extractDelta / 节流累积 / 段落切换 / finish / dispose /
+    never-throw / writer 复用 / **T8 真实接线**（注册→事件派发→落盘，含 toolcall 忽略与非 assistant 不误删）
+  - **变异验证**：事件名改错 ⇒ T8 精确红在「注册了 message_update」；还原后 sha256 一致
+  - CDP 端到端 5 态：无快照→不显示 / 写入→显示 / 更新→文本增长 / kind=text→「正在输出…」/ 删除→消失
+  - 端点三态：有快照 200(ageMs) / 陈旧 404 / 无 404
+- **未闭合**：
+  - **需 `/reload` 或新会话才生效**（扩展在 pi 启动时加载；本会话进程加载的是旧代码）
+  - 扩展按 cwd 加载 ⇒ 仅本仓会话生效（用户已确认「内建本插件」）
+  - `toolcall_delta` 不做（工具卡已有「执行中」态）
 
 <a id="item-58"></a>
 ### Item 58 - ChatPage 虚拟化时间线（独立任务，登记于 2026-10-20，未开工）
