@@ -11,7 +11,8 @@
  * 2026-10-15 起：由 ZCode「Zai Dark」1:1 复刻改为 Anthropic 暖纸体系
  * （plans/20261015_gui_anthropic_style_guide.md §3 值表）。
  * 风格值来自 OpenDesign 自带设计系统包 design-systems/claude/（curated fixture，
- * 非 anthropic.com 抓取值）。暖暗优先（工作台长时间盯屏）；浅色为结构免费的次选主题。
+ * 非 anthropic.com 抓取值）。默认暖亮（2026-10-19 用户改口径，原「暖暗优先」作废）；
+ * 暖暗为结构免费的次选主题，一键可切。
  * 口径：中性色全部带黄褐底调、系统内无冷蓝灰；陶土 #c96442 是唯一彩色动作；
  * 深度靠 0 0 0 1px 环状阴影 + 表面色阶，不引第二套投影语言。 */
 

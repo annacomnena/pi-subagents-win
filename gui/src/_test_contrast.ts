@@ -336,7 +336,7 @@ graphicTier(dark, [
 	["--info（唯一冷色）", "--color-info"],
 ]);
 compositeTier(dark, "dark");
-okGroup("① 暗色 .theme-warm-dark：正文档 28 + 图标档 8 + 复合档（生产默认主题）");
+okGroup("① 暗色 .theme-warm-dark：正文档 28 + 图标档 8 + 复合档（次选主题）");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. 亮色（S6 起为可选主题）
@@ -356,7 +356,7 @@ graphicTier(light, [
 	["--focus-ring", "--color-focus-ring"],
 ]);
 compositeTier(light, "light");
-okGroup("② 亮色 .theme-warm-light：正文档 28 + 图标档 12 + 复合档（S6 可选主题）");
+okGroup("② 亮色 .theme-warm-light：正文档 28 + 图标档 12 + 复合档（S6 可选主题；2026-10-19 起为默认）");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. 结果

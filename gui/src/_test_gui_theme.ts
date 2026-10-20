@@ -22,11 +22,11 @@ const ok = (name: string): void => {
 };
 
 // ① 默认主题 + 档位常量
-assert.equal(DEFAULT_THEME, "warm-dark", "默认 = 暖暗（风格指南口径「暖暗优先」）");
+assert.equal(DEFAULT_THEME, "warm-light", "默认 = 暖亮（2026-10-19 用户改口径：默认亮主题）");
 assert.deepEqual([...THEME_CLASSES], ["theme-warm-dark", "theme-warm-light"], "两档 class 名");
 assert.equal(THEME_LABEL["warm-dark"], "暖暗");
 assert.equal(THEME_LABEL["warm-light"], "暖亮");
-ok("① 默认暖暗 + 两档 class/标签常量");
+ok("① 默认暖亮 + 两档 class/标签常量");
 
 // ② applyTheme：清另一档再挂当前档（不并存）+ 幂等
 {
@@ -93,6 +93,9 @@ ok("⑥ nextTheme：两档互切 + 对合（主界面开关纯逻辑）");
 	assert.ok(top.includes("onClick={toggleTheme}"), "开关绑 toggleTheme");
 	assert.ok(/aria-label=\{`切换到\$\{THEME_LABEL\[nextTheme\(theme\)\]\}主题`\}/.test(top), "开关 aria-label 说明切到哪档");
 	assert.ok(top.includes("aria-pressed"), "开关带 aria-pressed 状态");
+	// 2026-10-19：tooltip 只留一个短词（用户要求「就一个主题亮/暗」），长描述不得回潮
+	assert.ok(top.includes('title="主题亮/暗"'), "开关 tooltip 是短词「主题亮/暗」");
+	assert.ok(!top.includes("不持久化，不改 config.json"), "开关 tooltip 不得再塞长描述");
 	assert.ok(top.includes("useThemeValue"), "TopBar 读共享主题态（非自持 useState）");
 
 	const hookRaw = readFileSync(new URL("./useTheme.ts", import.meta.url), "utf8");

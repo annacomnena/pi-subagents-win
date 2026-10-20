@@ -2,9 +2,13 @@
 title: GUI 工作台 UI（token / 组件 / 导航）
 kind: architecture
 status: current
-updated: 2026-10-01
+updated: 2026-10-20
 source_paths:
   - gui/src/index.css
+  - gui/src/theme.ts
+  - gui/src/useTheme.ts
+  - gui/src/pages/TopBar.tsx
+  - gui/src/pages/AppearancePage.tsx
   - gui/src/ui/index.tsx
   - gui/src/App.tsx
   - gui/src/main.tsx
@@ -26,13 +30,20 @@ source_paths:
 
 ## Summary
 
-GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义 token 体系、暗色单主题常驻；组件层是「shadcn 套件为内核 + `ui/index.tsx` 薄适配层」的双体系；导航契约为「顶栏 + 常驻左栏（会话列表 + 次级导航）+ 中央主路由（chat/timeline 两 Tab）+ 运行时全屏覆盖层」。消息数据面另见 [[GUI 消息管道与延迟贡献项]]。
+GUI 工作台（`gui/`）的视觉与导航现状：Anthropic 暖纸语义 token 体系 + **双档主题（默认暖亮、可一键切暖暗，内存态不持久化）**；组件层是「shadcn 套件为内核 + `ui/index.tsx` 薄适配层」的双体系；导航契约为「顶栏 + 常驻左栏（会话列表 + 次级导航）+ 中央主路由（chat/timeline 两 Tab）+ 运行时全屏覆盖层」。消息数据面另见 [[GUI 消息管道与延迟贡献项]]。
 
 ## 主题 token 体系（index.css）
 
-- **底座 1:1 移植**：token 保 zcode 原名，值照抄 zcode `packages/ui/src/styles.css`——`:root` 亮色定义（仅留定义，不接切换器）+ `.theme-zai-dark` 生效值。`main.tsx` 给 `documentElement` 常挂 `.theme-zai-dark`，**暗色是唯一生效主题**，无切换器（`gui/src/index.css:22-162`、`gui/src/main.tsx:12`）。
-- **四枚有意补齐**（zcode 未定义，按暗色可读性拍板取值，非照抄）：`ring`（亮 `rgba(0,0,0,0.35)` / 暗 `rgba(255,255,255,0.5)`，调制后 ≈25% 白环）、`muted`（暗 `#242424`，背景与卡底之间的抬升档）、`muted-foreground`（暗 = neutral-400）、`info`（暗 `#38bdf8`，真信息蓝）（`gui/src/index.css:89-93,153-160`）。
-- **一处有意偏离 zcode 原值**：暗色 `foreground-subtlest` 由 30% 调到 50%（对比度 ≈2.2:1 → ≈4:1），测试断言同步（`gui/src/index.css:161`）。
+- **底座（2026-10-15 起 Anthropic 暖纸体系，非 ZCode）**：`@theme` 是亮色基底（`gui/src/index.css:24`），两档生效值分别为 `.theme-warm-dark`（`gui/src/index.css:158`）与 `.theme-warm-light`（`gui/src/index.css:245`）；`applyTheme` 先清两档再挂当前档，防并存歧义（`gui/src/theme.ts`）。
+- **默认档 = `warm-light`**（2026-10-19 用户改口径，原「暖暗优先」作废；`gui/src/theme.ts:26` `DEFAULT_THEME`）。`main.tsx` 挂 `DEFAULT_THEME`；`applyColorScheme` 同步 `color-scheme`（原生滚动条跟随）。
+- **切换入口两处、共享单份状态**：顶栏开关（`gui/src/pages/TopBar.tsx`，`data-theme-toggle="1"`，tooltip 仅「主题亮/暗」短词，当前档/目标档由 `aria-label` 表达）+ 「外观」页（`gui/src/pages/AppearancePage.tsx`）。状态是 `useTheme.ts` 的**模块级 store + `useSyncExternalStore`**（不是各调用点 `useState`，否则顶栏与设置页各持一份）。
+- **不持久化**：`gui/src` 全量禁止 WebStorage（K3 断言），故主题仅本次会话内存态，刷新回默认暖亮；不写 `config.json`、不加后端端点。
+- **信息分级约定**：`foreground-subtle` = 信息性文字（导语、ID、相对时间、缺字段提示）；`foreground-subtlest` = **仅装饰**（空态图标、占位、水印）。信息性内容不得用 subtlest。
+- **字阶**：`--ui-font-size: 14px` 基准派生七档；mono 字体显式加入 CJK 段（Consolas 无中文字形）（`gui/src/index.css:19-40`）。
+- shadcn 语义 variant（`data-open`/`data-checked`/`data-active`/`data-horizontal` 等）按 shadcn 4.1.1 dist 手写在 `index.css`，不引 shadcn 包。
+- **对比度硬门**：两档各 118 对全部 ≥ 阈值（正文/元信息/徽章 ≥4.5:1、大字与图标 ≥3:1），见 `npm run test:gui-contrast`。
+- **四枚补齐 token（2026-10-15 暖纸体系当前值，已实测）**：`ring`（亮 `brand-ink` 22% 调制 / 暗 `surface-warm` 28%）、`muted`（亮 = `brand-sand` / 暗 = `hover` 暖抬升档）、`muted-foreground`（亮 `#5e5d59` / 暗 = `foreground-subtle`）、`info`（亮 `#2d70ab` / 暗 = `brand-focus` `#3898ec`，系统唯一冷色）（`gui/src/index.css:116-135,220-240`）。
+- **`foreground-subtlest` 取 hex 硬值**：亮 `#6c6b65`（L4 复算修正，原 `#706f69` 在 sidebar 上仅 4.27:1）、暗 `#898880`（§3.1 权威值，5.18:1 on `#141413`）（`gui/src/index.css:91,196,267`）。
 - **信息分级约定**：`foreground-subtle`（60% 调制）= 信息性文字（导语、ID、相对时间、缺字段提示）；`foreground-subtlest`（暗 50% 调制）= **仅装饰**（空态图标、占位、水印）。信息性内容不得用 subtlest。
 - **字阶**：`--ui-font-size: 14px` 基准派生 `text-ui-2xs…ui-xl` 七档；mono 字体显式加入 CJK 段（Consolas 无中文字形）（`gui/src/index.css:17-33,23-26`）。
 - shadcn 语义 variant（`data-open`/`data-checked`/`data-active`/`data-horizontal` 等）按 shadcn 4.1.1 dist 手写在 `index.css`，不引 shadcn 包（`gui/src/index.css:384-445`）。
@@ -79,7 +90,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：整表移植 ZCode 的语义
 
 ## Evidence
 
-- token 表与 focus reset：`gui/src/index.css`（`@theme` 亮色基底 L22-94、`.theme-zai-dark` 生效值 L98-162、focus reset L185-199、shadcn variant L384-445）
+- token 表与 focus reset：`gui/src/index.css`（`@theme` 亮色基底 L24-136、`.theme-warm-dark` L158-242、`.theme-warm-light` L245-309、`focus-visible` reset L338-341、shadcn variant L365+）；主题纯逻辑 `gui/src/theme.ts`、共享态 `gui/src/useTheme.ts`、顶栏开关 `gui/src/pages/TopBar.tsx`、外观页 `gui/src/pages/AppearancePage.tsx`
 - 适配层组件与 variant/tone 映射：`gui/src/ui/index.tsx`（BUTTON_VARIANT_MAP L21-26、BADGE_TONES L83-93）
 - 布局/路由/轮询/TooltipProvider：`gui/src/App.tsx`（TabId L17-22、三栏 L43-70）
 - 暗色常驻：`gui/src/main.tsx:12`

@@ -67,7 +67,8 @@ export function TopBar() {
 			: chatActiveId;
 
 	const proposal = latestHandoffAttention(attention);
-	// 亮暗开关（主界面直开）：图标示「当前档」、label/title 示「点击后切到哪档」
+	// 亮暗开关（主界面直开）：图标示「当前档」；tooltip 只给一个短词（2026-10-19 用户要求去掉长描述），
+	// 「当前档 / 点击后切到哪档」仍由 aria-label 表达（无障碍不降级）。
 	const theme = useThemeValue();
 	// G5.2：压力显示优先 liveness 活值 + as-of；无心跳/无有效读数回退提案时点值并标注
 	const live = useGui((s) => s.snapshot?.master?.liveness ?? null);
@@ -160,7 +161,7 @@ export function TopBar() {
 						aria-label={`切换到${THEME_LABEL[nextTheme(theme)]}主题`}
 						aria-pressed={theme === "warm-light"}
 						data-theme-toggle="1"
-						title={`界面主题：当前${THEME_LABEL[theme]}——点击切到${THEME_LABEL[nextTheme(theme)]}（仅本次会话，不持久化，不改 config.json）`}
+						title="主题亮/暗"
 						onClick={toggleTheme}
 					>
 						{theme === "warm-dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}

@@ -412,6 +412,10 @@ export interface TranscriptBody {
 	rows: TranscriptRow[];
 	skippedUnknown: number;
 	name: string | null;
+	/** L2 perf（2026-10-20）：tail 模式标记（`?tail=N`）；全量快照时字段缺席。 */
+	tail?: true;
+	/** tail 模式下窗口之外是否还有更早的行（GUI 据此显示「加载更早」）。 */
+	hasOlder?: boolean;
 }
 
 // ── G6-P1：WS /v1/events/stream 帧契约（runtime-host/ws.ts 手抄）──

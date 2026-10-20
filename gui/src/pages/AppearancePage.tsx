@@ -4,7 +4,7 @@
  * 纯 UI 态：偏好仅存**本次会话内存**（不持久化 —— K3 断言禁止 WebStorage），**不写 config.json、
  * 不加后端端点、不动 daemon**（指导文档 §2 C-3 红线）。
  *
- * 默认暖暗（风格指南口径「暖暗优先」，工作台长时间盯屏）；暖亮为结构免费的次选。
+ * 默认暖亮（2026-10-19 用户改口径；原「暖暗优先」作废）；暖暗为结构免费的次选。
  * 两档均已通过 §6 对比度硬门（正文/元信息/徽章 ≥4.5:1、大字与图标 ≥3:1）。
  */
 
@@ -15,14 +15,14 @@ import { useTheme } from "../useTheme";
 
 const OPTIONS: { id: GuiTheme; zh: string; desc: string }[] = [
 	{
-		id: "warm-dark",
-		zh: "暖暗（默认）",
-		desc: "暖炭底 #141413 + 暖灰字 + 陶土重音。长时间盯屏的默认档。",
+		id: "warm-light",
+		zh: "暖亮（默认）",
+		desc: "羊皮纸底 #f5f4ed + 近黑字。日间/投影环境更易读，默认档。",
 	},
 	{
-		id: "warm-light",
-		zh: "暖亮",
-		desc: "羊皮纸底 #f5f4ed + 近黑字。日间/投影环境更易读。",
+		id: "warm-dark",
+		zh: "暖暗",
+		desc: "暖炭底 #141413 + 暖灰字 + 陶土重音。暗环境盯屏更柔和。",
 	},
 ];
 
@@ -44,9 +44,9 @@ export function AppearancePage() {
 
 	return (
 		<div className="space-y-3">
-			<PageIntro>界面主题（仅本次会话；刷新后回默认暖暗）</PageIntro>
+			<PageIntro>界面主题（仅本次会话；刷新后回默认暖亮）</PageIntro>
 			<Card
-				title={<Term zh="主题" en="theme" hint="默认暖暗；仅本次会话生效（不持久化）；不写 config.json、不加后端端点" />}
+				title={<Term zh="主题" en="theme" hint="默认暖亮；仅本次会话生效（不持久化）；不写 config.json、不加后端端点" />}
 			>
 				<ul className="space-y-2">
 					{OPTIONS.map((o) => {
