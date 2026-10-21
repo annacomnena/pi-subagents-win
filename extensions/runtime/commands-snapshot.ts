@@ -35,6 +35,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
+import { COMMAND_ARGUMENT_HINTS } from "./builtin-cmd-bridge.ts";
 
 /** 命令来源（与 pi 的 `SlashCommandSource` 对齐，但只保留本仓关心的三种 + 兜底）。 */
 export type CommandSource = "extension" | "prompt" | "skill" | "builtin" | "other";
@@ -43,6 +44,15 @@ export interface CommandEntry {
 	name: string;
 	description?: string;
 	source: CommandSource;
+	/** 参数提示（additive，2026-10-21）。
+	 *
+	 * 来源：pi 的 `BUILTIN_SLASH_COMMANDS` 自带 `argumentHint`（如 `/model` = `<provider/model>`），
+	 * 但 `getCommands()` 返回的 `SlashCommandInfo` 不带它。本仓自注册的命令可在
+	 * registerCommand 时自己补。GUI 面板拿它渲染输入提示。
+	 *
+	 * 加法字段：老读端忽略即可，不破坏契约。
+	 */
+	argumentHint?: string;
 }
 
 export interface CommandsSnapshot {
@@ -80,7 +90,17 @@ export function normalizeCommands(raw: unknown): CommandEntry[] {
 				? src
 				: "other";
 		const description = typeof rec.description === "string" && rec.description.length > 0 ? rec.description : undefined;
-		out.push({ name, source, ...(description !== undefined ? { description } : {}) });
+		// hint 两个来源：① 源头自带（pi 内建将来若透传）；② 本仓映射表（registerCommand 没有该字段，
+		// 见 builtin-cmd-bridge.ts 注释）。源头优先。
+		const hintFromSource =
+			typeof rec.argumentHint === "string" && rec.argumentHint.length > 0 ? rec.argumentHint : undefined;
+		const argumentHint = hintFromSource ?? COMMAND_ARGUMENT_HINTS[name];
+		out.push({
+			name,
+			source,
+			...(description !== undefined ? { description } : {}),
+			...(argumentHint !== undefined ? { argumentHint } : {}),
+		});
 	}
 	return out;
 }

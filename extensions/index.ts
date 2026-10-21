@@ -70,6 +70,7 @@ import { appendAuditEvent, appendAuditLine, readAuditTail, readFrontierSnapshot,
 import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
 import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
 import { registerSessionControl } from "./runtime/session-control-register.ts";
+import { registerBuiltinCommandBridge } from "./runtime/builtin-cmd-bridge.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2624,6 +2625,11 @@ export default function (pi: ExtensionAPI) {
 
 	// 会话控制（2026-10-20 停止按钮）：消费 state/session-control/ 的 abort 请求 → ctx.abort()
 	collect(registerSessionControl(pi));
+
+	// 内建命令桥（2026-10-21）：pi 的内建 `/reload` `/model` 不在 getCommands() 里
+	//（agent-session.js:2613-2634 只返 extension/prompt/skill）⇒ 远端/GUI 看不到也调不到。
+	// 注册同名扩展命令，handler 内调 ctx.reload() / pi.setModel() 真执行。
+	collect(registerBuiltinCommandBridge(pi as never));
 
 	// mailbox 消费循环（Phase 4d）：flag 关/非 owner 时 tick 空转，零行为变化
 	collect(registerMailboxConsumer(pi, {}));
