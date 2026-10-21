@@ -60,6 +60,21 @@ const COMPOSER_MESSAGE_MASK_FADE_PX = 24;
 const COMPOSER_MESSAGE_MASK_TRANSPARENT_HEIGHT_PX = 96;
 // 工具卡收起延迟卸载（ToolLayout.tsx#L26）
 const TOOL_CONTENT_COLLAPSE_UNMOUNT_DELAY_MS = 300;
+/**
+ * write 卡「收笔」窗口（`running → 终态` 那一拍起算），同时用于 ① 门控扫光/勾/徽标弹只播一次
+ * ② 压制自动合上（`holdOpen`）。
+ *
+ * 门槛 = **≥ 最长的收笔动画**：扫光 520ms、勾 300ms+90ms 延迟、徽标 420ms ⇒ 620ms 是下界，取 700。
+ * 为什么不下界加 `TOOL_CONTENT_COLLAPSE_UNMOUNT_DELAY_MS`：`holdOpen` 在 settling 期间把卡片
+ * 钉在展开态，300ms 卸载倒计时根本不启动（settling 落下后才起算）。
+ * 没有 `holdOpen` 时（提交 d7964db 原状）可用时长只有 300ms < 520ms ⇒ 扫光被卸载截断，
+ * 实测 `settling` 起 +350ms 时 `.write-sweep` 已 `ABSENT`。该等式由 R9 守门（读两处真实常数）。
+ *
+ * 边界（2026-10-22）：`holdOpen` **不得越过用户手动操作** —— 用户手动收起 write 卡后
+ * `userLockedRef` 为真，此时 `holdOpen` 必须失效（`autoExpandTarget` 返回 null = 一动不动），
+ * 否则卡片完成瞬间会被收笔动画重新掰开 700ms 再合上，等于和用户抢开合。
+ */
+const WRITE_SETTLE_MS = 700;
 
 function fmtDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
@@ -359,23 +374,62 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	 * 用户一旦手动操作过，自动逻辑永久让位。
 	 */
 	const wasRunningRef = useRef(row.status === "running");
+	/**
+	 * write 专属：正文换成「落笔」迷你编辑器（设计稿 plans/20261021_write_card/design.md）。
+	 * 判据只有工具名 —— 其余工具**完全走原路径**（原 pre + JSON.stringify），零回归面。
+	 * 声明在这里（而不是渲染前）：下面的 autoExpand effect 依赖它（收笔期间不让合上）。
+	 */
+	const isWrite = isWriteTool(row.name);
+	/**
+	 * 收笔窗口：`running → 终态`起算的 700ms。
+	 * 它同时门控两件事：① 扫光/勾/徽标弹只播这一次（历史卡片重挂不重播）；
+	 * ② **压制自动合上** —— 否则「收笔」会在自己演到一半时被抽掉：自动合上收到
+	 *    `TOOL_CONTENT_COLLAPSE_UNMOUNT_DELAY_MS = 300` 后卸载展开体，而扫光是 520ms、
+	 *    勾是 300ms+90ms 延迟。实测（真 Radix Collapsible + 真 WriteCardBody，无头 Chrome）：
+	 *    settling 起 +350ms 时 `.write-sweep` 已 `ABSENT`（元素被卸载），520ms 的“墨干”
+	 *    永远只剩前 300ms。所以 write 卡的合上延到 `settling` 结束后（见下方 autoExpand 的
+	 *    `holdOpen`）。
+	 */
+	const [settling, setSettling] = useState(false);
+	useEffect(() => {
+		if (row.status === "running") {
+			wasRunningRef.current = true;
+			if (isWrite) setSettling(false);
+			return;
+		}
+		if (!wasRunningRef.current) return;
+		// 只有 write 卡有「收笔」这一幕；其它工具卡一律不碰 settling（少两次无意义重渲染 = 零回归面）
+		if (!isWrite) return;
+		setSettling(true);
+		const t = window.setTimeout(() => setSettling(false), WRITE_SETTLE_MS);
+		return () => window.clearTimeout(t);
+	}, [row.status, isWrite]);
+	/** 收笔期间保持展开；settling 落下去后这个 effect 重跑，才会真正执行“完后自动合上”。
+	 *  **只对 write 生效** —— 其它工具卡的开合时序必须一动不动（零回归面）。
+	 *  **`userLockedRef` 优先于 `holdOpen`**：`chatAutoExpand.ts` 的契约是「用户手动点过 ⇒
+	 *  自动逻辑永久让位（返回 null）」。若 holdOpen 盖掉它，用户在 running 时手动收起 write 卡，
+	 *  卡片完成瞬间会被收笔动画**强行再展开 700ms** 再合上 —— 与「不能和用户抢」冲突（临床：
+	 *  用户手动收起后不得被收笔动画重新掰开）。所以这里必须在用户锁定时整条 holdOpen 失效。 */
+	const holdOpen = isWrite && settling && !userLockedRef.current;
 	useEffect(() => {
 		const isRunningNow = row.status === "running";
 		if (isRunningNow) wasRunningRef.current = true;
-		const want = autoExpandTarget({
-			isRunning: isRunningNow,
-			wasRunning: wasRunningRef.current,
-			userLocked: userLockedRef.current,
-		});
+		const want = holdOpen
+			? true
+			: autoExpandTarget({
+					isRunning: isRunningNow,
+					wasRunning: wasRunningRef.current,
+					userLocked: userLockedRef.current,
+				});
 		if (want === null) return;
 		if (want !== open) {
 			toolCardOpenState.set(row.rowId, want);
 			setOpen(want);
 			if (want) setShouldRenderContent(true);
 		}
-		// open 故意不进依赖：只在 status 变化时决策，避免与用户点击互相拉扯
+		// open 故意不进依赖：只在 status / settling 变化时决策，避免与用户点击互相拉扯
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [row.status, row.rowId]);
+	}, [row.status, row.rowId, holdOpen]);
 	// shouldRenderContent：收起后延迟 300ms 再卸载展开体（Radix closed 动画要读高度变量）
 	const [shouldRenderContent, setShouldRenderContent] = useState(open);
 	const unmountDelayRef = useRef<number | null>(null);
@@ -405,28 +459,9 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	const isRunning = row.status === "running";
 	const isError = row.status === "error";
 	const statusLabel = isRunning ? "执行中" : isError ? "出错" : "完成";
-	/**
-	 * write 专属：正文换成「落笔」迷你编辑器（设计稿 plans/20261021_write_card/design.md）。
-	 * 判据只有工具名 —— 其余工具**完全走原路径**（原 pre + JSON.stringify），零回归面。
-	 */
-	const isWrite = isWriteTool(row.name);
+	// write 的触发面唯一性判定在函数开头（isWrite：holdOpen 要用）
 	const write = isWrite ? readWriteArgs(row.arguments) : null;
 	const writePath = write && write.path !== "" ? splitPath(write.path) : null;
-	/**
-	 * 收笔动画（勾描边 + 徽标弹）只播**一次**：running → 终态那一拍开 700ms。
-	 * 不能只靠 CSS `[data-status="done"]` —— 历史卡片一挂载也会播，一屏几十张卡同时弹一下是噪音。
-	 */
-	const [settling, setSettling] = useState(false);
-	useEffect(() => {
-		if (row.status === "running") {
-			setSettling(false);
-			return;
-		}
-		if (!wasRunningRef.current) return;
-		setSettling(true);
-		const t = window.setTimeout(() => setSettling(false), 700);
-		return () => window.clearTimeout(t);
-	}, [row.status]);
 
 	return (
 		<RowShell rowId={row.rowId} animate={animate} className="py-0">
@@ -492,8 +527,13 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 					// 展开体（ToolLayout.tsx#L24-25 + 锚 §2.b）：pt-2 内容壳 + pre font-mono text-ui-sm
 					<CollapsibleContent className="text-popover-foreground outline-none">
 						{write ? (
-							// write：落笔迷你编辑器（行号 + 逐行 + 墨线 + 收笔扫光）
-							<WriteCardBody content={write.content} status={row.status} output={row.output} />
+							// write：落笔迷你编辑器（行号 + 逐行 + 墨线 + 收笔扫光；settling 门控扫光只在刚写完那一拍播）
+							<WriteCardBody
+								content={write.content}
+								status={row.status}
+								output={row.output}
+								settling={settling}
+							/>
 						) : (
 							<div className="pt-2">
 								<pre className="max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm text-foreground-subtle">

@@ -359,6 +359,99 @@ compositeTier(light, "light");
 okGroup("② 亮色 .theme-warm-light：正文档 28 + 图标档 12 + 复合档（S6 可选主题；2026-10-19 起为默认）");
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 4b. write 工具卡「落笔」的墨色层次（2026-10-22 L4 补）
+// ═══════════════════════════════════════════════════════════════════════════
+// 为什么单列一段：这套卡的"层次感"是**同色降透明度**（`.write-tx[data-k=cmt]{opacity:.72}`），
+// 而本门禁原来只查 token 裸值 × 表面，**不查"降完透明度之后"的合成色** ⇒ 一段 3.34:1 的
+// 注释文字可以全绿通过（2026-10-22 L4 实测：修复前亮层 3.34/2.95、暗层 3.85/3.46，
+// error 态再叠 .62 降到 1.86/2.14，而当时 write-card 与 gui-contrast 两道门都是绿的）。
+// 这里直接解析 index.css 里 `.write-*` 的真实 opacity 值，做 alpha 合成再比，缺规则即红。
+function writeCardTiers(T: ReturnType<typeof makeResolver>, themeName: string): void {
+	const css2 = css.replace(/\/\*[\s\S]*?\*\//g, "");
+	/** 取某选择器某属性的**最后一个**声明（级联后者胜）。 */
+	const decl = (wantSel: string, prop: string): string => {
+		const wanted = wantSel.replace(/\s+/g, " ").trim();
+		let last = "";
+		for (const m of css2.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+			const sels = m[1]!.split(",").map((x) => x.replace(/\s+/g, " ").trim());
+			if (!sels.includes(wanted)) continue;
+			const pm = new RegExp("(?:^|;)\\s*" + prop + "\\s*:\\s*([^;]+)", "m").exec(m[2]!);
+			if (pm) last = pm[1]!.replace(/\s+/g, " ").trim();
+		}
+		assert.ok(last !== "", `${themeName}：index.css 找不到「${wanted}」的 ${prop}（write 卡契约规则被删/改名）`);
+		return last;
+	};
+	const varOf = (sel: string, prop: string): string => {
+		const v = decl(sel, prop);
+		const m = /^var\((--[a-z0-9-]+)\)$/.exec(v);
+		assert.ok(m, `${themeName}：「${sel}」的 ${prop} 必须是单个 var(--token)，实际 "${v}"（否则本段无法复算）`);
+		return m[1]!;
+	};
+	const alphaOf = (sel: string): number => {
+		const raw = decl(sel, "opacity");
+		const n = Number(raw);
+		assert.ok(Number.isFinite(n) && n > 0 && n <= 1, `${themeName}：「${sel}」opacity 必须是 (0,1]，实际 "${raw}"`);
+		return n;
+	};
+
+	const bg = T.color("--color-card");
+	const bodyTok = varOf(".write-lines", "color");
+	const noTok = varOf(".write-no", "color");
+	const curTok = varOf(".write-row.is-cur .write-no", "color");
+	const cmtA = alphaOf('.write-tx[data-k="cmt"]');
+	const attrA = alphaOf('.write-tx[data-k="attr"]');
+	const noA = alphaOf(".write-no");
+
+	// 注意：`contrast()` 的 lum() 只读 rgb、**不合成 alpha**。凡 a<1 必须先 over() 压到面上，
+	// 否则 0.72 的注释档会按不透明算成 6.12 而假绿（2026-10-22 本段第一版就这么错过一次）。
+	const onCard = (tok: string, a: number): Rgb => over({ ...T.color(tok), a }, bg);
+
+	// ① 正文三档：body / 注释 / 特性·结构（都是文字，≥4.5）
+	pair(`${themeName} write 卡：正文（${bodyTok}）`, T.color(bodyTok), bg, TEXT_MIN);
+	pair(`${themeName} write 卡：注释档（${bodyTok} @${cmtA}）`, onCard(bodyTok, cmtA), bg, TEXT_MIN);
+	pair(`${themeName} write 卡：特性·结构档（${bodyTok} @${attrA}）`, onCard(bodyTok, attrA), bg, TEXT_MIN);
+	// ② 行号（subtlest @1）与当前行号（必须是 accent-text：accent 当文字 4.17 不达）
+	pair(`${themeName} write 卡：行号（${noTok} @${noA}）`, onCard(noTok, noA), bg, TEXT_MIN);
+	pair(`${themeName} write 卡：当前行号（${curTok}）`, T.color(curTok), bg, TEXT_MIN);
+	assert.equal(curTok, "--color-accent-text", `${themeName}：当前行号是文字，必须 --color-accent-text（--color-accent 不达 4.5）`);
+
+	// ②b-2 头部 meta / 注脚 / 徽标 —— 全是文字，同样逐对复算（2026-10-22 L4 实测：
+	// `--color-accent` 直接当文字只有 3.70/4.17，不足以给「N 行」徽标，必须走 accent-text）。
+	const metaRows: Array<[string, string, number]> = [
+		["文件名（上一级目录）", varOf(".write-path", "color"), 1],
+		["文件名（本体 b）", varOf(".write-path b", "color"), 1],
+		["徽标（done / 静态）", varOf(".write-delta", "color"), 1],
+		["徽标（running）", varOf('.write-delta[data-status="running"]', "color"), 1],
+		["徽标（error）", varOf('.write-delta[data-status="error"]', "color"), 1],
+		["注脚正文（工具真实输出）", varOf(".write-note", "color"), 1],
+		// 注脚固定口径**不得**再叠 opacity（subtlest 本身只 5.07/4.57，乘 .9 就掉到 4.13/3.97）
+		["注脚固定口径", varOf(".write-note-caveat", "color"), 1],
+	];
+	for (const [label, token, a] of metaRows) {
+		pair(`${themeName} write 卡：${label}（${token}${a === 1 ? "" : ` @${a}`}）`, onCard(token, a), bg, TEXT_MIN);
+	}
+
+	// ③ error 态**不得**再拿 opacity 压内容/行号：行号底色 subtlest 本身就只 5.07/4.57，
+	//    乘 .9 剩 4.13/3.97、乘 .62 剩 2.63/3.10 ⇒ 一律跌破 4.5。这条是设计约束的机器可读形式。
+	assert.ok(
+		!/\.write-card\[data-status="error"\]\s+\.(write-no|write-lines)\b/.test(css2),
+		`${themeName}：error 态不得对 .write-no/.write-lines 叠加 opacity（会把行号/正文压到 4.5 以下）`,
+	);
+
+	// ④ 反例自检：同一套算式用在**修复前的取值**上必须跌破门（证明本段会拦，不是恒真）
+	const staleCmt = contrast(over({ ...T.color("--color-foreground-subtle"), a: 0.72 }, bg), bg);
+	const staleAttr = contrast(over({ ...T.color("--color-foreground-subtle"), a: 0.66 }, bg), bg);
+	const staleErr = contrast(over({ ...T.color("--color-foreground-subtle"), a: 0.66 * 0.62 }, bg), bg);
+	assert.ok(staleCmt < TEXT_MIN, `${themeName}：反例自检失败 —— 修复前 subtle@.72 应 <4.5，实得 ${staleCmt.toFixed(2)}`);
+	assert.ok(staleAttr < TEXT_MIN, `${themeName}：反例自检失败 —— 修复前 subtle@.66 应 <4.5，实得 ${staleAttr.toFixed(2)}`);
+	assert.ok(staleErr < GRAPHIC_MIN, `${themeName}：反例自检失败 —— 修复前 error 双透明应 <3，实得 ${staleErr.toFixed(2)}`);
+}
+writeCardTiers(dark, "暗色");
+writeCardTiers(light, "亮色");
+okGroup("②b write 卡墨色层次（含透明度合成；反例自检：修复前取值必红）");
+
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 5. 结果
 // ═══════════════════════════════════════════════════════════════════════════
 console.log(`\n[逐对明细] 共 ${pairs} 对`);

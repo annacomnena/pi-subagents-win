@@ -190,7 +190,7 @@
 	--color-selected: color-mix(in oklab, var(--color-surface-warm) 12%, transparent); /* #2d2d2b */
 	--color-border: color-mix(in oklab, var(--color-surface-warm) 14%, transparent); /* #33312d */
 	--color-border-hover: color-mix(in oklab, var(--color-surface-warm) 24%, transparent); /* #494640 */
-	--color-foreground: var(--color-brand-mist); /* #d9d7cd 正文 */
+	--color-foreground: var(--color-brand-mist); /* #b0aea5 暖银（--color-brand-mist 暗层值）正文 */
 	--color-foreground-strong: var(--color-brand-ivory); /* #faf9f5 标题/强调 */
 	--color-foreground-subtle: #a09f96; /* §3.1 权威 hex（6.93:1 on #141413） */
 	--color-foreground-subtlest: #898880; /* §3.1 权威 hex（5.18:1 on #141413） */
@@ -674,13 +674,13 @@ body {
 	box-shadow: none;
 	animation: none;
 }
-/* 错误态整块降饱和（“转灰”）：不引新色，只用透明度压低内容与行号的对比 */
-.write-card[data-status="error"] .write-lines {
-	opacity: 0.62;
-}
-.write-card[data-status="error"] .write-no {
-	opacity: 0.4;
-}
+/* 错误态**不得再用 opacity 压内容或行号** —— 这是实测出来的硬约束，不是审美选择：
+ *   · 压 .write-lines：三档墨色本身已是 fg 的 .72/.66，整块再乘 .62 ⇒ .495/.409，
+ *     亮层 2.73/1.98、暗层 3.16/2.34，正文直接跌破 AA；
+ *   · 压 .write-no：行号底色 subtlest 本身就只亮 5.07 / 暗 4.57，乘 .9 剩 4.13 / 3.97，
+ *     乘 .4（旧值）剩 1.73 / 1.64。
+ * “转灰”的观感由**非文字信号**承担：destructive 描边 + 14px destructive 残线 + 注脚
+ * （注脚有完整文字，不靠颜色单独承载信息）。色觉/对比度受限时也不会丢信息。 */
 /* 视口：固定 10 行高；顶部 mask 渐隐 = 「上面还有」。
  * 内容高于视口时**溢出向上**（.write-lines 绝对贴底）—— 不能用 flex-end 贴底：
  * 负剩余空间下规范会把 flex-end 当 flex-start，正在写的那一行会被顶出下边界（实测踩过）。 */
@@ -704,7 +704,13 @@ body {
 	font-family: var(--font-mono);
 	font-size: var(--text-ui-sm);
 	line-height: var(--write-row-h);
-	color: var(--color-foreground-subtle);
+	/* 正文取 --color-foreground（亮 #141413 = 17.50:1；暗 = --color-brand-mist #b0aea5 = 7.32:1
+	 * on card #21201e —— 注意 index.css:193 那行注释曾把暗层写成 #d9d7cd，是错的，已就地改正）。
+	 * 三档墨色是「同色降透明度」，降完必须仍过正文门 ≥4.5:1 —— 否则"层次"变成"读不清"。
+	 * 实测（亮/暗）：旧 subtle 基底 @.72 = 3.34 / 3.85、@.66 = 2.95 / 3.46（均不达）；
+	 * 今 fg 基底 @.82 = 10.29 / 5.39、@.76 = 8.30 / 4.83。
+	 * 回算：`npm run test:gui-contrast`（②b 段逐对断言双主题 + 反例自检）。 */
+	color: var(--color-foreground);
 }
 .write-row {
 	/* 行号列用 minmax(30px, max-content)：4–5 位行号（1000+ 行文件很常见）会自己撑开，
@@ -722,11 +728,13 @@ body {
 	font-size: var(--text-ui-xs);
 	font-variant-numeric: tabular-nums;
 	color: var(--color-foreground-subtlest);
-	opacity: 0.55;
+	opacity: 1;
 	user-select: none;
 }
 .write-row.is-cur .write-no {
-	color: var(--color-accent);
+	/* accent（#c96442）当**文字**只有 3.70:1（亮）/4.17:1（暗）⇒ 不达 4.5。当前行号是文字，
+	 * 用 accent-text（亮 #a84e33 = 5.24 / 暗 #d97757 = 5.21），仍是同一套陶土色语言。 */
+	color: var(--color-accent-text);
 	opacity: 1;
 }
 /* 折行靠 grid（一行一个元素），不用「行号列 + 代码列」两块独立容器 —— 那样遇折行必错位 */
@@ -737,11 +745,14 @@ body {
 	min-height: var(--write-row-h);
 }
 .write-tx[data-k="cmt"] {
-	opacity: 0.72;
+	/* 三档墨色 = 同色降透明度，**降完必须仍过 4.5:1**（`npm run test:gui-contrast` ②b 段逐对复算）。
+	 * 实测下限：暗层 card #21201e 上 fg@.72 只有 4.48:1 ⇒ .82 才 5.39:1；亮层 10.29:1。 */
+	opacity: 0.82;
 }
 .write-tx[data-k="attr"],
 .write-tx[data-k="struct"] {
-	opacity: 0.66;
+	/* .76 是双主题的帕累托下限：亮层 8.30 / 暗层 4.83（再降到 .72 暗层就 4.48 破门）。 */
+	opacity: 0.76;
 }
 /* 收笔扫光：一条暖陶土薄带自上而下走一遍 = 墨干 */
 .write-sweep {
@@ -760,7 +771,9 @@ body {
 		transparent
 	);
 }
-.write-card[data-status="done"] .write-sweep {
+/* 收笔扫光：只在「刚写完」那一拍播（.is-settling 由 ChatPage 在 running→终态转场开 700ms）——
+ * 不能纯靠 [data-status="done"]：历史卡片每次展开重挂都会重播一遍（设计稿 §10.1 第 4 条）。 */
+.write-card[data-status="done"].is-settling .write-sweep {
 	animation: write-dry-sweep 520ms cubic-bezier(0.22, 1, 0.36, 1) 1 both;
 }
 .write-note {
@@ -782,9 +795,10 @@ body {
 	min-width: 0;
 }
 .write-note-caveat {
+	/* 不再叠 .9：subtlest 本身亮 5.07 / 暗 4.57 才刚过 4.5，乘 .9 会掉到 4.13 / 3.97。
+	 * 降一档的观感由字号（text-ui-xs）+ 与错误正文的色差（destructive vs subtlest）承担。 */
 	color: var(--color-foreground-subtlest);
 	font-size: var(--text-ui-xs);
-	opacity: 0.9;
 }
 
 /* 头部 meta（只有 write 卡渲染）：文件名 + 尺度徽标 */
@@ -827,8 +841,11 @@ body {
 		border-color 0.25s ease;
 }
 .write-delta[data-status="running"] {
+	/* 徽标里的「N 行」是**文字**：accent 当文字只有 3.70:1（亮）/4.17:1（暗）⇒ 不达 4.5。
+	 * 用 accent-text（亮 #a84e33 = 5.24 / 暗 #d97757 = 5.21）；描边仍可用 accent 的 color-mix
+	 * （边框是非文字元素，3:1 门即达标）。 */
 	border-color: color-mix(in oklab, var(--color-accent) 30%, var(--color-border));
-	color: var(--color-accent);
+	color: var(--color-accent-text);
 }
 .write-delta[data-status="error"] {
 	border-color: color-mix(in oklab, var(--color-destructive) 35%, var(--color-border));
@@ -853,7 +870,10 @@ body {
 	width: 13px;
 	height: 13px;
 	flex: 0 0 auto;
-	color: var(--color-success);
+	/* 契约（Wiki gui-workbench-ui「write 卡渲染契约」）：整卡只用 accent/border/card/
+	 * foreground-subtle|subtlest/destructive —— 勾是「收笔」的最后一笔，用陶土墨色，
+	 * 不得用 success 绿（设计稿 §2：绿成功 = 第二套色语言）。 */
+	color: var(--color-accent);
 }
 .write-check path {
 	stroke-dasharray: 22;
@@ -957,7 +977,8 @@ body {
 	.stream-caret,
 	.write-row.is-new,
 	.write-ink::after,
-	.write-sweep,
+	/* 同文本选择器：弱化成 .write-sweep（0,1,0）盖不住 (0,4,0) 的动画规则（2026-10-22 L4 实锤） */
+	.write-card[data-status="done"].is-settling .write-sweep,
 	.write-delta.is-settling,
 	.write-delta[data-status="running"] .write-dot,
 	.write-check.is-drawing path {

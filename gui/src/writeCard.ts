@@ -20,18 +20,23 @@ export function isWriteTool(name: string): boolean {
 }
 
 /**
- * 读 write 的入参。`content` 允许 string 或 string[]（两种形状都见过），
- * 缺失时返回空串 —— 调用方据此渲染「0 行的空白纸」，而不是回退到 JSON dump。
+ * 读 write 的入参。`content` 允许 string 或 string[]（两种形状都见过）。
+ *
+ * **拿不到 content 就返回 `null`**（设计稿 §6 + Wiki「write 卡渲染契约」：触发面唯一 =
+ * `name==="write"` **且** 能解析出 content，否则**保持原 pre 路径**）。
+ * 曾经这里对缺失 content 返回空串，等于把一个「write 卡永远渲染」的死分支焊死：
+ * 模型发错键名（例：`file_path`、`contents`）或参数只流式到一半时，用户看到的是一张
+ * **空白纸**，而**原始 arguments 被整个吞掉** —— 恰好在最需要看原始入参的时刻丢信息。
+ * 返回 null ⇒ 调用方回落到 `JSON.stringify(row.arguments, null, 2)`，零信息损失。
  */
-export function readWriteArgs(args: unknown): { path: string; content: string } {
-	const a = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+export function readWriteArgs(args: unknown): { path: string; content: string } | null {
+	if (!args || typeof args !== "object") return null;
+	const a = args as Record<string, unknown>;
 	const raw = a.content;
-	const content =
-		typeof raw === "string"
-			? raw
-			: Array.isArray(raw)
-				? raw.filter((x): x is string => typeof x === "string").join("\n")
-				: "";
+	let content: string;
+	if (typeof raw === "string") content = raw;
+	else if (Array.isArray(raw)) content = raw.filter((x): x is string => typeof x === "string").join("\n");
+	else return null;
 	return { path: typeof a.path === "string" ? a.path : "", content };
 }
 

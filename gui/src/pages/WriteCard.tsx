@@ -14,10 +14,12 @@
  *   3. 行以**绝对行号**为 key ⇒ React 复用 DOM ⇒ 已写好的行不重放入场动画（只有新行带 is-new）。
  *
  * error 态为何不画进度：`write` 是单次整文件覆盖写（非原子、无回滚，取证见 design.md §10.4 ②），
- *   断在第几行/第几字节不可知 ⇒ 墨线塌成固定残线 + 整块降饱和 + 注脚（工具真实输出 + 固定口径）。
+ *   断在第几行/第几字节不可知 ⇒ 墨线塌成固定残线 + 注脚（工具真实输出 + 固定口径）。
+ *   注意：**“整块降饱和”已改成非 opacity 手段**（描边/残线/注脚）—— 因为 opacity 会把
+ *   已降过透明度的三档墨色再乘一次，实测跌破 4.5:1（见 index.css 的 error 段注释）。
  */
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
 	WRITE_ERROR_CAVEAT,
 	WRITE_KEEP_ROWS,
@@ -37,22 +39,42 @@ export function WriteCardBody({
 	content,
 	status,
 	output,
+	settling = false,
 }: {
 	content: string;
 	status: WriteStatus;
 	output?: string;
+	/** 收笔只在「刚写完」那一拍播：扫光动画由它门控（历史卡片重挂不得重播，见 §10.1 第 4 条）。 */
+	settling?: boolean;
 }) {
 	const { rows, total } = useMemo(() => visibleRows(content, WRITE_KEEP_ROWS), [content]);
+	/**
+	 * 「新行水位」：记住**上一次交付给 DOM 的 total**，用来给超过水位的行加入场动画。
+	 *
+	 * 两个约束（都是实测出来的，勿"优化"掉）：
+	 * 1. **只增不减** —— 滑窗把旧行移出 DOM 时若跟着回退，窗口一滑老行就重新变 is-new
+	 *    再入场一次（观感是"整块在抖"）。
+	 * 2. **不在渲染体内写 ref** —— React 19 的 StrictMode 会把渲染函数调两次
+	 *    （`renderWithHooksAgain`，react-dom-client：一处 didScheduleRenderPhaseUpdate、
+	 *    一处 StrictLegacyMode 双调），渲染体内 `prevTotalRef.current = total` 第一趟就把水位
+	 *    推到位，第二趟 `prevTotal === total ⇒ is-new 全部为 false`。实测（真实 WriteCardBody，
+	 *    真 React 19.2 + StrictMode，content 1 行 → 2 行）：dev 下第二行 class = "is-cur"（**丢动画**），
+	 *    prod 下 = "is-cur is-new"。所以写 ref 必须放 `useEffect`（提交后、且在整次双重渲染之后）。
+	 *    代价：首帧 prevTotal=0 ⇒ 首屏会把已有行都当"新行"入场一次，这是历史卡片重挂的已知行为，
+	 *    与 `status==="running"` 门叠加后只在真的 running 时发生（历史卡片是终态 ⇒ 不加 is-new）。
+	 */
 	const prevTotalRef = useRef(0);
 	const prevTotal = prevTotalRef.current;
-	prevTotalRef.current = total;
+	useEffect(() => {
+		prevTotalRef.current = total;
+	}, [total]);
 
 	const lastNo = rows.length > 0 ? rows[rows.length - 1]!.no : 0;
 	// error 态不给进度高度（断点不可知，见 design.md §10.4 ②）——undefined ⇒ 交给 CSS 的固定残线
 	const inkH = inkHeightCss(total, status);
 
 	return (
-		<div className="write-card" data-status={status}>
+		<div className={`write-card${settling ? " is-settling" : ""}`} data-status={status}>
 			<div className="write-editor">
 				<div className="write-rail" aria-hidden>
 					<div className="write-ink" style={inkH ? { height: inkH } : undefined} />
