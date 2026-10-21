@@ -2,10 +2,12 @@
 title: GUI 消息管道与延迟贡献项
 kind: concept
 status: current
-updated: 2026-10-20
+updated: 2026-10-21
 source_paths:
   - gui/src/useEventStream.ts
   - extensions/runtime/transcript.ts
+  - extensions/runtime/commands-snapshot.ts
+  - extensions/runtime/builtin-cmd-bridge.ts
   - extensions/runtime-host/session-title.ts
   - gui/src/store.ts
   - gui/src/api/client.ts
@@ -122,6 +124,40 @@ snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，�
 ## 附：markdown 渲染
 
 正文此前是 `whitespace-pre-wrap` 纯文本（markdown 原样显示）。现由自研 `gui/src/ui/Markdown.tsx`（330 行、零新依赖）渲染：**无 innerHTML 路径**（只产 React 元素 ⇒ 文本由 React 转义）+ 链接协议白名单（http/https）+ 外链 `rel="noopener noreferrer"`。未采用 zcode 的 `streamdown`（remark+rehype+shiki+mermaid 体积大、与零依赖纪律冲突），只借鉴其元素划分与流式容错思路。
+
+## 斜杠命令：为什么内建命令曾经根本不可见（2026-10-21）
+
+**两级根因（源码直读）**：
+1. `pi.getCommands()` **只返 extension / prompt / skill 三类**（`dist/core/agent-session.js:2613-2634`），
+   完全不含内建命令。内建清单在 `dist/core/slash-commands.js::BUILTIN_SLASH_COMMANDS`（24 条），
+   而它只在 TUI 层（`interactive-mode.js:429/443`）用于补全与冲突检测。
+   实测本仓某会话快照：**73 条 = 61 extension + 1 prompt + 11 skill，builtin 为 0**。
+2. `prompt()` 的命令识别只走 `_tryExecuteExtensionCommand`（`:1458-1465`），
+   找不到就**把字符串当正文发给 LLM** ⇒ 远端发 `/model x` 会污染上下文并白烧 token。
+   而 `readCommandNames()` 又是 executor 的白名单源 ⇒ 内建命令连校验都过不了。
+
+**为什么能真执行（不是简化版）**：`registerCommand` 的 handler 签名是
+`(args, ctx: ExtensionCommandContext)`（`types.d.ts:1128`），该 ctx 提供 `reload()`（`:322`）；
+`setModel()` 在 `ExtensionAPI` 上（`:1248`）。⇒ 注册同名扩展命令即可语义等价执行。
+
+**已补两条（用户限定范围）**：`extensions/runtime/builtin-cmd-bridge.ts`
+- `/reload` → `ctx.reload()`，回执明确「会话上下文未丢弃」
+- `/model` + `/models`（别名同 handler）→ 无参列模型 / 带参 `pi.setModel()`；
+  `setModel` 返 false 按官方语义（`:1244-1247`）= provider 未配认证
+- **核心安全约束**：`matchModel` **禁止模糊纠正** —— 近似前缀 / 多 provider 同 id 一律
+  返回 null 并列出候选，**绝不静默切到用户没要的模型**（回归门 B2/B8 钉住）
+
+**显示适配**：`CommandEntry` 加 additive `argumentHint?`。注意 `registerCommand` 的
+options 类型 `RegisteredCommand`（`types.d.ts:1123-1129`）**没有 argumentHint 字段**
+⇒ 无法通过注册传 hint，故 `normalizeCommands` 用「源头优先 / 本仓映射表兜底」两层。
+
+**已知代价（未实测，必须记住）**：注册同名命令后 TUI 会命中
+`interactive-mode.js:429-437`「与内建冲突」⇒ 该名字从内建补全里被摘掉；且 `prompt()` 里
+扩展命令优先 ⇒ TUI 原生 `/model` 选择器 UI **可能**被简化版取代。若退化，需改名或加开关。
+
+**其余 22 条内建命令未做**；其中 `/settings` `/tree` `/thinking` 这类「执行 = 打开 TUI UI」的
+在远端只能等价重实现，`/fork` `/resume` `/new` 需要 `ExtensionCommandContext` 而
+`sendUserMessage` 路径拿不到。
 
 ## Evidence
 
