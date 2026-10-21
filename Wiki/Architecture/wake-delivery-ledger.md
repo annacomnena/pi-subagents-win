@@ -2,11 +2,12 @@
 title: 唤醒必达（交付真账本 + ACK 驱动）
 kind: architecture
 status: current
-updated: 2026-10-16
+updated: 2026-10-21
 source_paths:
   - extensions/delivery-ledger.ts
   - extensions/delivery-ack.ts
   - extensions/delivery-reconciler.ts
+  - extensions/runtime-host/server.ts
   - extensions/async-result-watcher.ts
   - extensions/mailbox-consumer.ts
   - extensions/outbox-bridge.ts
@@ -82,13 +83,24 @@ C 序列实现 + 两轮独立复核）。
 
 ## 已知缺口（记录，未修）
 
-1. `effectiveStage` 在 incident 已发布时不返回 `failed_delivery`（有 attempt 时恒报 attempted/received）
-   ⇒ 按 `stage` 统计的消费侧（GUI 红项/§8.4 oracle）会误算未关单；建议消费侧改判
-   `reconcileDecision().action` 或 `Boolean(event.incidentId)`。
+1. ~~`effectiveStage` 在 incident 已发布时不返回 `failed_delivery`（有 attempt 时恒报 attempted/received）~~
+   ⇒ **已不成立（2026-10-21 复核）**：`949be704`（2026-10-16 11:30，已推送）引入
+   `effectiveStageOf(ledger, incident, now)`，其中 **incident 分支优先于一切成功态**
+   （`delivery-ledger.ts:337-339` `if (incident.incidentId) return { stage: "failed_delivery" }`）。
+   回归：`test:delivery-ledger` D8 + **D13「24 组合 incident 开启恒 failed_delivery（无成功态泄漏）」**。
+   本页原据旧记录写成缺口，实测已闭合 —— 保留此条仅为防止有人按旧结论“再修一次”。
 2. mailbox unconfirmed 重投**无次数上界**（每 tick 一个新 attempt 文件）——与 watcher/outbox 范式不一致；
    待裁（退避 or 改枚举）。
 3. B 未接线生产（见上）。
 4. `reliability-acceptance.mjs`（R1–R4/R9–R14）未建。
+5. **incident 曾经没有任何可见面/Ack 入口（2026-10-21 已修）**：实测 `ackIncident` / `listOpenIncidents`
+   **全仓零调用** ⇒ 106 条 incident 积压（ack 数 0，最旧 4.8 天，91/106 > 1 天）。
+   设计说「incident 是 durable 可见出口，显式 ack 才清」，但**既无可见面也无 ack 入口** = AGENTS R-2 静默失效。
+   现交付：`/v1/health` 新增 `delivery` 段（`openIncidents`/`oldestAgeMs`/`byReason`/`stale`/`sampledAt`，
+   按 R-2.2 给**年龄**）+ 只读 `/v1/incidents` + `POST /v1/incidents/:id/ack`（走后 `authorizeCommand` 鉴权）。
+   **故意不自动 ack**（红线：不能因为通知发出去就当作已处理）。回归 `test:incident-visibility`（6 组）。
+   仍未闭合：GUI 卡片未做；incident **无 GC**（ack 后文件仍在盘上，只加 `ackedAt`）；
+   仍有 106 条待人工 ack。
 
 ## Evidence
 

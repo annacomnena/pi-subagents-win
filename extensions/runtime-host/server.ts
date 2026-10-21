@@ -120,6 +120,7 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
+import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 import { piSessionAddress } from "../runtime/address.ts";
@@ -285,6 +286,28 @@ export interface HealthView {
 		/** 超阈值未轮询（enabled && receiveEnabled && credsPresent 时才有意义） */
 		stale: boolean;
 		lastError: string | null;
+	};
+	/**
+	 * 交付失败账本（additive，2026-10-21）。
+	 *
+	 * 动因（Item 53 未决项，实测取证）：`ackIncident` / `listOpenIncidents` 全仓**零调用**，
+	 * 106 条 incident 积压至今（ack 数 0，最旧 4.8 天，91/106 > 1 天）。
+	 * 设计声称「incident 是 durable 可见出口，显式 ack 才清」，但**既无可见面也无 ack 入口** ⇒
+	 * 有状态、无出口 = AGENTS R-2 的静默失效形状。本段给它一个**只读**可见面。
+	 *
+	 * 按 R-2.2：给**年龄**（`oldestAgeMs`）而不只是绝对时间，且超阈值显式 `stale`。
+	 */
+	delivery: {
+		/** 未 ack 的 incident 数（= listOpenIncidents 长度）。 */
+		openIncidents: number;
+		/** 最旧的未 ack incident 距今（ms）；null = 无未 ack。 */
+		oldestAgeMs: number | null;
+		/** 按 reason 前缀（`deadline-exceeded` 等）分组计数。 */
+		byReason: Record<string, number>;
+		/** 最旧超阈值 ⇒ true（这是“有人在等你处理”的信号，不是错误）。 */
+		stale: boolean;
+		/** 本次读数取自何时（缓存可能命中，必须让读的人知道年龄）。 */
+		sampledAt: string;
 	};
 	generatedAt: string;
 }
@@ -565,6 +588,61 @@ const WECHAT_POLL_STALE_MS = 5 * 60 * 1000;
  *
  * never-throw：任何读失败都降级为 null/false，不让 health 500。
  */
+// ── 交付失败账本采样（2026-10-21，Item 53 未决项）────────────────
+//
+// 为何需要缓存：`delivery/` 目录当前 **1357 个文件**（含 attempt/incident 两类），
+// health 每 2s 一次 ⇒ 裸扫会造成新的 stat 风暴（Item 57 刚删掉一个同类）。
+//
+// ⚠️ 首版写了「指纹 + TTL」缓存，被自己的回归测试抓出**陈旧 bug**：
+// `ttlOk`（TTL 未到）与 `fresh`（指纹一致**且** TTL 内）被混用 ⇒ 指纹已变但 TTL 未到时
+// 仍复用旧值 ⇒ ack 后 health 计数不降（实测 2 !== 0）。
+//
+// 实测冷扫只需 **7.1ms / 106 条**（远低于 health 基线 17ms）⇒ **不缓存最简单且无陈旧风险**。
+// 若未来 incident 量级增至数千，再引入「目录 mtime + 文件数」双字段指纹缓存（R-3）。
+/** 最旧 incident 超此年龄 ⇒ `stale`（“有人在等你处理”）。 */
+export const DELIVERY_INCIDENT_STALE_MS = 60 * 60 * 1000;
+
+function scanOpenIncidents(dir: string, nowMs: number): Omit<HealthView["delivery"], "sampledAt"> {
+	let entries: string[];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		return { openIncidents: 0, oldestAgeMs: null, byReason: {}, stale: false };
+	}
+	let open = 0;
+	let oldest: number | null = null;
+	const byReason: Record<string, number> = {};
+	for (const f of entries) {
+		if (!f.includes(".incident.") || !f.endsWith(".json")) continue;
+		let inc: { incidentId?: string; reason?: string; createdAt?: string; ackedAt?: string };
+		try {
+			inc = JSON.parse(readFileSync(join(dir, f), "utf8")) as typeof inc;
+		} catch {
+			continue;
+		}
+		if (!inc?.incidentId || inc.ackedAt) continue;
+		open += 1;
+		const at = typeof inc.createdAt === "string" ? Date.parse(inc.createdAt) : Number.NaN;
+		if (Number.isFinite(at)) {
+			const age = Math.max(0, nowMs - at);
+			if (oldest === null || age > oldest) oldest = age;
+		}
+		const key = (inc.reason ?? "unknown").split("(")[0] ?? "unknown";
+		byReason[key] = (byReason[key] ?? 0) + 1;
+	}
+	return {
+		openIncidents: open,
+		oldestAgeMs: oldest,
+		byReason,
+		stale: oldest !== null && oldest > DELIVERY_INCIDENT_STALE_MS,
+	};
+}
+
+function sampleDeliveryLedger(now: Date, runtimeDir: string): HealthView["delivery"] {
+	// 直扫（无缓存）：年龄天然按 now 计算，不存在「缓存使读数变年轻」的 R-2.2 风险。
+	return { ...scanOpenIncidents(deliveryDir(runtimeDir), now.getTime()), sampledAt: iso(now) };
+}
+
 function sampleWechatChannel(now: Date, configPath: string, runtimeDir: string): HealthView["wechat"] {
 	const base: HealthView["wechat"] = {
 		enabled: false,
@@ -629,6 +707,55 @@ function readCommandsSnapshot(sessionId: string): Record<string, unknown> | null
 	} catch {
 		return null;
 	}
+}
+
+/** `/v1/incidents` 只读投影：未 ack 的交付失败账本（Item 53 未决项）。 */
+export interface IncidentsView {
+	version: 1;
+	generatedAt: string;
+	openCount: number;
+	items: {
+		incidentId: string;
+		runId: string;
+		eventId: string;
+		reason: string;
+		createdAt: string;
+		/** 距今（ms）—— R-2.2：必须给年龄，不能只给绝对时间。 */
+		ageMs: number;
+	}[];
+}
+
+export function buildIncidentsView(now: Date, runtimeDir: string = defaultRuntimeDir()): IncidentsView {
+	const dir = deliveryDir(runtimeDir);
+	const nowMs = now.getTime();
+	const items: IncidentsView["items"] = [];
+	let entries: string[] = [];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		/* never-throw：无目录 = 无 incident */
+	}
+	for (const f of entries) {
+		if (!f.includes(".incident.") || !f.endsWith(".json")) continue;
+		let inc: { incidentId?: string; runId?: string; eventId?: string; reason?: string; createdAt?: string; ackedAt?: string };
+		try {
+			inc = JSON.parse(readFileSync(join(dir, f), "utf8")) as typeof inc;
+		} catch {
+			continue;
+		}
+		if (!inc?.incidentId || inc.ackedAt) continue;
+		const at = typeof inc.createdAt === "string" ? Date.parse(inc.createdAt) : Number.NaN;
+		items.push({
+			incidentId: inc.incidentId,
+			runId: inc.runId ?? "-",
+			eventId: inc.eventId ?? "-",
+			reason: inc.reason ?? "unknown",
+			createdAt: inc.createdAt ?? "",
+			ageMs: Number.isFinite(at) ? Math.max(0, nowMs - at) : 0,
+		});
+	}
+	items.sort((a, b) => b.ageMs - a.ageMs);
+	return { version: 1, generatedAt: iso(now), openCount: items.length, items };
 }
 
 export function buildHealthView(opts: HealthOptions): HealthView {
@@ -722,6 +849,7 @@ export function buildHealthView(opts: HealthOptions): HealthView {
 		mailboxPending,
 		memory: sampleMemory(now, opts.sessionsDir ?? defaultSessionsDir()),
 		wechat: sampleWechatChannel(now, opts.configPath ?? defaultPkgConfigPath(), opts.runtimeDir ?? defaultRuntimeDir()),
+		delivery: sampleDeliveryLedger(now, opts.runtimeDir ?? defaultRuntimeDir()),
 		generatedAt: iso(now),
 	};
 }
@@ -1642,6 +1770,17 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				}
 				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/commands 仅接受 POST（唯一命令入口）；读投影走其余 GET 端点" });
 			}
+			// ack 一个交付失败 incident（Item 53 未决项：显式 ack 才清——**故意不做自动 ack**，
+			// 设计红线：不能因为 toast/通知发送成功就当作已处理）。
+			const incAck = /^\/v1\/incidents\/([A-Za-z0-9_.-]+)\/ack$/.exec(u.pathname);
+			if (incAck !== null) {
+				if (req.method !== "POST") throw new HttpError(405, { error: "method-not-allowed", hint: "ack 仅 POST" });
+				if (!authorizeCommand(req)) { respondJson(res, 401, { error: "unauthorized" }); try { req.destroy(); } catch { /* ignore */ } return; }
+				const okAck = ackIncident(deliveryDir(opts.runtimeDir ?? defaultRuntimeDir()), incAck[1]!, "gui", Date.now());
+				// 幂等：已 ack / 不存在 ⇒ 200 但 acked=false（不报错、不重复扣计数）
+				respondJson(res, 200, { incidentId: incAck[1], acked: okAck });
+				return;
+			}
 			// 0923 微信 iLink 绑定 7 端点（v1：绑定/解绑/状态 + enable/disable 开关）：鉴权沿用
 			// authorizeCommand 链（无/错 → 401，同 /v1/commands 面）；opt-in OFF（enabled!==true）→
 			// 5 个绑定端点 403 wechat-disabled（enable/disable 不受闸限制；GUI「微信连接」入口始终渲染）。
@@ -1686,7 +1825,15 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						timersDir: opts.timersDir,
 						journalPath: opts.journalPath,
 						mailboxDir: opts.mailboxDir,
+						// delivery 段（incident 可见面）必须与 ack 端点读**同一个** runtimeDir，
+						// 否则测试/多实例场景会读默认目录（实测：不传则读到真实 13 条而非夹具 2 条）。
+						runtimeDir: opts.runtimeDir,
 					});
+					break;
+				case "/v1/incidents":
+					// 只读：未 ack 的交付失败账本（Item 53 未决项：此前 ackIncident/listOpenIncidents
+					// 全仓零调用 ⇒ 106 条 incident 无任何可见面）。按 R-2.2 带**年龄**。
+					body = buildIncidentsView(new Date(), opts.runtimeDir);
 					break;
 				case "/v1/snapshot":
 					body = buildSnapshotView({

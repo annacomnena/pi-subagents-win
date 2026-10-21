@@ -1078,6 +1078,95 @@ try {
 			await h.close();
 		}
 	}
+
+	// ── T15 incident 可见面 + HTTP ack 接线（L4 v2 NIT：请求级接线无测试）─────
+	// 动因：`ackIncident` / `listOpenIncidents` 曾全仓零调用，106 条 incident 无可见面。
+	// 本组走**真实 HTTP 路由**（不是直调函数），钉住：鉴权 / 只读 / ack 幂等 / 路径穿越防护。
+	{
+		const D = mkdtempDir("runtime-host-t15-");
+		DIRS.push(D);
+		const rt = join(D, "rt");
+		const deliverDir = join(rt, "delivery");
+		mkdirSync(deliverDir, { recursive: true });
+		const nowMs = Date.now();
+		const seed = (id: string): void => {
+			const eventId = `async:run_${id}:abc`;
+			writeFileSync(
+				join(deliverDir, `${encodeURIComponent(eventId)}.incident.${id}.json`),
+				JSON.stringify({ incidentId: id, eventId, runId: `run_${id}`, reason: "deadline-exceeded(stage=attempted)", createdAt: new Date(nowMs - 3600_000).toISOString() }),
+				"utf8",
+			);
+		};
+		seed("inc_t15a");
+		seed("inc_t15b");
+
+		const h = await createRuntimeHostServer({
+			hostPath: join(D, "host.json"),
+			runtimeDir: rt,
+			stateDir: join(D, "state"),
+			journalPath: join(D, "events.jsonl"),
+			timersDir: join(D, "timers"),
+			mailboxDir: join(D, "mailbox"),
+		});
+		try {
+			const base = `http://127.0.0.1:${h.info.port}`;
+			const tok = h.info.token!;
+
+			// (a) health 有 delivery 段，且读数与盘面一致（带年龄，R-2.2）
+			const hres = await fetch(`${base}/v1/health`, { headers: { "x-command-token": tok } });
+			assert.equal(hres.status, 200);
+			const hbody = (await hres.json()) as { delivery: { openIncidents: number; oldestAgeMs: number | null; stale: boolean; sampledAt: string } };
+			assert.equal(hbody.delivery.openIncidents, 2, "health.delivery.openIncidents 反映盘面");
+			assert.ok(typeof hbody.delivery.oldestAgeMs === "number" && hbody.delivery.oldestAgeMs! > 3600_000 - 5000, "oldestAgeMs 给年龄（≈1h）");
+			assert.equal(hbody.delivery.stale, true, "超 1h 阈值 ⇒ stale");
+			assert.ok(hbody.delivery.sampledAt.length > 0, "sampledAt 必给");
+
+			// (b) GET /v1/incidents 只读列表
+			const lres = await fetch(`${base}/v1/incidents`);
+			assert.equal(lres.status, 200);
+			const lbody = (await lres.json()) as { openCount: number; items: { incidentId: string; ageMs: number }[] };
+			assert.equal(lbody.openCount, 2, "/v1/incidents 列 2 条");
+			assert.ok(lbody.items.every((i) => typeof i.ageMs === "number"), "每条带 ageMs");
+
+			// (c) ack 无 token ⇒ 401（鉴权真的在）
+			const noAuth = await fetch(`${base}/v1/incidents/inc_t15a/ack`, { method: "POST" });
+			assert.equal(noAuth.status, 401, "ack 无 token ⇒ 401");
+
+			// (d) ack 有 token ⇒ 200 + acked=true；重复 ⇒ acked=false（幂等）
+			const a1 = await fetch(`${base}/v1/incidents/inc_t15a/ack`, { method: "POST", headers: { "x-command-token": tok } });
+			assert.equal(a1.status, 200);
+			assert.equal(((await a1.json()) as { acked: boolean }).acked, true, "首次 ack 生效");
+			const a2 = await fetch(`${base}/v1/incidents/inc_t15a/ack`, { method: "POST", headers: { "x-command-token": tok } });
+			assert.equal(a2.status, 200);
+			assert.equal(((await a2.json()) as { acked: boolean }).acked, false, "重复 ack 幂等（200 + acked=false，不报错）");
+
+			// (e) ack 后可见面立即降（无陈旧缓存）
+			const after = (await (await fetch(`${base}/v1/health`, { headers: { "x-command-token": tok } })).json()) as { delivery: { openIncidents: number } };
+			assert.equal(after.delivery.openIncidents, 1, "ack 后 health 计数立即 -1");
+			const lres2 = (await (await fetch(`${base}/v1/incidents`)).json()) as { openCount: number; items: { incidentId: string }[] };
+			assert.equal(lres2.openCount, 1, "ack 后列表立即少一条");
+			assert.equal(lres2.items[0]!.incidentId, "inc_t15b", "剩下的正是未 ack 的那条");
+
+			// (f) 恶意/不存在 id ⇒ 安全（不穿越、不报 500）
+			// 注：`..%2F..%2Fhost` 解码后含 `/`，不匹配 `[A-Za-z0-9_.-]+` 白名单
+			// ⇒ 不会进 ack 分支（实测 405）。这也是安全的结果（不写、不 500），断言放宽。
+			const bad = await fetch(`${base}/v1/incidents/..%2F..%2Fhost/ack`, { method: "POST", headers: { "x-command-token": tok } });
+			assert.ok(
+				bad.status === 404 || bad.status === 405 || bad.status === 200,
+				`路径穿越尝试不炸（实际 ${bad.status}）—— 不得 500、不得越界写`,
+			);
+			if (bad.status === 200) assert.equal(((await bad.json()) as { acked: boolean }).acked, false, "不存在/恶意 id ⇒ acked=false");
+			const missing = await fetch(`${base}/v1/incidents/inc_nope/ack`, { method: "POST", headers: { "x-command-token": tok } });
+			assert.equal(missing.status, 200);
+			assert.equal(((await missing.json()) as { acked: boolean }).acked, false, "不存在的 id ⇒ acked=false，不抛");
+
+			// (g) GET 到 ack 路径 ⇒ 405（写操作只认 POST）
+			const wrongMethod = await fetch(`${base}/v1/incidents/inc_t15b/ack`);
+			assert.equal(wrongMethod.status, 405, "ack 路径 GET ⇒ 405");
+		} finally {
+			await h.close();
+		}
+	}
 } finally {
 	for (const d of DIRS) {
 		rmSync(d, { recursive: true, force: true });
