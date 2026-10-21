@@ -746,3 +746,70 @@ export interface FrontierSnapshot {
 	/** true = 首帧（prev=null）：只建基线，不算触发（防冷启动风暴）。 */
 	baseline: boolean;
 }
+
+// ── 2026-10-22 档 A：async subagent run 卡片（GET /v1/runs；server 侧 = subagent-kill.ts RunCard）──
+
+/** async run 记录里的 `status`（与 `RunLiveness` 正交：status 说记录怎么写的，liveness 说进程在不在）。
+ *  注意与上方 `RunStatus`（tab run 的 journal 投影七态：created/dispatched/running/waiting/...）**不是同一个东西**
+ *  ⇒ 命名必须区分，否则两份契约会被混读。 */
+export type AsyncRunStatus = "running" | "completed" | "failed" | "cancelled";
+
+/**
+ * 三态判活（**不是** status 的派生）：`alive` = 登记 pid 存活、`dead` = 登记 pid 已不在、
+ * `unknown` = 没有 pid 可判。实测 152/154 记录是 `unknown`（缺 pid 是常态）⇒ UI 必须能显示
+ * 「状态未知」，且**不得**把它折算成运行中或失败。派生逻辑只在 `runsView.ts::deriveRunDisplay`。
+ */
+export type RunLiveness = "alive" | "dead" | "unknown";
+
+/** `result.usage` 六聚合量（运行中记录没有这个字段 ⇒ 卡片 `usage: null`）。 */
+export interface RunUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	turns: number;
+}
+
+/** 最近一次工具调用（`argsDigest` 服务端已截 ≤160 字节，键序归一）。 */
+export interface RunCall {
+	tool: string;
+	argsDigest: string;
+	ts: string;
+	turn: number;
+}
+
+/** 循环判据（`classifyLoop` 三值 + 终态恒 `unknown`）。 */
+export type RunLoopVerdict = "ok" | "repeating" | "no_progress" | "unknown";
+
+/** 一行一 run 的卡片（GET /v1/runs 的 `runs[]` 元素）。 */
+export interface RunCard {
+	id: string;
+	agent: string | null;
+	/** 任务摘要：空白折叠 + 截 40 字符（服务端口径）。 */
+	taskPreview: string;
+	status: AsyncRunStatus;
+	liveness: RunLiveness;
+	pid: number | null;
+	startedAt: string | null;
+	/** 最近脉搏（`lastActivity` → `pidRecordedAt` → `startedAt` 回退链）。 */
+	lastActivity: string | null;
+	/** `result.usage`；缺失（运行中常态）⇒ null。**不要从别处推断**。 */
+	usage: RunUsage | null;
+	/** 仅 `includeRecentCalls=1` 出现；最近 3 条，newest-first。 */
+	recentCalls?: RunCall[];
+	/** 仅 `includeRecentCalls=1` 出现；只对 status=running 给 verdict，终态恒 "unknown"。 */
+	loopVerdict?: RunLoopVerdict;
+}
+
+/** GET /v1/runs 响应（`version:1` 后只增不改；ETag 排除 asof）。 */
+export interface RunsResponse {
+	version: 1;
+	/** 响应时刻（服务端时钟；**不参与 ETag**）。 */
+	asof: string;
+	/** 本次返回条数（= runs.length，已按 limit 截断）。 */
+	count: number;
+	/** 截断前总记录数（「显示 N / 共 M」用）。 */
+	total: number;
+	runs: RunCard[];
+}

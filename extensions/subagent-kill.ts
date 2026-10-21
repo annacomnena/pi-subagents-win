@@ -29,6 +29,9 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// 卡片投影的循环判据与摘要截断与 TUI 侧同源（classifyLoop / ARGS_DIGEST_MAX_CHARS），
+// 不复制阈值：两边口径漂移会让「GUI 说卡住」与「工具说 ok」互相打脸。
+import { ARGS_DIGEST_MAX_CHARS, classifyLoop, truncateUtf8, type RecentCallEntry } from "./recent-calls.ts";
 
 /**
  * runs 目录解析口径（单一来源，启动时读一次 env）：
@@ -437,6 +440,172 @@ export function listAsyncRunSummaries(runsDir: string = DEFAULT_RUNS_DIR, limit 
 		return (b.startedAt ?? "").localeCompare(a.startedAt ?? "");
 	});
 	return summaries.slice(0, limit);
+}
+
+/**
+ * ── 卡片投影（`GET /v1/runs` 端点专用，2026-10-22）────────────────
+ *
+ * 与 `listAsyncRunSummaries` 的关系：**同一份读盘逻辑的另一个投影**，不改它的返回形状
+ * （`subagent-win{status/list}` 与 async-panel 都在消费 `RunSummary`）。两者的关键差别：
+ *   - `RunSummary.pidAlive?: boolean` 是**二态**，pid 缺失时是 `undefined`；卡片需要**三态**
+ *     `alive | dead | unknown`，因为 UI 必须能把「不知道」和「确定没活」分开显示——
+ *     把 unknown 当 running 展示是错的（会谎报「运行中」），当 dead 展示也是错的（会谎报失败）。
+ *   - 卡片带 `usage`（`result.usage`，运行中恒 null）与可选 `recentCalls` / `loopVerdict`。
+ *
+ * **纯读**：不写盘、不碰 registry、不 kill；任何单份坏 json 跳过（never-throw）。
+ */
+export type RunLiveness = "alive" | "dead" | "unknown";
+
+/** `result.usage` 的六个聚合量（与 `AsyncRunRecord.result.usage` 同形）。 */
+export interface RunCardUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	turns: number;
+}
+
+/** 一次工具调用（`recentCalls` 元素；`argsDigest` 已截 ≤160 字节）。 */
+export interface RunCardCall {
+	tool: string;
+	argsDigest: string;
+	ts: string;
+	turn: number;
+}
+
+/** 循环判据：`classifyLoop` 的三值 + 终态恒 `unknown`（终态 verdict 不是「卡住」的证据）。 */
+export type RunCardVerdict = "ok" | "repeating" | "no_progress" | "unknown";
+
+/** 一行一 run 的卡片数据（`GET /v1/runs` 契约字段面，version:1 后只增不改）。 */
+export interface RunCard {
+	id: string;
+	agent: string | null;
+	taskPreview: string;
+	status: string;
+	liveness: RunLiveness;
+	pid: number | null;
+	startedAt: string | null;
+	lastActivity: string | null;
+	/** `result.usage`；缺失（运行中常态）⇒ null。**不从 result 之外推断**。 */
+	usage: RunCardUsage | null;
+	/** 仅 includeRecentCalls=1 出现；最近 3 条，**newest-first**。 */
+	recentCalls?: RunCardCall[];
+	/** 仅 includeRecentCalls=1 出现；只对 `status==="running"` 给 verdict，终态恒 "unknown"。 */
+	loopVerdict?: RunCardVerdict;
+}
+
+/** `?limit` 缺省 50 / 上限 200（与端点契约一致）。 */
+export const RUNS_LIMIT_DEFAULT = 50;
+export const RUNS_LIMIT_MAX = 200;
+/** 卡片携带的 recentCalls 条数上限。 */
+export const RUN_CARD_RECENT_CALLS = 3;
+
+/**
+ * pid → 三态判活。**永不从 status 猜**（R-11：缺 pid 是常态——实测 2/154 带 pid）。
+ * 负数/非整数视为「没有 pid」⇒ unknown（不是 dead）。
+ */
+export function classifyRunLiveness(pid: unknown): { liveness: RunLiveness; pid: number | null } {
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return { liveness: "unknown", pid: null };
+	return { liveness: isPidAlive(pid) ? "alive" : "dead", pid };
+}
+
+function readRunRecords(runsDir: string): KillableRunRecord[] {
+	if (!existsSync(runsDir)) return [];
+	const records: KillableRunRecord[] = [];
+	for (const f of readdirSync(runsDir)) {
+		if (!f.endsWith(".json")) continue;
+		try {
+			const rec = JSON.parse(readFileSync(join(runsDir, f), "utf8")) as KillableRunRecord;
+			if (rec && typeof rec.id === "string") records.push(rec);
+		} catch {
+			/* skip bad json（never-throw：一份坏文件不能拖垮整个列表） */
+		}
+	}
+	return records;
+}
+
+function usageOf(record: KillableRunRecord): RunCardUsage | null {
+	const raw = (record.result as { usage?: unknown } | undefined)?.usage;
+	if (raw === null || typeof raw !== "object") return null;
+	const u = raw as Record<string, unknown>;
+	const num = (k: string): number => (typeof u[k] === "number" && Number.isFinite(u[k]) ? (u[k] as number) : 0);
+	return { input: num("input"), output: num("output"), cacheRead: num("cacheRead"), cacheWrite: num("cacheWrite"), cost: num("cost"), turns: num("turns") };
+}
+
+function recentCallsOf(record: KillableRunRecord): RecentCallEntry[] {
+	const raw = (record as { recentCalls?: unknown }).recentCalls;
+	if (!Array.isArray(raw)) return [];
+	const out: RecentCallEntry[] = [];
+	for (const item of raw) {
+		if (item === null || typeof item !== "object") continue;
+		const e = item as Record<string, unknown>;
+		if (typeof e.tool !== "string" || typeof e.ts !== "string") continue;
+		out.push({
+			tool: e.tool,
+			argsDigest: typeof e.argsDigest === "string" ? e.argsDigest : "",
+			ts: e.ts,
+			turn: typeof e.turn === "number" && Number.isFinite(e.turn) ? e.turn : 0,
+		});
+	}
+	return out;
+}
+
+/**
+ * 列出 run 卡片（running 优先 → `startedAt` 降序；`limit` 截断在排序**之后**）。
+ * 返回 `total` = 截断前的记录数（UI 用它表达「显示 N / 共 M」）。
+ */
+export function listAsyncRunCards(
+	runsDir: string = DEFAULT_RUNS_DIR,
+	opts: { limit?: number; includeRecentCalls?: boolean } = {},
+): { total: number; runs: RunCard[] } {
+	const limitRaw = opts.limit;
+	const limit =
+		typeof limitRaw === "number" && Number.isInteger(limitRaw) && limitRaw > 0
+			? Math.min(limitRaw, RUNS_LIMIT_MAX)
+			: RUNS_LIMIT_DEFAULT;
+	const includeRecentCalls = opts.includeRecentCalls === true;
+	const records = readRunRecords(runsDir);
+	const cards: RunCard[] = records.map((r) => {
+		const { liveness, pid } = classifyRunLiveness(r.pid);
+		const lastIso = r.lastActivity ?? r.pidRecordedAt ?? r.startedAt;
+		const card: RunCard = {
+			id: r.id,
+			agent: typeof r.agent === "string" ? r.agent : null,
+			taskPreview: String(r.task ?? "").replace(/\s+/g, " ").slice(0, 40),
+			status: r.status,
+			liveness,
+			pid,
+			startedAt: r.startedAt ?? null,
+			lastActivity: lastIso ?? null,
+			usage: usageOf(r),
+		};
+		if (includeRecentCalls) {
+			// newest-first（与 formatRecentCalls 的展示口径一致）；record 内是 newest-last 环形。
+			const ring = recentCallsOf(r);
+			const tail = ring.slice(Math.max(0, ring.length - RUN_CARD_RECENT_CALLS));
+			card.recentCalls = tail
+				.slice()
+				.reverse()
+				.map((e) => ({ tool: e.tool, argsDigest: truncateUtf8(e.argsDigest, ARGS_DIGEST_MAX_CHARS), ts: e.ts, turn: e.turn }));
+			// 终态 verdict 不是「卡住」证据（报告 §1.5）⇒ 终态恒 unknown，不算不猜。
+			card.loopVerdict =
+				r.status === "running"
+					? classifyLoop(ring, {
+							turnClock: typeof r.turnClock === "number" && Number.isFinite(r.turnClock) ? r.turnClock : 0,
+							lastToolTurn: typeof r.lastToolTurn === "number" && Number.isFinite(r.lastToolTurn) ? r.lastToolTurn : 0,
+						}).verdict
+					: "unknown";
+		}
+		return card;
+	});
+	cards.sort((a, b) => {
+		const ra = a.status === "running" ? 0 : 1;
+		const rb = b.status === "running" ? 0 : 1;
+		if (ra !== rb) return ra - rb;
+		return (b.startedAt ?? "").localeCompare(a.startedAt ?? "");
+	});
+	return { total: cards.length, runs: cards.slice(0, limit) };
 }
 
 function fmtClock(iso?: string): string {

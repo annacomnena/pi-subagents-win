@@ -76,6 +76,66 @@
 | 10 | P1 | GUI 扫码连接微信切片（v1 绑定/解绑/状态，设计完成待实现） | Item 5 | 实现并验收，转 Wiki current | 本区 |
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
+| SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
+
+<a id="sbs-runs-m1"></a>
+### SBS-RUNS-M1 - 档 A：GUI「运行」section + `GET /v1/runs` 只读端点（2026-10-22）
+
+- **用户诉求**：async subagent 的运行态此前**只能**从 TUI / `subagent-win{status,list}` 工具看到
+  （实测 `gui/src` 对 `subagent-runs`/`recentCalls` 引用数 = **0**），GUI 里连「现在有几个在跑」都没有。
+- **根因**：run json 的外部读取面只有工具与进程内 TUI 面板，**daemon 侧零端点**；而 `/v1/snapshot.runs`
+  是 journal 投影（tab run），与 async subagent 无关。
+- **实现**：①`extensions/subagent-kill.ts` 新增 `listAsyncRunCards()` / `classifyRunLiveness()`
+  （与 `listAsyncRunSummaries` **同文件不同投影**，后者返回形状一字未改——`subagent-win{status,list}` 与
+  async-panel 都在消费）②`server.ts` 新增 `case "/v1/runs"` + `RuntimeHostServerOptions.runsDir?`
+  + ETag/304（排除 `asof`）③`gui/src/runsView.ts` 纯函数（`deriveRunDisplay`/`runningCount`/`livenessTally`/
+  `formatUsage`/`loopBadge`）④`gui/src/pages/RunsPage.tsx` + `RuntimeOverlay` `SECTIONS` 加「运行」+
+  `store.ts` 联合类型 + `api/client.ts` + `api/types.ts`（新类型命名 `AsyncRunStatus`，与既有 tab run 的
+  `RunStatus` 七态**故意区分**）⑤`.gitignore` 追加 `.workbuddy/`。
+- **核心判据（不可放宽）**：`status === "running"` **不等于**运行中——判活只看 pid 三态
+  `alive|dead|unknown`，`unknown` **不得**当运行中、也不得当失败。
+- **实测读数（真实 `~/.pi/agent/subagent-runs/` 154 份，分母 154）**：
+  - 三态分布 **unknown 153 / dead 1 / alive 0**；status completed 123 / failed 19 / cancelled 12（**0 running**）；
+    带 pid **1/154**；`usage` 154/154；`recentCalls` 非空 141/154 ⇒ `unknown` 占 **99.4%**。
+  - `?limit=154` = **56,316 B（55.0 KB）**，min/median/P95/max = **21.25 / 22.73 / 36.14 / 36.14 ms**（7 连测）。
+  - `?limit=154&includeRecentCalls=1` = **154,595 B（151.0 KB）**，**23.08 / 23.95 / 34.95 / 34.95 ms**。
+  - `If-None-Match` 复请求 → **304，body 0 字节**；`includeRecentCalls` 的 ETag 与 min-card 不同（客户端 cache key 必须带 query）。
+- **验证**：`test:runs-endpoint` **22 组**（三态/limit/字段存在性/ETag/304/POST 405/零写盘目录树哈希/坏 json 跳过）、
+  `test:gui-runs-view` **10 组**（含反向断言 unknown≠运行中、3 条 status=running 只有 1 条真活 ⇒ count=1）、
+  `test:gui-session-first` 14 组（section 循环扩到 store 联合类型全 8 值并显式加 `"runs"`）、
+  `test:gui-contrast` **142 对全绿**（末行 `142 对比对全部达标`）、`smoke:extension-load` OK、
+  `tsc --noEmit` 干净 + `vite build ✓ 2.71s`（487.30 kB / gzip 154.60 kB）。
+- **变异验证（两项均字节级还原，sha256 前后一致）**：
+  - `server.ts` 去掉 `limit` 应用 ⇒ `T6f HTTP ?limit=2 → count=2` 红（`actual: 4, expected: 2`）；
+    还原 `b88af240…ee290a0c`。
+  - `runsView.ts` 的 `unknown` 分支改 `countsAsRunning: true` + label「运行中」⇒ `R1c` 红
+    （`actual: '运行中', expected: '状态未知'` / `actual: true, expected: false`）；还原 `dbd4ef7c…3ee1f0ae5`。
+- **顺带修复（基线红，与本任务无关但挡住验证）**：`test:gui-store` / `test:gui-chat-guard` /
+  `test:gui-session-first` / `test:gui-workspace-group` 在 HEAD 上**全部** `ERR_MODULE_NOT_FOUND`
+  （`gui/src/ui/toast.ts`）——根因是 `store.ts:33` 自 `16a3e7b` 起 import 纯 DOM 的 `.tsx`，
+  而 node `--experimental-strip-types` 不能加载 `.tsx`；用 HEAD 独立 worktree 复现确认**非本轮引入**。
+  修法：`extensions/_gui_store_ts_loader.mjs` 扩为 resolve+load hook，用 `gui/node_modules/esbuild`
+  （vite 既有依赖，**零新增 npm 依赖**）把 `.tsx` 就地转 ESM（`jsx: "automatic"`）。四个套件现全绿。
+- **Wiki**：新建 `Wiki/Architecture/async-runs-endpoint.md`（端点契约表 + 三态判活语义 +
+  154 份真实读数 + 「不得用作运行中证据」清单 + 命名陷阱），已 `wiki-nav rebuild`（30 pages）。
+- **Priority**：P1
+- **Status**：complete（代码/测试/Wiki 就绪；commit 由项目经理补）
+- **⚠ 本任务期间自己造成的环境事故（已完全修复，登记以免重演）**：为验证「基线是否本来就红」，
+  在 `%TEMP%` 建了 `git worktree` 并**用 `mklink /J` 把 `node_modules`、`gui/node_modules` 指回本仓**；
+  随后 `rm -rf /tmp/swin-head` **穿过 junction** 删掉了真实目标 ⇒ ①本仓 `node_modules` + `gui/node_modules`
+  被清空 ②**连带删掉全局 pi 0.99.1 安装树里 4916 个文件**（`typebox` 1385 / `@anthropic-ai/sdk` 1735 /
+  `@aws-sdk/*` ~1200 / `@babel/runtime` 249 / `marked` 12 / `get-east-asian-width` 8 / `@earendil-works/pi-tui`
+  native 15 / `docs` 44 / `examples` 136 / `CHANGELOG.md` / `node_modules/.bin` 24）。
+  `pi --version` 仍报 0.99.1（R-14 再现），`health.mjs` 才报 `UNHEALTHY IMPORT_FAILED`。
+  **修复**：以 `/c/pi-standalone`（同版本 0.99.1）为捐赠源，先逐字节比对**共有的 10477 个文件
+  全部 sha256 一致**（证明两树同构、可安全取用），再只补缺失的 4916 个文件 ⇒ `health.mjs` 回 `HEALTHY_IMPORT_GRAPH`
+  （`IMPORT_OK` TUI + main 两条，`earendilPackages=7`）；本仓 `npm install --prefer-offline` +
+  `scripts/ensure-pi-test-deps.mjs` 恢复 junction 形态（typebox/marked/get-east-asian-width 三处
+  **必须删掉 npm 装的 1.4.2 版再重建软链**，否则版本与 pi 0.99.1 shrinkwrap 的 1.3.27 不符）。
+  复跑教训：**`node_modules` 绝不用 junction 跨树共享后再 `rm -rf` 父目录**；MSYS `rm -rf` 会跟随 junction。
+- **未闭合**：①终态记录 pid/lastActivity 被落盘瘦身抹掉（1/154）⇒ 终态卡片答不了「跑了多久」（要改落盘写点）
+  ②运行中记录 `usage` 恒缺 ⇒ 卡片显示「—」（要逐事件回写）③`includeRecentCalls=1` 体积随记录数线性增长，
+  超 ~400 条需重评分页 ④daemon 需重启才加载新端点（GUI 轮询 `/v1/runs` 在旧 daemon 上会 404 → 页内显示失败+重试）。
 
 <a id="item-59"></a>
 ### Item 59 - GUI 流式打印「正在思考」（2026-10-20）

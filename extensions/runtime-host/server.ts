@@ -47,6 +47,11 @@
  *     journal message.expired 回执（sweepExpiredOutboxItems；目标会话永不重启时 pending
  *     不再是永久孤儿——任一项至多存活到下次 host 启动；桥侧另在每个消费 tick 扫）。
  *     唯一读投影例外，best-effort never-throw；POST /v1/commands 仍是唯一命令入口。
+ *   - `GET /v1/runs?limit&includeRecentCalls`（2026-10-22 档 A）：async subagent run 的**只读**
+ *     卡片投影（`subagent-kill.ts::listAsyncRunCards`）。三态 `liveness=alive|dead|unknown`：
+ *     pid 为活数 → alive / 死数 → dead / **无 pid → unknown**（实测 152/154 无 pid 是常态；
+ *     `unknown` 永不当 running 展示，也不当失败）。独立端点而不塞 `/v1/snapshot`：后者已
+ *     412 KB 且 runs 占 81%。ETag 排除 `asof`；纯读零写盘。
  *   - 0923 微信 iLink 绑定 5 端点（v1：绑定/解绑/状态）：`POST /v1/wechat/bind/start`（幂等）/
  *     `GET /v1/wechat/bind/status` / `GET /v1/wechat/bind/qr-image`（daemon 代理转 data URL）/
  *     `POST /v1/wechat/bind/cancel` / `POST /v1/wechat/unbind`。鉴权沿用 authorizeCommand 链
@@ -168,6 +173,7 @@ import { ARTIFACT_REF_RE, startWechatInput } from "./wechat-input.ts";
 import { startWechatReplyWatcher } from "./wechat-reply.ts";
 import { listReplyIntents, replyIntentDir } from "../runtime/wechat-reply.ts";
 import { readAttachment } from "../runtime/registry.ts";
+import { DEFAULT_RUNS_DIR, listAsyncRunCards } from "../subagent-kill.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
@@ -996,6 +1002,9 @@ export interface RuntimeHostServerOptions {
 	configPath?: string;
 	/** G6-P1：pi sessions 根目录（缺省 defaultSessionsDir()；测试注入隔离）。 */
 	sessionsDir?: string;
+	/** 2026-10-22：async run 记录目录（缺省 `subagent-kill.ts::DEFAULT_RUNS_DIR`，即 env
+	 *  PI_SUBAGENT_RUNS_DIR 口径）。测试注入夹具目录；**不得读真实目录**。 */
+	runsDir?: string;
 	/** 会话列表标题解析链：tab-runs 台账根目录（缺省 tabRunsDir()＝env PI_TAB_RUNS_DIR 覆盖；测试注入隔离）。 */
 	tabRunsDir?: string;
 	/** G6-P1：WS live tail 轮询间隔 ms（缺省 250；测试注入更快）。 */
@@ -1893,6 +1902,39 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					body = { version: 1, count: ix.length, interactions: ix };
 					break;
 				}
+				case "/v1/runs": {
+					// 2026-10-22 档 A（GUI 运行态可视化）：async subagent run 的**只读**卡片投影。
+					// 动因：run json 的外部读取面此前只有工具 `subagent-win`（status/list/recent-calls）+
+					// 进程内 TUI 面板，daemon 侧**零端点** ⇒ GUI 完全看不到 subagent 在跑什么。
+					// 为何独立端点而不塞 /v1/snapshot：实测 snapshot 已 412 KB 且 runs 占 81%，
+					// 追加 154 份 run 即便只投影 min-card 也要 +80 KB（+19.5%），且 buildRunsSection 是同步投影。
+					// 数据源 = `subagent-kill.ts::DEFAULT_RUNS_DIR`（PI_SUBAGENT_RUNS_DIR 口径）；**纯读、零写盘**。
+					const runsQ = u.searchParams;
+					const runsLimitRaw = runsQ.get("limit");
+					const runsLimit = runsLimitRaw === null ? undefined : Number(runsLimitRaw);
+					const includeRecentCalls = (runsQ.get("includeRecentCalls") ?? "") === "1";
+					const cards = listAsyncRunCards(opts.runsDir ?? DEFAULT_RUNS_DIR, {
+						...(runsLimit !== undefined && Number.isFinite(runsLimit) ? { limit: runsLimit } : {}),
+						includeRecentCalls,
+					});
+					// ETag 排除 asof（响应时间戳不是状态；否则每拍都 miss）——手法同 /v1/snapshot。
+					// asof 也**不在**卡片里放任何 `now-` 相对量：相对量会让 ETag 永不命中，年龄由 GUI 用
+					// lastActivity 自己算。
+					const runsBody = {
+						version: 1 as const,
+						asof: new Date().toISOString(),
+						count: cards.runs.length,
+						total: cards.total,
+						runs: cards.runs,
+					};
+					const runsEtag = sha1Etag(JSON.stringify({ ...runsBody, asof: undefined }));
+					if (matchEtag(req, runsEtag)) {
+						respondNotModified(res, runsEtag);
+						return;
+					}
+					respondJson(res, 200, runsBody, runsEtag);
+					return;
+				}
 				case "/v1/timeline": {
 					// G3（拍板②）+ G5.2：limit（默认 200，at 升序尾部 N 条）+ before=（历史翻页排他上界）
 					const q = u.searchParams;
@@ -2058,7 +2100,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					}
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
-						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）| /v1/wechat/{enable,disable} + bind/{start,status,qr-image,cancel} + /v1/wechat/unbind（微信 iLink 绑定与 opt-in 开关）` });
+						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/runs | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）| /v1/wechat/{enable,disable} + bind/{start,status,qr-image,cancel} + /v1/wechat/unbind（微信 iLink 绑定与 opt-in 开关）` });
 					}
 					const sessionId = decodeURIComponent(mt[1]);
 					const file = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), sessionId);

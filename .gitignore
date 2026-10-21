@@ -41,3 +41,6 @@ Wiki/_hotspot.trash.jsonl
 
 # codegraph 符号索引（本机工具产物，可重建，不入库）
 .codegraph/
+
+# 本机工作区工具产物（.workbuddy/，非本仓内容；仅追加，勿改写上面条目）
+.workbuddy/

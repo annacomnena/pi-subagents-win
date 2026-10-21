@@ -7,6 +7,7 @@
  * 内部骨架 = SettingsPage.tsx#L1375 同款 grid：窄栅 68px 图标栏 / ≥lg 268px 全栏；
  * 返回钮 = #L1408 圆角-xl 套件（m-1 w-[calc(100%-0.5rem)] justify-start rounded-xl…）。
  * 四 section（attention/master/workstream/runtime）组件**原样复用**为右栏内容；
+ * 2026-10-22 档 A 加第 8 项「运行」（RunsPage，async subagent 运行态；GET /v1/runs 只读投影）；
  * 0923 加第 5 项「微信连接」（ChannelsPage）；L3 UX 修复：入口**始终渲染**——
  * 不再按 /v1/wechat/bind/status 200 探测隐藏（403 wechat-disabled → 页内「启用微信连接」按钮；
  * 401 → 页内给 /gui open 引导文案），消除「功能存在但不可发现」陷阱；
@@ -15,7 +16,7 @@
  */
 
 import { useEffect } from "react";
-import { Activity, ArrowLeft, Crown, Inbox, Layers, MessageCircle, Palette, Server, type LucideIcon } from "lucide-react";
+import { Activity, ArrowLeft, Crown, Inbox, Layers, MessageCircle, Palette, PlayCircle, Server, type LucideIcon } from "lucide-react";
 import { useGui, type RuntimeOverlaySection } from "../store";
 import { AttentionPage } from "./AttentionPage";
 import { AutonomyPage } from "./AutonomyPage";
@@ -23,6 +24,7 @@ import { ChannelsPage } from "./ChannelsPage";
 import { MasterPage } from "./MasterPage";
 import { WorkstreamPage } from "./WorkstreamPage";
 import { RuntimePage } from "./RuntimePage";
+import { RunsPage } from "./RunsPage";
 import { AppearancePage } from "./AppearancePage";
 import { Button } from "../ui/button";
 
@@ -31,6 +33,9 @@ const SECTIONS: { id: RuntimeOverlaySection; zh: string; icon: LucideIcon }[] = 
 	{ id: "master", zh: "主控", icon: Crown },
 	{ id: "workstream", zh: "工作流", icon: Layers },
 	{ id: "runtime", zh: "运行时", icon: Server },
+	// 2026-10-22 档 A：async subagent 运行态（GET /v1/runs 只读投影）。放在「运行时」之后：
+	// 运行时页是 daemon 自身的健康面，这一页是「daemon 之外派出去的活现在怎么样」。
+	{ id: "runs", zh: "运行", icon: PlayCircle },
 	{ id: "wechat", zh: "微信连接", icon: MessageCircle },
 	// 2026-09-30：第 6 个 section「主动性」（从微信页拆出的独立设置页：开关 + frontier 可视化）
 	{ id: "autonomy", zh: "主动性", icon: Activity },
@@ -119,6 +124,8 @@ export function RuntimeOverlay() {
 							{sec.id === "master" && <MasterPage />}
 							{sec.id === "workstream" && <WorkstreamPage />}
 							{sec.id === "runtime" && <RuntimePage />}
+							{/* 2026-10-22 档 A：异步 subagent 运行态（只读端点投影） */}
+							{sec.id === "runs" && <RunsPage />}
 							{/* 0923 L3 UX 修复：section 始终渲染（未启用/无凭据由 ChannelsPage 页内提示 + 启用按钮） */}
 							{sec.id === "wechat" && <ChannelsPage />}
 							{/* 2026-09-30：主动性独立设置页（开关 + frontier 可视化） */}

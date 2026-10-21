@@ -15,6 +15,7 @@ import type {
 	HealthView,
 	InteractionsResponse,
 	RuntimeSnapshot,
+	RunsResponse,
 	SessionsBody,
 	SessionControlBody,
 	BusySnapshot,
@@ -138,6 +139,23 @@ export const api = {
 	health: (): Promise<FetchResult<HealthView>> => fetchJson<HealthView>("/v1/health"),
 
 	snapshot: (): Promise<FetchResult<RuntimeSnapshot>> => fetchJson<RuntimeSnapshot>("/v1/snapshot", undefined, 8000, "/v1/snapshot"),
+
+	/**
+	 * 2026-10-22 档 A：GET /v1/runs（async subagent run 卡片投影）。
+	 *
+	 * 第四参数 = ETag cache key：服务端按「除 asof 之外的响应体」发 ETag，命中回 304 ⇒
+	 * 客户端拿上次 200 的**同一引用**（`runs` section 每 5s 轮询，稳态下零重渲染）。
+	 * 超时 8000ms：154 份 run json 全读+parse 实测 median 26ms，但冷盘/杀毒扫描下留余量。
+	 */
+	runs: (opts?: { limit?: number; includeRecentCalls?: boolean }): Promise<FetchResult<RunsResponse>> => {
+		const q = new URLSearchParams();
+		if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
+		if (opts?.includeRecentCalls === true) q.set("includeRecentCalls", "1");
+		const qs = q.toString();
+		// ETag cache key **必须带 query**：同一路径下不同 limit/includeRecentCalls 的响应体不同，
+		// 共用 key 会把 A 查询的 ETag 拿去校验 B 查询，命中时会把 A 的缓存数据当成 B 的结果。
+		return fetchJson<RunsResponse>(`/v1/runs${qs ? `?${qs}` : ""}`, undefined, 8000, `/v1/runs${qs ? `?${qs}` : ""}`);
+	},
 
 	events: (after: string, limit?: number): Promise<FetchResult<EventsResponse>> => {
 		const q = new URLSearchParams({ after });
