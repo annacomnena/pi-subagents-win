@@ -2,7 +2,7 @@
 title: GUI 工作台 UI（token / 组件 / 导航）
 kind: architecture
 status: current
-updated: 2026-10-21
+updated: 2026-10-22
 source_paths:
   - gui/src/index.css
   - gui/src/writeCard.ts
