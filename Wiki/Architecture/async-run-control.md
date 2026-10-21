@@ -2,12 +2,23 @@
 title: 异步 Run 控制面（list / kill）
 kind: concept
 status: current
-updated: 2026-10-16
+updated: 2026-10-22
 source_paths:
   - extensions/subagent-zombie.ts
   - extensions/_test_subagent_zombie.ts
   - extensions/async-result-watcher.ts
   - extensions/subagent-kill.ts
+  - extensions/subagent-kill.ts#L269-L287
+  - extensions/subagent-kill.ts#L295-L310
+  - extensions/subagent-kill.ts#L346-L356
+  - extensions/subagent-kill.ts#L369-L402
+  - extensions/subagent-kill.ts#L405-L440
+  - extensions/subagent-kill.ts#L506-L534
+  - extensions/index.ts#L2285-L2308
+  - extensions/index.ts#L2343-L2347
+  - extensions/index.ts#L4331-L4358
+  - extensions/index.ts#L4413-L4462
+  - extensions/subagent-zombie.ts#L369-L442
   - extensions/index.ts#L1428
   - extensions/index.ts#L1665-L1684
   - extensions/index.ts#L1695-L1710
@@ -18,6 +29,12 @@ source_paths:
   - extensions/links.ts#L33-L39
   - extensions/notify-windows.ts#L41-L53
   - extensions/spawn-trace.ts#L22-L24
+  - extensions/runtime/address.ts#L56
+  - extensions/runtime/journal.ts#L99-L103
+  - extensions/runtime-host/server.ts#L1824-L1860
+  - extensions/runtime-host/server.ts#L1978
+  - extensions/runtime-host/delivery-reconciler-loop.ts#L53
+  - extensions/runtime/adapters/tab-run.ts
   - extensions/_test_subagent_kill.ts
 ---
 
@@ -30,6 +47,47 @@ source_paths:
 终止前有**双重安全校验**（pid 必须来自该 run 的派发登记；并向 OS 核对启动时间 + 命令行 marker 防 pid 重用误杀），缺一即拒杀；重复 kill / 已终态 / 进程已消失都走**幂等成功**。记录文件里的 `pid`/`pidRecordedAt`/`pidCmdMarker`/`lastActivity` 是控制面的数据底座。
 
 ## Current Contract
+
+### run json 字段面与落盘写点（本页唯一权威表）
+
+`AsyncRunRecord`（`extensions/index.ts#L2285-L2308`）是 run json 的类型源；`KillableRunRecord`（`extensions/subagent-kill.ts#L48-L71`，带 `[k: string]: unknown`）是 kill/zombie 侧的宽类型视图。**写点共 8 处**，全部整份 `JSON.stringify` 覆盖写：
+
+| # | 写什么 | 触发 | 位置 |
+|---|---|---|---|
+| 1 | 初始 `status:"running"` + `id/agent/task/startedAt/cwd?` | 派发即 1 次 | `index.ts#L4417`（单发）/ `#L4331`（异步并行） |
+| 2 | `maxWallMs`+`maxWallSource`，随后 `model` | 派发后立刻各 1 次 | `index.ts#L4430` / `#L4432` |
+| 3 | `pid`/`pidRecordedAt`/`pidCmdMarker`/`lastActivity` | 子进程 spawn 成功 1 次（每次 attempt 覆盖） | `subagent-kill.ts#L269-L287`（`registerRunProcess`） |
+| 4 | `lastActivity`（脉搏） | 心跳回调，**≤1 次/5s** | `subagent-kill.ts#L295-L310`（`ACTIVITY_PERSIST_INTERVAL_MS=5_000`，`#L130`） |
+| 5 | `recentCalls`/`lastToolTurn`/`turnClock` | 每个 tool 事件，**≤1 次/5s（首调用立即）** | `index.ts#L4442-L4445` → `createThrottledRunMerger`（`subagent-kill.ts#L346-L356`，`RECENT_CALLS_PERSIST_INTERVAL_MS=5_000` `#L132`） |
+| 6 | 终态整份覆盖（`status`/`result`/`recentCalls`/`killAudit?`） | `.then` 1 次 | `index.ts#L4447-L4457`（并行 `#L4346-L4356`） |
+| 7 | kill 终态 `cancelled`+`killedAt/killedBy/killReason`，删 pid 三字段 | kill 时 1 次 | `subagent-kill.ts#L506-L534`（`markKilled`） |
+| 8 | 僵尸终态 `failed`+`failure{kind:"zombie"}`+`endedAt`/`zombieReapedAt` | 看门狗判死 1 次（tmp+rename 原子写） | `subagent-zombie.ts#L369-L442`（`writeRecordAtomic` `#L219-L225`） |
+
+**终态覆盖会抹掉运行期字段（结构性，非偶发）**：#3/#4/#5 都是**读盘-改盘**（`readRecord`→改→`writeRecord`），而 #6 写的是**派发时的内存对象**（`index.ts#L4416` 的常量 `record`）——它从未被赋过 `pid`/`lastActivity`/`lastToolTurn`/`turnClock`，整份 `JSON.stringify(record)` 就把这些字段从盘上抹掉。唯一幸存者是 `recentCalls`，因为 `.then` 显式回写（`index.ts#L4448`）。
+
+现网实测（分母 153 份 run json，2026-10-22）：`pid`/`pidRecordedAt`/`pidCmdMarker`/`lastToolTurn`/`turnClock` 全部 **1/153**（仅那份被僵尸回收、finalize 没跑的记录有）；`lastActivity` **13/153**（12 cancelled + 1 zombie）；`status` 分布 `completed 122 / failed 19 / cancelled 12 / running 0`。⇒ **终态 run 无法回答「跑在哪个 pid / 最后活动时刻 / 最后回合是否空转」**，这些数据只在 running 期短暂存在于盘上。
+
+其余出现率：`recentCalls 152/153`、`model 146/153`（缺失 7 份全是老 `failed`）、`cwd 64/153`、`killReason 23/153`、`killAudit 12/153`。
+
+### 写盘瘦身 `slimRunRecordForDisk`（剥哪个字段）
+
+`index.ts#L2343-L2347`：仅当 `result.usageEvents` 非空时，把**磁盘那份**的 `result.usageEvents` 换成 `[]`；**只剥这一个字段**，不改内存对象（并行路径仍用内存事件做汇总）。`result.usage`（聚合）、`result.text`、`error`/`priorFailures`/`triedModels` 全部保留。
+
+实测（分母 153，2026-10-22 复核）：`result.usageEvents` 键 153/153 存在，**非空只有 78/153**；交叉校验「`usage.turns>0` 但事件空」= **55/153** ⇒ 这 55 份正是被瘦身清空的（turns>0 必然至少 1 个事件）。
+
+占盘比（78 份含事件的记录，**分母必须写清**——三个分母给出差异很大的读数）：
+
+| 分母 | min | median | max |
+|---|---|---|---|
+| 事件数组 ÷ **整个 run json** | **10.4%** | **41.5%** | **78.7%** |
+| 事件数组 ÷ `JSON.stringify(result)` | 16.9% | 58.4% | 88.9% |
+| 事件数组 ÷ (文件 − 事件数组) | 11.6% | 71.0% | 369.0% |
+
+最大单文件 `run_mvf26raa_9w5l.json`：93,563 B 中事件 **70,808 B（75.7%，261 条事件）**。
+
+> **旧读数 11.2% / 43.2% / 84.8% / 「76,288 B」已不可复现**（2026-10-22 全量重算，方法：`Buffer.byteLength(JSON.stringify(events))` 与 `statSync().size` 逐文件比对，以及「删键后重新序列化求差」双法交叉，两法一致）。同理 `extensions/index.ts#L2337` 注释里的「83–93% / 85KB 文件里 74.5KB」也**无法在现网 153 份上复现**（max 78.7%；真正的 93.5KB 文件事件为 70.8KB）——该数字来自 commit `0dfc70d`（2026-10-20）当时的 92 份样本，**未留可复现口径**，不应继续作为「实测」引用。
+
+**单事件被剥的代价可量化**：55 份被剥记录 `turns` 合计 **2,151**，按实测 **266 B/事件**（1,261,193 B ÷ 4,737 条）估 ⇒ 约 **572 KB** 逐轮明细已从盘上消失（≈ 现 3.12 MB 总量的 +18.3%）。**但 `turns` 聚合保留，账本能补明细**（见限制 9 的 join 约束）。
 
 ### 工具入口、签名与返回
 
@@ -87,7 +145,7 @@ kill 成功（非 preserveTerminal）后落盘：`status:"cancelled"` + `killedA
 
 ### 脉搏（lastActivity）
 
-`touchRunActivity` 由 async 派发的 `onUpdate` 心跳触发，但**只在距上次落盘 >5s 时写文件**（`ACTIVITY_PERSIST_INTERVAL_MS = 5_000`），因此 `list` 的 `idle` 有最多 5s 的粒度误差。它是「谁卡住」的唯一判据来源（`lastActivity` → `pidRecordedAt` → `startedAt` 逐级回退）。
+`touchRunActivity`（`subagent-kill.ts#L295-L311`）由 async 派发的 `onUpdate` 心跳触发，但**只在距上次落盘 >5s 时写文件**（`ACTIVITY_PERSIST_INTERVAL_MS = 5_000`），因此 `list` 的 `idle` 有最多 5s 的粒度误差。它是「谁卡住」的唯一判据来源（`lastActivity` → `pidRecordedAt` → `startedAt` 逐级回退）。
 
 ### config.json 未枚举顶层键的往返保留
 
@@ -172,6 +230,8 @@ provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
 
 ## 已知限制 / UNKNOWN
 
+0. **终态 run 丢失运行期字段**（2026-10-22 分母体检）：`pid`/`pidRecordedAt`/`pidCmdMarker`/`lastActivity`/`lastToolTurn`/`turnClock` 在 `.then` 整份覆盖时被抹掉（现网 1/153、1/153、1/153、13/153、1/153、1/153），只有 `recentCalls` 因显式回写幸存（152/153）。任何「从终态 run 反推 pid / 最后活动 / 最后回合」的读法都不可靠；耗时只能用 `result.durationMs`（终态 139/153 有），用量只能用 `result.usage`。
+
 1. **身份校验的容差窗口**（`[-5min, +3min]`）：监控 pid 在窗口外被重用必然拒杀；理论上 pid 在窗口内被重用、且新进程命令行恰好也含同一 marker（例如同一 PI CLI 脚本路径）时会误判为「同一进程」——未做压力实证，属**已知残余风险**，不是已证实的缺陷。
 2. **脱离进程树的孙进程可能漏杀**：Windows `taskkill /T` 沿父链枚举后代，若后代自行 `detached`/新建进程组、或父进程先退出导致 re-parent，该后代可能不在树内。POSIX 分支先杀进程组可缓解；Windows 无等价保证。**未实测**。
 3. **外部 CLI 后端未端到端**：`cli:claude`/`cli:codex`/`cli:agy`/`cli:atomcode`/`cli:zcode`/`cli:mimo` 已接 `onChildSpawn` 登记 pid + 走同一 `taskkill /T`，但本机未安装这些 CLI，**端到端集成测试未做**（仅 `smoke:extension-load` 覆盖接线）。
@@ -190,7 +250,12 @@ provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
      （属显式绕过人工路径的边界，非自动路径保证）。
    - **跨进程僵锁竞态未做受控交错测试**：Z3 仅烟雾级（两真进程竞争）；无「暂停 owner 跨 TTL」的
      确定性用例（第 5 代已无 TTL 接管路径，该用例随之失效并被删除）。
-8. **测试隔离纪律的已知缺口（非本控制面范围）**：`_test_async_panel.ts` 仍可经 `notifyAsyncCompletion` 弹真实 toast（可用 `PI_NOTIFY_DISABLE=1` 抑制，测试 runner 未统一设置）；`_test_readconfig_preserve_keys.ts` 会临时改写真实 `config.json` 字节（`finally` 还原，被 SIGKILL/硬超时打断的窗口内会留下夹具配置）。
+9. **`cancelled` 记录的 `result` 是占位体，且 join 键被写坏**（分母 12）：`applyKillOutcome`（`subagent-kill.ts#L369-L402`）与 `markKilled`（`#L506-L536`）用固定占位 `result`（`usage.turns:0`、无 `toolCallsCount`/`durationMs`/`requestedModel`/`triedModels`），实测 12/12 cancelled 的 `usage.turns==0`，0/12 有 `toolCallsCount`/`durationMs`/`requestedModel`。
+
+   **真因比「占位体」更严重：这两处的 `result.runId` 写的是文件名 id（`runId: record.id` / `runId: next.id`），而账本恒用 dispatch UUID**（`index.ts#L1757`）⇒ **kill 路径把 join 键写坏了**。实测账本里 `runId` 形如 `run_*` 的行数 = **0/118,984**（全是 UUID）；`result.runId == 文件名 id` 的 **13/153** 记录，恰好就是 **12 cancelled + 1 zombie failed**（`turns` 全为 0）。
+
+   **真实用量其实在账本里**（本轮新证据）：按 `[startedAt, killedAt]` ∩ 同 `agent` 匹配，**8/12** cancelled 有**唯一候选 UUID**（turns 合计 **173**，可无歧义恢复）；另 4/12 有 2–5 个候选 UUID（并发同 agent 派发）⇒ **时间窗 join 不可靠，必须存 join 键**。
+10. **测试隔离纪律的已知缺口（非本控制面范围）**：`_test_async_panel.ts` 仍可经 `notifyAsyncCompletion` 弹真实 toast（可用 `PI_NOTIFY_DISABLE=1` 抑制，测试 runner 未统一设置）；`_test_readconfig_preserve_keys.ts` 会临时改写真实 `config.json` 字节（`finally` 还原，被 SIGKILL/硬超时打断的窗口内会留下夹具配置）。
 
 ### 已实证（勿拔高、也勿贬低）
 
@@ -215,6 +280,63 @@ provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
 2. **U-POSIX**：在 Linux/macOS 上跑 `npm run test:subagent-kill` → 预期 `ALL PASS`，且日志/记录显示走 `killed tree:`（进程组 + 后代遍历）路径。
 3. **U-RESTART**：派发一个长 async run → 重启宿主 → `list` 仍应显示该 run（running）与 pid → `kill` 应安全树杀并落 `cancelled`。
 4. **反向误杀防护**：手工把某 run json 的 `pidCmdMarker` 改成不匹配值 → `kill` 应 `isError` + `code:"pid_reused"`，且目标进程**仍存活**。
+
+## 观测面现状（2026-10-22 勘察 + M1 收口）
+
+run json 的**外部读取面只有工具 `subagent-win`**（`action:"status"|"list"|"recent-calls"`），以及进程内 TUI 面板 `refreshAsyncPanel`（`extensions/async-panel.ts#L91`，`ASYNC_DONE_TTL_MS=30min`）。**runtime-host daemon 不提供任何 async run 端点**：
+
+- 全仓 `/v1/*` 路由集合（`server.ts#L1824-L2060` 的 `switch` + 正则分支）：`health` / `incidents` / `snapshot` / `events` / `attention` / `interactions` / `timeline` / `sessions` / `sessions/:id/{transcript,usage}` / `session-commands/:sid` / `session-busy/:sid` / `streaming/:sid` / `session-control/:sid` / `notify/:sid` / `autonomy/*` / `wechat/*` / `commands` / `challenge` / `bootstrap` / `uploads` / `events/stream`。**无 `/v1/subagent/*`、无 async 用量端点**。**校准（2026-10-22 M1 收口）**：本节其余文字是勘察轮（M1 落地前）的快照，其中两项已不成立 —— ① `/v1/runs` **已实现**（`extensions/runtime-host/server.ts` 的 `case "/v1/runs"`，契约页 [[异步 Run 卡片端点（GET /v1/runs）]]）；② `gui/src/**` 对 run 记录的引用数**不再是 0**（`gui/src/pages/RunsPage.tsx` + `gui/src/runsView.ts` + `gui/src/api/types.ts`）。
+- 唯一间接可见面：`/v1/health.delivery`（`server.ts#L644-L647` → 直扫 delivery 账本，给 `openIncidents`/`oldestAgeMs`/`byReason`/`stale`/`sampledAt`）与 `GET /v1/incidents`（`server.ts#L731-L760`）——每条带 `runId` + `eventId`，而 delivery 事件文件的 `terminalSnapshotPath` 直接指向 `~/.pi/agent/subagent-runs/<runId>.json`（实测 1751 个事件文件均如此）。
+- **`/v1/snapshot.runs` 不含 async run**：它是 journal 投影（`snapshot.ts#L85`），而 journal 仅由 tab 适配器写入（`adapters/tab-run.ts` 的 `tabDispatchToRuntimeEvent`/`tabResultToRuntimeEvent`，接线在 `index.ts#L3419-L3422`、`event-bus.ts#L244`）。`run://subagent/<runId>` 地址只有定义（`runtime/address.ts#L56 subagentRunAddress`），**全仓无生产者**。实测本机 journal 1459 行里 `run://` subject 377 个**全部是 `run://tab`**，`/v1/snapshot.runs` 212 条也全是 tab。
+
+⇒ 结论：要把 async run 搬上 GUI，**必须新增读取面**（新端点或扩展 `/v1/snapshot`）；数据底座够（`recentCalls` 带完整命令行摘要、`result.usage` 聚合齐全），缺的是终态保留的 pid/脉搏（见上文限制 0）与一个不依赖工具的只读出口。
+
+### GUI 侧消费量实测（2026-10-22，分母口径）
+
+`rg -n "subagent|recentCalls|recent-calls|tab-run|runs\[" gui/src` 命中 **2 行**，且两行都与运行态无关：
+
+1. `gui/src/api/types.ts:165` — `ProjectedRun` 的注释（提到「无 tab-runs phase/waiting 字段」）；
+2. `gui/src/pages/TopBar.tsx:118` — cwd 为空时的兜底显示字符串 `"subagent-win"`（仓库名，不是 subagent run）。
+
+更窄的精确词更干净：`subagent-runs` = **0**、`recentCalls` / `recent-calls` = **0**、`async` 相关的 run 列表/卡片组件 = **0**（`gui/src/pages/` 14 个页面中无任何一个渲染 async run）。
+
+⇒ **精确结论：GUI 没有任何界面在展示 subagent 的运行态，连计数/列表都没有。** 现有的「run 类」展示只有两处，都是 **tab**：
+- `gui/src/pages/WorkstreamPage.tsx:45` 读 `snapshot.runs`（= journal 投影的 tab run），按 `taskSelector.runSubjects` / `externalTaskId` 过滤后只渲染 `status` + `summary`（L225-L235）；
+- `gui/src/pages/AutonomyPage.tsx:71` 读 `/v1/autonomy/frontier` 的 `projects[].runs`（`Record<runId, phase>`，`frontier.ts#L142`/`#L469-L470`）只渲染 `runId → phase` 文本。
+
+tab 的运行态字段（`phase`/`turn`/`pid`/`heartbeatAt`/`currentToolStartedAt`）**同样不在** `/v1/snapshot.runs` 里——那里是 `RunView = ProjectedRun` 原样（`snapshot.ts#L86`），字段清单见 [[Tab 运行账本与运行态数据面]]。
+
+### 搬上 GUI 的五条路径 × 改动面（2026-10-22 实测评估）
+
+若要让 GUI 展示 async run，五条路径的**最小改动面**（行数为量级估计）。**校准（2026-10-22 M1 收口）：路径 (e) 已实现**（独立只读端点 `/v1/runs` + `listAsyncRunCards` 投影 + GUI RunsPage；契约与实测读数见 [[异步 Run 卡片端点（GET /v1/runs）]]），其余四条 (a)(b)(c)(d) 仍未实现：
+
+| # | 目标 | 关键写点 | 是否改落盘形状 | 量级 | 体积代价 |
+|---|---|---|---|---|---|
+| **a** | 终态保留 `pid`/`lastActivity`/`turnClock` | `.then` 里把 `writeFileSync(JSON.stringify(slimRunRecordForDisk(record)))` 换成 `mergeRunRecord(runId, patch, RUNS_DIR)`（`index.ts#L4457` / 并行 `#L4356`；`mergeRunRecord` 已有，`subagent-kill.ts#L327`） | **否**（字段已在 `AsyncRunRecord` 类型，`index.ts#L2285-L2308`，只是被抹掉） | +5~10 行（最小）/ +25~40（抽 `finalizeRunRecord` 两处共用） | +92 B/run ⇒ 153 份 +14 KB |
+| **b** | cancelled 的 `result` 占位体 | `applyKillOutcome`（`subagent-kill.ts#L389-L398`）与 `markKilled`（`#L518-L527`）改为**保留 prevResult** 的 `usage`/`usageEvents`/`runId`/`requestedModel` 等，只覆盖 `status/text(缺省)/error` | 最小做法**是**（顶层新增 `dispatchRunId?`）；最稳做法**否** | +3~6 行 / +20~35 行 | ≤ +100 B/run |
+| **c** | 逐事件用量回写 | `slimRunRecordForDisk`（`index.ts#L2343-L2347`）去掉勫身 / 或改成紧凑数组（`[ts,in,out,cacheRead,cacheWrite,cost]`）+ cap | **是** | −3 行（倒退优化）/ +20~30 行 | 全量恢复 +572 KB（+18.3%）；紧凑数组为全量的 **1/4.57** |
+| **d** | `/v1/snapshot.runs[]` 加 async run（journal 生产者） | 新增 adapter 照 `runtime/adapters/tab-run.ts` 形状 + 两处 `emitRuntimeEventOnce`（`journal.ts#L99-L103`），subject = `subagentRunAddress(runId)`（`address.ts#L56`，现**零生产者**） | **是**（journal append-only 新增 subject 族，0→N 不可逆） | +40~60 行 / +120~180 行 | journal 永久 +~402 KB；snapshot +80 KB（min-card）~ +354 KB（+recentCalls） |
+| **e** | 新只读端点直读 `subagent-runs/*.json` | `server.ts#L1824` 的 `switch` 加 `case "/v1/runs"`（或 `default:` 正则分支 `#L1978`）；复用 `subagent-kill.ts::listAsyncRunSummaries`（`#L405-L446`；**`DEFAULT_RUNS_DIR` 已被 runtime-host 侧 import**：`delivery-reconciler-loop.ts#L53` ⇒ 无新依赖无环） | **否**（纯读，零写盘） | +20~35 行 / +120~200 行 | 独立端点，**不增 `/v1/snapshot` 一字节**；min-card 153 条 ≈ **80 KB**（avg 525 B） |
+
+**优先级（成本/收益）：(e) > (a) > (b) > (c) > (d)**。关键依赖：**（a）是（b）的前置**——不先改 `.then`，任何新写入的 `dispatchRunId`/`pid` 仍会被整份覆盖抹掉。
+**为什么不做（d）**：journal 是 append-only 权威事实日志，为纯展示新增 subject 族（0 → N 永久留痕）成本/收益倒挂；
+且 `RunView = ProjectedRun` 原样，新增的 `run://subagent/*` 条目字段面与 tab 同形，`WorkstreamPage` 的过滤谓词（`taskSelector.runSubjects`/`externalTaskId`）**不会命中** ⇒ 不显示（无害但也无用）。
+
+### 塞进 `/v1/snapshot` 的体积量级（实测，分母=153 份 run json 真实内容）
+
+当前 `/v1/snapshot` 实测 **412,084 B / 21-38 ms**（5 连测；`runs` 212 条占 **81.2%** = 334,566 B，avg 1,578 B/run）。
+
+| 投影形态 | 153 条总字节 | 相对 412,084 | 合计 snapshot |
+|---|---|---|---|
+| 整份 run json 原样 | 3,121,268 | **+757.4%** | **3,451 KB** ❌ |
+| ProjectedRun 同形（`summary` ≤2048B） | 276,400 | +67.1% | 672 KB ⚠ |
+| **min-card**（subject/status/agent/title≤120/startedAt/usage） | **80,276** | **+19.5%** | **481 KB** ✅ |
+| min-card + `recentCalls` tail5 | 354,061 | +85.9% | 748 KB ⚠ |
+| 只取最近 **20** 条（running 优先，= 现 `listAsyncRunSummaries` 缺省 limit） | 6,874 | **+1.7%** | **409 KB** ✅✅ |
+
+⇒ **不要塞进 `/v1/snapshot`**：全量原样 = 3.4 MB（6s 轮询 ≈ 580 KB/s）；且 `buildRunsSection` 是同步投影（`snapshot.ts#L312-L328`），
+153 文件全读+parse 实测 **17.5–20.8 ms/拍**会阻塞事件循环。正确做法是 **（e）独立端点 + ETag/304 + 缺省 limit 20**。
+
 
 ## 与 steer 通道的口径对照（一致性检查）
 

@@ -2,16 +2,26 @@
 title: 子代理模型解析 / fallback 链 / 用量账本
 kind: concept
 status: current
-updated: 2026-10-18
+updated: 2026-10-22
 source_paths:
+  - extensions/index.ts#L858-L875
+  - extensions/index.ts#L2065-L2092
+  - extensions/index.ts#L2184-L2220
+  - extensions/runtime/session-usage.ts
+  - extensions/runtime-host/server.ts#L2042-L2057
+  - extensions/gc-cleaner.ts#L100-L122
   - extensions/index.ts#L427-L490
   - extensions/index.ts#L521-L546
   - extensions/index.ts#L633-L679
   - extensions/index.ts#L881-L915
   - extensions/index.ts#L1248-L1263
   - extensions/index.ts#L1274-L1420
-  - extensions/index.ts#L1560-L1608
-  - extensions/index.ts#L1709-L1747
+  - extensions/index.ts#L2035-L2092
+  - extensions/index.ts#L2184-L2220
+  - extensions/index.ts#L1757
+  - extensions/index.ts#L1603
+  - extensions/index.ts#L2343-L2347
+  - extensions/runner-argv.ts#L70
   - extensions/index.ts#L253-L254
   - extensions/index.ts#L258-L308
   - extensions/index.ts#L3137
@@ -85,12 +95,57 @@ source_paths:
 
 - 目录：`USAGE_DIR = process.env.PI_SUBAGENT_USAGE_DIR ?? ~/.pi/agent/subagent-usage`（`extensions/index.ts#L1428`）。
 - 按**本地日**切分文件：`localDayBounds` (`#L1439-L1447`) → `dailyUsagePath` = `<USAGE_DIR>/<YYYY-MM-DD>.jsonl`（`#L1449-L1452`）。
-- 写入 `recordUsage(agent, result)` (`extensions/index.ts#L1458-L1481`)：对 `result.usageEvents` 逐条 append。v2 行结构：
+- 写入 `recordUsage(agent, result)` (`extensions/index.ts#L2065-L2092`)：对 `result.usageEvents` 逐条 append。v2 行结构：
   `{version:2, id, runId, ts, agent, model, usage:{input, output, cacheRead, cacheWrite, cost, turns}}`。
-  每个事件按其**自身 assistant 消息 ts** 落到对应本地日文件（run 跨日也正确归属）。
-- 读取/聚合 `collectSubagentUsage(day)` (`extensions/index.ts#L1749-L1757`)：按事件 `id` 去重，按本地日 + UTC 命名 legacy 文件双读；产出 `UsageBucket{input,output,cacheRead,cacheWrite,cost,turns,count,byModel}`。`/today-usage` 消费。
-- 账本行读取已抽成公开 `readUsageRecords(day)` (`extensions/index.ts#L1709-L1747`)，`/today-usage` 与 `/tiers usage` 共用。
+  每个事件按其**自身 assistant 消息 ts** 落到对应本地日文件（run 跨日也正确归属）。事件为空时退一条 `${result.runId}:empty` 占位行（`#L2068-L2073`）。
+- **两个 id 体系并存（关键 join 约束）**：账本行的 `runId` 字段是 **`dispatchRunId = randomUUID()`**（`index.ts#L1757`，由 `withAllAttemptUsage` 赋给 `result.runId`，`#L1603`），**不是** run json 的文件名 `run_<ts>_<rand>`（`index.ts#L4414`）。实测（2026-10-22 复核，分母 153 份 run json）：`result.runId == 文件名 id` 仅 **13/153**（且这 13 份全是 12 cancelled + 1 zombie failed，`turns` 全为 0），不一致 **140/153**；按 `result.runId` join 账本命中 **140/153**，按文件名 id join **0/153**。单日样本：2026-10-21 账本 2334 行 / 81 distinct UUID，命中 run json **56/81**（其余是 run json 已被 gc）；2026-10-18 命中 5/78、2026-10-20 22/119、2026-10-22 2/19 —— 历史命中率随 gc 单调下降。⇒ 任何「把账本用量挂到 run json 记录」的 join **必须用 `result.runId`（UUID）**；且**账本里存在 `run_*` 形态的 `runId` 行数 = 0/118,984**（全部是 UUID）。
+- 读取/聚合 `collectSubagentUsage(day)` (`extensions/index.ts#L2222-L2230`)：按事件 `id` 去重，按本地日 + UTC 命名 legacy 文件双读；产出 `UsageBucket{input,output,cacheRead,cacheWrite,cost,turns,count,byModel}`。`/today-usage` 消费。
+- 账本行读取已抽成公开 `readUsageRecords(day)` (`extensions/index.ts#L2184-L2220`)，`/today-usage` 与 `/tiers usage` 共用。
+- **`cancelled` run 的 `result` 是占位体，且 join 键在 kill 路径被写坏**（见 [[异步 Run 控制面（list / kill）]] 限制 9）——其用量只能从账本读，而 `applyKillOutcome`/`markKilled` 把 `result.runId` 写成**文件名 id**（`run_*`）而非 dispatch UUID ⇒ **账本 join 必失败**（实测账本里 `run_*` 形态 `runId` 行数 = 0/118,984）。变通（时间窗 + agent 名）实测只能无歧义恢复 **8/12**（turns 173），另 4/12 有 2–5 个并发候选 ⇒ **必须存 join 键，不能靠时间窗**。
 - 注：账本行**不含 role/costTier 字段**——`collectSubagentUsage` 的聚合键仍只有 `model`；role×costTier 视角是 `/tiers usage` 的**读时 join**（见 §8）。
+- **账本不是 `/v1/sessions/:id/usage` 的同源不同口径，而是完全不同源不同口径**（易混淆，写清）：
+  - `/v1/sessions/:id/usage`（`server.ts#L2042-L2057` → `runtime/session-usage.ts::readSessionUsage`）读**会话 JSONL 尾部**，答的是「**当前轮次**上下文占用」（`tokens` 优先 provider `totalTokens`、`percent`、`cachePercent`）；
+  - 账本 / `result.usage` 答的是「**整个 run 的累计计费**」（`input/output/cacheRead/cacheWrite/cost/turns` 求和），无 `totalTokens`、无 `reasoning`。
+  - **对 async run 不能用 `/usage`**：async 子进程 `--no-session`（`runner-argv.ts#L70`）⇒ `SessionManager.inMemory` ⇒ **无会话文件** ⇒ `/v1/sessions/run_*/usage` 实测 **404 `no-session`**。⇒ GUI 要「这个 run 花了多少/每回合增量」，只有账本或 run json 的 `result.usageEvents` 两条来源。
+
+### 4.1 账本结构与体量（2026-10-22 全量实测）
+
+| 读数 | 值 |
+|---|---|
+| 文件数（本地日切分） | **78** |
+| 总行数 / 总字节 | **119,171 行** / 34,646,862 B |
+| 单行字节 min / q25 / **median** / q75 / p90 / max | 32 / 281 / **293** / 299 / 305 / 318（极窄 ⇒ 行体积由字段名常数决定） |
+| distinct `runId` | **3,959** |
+| 每 run 行数 min / **median** / max | 1 / **19** / **1,883**（avg 30.1） |
+| 坏行 / 重复 `id` | **0 / 0** |
+| `usage.turns` 分布 | `1` 占 **118,694（99.5%）**；`0` 占 189（`:empty` 占位行）；其余 2..N 共 76 取值 ⇒ **一行 = 一个 assistant 回合** |
+| legacy 行（无 `version`/`id`/`runId`） | **297** |
+
+**join 现实（分母 153 份 run json）**：`result.runId`（UUID）命中账本 **140/153**；文件名 id 命中 **0/153**。
+细看 13 份 miss：**12/12 cancelled + 1 zombie failed**，其 `turns` **全为 0**、只可能命中 `:empty` 占位行（实测 0 命中）。
+反向：`turns>0` 的 **133/133 全部命中真实明细行**；那 140 份的 `result.usage.turns` 与账本 `sum(usage.turns)` **140/140 完全相等**。
+
+**账本比 run json 长寿**：账本 3,959 distinct UUID vs run json 153 份（run json 被 `/subagent-gc` 按 48h mtime 删：`gc-cleaner.ts#L100-L122`，入口 `index.ts#L4839`）⇒ 账本是**更长期**的权威，run json 是**短期**的。
+
+### 4.2 `usageEvents` 的类型、体积与被剥的代价
+
+**类型**：`SubagentUsageEvent`（`extensions/index.ts#L867-L875`）= `{id, runId, ts, model?, usage}`；内嵌 `UsageSummary`（`#L858-L865`）= `{input, output, cacheRead, cacheWrite, cost, turns}`。
+**无可变长 payload**（无文本/工具名/参数）⇒ 体积由字段名常数决定，实测 **266.2 B/事件**（1,261,193 B ÷ 4,737 条）。
+
+**现网体量**（分母 = 153 份 run json）：`usageEvents` 键 **153/153** 存在，**非空 78/153**，`usage.turns>0 但事件空` **55/153**（= 已被剥）；
+事件条数 total **4,737**，每 run 中位 40 / max 261；事件数组单文件最大 **70,808 B（261 条）**。
+
+**被剥的代价可量化**：55 份被剥记录 `turns` 合计 **2,151** × 266 B ⇒ **约 572 KB** 逐轮明细已从盘上消失（≈ 现 3.12 MB 总量的 **+18.3%**）。
+`turns` 与事件数 **1:1**（实测 78 份非空记录 avg events/run 60.7 = avg turns/run 60.7）——这是「用 `turns` 反推已丢明细量」的前提。
+
+**引入动机**：`git log -S slimRunRecordForDisk` → 唯一 commit **`0dfc70d`**（2026-10-20），提交说明写的是「顺带（同日性能问题）… run json 里 usageEvents 占 83–93% 体积但**只读查询方从不使用**」。
+⇒ 这是**顺带性能优化**（`status/kill` 全量读目录的热读成本），不是安全/正确性要求；且「当时的读取方」≠「未来的读取方」——GUI 用量视图正是新的读取方。
+
+> **⚠ 注释里的占比数字已不可复现**：`extensions/index.ts#L2337` 注释写「**83–93%**：85KB 文件里 usageEvents 74.5KB」，
+> 实测 max 仅 **78.7%**；真正的 93.5KB 文件（`run_mvf26raa_9w5l.json`）事件为 **70,808 B**（且 76288/93563 也只得 81.5%）。
+> 三种分母全给：事件÷整个 run json = **10.4% / 41.5% / 78.7%**（min/median/max）；事件÷`JSON.stringify(result)` = 16.9% / 58.4% / 88.9%；
+> 事件÷(文件−事件) = 11.6% / 71.0% / 369.0%。**引用时必须写清分母**，否则读数差一倍。
+
 
 ### 5. 派发门（工具参数校验）现状
 
@@ -270,8 +325,12 @@ USAGE_CAP（套餐用量用尽）后的主 agent 指引已从旧的「switch mai
 - `extensions/index.ts#L384-L419` — `formatFailureForMainAgent`
 - `extensions/index.ts#L1248-L1263` — `costTierGate`（门 + enforce 灰度，纯函数）
 - `extensions/index.ts#L1274-L1420` — `runWithFallback` 候选集 + 无模型名门 / costTier 主门 / fallback 逐候选门（tried / priorFailures）
-- `extensions/index.ts#L1560-L1608` — `USAGE_DIR` / 按日切分 / `recordUsage`
-- `extensions/index.ts#L1709-L1747` — `readUsageRecords`；`#L1749-L1757` — `collectSubagentUsage`
+- `extensions/index.ts#L2035-L2092` — `USAGE_DIR`（`#L2035`）/ 按日切分（`localDayBounds` `#L2046` / `dailyUsagePath` `#L2056`）/ `recordUsage`（`#L2065-L2092`）
+- `extensions/index.ts#L2184-L2220` — `readUsageRecords`；`#L2222-L2230` — `collectSubagentUsage`
+- `extensions/index.ts#L1757` / `#L1603` — `dispatchRunId = randomUUID()`（账本 `runId` 口径）/ `withAllAttemptUsage` 赋 `result.runId`
+- `extensions/index.ts#L4414` — run json 文件名 id 口径（`run_<ts>_<rand>`），与账本 UUID **不同源**
+- `extensions/index.ts#L2343-L2347` — `slimRunRecordForDisk`（落盘剥 `result.usageEvents`）
+- `extensions/runner-argv.ts#L70` — `--no-session`（async 不产会话 JSONL ⇒ 账本是唯一逐轮明细）
 - `extensions/index.ts#L933` — `toolsSupportedForBackend` 派发门
 - `extensions/index.ts#L253-L254` — `AgentConfig.roleTier?`（裸透传）；`#L278` — `AgentConfig.costTier?{enforce?}`（裸透传）；`#L258-L308` — `readConfig` / `writeConfig`
 - `extensions/index.ts#L3137` — 工具参数 `allowTierEscalation`；`#L3399` — handler 身份门（`isMainSession()`）

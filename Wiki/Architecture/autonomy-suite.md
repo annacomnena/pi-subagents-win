@@ -2,7 +2,7 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-10-19
+updated: 2026-10-22
 source_paths:
   - extensions/runtime/autonomy/config.ts::normalizeAutonomy
   - extensions/runtime/autonomy/frontier.ts
@@ -177,6 +177,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 | 1 | 无账本条目（`!ledger`） | `NOT_MONITORED` |
 | 2 | `ledger.optOut === true` | `NOT_MONITORED`（静默留档：不问不动） |
 | 3 | `ledger.status === "paused"` | `PAUSED_USER` |
+| 3a | `tab.phase === "unconfirmed" ∧ tab.stop !== "aborted"`（RF-1，`frontier.ts#L378`） | `BLOCKED_USER`（兜底结果：回合结束但没 `tab-finish` ⇒ 需人核实；`aborted` 例外 = 主动中断，不属静默卡死） |
+| 3b | `tab.resultMissing === true ∧ mapPhaseToProjectState(tab.phase).terminal`（RF-1，`frontier.ts#L380`） | `BLOCKED_USER`（终态 phase 但 `result.json` 缺失 ⇒ **不得**伪装成 `DONE`） |
 | 4 | tab phase 终态 | `DONE`（等主会话关账） |
 | 5 | `needsHuman ∨ gate==="awaiting" ∨ attention>0` | `BLOCKED_USER`（提醒、不推动） |
 | 6 | `tab.stop === "error"` | `BLOCKED_USER`（需人介入重派） |
@@ -184,8 +186,10 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 | 8 | `phase==="waiting" ∧ idleMs 有限 ∧ idleMs > pushMs` | `STALLED` |
 | 9 | 其余 | `ACTIVE` |
 
+- 行号锚点（2026-10-22 校准）：上表 1–9 条件对应 `extensions/runtime/autonomy/frontier.ts#L364-L394`（函数体逐行：`L372` 无账本 / `L374` optOut / `L375` paused / `L378` RF-1 3a / `L380` RF-1 3b / `L381` 终态 / `L382` needsHuman∨gate∨attention / `L386` stop=error / `L387` toolUse 豁免 / `L393` STALLED / `L394` ACTIVE）；`VARIANT_RANK` `#L325`、`SUPERVISION_RANK` `#L328`。
+- 3a/3b（RF-1 两支）**必须先于** 4（终态→DONE）：否则「终态但没 result」会被判成 DONE（可以回收关账），把「没回报」伪装成「完成」。
 - `idleMs === null`（无 `state.lastActivityAt` 载体）**不得**当停滞（不猜）。
-- 阈值缺省 `SUPERVISION_THRESHOLDS` = SOFT 5min / PUSH 15min / USER 30min / HANG 60min，在 `supervision.ts` 与 `frontier.ts` 各存一份同源常量（frontier 零 IO 不得 import 该文件）。
+- 阈值缺省 `SUPERVISION_THRESHOLDS` = SOFT 5min / PUSH 15min / USER 30min / HANG 60min，在 `supervision.ts#L48` 与 `frontier.ts#L86` 各存一份同源常量（frontier 零 IO 不得 import 该文件）。
 - 项目级取**最严重**一个 tab 的派生（`SUPERVISION_RANK`）；`ProjectFrontier.stagnation` 判据**未变**，仍是 `supervision.state === "STALLED"`（brief 明令一字不动）。
 
 #### `blocked_overdue`：与 `stagnation` 正交的超龄提醒载体（trigger ⑨b）
@@ -302,7 +306,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 | 侧 | 判据 | 源码 |
 |---|---|---|
-| `frontier` → `BLOCKED_USER`（P0 定稿，**未改**） | `tab.needsHuman` ∨ `gate==="awaiting"` ∨ `attention>0`，再 ∨ `stop==="error"`；而 `tab.needsHuman = reclaim === "awaitingInput" \|\| gate === "awaiting"`（**广义 reclaim**） | `frontier-carriers.ts:338` → `frontier.ts:329-331` |
+| `frontier` → `BLOCKED_USER`（P0 定稿，**未改**） | `tab.needsHuman` ∨ `gate==="awaiting"` ∨ `attention>0`，再 ∨ `stop==="error"`；而 `tab.needsHuman = reclaim === "awaitingInput" \|\| gate === "awaiting"`（**广义 reclaim**） | `frontier-carriers.ts#L301-L314`（`return` 在 `#L313`）→ `frontier.ts#L382`（2026-10-22 校准；旧引 `frontier-carriers.ts:338` / `frontier.ts:329-331` 已漂移） |
 | `supervise-push` → `needs-human`（**两次收窄**） | ① `gate === "awaiting"` ∨ `attention > 0`；② **或** `stop === "error" ∧ pushesThisEpoch >= 1`（**不含 `awaitingInput`**；`stop=error` 首推放行） | `supervision-runtime.ts::evaluatePushGuards` 门 4 / 4b |
 
 理由（关键）：`tab-runs-runtime.ts::classifyForReclaim`（`:541-551`）把 `phase === "waiting"` 映射成 `awaitingInput`，而 **`waiting` 正是已 `agent_settled` 的 idle tab 的形状 = STALLED 的形状**。若把 `awaitingInput` 计入 `needs-human`，则**真实 idle tab 恒被拒** ⇒ `STALLED` 永不触发 ⇒ P1 核心交付在真实盘面完全不可用（已用独立探针实测证明：把聚合改回含 `awaitingInput` 后，真实端到端成功用例实红且命中预期断言）。
@@ -322,7 +326,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **为什么从 `failed` 拆出**（不是措辞洁癖）：`failed` 的语义是「已失败 ⇒ **可以另起新 tab**」；而 unconfirmed 只说明「这回合 settle 了、成果未声明」——tab 可能只是**中途停下**，成果真实存在（SBS-B1 的 commit 是真的）。归 `failed` 会通过 event-bus 的 reclaim 编排诱导主会话「失败 ⇒ 另派」，与**可能复活的原 tab 双写竞争**（两个 tab 改同一批文件）。
 - **消费点**（口径一致，全部新增该组）：`reclaim-tabs` 的返回分组 `details.unconfirmed[]` + `summary`（`unconfirmed=N`）+ `renderResult` 分组 + 工具 description；`failed` 组退化为「真失败 + 派发失败（`launch_failed`）」。
 - **文案硬约束**：unconfirmed 分组正文**不得**含「重派 / rerun / re-run / 重启 / retry」——改用「另派**同一任务**」+「先读该 tab 的交付物/计划文件再决定」。理由同拆分理由：正文出现「重派」就等于在建议另起新 tab。`_test_tab_runs_runtime` 有禁词正则断言。
-- **`needsHuman` 刻意不含 `unconfirmed`**（`frontier-carriers.ts:338`：`needsHuman = reclaim === "awaitingInput" || gate === "awaiting"`）：若把 unconfirmed 纳入，unconfirmed tab 会命中 `supervise-push` 的 `needs-human` 门 ⇒ **与门 3（terminal）修复互相抵消**（门 3 刚放开「兜底 unconfirmed 不挡推」，门 4 又用 needs-human 挡回）。这是**刻意口径**，不是漏改。
+- **`needsHuman` 刻意不含 `unconfirmed`**（`frontier-carriers.ts#L313`：`needsHuman = reclaim === "awaitingInput" || gate === "awaiting"`）：若把 unconfirmed 纳入，unconfirmed tab 会命中 `supervise-push` 的 `needs-human` 门 ⇒ **与门 3（terminal）修复互相抵消**（门 3 刚放开「兜底 unconfirmed 不挡推」，门 4 又用 needs-human 挡回）。这是**刻意口径**，不是漏改。
 - **兜底 unconfirmed 的 `attention:true`**（`frontier-carriers.ts:203`）会让该仓 attention > 0 ⇒ 同仓所有受监管 tab 派生 `BLOCKED_USER`（六态规则 5）⇒ `STALLED` 不可达。这正是 `writeSettlementFallback` 必须有**常驻身份豁免**的原因（见下条），而不是靠 frontier 侧放宽。
 
 #### 兜底写入的常驻身份豁免（`writeSettlementFallback`，`tab-runs-runtime.ts:105-131`）
@@ -396,7 +400,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **`GET /v1/autonomy/frontier`（只读）**（`extensions/runtime-host/server.ts:1264`）：与 status/set 同一授权档（`authorizeCommand`，未认证 401）；只调 `readFrontierSnapshot({ stateDir })`——**读盘即返回完整 `FrontierSnapshot`，不重计算、零写入**；快照缺失/坏 JSON/字段漂移 → `200 null`（客户端据此区分「无文件」与「0 项目基线帧」）；仅 GET，其余方法 405。`/v1/autonomy/status` 形状未改（向后兼容）。
 - **GUI 第 6 section**：`RuntimeOverlaySection` 六值 union（`gui/src/store.ts:38`：attention/master/workstream/runtime/wechat/**autonomy**），`RuntimeOverlay` SECTIONS 表新增「主动性」（Activity 图标，`gui/src/pages/RuntimeOverlay.tsx:28-35`），`runtimeOverlay === "autonomy"` 打开即定位该 section；覆盖层页内容 = `gui/src/pages/AutonomyPage.tsx`：
   - `AutonomySettings`（总门开关）——**自微信连接页（ChannelsPage）整体迁出**，ChannelsPage 零引用；开关行为/API 逐字不变（`GET /v1/autonomy/status` + `POST /v1/autonomy/set`）。迁出后卡片不再位于任何带 401/403 早退分支的页内 → 默认配置与未认证/无权限各态下开关均可见（D17 可达性由此结构性保证，非逐分支补钉）。仍保留诚实文案（现文见「动作面」节 GUI 条目）与 `awayMode`「未实现（保留字段），不提供开关」。
-  - `FrontierViz`（frontier 可视化，`api.autonomyFrontier()`，**5s 轮询**，`gui/src/api/client.ts:147`）三块：**C 快照时效**（`asof` 相对时间 + `baseline` 首帧徽标 + 项目/触发计数）、**A 项目状态矩阵**（每项目 state+variant / needsUser 高亮 / gate / resultMissing / stagnation / overdue / runs 明细）、**B 触发记录表**（rule/project/evidence，`approximate` 降透明度 + 「近似」徽标）。状态语义：`snap===undefined` 加载中、`null` → 「快照尚未生成（autonomy 未启用，或尚未完成首次 tick）」；读失败显示可恢复错误、保留最近快照（不留永久加载态）；`gate:"unknown"` 呈中性「未知」（与 watchdog 3/8 恒 unknown 同款“不猜”语义）。零图表库（Badge/Card 手写）。
+  - `FrontierViz`（frontier 可视化，`api.autonomyFrontier()`，**5s 轮询**，`gui/src/api/client.ts#L155` + `gui/src/pages/AutonomyPage.tsx#L126`）三块：**C 快照时效**（`asof` 相对时间 + `baseline` 首帧徽标 + 项目/触发计数）、**A 项目状态矩阵**（每项目 state+variant / needsUser 高亮 / gate / resultMissing / stagnation / overdue / runs 明细）、**B 触发记录表**（rule/project/evidence，`approximate` 降透明度 + 「近似」徽标）。状态语义：`snap===undefined` 加载中、`null` → 「快照尚未生成（autonomy 未启用，或尚未完成首次 tick）」；读失败显示可恢复错误、保留最近快照（不留永久加载态）；`gate:"unknown"` 呈中性「未知」（与 watchdog 3/8 恒 unknown 同款“不猜”语义）。零图表库（Badge/Card 手写）。
+  - **GUI 侧消费缺口（2026-10-22 实测分母）**：`ProjectFrontier` 服务端还有 `supervision{state,idleMs,epochPushes}`（`frontier.ts#L132-L185`）/ `blockedOverdue` / `blockedOverdueRunId(s)` 四组字段，但 `gui/src/api/types.ts#L727-L739` 的 `ProjectFrontier` 手抄**未包含**它们（`rg 'supervision|blockedOverdue|epochPushes|idleMs' gui/src` 命中 **0**）⇒ 六态机/超龄提醒这两个已实现判定，GUI 当前完全看不到（`stagnation` 只是 `supervision.state==="STALLED"` 的一个布尔投影，命中 5 处）。
 
 ### A3 awayMode 空壳
 `autonomy.awayMode.enabled` 被解析但**无任何生产消费者** ⇒ 保留字段但 GUI 明确标注"未实现（保留字段）"，且**不提供开关**（不让界面出现按了没反应的按钮）。
@@ -407,7 +412,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 
 ## Evidence
 
-- **P1 主动推动 + 三处修正（`2a4024a` + 后续 commit，2026-10-18 实测）**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`）→ **all 71 checks passed**（七条拒绝路径逐条 + 门 4b `stop=error` 首推放行 + `io-error` 两条 + 模板逐字 + 预算/读侧重置 + `buildWakePrompt` 第三参 undefined/[] 与手写冻结字面量逐字节相等 + 工具注册与身份门 + 真实 `writeTabState(waiting)` 端到端成功 + 相位自动选档三例 + `evaluateWakes` 真派发监管块两例 + **第 10 组跨提交交互**：10(a) `stop=error ∧ result={status:"unconfirmed",autoGenerated:true} ∧ pushesThisEpoch=0` ⇒ `ok:true` + steer 真落盘 + `pushes=1`（夹具先经 `composeTabStatus` 断言 phase=unconfirmed/terminal=false，确保形状真实）、10(b) 对照 `result={status:"completed"}` ⇒ 仍拒 `terminal` 且不落 steer）；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks passed**；`npm run test:autonomy-actions` → **87 checks passed**；`npm run test:model-retry` → **8 组**；`npm run test:model-failure-classify` → **3 组**；`npm run test:runtime-wake` → all assertions passed。源码：`extensions/supervision-runtime.ts::{evaluatePushGuards,pushTemplate,supervisePush,registerSupervisionTools,countPushes,clampMaxPushes}`、`extensions/runtime/wake.ts::{buildWakePrompt,deriveSupervisionItems,WakeSupervisionItem}`、`extensions/tab-runs.ts::TabState.currentToolStartedAt` + `extensions/tab-runs-runtime.ts#L96-L107`、接线 `extensions/index.ts#L2543`。**接线变异验证**（69 checks 基线时执行）：将 `buildWakePrompt(ws, letters, supervision)` 变异回两参 ⇒ 监管块断言实红（1 failed / 68 passed），字节级还原后 sha256 一致 ⇒ 断言确实经由真实接线而非直调纯函数。**口径差异的证据链**：`needs-human` 含 `awaitingInput` 时真实端到端成功用例实红（命中预期断言，8 组）⇒ 第一次收窄为 `gate==="awaiting" ∨ attention>0`；随后 `stop="error"` 移出 `needsHuman`、由门 4b（`pushesThisEpoch>=1` 才升 needs-human）单独判定 ⇒ 第二次收窄。`frontier-carriers.ts:338` / `frontier.ts:329-331` 的 P0 广义 reclaim 判据**零改动**。
+- **P1 主动推动 + 三处修正（`2a4024a` + 后续 commit，2026-10-18 实测）**：`npm run test:supervision-push`（`extensions/_test_runtime_supervision_push.ts`）→ **all 71 checks passed**（七条拒绝路径逐条 + 门 4b `stop=error` 首推放行 + `io-error` 两条 + 模板逐字 + 预算/读侧重置 + `buildWakePrompt` 第三参 undefined/[] 与手写冻结字面量逐字节相等 + 工具注册与身份门 + 真实 `writeTabState(waiting)` 端到端成功 + 相位自动选档三例 + `evaluateWakes` 真派发监管块两例 + **第 10 组跨提交交互**：10(a) `stop=error ∧ result={status:"unconfirmed",autoGenerated:true} ∧ pushesThisEpoch=0` ⇒ `ok:true` + steer 真落盘 + `pushes=1`（夹具先经 `composeTabStatus` 断言 phase=unconfirmed/terminal=false，确保形状真实）、10(b) 对照 `result={status:"completed"}` ⇒ 仍拒 `terminal` 且不落 steer）；`npx tsx extensions/_test_runtime_autonomy.ts` → **66 checks passed**；`npm run test:autonomy-actions` → **87 checks passed**；`npm run test:model-retry` → **8 组**；`npm run test:model-failure-classify` → **3 组**；`npm run test:runtime-wake` → all assertions passed。源码：`extensions/supervision-runtime.ts::{evaluatePushGuards,pushTemplate,supervisePush,registerSupervisionTools,countPushes,clampMaxPushes}`、`extensions/runtime/wake.ts::{buildWakePrompt,deriveSupervisionItems,WakeSupervisionItem}`、`extensions/tab-runs.ts::TabState.currentToolStartedAt` + `extensions/tab-runs-runtime.ts#L96-L107`、接线 `extensions/index.ts#L2543`。**接线变异验证**（69 checks 基线时执行）：将 `buildWakePrompt(ws, letters, supervision)` 变异回两参 ⇒ 监管块断言实红（1 failed / 68 passed），字节级还原后 sha256 一致 ⇒ 断言确实经由真实接线而非直调纯函数。**口径差异的证据链**：`needs-human` 含 `awaitingInput` 时真实端到端成功用例实红（命中预期断言，8 组）⇒ 第一次收窄为 `gate==="awaiting" ∨ attention>0`；随后 `stop="error"` 移出 `needsHuman`、由门 4b（`pushesThisEpoch>=1` 才升 needs-human）单独判定 ⇒ 第二次收窄。`frontier-carriers.ts:313` / `frontier.ts:382` 的 P0 广义 reclaim 判据**零改动**。
 
 - **兜底 unconfirmed 三处契约（2026-10-18 实测，`6dc1821`）**：`npm run test:supervision-push` → **all 71 checks passed**（新增第 10 组 2 条：兜底 unconfirmed 首推放行 + completed 对照）；`npx tsx extensions/_test_tab_report_fallback.ts` → **all 37 checks passed**（新增第 10 组 4 条：`lms-*` / `master-*` 经真实 `agent_settled` 不写 result、普通 taskId 对照仍写、函数级 `skip-persistent-identity` 且未落盘）；`npx tsx extensions/_test_tab_runs_runtime.ts` → passed（新增 `classifyForReclaim(phase:"unconfirmed") === "unconfirmed"`、`launch_failed` 仍归 failed、以及经 `registerTabStatusTools` 真实工具入口的 `details.unconfirmed` 分组 / `summary unconfirmed=N` / 「核实」文案 / 禁词正则 `/重派|rerun|re-run|重启|retry/i` 断言）。源码：`extensions/supervision-runtime.ts:413-414`、`extensions/tab-runs-runtime.ts::{writeSettlementFallback(SettlementFallbackOutcome),classifyForReclaim}`、`extensions/tab-runs.ts::{validateTabResult,composeTabStatus,isUnconfirmedFallback}`、`extensions/runtime/frontier-carriers.ts:203/338`。未闭合：`master-` 前缀为命名约定、`unconfirmed` 桶只解决误导重派（不解决「谁来核实」）、`_test_graph_carriers`/`_test_frontier_attention_window` 在基线即为红（frontier 面未改）。
 - **监管账本默认开启（2026-10-18 实测）**：`npx tsx extensions/_test_runtime_supervision_default_on.ts` → **all 26 checks passed**（自动登记两接线点 / `optout` 与 `off` 语义 / `stop=error→BLOCKED_USER` 不限 phase / 重复登记不清 optOut / 用法串含 optout）；`npx tsx extensions/_test_runtime_autonomy.ts` → **all 66 checks passed**（SUP-P0 六态组未回归）；`npm run test:autonomy-actions` → **all 87 checks passed**；`npm run smoke:extension-load` → extension load OK；`npm run test:master-dispatch` → **# pass 16**。源码：`extensions/runtime/supervision.ts::{autoRegisterDispatchedTabs,setSupervisionStatus,setSupervisionOptOut,handleSuperviseCommand}`、`extensions/runtime/autonomy/frontier.ts::deriveTabSupervisionState`、`extensions/runtime/autonomy/collect.ts::readSupervisionInputs`、接线 `extensions/index.ts`（launch-tabs execute + `dispatchTab` 闭包）、`extensions/master-tools.ts#L731`；phase 派生 `extensions/tab-runs.ts#L356-L369`（`error|aborted → unconfirmed`）。

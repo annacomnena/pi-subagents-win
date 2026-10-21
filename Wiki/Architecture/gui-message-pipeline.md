@@ -2,9 +2,10 @@
 title: GUI 消息管道与延迟贡献项
 kind: concept
 status: current
-updated: 2026-10-21
+updated: 2026-10-22
 source_paths:
   - gui/src/useEventStream.ts
+  - gui/src/usePoll.ts
   - extensions/runtime/transcript.ts
   - extensions/runtime/commands-snapshot.ts
   - extensions/runtime/builtin-cmd-bridge.ts
@@ -17,6 +18,8 @@ source_paths:
   - extensions/runtime-host/commands.ts
   - extensions/runtime-host/server.ts
   - extensions/runtime-host/ws.ts
+  - extensions/subagent-kill.ts
+  - extensions/runtime/address.ts
   - extensions/outbox-bridge.ts
 ---
 
@@ -114,6 +117,22 @@ snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，�
    - **fail-closed 语义**：400 时零写盘（outbox / commands 状态均不动）；合法 UTF-8 路径显式 `ignoreBOM:true`，与旧 `Buffer.toString("utf8")` 逐字节同轨（含 BOM）。零新依赖（Node 内置 TextDecoder）。
    - 接线：`extensions/runtime-host/server.ts` 的 `/v1/commands`（`#L642`）与 challenge（`#L748`），按 `content-type` 的 charset 分派。
 2. **WS `OP_TEXT` 帧** — `extensions/runtime-host/ws.ts` 严格 UTF-8（`ignoreBOM:true`）；非法帧 → `close(1007, "invalid-utf8")` 且**不投 `onText`**（RFC 6455 §8.1：文本帧必须是合法 UTF-8）。
+
+## 实时性通道选择（2026-10-22 勘察：GUI 展示「运行中」对象的三条候选）
+
+GUI 要让任意「运行中的东西」可见，**只有三条通道**，它们的基础设施成熟度差一个量级（下表所有读数均本轮实测）：
+
+| # | 通道 | 现有基础设施（file:line） | 复用成本 | 已知限制（实测） |
+|---|---|---|---|---|
+| 1 | **HTTP 读投影**（`/v1/snapshot`、`/v1/sessions`、`/v1/autonomy/frontier`…） | 轮询编排 `gui/src/App.tsx:32-61`；`usePoll(effect, intervalMs, enabled)` 三参（`gui/src/usePoll.ts:12`，`visibilitychange` 暂停 + busy 门）；ETag/304 客户端缓存 `gui/src/api/client.ts:62-68,71-110`；服务端 `server.ts:891-908` + 接入 `:1841-1859`(snapshot) / `:1960-1963`(sessions) | **最低**：新增一个 `pollXxx` + `api.xxx()` 即上线，**零协议改动** | ① `/v1/snapshot` 实测 **421,151 B / 37 ms**（5 连测取一），其中 **`runs` 212 条占 338,184 B = 80.3%**（timeline 61,886 / runtime 18,466 / attention 712）；② 6s 档 ⇒ 观感延迟均值 +3s；③ `runs[]` **无 phase/turn/pid/heartbeatAt**（`gui/src/api/types.ts:165-188` 只有 dispatch/terminal 字段）；④ ~~无任何 async run 端点~~ **校准（2026-10-22 M1 收口）：`/v1/runs` 已实现**（`server.ts` 的 `case "/v1/runs"`，投影 `subagent-kill.ts::listAsyncRunCards`，GUI 侧 `RunsPage.tsx` 自建 5s `setInterval` 轮询 + ETag/304；契约页 [[异步 Run 卡片端点（GET /v1/runs）]]）——勘察轮写下该行时（M1 落地前）`grep '"/v1/runs'` 确为 0 命中，本行其余读数（snapshot 体积/延迟/`runs[]` 无 phase 字段）未变 |
+| 2 | **WS 主题增量**（`/v1/events/stream`） | 单升级路径 `extensions/runtime-host/ws.ts:81`（`WS_PATH`）、订阅分派 `ws.ts:678-701`（`journal` / `outbox` / `interactions` / `transcript:<sid>`，**其它一律 `unknown-topic`**）；统一 tail tick `ws.ts:811-829`（`tailMs ?? 250`）；客户端 hook `gui/src/useEventStream.ts:36`（1→10s 退避重连 + `onOpen` 强制 resync）+ 帧路由 `gui/src/store.ts:869-960` | **中**：要新主题得同时改服务端 `ws.ts` 与客户端 store 帧路由；**已有** `journal` 主题的 envelope 增量不需服务端改动（只要新事件进 journal） | ① **250ms tick 是下限**（`ws.ts:813`），但对毫秒级中间态仍会被合并；② journal 当前 **`run://` subject 377/377 全是 `run://tab`，`run://subagent/*` 全仓零生产者**（`subagentRunAddress` 仅定义在 `extensions/runtime/address.ts:56`，仅测试引用）；③ `journal` 主题**只在 ChatPage 有活跃会话时订阅**（`gui/src/pages/ChatPage.tsx:729-730` `enabled: activeId !== null`，订阅列表 `:752-765`）⇒ 非会话页拿不到增量 |
+| 3 | **短轮询新端点**（如 `/v1/runs`） | 同上 HTTP 栈；范例：`AutonomyPage` 自建 `setInterval(refresh, 5000)`（`gui/src/pages/AutonomyPage.tsx:116,126`），不走全局 `usePoll` | **最低**（新增端点后即插即用） | 体积最小（153 份 run json 的 min-card 实测 ≈ 80 KB，avg 525 B）；但**仍要新建端点**，且它不解决「毫秒级中间态」问题（数据源本身 ≤1 次/5s 节流：`RECENT_CALLS_PERSIST_INTERVAL_MS = 5_000`，`extensions/subagent-kill.ts:132`；脉搏 `ACTIVITY_PERSIST_INTERVAL_MS = 5_000`，`:130`） |
+
+**结论（通道选型的硬约束，不是偏好）**：
+
+- 想展示的是**「每个对象的状态快照」** ⇒ 通道 1/3（HTTP 读投影）；想展示的是**「刚刚发生了什么」** ⇒ 通道 2（journal）。两者不是替代关系。
+- **不要往 `/v1/snapshot` 里塞 async run**：实测 `runs` 已占 80.3%，再塞 153 条整份 run json = +757%（3.4 MB / 6s ≈ 580 KB/s）；且 `buildRunsSection` 是同步投影（`extensions/runtime-host/snapshot.ts:312-328`），全量读 153 文件实测 17.5–20.8 ms/拍会阻塞事件循环。
+- **WS 通道有「订阅活着才有增量」的前置条件**：`journal` 订阅现在绑在 ChatPage 上（见上表②），要把运行态放非会话页（覆盖层/左栏）就必须先把订阅提升到 App 级 —— 那是**已有 hook 复用**（`useEventStream` 无页面耦合），不是重写。
 
 ## 实测证据（C1 实验，257 次采样）
 

@@ -2,9 +2,10 @@
 title: Runtime Daemon 架构
 kind: concept
 status: draft
-updated: 2026-09-23
+updated: 2026-10-22
 source_paths:
   - extensions/runtime-host/server.ts#L1-L51
+  - extensions/runtime-host/server.ts#L1824-L2060
   - extensions/runtime-host/daemon-lifecycle.ts#L1-L30
   - plans/0923_runtime_daemon_final_plan.md
 ---
@@ -67,6 +68,39 @@ ode.exe` 的 WT 窗口）。
 **验证**：重启后可见控制台窗口数 **4 → 3**（daemon 窗口消失），daemon 存活（`/v1/health` 200）、worker 正常 spawn 且**无新增窗口**；worker 只有 1 个（`worker.json` pid 与 daemon 子进程一致）。
 
 **教训**：`windowsHide` 与 `detached` 的兼容性**必须按"本进程 + 它的子进程"两层分别实测**，不能靠一次探针或历史注释外推。
+
+## HTTP 端点全量清单（2026-10-22 按 `switch` + 正则分支逐条核对）
+
+**读端点全部只读纯投影，写侧唯一入口是 `POST /v1/commands`**（其余写路径仅 bootstrap/challenge/uploads/wechat/autonomy 这几个受 token 约束的窄口，`server.ts#L1822` 的非 GET 统一 405）。
+
+| 端点 | 数据源 | 备注 |
+|---|---|---|
+| `GET /v1/health` | `buildHealthView`（`#L355-L858`） | 段：`host / master / masterOwnerAlive / sessionHeartbeats / journalTail / mailboxPending / memory / wechat / delivery`；段级 never-throw |
+| `GET /v1/incidents` | `buildIncidentsView`（`#L731-L760`） | 未 ack 的交付失败账本，带 `ageMs`（R-2.2） |
+| `GET /v1/snapshot` | `buildSnapshotView`（`#L861-L884`）→ `snapshot.ts::buildRuntimeSnapshot` | journal 全量 rebuild 投影；ETag 排除 `generatedAt`（`#L1849-L1859`）；实测 **412,084 B / 21-38 ms**（5 连测，2026-10-22）；`runs` 212 条全为 `run://tab`（`executionKind` tab 211 + undefined 1）；**占响应体 81.2%**（334,566 B；各段：timeline 14.5% / runtime 3.6% / master 0.3% / attention 0.2% / workstreams 0.1%）。`runs[].summary` 单项就占 46.6%（155,912 B），`openIssues` 12.6% / `artifacts` 9.7%；avg **1,578 B/run** |
+| `GET /v1/events?after&type&limit` | journal raw 透传（`#L1861-L1878`） | 非法 cursor → 409 `cursor-invalid` + `resync:true` |
+| `GET /v1/attention?includeResolved` | `buildAttentionItems` | |
+| `GET /v1/interactions` | `buildInteractions` | 只读重算，决策仍走 `/v1/commands` |
+| `GET /v1/timeline?limit&before` | `buildTimelineItems` | 默认 200，at 升序 |
+| `GET /v1/sessions` | `listPiSessions` + `resolveSessionTitles` + `computeSessionPinFlags` | 带 ETag |
+| `GET /v1/runs?limit&includeRecentCalls` | `subagent-kill.ts::listAsyncRunCards`（async subagent run json 的只读卡片投影，`runsDir` 可注入） | 2026-10-22 新增（M1）。三态 `liveness=alive\|dead\|unknown`（缺 pid ⇒ unknown，**不猜**；表内竖线已转义，勿删反斜杠）；`limit` 缺省 50/上限 200、截断在排序后；`includeRecentCalls=1` 才带 `recentCalls`(≤3)+`loopVerdict`；ETag 排除 `asof`；纯读零写盘。契约页 [[异步 Run 卡片端点（GET /v1/runs）]] |
+| `GET /v1/sessions/:id/transcript?after&tail` | `transcript.ts` 投影（与 WS 同核） | `tail=N` 走尾部字节窗；唯一能看「现在在哪一步」的面（`toolCall` 行带 `status: running\|done\|error`） |
+| `GET /v1/sessions/:id/usage` | `readSessionUsage`（`runtime/session-usage.ts`）+ `readLiveness().windowTokens` | 取不到窗口 ⇒ `percent:null`（不猜） |
+| `GET /v1/session-commands/:sid` | `state/commands/<sid>.json` | 陈旧超 `COMMANDS_STALE_MS` → 404 |
+| `GET /v1/session-busy/:sid` | `state/session-busy/<sid>.json` | 忙=200 / 空闲或陈旧=404 |
+| `GET /v1/streaming/:sid` | `state/streaming/<sid>.json` | 陈旧 → 404（`STREAMING_STALE_MS=60_000`，`server.ts#L533`；端点 `#L2005-L2012`）。`kind` 仅 `reasoning\|text`（**无 tool args**，写端 `streaming-snapshot.ts#L202` 显式拒收 `toolcall_delta`）；写端节流 `STREAMING_FLUSH_MS=150`（`#L34`）。**async run 恒不可用**：其 `sid` 是 pi sessionId，而子进程 `--no-session` ⇒ `SessionManager.inMemory` ⇒ 无可寻址会话 |
+| `GET /v1/session-control/:sid` | `state/session-control/` 最近一条 | 无请求 → 404 |
+| `GET /v1/notify/:sid?after` | `readNotify`（字节 offset 增量） | 只读一个天文件 |
+| `GET /v1/autonomy/{status,frontier}` · `POST /v1/autonomy/set` | autonomy state / frontier.json | |
+| `WS /v1/events/stream` | journal + transcript + outbox + interactions 四主题多路复用（`ws.ts`） | 唯一升级路径 |
+| `POST /v1/commands` · `POST /v1/challenge` · `POST /v1/bootstrap` · `GET /v1/bootstrap/exchange` · `POST /v1/uploads` | command-executor / master-injection | 均 fail-closed 鉴权 |
+| `/v1/wechat/*` | 绑定/开关/worker 状态/inbox | 5 绑定端点 + enable/disable + 只读状态 |
+
+**已知不对称（值得注意）**：`/v1/snapshot.runs` 只含 **tab run**（journal 投影，`snapshot.ts#L85`），且只是 `ProjectedRun` 原样（`snapshot.ts#L86`）——**tab 的运行态字段（`phase`/`turn`/`pid`/`heartbeatAt`/`currentToolStartedAt`）一个都不在其中**，它们在 `tab-runs/<runId>.state.json` 里而 **daemon 没有直读它的端点**（详见 [[Tab 运行账本与运行态数据面]]）。async subagent 的 run json 现已有**一个**只读端点 `/v1/runs`（2026-10-22 M1，见上表；契约页 [[异步 Run 卡片端点（GET /v1/runs）]]）；此外 `/v1/health.delivery` 与 `/v1/incidents` 仍能间接看到它的 `runId`（详见 [[异步 Run 控制面（list / kill）]] 的「观测面现状」节）。
+
+> **体积约束（勿轻易往 snapshot 里塞数据，2026-10-22 实测）**：现 `/v1/snapshot` **412,084 B**，`runs` 已占 **81.2%**。若把 153 份 async run json
+> 按原样塞进去 = **+3.12 MB（+757%）**；即使投影成 min-card（subject/status/agent/title/usage）也要 **+80 KB（+19.5%）**。
+> 正确做法是**独立端点**（如 `/v1/runs`）而非扩 snapshot。完整四种投影的字节读数与五条路径改动面见 [[异步 Run 控制面（list / kill）]] 的「搬上 GUI 的五条路径」节。
 
 ## Evidence
 

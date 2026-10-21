@@ -189,7 +189,7 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 | GUI 纯函数 | `gui/src/runsView.ts`（`deriveRunDisplay`/`runningCount`/`livenessTally`/`formatUsage`/`loopBadge`） | 判活唯一入口，可 node 直载测试 |
 | GUI 视图 | `gui/src/pages/RunsPage.tsx`（RuntimeOverlay `SECTIONS` 项「运行」） | 5s 轮询；失败保留旧数据；`running` 组只放 `countsAsRunning` 的记录，其余进「最近记录」 |
 | 契约类型 | `gui/src/api/types.ts`（`RunCard`/`RunLiveness`/`AsyncRunStatus`/`RunsResponse`） | `AsyncRunStatus` 与 tab run 的 `RunStatus`（七态）**故意区分命名** |
-| 测试 | `extensions/_test_runs_endpoint.ts`（22 组）、`gui/src/_test_runs_view.ts`（10 组） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
+| 测试 | `extensions/_test_runs_endpoint.ts`（23 组：T1–T10，含 T10 非法 pid 边界）、`gui/src/_test_runs_view.ts`（11 组：R1–R7，R7 = `partitionRuns` 页面分组口径） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
 
 **命名陷阱（本仓已踩）**：`gui/src/api/types.ts` 已有 `RunStatus`（tab run 的 journal 投影七态
 `created/dispatched/running/waiting/completed/failed/cancelled/orphaned`）。async run 的状态是另一套四态
@@ -197,9 +197,9 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 
 ## Evidence
 
-- `extensions/_test_runs_endpoint.ts` — 22 组断言：三态各命中、`limit` 在排序后截断、
+- `extensions/_test_runs_endpoint.ts` — 23 组断言（T1–T10；T10 = 非法 pid 负/0/浮点/字符串/NaN/Infinity/null/undefined 一律 unknown）：三态各命中、`limit` 在排序后截断、
   `includeRecentCalls` 字段存在性、ETag/304、POST→405、零写盘（目录树哈希）、坏 json 跳过。
-- `gui/src/_test_runs_view.ts` — 10 组断言，含反向断言「`running`+`unknown` ⇒ `countsAsRunning===false`
+- `gui/src/_test_runs_view.ts` — 11 组断言（R1–R7），含反向断言「`running`+`unknown` ⇒ `countsAsRunning===false`
   且 `label !== "运行中"`」与「3 条 `status=running` 但只有 1 条真活 ⇒ `runningCount===1`」。
 - `extensions/_probe_runs_endpoint_real.ts` — 对真实 154 份记录取体积/延迟/三态分布/304 的探针。
 - 变异验证（两项均字节级还原，`sha256` 前后一致）：

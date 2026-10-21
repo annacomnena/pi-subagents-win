@@ -2,7 +2,7 @@
 title: Wiki 索引
 kind: concept
 status: current
-updated: 2026-10-13
+updated: 2026-10-22
 source_paths:
   - plans/0923_decisions.md
   - extensions/hotspot/index.ts
@@ -39,6 +39,7 @@ source_paths:
 - [[Wake 回信（round-trip 回执）]] — wake-spawn tab 无发信工具，回信必须走 deliverLetter 的渠道与 prompt 契约（`status: current`）
 - [[期望账本（⑧ 请求—回执期望）]] — 请求—回执期望的声明/到达/超期语义、两生产者落点、生产侧入账方现状与读取面（含 Graph 只读投影）（`status: current`）
 - [[Work Graph 只读关系面]] — 既有四对象之上的只读关系面（引用式边 + 纯投影 + diff；快照 v2，含⑧期望投影；E2.3 起接线、生产缺省 graph 源）（`status: current`）
+- [[Tab 运行账本与运行态数据面]] — tab 派发三文件（`<runId>.json` / `.state.json` / `.result.json`）的写者、字段面与权威分层；`/v1/snapshot.runs[]` 逐字段来源链与实测分母（`status: current`）
 - [[Local Master Ensure（幂等确保）]] — 主会话按 cwd 幂等确保他仓 local master：四层授权 + 零新增权力 + 严格就绪判据 + #A 消费循环注册语义（`status: current`）
 - [[Master 在线判据与远程输入门]] — 会话心跳（`sessionAlive` 15s）为唯一在线门、四消费点、标签页 master 盲区与 B 修复（`status: current`）
 - [[Master 开机自启与防双开]] — `pi-runtime-host-boot`/`pi-master-resume-boot` 与 boot-resume P1–P6/G1–G3、G2.5 心跳判据、P2 transfer-window 24h（`status: current`）
@@ -68,6 +69,7 @@ source_paths:
 - [[Master 开机自启与防双开]]
 - [[Steer 通道（立即插入消息）]]
 - [[异步 Run 控制面（list / kill）]]
+- [[Tab 运行账本与运行态数据面]]
 
 ## Backlinks
 
