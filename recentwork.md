@@ -118,8 +118,17 @@
   （vite 既有依赖，**零新增 npm 依赖**）把 `.tsx` 就地转 ESM（`jsx: "automatic"`）。四个套件现全绿。
 - **Wiki**：新建 `Wiki/Architecture/async-runs-endpoint.md`（端点契约表 + 三态判活语义 +
   154 份真实读数 + 「不得用作运行中证据」清单 + 命名陷阱），已 `wiki-nav rebuild`（30 pages）。
+- **项目经理复核（派发方，独立于实现方）**：① 环境健康 `plans/pi-corruption-diagnostics/health.mjs`
+  → `HEALTHY_IMPORT_GRAPH`（TUI + main 两条 `IMPORT_OK`、`earendilPackages=7`）；② 亲自重跑两处真实变异：
+  `subagent-kill.ts` 去掉 `limit` 应用 ⇒ limit 断言红（actual 4 / expected 2），还原 `sha256=fc47d831…8ebdc998` **一致**；
+  `runsView.ts` unknown → 运行中 ⇒ R1c 红（actual '运行中' / expected '状态未知'），还原 `sha256=dbd4ef7c…3ee1f0ae5` **一致**；
+  ③ 补 L4 审查点名的缺口：`test:runs-endpoint` 新增 **T10 非法 pid 断言组**（负/0/浮点/字符串/NaN/Infinity/null/undefined
+  一律 unknown，合法死 pid 仍 dead）⇒ 22 → **23 groups** 全绿；④ 报告补 `§10 P1 实测样本 + P2 判活分母`（154 分母、
+  with-pid 2/154、isPidAlive 0.142 ms、全量读 median 26.36 ms、档 A 预计 vs 实际工作量 2~3 倍偏差原因）。
+  L4 审查：`plans/20261022_runs_endpoint_l4_review.md`（PASS-with-fixes；其自述「非独立进程」为模型误述，
+  派发侧证据见该文件附录）。
 - **Priority**：P1
-- **Status**：complete（代码/测试/Wiki 就绪；commit 由项目经理补）
+- **Status**：complete（commit **`67bafb1`**，**未 push**）
 - **⚠ 本任务期间自己造成的环境事故（已完全修复，登记以免重演）**：为验证「基线是否本来就红」，
   在 `%TEMP%` 建了 `git worktree` 并**用 `mklink /J` 把 `node_modules`、`gui/node_modules` 指回本仓**；
   随后 `rm -rf /tmp/swin-head` **穿过 junction** 删掉了真实目标 ⇒ ①本仓 `node_modules` + `gui/node_modules`
