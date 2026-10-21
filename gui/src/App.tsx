@@ -43,6 +43,9 @@ export default function App() {
 	// 流式快照（2026-10-20）：pi 扩展节流 150ms 覆盖写，这里 200ms 拉一次 ⇒ 观感 5 次/秒；
 	// GUI 用 CSS 动画填平间隙（不逐 token 渲染）。只在 chat 页且有活跃会话时拉。
 	usePoll(() => useGui.getState().pollChatStreaming(useGui.getState().chatActiveId), 200, activeTab === "chat");
+	// notify 桥（2026-10-21）：ctx.ui.notify 是 TUI-only，桥把它落盘后这里拉增量并以 toast 呈现。
+	// 2s 足够（notify 是人读的短信息，不像流式那样需要 5 次/秒）；只在 chat 页且有活跃会话时拉。
+	usePoll(() => useGui.getState().pollNotify(useGui.getState().chatActiveId), 2000, activeTab === "chat");
 	// 会话正忙标记（2026-10-20）：turn 级信号，补上流式快照在「点发送→首个 token」与
 	// 「工具跑完→下一段输出」两段的空白（那两段里停止按钮本来应该是可点的）。
 	// 400ms 足够（心跳 15s；这里只关心「忙/不忙」两值，不需要跟流式同频）。

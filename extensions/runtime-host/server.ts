@@ -122,6 +122,7 @@ import {
 import { validateStreamGen } from "../runtime/stream-gen.ts";
 import { readLiveness } from "../runtime/liveness.ts";
 import { readSessionUsage } from "../runtime/session-usage.ts";
+import { readNotify } from "../runtime/notify-bridge.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
@@ -2020,6 +2021,18 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						const latest = latestControlRequest(sid);
 						if (latest === null) throw new HttpError(404, { error: "no-control-request", sessionId: sid });
 						body = { version: 1, sessionId: sid, request: latest, ageMs: Date.now() - Date.parse(latest.requestedAt) };
+						break;
+					}
+					// 2026-10-21：notify 桥（GUI 侧）。
+					// 为何需要：ctx.ui.notify 是 TUI-only（types.d.ts:80），本仓 137 个
+					// notify 调用点 GUI 全看不到（如 /today-usage 输出完整统计但 GUI 空白）。
+					// 按字节 offset 增量读，**只读一个天文件**（不扫目录、不全量读）。
+					const mn = /^\/v1\/notify\/([^/]+)$/.exec(u.pathname);
+					if (mn !== null) {
+						const nSid = decodeURIComponent(mn[1]!);
+						const afterRaw = u.searchParams.get("after");
+						const afterN = afterRaw === null ? undefined : Number(afterRaw);
+						body = { version: 1, sessionId: nSid, ...readNotify(nSid, Number.isFinite(afterN) ? afterN : undefined, new Date(), opts.runtimeDir) };
 						break;
 					}
 					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，

@@ -23,6 +23,7 @@ import type {
 	TimelineResponse,
 	TranscriptBody,
 	SessionUsageBody,
+	NotifyResponseBody,
 	UploadResult,
 	WechatBindStartBody,
 	WechatBindStatusBody,
@@ -274,6 +275,15 @@ export const api = {
 	 */
 	usage: (sessionId: string): Promise<FetchResult<SessionUsageBody>> =>
 		fetchJson<SessionUsageBody>(`/v1/sessions/${encodeURIComponent(sessionId)}/usage`, undefined, 5000),
+
+	/**
+	 * GET /v1/notify/:sessionId?after=<offset>：notify 桥（2026-10-21）。
+	 *
+	 * 背景：`ctx.ui.notify` 是 TUI-only，本仓 137 个 notify 调用点 GUI 全看不到。
+	 * 桥把每条 notify 追加落盘，本端点按字节 offset 增量读（只读一个天文件）。
+	 */
+	notify: (sessionId: string, after?: number): Promise<FetchResult<NotifyResponseBody>> =>
+		fetchJson<NotifyResponseBody>(`/v1/notify/${encodeURIComponent(sessionId)}${after !== undefined && after > 0 ? `?after=${after}` : ""}`, undefined, 5000),
 
 	/**
 	 * GET /v1/streaming/:sessionId：流式快照（节流 ~6.7 次/秒写入）。

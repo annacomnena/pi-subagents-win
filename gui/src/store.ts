@@ -23,12 +23,14 @@ import type {
 	RuntimeSnapshot,
 	SessionSummary,
 	SessionUsageBody,
+	NotifyRecordBody,
 	TimelineItem,
 	StreamingSnapshot,
 	TranscriptHead,
 	TranscriptRow,
 } from "./api/types";
 import type { StreamServerFrame, StreamState } from "./useEventStream";
+import { toast } from "./ui/toast";
 
 /** 主视图 Tab（会话为主重构 S4 收窄）：chat=永久默认主视图；timeline=次级全页（排障刚需）。
  *  原 master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（runtimeOverlay）。 */
@@ -207,6 +209,12 @@ interface GuiState {
 	 */
 	chatUsageBySession: Record<string, SessionUsageBody>;
 	/**
+	 * notify 桥读侧指针（2026-10-21）：sessionId → 已消费到的字节 offset。
+	 *
+	 * 只增不减（文件按天切，跨天时服务端把越界 offset 当首屏处理）。
+	 */
+	notifyOffsetBySession: Record<string, number>;
+	/**
 	 * 当前会话最近一条**控制指令**回执（2026-10-20 停止按钮）。
 	 * null = 没点过停止（或已过展示期）；status=done + result=aborted ⇒ 已停下。
 	 */
@@ -235,6 +243,12 @@ interface GuiState {
 	reloadChatSession: (id: string, tail?: number) => Promise<void>;
 	/** 刷新指定会话的上下文用量（2026-10-21；失败保留旧值，不置空）。 */
 	refreshChatUsage: (id: string) => Promise<void>;
+	/**
+	 * 拉取当前会话的新 notify 并以 toast 呈现（2026-10-21）。
+	 *
+	 * 与 usage 同频（打开会话 / 轮询一起），不单独开定时器。
+	 */
+	pollNotify: (id: string | null) => Promise<void>;
 	/** 拉一次流式快照（404 = 没在流式 → 置 null，不算错误）。 */
 		pollChatStreaming: (id: string | null) => Promise<void>;
 	/**
@@ -294,6 +308,30 @@ export function capTimelineItems(merged: TimelineItem[], historyAnchorId: string
 	const tail = merged.slice(idx + 1);
 	if (tail.length <= TIMELINE_CAP) return merged;
 	return [...merged.slice(0, idx + 1), ...tail.slice(-TIMELINE_CAP)];
+}
+
+/**
+ * notify 记录 → toast（2026-10-21）。
+ *
+ * 映射纪律：
+ * - `error` → variant "warning"（toast 只有 warning 档；error 用更长时长区分）
+ * - `warning` → "warning"
+ * - `info` → "info"
+ * - `dedupeKey` 用 text 哈希：轮询重复拉到同一条时替换而非堆积
+ * - warning/error 停留更久（8s vs 4s），因为它们是「需要看见」的
+ */
+function pushNotifyToast(rec: NotifyRecordBody): void {
+	const variant = rec.level === "error" || rec.level === "warning" ? "warning" : "info";
+	// 简易稳定键：level + 文本（同一条 notify 重投时替换）
+	let h = 0;
+	for (let i = 0; i < rec.text.length; i += 1) h = (h * 31 + rec.text.charCodeAt(i)) | 0;
+	toast(rec.text, {
+		variant,
+		durationMs: variant === "warning" ? 8000 : 4000,
+		dedupeKey: `notify:${rec.level}:${h}`,
+		dismissible: true,
+		position: "top-right",
+	});
 }
 
 export const useGui = create<GuiState>((set, get) => ({
@@ -466,6 +504,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatTailBySession: {},
 	chatStreaming: null,
 	chatUsageBySession: {},
+	notifyOffsetBySession: {},
 	chatControl: null,
 	chatBusyFlag: false,
 	chatCommands: null,
@@ -743,6 +782,28 @@ export const useGui = create<GuiState>((set, get) => ({
 			chatTailBySession: { ...get().chatTailBySession, [id]: Math.max(want, rows.length) },
 		});
 		get().markUp(r.at);
+	},
+
+	/**
+	 * 拉取新 notify → toast（2026-10-21）。
+	 *
+	 * 纪律：
+	 * - 按 offset 增量，无新内容不发请求体外的副作用
+	 * - **静默态不打扰**：absent（无文件）直接返回
+	 * - 同 text 去重（`dedupeKey`）防同一句话在轮询里反复弹
+	 * - 失败什么也不做（notify 是辅助通道）
+	 */
+	pollNotify: async (id) => {
+		if (id === null) return;
+		const after = get().notifyOffsetBySession[id] ?? 0;
+		const r = await api.notify(id, after > 0 ? after : undefined);
+		if (!r.ok) return;
+		const { records, nextOffset } = r.data;
+		if (nextOffset > after) {
+			set({ notifyOffsetBySession: { ...get().notifyOffsetBySession, [id]: nextOffset } });
+		}
+		if (records.length === 0) return;
+		for (const rec of records) pushNotifyToast(rec);
 	},
 
 	/**

@@ -71,6 +71,7 @@ import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLi
 import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
 import { registerSessionControl } from "./runtime/session-control-register.ts";
 import { registerBuiltinCommandBridge } from "./runtime/builtin-cmd-bridge.ts";
+import { installNotifyBridge } from "./runtime/notify-bridge.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
@@ -2545,6 +2546,12 @@ async function searchableSelect(
 // ── 扩展入口 ────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// notify 桥（2026-10-21）：**必须最先**安装——它影子化 pi.registerCommand，
+	// 之后所有 registerCommand 才会被包上 ui.notify 代理。放后面就会漏掉已注册的命令。
+	// 为何需要：ctx.ui.notify 是 TUI-only（types.d.ts:80 + interactive-mode.js:1983），
+	// pi 无 notification 类事件钩子 ⇒ 本仓 137 个 notify 调用点 GUI 全看不到。
+	installNotifyBridge(pi as never);
+
 	const agents = discoverAgents();
 
 	// 标签页身份 flag（--tab-run-id <runId>）：launch-tabs 派发时注入，可靠传递

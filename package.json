@@ -134,6 +134,7 @@
 		"test:incident-visibility": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_incident_visibility.ts",
 		"test:builtin-cmd-bridge": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_builtin_cmd_bridge.ts",
 		"test:session-usage": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_usage.ts",
+		"test:notify-bridge": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_notify_bridge.ts",
 		"test:scope-consume": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_scope_consume.ts",
 		"test:local-master-consumption": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_scope_consume.ts",
 		"accept:local-master-loop": "node ./scripts/local-master-loop-acceptance.mjs",

@@ -436,6 +436,29 @@ export interface TranscriptHead {
  * - `percent`：`tokens / contextWindow` ×100；null = 窗口未知（不猜）
  * - `cachePercent`：`cacheRead / (cacheRead + input)` ×100（**只看输入侧**）；null = 无输入
  */
+/** GET /v1/notify/:sessionId（2026-10-21）：notify 桥读侧（TUI notify 的 GUI 镜像）。 */
+export interface NotifyRecordBody {
+	id: string;
+	at: string;
+	sessionId: string;
+	level: "info" | "warning" | "error";
+	/** 原文（服务端不截断）。 */
+	text: string;
+	/** `command:<name>` / `event:<name>` / `unknown`。 */
+	source: string;
+	pid: number;
+}
+
+export interface NotifyResponseBody {
+	version: number;
+	sessionId: string;
+	records: NotifyRecordBody[];
+	/** 下次请求的字节 offset。 */
+	nextOffset: number;
+	/** 文件不存在（无害空态，不是错误）。 */
+	absent: boolean;
+}
+
 export interface SessionUsageBody {
 	version: number;
 	sessionId: string;
