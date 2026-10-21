@@ -29,7 +29,7 @@
 | 57 | P1 | **OpenCode v2 借鉴评估 + 读取路径常数成本三项**（删 `/v1/sessions` 指纹 stat 风暴 130-146ms/拍；`validateStreamGen` 整文件 sha1 → 采样指纹；WS 订阅无新行快路）。sessions 145-178→44-46ms、`?after=` 1251→111ms | none | 已落 3 commit；下一候选：虚拟化时间线（首屏长任务 90ms） | 本区 |
 | 56 | P1 | **GUI 读投影提速（两轮）**：①`/v1/sessions` 131ms→**33ms**（会话 head/台账/标题三级缓存）；②`/v1/snapshot` 60-71ms→**17-21ms**、单拍文件读 776→207（wake-state O(n·m) 去重 + journal 一拍一读 + 信箱一拍一扫）。含 T11 失效门 + 2 处变异验证 + 1 个既有时间炸弹修复 | none | 待 `/runtime-host restart` 生效；下一候选：health 的 journal 增量 tail、snapshot/sessions 体积裁剪（契约变更） | 本区 |
 | 55 | P2 | **GUI 默认主题改暖亮 + 顶栏开关 tooltip 精简**（`DEFAULT_THEME` warm-dark→warm-light；`title` 长描述→`主题亮/暗`，当前档/目标档保留在 `aria-label`；含 4 个测试断言同步 + dist 重建） | none | —（已完成；`gui:build` 已重建，刷新页面生效） | 本区 |
-| 54 | P1 | **僵尸死角 / 认领后 liveness 不刷新（B 线）**：`registry/.lease` 为全局单文件 ⇒ 跨 scope 假竞争（实证 6ms `lease-contended`）；非强接路径不消费 pid；`writeScopeLiveness` 不在认领路径 ⇒ 新 owner 至首个 agent turn 前 liveness 为旧代 | Item 47 / 53 | **待裁 D-5（升级门窗口定义）+ D-1/D-2**；已交付：可采纳项 (b) 认领即刷 liveness（`f042d53`）+ Wiki 三条缺口 | 本区 |
+| 54 | P1 | **僵尸死角 / 认领后 liveness 不刷新（B 线）**：`registry/.lease` 为全局单文件 ⇒ 跨 scope 假竞争（实证 6ms `lease-contended`）；非强接路径不消费 pid；`writeScopeLiveness` 不在认领路径 ⇒ 新 owner 至首个 agent turn 前 liveness 为旧代 | Item 47 / 53 | **D-5 已实现**（升级门按失败类型分型，非时间窗口）+ D-1/D-2 仍待裁；已交付：(b) 认领即刷 liveness（`f042d53`）、(c) 升级门分型（`test:escalation-gate` 6 组） | 本区 |
 | 53 | P0 | **唤醒必达（交付真账本 + C-3 判定层切换）**：终态事件阶段机 pending→leased→attempted→received→consumed + 租约/incident；A 快通道改绕 event/ACK；B 独立进程对账（独立 PID、公平分页）；**4 个注入调用点全部切换**（`undefined ⇒ unconfirmed`，delivered 仅由 consumed ACK 写）；R7/R8 故障矩阵用例 | none | 已 15 commit；L4 PASS 待补（luna 可作验收；F-1/F-2 已修）；**未决**：`effectiveStage` 在 incident 后不报 failed_delivery（消费侧口径待裁） | 本区 |
 | 52 | P0 | **失败必达终态 + 僵尸看门狗**：额度/认证类不可恢复失败立即终止子进程（否则上游死等 100min，2026-10-15 事故 6 个僵尸）；新增宿主侧看门狗（pid 死 / pid 重用 ⇒ 落 `failed(zombie)`）；on-read 惰性 + watcher 10s tick 双路回收；`stderrBuf` 提前清空致额度线索丢失的 bug | none | 已 11 commit（`e22fd96`…`c450509`）；L4 五轮 PASS-WITH-NITS；**未解决**：等待仍无界（P0，可分离）+ 无 pid 僵尸默认观察模式 | 本区 |
 | 51 | P1 | GUI 三项：会话标题可读（titleSource 契约 + 256KB 分块头扫 + `<file>`/`<system-reminder>` 附件块剥离；ledger 0→20、XML 噪音标题→可读/灰 shortId）+ 每组截断 6→3 + Web Console 输入失败诊断（零服务端痕迹 ⇒ 最可能 composer 未选会话禁用态） | msg_mungitzk_7kj5b7 | R1/R2 已实现 `c39c7a0`+`1eeb62d`+`40b3448`+`eef10cb`；R3 只诊断（建议：chatActiveId 持久化 + 8000 字节 vs 8000 字符对齐）；待重启 host 验线上 API | — |
@@ -182,12 +182,12 @@
 - **三条 Wiki 已收口（`eb0bd77`，`Wiki/Decisions/local-master-claim.md`）**：① 全局 `.lease` ⇒ 跨 scope 假竞争；② 非强接路径**不消费 pid**（pid 判据只在 `forceStale`，且 local 上 age 恒真）；③ `writeScopeLiveness` 唯一写手是 `session-hooks.ts:46`（`agent_start`/`agent_end`）⇒ **认领路径不写**。
 - **已交付（可采纳项 b）**：`f042d53` —— `silentScopeGenesis`/`takeoverStaleScopeOwner` 成功后**立即刷 `scope-liveness`**（never-throw、新身份不受 30s 节流、**零新增权力**）；回归：`_test_scope_stale_takeover` 改断言 + `_test_scope_consume` 夹具适配；`accept:local-master-loop` exit=0。
 - **待裁与未做**：
-  1. **D-5 升级门**（要求 c）："僵尸死角不得直接判需用户强接，须先需再次尝试 + 预计等待窗口"——但 **local 无可推导窗口值**（心跳 10min 对 local 恒真；liveness 按 turn 不由时间决定）⇒ 需**新定义**窗口与取值（另：`(c)` 的"`lease-contended` 退避一次"子项待确认后可单独落地）。
-  2. **pid 实证加速穿透**（要求 a）：可采纳路径 = 把 `judgeScopeOwnerStale` 的 verdict 经**参数注入**接到 `attach` 的 forceStale 分支（registry 不 import liveness，保持 fail-closed：skip ⇒ 仍拒）；未做。
+  1. **D-5 升级门**（要求 c）——**已实现（2026-10-21）**：结论是 local **不存在「时间窗口」这种语义**（registry 心跳 10min 对 local 恒休真 `registry.ts:218/:394`；scope-liveness 按 turn 刷新不由时间决定 `session-hooks.ts:46`；lease stale 30s 只是毫秒级并发互斥 `registry.ts:330`）⇒ 硬造时间窗口必然退化成「永不升级」或「永远升级」。改为按**失败类型**分型：`retryable`（`lease-contended`/`owner-pid-dead` ⇒ 建议再试一次）/ `wait-only`（`transfer-in-progress` ⇒ 只等既有 token 窗口）/ `hopeless`（**只收真恒 skip 的**：`no-liveness`/`identity-mismatch`/`bad-session`/`not-owner`，`scope.ts:194/196` ⇒ 明写「任何重试都不会成功」）；**token 类与 `not-stale` 归 retryable**（拿对 token / 等心跳过期就是路径 —— L4 v2 捉出首版把它们误归 hopeless = 作用域宽于证明）/ `insufficient-evidence`（未列举 ⇒ 不猜）。落点：`local-master-launch.ts::classifyEscalation` + `escalationGuidance`、`master-tools.ts::attachFailureGuidance`（`master-attach` 失败回执不再只拼 reason——**事故里用户看到的就是那一句**）；`owner-active` 用现成 `judgeScopeOwnerStale` 二判（僵主 ⇒ 建议再试 / 活主 ⇒ 明说「正确拒绝，不是故障」/ skip ⇒ hopeless），**零新增权力、`forceStale` 仍只归用户**。护栏：同名不同义（`no-liveness` 在 attach=hopeless、在 ensure=不猜），由 `test:escalation-gate` E2/E6 钉住。计划 `plans/20261021_d5_escalation_gate_plan.md`。
+  2. **pid 实证加速穿透**（要求 a）：可采纳路径 = 把 `judgeScopeOwnerStale` 的 verdict 经**参数注入**接到 `attach` 的 forceStale 分支（registry 不 import liveness，保持 fail-closed：skip ⇒ 仍拒）；**未做**（D-5 只把 verdict 用于回执分型，未接成放行面）。
   3. **incident=manual-retry-success 自动归因**（要求 d）：需给 `attached`/`takeover` payload 补 `cause`/`prevAttemptId`（现无关联字段）；当前只作报告口径。
 - **Priority**：P1
-- **Status**：active（(b) 已交付；待裁 D-5 后继续）
-- **Commit**：`eb0bd77`+`f042d53`
+- **Status**：active（(b)+(c) 已交付；剩余 (a) pid 注入放行面、(d) incident 归因 + 待裁 D-1/D-2）
+- **Commit**：`eb0bd77`+`f042d53`（D-5 见本地未提交工作树，`plans/20261021_d5_escalation_gate_plan.md`）
 - **计划/审查**：`plans/20261016_zombie_deadlock_premature_escalation_research.md`（321 行，含 Wiki section list）+ `plans/20261016_pending_strong_tier_queue.md`（D-1…D-5）
 
 <a id="item-53"></a>

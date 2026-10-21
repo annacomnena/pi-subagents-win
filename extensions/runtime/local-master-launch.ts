@@ -234,6 +234,98 @@ export const CONSUME_EVIDENCE_REASONS = [
 	"consume-evidence-old-generation",
 ] as const;
 
+// ── 升级门分型（D-5，2026-10-21）──────────────────────────────────
+//
+// 问题：研究文档 §7(c) 要求「僵尸死角不得直接判需人工强接，须先需再次尝试 + 预计等待窗口，
+// 窗口过期才升级」。但 local 上**没有可推导的时间窗口**（源码证据见
+// plans/20261021_d5_escalation_gate_plan.md §1）：registry 心跳 10min 对 local 恒休真
+//（registry.ts:218 / :394）、scope-liveness 按 turn 刷新不由时间决定（session-hooks.ts:46）、
+// lease stale 30s 只是毫秒级并发互斥（registry.ts:330）。硬造时间窗口要么恒过期
+//（= 永远直接升级），要么恒不过期（= 永不升级）。
+//
+// 所以把「窗口」换成**可判定的东西**：按失败**类型**决定有没有自主路径，
+// 有才谈「再试一次」，没有就**第一次就升级**（否则文案在指导用户无限重试）。
+
+/** 升级门分型。
+ *
+ * - `retryable`：存在自主路径，应先「再试一次」再谈人工强接。
+ *   - `owner-pid-dead`：owner 的 pid 已死（僵尸 owner）⇒ 重试可能穿透
+ *   - `lease-contended`：毫秒级假竞争（实证只有 6ms）⇒ 退避重试可消除
+ *   - `handoff-token`：token 错/过期/代不符 ⇒ **路径存在**（去拿正确 token），不是死路
+ *   - `not-stale`：心跳尚未过 10min ⇒ 等一会儿再试就是自主路径
+ * - `wait-only`：只需等待既有窗口过期（窗口值现成，不新造）
+ *   - `transfer-in-progress`：等 token 过期 / human cancel
+ * - `hopeless`：现有代码下重试**永远**不会成功 ⇒ 必须**首次即升级**
+ *   - `no-liveness` / `identity-mismatch`（`scope.ts:194/196` 恒 skip）
+ *   - `bad-session`（无有效 sessionId，重跑一万次也是坏 sessionId）
+ * - `insufficient-evidence`：判据不足，**不猜**
+ *   - `stalled` / `consume-unverified` / `claim-not-observed` / 未列举 reason
+ *
+ * L4 v2 NIT（2026-10-21）：首版把 `bad-token` / `token-expired` / `generation-mismatch` /
+ * `not-stale` 也归在 hopeless，**判据错了** —— 源码直读（`registry.ts:194-221`）：
+ * token 类只要拿到**正确且未过期**的 handoff token 就能过；`not-stale` 只是
+ * 「心跳还没过 10min（`:218-220`）」，等一等再试就是路径。把它们说成「任何重试都不会成功」
+ * 是**作用域宽于证明**（AGENTS §0）。已收窄：只有真恒 skip 的才留在 hopeless。
+ */
+export type EscalationClass = "retryable" | "wait-only" | "hopeless" | "insufficient-evidence";
+
+/** 两个 reason 命名空间（**重要：同名不同义**）。
+ *
+ * - `attach`：`registry.ts:113` 的 attach 失败 reason（owner-active / lease-contended /
+ *   no-liveness / identity-mismatch / not-stale / bad-token …）。
+ * - `ensure`：`judgeLocalMasterEnsureReady` 的就绪 reason（no-liveness / no-owner /
+ *   claim-not-observed / consume-evidence-* …）。
+ *
+ * **同名不同义**：`no-liveness` 在 `attach` 里是**恒 skip、重试永远不会成功**（
+ * `scope.ts:194`）⇒ hopeless；而在 `ensure` 里只意味着**spawn 出的会话还没写 liveness**
+ * ⇒ 不是 hopeless，只能「不猜」（保持既有 G2/H 断言口径）。混用会直接误导用户。
+ */
+export type EscalationNamespace = "attach" | "ensure";
+
+const RETRYABLE_REASONS = new Set(["owner-pid-dead", "lease-contended", "not-stale", "bad-token", "token-expired", "generation-mismatch"]);
+const HOPELESS_ATTACH_REASONS = new Set([
+	"no-liveness",
+	"identity-mismatch",
+	"bad-session",
+	"not-owner",
+	"no-cwd",
+]);
+
+/** 失败 reason → 升级门分型（纯函数，可单测）。
+ *
+ * 未列举的 reason 一律 `insufficient-evidence`（**不猜**）——宁可不给指引，也不给错指引。
+ */
+export function classifyEscalation(
+	reason: string | undefined,
+	namespace: EscalationNamespace = "attach",
+): EscalationClass {
+	if (reason === undefined) return "insufficient-evidence";
+	if (RETRYABLE_REASONS.has(reason)) return "retryable";
+	if (reason === "transfer-in-progress") return "wait-only";
+	// `no-liveness` / `identity-mismatch` 只在 attach 命名空间里是恒 skip（hopeless）。
+	// ensure 命名空间里它们是「会话还没起来」⇒ 保持不猜。
+	if (namespace === "attach" && HOPELESS_ATTACH_REASONS.has(reason)) return "hopeless";
+	return "insufficient-evidence";
+}
+
+/** 给客户端的受控文案（按分型）。
+ *
+ * 硬约束（plan A3）：`hopeless` **不得**出现「再试一次」类措辞 —— 否则就是指导用户
+ * 无限重试一个恒失败的路径。
+ */
+export function escalationGuidance(cls: EscalationClass): string {
+	switch (cls) {
+		case "retryable":
+			return "需再次尝试：本次失败有自主路径（退避重试 / 拿到正确且未过期的 handoff token / 等心跳过期均可穿透）。建议重跑一次 local-master-ensure 或在该仓开一个会话；若再次失败仍不恢复，才需人工强接（/master-attach --local --force-stale --confirm，只归用户）";
+		case "wait-only":
+			return "在途交接未结束：需等该交接结束或 token 过期（或用户 human cancel）后才可接管；重试无意义，不要刷";
+		case "hopeless":
+			return "无自主路径：该死角在现有判据下无法自动恢复（缺 liveness / 身份不匹配 / 会话 id 非法），任何重试都不会成功 —— 只能由用户走 /master-attach --local --force-stale --confirm 人工处置（本工具不带该权力）";
+		case "insufficient-evidence":
+			return "判据证据不足，不猜：人工在该仓开 pi 会话用 /master-status 核查（或由用户走 /master-attach --local --force-stale --confirm 处置死角）";
+	}
+}
+
 /** deadline 分类：判不了/没认领/消费证据不足 → stalled（不猜）；判得了但没就绪 → timeout（带快照）。 */
 export function ensureStatusForReason(reason: string | undefined): "stalled" | "timeout" {
 	return reason === "no-liveness" || reason === "no-owner" || reason === "claim-not-observed" ||

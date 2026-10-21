@@ -2,12 +2,13 @@
 title: Local Master 认领与接管
 kind: decision
 status: current
-updated: 2026-10-16
+updated: 2026-10-21
 source_paths:
   - extensions/master-tools.ts
   - extensions/index.ts
   - extensions/runtime/scope.ts
   - extensions/runtime/registry.ts
+  - extensions/runtime/local-master-launch.ts
   - extensions/runtime/master-home-guard.ts
   - extensions/runtime/liveness.ts
   - extensions/runtime/master-control.ts
@@ -35,6 +36,7 @@ source_paths:
 - **liveness 来源**：`<runtimeDir>/state/scope-liveness/<scope>.json`（pid + sessionId + generation + updatedAt），判活走 `process.kill(pid, 0)`。**与全局 master 的会话心跳（`timers/sessions/<sid>.json`）是两套互不相干的机制**：local 不依赖也不写会话心跳，故 2026-10-12 的「标签页 owner 写心跳」修复不涉及 local（见 [[Master 在线判据与远程输入门]]）。
 - **`registry/.lease` 是全局单文件（2026-10-16 补，源码直读 + journal 逐帧复核）**：`acquireRegistryLease()` 的路径恒为 `join(registryDir(), ".lease")`（`registry.ts:330-331`）——**不分 scope、不分 agent**；`wx` 排他创建 first-wins，被占且 `age > staleAfterMs`（缺省 30s，`registry.ts:347`）则覆盖写抢走，否则认输（`registry.ts:354`）。`attach`（`registry.ts:167`）与 `takeover`（`registry.ts:406`）共用它。⇒ **跨 scope 假竞争**：多仓 local master 的会话并发认领时互相抢同一把锁。实证：2026-10-16 `02:02:09.942Z` `master_local_battlesandbox` `taking_over` → `:943` `master_local_GreenCAD` `taking_over` → `:949` **早 6ms** 的 `takeover_failed reason=lease-contended`，同一 tick 内 battlesandbox `takeover` 成功（`~/.pi/agent/runtime/events.jsonl`）。失败**零自动重试**：`takeoverStaleScopeOwner` 折叠为 `skipped:takeover-failed`（`scope.ts:217`），调用方 `mailbox-consumer.ts:830` 不重试，且非 owner 在 `:843` 早退 ⇒ 该会话生命周期内不再尝试。
 - **非强接路径不消费 pid（2026-10-16 补）**：`attachMaster` → `attachWithOwnerLocked` 的判据只有「有无 owner」与同会话幂等（`registry.ts:187-190`、`:234`）。**pid 实证只存在于 `forceStale` 路径**（判据是 `lastHeartbeatAt` 年龄 > 10min，`registry.ts:218`；该路径**不看 pid**），而 registry 不 import liveness、`MasterAttachment` 无 pid 字段（`registry.ts:35-46`；`liveness.ts:32` 注释「pid/startedAt 只住本文件，不进 registry」）。⇒ **普通认领下 pid-dead 不可穿透**（异会话一律 `owner-active`）；**强接路径下 pid 判据也不参与**（local 心跳冻结，见上文合同第 4 条）。两条判据轴互不相通——想让 pid 死判据生效须改调用侧，不是现成行为。
+- **升级门分型：local 没有「时间窗口」，只有「失败类型」（D-5，2026-10-21 实现）**：`local-master-launch.ts::classifyEscalation(reason, namespace)` 把失败按**有无自主路径**分四型——`retryable`（有路径：`lease-contended` 毫秒级假竞争 / `owner-pid-dead` 僵尸主 / `not-stale` 只是心跳未过 10min / token 类 `bad-token`·`token-expired`·`generation-mismatch` ⇒ 拿对 token 即可）、`wait-only`（`transfer-in-progress`，只等既有 token 窗口）、`hopeless`（**只收真恒 skip 的**：`attach` 侧 `no-liveness`/`identity-mismatch`（`scope.ts:194/196`）+ `bad-session`/`not-owner`/`no-cwd` ⇒ 文案明写「任何重试都不会成功」）、`insufficient-evidence`（未列举 reason ⇒ 不猜）。配套 `escalationGuidance()` 出受控文案。**为何不用时间窗口**：registry 心跳 10min 仅在 `forceStale` 分支且对 scope 恒休真（`registry.ts:218`/`:394`）、`scope-liveness` 按 turn 刷新不由时间决定（`session-hooks.ts:46`）、lease stale 30s 只是并发互斥（`registry.ts:330`）⇒ 任何时间窗口要么恒过期要么恒不过期。**`owner-active` 是唯一必须二判的 reason**：`master-attach` 失败回执现在用现成的 `judgeScopeOwnerStale` 查一次（verdict=stale ⇒ retryable；alive ⇒ 明说「正确拒绝，不是故障」；skip ⇒ hopeless；**探不到 ⇒ 不猜，不得声称重试无用**），**不新开读路径、不新增权力**，`forceStale` 仍只归用户。两道护栏（均由 `test:escalation-gate` 7 组钉住）：① 同名不同义 —— `no-liveness` 在 `attach` 命名空间是 hopeless，在 `ensure` 命名空间只是「会话还没写 liveness」⇒ 不猜（保持 G2/H 既有断言口径）；② **作用域纪律** —— token 类/`not-stale` **不得**归 hopeless（L4 v2 捉出的真实错误：首版把它们说成「任何重试都不会成功」，而源码 `registry.ts:194-221` 显示拿对 token / 等心跳过期就是路径）。计划：`plans/20261021_d5_escalation_gate_plan.md`，L4 两轮：`..._L4_review.md` / `..._L4_review_v2.md`。
 - **认领路径与消费循环注册的耦合（2026-09-25 补，源码直读 + L4 独立验证）**：scope 信箱的消费循环**只**在 `session_start` 处理块里注册（`mailbox-consumer.ts::registerScopeWakeLoop`，接线全仓仅 `index.ts:1945` 一处），且**认领成功 ⟺ 注册**（同一处理块内）；`triggerOwnershipRecheck()` 只补注册**全局** result watcher。⇒ **手动 `/master-attach --local` 不经过 `session_start` → 不注册 scope 消费循环**（工具 `master-tools.ts:521`、slash `index.ts:2125` 成功后都只调 `triggerOwnershipRecheck()`）——该会话默认收不到本仓信箱的信，直到下一个 `session_start`。详见 [[Local Master Ensure（幂等确保）]] §#A。
 
 ## 已知缺口（记录，未修）
@@ -74,6 +76,6 @@ source_paths:
 ## Open Questions
 
 - 自动回收兜底判据是否引入（`no-liveness` 时会话静默时长 / 进程表反查），以及"顶掉活 owner"是否需要在回执与 journal 中显式记录 prev owner/gen。
-- 跨 scope 假竞争（全局 `.lease`）是否改为 per-agent/per-scope lock（或给 `lease-contended` 加一次退避重试）——现为 6ms 级 flaky，见上文。
-- 是否把 `judgeScopeOwnerStale` 的 pid 判据接到 `master-attach` 的非强接路径（需把 liveness 以参数注入 registry，避免 registry 依赖 runtime 读盘）；若接，须保持 `skip`（`no-liveness`/`identity-mismatch`）仍拒绝的 fail-closed 语义。
+- ~~跨 scope 假竞争（全局 `.lease`）是否改为 per-agent/per-scope lock（或给 `lease-contended` 加一次退避重试）~~ ⇒ **2026-10-21 已定性并接入升级门**：`lease-contended` 归 `retryable`（文案建议再试）；**结构性修复（per-scope 锁）仍未做** —— 现仅「文案 + 建议重试」，自动重试器未实现。
+- 是否把 `judgeScopeOwnerStale` 的 pid 判据接到 `master-attach` 的非强接路径（需把 liveness 以参数注入 registry，避免 registry 依赖 runtime 读盘）；若接，须保持 `skip`（`no-liveness`/`identity-mismatch`）仍拒绝的 fail-closed 语义。⇒ **2026-10-21 部分作答**：判据已用于**失败回执分型**（只读、零改判据），但**未**把它接成放行面（`owner-pid-dead` 仍不会自动放行 attach）。
 - 认领成功后是否统一补一次 `writeScopeLiveness`（落在 `scope.ts` 的 genesis/takeover 成功分支，一处覆盖 `session_start` 与手动 attach 两条路径）。

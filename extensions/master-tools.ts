@@ -50,8 +50,10 @@ import {
 import type { MasterSuccessionConfig } from "./runtime/master-auto.ts";
 import {
 	auditLocalMasterEnsure,
+	classifyEscalation,
 	ensureLocalMaster,
 	ensureResultIsError,
+	escalationGuidance,
 	formatLocalMasterEnsureResult,
 	type LocalMasterEnsureDeps,
 	type LocalMasterSpawn,
@@ -152,6 +154,50 @@ function autoHandoffLine(cfg: MasterSuccessionConfig): string {
 	return `succession: ${cfg.enabled ? "on" : "off"} · auto-handoff: ${cfg.auto ? "ON" : "OFF"} (autoPercent=${cfg.autoPercent})`;
 }
 
+/** `master-attach` 失败回执的分型文案（D-5，2026-10-21）。
+ *
+ * 背景：事故里用户实际看到的就是 `master-attach 失败：owner-active` 这一句，**没有任何
+ * 可做的下一步**（master-tools.ts 旧实现只拼 reason）。分型见
+ * `runtime/local-master-launch.ts::classifyEscalation` 与 plans/20261021_d5_escalation_gate_plan.md。
+ *
+ * `owner-active` 是唯一**必须二判**的 reason：同样的 reason 既可能是「真的有个活主
+ * 占位」（正确拒绝），也可能是「僵尸主占位」（该重试/该强接）。判据用现成的
+ * `judgeScopeOwnerStale`（**不新开读路径、不新增权力**）：只有 pid 确实死了才算 retryable。
+ *
+ * L4 NIT-1（2026-10-21）：**探不到 ≠ 已证明走不通**。此前 verdict=undefined（读盘失败 /
+ * attachment 缺失）与 verdict=skip 被折叠成同一句「无自主路径…任何重试都不会成功」——
+ * 在证据不足时这是过强的断言（违反 AGENTS §0「声明的作用域不得宽于证明的作用域」）。
+ * 现改为：只有**真的拿到 skip** 才说 hopeless；拿不到一律 `insufficient-evidence`（不猜）。
+ */
+export function attachFailureGuidance(r: {
+	reason?: string;
+	local: boolean;
+	verdict?: "stale" | "alive" | "skip";
+	verdictReason?: string;
+	/** 二判是否真的执行过（含失败）：false ⇒ 证据不足，不得下 hopeless 断言。 */
+	verdictProbed?: boolean;
+}): string {
+	if (r.reason === "owner-active" && r.local) {
+		if (r.verdict === "stale") {
+			return escalationGuidance("retryable");
+		}
+		if (r.verdict === "alive") {
+			return "已有活主占位（其 pid 活着）：正确拒绝，不是故障 —— 无需重试；要向它交接请让它执行 /master-detach 发 token 后由你在 home 会话 attach";
+		}
+		if (r.verdict === "skip") {
+			// 真拿到 verdict（no-liveness / identity-mismatch）⇒ 确证无自主路径
+			return escalationGuidance("hopeless");
+		}
+		// 未探到 / 读盘失败 ⇒ **不猜**（不得声称重试一定无用）
+		return escalationGuidance("insufficient-evidence");
+	}
+	const cls = classifyEscalation(r.reason, "attach");
+	if (cls === "insufficient-evidence") {
+		return `unclassified reason（不猜）；若确认是僵尸死角，只能由用户走 /master-attach --local --force-stale --confirm 人工处置`;
+	}
+	return escalationGuidance(cls);
+}
+
 export function masterAttachLogic(
 	sessionId: string,
 	input: { token?: string; forceStale?: boolean; confirm?: boolean; local?: boolean } = {},
@@ -180,7 +226,41 @@ export function masterAttachLogic(
 				details: { reason: r.reason },
 			};
 		}
-		return { text: `master-attach 失败：${r.reason}`, isError: true };
+		// D-5：失败回执不能只有 reason（事故里用户看到的就是一句 `owner-active`）。
+		// `owner-active` 必须**二判**（活主 vs 僵尸主）：判据用现成的 judgeScopeOwnerStale。
+		let verdict: "stale" | "alive" | "skip" | undefined;
+		let verdictReason: string | undefined;
+		let verdictProbed = false;
+		if (r.reason === "owner-active" && localAgent) {
+			try {
+				const att = readAttachment(localAgent);
+				if (att) {
+					const v = judgeScopeOwnerStale(att, readScopeLiveness(localAgent));
+					verdict = v.verdict;
+					verdictProbed = true;
+					if (v.verdict === "skip") verdictReason = v.reason;
+				}
+			} catch {
+				// 探不到就不探（不猜）——verdict 保持 undefined ⇒ 走 insufficient-evidence（**不再是 hopeless**）
+			}
+		}
+		const guidance = attachFailureGuidance({
+			reason: r.reason,
+			local: Boolean(localAgent),
+			verdictProbed,
+			...(verdict !== undefined ? { verdict } : {}),
+			...(verdictReason !== undefined ? { verdictReason } : {}),
+		});
+		return {
+			text: `master-attach 失败：${r.reason} — ${guidance}`,
+			isError: true,
+			details: {
+				reason: r.reason,
+				...(localAgent ? { agent: localAgent } : {}),
+				...(verdict !== undefined ? { verdict } : {}),
+				...(verdictReason !== undefined ? { verdictReason } : {}),
+			},
+		};
 	}
 	const agent = localAgent ?? masterAddress();
 	return {
