@@ -36,6 +36,7 @@
 export const COMMAND_ARGUMENT_HINTS: Readonly<Record<string, string>> = Object.freeze({
 	model: "<provider/id>",
 	models: "<provider/id>",
+	compact: "[自定义压缩要求]",
 });
 
 /** 命令注册所需的最小 pi 面（结构化，便于测试注入，不依赖真实 ExtensionAPI）。 */
@@ -51,6 +52,14 @@ export interface CommandBridgeApi {
 /** handler 实际用到的 ctx 面（`ExtensionCommandContext` 子集）。 */
 export interface CommandBridgeContext {
 	reload?: () => Promise<void>;
+	/** 触发压缩（**不阻塞**，`types.d.ts:249` 明确 without awaiting completion；结果靠回调）。 */
+	compact?: (opts?: {
+		customInstructions?: string;
+		onComplete?: (r: { tokensBefore?: number; estimatedTokensAfter?: number }) => void;
+		onError?: (e: Error) => void;
+	}) => void;
+	/** 当前上下文用量（`types.d.ts:248`）；percent=null 表示未知。 */
+	getContextUsage?: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
 	modelRuntime?: {
 		getAvailableSnapshot?: () => readonly ModelLike[];
 		getError?: () => string | undefined;
@@ -220,6 +229,54 @@ export function registerBuiltinCommandBridge(pi: CommandBridgeApi): string[] {
 		}
 	};
 
+	// ── /compact ───────────────────────────────────────────────
+	// 关键语义（`types.d.ts:249`）：`ctx.compact()` **不阻塞**、不返 promise，
+	// 结果靠 `onComplete` / `onError` 回调。⇒ 回执必须分两段：先“已发起”，
+	// 再由回调追加结果。不能在这里 await 等它完（拿不到）。
+	const compactHandler = async (args: string, ctx: CommandBridgeContext): Promise<void> => {
+		const fn = ctx.compact;
+		if (typeof fn !== "function") {
+			notify(ctx, "/compact 不可用：当前上下文没有 compact()（可能不是用户发起的命令）", "warning");
+			return;
+		}
+		// 前置读数：压缩前给一个“能看得出变化”的基准（拿不到就如实说未知，不编造）
+		let before: string = "未知";
+		try {
+			const u = ctx.getContextUsage?.();
+			if (u !== undefined && u !== null) {
+				before =
+					u.tokens === null
+						? `未知（contextWindow ${u.contextWindow}）`
+						: `${u.tokens} tokens${u.percent === null ? "" : `（${u.percent.toFixed(1)}%）`}`;
+			}
+		} catch {
+			/* 读数失败不阻止压缩 */
+		}
+		const instructions = (args ?? "").trim();
+		try {
+			fn.call(ctx, {
+				...(instructions.length > 0 ? { customInstructions: instructions } : {}),
+				onComplete: (r) => {
+					// R-2.2：给**变化**（前→后），不只给绝对值
+					const beforeTok = typeof r?.tokensBefore === "number" ? String(r.tokensBefore) : null;
+					const afterTok = typeof r?.estimatedTokensAfter === "number" ? String(r.estimatedTokensAfter) : null;
+					const delta =
+						beforeTok !== null && afterTok !== null ? ` → ${beforeTok} → ${afterTok} tokens（估算）` : "";
+					notify(ctx, `/compact 完成${delta}${delta === "" ? "（前后 token 数未提供）" : ""}。会话历史保留，只是较早内容被摘要替换。`);
+				},
+				onError: (e) => {
+					notify(ctx, `/compact 失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+				},
+			});
+			notify(
+				ctx,
+				`/compact 已发起（压缩前 ${before}${instructions.length > 0 ? `；自定义要求：${instructions.slice(0, 80)}` : ""}）。压缩在后台进行，结束后会再报一次数字。`,
+			);
+		} catch (e) {
+			notify(ctx, `/compact 发起失败：${e instanceof Error ? e.message : String(e)}`, "warning");
+		}
+	};
+
 	try {
 		pi.registerCommand("reload", {
 			description: "重载 extensions / skills / prompts / themes / context files（不丢会话历史）",
@@ -243,6 +300,16 @@ export function registerBuiltinCommandBridge(pi: CommandBridgeApi): string[] {
 		} catch {
 			/* never-throw */
 		}
+	}
+
+	try {
+		pi.registerCommand("compact", {
+			description: "压缩会话上下文（可选参数：自定义压缩要求），不丢历史",
+			handler: compactHandler,
+		});
+		registered.push("compact");
+	} catch {
+		/* never-throw */
 	}
 
 	return registered;

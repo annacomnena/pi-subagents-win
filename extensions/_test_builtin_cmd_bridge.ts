@@ -117,17 +117,18 @@ function fakeCtx(over: Partial<CommandBridgeContext> = {}): { ctx: CommandBridge
 	ok("B3 文案：列出含当前标记；未找到含候选且声明不自动纠正");
 }
 
-// ── B4 真实注册：三条命令都注册上（含别名）─────────────────────
+// ── B4 真实注册：四条命令都注册上（含别名）─────────────────────
 {
 	const { api, registered } = fakePi();
 	const names = registerBuiltinCommandBridge(api);
-	assert.deepEqual(names.sort(), ["model", "models", "reload"].sort(), "注册 reload + model + models 别名");
+	assert.deepEqual(names.sort(), ["compact", "model", "models", "reload"].sort(), "注册 reload + model + models + compact");
 	assert.ok(registered.has("reload"));
 	assert.ok(registered.has("model"));
 	assert.ok(registered.has("models"), "别名 /models（用户按复数记，兼容）");
+	assert.ok(registered.has("compact"));
 	// models 与 model 必须同一 handler（行为一致）
 	assert.equal(registered.get("models")!.handler, registered.get("model")!.handler, "别名与主命令同 handler");
-	ok("B4 真实注册：reload / model / models(别名同 handler)");
+	ok("B4 真实注册：reload / model / models(别名同 handler) / compact");
 }
 
 // ── B5 /reload 走真实 handler：调 ctx.reload 一次 ────────────────
@@ -235,6 +236,73 @@ function fakeCtx(over: Partial<CommandBridgeContext> = {}): { ctx: CommandBridge
 	const srcWins = normalizeCommands([{ name: "model", source: "extension", argumentHint: "<other>" }]);
 	assert.equal(srcWins[0]!.argumentHint, "<other>", "源头 hint 优先于映射表");
 	ok("B11 快照：argumentHint additive 透传（空串不落 + 映射表兜底 + 源头优先）");
+}
+
+// ── B12 /compact：**不阻塞**语义（这是最容易写错的一处）──────────────
+// `ctx.compact()` 明确 "Trigger compaction without awaiting completion"（types.d.ts:249），
+// 不返 promise，结果靠 onComplete/onError 回调。若误以为是 promise 去 await，
+// 会拿到 undefined 并误报“压缩完成”。本组钉住：发起时只报“已发起”，完成后**另一个回调**才报结果。
+{
+	const { api, registered } = fakePi();
+	registerBuiltinCommandBridge(api);
+	const calls: { instructions?: string; complete?: (r: unknown) => void; error?: (e: Error) => void }[] = [];
+	const { ctx, notes } = fakeCtx({
+		compact: (opts) => {
+			calls.push({ instructions: opts?.customInstructions, complete: opts?.onComplete as never, error: opts?.onError });
+		},
+		getContextUsage: () => ({ tokens: 120_000, contextWindow: 272_000, percent: 44.117647 }),
+	});
+	const before = notes.length;
+	await registered.get("compact")!.handler("", ctx);
+	assert.equal(calls.length, 1, "handler 调了 ctx.compact 一次");
+	// 发起回执里**不得**出现“完成”（本实现压缩未阻塞，此时尚未完成）
+	const issued = notes.slice(before).map((x) => x.msg).join("\n");
+	assert.ok(!issued.includes("完成"), `发起时不报完成（实际：${issued}）`);
+	assert.ok(issued.includes("已发起"), "明说已发起");
+	assert.ok(issued.includes("120000") || issued.includes("120,000"), "给出压缩前 token 数（R-2.2 给变化基准）");
+	assert.ok(issued.includes("44"), "给出百分比");
+	assert.equal(calls[0]!.instructions, undefined, "无参 ⇒ 不传 customInstructions（不传空串）");
+
+	// 模拟 pi 事后回调
+	calls[0]!.complete!({ tokensBefore: 120_000, estimatedTokensAfter: 18_000 });
+	const done = notes.slice(-1)[0]!.msg;
+	assert.ok(done.includes("完成"), "回调后才报完成");
+	assert.ok(done.includes("120000") && done.includes("18000"), `给前后变化（实际：${done}）`);
+	assert.ok(done.includes("历史保留") || done.includes("摘要替换"), "澄清历史不丢（只被摘要替换）");
+	ok("B12 /compact：发起不报完成；回调后才报结果；给前后 token 变化");
+}
+
+// ── B13 /compact 有参 / 无能力 / 异常 ───────────────────────────
+{
+	const { api, registered } = fakePi();
+	registerBuiltinCommandBridge(api);
+	const seen: (string | undefined)[] = [];
+	const { ctx } = fakeCtx({ compact: (o) => seen.push(o?.customInstructions) });
+	await registered.get("compact")!.handler("  保留所有 API 签名  ", ctx);
+	assert.equal(seen[0], "保留所有 API 签名", "有参 ⇒ 传 customInstructions（trim）");
+
+	// 无 compact() ⇒ 如实报不可用，不炸
+	const { ctx: c2, notes: n2 } = fakeCtx({ compact: undefined });
+	await registered.get("compact")!.handler("", c2);
+	assert.ok(n2.some((x) => x.msg.includes("不可用")), "无 compact() ⇒ 明说不可用");
+	assert.ok(n2.some((x) => x.level === "warning"));
+
+	// compact() 同步抛 ⇒ 捕获回报
+	const { ctx: c3, notes: n3 } = fakeCtx({
+		compact: () => {
+			throw new Error("busy");
+		},
+	});
+	await registered.get("compact")!.handler("", c3);
+	assert.ok(n3.some((x) => x.msg.includes("发起失败") && x.msg.includes("busy")), "同步抛 ⇒ 捕获并报原因");
+
+	// onError 回调 ⇒ 报失败
+	let errCb: ((e: Error) => void) | undefined;
+	const { ctx: c4, notes: n4 } = fakeCtx({ compact: (o) => { errCb = o?.onError; } });
+	await registered.get("compact")!.handler("", c4);
+	errCb!(new Error("provider down"));
+	assert.ok(n4.slice(-1)[0]!.msg.includes("失败") && n4.slice(-1)[0]!.msg.includes("provider down"), "onError ⇒ 报失败原因");
+	ok("B13 /compact：参数透传 / 无能力 / 同步抛 / onError 四态");
 }
 
 console.log(`\n_test_builtin_cmd_bridge: all assertions passed (${n} groups)`);
