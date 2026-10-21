@@ -83,6 +83,12 @@ export function writeLaneTimers(tabRunId: string, lane: LaneId, deadline: Date, 
 export interface LaunchTraceRunInput {
 	task: string;
 	repoRoot: string;
+	/**
+	 * per-call worker 模型（参数化 ①，2026-10-21）：已由调用方校验过的 `provider/id`。
+	 * 优先级（唯一实现点见 launchTraceRun 顶部）：本字段 > `config.workerModel` > 不传（lane 默认）。
+	 * 注意：config 旧路径**不做校验**（向后兼容；校验只在显式传参时发生）。
+	 */
+	workerModel?: string;
 	/** 已解析的环境（命令 handler 负责 findWindowsTerminal/findPiCli）。 */
 	wtExe: string;
 	piCli: string;
@@ -155,6 +161,9 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 	const now = input.now ?? new Date();
 	const spawnTab = input.spawnTab ?? ((opts) => spawnPiTab(opts));
 	const mode = input.config.mode ?? "diagnose";
+	// 参数化 ①（2026-10-21）：per-call model > config.workerModel > 不传（lane 默认模型）。
+	// 这是模型优先级的**唯一实现点**；config 旧路径不校验（向后兼容，见计划 D8）。
+	const workerModel = input.workerModel ?? input.config.workerModel;
 
 	// 1. preflight（§14.2：含单 active run 互斥）
 	const pf = runPreflight(input.repoRoot, { runsDir, maxActiveRuns: input.config.maxActiveRuns });
@@ -227,7 +236,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 				mode: "trace",
 				title,
 				cwd: repoRoot,
-				requestedModel: input.config.workerModel,
+				requestedModel: workerModel,
 				dispatchedAt: new Date().toISOString(),
 				dispatchStatus: "dispatched",
 			};
@@ -239,7 +248,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 				cwd: repoRoot,
 				title,
 				prompt,
-				model: input.config.workerModel,
+				model: workerModel,
 				tabRunId: laneRunId,
 				sessionProfile: "trace-worker",
 				traceRunId: runId,
@@ -361,7 +370,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			mode: "trace",
 			title,
 			cwd: laneMeta.worktree,
-			requestedModel: input.config.workerModel,
+			requestedModel: workerModel,
 			dispatchedAt: new Date().toISOString(),
 			dispatchStatus: "dispatched",
 		};
@@ -375,7 +384,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			cwd: laneMeta.worktree,
 			title,
 			prompt,
-			model: input.config.workerModel,
+			model: workerModel,
 			tabRunId: laneRunId,
 			sessionProfile: "trace-worker",
 			traceRunId: runId,

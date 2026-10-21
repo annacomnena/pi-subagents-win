@@ -69,8 +69,14 @@ export type TraceRunMetaExtra = { cancelledReason?: string; cleanedAt?: string }
 /** diagnose 模式的启动时工作树基线（collect 时对比，确定性检 lane 是否违规写主仓库）。 */
 export type DiagnoseMetaExtra = { dirtyBaselineFile?: string };
 
-/** artifact 根：~/.pi/agent/trace-fusion-runs/<runId>/（§15：artifact 可放长路径）。 */
+/** artifact 根：~/.pi/agent/trace-fusion-runs/<runId>/（§15：artifact 可放长路径）。
+ *
+ * 测试/隔离旁路（计划 D6）：`PI_TRACE_FUSION_RUNS_DIR` 指向临时根，避免测试往用户真实目录
+ * 写 run（否则 `maxActiveRuns=1` 会与线上 running run 互斥）。未设 ⇒ 与今天逐字节一致。
+ */
 export function defaultRunsDir(): string {
+	const override = (process.env.PI_TRACE_FUSION_RUNS_DIR ?? "").trim();
+	if (override) return override;
 	return join(homedir(), ".pi", "agent", "trace-fusion-runs");
 }
 

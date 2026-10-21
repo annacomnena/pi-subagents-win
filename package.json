@@ -63,6 +63,7 @@
 		"test:trace-fusion-collect": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_collect.ts",
 		"test:trace-fusion-crosstest": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_crosstest.ts",
 		"test:trace-fusion-supervisor": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_supervisor.ts",
+		"test:trace-fusion-param": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_param.ts",
 		"test:hotspot": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/hotspot/_test_hotspot_v4.ts",
 		"test:lite-mode": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_lite_mode.ts",
 		"test:external-cli": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_external_cli.ts",

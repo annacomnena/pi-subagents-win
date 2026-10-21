@@ -10,8 +10,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig, type TraceFusionProvisioning } from "./types.ts";
 
-/** 包 config.json 路径（= PKG_DIR/config.json；模块相对定位避免环依赖 index.ts）。 */
+/** 包 config.json 路径（= PKG_DIR/config.json；模块相对定位避免环依赖 index.ts）。
+ *
+ * 测试/隔离旁路（计划 V4-2）：`PI_TRACE_FUSION_CONFIG` 指向替身配置，避免测试读写用户 config。
+ * 未设 ⇒ 与今天逐字节一致（PKG_DIR/config.json）。
+ */
 export function traceFusionConfigPath(): string {
+	const override = (process.env.PI_TRACE_FUSION_CONFIG ?? "").trim();
+	if (override) return override;
 	const here = dirname(fileURLToPath(import.meta.url)); // .../extensions/trace-fusion
 	return join(here, "..", "..", "config.json");
 }

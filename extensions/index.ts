@@ -36,6 +36,7 @@ import { cleanTraceRun } from "./trace-fusion/clean.ts";
 import { registerHotspot } from "./hotspot/index.ts";
 import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
+import { resolveWorkerModel as resolveTraceWorkerModel, type AvailableModelRef } from "./trace-fusion/models.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
@@ -5036,16 +5037,37 @@ export default function (pi: ExtensionAPI) {
 			"只允许主会话调用；同一时刻仅允许一个 active run（并发启动会被 preflight 拒绝）。",
 		].join(" "),
 		parameters: Type.Object({
-			task: Type.String({ description: "任务描述（三路逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
+			task: Type.String({ description: "任务描述（各 lane 逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
+			model: Type.Optional(Type.String({ description: "per-call 模型（provider/id 或唯一短名）。优先级：本参数 > config.workerModel > lane 默认；非法模型直接报错（不静默回落）" })),
 		}),
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
 			if (!capabilities().launchTabs) {
 				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
 			}
-			const params = rawParams as { task?: string };
+			const params = rawParams as { task?: string; model?: unknown };
 			const task = (params.task ?? "").trim();
 			if (!task) {
 				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
+			}
+			// 参数化 ①（2026-10-21）：per-call model 校验**先于任何 spawn/IO**。
+			// 权威来源 = 本次会话的 modelRegistry（审查 B3：本地 models.json 不是 CLI 可用集），
+			// 省略参数时不触碰 registry（保持旧路径零新增依赖）。
+			let workerModel: string | undefined;
+			if (params.model !== undefined) {
+				const available: AvailableModelRef[] = (() => {
+					try {
+						const reg = (ctx as unknown as { modelRegistry?: { getAvailable?: () => unknown } }).modelRegistry;
+						const list = reg?.getAvailable?.();
+						return Array.isArray(list) ? (list as AvailableModelRef[]) : [];
+					} catch {
+						return [];
+					}
+				})();
+				const resolved = resolveTraceWorkerModel(params.model, available);
+				if (!resolved.ok) {
+					return { content: [{ type: "text", text: `trace-fusion: ${resolved.error}` }], isError: true };
+				}
+				workerModel = resolved.model;
 			}
 			let wtExe: string | null;
 			let piCli: string;
@@ -5066,6 +5088,8 @@ export default function (pi: ExtensionAPI) {
 				wtExe,
 				piCli,
 				config: { ...tfConfig, mode: "diagnose" },
+				// 参数化 ①：已校验的 per-call 模型（undefined ⇒ 回落到 config.workerModel）
+				workerModel,
 				runsDir: defaultTraceFusionRunsDir(),
 			});
 			const lines = result.lines ?? [];
