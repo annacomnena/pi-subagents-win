@@ -2,9 +2,13 @@
 title: GUI 工作台 UI（token / 组件 / 导航）
 kind: architecture
 status: current
-updated: 2026-10-20
+updated: 2026-10-21
 source_paths:
   - gui/src/index.css
+  - gui/src/writeCard.ts
+  - gui/src/pages/WriteCard.tsx
+  - gui/src/pages/ChatPage.tsx
+  - gui/src/_test_write_card.ts
   - gui/src/theme.ts
   - gui/src/useTheme.ts
   - gui/src/pages/TopBar.tsx
@@ -83,6 +87,22 @@ GUI 工作台（`gui/`）的视觉与导航现状：Anthropic 暖纸语义 token
 - **行数上限（与标题契约同屏）**：每组非置顶可见行默认 3（`workspaceGroup.ts` 的 `GROUP_VISIBLE_LIMIT = 3`），超出收进「还有 N 个 · 展开查看全部」行；置顶行豁免不计、展开态持久化 `saw-ws-overflow`（`workspaceRailExpand.ts` 统一读写 localStorage）。
 - **结构性降级（正常态，非 bug）**：gc-cleaner 把终态台账记录移入 `_archived/`（解析链只读顶层）→ 历史派发会话的 P1 永久不可达，按链降 P2/P3；新派发会话在台账归档前可命中 P1。
 
+## write 工具卡渲染契约（落笔迷你编辑器）
+
+`write` 是全系统唯一「生产内容」的工具；本卡把它渲染成一块**正在被书写的小编辑纸**（陶土=墨、卡片=纸）。契约如下（改卡前先读本节）：
+
+- **触发面唯一**：`name === "write"` 且 `arguments` 可解析出 `content`（`string` 或 `string[]`，数组按 `\n` join）⇒ 渲染 `WriteCardBody`；否则**保持原 `JSON.stringify(row.arguments, null, 2)` 的 `<pre>` 路径**（`gui/src/pages/ChatPage.tsx:413,496`，`readWriteArgs` 是唯一入口 `gui/src/writeCard.ts:26`）。`edit` / `multi_edit` **不得**套用本卡（它们该给 diff，不是文件预览）。
+- **行号契约**：渲染的是**文件绝对行号**（尾部滑窗 `base = total - keep + 1`），React `key = 行号` ⇒ 老行复用 DOM、不重放入场动画。`countLines` **不把结尾 `\n` 当一行**（`gui/src/writeCard.ts:52`），否则每个正常文件都多报 1 行。半行（流式 args 只给到一半）按现有字节渲染，**不等闭合**。
+- **几何常数（是 DOM 常数，不是 max-height）**：`WRITE_VISIBLE_ROWS = 10` / `WRITE_KEEP_ROWS = 12`（`gui/src/writeCard.ts:12,14`，即 DOM 里恒 ≤12 个 row 元素）；行高 `--write-row-h: calc((var(--ui-font-size) - 2px) * 1.72)` = 20.64px@14px；视口 `height: calc(var(--write-row-h) * 10 + 18px)` = 224.39px（`gui/src/index.css:598,692`），顶部 26px `mask-image` 渐隐表示「上面还有」。
+- **溢出方向必须向上**：`.write-lines` 绝对贴底（`gui/src/index.css:700`）。**不能用 `justify-content:flex-end` 贴底** —— 负剩余空间下规范把它退化为 `flex-start`，正在写的那一行会被顶出下边界（实测踩过）。
+- **折行**：一行 = 一个 `grid-template-columns: minmax(30px, max-content) 1fr` 元素 + `white-space: pre-wrap` + `word-break: break-word`（**不用 `break-all`**，它会切断标识符）。不能用「行号列 + 代码列」两块独立容器：遇折行必错位。
+- **三幕动效口径**（全部只由 `data-status` + 一个 DOM 类驱动，无 JS 逐帧）：①**落纸** `running` ⇒ 描边 `color-mix(accent 40%, border)`；②**书写** ⇒ 新行 `write-line-in 220ms`（blur 2px→0 + 上浮 3px）+ 末行 `.stream-caret` + 墨线 `inkPercent = 100*(1-e^{-n/11})` **渐近但永不满**（总行数不可知，不假装百分比）+ 笔尖 `write-pen-tip 1.1s` 循环；③**收笔** ⇒ 墨线塌成 1px 残线（`opacity .3`）+ `write-dry-sweep 520ms` + 勾 `write-check-draw 300ms` + 徽标 `write-delta-pop 420ms`。
+- **收笔只在「刚写完」那一拍播**：`settling` 由 `ChatPage` 在 `running → 终态` 转场开 700ms（`gui/src/pages/ChatPage.tsx:419`），**不是**纯 CSS `[data-status="done"]` —— 否则历史卡片挂载时也会播，一屏几十张卡同时弹一下是噪音。同理 `is-new` 只在 `running` 给，`prefers-reduced-motion: reduce` 下 6 个 keyframes 全 `animation:none` 且只留终态。
+- **error 态判据（据上游写盘语义实测，勿改回「墨停在断点」）**：pi 的 `write` = `mkdir` + `fs.writeFile(path, content, "utf-8")` 的**单次整文件覆盖写**，无 temp+rename、无回滚（`@earendil-works/pi-coding-agent/dist/core/tools/write.js:16-19,30-54`）⇒ **断点不可知**。故 `inkHeightCss(total, "error") === undefined`（`gui/src/writeCard.ts:106`）让 CSS 只画 14px destructive 残线、正文 `opacity .62` 降饱和；注脚两段 = 工具真实输出首行 + `WRITE_ERROR_CAVEAT`（`gui/src/writeCard.ts:111`：失败时目标文件**可能**是截断/空文件，也**可能**完全未改动 —— 无法从结果判定）；徽标 error = `N 行 · 未确认`（`未写入` 是不可验证的断言）。测试 R6 静态断言禁止注脚出现「已回滚 / 原文件未改动」。
+- **零新增颜色约束**：整卡只用 `--color-accent`（陶土=墨）/ `--color-border` / `--color-card` / `--color-foreground-subtle|subtlest` / `--color-destructive`，浓淡全靠 `color-mix` 与 `opacity`；**不得**引入进度条式第二套色语言（蓝/绿）。三档墨色层次（注释 `.72` / 特性·结构 `.66` / 成员声明 `1.0`）也只调透明度。
+- **running 帧的结构性边界（约束后续任何「给工具卡加 running 动效」的设计）**：本地快速写的可见窗口 ≲1ms（实测 6 次真实 `write` 的 toolResult 时间戳彼此差 1ms），而宿主 transcript tail 是 **250ms 一拍**（`extensions/runtime-host/ws.ts:813`）、流式快照只携带 `reasoning|text` **无 partial tool args**（`gui/src/api/types.ts:506`）⇒ GUI 里 `write` 卡实际只会以「已终态」出现；「落纸/书写」两幕只在慢盘 / 超大文件 / 慢网络下可见。要让「书写」真实可见必须改**传输面**（让快照携带 partial tool args），不是改样式。
+- **门**：`cd gui && npm run test:write-card`（10 组：纯函数 + R5 接线静态断言 + R6 error 口径）、`npm run build`（`tsc --noEmit && vite build`）。
+
 ## Focus 基线
 
 - 全局 reset 仅清 `outline`：`*:focus, *:focus-visible { outline: none !important }`——**不清 box-shadow**，shadcn 组件以 `box-shadow`（`ring-*`）实现 focus-visible 焦点环（`gui/src/index.css:185-191`）。
@@ -98,6 +118,7 @@ GUI 工作台（`gui/`）的视觉与导航现状：Anthropic 暖纸语义 token
 - 会话列表标题契约：`extensions/runtime-host/session-title.ts`（解析链 + `MACHINE_INJECTED_TAGS` registry 四标签（file/skill/system-reminder/recent-working-set，各带注入源注释）→ 生成 `LEADING_OPEN_TAG/LEADING_CLOSED_BLOCK/LEADING_UNCLOSED_BLOCK/TRAILING_INJECTED_BLOCK` 通用正则、领头/尾部循环剥、只剥 registry 内标签防误伤、剥空回退 P3、P1 `ledgerProbeFirstLine` 开标签行跳过同为 registry 通用）、`extensions/hotspot/inject.ts`（注入恒 `text: ${text}\n\n${sel.block}` 追加在首条 user 消息末尾）、测试 `extensions/_test_session_title.ts`（T12a/T12b：尾部 recent-working-set 块 → title 不含标签、回退 P3；T13a–T13e：纯 skill→null、skill+正文→取正文、领头 skill+尾部 RWS→取中间正文、registry 外 XML 不剥防误伤、存量回归，`npm run test:session-title`）、`extensions/runtime/transcript.ts`（`readHead` 分块扫描常量 `HEAD_READ_BYTES/HEAD_CHUNK_BYTES/HEAD_SCAN_MAX_BYTES`、`StringDecoder` 跨块解码、`FIRST_USER_TEXT_CAP`）、`gui/src/workspaceGroup.ts`（`GROUP_VISIBLE_LIMIT = 3`、`resolveGroupOpen`）、`gui/src/workspaceRailExpand.ts`（`saw-ws-overflow` 展开态）、`extensions/runtime-host/server.ts:1404`（`titleSource` 字段下发）
 - 覆盖层六 section 与主动性入口：`gui/src/store.ts:38`（`RuntimeOverlaySection` union）、`gui/src/pages/RuntimeOverlay.tsx:28-35`（SECTIONS 表）、`gui/src/pages/AutonomyPage.tsx`
 - 轮询门控与条件请求：`gui/src/App.tsx:32-42`（timeline `usePoll` 第三参门控）
+- write 卡契约：`gui/src/writeCard.ts`（常量 L12,14、`readWriteArgs` L33、`countLines` L64、`inkHeightCss` L106、`WRITE_ERROR_CAVEAT` L111）、`gui/src/pages/WriteCard.tsx`（`WriteCardBody` L36、注脚 L85）、`gui/src/pages/ChatPage.tsx`（L413 解析、L419 `settling`、L496 分支）、`gui/src/index.css`（`.write-card` L597、行高 L598、视口 L692、贴底 L700、error 段 L678-682）、测试 `gui/src/_test_write_card.ts`；上游写盘语义 `@earendil-works/pi-coding-agent/dist/core/tools/write.js:16-19,30-54`；不可观测边界 `extensions/runtime-host/ws.ts:813`（tail 250ms）+ `gui/src/api/types.ts:506`（快照无 tool args）。提交：`d7964db`（落笔卡 + error 态按实测写盘语义收口）。
 - 提交：`ffdef07`（会话列表标题契约节）、`b619edb`（StringDecoder 跨块 UTF-8 + 注释同步）、`eef10cb`（每组可见行 6→3）、`6ee8191`（覆盖层第 6 section + AutonomySettings 迁出微信页）。
 
 ## Links Out
