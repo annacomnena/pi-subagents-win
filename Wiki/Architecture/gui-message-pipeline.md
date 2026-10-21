@@ -140,10 +140,14 @@ snapshot 326-429KB / sessions 392KB 的体积裁剪属**契约 + UI** 变更，�
 `(args, ctx: ExtensionCommandContext)`（`types.d.ts:1128`），该 ctx 提供 `reload()`（`:322`）；
 `setModel()` 在 `ExtensionAPI` 上（`:1248`）。⇒ 注册同名扩展命令即可语义等价执行。
 
-**已补两条（用户限定范围）**：`extensions/runtime/builtin-cmd-bridge.ts`
+**已补三条（用户逐次点名）**：`extensions/runtime/builtin-cmd-bridge.ts`
 - `/reload` → `ctx.reload()`，回执明确「会话上下文未丢弃」
 - `/model` + `/models`（别名同 handler）→ 无参列模型 / 带参 `pi.setModel()`；
   `setModel` 返 false 按官方语义（`:1244-1247`）= provider 未配认证
+- `/compact [自定义要求]` → `ctx.compact()`。**关键：它不阻塞**（`:249`
+  "without awaiting completion"，不返 promise），结果只走 `onComplete`/`onError`（`:204-208`）
+  ⇒ 回执必须分两段：发起只报「已发起」（**不得自称完成**），结果由回调再报一次；
+  `onComplete` 给 `tokensBefore → estimatedTokensAfter` 变化（R-2.2 给变化而非只给绝对值）
 - **核心安全约束**：`matchModel` **禁止模糊纠正** —— 近似前缀 / 多 provider 同 id 一律
   返回 null 并列出候选，**绝不静默切到用户没要的模型**（回归门 B2/B8 钉住）
 
@@ -155,7 +159,7 @@ options 类型 `RegisteredCommand`（`types.d.ts:1123-1129`）**没有 argumentH
 `interactive-mode.js:429-437`「与内建冲突」⇒ 该名字从内建补全里被摘掉；且 `prompt()` 里
 扩展命令优先 ⇒ TUI 原生 `/model` 选择器 UI **可能**被简化版取代。若退化，需改名或加开关。
 
-**其余 22 条内建命令未做**；其中 `/settings` `/tree` `/thinking` 这类「执行 = 打开 TUI UI」的
+**其余 21 条内建命令未做**；其中 `/settings` `/tree` `/thinking` 这类「执行 = 打开 TUI UI」的
 在远端只能等价重实现，`/fork` `/resume` `/new` 需要 `ExtensionCommandContext` 而
 `sendUserMessage` 路径拿不到。
 
