@@ -586,6 +586,365 @@ body {
 	animation: stream-caret-breath 1.4s ease-in-out infinite;
 }
 
+/* ── write 工具卡「落笔」（2026-10-21）────────────────────────────────
+ * 设计稿：plans/20261021_write_card/design.md（交互样张同目录 write-card.html）。
+ * 口径：陶土 = 墨、卡片 = 纸、光标 = 笔尖。**零新增颜色** —— 只用 accent 的浓淡与粗细
+ * 表达「正在写 → 已写完」。三个演出：① 落纸（描边暖 + 墨线长出）② 书写（逐行浮现 +
+ * 笔尖/光标）③ 收笔（墨线塌成 1px 残线 + 一道暖带自上而下扫过「墨干」+ 勾）。
+ *
+ * 几何：行高 = 12px × 1.72 = 20.64px，视口 10 行（与 WriteCard.tsx 的 WRITE_VISIBLE_ROWS 对应）。
+ * 只用透明度做三档墨色层次（注释/特性/结构 < 成员声明），不引第二套配色。 */
+.write-card {
+	--write-row-h: calc((var(--ui-font-size) - 2px) * 1.72);
+	margin-top: 6px;
+	border: 1px solid var(--color-border);
+	border-radius: 8px;
+	overflow: hidden;
+	background: var(--color-card);
+}
+/* 书写中：整块描边暖成陶土 —— 这是「这块正在被写」的唯一全局信号（零新增色） */
+.write-card[data-status="running"] {
+	border-color: color-mix(in oklab, var(--color-accent) 40%, var(--color-border));
+}
+.write-card[data-status="error"] {
+	border-color: color-mix(in oklab, var(--color-destructive) 45%, var(--color-border));
+}
+.write-editor {
+	display: flex;
+}
+/* 左栏「墨线」：书写中随行数渐近增长；收笔后塌成 1px 残线（0 新增色） */
+.write-rail {
+	position: relative;
+	width: 22px;
+	flex: 0 0 auto;
+	border-right: 1px solid var(--color-border);
+}
+.write-ink {
+	position: absolute;
+	left: 6px;
+	top: 0;
+	width: 2px;
+	border-radius: 2px;
+	background: linear-gradient(
+		to bottom,
+		color-mix(in oklab, var(--color-accent) 25%, transparent),
+		var(--color-accent)
+	);
+	transition:
+		height 0.34s cubic-bezier(0.22, 1, 0.36, 1),
+		opacity 0.5s ease,
+		width 0.5s ease,
+		left 0.5s ease;
+}
+/* 笔尖：跟着墨线底部（4px 点 + 光晕） */
+.write-ink::after {
+	content: "";
+	position: absolute;
+	left: -1px;
+	bottom: -2px;
+	width: 4px;
+	height: 4px;
+	border-radius: 9999px;
+	background: var(--color-accent);
+	box-shadow: 0 0 6px 1px color-mix(in oklab, var(--color-accent) 55%, transparent);
+	animation: write-pen-tip 1.1s ease-in-out infinite;
+}
+.write-card[data-status="done"] .write-ink {
+	opacity: 0.3;
+	width: 1px;
+	left: 7px;
+}
+.write-card[data-status="done"] .write-ink::after {
+	display: none;
+}
+/* 错误态：墨线**不再承担进度语义** —— write 是整次覆写（非原子），断点不可知
+ * （design.md §10.4 ②），所以 js 不再给 height（见 inkHeightCss）⇒ 这里给一条固定残线。 */
+.write-card[data-status="error"] .write-ink {
+	background: linear-gradient(
+		to bottom,
+		color-mix(in oklab, var(--color-destructive) 25%, transparent),
+		var(--color-destructive)
+	);
+	height: 14px;
+	width: 2px;
+	opacity: 0.55;
+}
+.write-card[data-status="error"] .write-ink::after {
+	background: var(--color-destructive);
+	box-shadow: none;
+	animation: none;
+}
+/* 错误态整块降饱和（“转灰”）：不引新色，只用透明度压低内容与行号的对比 */
+.write-card[data-status="error"] .write-lines {
+	opacity: 0.62;
+}
+.write-card[data-status="error"] .write-no {
+	opacity: 0.4;
+}
+/* 视口：固定 10 行高；顶部 mask 渐隐 = 「上面还有」。
+ * 内容高于视口时**溢出向上**（.write-lines 绝对贴底）—— 不能用 flex-end 贴底：
+ * 负剩余空间下规范会把 flex-end 当 flex-start，正在写的那一行会被顶出下边界（实测踩过）。 */
+.write-viewport {
+	position: relative;
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	height: calc(var(--write-row-h) * 10 + 18px);
+	-webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 4px, #000 26px, #000 100%);
+	mask-image: linear-gradient(to bottom, transparent 0, transparent 4px, #000 26px, #000 100%);
+}
+.write-lines {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	display: flex;
+	flex-direction: column;
+	padding: 9px 0;
+	font-family: var(--font-mono);
+	font-size: var(--text-ui-sm);
+	line-height: var(--write-row-h);
+	color: var(--color-foreground-subtle);
+}
+.write-row {
+	/* 行号列用 minmax(30px, max-content)：4–5 位行号（1000+ 行文件很常见）会自己撑开，
+	 * 固定 30px 会把数字挤进代码里 */
+	display: grid;
+	grid-template-columns: minmax(30px, max-content) 1fr;
+	flex: 0 0 auto;
+}
+.write-row.is-new {
+	animation: write-line-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.write-no {
+	text-align: right;
+	padding-right: 11px;
+	font-size: var(--text-ui-xs);
+	font-variant-numeric: tabular-nums;
+	color: var(--color-foreground-subtlest);
+	opacity: 0.55;
+	user-select: none;
+}
+.write-row.is-cur .write-no {
+	color: var(--color-accent);
+	opacity: 1;
+}
+/* 折行靠 grid（一行一个元素），不用「行号列 + 代码列」两块独立容器 —— 那样遇折行必错位 */
+.write-tx {
+	white-space: pre-wrap;
+	word-break: break-word;
+	padding-right: 12px;
+	min-height: var(--write-row-h);
+}
+.write-tx[data-k="cmt"] {
+	opacity: 0.72;
+}
+.write-tx[data-k="attr"],
+.write-tx[data-k="struct"] {
+	opacity: 0.66;
+}
+/* 收笔扫光：一条暖陶土薄带自上而下走一遍 = 墨干 */
+.write-sweep {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 0;
+	height: 110px;
+	z-index: 2;
+	pointer-events: none;
+	opacity: 0;
+	background: linear-gradient(
+		to bottom,
+		transparent,
+		color-mix(in oklab, var(--color-accent) 9%, transparent) 45%,
+		transparent
+	);
+}
+.write-card[data-status="done"] .write-sweep {
+	animation: write-dry-sweep 520ms cubic-bezier(0.22, 1, 0.36, 1) 1 both;
+}
+.write-note {
+	display: flex;
+	align-items: flex-start;
+	gap: 7px;
+	padding: 8px 12px 9px;
+	border-top: 1px solid var(--color-border);
+	font-family: var(--font-mono);
+	font-size: var(--text-ui-sm);
+	color: var(--color-destructive);
+	overflow-wrap: anywhere;
+}
+/* 注脚两段：工具真实输出（err）+ 固定口径（caveat）。caveat 降一档色阶，避免跟错误正文抢注意力。 */
+.write-note-body {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	min-width: 0;
+}
+.write-note-caveat {
+	color: var(--color-foreground-subtlest);
+	font-size: var(--text-ui-xs);
+	opacity: 0.9;
+}
+
+/* 头部 meta（只有 write 卡渲染）：文件名 + 尺度徽标 */
+.write-meta {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+}
+.write-path {
+	font-family: var(--font-mono);
+	font-size: var(--text-ui-xs);
+	color: var(--color-foreground-subtlest);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 230px;
+}
+.write-path b {
+	font-weight: 600;
+	color: var(--color-foreground-subtle);
+}
+.write-delta {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	flex: 0 0 auto;
+	padding: 2px 7px;
+	border-radius: 9999px;
+	border: 1px solid var(--color-border);
+	background: color-mix(in oklab, var(--color-foreground) 3%, transparent);
+	font-family: var(--font-mono);
+	font-size: var(--text-ui-xs);
+	font-variant-numeric: tabular-nums;
+	color: var(--color-foreground-subtle);
+	white-space: nowrap;
+	transition:
+		color 0.25s ease,
+		border-color 0.25s ease;
+}
+.write-delta[data-status="running"] {
+	border-color: color-mix(in oklab, var(--color-accent) 30%, var(--color-border));
+	color: var(--color-accent);
+}
+.write-delta[data-status="error"] {
+	border-color: color-mix(in oklab, var(--color-destructive) 35%, var(--color-border));
+	color: var(--color-destructive);
+}
+.write-dot {
+	width: 4px;
+	height: 4px;
+	flex: 0 0 auto;
+	border-radius: 9999px;
+	background: currentColor;
+	opacity: 0.7;
+}
+.write-delta[data-status="running"] .write-dot {
+	animation: write-dot-breathe 1.3s ease-in-out infinite;
+}
+/* 徽标「定稿」弹一下 —— 只由 WriteCard 在 running→终态那一拍加 .is-settling */
+.write-delta.is-settling {
+	animation: write-delta-pop 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.write-check {
+	width: 13px;
+	height: 13px;
+	flex: 0 0 auto;
+	color: var(--color-success);
+}
+.write-check path {
+	stroke-dasharray: 22;
+	stroke-dashoffset: 0;
+}
+.write-check.is-drawing path {
+	animation: write-check-draw 300ms cubic-bezier(0.22, 1, 0.36, 1) 90ms both;
+}
+
+@keyframes write-line-in {
+	from {
+		opacity: 0;
+		filter: blur(2px);
+		transform: translateY(3px);
+	}
+
+	to {
+		opacity: 1;
+		filter: blur(0);
+		transform: none;
+	}
+}
+
+@keyframes write-pen-tip {
+	0%,
+	100% {
+		transform: scale(0.7);
+		opacity: 0.55;
+	}
+
+	50% {
+		transform: scale(1.15);
+		opacity: 1;
+	}
+}
+
+@keyframes write-dry-sweep {
+	0% {
+		opacity: 0;
+		transform: translateY(-110px);
+	}
+
+	18% {
+		opacity: 1;
+	}
+
+	100% {
+		opacity: 0;
+		transform: translateY(calc(100% + 20px));
+	}
+}
+
+@keyframes write-check-draw {
+	from {
+		stroke-dashoffset: 22;
+	}
+
+	to {
+		stroke-dashoffset: 0;
+	}
+}
+
+@keyframes write-dot-breathe {
+	0%,
+	100% {
+		opacity: 0.25;
+		transform: scale(0.85);
+	}
+
+	50% {
+		opacity: 1;
+		transform: scale(1.15);
+	}
+}
+
+@keyframes write-delta-pop {
+	0% {
+		transform: scale(0.94);
+		opacity: 0.6;
+	}
+
+	55% {
+		transform: scale(1.045);
+	}
+
+	100% {
+		transform: scale(1);
+		opacity: 1;
+	}
+}
+
 @media (prefers-reduced-motion: reduce) {
 	.animated-gradient-text,
 	.zcode-draft-prompt-waterfall,
@@ -595,7 +954,13 @@ body {
 	[data-zcode-stream-animate="true"],
 	[data-zcode-tool-stream-animate="true"],
 	.stream-chunk-in,
-	.stream-caret {
+	.stream-caret,
+	.write-row.is-new,
+	.write-ink::after,
+	.write-sweep,
+	.write-delta.is-settling,
+	.write-delta[data-status="running"] .write-dot,
+	.write-check.is-drawing path {
 		animation: none;
 	}
 
@@ -604,6 +969,17 @@ body {
 	.stream-chunk-in {
 		opacity: 1;
 		filter: none;
+	}
+
+	/* write 卡：只留终态（墨线、行、勾全部静态） */
+	.write-row.is-new {
+		opacity: 1;
+		filter: none;
+		transform: none;
+	}
+
+	.write-check path {
+		stroke-dashoffset: 0;
 	}
 
 	.zcode-task-interaction-countdown-fill {

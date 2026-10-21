@@ -38,6 +38,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import type { ChatOutboxEntry, StreamingSnapshot, TranscriptRow } from "../api/types";
 import type { StreamSubscribeMsg } from "../api/types";
 import { api } from "../api/client";
+import { deltaLabel, isWriteTool, readWriteArgs, splitPath } from "../writeCard";
+import { WriteCardBody, WriteCheck } from "./WriteCard";
 import {
 	attachmentIds,
 	canSendMessage,
@@ -403,6 +405,28 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	const isRunning = row.status === "running";
 	const isError = row.status === "error";
 	const statusLabel = isRunning ? "执行中" : isError ? "出错" : "完成";
+	/**
+	 * write 专属：正文换成「落笔」迷你编辑器（设计稿 plans/20261021_write_card/design.md）。
+	 * 判据只有工具名 —— 其余工具**完全走原路径**（原 pre + JSON.stringify），零回归面。
+	 */
+	const isWrite = isWriteTool(row.name);
+	const write = isWrite ? readWriteArgs(row.arguments) : null;
+	const writePath = write && write.path !== "" ? splitPath(write.path) : null;
+	/**
+	 * 收笔动画（勾描边 + 徽标弹）只播**一次**：running → 终态那一拍开 700ms。
+	 * 不能只靠 CSS `[data-status="done"]` —— 历史卡片一挂载也会播，一屏几十张卡同时弹一下是噪音。
+	 */
+	const [settling, setSettling] = useState(false);
+	useEffect(() => {
+		if (row.status === "running") {
+			setSettling(false);
+			return;
+		}
+		if (!wasRunningRef.current) return;
+		setSettling(true);
+		const t = window.setTimeout(() => setSettling(false), 700);
+		return () => window.clearTimeout(t);
+	}, [row.status]);
 
 	return (
 		<RowShell rowId={row.rowId} animate={animate} className="py-0">
@@ -418,7 +442,11 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 				data-zcode-tool-stream-animate="true"
 			>
 				{/* 摘要行（ToolSummaryRow.tsx canToggle 分支 + ToolLayout.tsx#L165-176）：图标刻意不转 */}
-				<CollapsibleTrigger className="group/tool-summary inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base transition-colors">
+				<CollapsibleTrigger
+					className={`group/tool-summary inline-flex max-w-full cursor-pointer items-center gap-2 self-start text-left text-ui-base transition-colors${
+						isWrite ? " w-full" : ""
+					}`}
+				>
 					<span className="shrink-0 text-foreground-subtlest [&_svg]:text-foreground-subtlest">
 						<Wrench className="size-3.5" />
 					</span>
@@ -435,6 +463,26 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 							{statusLabel}
 						</span>
 					</span>
+					{/* 写完的勾：只在「刚写完」那一拍描边画出 */}
+					{isWrite && !isRunning && !isError && <WriteCheck drawing={settling} />}
+					{isWrite && write && (
+						<span className="write-meta">
+							{writePath && (
+								<span className="write-path" title={write.path}>
+									{writePath.parent ? `…/${writePath.parent}/` : ""}
+									<b>{writePath.name}</b>
+								</span>
+							)}
+							<span
+								className={`write-delta${settling ? " is-settling" : ""}`}
+								data-status={row.status}
+								title={write.path || undefined}
+							>
+								<span className="write-dot" />
+								{deltaLabel(write.content, row.status)}
+							</span>
+						</span>
+					)}
 					<ChevronRight
 						aria-hidden
 						className={`shrink-0 text-foreground-subtlest transition-transform group-data-[state=open]/collapsible:rotate-90`}
@@ -443,20 +491,25 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 				{shouldRenderContent && (
 					// 展开体（ToolLayout.tsx#L24-25 + 锚 §2.b）：pt-2 内容壳 + pre font-mono text-ui-sm
 					<CollapsibleContent className="text-popover-foreground outline-none">
-						<div className="pt-2">
-							<pre className="max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm text-foreground-subtle">
-								{JSON.stringify(row.arguments, null, 2)}
-							</pre>
-							{row.output !== undefined && (
-								<pre
-									className={`mt-1 max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm ${
-										isError ? "text-destructive" : "text-foreground-subtle"
-									}`}
-								>
-									{row.output}
+						{write ? (
+							// write：落笔迷你编辑器（行号 + 逐行 + 墨线 + 收笔扫光）
+							<WriteCardBody content={write.content} status={row.status} output={row.output} />
+						) : (
+							<div className="pt-2">
+								<pre className="max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm text-foreground-subtle">
+									{JSON.stringify(row.arguments, null, 2)}
 								</pre>
-							)}
-						</div>
+								{row.output !== undefined && (
+									<pre
+										className={`mt-1 max-h-56 overflow-y-auto whitespace-pre-wrap break-all font-mono text-ui-sm ${
+											isError ? "text-destructive" : "text-foreground-subtle"
+										}`}
+									>
+										{row.output}
+									</pre>
+								)}
+							</div>
+						)}
 					</CollapsibleContent>
 				)}
 			</Collapsible>
