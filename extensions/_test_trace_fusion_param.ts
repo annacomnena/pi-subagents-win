@@ -174,14 +174,32 @@ function modelsInSpawns(): Array<string | undefined> {
 		return i >= 0 ? args[i + 1] : undefined;
 	});
 }
-/** 抽 spawn argv 里 wt 的 `-d <dir>`：tab 工作目录经 argv 物化（spawn options 不带 cwd）。 */
+/**
+ * 抽 spawn argv 里 wt 的 `-d <dir>`：tab 工作目录经 argv 物化（spawn options 不带 cwd）。
+ *
+ * **结构耦合已核对**（2026-10-22 L4）：argv 由 `buildWindowsTerminalArgs`（tab-launch-core.ts:215-223）
+ * 构造，`-d` 是**数组元素**（不是被空格拆开的字符串），title/prompt 各自占一个元素，
+ * 而 piArgs 段（`--model/--skill/--exclude-tools/--tab-run-id/…` + prompt）**没有** `-d`。
+ * 这里额外断言"恰好一个 `-d`"—— 将来 piArgs 真冒出 `-d`（或 wt argv 改序）时立刻报错，
+ * 而不是默默抽到别的值。
+ */
 function tabCwds(): Array<string | undefined> {
 	return spawnArgv().map((args) => {
+		const hits = args.filter((a) => a === "-d").length;
+		assert.equal(hits, 1, `argv 里应恰好一个 -d（wt 的工作目录旗标），实际 ${hits}：${args.join(" ")}`);
 		const i = args.indexOf("-d");
-		return i >= 0 ? args[i + 1] : undefined;
+		assert.ok(i + 1 < args.length, "-d 后面必须跟目录");
+		return args[i + 1];
 	});
 }
-/** 路径比较用归一化：git rev-parse 回正斜杠、process.cwd() 回反斜杠，同一目录不得因分隔符判不等。 */
+/**
+ * 路径比较用归一化：git rev-parse 回正斜杠、process.cwd() 回反斜杠，同一目录不得因分隔符判不等。
+ *
+ * **已知限（显式登记，不是没想到）**：`toLowerCase()` 在 Windows（本套件唯一运行平台）
+ * 与文件系统语义一致 —— 大小写不同的两个路径**就是同一个目录**。但在大小写敏感平台上，
+ * 它会把两个**不同**的目录判为相等（从而掩掉真缺陷）。本套件不跨平台跑；若将来要在
+ * Linux/macOS 跑，必须先按 `process.platform` 分支（`win32` 才 lower）。
+ */
 function normPath(p: string): string {
 	return resolve(p).replace(/[\\/]+$/, "").toLowerCase();
 }
@@ -314,11 +332,20 @@ function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?
 		// chdir 时序保护：断言用的当前目录在 execute 前读取一次
 		const cwdNow = process.cwd();
 		assert.equal(normPath(cwdNow), normPath(REPO), "前置：当前目录应为用例临时 git 仓");
-		const r = await tool!.execute("", { task: "诊断 flaky 测试" }, undefined, undefined, ctxFor());
+		// **判别力前置**（2026-10-22 L4 反例自检发现）：变异「缺省 repoRoot = process.cwd()」→
+		// `ctx.cwd` 时，本用例原来**全绿** —— 因为 ctxFor() 的 cwd 恰好也是 REPO，两者不可区分。
+		// 改成 ctx.cwd 指到另一个**同为真 git 仓**的目录：省略参数必须忽略 ctx.cwd，仍用 process.cwd()。
+		// 这样「缺省语义」才真的有断言（而不是两条同值路径互相印证）。
+		const OTHER = mkdtempSync(join(TMP, "c1-other-"));
+		g(["init", "-b", "main"], OTHER);
+		g(["commit", "--allow-empty", "-m", "init"], OTHER);
+		assert.notEqual(normPath(OTHER), normPath(cwdNow), "前置：两个目录必须真的不同");
+		const r = await tool!.execute("", { task: "诊断 flaky 测试" }, undefined, undefined, ctxFor({ cwd: OTHER }));
 		assert.equal(r.isError, undefined, `省略 cwd 不应报错：${r.content?.[0]?.text}`);
 		assert.equal(spawnCapture.length, 3, "省略 cwd ⇒ 仍派三 lane");
 		for (const d of tabCwds()) {
-			assert.equal(normPath(String(d)), normPath(cwdNow), `省略 cwd ⇒ lane 工作目录必须是当前目录，实际 ${d}`);
+			assert.equal(normPath(String(d)), normPath(cwdNow), `省略 cwd ⇒ lane 工作目录必须是 process.cwd()（不是 ctx.cwd），实际 ${d}`);
+			assert.notEqual(normPath(String(d)), normPath(OTHER), "省略 cwd ⇒ 绝不能落到 ctx.cwd 上");
 		}
 		// 账本同源（preflight 回的 toplevel 与 process.cwd() 只差分隔符，归一化后必须相等）
 		const recs = dispatchRecords("");
