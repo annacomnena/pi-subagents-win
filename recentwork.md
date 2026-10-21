@@ -127,6 +127,29 @@
   with-pid 2/154、isPidAlive 0.142 ms、全量读 median 26.36 ms、档 A 预计 vs 实际工作量 2~3 倍偏差原因）。
   L4 审查：`plans/20261022_runs_endpoint_l4_review.md`（PASS-with-fixes；其自述「非独立进程」为模型误述，
   派发侧证据见该文件附录）。
+- **L4 独立审查 v2（2026-10-22，另进程复核）**：`plans/20261022_runs_endpoint_l4_review_v2.md` —— 本人**非实现方**，
+  7 项变异全部本人执行（M1 unknown→alive / M2 投影层 limit / **M2b HTTP query limit 接线** / M3 unknown→运行中 /
+  M4 非法 pid 守卫收窄 / M5 union 加成员 ⇒ `tsc` `TS2741` / M7 分组退回裸 status），**全部命中预期断言 + 字节级还原 sha256 一致**。
+  **发现并修 1 个真缺陷**：GUI「运行中/其余」分组原为**页面内联 filter** ⇒ 变异接线后 4 个套件全绿（**零判别力**，
+  AGENTS §4.2）⇒ 提升为纯函数 `gui/src/runsView.ts::partitionRuns` + R7 断言组（`test:gui-runs-view` 10 → **11 组**），
+  修复后同一变异**必红**（`:161 actual ['a','b','c'] / expected ['a']`）。零显示行为变化。
+  **只读性**：真实 `~/.pi/agent/subagent-runs/` 整轮探针前后目录树哈希**逐字节一致**（`f6a77ad8…`）。
+  **真实读数（本机现存量，分母口径写清）**：目录 1109 条目 / `*.json` run 记录 **156**；`?limit=154` **56,243 B**、
+  P95 **35.53 ms**；`+includeRecentCalls=1` **153,254 B**、P95 26.60 ms；三态 `unknown 153 / dead 1`；`pid 1/154`；
+  本次样本 **0 条 running** ⇒ 自审版「运行中无 usage」**本次无法复现**（样本差异，非矛盾）。
+  **与自审版（v1）不一致 5 处**（报告 §8 专节）：v1 称「未发现需修复缺陷」但漏检上述页面接线缺陷；v1 未跑变异（本轮 7 项补齐）；
+  v1 §6 的「pid 边界无断言」在 `67bafb1` 中已有 T10。
+  **登记未修**（报告 §9）：`AutonomyPage.tsx:80` stagnation tooltip 仍写「45min ∨ 结果缺失」（现行 15min + 须有监管账本）；
+  `gui/src/api/types.ts::ProjectFrontier` 缺 `supervision`/`blockedOverdue`；`RunsPage` 无渲染级测试（0/14 测试文件 import 它）；
+  3 处**存量**表格行 code span 的 `|` 未转义（`expectation-ledger.md:68` 等）。
+- **Wiki 收口（另一会话遗留）**：`Wiki/` 8 个已修改页 + 未跟踪新页 `Wiki/Architecture/tab-run-ledger.md`（176 行）
+  来源 = **可视化勘察轮**（M1 落地前）+ **M1 收口**；逐 hunk 归属审计（4 类，**无越界话题 / 无新增任务号叙事**）见
+  L4 v2 报告 §附录 A。校准 10 处（`/v1/runs` 已实现、五条路径 (e) 已实现、八 section、`_test_session_first.ts:55`、
+  23 组、tab-run-ledger 两行等），另修 2 处表格 `|` 转义 + 1 处「10 组」陈旧读数（独立 code-reviewer 进程发现）。
+  `wiki-nav rebuild` → 30 pages；`wiki-nav find "GET /v1/runs 异步 Run 卡片端点"` → **5 matches**，首条即该页（`status: current`）。
+  `tab-run-ledger.md` 与 `async-runs-endpoint.md` **无重复/冲突**（对象不同，交叉引用为对照表）。
+- **本轮验收（冻结树）**：`test:runs-endpoint` **23** / `test:gui-runs-view` **11** / `test:gui-session-first` **14** /
+  `test:gui-contrast` **142 对** / `smoke:extension-load` OK / `tsc --noEmit` 0 errors / `vite build ✓ 2.52s`。
 - **Priority**：P1
 - **Status**：complete（commit **`67bafb1`**，**未 push**）
 - **⚠ 本任务期间自己造成的环境事故（已完全修复，登记以免重演）**：为验证「基线是否本来就红」，

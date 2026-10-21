@@ -104,6 +104,24 @@ export function runningCount(runs: Pick<RunCard, "status" | "liveness">[]): numb
 	return n;
 }
 
+/**
+ * 按「算不算运行中」把记录分成两组。**这是分组的唯一入口**（与 `runningCount` 同走 `deriveRunDisplay`）。
+ *
+ * 为什么必须是可直载的纯函数、不能由页面内联 filter：页面内联的
+ * `filter((r) => r.status === "running")` 是**零判别力**的——2026-10-22 变异实测，把它改回裸 status 判定后
+ * `test:gui-runs-view` / `test:gui-session-first` / `test:gui-contrast` / `tsc --noEmit` **全绿**，
+ * 即「unknown 不得显示为运行中」在页面层没有任何断言保护（AGENTS §4.2）。抽到这里后，
+ * 变异本函数必红（R7 组）。
+ *
+ * 保持传入顺序：服务端已做 running-first + `startedAt` 降序，本函数**不二次排序**。
+ */
+export function partitionRuns<T extends Pick<RunCard, "status" | "liveness">>(runs: T[]): { running: T[]; others: T[] } {
+	const running: T[] = [];
+	const others: T[] = [];
+	for (const r of runs) (deriveRunDisplay(r).countsAsRunning ? running : others).push(r);
+	return { running, others };
+}
+
 /** 三态分布（页脚说明用；分母 = 传入条数）。 */
 export function livenessTally(runs: Pick<RunCard, "liveness">[]): Record<RunLiveness, number> {
 	const t: Record<RunLiveness, number> = { alive: 0, dead: 0, unknown: 0 };

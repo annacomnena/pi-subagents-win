@@ -9,7 +9,7 @@
  *   F3 runtimeOverlay：attention/master/workstream/runtime/runs（+ 既有 wechat/autonomy/appearance）
  *      section 值打开并保持定位；setRuntimeOverlay(null) 关闭复位。
  *      **SBS-RUNS-M1**：section 循环扩到 store 联合类型的**全部**成员并加 `"runs"`——
- *      原来的四值循环是弱覆盖（新增 section 忘了接线也能全绿）。
+ *      原来的四值循环是弱覆盖（新增 section 忘了接线也能全绿）。（2026-10-22 再加固：列表改由 Record<RuntimeOverlaySection,true> 派生 ⇒ 新增成员时 tsc 直接红。）
  *   F4 会话列表过滤谓词（按仓库分组切片拍板 5 收窄）：空查询全匹配；title/shortId（sessionId
  *      前 12 位）/basename(cwd) 子串匹配；大小写不敏感；全量 ID 尾部/文件全路径不再命中；无命中 false
  *
@@ -27,6 +27,7 @@ register("../../extensions/_gui_store_ts_loader.mjs", import.meta.url);
 
 const { useGui } = await import("./store.ts");
 const { matchesSessionFilter } = await import("./sessionFilter.ts");
+import type { RuntimeOverlaySection } from "./store.ts";
 import type { SessionSummary } from "./api/types.ts";
 
 let n = 0;
@@ -52,7 +53,20 @@ ok('F2b setActiveTab("chat") 生效（回到默认主视图）');
 // ── F3 runtimeOverlay 开/关/带 section 打开 ───────────────────────
 // 与 `RuntimeOverlaySection` 联合类型逐值对齐（新增 section 必须同时加到这里——否则本断言
 // 不覆盖它，而 RuntimeOverlay.tsx 的 SECTIONS 与渲染分支漏接线时构建仍会通过）。
-const OVERLAY_SECTIONS = ["attention", "master", "workstream", "runtime", "runs", "wechat", "autonomy", "appearance"] as const;
+// 编译期穷尽性守卫（2026-10-22 加固）：RuntimeOverlaySection 新增成员时本对象缺键
+// ⇒ `tsc --noEmit`（gui:build 第一段）直接报 missing property，测试无法静默漏覆盖新 section。
+// 单一来源：下面的断言列表由本对象的键派生，不再手写两份。
+const SECTION_COVERAGE: Record<RuntimeOverlaySection, true> = {
+	attention: true,
+	master: true,
+	workstream: true,
+	runtime: true,
+	runs: true,
+	wechat: true,
+	autonomy: true,
+	appearance: true,
+};
+const OVERLAY_SECTIONS = Object.keys(SECTION_COVERAGE) as RuntimeOverlaySection[];
 for (const section of OVERLAY_SECTIONS) {
 	useGui.getState().setRuntimeOverlay(section);
 	assert.equal(useGui.getState().runtimeOverlay, section);

@@ -13,6 +13,7 @@
  *   R4 runningCount：只数 countsAsRunning；两条 status=running 但只有一条真活 ⇒ 1
  *   R5 formatUsage：null → "—"；有值 → in/out + cost；缺失 cost 不出 $
  *   R6 livenessTally 分母 = 传入条数；loopBadge 只对 repeating/no_progress 出徽标
+ *   R7 partitionRuns：页面分组口径（只有 running+alive 进 running 组；M6 变异暴露的页面层零判别力缺口）
  *
  * 运行：npm run test:gui-runs-view
  */
@@ -23,7 +24,7 @@ import { register } from "node:module";
 // gui/src 按 vite/bundler 惯例 extensionless 相对导入 → 复用 store 测试 resolve hook 补 .ts
 register("../../extensions/_gui_store_ts_loader.mjs", import.meta.url);
 
-const { deriveRunDisplay, formatUsage, livenessTally, loopBadge, runningCount } = await import("./runsView.ts");
+const { deriveRunDisplay, formatUsage, livenessTally, loopBadge, partitionRuns, runningCount } = await import("./runsView.ts");
 import type { RunCard, RunUsage } from "./api/types.ts";
 
 let n = 0;
@@ -145,6 +146,24 @@ const card = (over: Partial<RunCard>): RunCard => ({
 	assert.equal(loopBadge("repeating")?.tone, "warn");
 	assert.equal(loopBadge("no_progress")?.label, "无进展");
 	ok("R6b loopBadge：仅 repeating/no_progress 出徽标（ok/unknown 静默）");
+}
+
+// ── R7 partitionRuns：页面分组口径（M6 变异暴露的零判别力缺口）────────────
+{
+	const fixture: RunCard[] = [
+		card({ id: "a", status: "running", liveness: "alive" }), // 唯一真跑
+		card({ id: "b", status: "running", liveness: "unknown" }), // 记录 running 但不知道 ⇒ 不得进 running
+		card({ id: "c", status: "running", liveness: "dead" }),
+		card({ id: "d", status: "completed", liveness: "unknown" }),
+		card({ id: "e", status: "failed", liveness: "dead" }),
+	];
+	const { running, others } = partitionRuns(fixture);
+	assert.deepEqual(running.map((r) => r.id), ["a"], "running 组只含 running+alive");
+	assert.deepEqual(others.map((r) => r.id), ["b", "c", "d", "e"], "unknown/dead/终态全部进 others（顺序保持）");
+	assert.equal(running.length + others.length, fixture.length, "分组不丢记录（分母守恒）");
+	assert.equal(running.length, runningCount(fixture), "partitionRuns 与 runningCount 同口径（两者不得漂移）");
+	assert.deepEqual(partitionRuns([]), { running: [], others: [] }, "空输入 → 两组皆空");
+	ok("R7 partitionRuns：只有 running+alive 进 running 组（unknown/dead/终态进 others，分母守恒）");
 }
 
 console.log(`_test_runs_view: all assertions passed (${n} groups)`);

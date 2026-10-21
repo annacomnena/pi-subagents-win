@@ -24,7 +24,7 @@ import { AlertTriangle, Activity, PlayCircle } from "lucide-react";
 import { api } from "../api/client";
 import type { RunCard, RunsResponse } from "../api/types";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
-import { deriveRunDisplay, formatUsage, livenessTally, loopBadge, runningCount, type RunTone } from "../runsView";
+import { deriveRunDisplay, formatUsage, livenessTally, loopBadge, partitionRuns, runningCount, type RunTone } from "../runsView";
 
 /** 每页最多显示多少条（服务端 limit 上限 200；这里只要「最近的一屏」）。 */
 const PAGE_LIMIT = 50;
@@ -113,10 +113,10 @@ export function RunsPage() {
 	const runs = data.runs;
 	const live = runningCount(runs);
 	const tally = livenessTally(runs);
-	const running = runs.filter((r) => deriveRunDisplay(r).countsAsRunning);
 	// 「运行中」组 = 真活；其余（含 status=running 但 unknown/dead）一律算「未确认为运行中」，
 	// 与终态混排（按服务端给的 running-first + startedAt 降序顺序原样呈现，不再二次排序）。
-	const others = runs.filter((r) => !deriveRunDisplay(r).countsAsRunning);
+	// 分组口径的**唯一实现**在 `runsView.ts::partitionRuns`（页面内联 filter 会被变异而不被发现）。
+	const { running, others } = partitionRuns(runs);
 
 	return (
 		<div className="space-y-3">
