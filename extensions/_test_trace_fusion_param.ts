@@ -23,7 +23,7 @@ import cp from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 // ── 隔离必须在 import 本仓模块之前（homedir 派生）──────────────────────
 const TMP = mkdtempSync(join(tmpdir(), "tf-param-"));
@@ -174,6 +174,17 @@ function modelsInSpawns(): Array<string | undefined> {
 		return i >= 0 ? args[i + 1] : undefined;
 	});
 }
+/** 抽 spawn argv 里 wt 的 `-d <dir>`：tab 工作目录经 argv 物化（spawn options 不带 cwd）。 */
+function tabCwds(): Array<string | undefined> {
+	return spawnArgv().map((args) => {
+		const i = args.indexOf("-d");
+		return i >= 0 ? args[i + 1] : undefined;
+	});
+}
+/** 路径比较用归一化：git rev-parse 回正斜杠、process.cwd() 回反斜杠，同一目录不得因分隔符判不等。 */
+function normPath(p: string): string {
+	return resolve(p).replace(/[\\/]+$/, "").toLowerCase();
+}
 function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?: string; taskId?: string }> {
 	const tabRunsDir = join(AGENT_DIR, "tab-runs");
 	if (!existsSync(tabRunsDir)) return [];
@@ -293,6 +304,94 @@ function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?
 		const r = await tool!.execute("", { task: "x" }, undefined, undefined, ctxFor());
 		assert.equal(r.isError, undefined, `旧 config 路径不得校验：${r.content?.[0]?.text}`);
 		assert.deepEqual(modelsInSpawns(), ["not/a-real-model", "not/a-real-model", "not/a-real-model"]);
+	});
+
+	console.log("② per-call cwd");
+
+	await check("C1 省略 cwd ⇒ 向后兼容：3 lane 且工作目录 = process.cwd()", async () => {
+		installCpStubs();
+		useCase("c1", {});
+		// chdir 时序保护：断言用的当前目录在 execute 前读取一次
+		const cwdNow = process.cwd();
+		assert.equal(normPath(cwdNow), normPath(REPO), "前置：当前目录应为用例临时 git 仓");
+		const r = await tool!.execute("", { task: "诊断 flaky 测试" }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, undefined, `省略 cwd 不应报错：${r.content?.[0]?.text}`);
+		assert.equal(spawnCapture.length, 3, "省略 cwd ⇒ 仍派三 lane");
+		for (const d of tabCwds()) {
+			assert.equal(normPath(String(d)), normPath(cwdNow), `省略 cwd ⇒ lane 工作目录必须是当前目录，实际 ${d}`);
+		}
+		// 账本同源（preflight 回的 toplevel 与 process.cwd() 只差分隔符，归一化后必须相等）
+		const recs = dispatchRecords("");
+		assert.equal(recs.length, 3, "三份 dispatch 账本");
+		for (const rec of recs) {
+			assert.equal(normPath(String(rec.cwd)), normPath(cwdNow), `账本 cwd 必须与 spawn 同源，实际 ${rec.cwd}`);
+		}
+	});
+
+	await check("C2 显式 cwd（另一个真 git 仓）生效：3 lane 且工作目录 = 该仓", async () => {
+		installCpStubs();
+		useCase("c2", {});
+		// 第二个临时仓：必须真 HEAD + 干净树，preflight 才过
+		const REPO2 = mkdtempSync(join(TMP, "repo2-"));
+		g(["init", "-b", "main"], REPO2);
+		g(["commit", "--allow-empty", "-m", "init"], REPO2);
+		const resolveCwd = resolve(REPO2);
+		const r = await tool!.execute("", { task: "x", cwd: resolveCwd }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, undefined, `显式 cwd 不应报错：${r.content?.[0]?.text}`);
+		assert.equal(spawnCapture.length, 3, "显式 cwd ⇒ 仍派三 lane");
+		for (const d of tabCwds()) {
+			assert.equal(normPath(String(d)), normPath(resolveCwd), `显式 cwd ⇒ lane 工作目录必须是该仓，实际 ${d}`);
+		}
+		for (const rec of dispatchRecords("")) {
+			assert.equal(normPath(String(rec.cwd)), normPath(resolveCwd), `账本 cwd 必须落在显式 cwd，实际 ${rec.cwd}`);
+		}
+	});
+
+	await check("C3 相对路径 cwd ⇒ 拒：isError + 零 spawn", async () => {
+		installCpStubs();
+		useCase("c3", {});
+		const r = await tool!.execute("", { task: "x", cwd: "extensions" }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, true, "相对路径必须被拒");
+		assert.match(r.content[0].text, /绝对路径/, `文案应说明必须是绝对路径，实际：${r.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "被拒 ⇒ 零 spawn");
+	});
+
+	await check("C4 不存在的绝对目录 ⇒ 拒：isError + 零 spawn", async () => {
+		installCpStubs();
+		useCase("c4", {});
+		const missing = join(TMP, "no-such-dir");
+		const r = await tool!.execute("", { task: "x", cwd: missing }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, true, "不存在的目录必须被拒");
+		assert.match(r.content[0].text, /不存在或不是目录/, `文案应说明目录不存在，实际：${r.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "被拒 ⇒ 零 spawn");
+	});
+
+	await check("C5 非字符串 / 全空白 cwd ⇒ 拒：isError + 零 spawn", async () => {
+		// 5a：非字符串（123）
+		installCpStubs();
+		useCase("c5a", {});
+		const rNum = await tool!.execute("", { task: "x", cwd: 123 }, undefined, undefined, ctxFor());
+		assert.equal(rNum.isError, true, "非字符串 cwd 必须被拒");
+		assert.match(rNum.content[0].text, /非空字符串/, `文案应说明必须是非空字符串，实际：${rNum.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "非字符串 ⇒ 零 spawn");
+		// 5b：全空白字符串——实现先查 `!trim()` 再查 isAbsolute，故命中「非空字符串」而非「绝对路径」
+		installCpStubs();
+		useCase("c5b", {});
+		const rBlank = await tool!.execute("", { task: "x", cwd: "   " }, undefined, undefined, ctxFor());
+		assert.equal(rBlank.isError, true, "全空白 cwd 必须被拒");
+		assert.match(rBlank.content[0].text, /非空字符串/, `全空白先命中非空检查（实现顺序：trim 先于 isAbsolute），实际：${rBlank.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "全空白 ⇒ 零 spawn");
+	});
+
+	await check("C6 cwd 指向文件（非目录）⇒ 拒：isError + 零 spawn", async () => {
+		installCpStubs();
+		useCase("c6", {});
+		const filePath = join(savedCwd, "extensions", "index.ts");
+		assert.ok(existsSync(filePath), "前置：夹具文件必须存在");
+		const r = await tool!.execute("", { task: "x", cwd: filePath }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, true, "指向文件必须被拒");
+		assert.match(r.content[0].text, /不存在或不是目录/, `文案应说明不是目录，实际：${r.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "被拒 ⇒ 零 spawn");
 	});
 
 	process.chdir(savedCwd);

@@ -9,9 +9,9 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, unlinkSync, writeFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, dirname, basename } from "node:path";
+import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -5039,12 +5039,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			task: Type.String({ description: "任务描述（各 lane 逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
 			model: Type.Optional(Type.String({ description: "per-call 模型（provider/id 或唯一短名）。优先级：本参数 > config.workerModel > lane 默认；非法模型直接报错（不静默回落）" })),
+			cwd: Type.Optional(Type.String({ description: "per-call 目标仓库（必须是绝对路径；缺省 = 当前目录）。校验沿用 preflight（git 仓库/HEAD/merge 状态），路径先规范化成绝对路径" })),
 		}),
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
 			if (!capabilities().launchTabs) {
 				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
 			}
-			const params = rawParams as { task?: string; model?: unknown };
+			const params = rawParams as { task?: string; model?: unknown; cwd?: unknown };
 			const task = (params.task ?? "").trim();
 			if (!task) {
 				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
@@ -5080,11 +5081,32 @@ export default function (pi: ExtensionAPI) {
 			if (!wtExe) {
 				return { content: [{ type: "text", text: "未找到 Windows Terminal (wt.exe)，无法启动标签页。" }], isError: true };
 			}
+			// 参数化 ②（2026-10-21）：per-call cwd —— 缺省 process.cwd()（向后兼容）；
+			// 显式传入必须规范化成绝对路径且是已存在目录；git 仓库/HEAD/merge 校验交给 preflight（不重写）。
+			let repoRoot = process.cwd();
+			if (params.cwd !== undefined) {
+				if (typeof params.cwd !== "string" || !params.cwd.trim()) {
+					return { content: [{ type: "text", text: "trace-fusion: cwd 必须是非空字符串（绝对路径）。" }], isError: true };
+				}
+				if (!isAbsolute(params.cwd)) {
+					return { content: [{ type: "text", text: `trace-fusion: cwd 必须是绝对路径：${params.cwd}` }], isError: true };
+				}
+				repoRoot = resolve(params.cwd);
+				let cwdIsDir = false;
+				try {
+					cwdIsDir = statSync(repoRoot).isDirectory();
+				} catch {
+					cwdIsDir = false;
+				}
+				if (!cwdIsDir) {
+					return { content: [{ type: "text", text: `trace-fusion: cwd 不存在或不是目录：${repoRoot}` }], isError: true };
+				}
+			}
 			const tfConfig = readTraceFusionConfig();
 			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档
 			const result = launchTraceRun({
 				task,
-				repoRoot: process.cwd(),
+				repoRoot,
 				wtExe,
 				piCli,
 				config: { ...tfConfig, mode: "diagnose" },
