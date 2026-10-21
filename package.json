@@ -133,6 +133,7 @@
 		"test:escalation-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_escalation_gate.ts",
 		"test:incident-visibility": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_incident_visibility.ts",
 		"test:builtin-cmd-bridge": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_builtin_cmd_bridge.ts",
+		"test:session-usage": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_usage.ts",
 		"test:scope-consume": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_scope_consume.ts",
 		"test:local-master-consumption": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_scope_consume.ts",
 		"accept:local-master-loop": "node ./scripts/local-master-loop-acceptance.mjs",

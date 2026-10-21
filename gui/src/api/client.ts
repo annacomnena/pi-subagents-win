@@ -22,6 +22,7 @@ import type {
 	StreamingSnapshot,
 	TimelineResponse,
 	TranscriptBody,
+	SessionUsageBody,
 	UploadResult,
 	WechatBindStartBody,
 	WechatBindStatusBody,
@@ -261,6 +262,18 @@ export const api = {
 		const q = after !== undefined && after > 0 ? `?after=${after}` : tail !== undefined && tail > 0 ? `?tail=${tail}` : "";
 		return fetchJson<TranscriptBody>(`/v1/sessions/${encodeURIComponent(sessionId)}/transcript${q}`, undefined, 8000);
 	},
+
+	/**
+	 * GET /v1/sessions/:id/usage：会话**当前轮次**上下文用量（2026-10-21）。
+	 * 数据源 = 会话 JSONL 最后一条带 usage 的 assistant（服务端尾部块读，9ms 量级）。
+	 *
+	 * 三指标口径（见 extensions/runtime/session-usage.ts 头注释）：
+	 * - tokens = 最后一条 assistant 的 totalTokens（上下文长度，绝对）
+	 * - percent = tokens / contextWindow（窗口取自 master-liveness.windowTokens；未知⇒null）
+	 * - cachePercent = cacheRead / (cacheRead + input)（**只看输入侧**，不含 output）
+	 */
+	usage: (sessionId: string): Promise<FetchResult<SessionUsageBody>> =>
+		fetchJson<SessionUsageBody>(`/v1/sessions/${encodeURIComponent(sessionId)}/usage`, undefined, 5000),
 
 	/**
 	 * GET /v1/streaming/:sessionId：流式快照（节流 ~6.7 次/秒写入）。

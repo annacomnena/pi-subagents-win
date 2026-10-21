@@ -50,6 +50,31 @@ export function fmtPressurePct(v: unknown): string {
 	return p === null ? "暂无数据" : `${p.toFixed(1)}%`;
 }
 
+/**
+ * token 数紧凑展示（2026-10-21，上下文用量）。
+ *
+ * 三种量级：< 1000 原数；< 1M 用 k（一位小数，去尾 .0）；>= 1M 用 M。
+ * 为什么要缩：顶栏空间有限，319,668 这种全数字会把其他项挤掉。
+ * 精确值留在 tooltip（调用方给）。
+ */
+export function fmtTokens(v: number | null | undefined): string {
+	if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return "--";
+	if (v < 1000) return String(Math.round(v));
+	if (v < 1_000_000) {
+		const k = v / 1000;
+		// 100k 以上不要小数（259.7k 反而更长）；以下保留一位并去掉 .0
+		return `${k >= 100 ? Math.round(k) : Math.round(k * 10) / 10}k`;
+	}
+	const m = v / 1_000_000;
+	return `${Math.round(m * 100) / 100}M`;
+}
+
+/** 百分比（已是 0-100 刻度，两位小数）；null → 「--」（与 fmtTokens 的空态一致）。 */
+export function fmtPct100(v: number | null | undefined): string {
+	if (typeof v !== "number" || !Number.isFinite(v)) return "--";
+	return `${v.toFixed(v >= 10 ? 0 : 1)}%`;
+}
+
 // ── 状态中文映射（仅展示层；store/类型零改动） ──────────────────
 
 export const WS_STATUS_ZH: Record<string, string> = {

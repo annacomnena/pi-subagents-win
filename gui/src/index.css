@@ -515,6 +515,77 @@ body {
 	will-change: opacity;
 }
 
+/* ── 流式增量入场（2026-10-21）───────────────────────────────────────
+ * 只挂在「本次新追加的那一段」上（前缀是另一个文本节点，完全不动）：
+ * 透明→实 + 模糊→清晰 + 暖陶土→正文墨色。这是把 200ms 一次的整块跳变
+ * 变成连续观感的关键 —— 旧实现只有呼吸光标，新字是「啪」地贴上去的。
+ *
+ * 时长 220ms 略长于 200ms 轮询间隔：相邻两块略有交叠，避免「先停住再出现」的节拍感。
+ * `--stream-chunk-ink` 由上下文给（正文用 foreground、思考用 foreground-subtle），
+ * 所以不同墨色区共用同一组关键帧，不会把思考块的字染成正文色。
+ *
+ * `--stream-chunk-blur` / `--stream-chunk-tint` 由渲染层**按这一块自身字数**给（见
+ * ChatPage.chunkIntensity）：`filter` 只作用于它所挂的那个元素，所以一拍 40 字（tps 200）
+ * 会被切片成 12 字一块，模糊只糊 12 字而不是整行。缺省值 = 小块的默认强度，
+ * 只是为了「没给变量也能跑」。
+ *
+ * 不用 mask 扫光的原因见 ChatPage.StreamingPreview 注释（折行 inline 上几何不可控，实测）。 */
+@keyframes stream-chunk-in {
+	from {
+		opacity: 0;
+		filter: blur(var(--stream-chunk-blur, 3px));
+		color: color-mix(in oklab, var(--color-accent) var(--stream-chunk-tint, 55%), var(--stream-chunk-ink, var(--color-foreground)));
+	}
+
+	60% {
+		opacity: 1;
+		filter: blur(calc(var(--stream-chunk-blur, 3px) * 0.2));
+	}
+
+	to {
+		opacity: 1;
+		filter: blur(0);
+		color: var(--stream-chunk-ink, var(--color-foreground));
+	}
+}
+
+.stream-chunk-in {
+	--stream-chunk-ink: var(--color-foreground);
+	animation: stream-chunk-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* 思考预览：墨色跟 ReasoningRowView 一致（subtle），不要把思考染成正文墨 */
+[data-streaming-kind="reasoning"] .stream-chunk-in {
+	--stream-chunk-ink: var(--color-foreground-subtle);
+}
+
+/* 光标（2026-10-21）：旧的 6px 方块 `animate-pulse` 是硬闪 + 整块明暗跳，换成
+ * terracotta→透明的渐变尾（像个打印头），呼吸靠 scaleX + opacity 缓动做柔。 */
+@keyframes stream-caret-breath {
+	0%,
+	100% {
+		opacity: 0.3;
+		transform: scaleX(0.72);
+	}
+
+	50% {
+		opacity: 1;
+		transform: scaleX(1);
+	}
+}
+
+.stream-caret {
+	display: inline-block;
+	width: 9px;
+	height: 1em;
+	margin-left: 2px;
+	vertical-align: -0.14em;
+	border-radius: 1px;
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-accent) 85%, transparent), transparent);
+	transform-origin: left center;
+	animation: stream-caret-breath 1.4s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
 	.animated-gradient-text,
 	.zcode-draft-prompt-waterfall,
@@ -522,8 +593,17 @@ body {
 	.task-search-result-highlight,
 	[data-fork-highlight="true"],
 	[data-zcode-stream-animate="true"],
-	[data-zcode-tool-stream-animate="true"] {
+	[data-zcode-tool-stream-animate="true"],
+	.stream-chunk-in,
+	.stream-caret {
 		animation: none;
+	}
+
+	/* 减动效时增量的入场动画关掉后，opacity/color/filter 回到初始值（否则 animation:none
+	 * 会让元素停在 base 样式 —— 那本来就是最终态，此处只需要显式清掉 filter 残留预期）。 */
+	.stream-chunk-in {
+		opacity: 1;
+		filter: none;
 	}
 
 	.zcode-task-interaction-countdown-fill {

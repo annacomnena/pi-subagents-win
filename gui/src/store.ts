@@ -22,6 +22,7 @@ import type {
 	SessionControlBody,
 	RuntimeSnapshot,
 	SessionSummary,
+	SessionUsageBody,
 	TimelineItem,
 	StreamingSnapshot,
 	TranscriptHead,
@@ -199,6 +200,13 @@ interface GuiState {
 	/** 当前会话的流式快照（节流 ~6.7 次/秒；null = 没在流式）。L2/UX 2026-10-20。 */
 	chatStreaming: StreamingSnapshot | null;
 	/**
+	 * 会话 → 当前轮次上下文用量（2026-10-21）。
+	 *
+	 * 按 sessionId 缓存（切会话不串值）。刷新时机：打开会话 / 会话忙结束 / 手动刷新。
+	 * 不做高频轮询：usage 只在 assistant 消息落盘后才变，跟 transcript 同源同频。
+	 */
+	chatUsageBySession: Record<string, SessionUsageBody>;
+	/**
 	 * 当前会话最近一条**控制指令**回执（2026-10-20 停止按钮）。
 	 * null = 没点过停止（或已过展示期）；status=done + result=aborted ⇒ 已停下。
 	 */
@@ -225,6 +233,8 @@ interface GuiState {
 	openChatSession: (id: string) => Promise<void>;
 	/** 首屏/全量重拉：缺省只取最新 TAIL_FIRST 行（`?tail=`）；传 tail 显式放大（「加载更早」）。 */
 	reloadChatSession: (id: string, tail?: number) => Promise<void>;
+	/** 刷新指定会话的上下文用量（2026-10-21；失败保留旧值，不置空）。 */
+	refreshChatUsage: (id: string) => Promise<void>;
 	/** 拉一次流式快照（404 = 没在流式 → 置 null，不算错误）。 */
 		pollChatStreaming: (id: string | null) => Promise<void>;
 	/**
@@ -455,6 +465,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatHasOlderBySession: {},
 	chatTailBySession: {},
 	chatStreaming: null,
+	chatUsageBySession: {},
 	chatControl: null,
 	chatBusyFlag: false,
 	chatCommands: null,
@@ -525,6 +536,12 @@ export const useGui = create<GuiState>((set, get) => ({
 	 *
 	 * 404 是**正常态**（会话没在流式）⇒ 置 null，不 markDown（否则健康度会被误判）。
 	 * 其他错误同样置 null：流式预览失败不该影响主数据面。
+	 *
+	 * 2026-10-21 动效：除了透传服务端快照，这里再算两个**GUI 派生字段**
+	 * （`appendFrom` / `rev`，见 `StreamingSnapshot` 注释）——
+	 * 让渲染层能「只给刚追加的那一段」加入场动画，而不是整段重画。
+	 * 放在 store 而不是组件里：组件若用 ref 记住「上一帧文本」，StrictMode 双渲染
+	 * 会先消费掉 ref ⇒ 动画在 dev 下时有时无；状态里带下标才是幂等的。
 	 */
 	pollChatStreaming: async (id) => {
 		if (id === null) {
@@ -539,7 +556,22 @@ export const useGui = create<GuiState>((set, get) => ({
 		}
 		// 防串台：响应必须属于当前会话
 		if (r.data.sessionId !== id) return;
-		set({ chatStreaming: r.data });
+		// 派生「本次追加段」：只有同会话 + 同 kind + 文本是上一份的前缀扩展，才算「接在后面」。
+		const prev = get().chatStreaming;
+		const appendable =
+			prev !== null &&
+			prev.sessionId === r.data.sessionId &&
+			prev.kind === r.data.kind &&
+			r.data.text.startsWith(prev.text);
+		const textChanged = prev === null || prev.kind !== r.data.kind || prev.text !== r.data.text;
+		set({
+			chatStreaming: {
+				...r.data,
+				appendFrom: appendable ? prev.text.length : 0,
+				// 只在内容真变时 bump：轮询空转（服务端暂停思考）不能让同一段字反复淡入
+				rev: (prev?.rev ?? 0) + (textChanged ? 1 : 0),
+			},
+		});
 	},
 
 	/**
@@ -713,6 +745,17 @@ export const useGui = create<GuiState>((set, get) => ({
 		get().markUp(r.at);
 	},
 
+	/**
+	 * 刷新会话上下文用量（2026-10-21）。
+	 *
+	 * 失败**保留旧值**：usage 是辅助读数，一次拉不到不该让工具栏闪成「--」。
+	 */
+	refreshChatUsage: async (id) => {
+		const r = await api.usage(id);
+		if (!r.ok) return;
+		set({ chatUsageBySession: { ...get().chatUsageBySession, [id]: r.data } });
+	},
+
 	/** 0923 2003 C3②：WS 重连强制 resync——启用 client.ts transcript 的 after= 增量：
 	 *  有 head → GET ?after=head.seq 拿「触及行终态」按 rowId upsert 合并（回填保位、新行按响应
 	 *  序追加）；无 head 或增量失败 → 回退全量 reloadChatSession。rowId 幂等 + seq 倒退防御
@@ -755,6 +798,8 @@ export const useGui = create<GuiState>((set, get) => ({
 	openChatSession: async (id) => {
 		set({ chatActiveId: id });
 		await get().reloadChatSession(id);
+		// 用量与 transcript 同源，同频拉一次（不单独轮询）
+		void get().refreshChatUsage(id);
 		// 新 topic / 新 head → 立即重订阅（不走断线退避）
 		get().bumpChatResync();
 	},

@@ -11,7 +11,7 @@
 import { Moon, PanelLeft, Settings, Sun } from "lucide-react";
 import { useGui } from "../store";
 import { pendingDecisionBadge } from "../interactionBadge";
-import { fmtPressurePct, fmtRel, fmtTime, pressurePct } from "../format";
+import { fmtPct100, fmtPressurePct, fmtRel, fmtTime, fmtTokens, pressurePct } from "../format";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import type { AttentionItem } from "../api/types";
@@ -80,6 +80,24 @@ export function TopBar() {
 			? { pct: proposalPct, label: `${fmtRel(asString(proposal?.payload?.proposedAt))}的提案时点值，非实时`, title: asString(proposal?.payload?.proposedAt) ? fmtTime(asString(proposal?.payload?.proposedAt)) : undefined }
 			: null;
 
+	// 2026-10-21：**当前打开会话**的上下文用量（长度 / 占比 / 缓存比例）。
+	// 与上面的「master 压力」是**两个不同口径**，不可混用：
+	//   · master 压力 = readPressure() 的百分比（值守会话）
+	//   · 本段 = 会话 JSONL 最后一条 assistant 的 usage（用户真正在看的那条会话）
+	// 有本会话读数就优先显示它（更具体、用户更常关心）；没有则退回 master 压力。
+	const chatUsage = chatActiveId !== null ? (useGui.getState().chatUsageBySession[chatActiveId] ?? null) : null;
+	const usageKnown = chatUsage !== null && chatUsage.tokens !== null;
+	const usageTitle = chatUsage === null
+		? undefined
+		: [
+				`上下文长度：${chatUsage.tokens === null ? "未知" : `${chatUsage.tokens.toLocaleString()} tokens`}`,
+				`上下文窗口：${chatUsage.contextWindow === null ? "未知" : chatUsage.contextWindow.toLocaleString()}`,
+				`占比：${chatUsage.percent === null ? "未知" : `${chatUsage.percent}%`}`,
+				`缓存命中：${chatUsage.cachePercent === null ? "未知（无输入）" : `${chatUsage.cachePercent}%`}`,
+				`输入 ${chatUsage.detail.input} · 命中 ${chatUsage.detail.cacheRead} · 写入 ${chatUsage.detail.cacheWrite} · 输出 ${chatUsage.detail.output}`,
+				chatUsage.at !== undefined ? `读数时刻：${fmtTime(chatUsage.at)}` : "读数时刻：未知",
+			].join("\n");
+
 	return (
 		// header（WorkspaceHeader.tsx#L152-176）：h-12 + border-border/50（草稿态 border-transparent 不做）
 		<header className="@container/workspace-header relative flex w-full shrink-0 h-12 border-b border-border/50 bg-header">
@@ -131,13 +149,33 @@ export function TopBar() {
 					</span>
 					<span
 						className="flex items-center gap-1 text-ui-sm text-foreground-subtle"
-						title="会话记忆快满时会自动提议交接"
+						title={usageKnown ? usageTitle : "会话记忆快满时会自动提议交接"}
 					>
-						上下文压力
-						<span className="font-mono text-foreground">
-							{pressureShown ? fmtPressurePct(pressureShown.pct) : <span className="text-foreground-subtlest">暂无数据</span>}
-						</span>
-						{pressureShown && (
+						上下文
+						{usageKnown && chatUsage !== null ? (
+							<>
+								<span className="font-mono text-foreground">{fmtTokens(chatUsage.tokens)}</span>
+								<span className="text-foreground-subtlest">/</span>
+								<span className="font-mono text-foreground-subtlest">{fmtTokens(chatUsage.contextWindow)}</span>
+								{chatUsage.percent !== null && (
+									<span
+										className={`font-mono ${chatUsage.percent >= 80 ? "text-destructive" : chatUsage.percent >= 60 ? "text-warning" : "text-foreground-subtle"}`}
+									>
+										（{fmtPct100(chatUsage.percent)}）
+									</span>
+								)}
+								{chatUsage.cachePercent !== null && (
+									<span className="font-mono text-foreground-subtlest" title="缓存命中率 = cacheRead / (cacheRead + input)，只看输入侧">
+										命中 {fmtPct100(chatUsage.cachePercent)}
+									</span>
+								)}
+							</>
+						) : (
+							<span className="font-mono text-foreground">
+								{pressureShown ? fmtPressurePct(pressureShown.pct) : <span className="text-foreground-subtlest">暂无数据</span>}
+							</span>
+						)}
+						{!usageKnown && pressureShown && (
 							<span className="text-ui-xs text-foreground-subtlest" title={pressureShown.title}>
 								（{pressureShown.label}）
 							</span>

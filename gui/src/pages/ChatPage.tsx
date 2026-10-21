@@ -14,8 +14,9 @@
  *   （ConversationTimeline.tsx#L882-909 公式，FADE=24 / TRANSPARENT=96）+ 回到底部浮钮。
  */
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { autoExpandTarget } from "../chatAutoExpand";
+import { planTurnCollapse, type TurnSummary } from "../turnCollapse";
 import {
 	applyCommandSelection,
 	filterCommands,
@@ -34,7 +35,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
-import type { ChatOutboxEntry, TranscriptRow } from "../api/types";
+import type { ChatOutboxEntry, StreamingSnapshot, TranscriptRow } from "../api/types";
 import type { StreamSubscribeMsg } from "../api/types";
 import { api } from "../api/client";
 import {
@@ -71,16 +72,24 @@ function RowShell({
 	rowId,
 	className,
 	animate,
+	attrs,
 	children,
 }: {
 	rowId: string;
 	className?: string;
 	/** 是否播放入场动画（只给「本次新增」的行；整批历史不打，见 ChatPage 的 animateFromIndex）。 */
 	animate?: boolean;
+	/** 额外 data-* 属性（诊断用；不参与样式）。 */
+	attrs?: Record<string, string>;
 	children: React.ReactNode;
 }) {
 	return (
-		<div data-row-id={rowId} {...(animate === true ? { "data-zcode-stream-animate": "true" } : {})} className={className}>
+		<div
+			data-row-id={rowId}
+			{...attrs}
+			{...(animate === true ? { "data-zcode-stream-animate": "true" } : {})}
+			className={className}
+		>
 			{children}
 		</div>
 	);
@@ -89,15 +98,71 @@ function RowShell({
 // ── 5 种行 → zcode 行型 ───────────────────────────────────────────
 
 /** 调试 turn header 行（ConversationRowView.tsx#L1622-1628）。 */
-function TurnHeaderRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "turnHeader" }>; animate?: boolean }) {
+/**
+ * turn header 行（2026-10-21 起兼任「本轮工作过程」的折叠摘要线）。
+ *
+ * - `summary === null` ⇒ 本轮不可折叠（正在跑 / 纯文字轮 / 收尾不是文字）：原样显示，
+ *   口径与 0923 复刻一致（`对话轮 N · 相对时间 · 时长|进行中`）。
+ * - `summary !== null` ⇒ 本轮已结束且过程可折叠：渲染成可点的一行摘要
+ *   `已完成 45.2s · 6 步 ⌄`，点一下展开/收起被折叠的思考与工具卡。
+ *   「对话轮 N」在摘要态**不显示** —— 那是调试信息，摘要线的用途是快速跳过过程。
+ *
+ * chevron 用 `open` 直接给类名（不用 `group-data-[state=open]/collapsible:`）：
+ * 这一行不在 Radix Collapsible 里，套那套选择器会永远不旋转（见 _test_chat_collapse_state ⑤）。
+ */
+function TurnHeaderRowView({
+	row,
+	animate,
+	summary,
+	onToggle,
+}: {
+	row: Extract<TranscriptRow, { kind: "turnHeader" }>;
+	animate?: boolean;
+	/** null/undefined = 不可折叠（原样显示）。 */
+	summary?: TurnSummary | null;
+	onToggle?: () => void;
+}) {
+	const dur = summary?.durationMs ?? row.durationMs ?? null;
 	return (
 		<RowShell
 			animate={animate}
 			rowId={row.rowId}
+			/**
+			 * 诊断属性（2026-10-21 用户报「感觉没生效」）：让「这一轮到底判成了什么」能在
+			 * DevTools 里一行查出来，而不是靠肉眼猜 ——
+			 * `document.querySelectorAll('[data-turn-summary="collapsed"]').length`
+			 * none = 不可折叠（正在跑 / 纯文字轮 / 收尾不是文字），collapsed / expanded = 可折叠。
+			 */
+			attrs={{
+				"data-turn-summary": summary === null || summary === undefined ? "none" : summary.expanded ? "expanded" : "collapsed",
+				...(summary === null || summary === undefined
+					? {}
+					: { "data-turn-hidden-rows": String(summary.rows), "data-turn-steps": String(summary.steps) }),
+			}}
 			className="border-b border-[var(--color-border)] py-1 text-ui-sm text-[var(--color-foreground-subtle)]"
 		>
-			对话轮 {row.turnIndex} · <RelTime at={row.startedAt} />
-			{row.durationMs !== undefined ? ` · ${fmtDuration(row.durationMs)}` : " · 进行中"}
+			{summary === null || summary === undefined ? (
+				<>
+					对话轮 {row.turnIndex} · <RelTime at={row.startedAt} />
+					{row.durationMs !== undefined ? ` · ${fmtDuration(row.durationMs)}` : " · 进行中"}
+				</>
+			) : (
+				<button
+					type="button"
+					onClick={onToggle}
+					aria-expanded={summary.expanded}
+					title={summary.expanded ? "收起这一轮的工作过程" : "展开这一轮的工作过程（思考 / 工具调用）"}
+					className="group/turn inline-flex max-w-full cursor-pointer items-center gap-1.5 text-left text-foreground-subtlest transition-colors hover:text-foreground-subtle"
+				>
+					<ChevronRight
+						className={`size-3.5 shrink-0 transition-transform ${summary.expanded ? "rotate-90" : ""}`}
+					/>
+					<span>已完成{dur !== null ? ` ${fmtDuration(dur)}` : ""}</span>
+					<span className="opacity-60">·</span>
+					<span>{summary.steps} 步</span>
+					{summary.expanded ? null : <span className="opacity-60">· 点击展开</span>}
+				</button>
+			)}
 		</RowShell>
 	);
 }
@@ -400,24 +465,122 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 }
 
 	/**
-	 * 流式临时块（2026-10-20）。
+	 * 增量入场的强度（**按这一块的自身字数**自适应，2026-10-21 第二轮）。
+	 *
+	 * 为什么不能固定 3px / 55%：GUI 每 200ms 只取一拍（`usePoll` 固定档 + busy 门会让
+	 * 上一拍未完成时掉拍，标签页切回来还会一次补一大块），所以**一拍里塞多少字完全由
+	 * 模型 tps 决定**：150ms 写一次快照、200ms 读一次 ⇒
+	 * tps 10 → 2 字/拍；50 → 10 字；100 → 20 字；**200 → 约 40 字（≈ 一整行）**；
+	 * 掉拍到 400ms → 80 字（两行）。
+	 * `filter: blur()` 是**按元素**生效的 ⇒ 一次渲染 40 字且不切片时，是「整行一起虚化」，
+	 * 观感不是「新字浮现」而是「一行糊了一下」。所以：
+	 *
+	 * 1. 超过 {@link CHUNK_SLICE_AT} 字先**切片**（每片 {@link CHUNK_SLICE_SIZE} 字）——
+	 *    切片之后每一片只有 12 字，模糊自然回到小块的档位，不会糊整行；
+	 * 2. 强度按**渲染块自己的字数**给（切片时按片长算），只对 7–32 字的单块做轻微收敛，
+	 *    避免「一口气 30 多字」那种中等跳变还是糊成一片。
+	 *
+	 * 时长没有跟着变短：必须 ≥ 200ms 轮询间隔，否则相邻两拍之间会出现「动画已结束、
+	 * 下一拍还没到」的空档，反而有节拍感（这是当初取 220ms 的原因）。
+	 */
+	function chunkIntensity(n: number): CSSProperties {
+		if (n <= 6) return {};
+		const over = n - 6;
+		return {
+			"--stream-chunk-blur": `${Math.max(0.9, 3 * Math.exp(-over / 30)).toFixed(2)}px`,
+			"--stream-chunk-tint": `${Math.round(Math.max(28, 55 - over * 0.8))}%`,
+		} as unknown as CSSProperties;
+	}
+
+	/** 一拍超过这个字数就切片：单块 32 字以上淡入已经像「糊一片」，切片才有「往下写」的走向。 */
+	const CHUNK_SLICE_AT = 32;
+	/** 每片码点数。12 字 ≈ 一行 1/4，模糊只作用在这一小段上。 */
+	const CHUNK_SLICE_SIZE = 12;
+	/** 切片整条的错峰总时长上限：必须 < 200ms 轮询间隔，否则波还没走完下一拍就来了。 */
+	const CHUNK_SLICE_SPREAD_MS = 120;
+	/** 单片最大间隔：太快看不出走向，太慢整条拖长。 */
+	const CHUNK_SLICE_STAGGER_MAX_MS = 12;
+	/** 超大 delta（标签页切回来、网络卡了几拍）不切片：避免一次插几百个节点。 */
+	const CHUNK_SLICE_MAX = 400;
+
+	/**
+	 * 按**码点**切片（不是 `slice()` 按 UTF-16 码元）：`slice()` 会把代理对/emoji 从中间
+	 * 劈开，切成两半的半个字符会短暂渲染成豆腐块。
+	 */
+	function sliceChunk(text: string, size: number): string[] {
+		const cps = Array.from(text);
+		const out: string[] = [];
+		for (let i = 0; i < cps.length; i += size) out.push(cps.slice(i, i + size).join(""));
+		return out;
+	}
+
+	/**
+	 * 流式临时块（2026-10-20；入场动效 2026-10-21）。
 	 *
 	 * 数据来自 pi 扩展节流覆盖写的快照（150ms ≈ 6.7 次/秒），GUI 200ms 拉一次。
 	 * 它只是**预览**：`message_end` 后快照消失，正式行从 transcript 投影进来替换。
 	 *
-	 * 动画填平：文本本身按 200ms 跳变，用一个呼吸光标 + 渐入遮罩让观感连续（不逐 token 渲染）。
+	 * 动效（用户要求「渐变出现」）：把「已显示前缀」与「刚到的增量」拆成两个节点，
+	 * **只给增量**挂 220ms 入场（透明→实 + 模糊→清晰 + 暖陶土→正文墨色），前缀完全不动。
+	 * 旧实现是整段跳变 + 一个呼吸方块光标 ⇒ 新增的 6–18 字是「啪」地贴上去的。
+	 * 一拍超过 {@link CHUNK_SLICE_AT} 字时再切片错峰，让大块也「往下写」而不是整块糊。
+	 *
+	 * ⚠️ 为什么不用 mask 扫光做「渐变擦入」（看着更像渐变，实测不行）：
+	 * `plans/20261021_stream_anim/masktest.html` 用无头 Chrome 冻结帧实测 —— Chromium 对
+	 * **会折行的 inline span** 的 mask 几何不可控：冻结在动画 18%（期望只露出约三成）时，
+	 * 增量已经基本全显，只有最右一两个字有淡出 ⇒ 擦入前沿根本看不见。改用
+	 * `inline-block` 才能可控，但那会把「跟着前缀续写」变成**另起一行**（同页已复现）。
+	 * 所以走 opacity+blur：合成层动画，折行不重排（同页实测两行位置不动）。
+	 *
+	 * 字号/墨色与**正式行对齐**（顺手修掉一个跳变）：正文预览 = text-ui-base/foreground
+	 * （同 `AssistantTextRowView`）、思考预览 = text-ui-sm/foreground-subtle（同 `ReasoningRowView`）。
+	 * 旧实现两者都按 12px/subtle 画 ⇒ `message_end` 正式行替换进来时，字号与墨色一起跳。
 	 */
-	function StreamingPreview({ snap }: { snap: { kind: "reasoning" | "text"; text: string } }) {
+	function StreamingPreview({ snap }: { snap: StreamingSnapshot }) {
 		const isReasoning = snap.kind === "reasoning";
+		const appendFrom = snap.appendFrom ?? 0;
+		const prefix = appendFrom > 0 ? snap.text.slice(0, appendFrom) : "";
+		const delta = snap.text.slice(appendFrom);
+		const rev = snap.rev ?? 0;
+		const slices =
+			delta.length > CHUNK_SLICE_AT && delta.length <= CHUNK_SLICE_MAX ? sliceChunk(delta, CHUNK_SLICE_SIZE) : null;
+		// 强度按**渲染块自身**字数算：切片后每片 12 字 ⇒ 模糊只作用在 12 字上，不会糊整行
+		const intensity = chunkIntensity(slices === null ? delta.length : CHUNK_SLICE_SIZE);
+		// 错峰间隔随片数收敛：整条波必须在 200ms 内走完（否则下一拍到了它还在走）
+		const stagger =
+			slices === null
+				? 0
+				: Math.max(4, Math.min(CHUNK_SLICE_STAGGER_MAX_MS, Math.floor(CHUNK_SLICE_SPREAD_MS / slices.length)));
 		return (
-			<div data-row-id="__streaming_preview__" data-streaming-preview="1" className="py-1">
+			<div
+				data-row-id="__streaming_preview__"
+				data-streaming-preview="1"
+				data-streaming-kind={snap.kind}
+				className="py-1"
+			>
 				<div className="mb-1 flex items-center gap-2 text-ui-xs text-foreground-subtlest">
 					<span className="inline-block size-1.5 animate-pulse rounded-full bg-accent" />
 					<span>{isReasoning ? "正在思考…" : "正在输出…"}</span>
 				</div>
-				<div className="whitespace-pre-wrap text-ui-sm text-foreground-subtle">
-					{snap.text}
-					<span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-foreground-subtlest align-middle" />
+				<div className={`whitespace-pre-wrap ${isReasoning ? "text-ui-sm text-foreground-subtle" : "text-ui-base text-foreground"}`}>
+					{prefix}
+					{/* key 换 = 重放入场动画；文本没变时 store 不 bump rev ⇒ 不会反复淡入 */}
+					{slices === null
+						? delta.length > 0 && (
+								<span key={rev} className="stream-chunk-in" style={intensity}>
+									{delta}
+								</span>
+							)
+						: slices.map((s, i) => (
+								<span
+									key={`${rev}-${i}`}
+									className="stream-chunk-in"
+									style={{ ...intensity, animationDelay: `${i * stagger}ms` }}
+								>
+									{s}
+								</span>
+							))}
+					<span className="stream-caret" aria-hidden />
 				</div>
 			</div>
 		);
@@ -651,6 +814,23 @@ export function ChatPage() {
 	const visibleRows = hiddenHead > 0 ? rows.slice(hiddenHead) : rows;
 
 	/**
+	 * 「任务执行完毕 → 自动折叠这一轮的工作过程」（2026-10-21 用户要求：
+	 * 「以简略界面方便用户更好的找到信息」）。
+	 *
+	 * 判定全在 `turnCollapse.ts`（纯函数，配 `_test_turn_collapse.ts` 9 条边界）；
+	 * 这里只负责：① 折叠态不渲染那些行；② 把摘要（时长/步数/是否展开）交给 turnHeader 行。
+	 *
+	 * `running` 用 `chatBusy`（busy 标志 400ms 轮询 ‖ 流式快照 ‖ 末行是 running 工具卡）——
+	 * 跑着的轮一律不折叠，过程要能看见。用户手动展开过的轮存在 `openTurns` 里（按
+	 * turnHeader.rowId，天然按会话隔离，不会串台）。
+	 */
+	const [openTurns, setOpenTurns] = useState<Record<string, boolean>>({});
+	const turnPlan = useMemo(
+		() => planTurnCollapse(visibleRows, { running: chatBusy, opened: openTurns }),
+		[visibleRows, chatBusy, openTurns],
+	);
+
+	/**
 	 * 入场动画只给「本次新增」的行（L2 perf，2026-10-20）。
 	 *
 	 * 事故形态：`data-zcode-stream-animate` 挂每一行 + CSS `will-change: opacity` ⇒ 首屏 200 行
@@ -700,7 +880,33 @@ export function ChatPage() {
 	// 贴底→新内容自动锚定吸底；离开底部→锁定阅读位 + 浮出「回到底部」钮 + 消息层 mask 渐隐。
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const messageLayerRef = useRef<HTMLDivElement | null>(null);
+	/** composer sticky dock（末位子元素）：它变高（输入框换行）时也要吸底。 */
+	const composerDockRef = useRef<HTMLDivElement | null>(null);
 	const [atBottom, setAtBottom] = useState(true);
+	/**
+	 * 跟随态（= 贴底）的 ref 镜像。`ResizeObserver` 回调只有在布局之后才跑，
+	 * 那时 `atBottom` 闭包可能是旧的 ⇒ 用 ref 读当前值，避免「正在回看却被拽回底部」。
+	 */
+	const followRef = useRef(true);
+
+	/**
+	 * 贴底 = 滚到**最大滚动位**（`scrollTop = scrollHeight`）。
+	 *
+	 * ⚠️ 为什么不是「滚到视口底」：composer dock 是滚动容器里的 `sticky bottom-0` 末位子元素，
+	 * 它在文档流里占着最后那一块位置。滚到最大滚动位时，消息末行正好停在**输入框上沿**；
+	 * 只要差一点没到底，sticky 就会把输入框顶到视口底部、盖住它后面的正文 ——
+	 * 观感就成了「以屏幕底为底」（2026-10-21 用户报的第 2 条）。
+	 */
+	const pinToBottom = (): void => {
+		const el = scrollRef.current;
+		if (el === null) return;
+		el.scrollTop = el.scrollHeight;
+	};
+	/** 跟随态与 state 一起改（两处都得改，否则 ref 与 UI 会分叉）。 */
+	const setFollow = (next: boolean): void => {
+		followRef.current = next;
+		setAtBottom(next);
+	};
 
 	// D4：切会话 → 重新定初始裁剪（先于首帧生效）
 	useEffect(() => {
@@ -746,28 +952,59 @@ export function ChatPage() {
 	const handleScroll = (): void => {
 		const el = scrollRef.current;
 		if (el === null) return;
-		setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 48);
+		const near = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+		followRef.current = near;
+		setAtBottom(near);
 		syncMask();
 	};
 
-	// 贴底锚定：仅在 atBottom 时跟随新行/回执滚动；回看（!atBottom）锁定阅读位
-	// （dep 用 visibleRows：分块补齐也在贴底时重新吸底）
+	/**
+	 * 贴底锚定：跟随态下跟着「新行 / 回执 / 流式增量 / 折叠展开」吸底；回看锁定阅读位。
+	 *
+	 * 2026-10-21 修（用户报「自动向下滚动不积极」+「以屏幕底为底」）：
+	 * 旧实现依赖只有 `[visibleRows, outboxEntries, atBottom]` —— **同一段流式文本增长期间
+	 * `visibleRows` 根本不变化**（快照 200ms 换一次内容，行列表没变），所以整个流式过程
+	 * 一次都不滚，新字持续堆到输入框底下；等堆过 48px 阈值后，下一次 scroll 事件又会把
+	 * `atBottom` 判成 false ⇒ 彻底停住跟随（越流越不跟）。
+	 * 现三条一起上：
+	 *   ① 把流式快照的 `text/kind` 也算进依赖 ⇒ 每拍（200ms）都吸一次；
+	 *   ② 用 `useLayoutEffect` 而不是 `useEffect` ⇒ 在绘制前就把位置摆好，不闪一帧；
+	 *   ③ 再用 `ResizeObserver` 兜住「父级没重渲染但高度变了」的情况（下面那个 effect）。
+	 */
+	useLayoutEffect(() => {
+		if (!atBottom) return;
+		pinToBottom();
+	}, [visibleRows, outboxEntries, atBottom, streaming?.text, streaming?.kind]);
+
+	/**
+	 * 高度兜底（2026-10-21）：`RowView` 的折叠块是**子组件自己的 state**，
+	 * 思考卡自动展开/合上时父级不会重渲染 ⇒ 上面那个依赖数组的 effect 跑不到。
+	 * 这里盯消息层与 composer dock 的实际高度：只要跟随态，高度一变就吸底。
+	 * 回看态直接返回（不抢用户阅读位）。
+	 */
 	useEffect(() => {
 		const el = scrollRef.current;
-		if (el !== null && atBottom) el.scrollTop = el.scrollHeight;
-	}, [visibleRows, outboxEntries, atBottom]);
+		const layer = messageLayerRef.current;
+		const dock = composerDockRef.current;
+		if (el === null || layer === null || typeof ResizeObserver === "undefined") return;
+		const ro = new ResizeObserver(() => {
+			if (!followRef.current) return;
+			el.scrollTop = el.scrollHeight;
+		});
+		ro.observe(layer);
+		if (dock !== null) ro.observe(dock);
+		return () => ro.disconnect();
+	}, [activeId]);
 
 	// 切会话 → 重置贴底（先看最新）
 	useEffect(() => {
-		setAtBottom(true);
-		const el = scrollRef.current;
-		if (el !== null) el.scrollTop = el.scrollHeight;
+		setFollow(true);
+		pinToBottom();
 	}, [activeId]);
 
 	const scrollToLatest = (): void => {
-		setAtBottom(true);
-		const el = scrollRef.current;
-		if (el !== null) el.scrollTop = el.scrollHeight;
+		setFollow(true);
+		pinToBottom();
 	};
 
 	// L3 窄路径：master 会话经本机受信通道可注入（服务端三证据门；离线回 409 master-offline）。
@@ -896,14 +1133,28 @@ export function ChatPage() {
 										正在补齐较早消息（{hiddenHead} 条）…
 									</div>
 								)}
-								{visibleRows.map((row, i) => (
-									<RowView
-										key={row.rowId}
-										row={row}
-										animate={hiddenHead + i >= animateFromIndex}
-										streaming={row.rowId === streamingRowId}
-									/>
-								))}
+								{visibleRows.map((row, i) => {
+									const animate = hiddenHead + i >= animateFromIndex;
+									// 已结束轮的工作过程：折叠态直接不渲染（判定在 turnCollapse.ts）
+									if (turnPlan.hidden.has(row.rowId)) return null;
+									const summary = turnPlan.summaryByHeaderId.get(row.rowId) ?? null;
+									if (row.kind === "turnHeader") {
+										return (
+											<TurnHeaderRowView
+												key={row.rowId}
+												row={row}
+												animate={animate}
+												summary={summary}
+												onToggle={() =>
+													setOpenTurns((m) => ({ ...m, [row.rowId]: m[row.rowId] !== true }))
+												}
+											/>
+										);
+									}
+									return (
+										<RowView key={row.rowId} row={row} animate={animate} streaming={row.rowId === streamingRowId} />
+									);
+								})}
 								{/* 2026-10-19 用户裁决：**不再画第二条气泡**。
 								    只在「已发出但还没进 transcript」且非终态成功时给一行极简状态
 								    （排队中/失败/被拒 才有价值；已进 transcript 的条目已被上面过滤掉）。 */}
@@ -921,7 +1172,7 @@ export function ChatPage() {
 						)}
 					</div>
 					{/* composer sticky dock（ConversationTimeline.tsx#L1911-1929 + ChatPromptEditor.tsx#L346-361） */}
-					<div className="pointer-events-none sticky bottom-0 z-20 mt-auto flex w-full justify-center">
+					<div ref={composerDockRef} className="pointer-events-none sticky bottom-0 z-20 mt-auto flex w-full justify-center">
 						<div className="pointer-events-auto relative z-10 w-full shrink-0 px-4 pb-4">
 							{/* 回看锁定阅读位时浮出「回到底部」钮（#L1937-1944 位置口径） */}
 							{!atBottom && activeId !== null && (

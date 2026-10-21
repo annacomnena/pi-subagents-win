@@ -120,6 +120,8 @@ import {
 	parseCommandRequest,
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
+import { readLiveness } from "../runtime/liveness.ts";
+import { readSessionUsage } from "../runtime/session-usage.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
@@ -2022,6 +2024,25 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					}
 					// G6-P1：GET /v1/sessions/:id/transcript?after=<seq>（HTTP 兜底分页，
 					// 与 WS transcript 流同一投影函数；after 缺省/0 = 全量快照，>0 = 增量触及行终态）
+					// 2026-10-21：会话当前轮次上下文用量（长度/占比/缓存比例）。
+					// 数据源 = 会话 JSONL 最后一条带 usage 的 assistant（尾部块读，不全量读）。
+					const mu = /^\/v1\/sessions\/([^/]+)\/usage$/.exec(u.pathname);
+					if (mu !== null) {
+						const usageSid = decodeURIComponent(mu[1]!);
+						const usageFile = findSessionFile(opts.sessionsDir ?? defaultSessionsDir(), usageSid);
+						if (usageFile === null) throw new HttpError(404, { error: "no-session", sessionId: usageSid });
+						// contextWindow 取自 master-liveness 的 windowTokens（与 pi readPressure() 同源）；
+						// 取不到 ⇒ null（不猜，不让 GUI 自己编一个窗口值）。
+						let win: number | null = null;
+						try {
+							const live = readLiveness();
+							win = typeof live?.windowTokens === "number" && live.windowTokens > 0 ? live.windowTokens : null;
+						} catch {
+							win = null;
+						}
+						body = { version: 1, sessionId: usageSid, ...readSessionUsage(usageFile, win) };
+						break;
+					}
 					const mt = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(u.pathname);
 					if (mt === null) {
 						throw new HttpError(404, { error: "not-found", hint: `端点：GET /（静态）| /assets/*（静态）| /v1/health | /v1/snapshot | /v1/events | /v1/attention | /v1/interactions | /v1/timeline | /v1/sessions | /v1/sessions/:id/transcript；${WS_PATH}（WS）；POST /v1/commands（唯一命令入口）| POST /v1/challenge（本地身份挑战）| POST /v1/bootstrap + GET /v1/bootstrap/exchange（本机 OTT 换 cookie，gui on 限定）| /v1/wechat/{enable,disable} + bind/{start,status,qr-image,cancel} + /v1/wechat/unbind（微信 iLink 绑定与 opt-in 开关）` });

@@ -428,6 +428,32 @@ export interface TranscriptHead {
 	gen?: number;
 }
 
+/**
+ * GET /v1/sessions/:id/usage（2026-10-21）：会话**当前轮次**上下文用量。
+ *
+ * 口径（与 extensions/runtime/session-usage.ts 头注释一致，**不得自行重算**）：
+ * - `tokens`：上下文长度（最后一条 assistant 的 `totalTokens`）；null = 还没有带 usage 的消息
+ * - `percent`：`tokens / contextWindow` ×100；null = 窗口未知（不猜）
+ * - `cachePercent`：`cacheRead / (cacheRead + input)` ×100（**只看输入侧**）；null = 无输入
+ */
+export interface SessionUsageBody {
+	version: number;
+	sessionId: string;
+	tokens: number | null;
+	contextWindow: number | null;
+	percent: number | null;
+	cachePercent: number | null;
+	detail: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		reasoning: number;
+	};
+	/** assistant 消息时间戳（缺失则不落该字段）。 */
+	at?: string;
+}
+
 export interface TranscriptBody {
 	version: 1;
 	sessionId: string;
@@ -461,6 +487,21 @@ export interface StreamingSnapshot {
 	pid: number;
 	/** 服务端算好的年龄（ms），GUI 不再自己算时钟差。 */
 	ageMs: number;
+	/**
+	 * **GUI 派生字段**（服务端不返回，由 `store.pollChatStreaming` 补齐，动效 2026-10-21）。
+	 *
+	 * 本次快照相对「上一份同会话同 kind 且被本次文本前缀包含的快照」**追加段**的起点下标：
+	 * `text.slice(0, appendFrom)` = 已显示前缀（渲染后完全不动），`text.slice(appendFrom)` = 增量。
+	 * 上一份不存在 / kind 变了 / 文本不是前缀扩展（服务端重启、段切换）⇒ 0（整段都算新增）。
+	 */
+	appendFrom?: number;
+	/**
+	 * **GUI 派生字段**：`text` 内容**真变了**才 +1 的版本号（同会话内单调递增）。
+	 *
+	 * 用作增量节点的 React `key` —— 只有换 key 才会重新挂载、重放 CSS 入场动画。
+	 * 文本没变（服务端暂停 / 轮询空转）**不 bump**，否则同一段字会每 200ms 反复淡入。
+	 */
+	rev?: number;
 }
 
 /**
