@@ -181,7 +181,7 @@ source_paths:
 |---|---|---|
 | 存哪 | `config.json.roleTier`（代码默认 `DEFAULT_ROLE_TIER`） | `~/.pi/agent/model-cost-tiers.json` |
 | 维度 | 角色 → 允许层级**区间** `{min,max}` | 模型 → 层级（全局、角色无关） |
-| 归一化 | `normalizeRoleTier` (`tiers.ts#L95-L110`)：`DEFAULT ∪ 合法覆盖`，未知角色 / 非法 tier / `max<min` / 边界为 `selfpaid|unknown` → 忽略 + `console.warn`，never-throw | `loadCostTiers` (`tiers.ts#L169-L180`)：缺文件 / 坏 JSON / `version!==1` → `{present:false, table:emptyTable()}`（`present` 是非枚举运行时标记） |
+| 归一化 | `normalizeRoleTier` (`tiers.ts#L95-L110`)：`DEFAULT ∪ 合法覆盖`，未知角色 / 非法 tier / `max<min` / 边界为 `selfpaid\|unknown` → 忽略 + `console.warn`，never-throw | `loadCostTiers` (`tiers.ts#L169-L180`)：缺文件 / 坏 JSON / `version!==1` → `{present:false, table:emptyTable()}`（`present` 是非枚举运行时标记） |
 | 写盘 | `/tiers role` → `writeConfig`（写前反校验，见 8.4） | `/tiers set\|rm` → `writeTiersFile` tmp+rename（Windows EPERM×3 重试，`tiers.ts#L521-L540`） |
 
 - 层级取值 `CostTier`（`tiers.ts#L30-L33`）：`free|cheap|standard|premium|selfpaid|unknown`。

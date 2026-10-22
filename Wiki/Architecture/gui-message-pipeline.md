@@ -66,7 +66,7 @@ source_paths:
 |---|---|---|---|
 | 会话头 | `extensions/runtime/transcript.ts::readHeadCached` | 路径；命中需 `(mtimeMs,size)` 与既有 statSync 读数一致 | 文件大小/时间变（追加写必变 size）；上限 4000 清空 |
 | 台账 | `extensions/runtime-host/session-title.ts::loadTabLedger` | 目录名集 + 每文件 `(mtimeMs,size)` 指纹；命中返回**同一数组引用** | 指纹变即重建（无 TTL） |
-| 标题 | 同上 `resolveSessionTitles` | `${file}|${mtimeMs}|${sizeBytes}` + **台账数组引用身份** | 台账重建 = 新引用 ⇒ 整表失效；上限 5000 清空 |
+| 标题 | 同上 `resolveSessionTitles` | `${file}\|${mtimeMs}\|${sizeBytes}` + **台账数组引用身份** | 台账重建 = 新引用 ⇒ 整表失效；上限 5000 清空 |
 
 效果：整条 `/v1/sessions` 路径 **474ms（冷）/131ms（温）→ 33-37ms**；无 TTL ⇒ 无陈旧窗口（缓存正确性由
 `_test_session_title.ts` 的 T11 门 + 变异验证钉住：键改成 `sessionId` 即红）。

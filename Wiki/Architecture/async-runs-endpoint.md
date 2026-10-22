@@ -186,10 +186,10 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 |---|---|---|
 | 数据层 | `extensions/subagent-kill.ts::listAsyncRunCards` / `classifyRunLiveness` | 与 `listAsyncRunSummaries` **同文件不同投影**；后者的返回形状（`RunSummary`，pidAlive 二态）**未改**——`subagent-win{status,list}` 与 async-panel 都在消费 |
 | 端点 | `extensions/runtime-host/server.ts` `case "/v1/runs"` + `RuntimeHostServerOptions.runsDir?` | 与 `/v1/snapshot` 同款 ETag/304 |
-| GUI 纯函数 | `gui/src/runsView.ts`（`deriveRunDisplay`/`runningCount`/`livenessTally`/`formatUsage`/`loopBadge`） | 判活唯一入口，可 node 直载测试 |
+| GUI 纯函数 | `gui/src/runsView.ts`（`deriveRunDisplay`/`runningCount`/`partitionRuns`/`livenessTally`/`formatUsage`/`loopBadge`） | 判活 + 分组的唯一实现入口，可 node 直载测试 |
 | GUI 视图 | `gui/src/pages/RunsPage.tsx`（RuntimeOverlay `SECTIONS` 项「运行」） | 5s 轮询；失败保留旧数据；`running` 组只放 `countsAsRunning` 的记录，其余进「最近记录」 |
 | 契约类型 | `gui/src/api/types.ts`（`RunCard`/`RunLiveness`/`AsyncRunStatus`/`RunsResponse`） | `AsyncRunStatus` 与 tab run 的 `RunStatus`（七态）**故意区分命名** |
-| 测试 | `extensions/_test_runs_endpoint.ts`（23 组：T1–T10，含 T10 非法 pid 边界）、`gui/src/_test_runs_view.ts`（11 组：R1–R7，R7 = `partitionRuns` 页面分组口径） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
+| 测试 | `extensions/_test_runs_endpoint.ts`（23 组：T1–T10，含 T10 非法 pid 边界）、`gui/src/_test_runs_view.ts`（12 组：R1–R8，R7 = `partitionRuns` 页面分组口径，R8 = `RunsPage` 源码级页面接线） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
 
 **命名陷阱（本仓已踩）**：`gui/src/api/types.ts` 已有 `RunStatus`（tab run 的 journal 投影七态
 `created/dispatched/running/waiting/completed/failed/cancelled/orphaned`）。async run 的状态是另一套四态
@@ -199,15 +199,24 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 
 - `extensions/_test_runs_endpoint.ts` — 23 组断言（T1–T10；T10 = 非法 pid 负/0/浮点/字符串/NaN/Infinity/null/undefined 一律 unknown）：三态各命中、`limit` 在排序后截断、
   `includeRecentCalls` 字段存在性、ETag/304、POST→405、零写盘（目录树哈希）、坏 json 跳过。
-- `gui/src/_test_runs_view.ts` — 11 组断言（R1–R7），含反向断言「`running`+`unknown` ⇒ `countsAsRunning===false`
+- `gui/src/_test_runs_view.ts` — 12 组断言（R1–R8），含反向断言「`running`+`unknown` ⇒ `countsAsRunning===false`
   且 `label !== "运行中"`」与「3 条 `status=running` 但只有 1 条真活 ⇒ `runningCount===1`」。
+  **R8 = `RunsPage` 源码级接线断言**（页面层零判别力缺口的兜底：R7 只证明 `partitionRuns` 本身对，
+  不证明页面在用它）——正向：`RunsPage.tsx` 必须调 `partitionRuns(runs)`、import 列表须同时含
+  `partitionRuns` 与 `"../runsView"`、须渲染 `running.map(` + `others.map(`；反向：**禁止页内内联
+  `.filter(`、禁止 `runs.map(`**（内联筛选会让 R7 全部失去判别力）。断言前先 `stripComments` 剥离
+  行/块注释（注释里提到 `.filter(` 不算违规），并带「注释里确实出现 filter 字样」前提断言防 R8b 空跑。
 - `extensions/_probe_runs_endpoint_real.ts` — 对真实 154 份记录取体积/延迟/三态分布/304 的探针。
-- 变异验证（两项均字节级还原，`sha256` 前后一致）：
+- 变异验证（三项均字节级还原：前两项 sha256 前后一致见下；第三项以 `git hash-object gui/src/pages/RunsPage.tsx`
+  == `git rev-parse HEAD:gui/src/pages/RunsPage.tsx`（`2e29feacbf3d5997ff09ae80af01b638fa429436`）为还原证据）：
   - 变异 `server.ts` 去掉 `limit` 应用 ⇒ `test:runs-endpoint` 的 `T6f HTTP ?limit=2 → count=2`
     红（`actual: 4, expected: 2`）；还原后 `b88af240…ee290a0c` 一致。
   - 变异 `runsView.ts` 的 `unknown` 分支（`countsAsRunning: true` 且 label「运行中」）⇒
     `test:gui-runs-view` 的 `R1c` 红（`actual: '运行中', expected: '状态未知'`；
     `countsAsRunning` 版 `actual: true, expected: false`）；还原后 `dbd4ef7c…3ee1f0ae5` 一致。
+  - 变异 `RunsPage.tsx` 把 `partitionRuns(runs)` 改回页内内联 `runs.filter(...)` ⇒ `test:gui-runs-view`
+    的 `R8a`（未调 `partitionRuns(runs)`）+ `R8b`（出现内联 `.filter(`）同组红，R1–R7 全绿
+    ⇒ 证明 R7 的页面层零判别力缺口已由 R8 兜住。
 
 ## Links Out
 

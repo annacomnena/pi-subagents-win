@@ -19,6 +19,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { register } from "node:module";
 
 // gui/src 按 vite/bundler 惯例 extensionless 相对导入 → 复用 store 测试 resolve hook 补 .ts
@@ -164,6 +165,68 @@ const card = (over: Partial<RunCard>): RunCard => ({
 	assert.equal(running.length, runningCount(fixture), "partitionRuns 与 runningCount 同口径（两者不得漂移）");
 	assert.deepEqual(partitionRuns([]), { running: [], others: [] }, "空输入 → 两组皆空");
 	ok("R7 partitionRuns：只有 running+alive 进 running 组（unknown/dead/终态进 others，分母守恒）");
+}
+
+// ── R8 RunsPage 源码级接线断言（页面层零判别力缺口：M6 变异只改页面接线时测试必须红）──
+//
+// 为什么读源码而不渲染：仓库无 DOM 测试基建（全 14 个 gui 测试都是纯函数/源码断言），
+// `_test_write_card.ts` 就是 readFileSync 读源码的范式。
+// 判据必须打在**接线**上（AGENTS §4.2）：断言页面确实从 `runsView` 拿分组、且**没有**自己内联筛选。
+//
+// 先做注释剥离：页内第 118 行注释本身就含「filter」字样，对原文断言会误判。
+// 剥离策略保守（不是完整 JS 词法分析，而是「只抹掉确定是注释的形态」），宁可漏剥不可错剥：
+//   1) 块注释 `/* … */`（非贪婪，跨行）
+//   2) 行首空白 + `//` 到行尾（页面里所有行注释都是这个形态；可避开 `"a // b"` 类字符串）
+// 副作用：若将来字符串字面量里出现 `http://…` 这类，也不会被剥（因为不是行首）。
+const stripComments = (src: string): string =>
+	src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+
+{
+	const raw = readFileSync(new URL("./pages/RunsPage.tsx", import.meta.url), "utf8");
+	const src = stripComments(raw);
+
+	// 夹具必须贴近剥离器真实语义（AGENTS §5）：块注释与**行首** `//` 被剔，**行内** `//` 故意保留
+	//（保守：不剔行内 `//` 才不会吃掉字符串里的 `http://…`；页面所有行注释都是行首形态）。
+	assert.equal(stripComments("/* 块 .filter( */ const a = 1;"), " const a = 1;", "块注释必须剥（含跨行）");
+	assert.equal(stripComments("\t// 行首注释 .filter(\nconst b = 2;"), "\nconst b = 2;", "行首 // 行注释必须剥");
+	assert.equal(
+		stripComments('const u = "http://x"; // 行内保留'),
+		'const u = "http://x"; // 行内保留',
+		"行内 // 不剥（保守：宁可漏剥也不错剥字符串）",
+	);
+	// 前提（真读数）：页面确实含注释里的 filter 字样 —— 否则 3b 的注释剥离是空跑
+	assert.ok(raw.includes("filter"), "前提：RunsPage（含注释）确实出现 filter 字样，否则 R8b 空跑");
+	assert.ok(
+		!src.includes("注释剥离生效"),
+		"前提：源码中不应保留已被剥离的块注释/行首注释内容",
+	);
+
+	// 三条接线判据**全部先算出来再报**：交集缺陷不能只报第一条命中项（否则变异会命中错断言，
+	// 违背 AGENTS §4.3「变异的判据是命中预期断言」），也无法从一次红看出到底改了什么接线）。
+	const violations: string[] = [];
+	// 3a 正向接线：页面必须调用 partitionRuns(runs) 得到分组
+	if (!/partitionRuns\s*\(\s*runs\s*\)/.test(src)) {
+		violations.push("R8a 页面未调用 partitionRuns(runs) 取分组（分组口径唯一实现应在 runsView.ts）");
+	}
+	// 3b 反向接线（抓变异主断言）：页面不得自己内联 .filter( 筛运行中
+	if (src.includes(".filter(")) {
+		violations.push(
+			"R8b RunsPage 出现内联 .filter( —— 分组口径的唯一实现在 runsView.ts::partitionRuns；内联筛选会让 R7 全部失去判别力",
+		);
+	}
+	// 3c 导入接线：import 列表（多符号，不写死顺序）必须同时含 partitionRuns 与 "../runsView"
+	if (!/import[^;]*partitionRuns[^;]*from\s*"\.\.\/runsView"/s.test(src)) {
+		violations.push('R8c 未从 "../runsView" 导入 partitionRuns（接线层：不得页面本地另写一份）');
+	}
+	// 3d 不得绕过分组直接渲染全量：只允许 running.map / others.map
+	if (/\bruns\.map\s*\(/.test(src)) {
+		violations.push("R8d 出现 runs.map( —— 直接渲染全量就绕过了 partitionRuns 的分组");
+	}
+	if (!src.includes("running.map(")) violations.push("R8d 前提：页面未渲染 running 组（正向基准不在）");
+	if (!src.includes("others.map(")) violations.push("R8d 前提：页面未渲染 others 组（正向基准不在）");
+	assert.deepEqual(violations, [], `R8 页面接线违规：\n- ${violations.join("\n- ")}`);
+
+	ok("R8 页面接线：RunsPage 用 partitionRuns(runs) 分组、import 自 ../runsView、且无内联 .filter(/runs.map(");
 }
 
 console.log(`_test_runs_view: all assertions passed (${n} groups)`);

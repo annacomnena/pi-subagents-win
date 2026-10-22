@@ -77,7 +77,7 @@ function ProjectRow({ p }: { p: ProjectFrontier }) {
 				<GateBadge gate={p.gate} />
 				{p.needsUser && <Badge tone="yellow" title="需要人工介入（needsUser 边沿触发）">⚠ 需人工</Badge>}
 				{p.resultMissing && <Badge tone="gray" title="unconfirmed → 结果缺失（走 stagnation）">结果缺失</Badge>}
-				{p.stagnation && <Badge tone="red" title="非终态 45min 无进展 ∨ 结果缺失">停滞</Badge>}
+				{p.stagnation && <Badge tone="red" title="六态机 STALLED：有监管账本 + waiting 相位 + idle > pushMs（默认 15min，可被账本覆盖）；无账本/在等人/报错/跑长工具都不算">停滞</Badge>}
 				{p.overdue > 0 && <Badge tone="red" title="timer overdue（approx 载体）">overdue {p.overdue}</Badge>}
 			</div>
 			<p className="mt-1.5 break-all font-mono text-ui-xs text-foreground">{p.project}</p>

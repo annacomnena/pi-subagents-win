@@ -83,6 +83,9 @@ source_paths:
   - gui/src/pages/AutonomyPage.tsx
   - gui/src/pages/RuntimeOverlay.tsx
   - gui/src/api/client.ts
+  - gui/src/api/types.ts::ProjectFrontier
+  - gui/src/api/types.ts::ProjectSupervision
+  - gui/src/api/types.ts::SupervisionState
   - extensions/_test_runtime_autonomy.ts
   - extensions/_test_autonomy_wiring.ts
   - extensions/_test_register_graph.ts
@@ -401,7 +404,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **GUI 第 6 section**：`RuntimeOverlaySection` 六值 union（`gui/src/store.ts:38`：attention/master/workstream/runtime/wechat/**autonomy**），`RuntimeOverlay` SECTIONS 表新增「主动性」（Activity 图标，`gui/src/pages/RuntimeOverlay.tsx:28-35`），`runtimeOverlay === "autonomy"` 打开即定位该 section；覆盖层页内容 = `gui/src/pages/AutonomyPage.tsx`：
   - `AutonomySettings`（总门开关）——**自微信连接页（ChannelsPage）整体迁出**，ChannelsPage 零引用；开关行为/API 逐字不变（`GET /v1/autonomy/status` + `POST /v1/autonomy/set`）。迁出后卡片不再位于任何带 401/403 早退分支的页内 → 默认配置与未认证/无权限各态下开关均可见（D17 可达性由此结构性保证，非逐分支补钉）。仍保留诚实文案（现文见「动作面」节 GUI 条目）与 `awayMode`「未实现（保留字段），不提供开关」。
   - `FrontierViz`（frontier 可视化，`api.autonomyFrontier()`，**5s 轮询**，`gui/src/api/client.ts#L155` + `gui/src/pages/AutonomyPage.tsx#L126`）三块：**C 快照时效**（`asof` 相对时间 + `baseline` 首帧徽标 + 项目/触发计数）、**A 项目状态矩阵**（每项目 state+variant / needsUser 高亮 / gate / resultMissing / stagnation / overdue / runs 明细）、**B 触发记录表**（rule/project/evidence，`approximate` 降透明度 + 「近似」徽标）。状态语义：`snap===undefined` 加载中、`null` → 「快照尚未生成（autonomy 未启用，或尚未完成首次 tick）」；读失败显示可恢复错误、保留最近快照（不留永久加载态）；`gate:"unknown"` 呈中性「未知」（与 watchdog 3/8 恒 unknown 同款“不猜”语义）。零图表库（Badge/Card 手写）。
-  - **GUI 侧消费缺口（2026-10-22 实测分母）**：`ProjectFrontier` 服务端还有 `supervision{state,idleMs,epochPushes}`（`frontier.ts#L132-L185`）/ `blockedOverdue` / `blockedOverdueRunId(s)` 四组字段，但 `gui/src/api/types.ts#L727-L739` 的 `ProjectFrontier` 手抄**未包含**它们（`rg 'supervision|blockedOverdue|epochPushes|idleMs' gui/src` 命中 **0**）⇒ 六态机/超龄提醒这两个已实现判定，GUI 当前完全看不到（`stagnation` 只是 `supervision.state==="STALLED"` 的一个布尔投影，命中 5 处）。
+  - **GUI 侧类型已同步 / 渲染仍故意不做（2026-10-22 实测分母）**：`gui/src/api/types.ts#L730-L780` 现已同步服务端四组字段——`SupervisionState`（`#L730-L737` 六态联合）+ `ProjectSupervision{state,idleMs,epochPushes}`（`#L739-L746`）+ `ProjectFrontier.supervision`（`#L780`）+ `blockedOverdue`（`#L766`）+ `blockedOverdueRunId(s)`（`#L768`/`#L770`）+ `blockedOverdueLastAt`（`#L778`）；`rg -c 'supervision|blockedOverdue|epochPushes|idleMs' gui/src` 命中 **1 文件 / 14 行**（全部在 `types.ts`，即类型层）。**字段有 ≠ 漏渲染**：`gui/src/pages/AutonomyPage.tsx` 有意不展示这两组（类型/注释块 `#L747-L754` 已写明理由）——① 六态机是**监管派生判据**，需账本语义（谁登记、optOut、epoch 预算）才能读对，直接当「项目状态」展示易误读；② `blockedOverdue*` 是**周期提醒**的发射/节流载体（1h/runId，权威账本在快照顶层 `blockedOverdueThrottle[project]`，本字段只是投影），不是面板指标。故 GUI 面板仍只消费 `state`/`variant`/`gate`/`needsUser`/`resultMissing`/`stagnation`/`overdue`/`runs`。
+  - `stagnation` 仍只是 `supervision.state === "STALLED"` 的**布尔投影**（`frontier.ts#L147-L151` 注释；GUI 侧 `stagnation` 字面出现在 `gui/src` 共 6 行 / 2 文件——`api/types.ts` 3 行 + `pages/AutonomyPage.tsx` 3 行）。其 tooltip 口径现为「六态机 STALLED：有监管账本 + waiting 相位 + idle > `pushMs`（默认 15min = `frontier.ts:88`，可被账本覆盖）；无账本/在等人/报错/跑长工具都不算」——旧文案「非终态 45min 无进展 ∨ 结果缺失」已汰除（`staleOver(45min)` 是**已拆除的旧语义**，见 `frontier.ts#L149`）。
 
 ### A3 awayMode 空壳
 `autonomy.awayMode.enabled` 被解析但**无任何生产消费者** ⇒ 保留字段但 GUI 明确标注"未实现（保留字段）"，且**不提供开关**（不让界面出现按了没反应的按钮）。

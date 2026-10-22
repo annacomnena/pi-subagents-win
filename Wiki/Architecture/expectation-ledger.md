@@ -65,7 +65,7 @@ expectReply !== false
 | 地址校验 | `index.ts#L2086` | `isObjectAddress` 不过 ⇒ 拒绝 + 审计 `rejected:bad-address` |
 | 非 `agent://` 域提示 | `index.ts#L2093` | S1：无回信消费者 ⇒ 提示「期望将走超期路径」（不阻断）|
 | 自环提示 | `index.ts` 回执构造段 | S3：`to===masterAddress()` ⇒ 谓词挡下、提示「非在等回信」|
-| 留痕 | 同段 | `appendAuditEvent("gating", "pass", "send-letter by=user:… to=… id=… expect=on|off")`——**`cat`/`concl` 均落 W5 冻结词表**，细节入 `reason` |
+| 留痕 | 同段 | `appendAuditEvent("gating", "pass", "send-letter by=user:… to=… id=… expect=on\|off")`——**`cat`/`concl` 均落 W5 冻结词表**，细节入 `reason` |
 
 **行为门重开（切片 B，`f09ab1e`）**：A10.1 allowlist 确认（`index.ts` 基线已在 ALLOW，无需改）、`_test_graph_frontier_shadow` 双态断言、`_test_runtime_autonomy` ⑧ 语义断言、`_test_expectations` 去运行期字符串拼接 import。
  **L4 复核**：`plans/0929_m1_send_letter_l4_review.md` —— **可直接采信（0 阻断）**；建议修 3 项已随 `a15bced` 闭合。

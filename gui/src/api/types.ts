@@ -723,7 +723,35 @@ export interface FrontierTrigger {
 	requestRev?: number;
 }
 
-/** frontier.ts ProjectFrontier（单 repo 聚合）。 */
+/**
+ * frontier.ts SupervisionState（六态机派生值）。
+ * 与 `ProjectFrontier.supervision.state` 同口径；本地命名，勿与前端其余类型混淆。
+ */
+export type SupervisionState =
+	| "NOT_MONITORED"
+	| "ACTIVE"
+	| "PAUSED_USER"
+	| "BLOCKED_USER"
+	| "DONE"
+	| "STALLED";
+
+/** frontier.ts ProjectSupervision（单 repo 监管派生态；无账本 ⇒ NOT_MONITORED）。 */
+export interface ProjectSupervision {
+	state: SupervisionState;
+	/** 该项目最严重 tab 的 idle（ms）；null = 无 idle 载体（不猜）。 */
+	idleMs: number | null;
+	/** 该项目所有在监管 tab 的 epoch 推动次数合计。 */
+	epochPushes: number;
+}
+
+/**
+ * frontier.ts ProjectFrontier（单 repo 聚合）。
+ *
+ * **故意不展示**：`supervision`（六态机）与 `blockedOverdue*`（超龄提醒）本类型已同步服务端字段，
+ * 但 GUI 目前**有意不渲染**——六态机是监管用的派生判据（需要账本语义才能读对，展示给用户易误读成
+ * 「项目状态」）；`blockedOverdue` 是**周期提醒**的发射载体（节流、按 runId），不是面板指标。
+ * 故：本类型有字段 ≠ 页面漏渲染，改动渲染前先读 frontier.ts 对应注释。
+ */
 export interface ProjectFrontier {
 	project: string;
 	state: FrontierProjectState;
@@ -732,7 +760,24 @@ export interface ProjectFrontier {
 	runs: Record<string, string>;
 	needsUser: boolean;
 	resultMissing: boolean;
+	/** ⑨ `supervision.state === "STALLED"`（旧语义「非终态 45min ∨ resultMissing」已拆除）。 */
 	stagnation: boolean;
+	/** ⑨b 存在「账本 active ∧ BLOCKED_USER ∧ idleMs > userMs」的 tab（与 stagnation 正交）。 */
+	blockedOverdue: boolean;
+	/** 本帧选中去提醒的 runId（超龄集合里 idle 最重者）；仅为候选，不是节流键。 */
+	blockedOverdueRunId?: string;
+	/** 全部满足 BLOCKED_USER ∧ idle>userMs 的 runId（idle 降序去重）；无则缺省。 */
+	blockedOverdueRunIds?: string[];
+	/**
+	 * blocked_overdue 节流账的**投影**（runId → 上次提醒时刻 epoch ms；≤1 次/小时/runId）。
+	 *
+	 * **权威账本在快照顶层** `FrontierSnapshot.blockedOverdueThrottle[project]`；本字段只是它的投影，
+	 * 且仅当本项目本帧出现在 `projects` 里且账本非空时才存在。**发射判定不得读本字段**（项目整帧不可见时
+	 * 它不存在，读它会把该项目所有 runId 当作「从未提醒」而窗内重发）。仅供展示/测试/图投影。
+	 */
+	blockedOverdueLastAt?: Record<string, number>;
+	/** 监管派生态（P0）：state 六态 + idleMs + epoch 推动次数。无账本 = NOT_MONITORED。 */
+	supervision: ProjectSupervision;
 	overdue: number;
 	overdueRequests: string[];
 	meaningfulStateVersion: number;
