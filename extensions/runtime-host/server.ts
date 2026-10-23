@@ -95,6 +95,7 @@ import {
 	newInstanceId,
 	readHostInfo,
 	writeHostInfo,
+	DAEMON_LOCK_WAIT_MS,
 	type HostInfo,
 	type HostState,
 } from "./discovery.ts";
@@ -2148,7 +2149,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	return new Promise((resolvePromise, reject) => {
 		// §2.2：先取跨进程独占锁，再绑定端口/写账。活 daemon 已持锁 → 本进程直接拒绝启动
 		// （防双跑）；交接期 handoff 锁 → 等待后获取。锁失败 = 启动失败（fail-closed）。
-		const lockWaitMs = opts.lockWaitMs ?? 15000;
+		// 不变式：父 ensure 等 host.json 的时长必须 **大于** 本值（ENSURE_READY_WAIT_MS），
+		// 否则父会在子仍在等锁时杀掉子（2026-10-23 事故）。
+		const lockWaitMs = opts.lockWaitMs ?? DAEMON_LOCK_WAIT_MS;
 		void acquireDaemonLockOrThrow(hostPath, { instanceId, runtimeId, acquiredAt: startedAt }, lockWaitMs).then((lockPath) => {
 			startListening(lockPath);
 		}).catch((e) => {

@@ -65,6 +65,28 @@ export type HostState = "missing" | "alive" | "stale" | "dead";
 /** 探活超时缺省 1.5s（GUI poll 1-3s 节奏内的低档）。 */
 export const HEALTH_PROBE_TIMEOUT_MS = 1500;
 
+/**
+ * 子 daemon **取跨进程锁**的最长等待（`server.ts` 启动第一步：先取锁，再 bind 端口 / 发布 host.json）。
+ *
+ * 2026-10-23 事故（用户症状「daemon 未就绪 / host 不可确权（stale）」）：父 ensure 只等
+ * **8000ms** 就判「server 可能启动失败」并 **kill 子进程**，而子进程此时可能仍在等锁
+ * （最长 15000ms）—— **父等待 < 子取锁等待** 是结构性矛盾：只要锁不是立刻空闲
+ * （交接期 / 僵尸锁接管 / 高负载），父进程必然在子进程还没 listen 时就杀掉它，
+ * 留下 host.json 残骸，下次 ensure 再判 stale ⇒ fail-closed ⇒ 启动永久失败。
+ *
+ * 本常量是**唯一来源**：`server.ts` 用它作 lockWaitMs 缺省，`daemon-lifecycle.ts`
+ * 用它派生父侧等待（必须 **大于** 它，见 ENSURE_READY_WAIT_MS）。
+ */
+export const DAEMON_LOCK_WAIT_MS = 15_000;
+
+/**
+ * 父侧等「新 daemon 发布 host.json」的最长等待 = 子取锁等待 + listen/写盘余量。
+ *
+ * 不变式：**ENSURE_READY_WAIT_MS > DAEMON_LOCK_WAIT_MS**。
+ * 违反它就退回 2026-10-23 的「父先超时杀子」事故。任何调整都须同时改两处，或只改本式。
+ */
+export const ENSURE_READY_WAIT_MS = DAEMON_LOCK_WAIT_MS + 8_000;
+
 export function hostInfoPath(): string {
 	return join(defaultRuntimeDir(), "host.json");
 }

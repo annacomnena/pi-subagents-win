@@ -39,7 +39,7 @@ import {
 	lockPathFor,
 	readRuntimeLock,
 } from "./runtime-host/daemon-lifecycle.ts";
-import { PROTOCOL_VERSION, readHostInfo } from "./runtime-host/discovery.ts";
+import { PROTOCOL_VERSION, readHostInfo, DAEMON_LOCK_WAIT_MS, ENSURE_READY_WAIT_MS } from "./runtime-host/discovery.ts";
 import { runtimeIdForDir } from "./runtime-host/identity.ts";
 import { isProcessAlive, probePidState } from "./runtime/liveness.ts";
 
@@ -381,6 +381,39 @@ try {
 			assert.equal(log.calls.length, 1, "⑩ 注入 spawn 被调用一次");
 			assert.ok((r.note ?? "").includes("僵尸"), `⑩ 回执标注僵尸接管：${r.note ?? ""}`);
 			assert.equal(readRuntimeLock(lockPathFor(hp)), null, "⑩ handoff 锁最终已释放");
+		}
+
+		// ── ⑪ 不变式：父等 host.json > 子取锁等待（2026-10-23 事故回归）─────
+		{
+			assert.ok(
+				ENSURE_READY_WAIT_MS > DAEMON_LOCK_WAIT_MS,
+				`⑪ 父侧等待(${ENSURE_READY_WAIT_MS}ms) 必须 > 子侧取锁等待(${DAEMON_LOCK_WAIT_MS}ms)；否则锁不空闲时父必在子 listen 前超时`, 
+			);
+			console.log(`⑪ 不变式 ENSURE_READY_WAIT_MS=${ENSURE_READY_WAIT_MS} > DAEMON_LOCK_WAIT_MS=${DAEMON_LOCK_WAIT_MS}`);
+		}
+
+		// ── ⑫ 超时不得 kill 仍存活的子进程（旧逻辑会杀，并留下 host.json 残骸）──
+		{
+			const D = mkd("ensure-timeout-12-");
+			const hp = join(D, "host.json");
+			const log: SpawnLog = { calls: [] };
+			let killed = false;
+			const r = await ensureRuntimeDaemon({
+				hostPath: hp,
+				serverPath: join(D, "server.ts"),
+				waitMs: 300,
+				// 子进程 pid = 本进程（确实存活），但永不写 host.json ⇒ 必然走到超时分支
+				spawn: (o) => {
+					log.calls.push(o);
+					return { pid: process.pid, kill: () => { killed = true; } };
+				},
+			});
+			console.log(`⑫ 超时且子活 → ok=${r.ok} uncertain=${r.uncertain ?? false} killed=${killed} error=${r.error ?? "-"}`);
+			assert.equal(r.ok, false, "⑫ 超时不 ok");
+			assert.equal(r.uncertain, true, "⑫ 子进程仍存活 ⇒ uncertain（不得当硬失败）");
+			assert.equal(killed, false, "⑫ 不得 kill 仍存活的子进程（它可能只是在等锁/发布中）");
+			assert.ok((r.error ?? "").includes("仍存活"), `⑫ 回执说明子进程仍存活：${r.error ?? ""}`);
+			assert.equal(log.calls.length, 1, "⑫ 注入 spawn 被调用一次");
 		}
 
 		console.log("_test_ensure_dead_rebuild: all assertions passed");

@@ -29,6 +29,7 @@ import {
 	isProcessAlive,
 	readHostInfo,
 	removeHostInfo,
+	ENSURE_READY_WAIT_MS,
 	type HostInfo,
 } from "./discovery.ts";
 import { defaultRuntimeDir } from "../runtime/journal.ts";
@@ -312,7 +313,10 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 	const hostPath = opts.hostPath ?? join(runtimeDir, "host.json");
 	const lockPath = lockPathFor(hostPath);
 	const serverPath = opts.serverPath ?? defaultServerPath();
-	const waitMs = opts.waitMs ?? 8000;
+	// 2026-10-23 事故根因：旧缺省 8000ms < 子 daemon 取锁等待 DAEMON_LOCK_WAIT_MS(15000ms)
+	// ⇒ 锁不空闲时父必然在子还没 listen 时超时，然后 kill 子、留 host.json 残骸。
+	// 现在缺省由 discovery.ts 的不变式派生（ENSURE_READY_WAIT_MS > DAEMON_LOCK_WAIT_MS）。
+	const waitMs = opts.waitMs ?? ENSURE_READY_WAIT_MS;
 	const now = opts.now ?? (() => new Date().toISOString());
 	const spawnFn = opts.spawn ?? defaultSpawnDaemon;
 
@@ -448,20 +452,35 @@ export async function ensureRuntimeDaemon(opts: DaemonEnsureOptions = {}): Promi
 				if (r && r.ok) {
 					return { ...r, already: false, ...(zombieNote ? { note: zombieNote } : {}) };
 				}
-				try {
-					handle.kill();
-				} catch {
-					/* ignore */
+				// 2026-10-23：`uncertain`（如 stale：pid 活着但健康探活未应答）**不是确定失败**——
+				// 子进程可能只是还没 listen 完。旧逻辑在这里 kill 子进程 ⇒ 把一个即将健康的
+				// daemon 杀掉并留下 host.json 残骸。现在：uncertain ⇒ 不杀，回到循环继续等
+				// （由 waitMs 上界兜底），让"启动慢"不再等价于"启动失败"。
+				if (!r?.uncertain) {
+					try {
+						handle.kill();
+					} catch {
+						/* ignore */
+					}
+					return fail(`新实例确权失败（${r?.error ?? "dead：spawn 后新实例未存活"}）：已要求回收子进程，fail-closed`, { uncertain: true, info: fresh, pid: fresh.pid, port: fresh.port });
 				}
-				return fail(`新实例确权失败（${r?.error ?? "dead：spawn 后新实例未存活"}）：已要求回收子进程，fail-closed`, { uncertain: true, info: fresh, pid: fresh.pid, port: fresh.port });
 			}
 			if (Date.now() - t0 > waitMs) {
-				try {
-					handle.kill();
-				} catch {
-					/* ignore */
+				// 2026-10-23：超时也不再无条件杀子——子可能仍在锁等待 / 正在发布 host.json。
+				// 仅当它确实已死时才回收（kill 对死进程本就是 no-op，但语义上要说清）。
+				const childAlive = handle.pid !== undefined && probePidState(handle.pid).state !== "dead";
+				if (!childAlive) {
+					try {
+						handle.kill();
+					} catch {
+						/* ignore */
+					}
 				}
-				return fail(`timeout ${waitMs}ms：host.json 未就绪（server 可能启动失败）`, { info: readHostInfo(hostPath) });
+				return fail(
+					`timeout ${waitMs}ms：host.json 未就绪（server 可能启动失败）` +
+						(childAlive ? `；子进程 pid=${handle.pid} 仍存活，未杀（可能在等锁/发布中，下次 ensure 可复用）` : "；子进程已退出"),
+					{ ...(childAlive ? { uncertain: true, pid: handle.pid ?? null } : {}), info: readHostInfo(hostPath) },
+				);
 			}
 			await sleep(100);
 		}
