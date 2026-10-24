@@ -12,6 +12,8 @@
 
 import assert from "node:assert/strict";
 import {
+	DEFAULT_SYNC_WALL_MS,
+	resolveSyncWallBudget,
 	detectWallBudget,
 	formatRemainingBudget,
 	parseWallBudget,
@@ -119,3 +121,45 @@ const rec = (o: Record<string, unknown>) => ({ status: "running", startedAt: new
 }
 
 console.log(`\n_test_subagent_wall_budget: all ${n} groups passed`);
+
+// ── P9：同步派发默认墙钟（2026-10-24 事故回归）─────────────────────────
+// 事故：async:false + 未传 maxWallMs + 持续输出但永不收敛的模型 ⇒ 主会话锁死 7h42m。
+// stall 只能抓「没输出」，抓不住「一直在输出」；同步必须有墙钟上限。
+{
+	assert.equal(DEFAULT_SYNC_WALL_MS, 30 * 60_000, "P9 同步默认墙钟 = 30min");
+
+	// ① 显式同步 + 未传 maxWallMs ⇒ 套默认，来源标注 sync-default
+	assert.deepEqual(
+		resolveSyncWallBudget({ async: false }),
+		{ ms: DEFAULT_SYNC_WALL_MS, source: "sync-default" },
+		"P9 async:false 且无 maxWallMs ⇒ 加 30min 墙钟（sync-default）",
+	);
+
+	// ② 显式同步 + 调用方传了 maxWallMs ⇒ **以调用方为准**（不改写）
+	assert.deepEqual(
+		resolveSyncWallBudget({ async: false, maxWallMs: 5_000 }),
+		{ ms: 5_000, source: "param" },
+		"P9 显式 maxWallMs 优先，同步不得改写调用方取值",
+	);
+
+	// ③ 异步（缺省 / true）⇒ 不加预算（逐字节保持既有行为）
+	assert.deepEqual(resolveSyncWallBudget({}), {}, "P9 缺省（异步）⇒ 不加墙钟");
+	assert.deepEqual(resolveSyncWallBudget({ async: true }), {}, "P9 async:true ⇒ 不加墙钟");
+
+	// ④ 成对对照：确保①不是「任何输入都加预算」的假绿
+	assert.notDeepEqual(
+		resolveSyncWallBudget({ async: true }),
+		resolveSyncWallBudget({ async: false }),
+		"P9 成对对照：async:true 与 async:false 结果必须不同（否则判据无判别力）",
+	);
+
+	// ⑤ 非法 maxWallMs（NaN）仍原样透传，由 parseWallBudget 拒绝（不在此吞错）
+	assert.deepEqual(
+		resolveSyncWallBudget({ async: false, maxWallMs: Number.NaN }),
+		{ ms: Number.NaN, source: "param" },
+		"P9 非法 maxWallMs 原样透传（拒绝责任在 parseWallBudget）",
+	);
+
+	console.log(`ok ${n + 5} - P9 同步默认墙钟矩阵（5 条）`);
+	n += 5;
+}

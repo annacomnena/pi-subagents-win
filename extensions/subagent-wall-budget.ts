@@ -158,3 +158,42 @@ export function formatRemainingBudget(
 	}
 	return `预算剩 ${min}m`;
 }
+
+// ── 同步派发的默认墙钟预算（2026-10-24 事故回归）─────────────────────────
+/**
+ * 事故（2026-10-24）：主会话以 `async: false` 派发 `searcher` + 一个 2B 本地模型，
+ * **未传 `maxWallMs`，也未传 `timeoutMs`**。stall 超时（缺省 600s）本应兜底，但子进程
+ * 持续有 token 输出 ⇒ **stall 计时器被反复重置** ⇒ 同步调用阻塞 **7 小时 42 分**
+ * （会话时间戳：06:57:23 发起 → 14:39:14 才返回 `aborted`）。
+ *
+ * 根因不是"没设 stall"，而是**stall 语义只能抓"没输出"，抓不住"一直在输出但永不收敛"**。
+ * 因此对**同步**派发强制一条墙钟上限：显式同步会让主会话失去响应能力，必须有界。
+ *
+ * 语义边界：
+ * - 只对 `async === false` 生效（缺省/异步不受影响，逐字节保持既有行为）；
+ * - 调用方显式传 `maxWallMs` 时**一律以调用方为准**（本函数不改写）；
+ * - 30 分钟：足够覆盖一次"要本轮就用的重活"（L4 复核、依赖型下一步），
+ *   又不足以把一个会话钉死半天。
+ */
+export const DEFAULT_SYNC_WALL_MS = 30 * 60_000;
+
+export interface SyncWallResolution {
+	/** 生效的墙钟预算（毫秒）；undefined = 不加预算。 */
+	ms?: number;
+	/** 来源：调用方显式传参 / 同步缺省。 */
+	source?: "param" | "sync-default";
+}
+
+/**
+ * 解析同步派发应使用的墙钟预算。
+ *
+ * - `maxWallMs` 显式给出（含非法值）⇒ 原样透传，source="param"
+ *   （非法值的拒绝与告警由既有 `parseWallBudget` 负责，本函数不吞错）
+ * - 否则 `async === false` ⇒ 套 `DEFAULT_SYNC_WALL_MS`，source="sync-default"
+ * - 否则 ⇒ 不加预算
+ */
+export function resolveSyncWallBudget(input: { async?: boolean; maxWallMs?: number }): SyncWallResolution {
+	if (input.maxWallMs !== undefined) return { ms: input.maxWallMs, source: "param" };
+	if (input.async === false) return { ms: DEFAULT_SYNC_WALL_MS, source: "sync-default" };
+	return {};
+}

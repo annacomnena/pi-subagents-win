@@ -167,7 +167,7 @@ import {
 // 僵尸看门狗（失败必达终态的宿主侧兜底）：on-read 惰性回收（tick 路径在 async-result-watcher）
 import { reapZombie, reapZombiesInDir } from "./subagent-zombie.ts";
 // 墙钟总预算（opt-in）：纯判定层 + 参数校验（C2 起接线）
-import { parseWallBudget } from "./subagent-wall-budget.ts";
+import { parseWallBudget, resolveSyncWallBudget } from "./subagent-wall-budget.ts";
 import {
 	classifyLoop,
 	clampN,
@@ -1388,7 +1388,9 @@ async function runSingle(
 		// 把解析结果回写到 opts（供面板/run json 投影与状态显示来源）
 		if (opts !== undefined && __wall.ms !== undefined) {
 			opts.maxWallMs = __wall.ms;
-			opts.maxWallSource = __wall.source;
+			// 2026-10-24：调用方已标注来源（如 "sync-default"）时**不覆盖**，
+			// 否则「同步默认墙钟」会被投影成 "param"，丢失可溯源性。
+			opts.maxWallSource = opts.maxWallSource ?? __wall.source;
 		}
 		const clearWallTimer = () => { if (wallTimer) { clearTimeout(wallTimer); wallTimer = null; } };
 		const resetStall = () => {
@@ -2009,7 +2011,10 @@ async function runParallel(
 				: undefined;
 
 			try {
-				results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools, allowTierEscalation: dispatchOpts?.allowTierEscalation, mainCall: dispatchOpts?.mainCall });
+				// 2026-10-24 同步事故回归：并行同步同样会锁死主会话，逐 task 也必玵有界
+				// （未传 maxWallMs 时套 DEFAULT_SYNC_WALL_MS）。
+				const tSyncWall = resolveSyncWallBudget({ async: false });
+				results[idx] = await runWithFallback(agentDef, t.task, t.systemPrompt, t.model, t.timeoutMs, signal, taskCb, { cwd: t.cwd, tools: t.tools, excludeTools: t.excludeTools, allowTierEscalation: dispatchOpts?.allowTierEscalation, mainCall: dispatchOpts?.mainCall, maxWallMs: tSyncWall.ms, maxWallSource: tSyncWall.source });
 				tasksProgress[idx].status = results[idx].status;
 				tasksProgress[idx].elapsedMs = results[idx].durationMs ?? (Date.now() - tasksProgress[idx].startedAt);
 				tasksProgress[idx].detail = results[idx].status === "completed" ? "完成" : (results[idx].error ?? "失败");
@@ -4474,7 +4479,11 @@ export default function (pi: ExtensionAPI) {
 							details: progress ? { progress } : undefined,
 						})
 					: undefined;
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(), maxWallMs: p.maxWallMs, maxWallSource: p.maxWallMs !== undefined ? "param" : undefined });
+				// 2026-10-24 事故回归：同步派发（async:false）必玵有界。
+				// 事故：未传 maxWallMs 的同步调用被一个「持续输出但永不收敛」的 2B 模型拖住，
+				// stall 计时器被反复重置 ⇒ 主会话锁死 7h42m。这里对显式同步套默认墓钟上限。
+				const syncWall = resolveSyncWallBudget({ async: p.async, maxWallMs: p.maxWallMs });
+				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(), maxWallMs: syncWall.ms, maxWallSource: syncWall.source });
 				recordUsage(agentDef?.name, result);
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
