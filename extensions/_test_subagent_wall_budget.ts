@@ -120,7 +120,6 @@ const rec = (o: Record<string, unknown>) => ({ status: "running", startedAt: new
 	ok("P7 面板投影：未启用 undefined（零空段）/ 分类文案");
 }
 
-console.log(`\n_test_subagent_wall_budget: all ${n} groups passed`);
 
 // ── P9：同步派发默认墙钟（2026-10-24 事故回归）─────────────────────────
 // 事故：async:false + 未传 maxWallMs + 持续输出但永不收敛的模型 ⇒ 主会话锁死 7h42m。
@@ -163,3 +162,84 @@ console.log(`\n_test_subagent_wall_budget: all ${n} groups passed`);
 	console.log(`ok ${n + 5} - P9 同步默认墙钟矩阵（5 条）`);
 	n += 5;
 }
+
+// ── P10 真进程端到端：持续输出的子进程在墙钟到点后被看门狗杀掉并落终态 ──────
+// 事故（2026-10-24）：主会话以 async:false 派发到本地 2B 模型，子进程**持续吐 token**
+// ⇒ stall 计时器（缺省 600s）被反复重置，永不触发 ⇒ 同步调用阻塞 7h42m。
+// stall 语义抓不住「一直在输出」；只有墙钟抓得住。本组用**真子进程**（每秒吐字节，
+// 模拟流式输出）证明：登记了 maxWallMs ⇒ 看门狗到点杀进程树 + 写终态。
+// 成对对照：同一 record 去掉 maxWallMs ⇒ 判定**不得**是 wall-budget。
+async function p10RealChild(): Promise<void> {
+	const { spawn } = await import("node:child_process");
+	const { mkdtempSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { detectZombie, reapZombie, writeRecordAtomic, readRunRecord } =
+		await import("./subagent-zombie.ts");
+	const { isPidAlive } = await import("./subagent-kill.ts");
+
+	const dir = mkdtempSync(join(tmpdir(), "wall-e2e-"));
+	// 子进程：每 50ms 吐一个字节 —— 模拟「一直有输出、永不收敛」
+	const child = spawn(process.execPath, ["-e", "setInterval(()=>process.stdout.write('.'),50)"], {
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	const pid = child.pid!;
+	const mk = (id: string, extra: Record<string, unknown>): void => {
+		const now = Date.now();
+		writeRecordAtomic(dir, id, {
+			id,
+			status: "running",
+			startedAt: new Date(now - 5_000).toISOString(),
+			pidRecordedAt: new Date(now - 5_000).toISOString(),
+			lastActivity: new Date(now).toISOString(),
+			pid,
+			...extra,
+		});
+	};
+
+	try {
+		// 正控：有 maxWallMs=2000，且已过 5s ⇒ 必须判 wall-budget
+		mk("run_p10_budget", { maxWallMs: 2_000 });
+		const v = detectZombie(readRunRecord(dir, "run_p10_budget")!);
+		assert.equal(v.zombie, true, "P10 有预算且超期 ⇒ 必须判僵尸");
+		assert.equal(v.reason, "wall-budget", "P10 判定理由必须是 wall-budget");
+
+		// 负控：同一子进程、同一时刻，只去掉 maxWallMs ⇒ 不得判 wall-budget
+		mk("run_p10_nobudget", {});
+		const vn = detectZombie(readRunRecord(dir, "run_p10_nobudget")!);
+		assert.notEqual(vn.reason, "wall-budget", "P10 无预算 ⇒ 不得判 wall-budget（成对对照）");
+
+		// 子进程此刻还活着（证明前面判的是「预算到点」而不是「进程已死」）
+		assert.equal(isPidAlive(pid), true, "P10 前置：判定时子进程仍存活");
+
+		// 真杀：看门狗必须杀掉进程树并把 record 落成终态
+		const r = reapZombie(dir, "run_p10_budget");
+		assert.equal(r.reaped, true, "P10 看门狗必须真的收割");
+		// 给它一点时间让 SIGTERM/SIGKILL 生效
+		for (let i = 0; i < 40 && isPidAlive(pid); i += 1) {
+			await new Promise((res) => setTimeout(res, 50));
+		}
+		assert.equal(isPidAlive(pid), false, "P10 子进程必须已被杀掉");
+		const after = readRunRecord(dir, "run_p10_budget")!;
+		assert.equal(after.status, "failed", "P10 终态必须是 failed（不是 cancelled）");
+		assert.match(
+			String(after.killReason ?? ""),
+			/wall_budget/,
+			"P10 killReason 必须记录 wall_budget（可审计）",
+		);
+		console.log(`ok ${n + 3} - P10 真进程端到端（预算到点 ⇒ 杀进程树 + failed 终态 + 溯源）`);
+		n += 3;
+	} finally {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			/* 已死 */
+		}
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+await p10RealChild();
+
+console.log(`
+_test_subagent_wall_budget: all ${n} assertion groups passed (P1-P10)`);
