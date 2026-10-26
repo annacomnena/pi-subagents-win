@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 61 | P1 | **subagent 运行态在 GUI 上的呈现（二轮研究，2026-10-26）**：M1 之后复测——六问覆盖 **0 能 / 4 部分 / 2 不能**；四个结构性缺陷（D1 `.then` 整份覆盖 ⇒ `completed 171/171` 丢 pid/lastActivity/turnClock；D2 kill 占位体 + `result.runId` 写成文件名 ⇒ 账本 join cancelled **0/17**；D3 `turnClock≡lastToolTurn` ⇒ `no_progress` 对运行中**恒不触发**（实测 5/5 差值 0）；D4 `_full.md` UUID 名与 run json **交集 0/220**）；**4/6 项「数据已在盘上只差投影」**（`durationMs` 197/220、`text` 194/220、`error` 73/220） | SBS-RUNS-M1 | 方案重排 M2a（零数据面，纯投影+`usePoll`）→ M2b（修 D1/D2 + 账本 join）→ M2c（修 D3 需新载体）；**待用户挑档开工** | 本区 |
 | 60 | P1 | **折叠块自动展开/合上**：`running` 工具卡自动展开、结束自动合上；思考用「流式刚结束 4s」信号展开。三态判定（true/false/null）保护历史卡片与用户手动操作。真实链路 CDP 实测通过 | Item 59 | 已落 commit；`streamJustEnded` 那半边待真实流式复测 | 本区 |
 | 59 | P1 | **GUI 流式打印「正在思考」**：pi 扩展 `message_update` → 节流 150ms 覆盖写 `state/streaming/<sid>.json` → `GET /v1/streaming/:sid` → GUI 200ms 轮询渲染临时块（CSS 动画填平）。含 8 组单测（含真实接线 + 变异验证）+ CDP 端到端 5 态 | none | 已落 2 commit；**需 `/reload` 或新会话才生效**（扩展在启动时加载） | 本区 |
 | 58 | P1 | **ChatPage 虚拟化时间线（独立任务，未开工）**：只渲染视口内行，替掉「首屏 200 行 + 贴底分块补齐」；需处理滚动锚定 / 贴底判定 / toolCall 展开高度缓存。动机：CDP 实测首屏长任务 90ms（200 行 DOM + markdown 全渲染） | Item 56/57 | 待排期开工；先写计划再实现（滚动行为回归风险高，需 CDP 复测基线） | 本区 |
@@ -77,6 +78,26 @@
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
 | SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
+
+<a id="item-61"></a>
+### Item 61 - subagent 运行态在 GUI 上的呈现（二轮研究，2026-10-26）
+
+- **触发**：用户「开始研究之前的一个任务：subagent 在 GUI 上的呈现」。前序一轮研究 `plans/20261021_subagent_gui_observability_research.md`（档 A/B/C 提案），档 A 已落地（见 `SBS-RUNS-M1`）。
+- **本轮定位**：M1 之后的**复测 + 缺口重排**（不重复一轮）。方法：派发方定位代码 → 串行派 2 名只读 searcher（数据面 / 呈现面）→ 派发方**亲自复跑**全部承重断言。
+- **报告**：`plans/20261026_research_subagent_gui_presentation.md`（gitignored）；证据 `plans/20261026_gui_presentation_S_A_data.md` / `_S_B_gui.md`。
+- **核心结论**：M1 让 subagent「能看见」，但看见的是**历史记录**不是「正在运行的东西」。六问 = **能 0 / 部分 4 / 不能 2**（Q3「现在哪一步」、Q6「输出到哪」完全不能）。
+- **四个结构性缺陷（源码+分母双重证实，派发方独立复跑）**：
+  - **D1** `.then` 写派发时的内存常量 `record`（`index.ts:4462`/`:4361`）⇒ 终态抹掉 `pid`/`lastActivity`/`turnClock`；实测 `completed 171/171` 全缺，全目录仅 `pid 5/220`、`lastActivity 22/220`，有值者全部不经 `.then`。
+  - **D2** kill 写占位体（`subagent-kill.ts:393-401`，usage 六零）+ `result.runId` 写成文件名 id ⇒ 账本 join：终态 198/220=**90.0%**，**cancelled 0/17、running 0/2**；无 `prevResult`。
+  - **D3** `turnClock = max(turn, lastToolTurn)` 且 `calls[].turn = result.usage.turns`（`index.ts:4449-4450` + `:1428`）⇒ 恒等；写点只在 tool 事件 ⇒ **`no_progress` 对运行中结构性不可能触发**；实测 5/5 差值 0（含 running 38/38、44/44）。**tab 路径 2026-10-16 已修同类缺陷，async 漏修**。
+  - **D4** `_full.md` 用 dispatch UUID 命名、run json 用 `run_` ⇒ 交集 **0/220**（md 125 份全 UUID 名）⇒ 长输出从卡片点不到。
+- **呈现面（GUI）**：async run **唯一渲染出口 = `RunsPage.tsx`**（`RuntimeOverlay.tsx:128`）；`ChatPage` 对 subagent **零引用**；tab(async) 与 tab run **零交叉引用、同名不同物**（`WorkstreamPage.tsx:215` 也叫「运行（N）」）；RunsPage 用裸 `setInterval` 5s（不走 `usePoll`）；`useEventStream` 仅 1 个调用点（`ChatPage.tsx:729`，非 App 级）。
+- **方案重排**：**M2a 零数据面**（端点加 `durationMs`/`endedAt`/`resultError`/`textTail`/`fullReportPath`、卡片渲 `cache*/turns/turn`、`lastActivity` 年龄+阈值、改走 `usePoll`）→ **M2b**（修 D1/D2 + `?includeUsageTurns=1` 账本 join）→ **M2c**（修 D3 需新回合计数载体 + 工具**开始**时占位 + D4 路径落盘）→ M3（journal 生产者**当前 0**、WS 提 App 级）沿用一轮结论。
+- **明确不做/需批准**：新建主路由「运行」页（违背「中央永远是对话视图」既定口径 + 会静默停掉 App.tsx 五路 chat 轮询）；新增第 9 个 overlay section 有编译期成本（`_test_session_first.ts:55` 穷尽性对象）但技术上可行——**详情下钻不需要新 section**。
+- **命名撞车（新登记，需一次裁定）**：「运行」现指三样——`RuntimePage`（进程）、`RunsPage`（async subagent）、`WorkstreamPage`「运行（N）」（tab run）。建议 RunsPage 改称「子代理」。
+- **未决/未测**：`.then` × `killAsyncRun` 并发仍无实测；「工具开始即写盘」事件时序未验证（M2c 前提）；WS 提 App 级副作用未测；本轮**未开浏览器**（纯函数测试 14 组、零渲染级测试）⇒ UI 观感属推断；`SBS-RUNS-M1` 记的 `test:gui-runs-view` 10 组已过期（实测 12 组）。
+- **顺带发现**：`failureReason` 顶层键 2/220 有值但**零生产者**（死字段）；`runsView.ts:145-154 fmtCompact` 与 `format.ts:60-71 fmtTokens` 逻辑逐行重复；`RunsPage.tsx:69` 用 `text-foreground-subtlest` 渲 `argsDigest`，与信息分级「subtlest 仅装饰」冲突。
+- **Wiki**：✏️ `async-runs-endpoint.md`（2026-10-26 复核表 + 两条 Open Question 修正）、✏️ `gui-workbench-ui.md`（行号校准 + async 呈现出口/六问/刷新面/WS 四段）；`wiki-nav rebuild` 30 pages。
 
 <a id="sbs-runs-m1"></a>
 ### SBS-RUNS-M1 - 档 A：GUI「运行」section + `GET /v1/runs` 只读端点（2026-10-22）

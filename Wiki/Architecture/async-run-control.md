@@ -2,7 +2,7 @@
 title: 异步 Run 控制面（list / kill）
 kind: concept
 status: current
-updated: 2026-10-22
+updated: 2026-10-26
 source_paths:
   - extensions/subagent-zombie.ts
   - extensions/_test_subagent_zombie.ts
@@ -230,7 +230,7 @@ provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
 
 ## 已知限制 / UNKNOWN
 
-0. **终态 run 丢失运行期字段**（2026-10-22 分母体检）：`pid`/`pidRecordedAt`/`pidCmdMarker`/`lastActivity`/`lastToolTurn`/`turnClock` 在 `.then` 整份覆盖时被抹掉（现网 1/153、1/153、1/153、13/153、1/153、1/153），只有 `recentCalls` 因显式回写幸存（152/153）。任何「从终态 run 反推 pid / 最后活动 / 最后回合」的读法都不可靠；耗时只能用 `result.durationMs`（终态 139/153 有），用量只能用 `result.usage`。
+0. **终态 run 丢失运行期字段**（2026-10-22 分母体检；**2026-10-26 分母 220 复核见 [[异步 Run 卡片端点（GET /v1/runs）]]「复核」节**：`completed` **171/171** 全缺，全目录仅 `pid 5/220`、`lastActivity 22/220`、`turnClock 5/220`，有值者全部不经 `.then`）：`pid`/`pidRecordedAt`/`pidCmdMarker`/`lastActivity`/`lastToolTurn`/`turnClock` 在 `.then` 整份覆盖时被抹掉（现网 1/153、1/153、1/153、13/153、1/153、1/153），只有 `recentCalls` 因显式回写幸存（152/153）。任何「从终态 run 反推 pid / 最后活动 / 最后回合」的读法都不可靠；耗时只能用 `result.durationMs`（终态 139/153 有，2026-10-26 复核 **197/220**），用量只能用 `result.usage`。
 
 1. **身份校验的容差窗口**（`[-5min, +3min]`）：监控 pid 在窗口外被重用必然拒杀；理论上 pid 在窗口内被重用、且新进程命令行恰好也含同一 marker（例如同一 PI CLI 脚本路径）时会误判为「同一进程」——未做压力实证，属**已知残余风险**，不是已证实的缺陷。
 2. **脱离进程树的孙进程可能漏杀**：Windows `taskkill /T` 沿父链枚举后代，若后代自行 `detached`/新建进程组、或父进程先退出导致 re-parent，该后代可能不在树内。POSIX 分支先杀进程组可缓解；Windows 无等价保证。**未实测**。
@@ -256,6 +256,7 @@ provider 错误/额度线索丢失（GLM 套餐提示多在 stderr）。
 
    **真实用量其实在账本里**（本轮新证据）：按 `[startedAt, killedAt]` ∩ 同 `agent` 匹配，**8/12** cancelled 有**唯一候选 UUID**（turns 合计 **173**，可无歧义恢复）；另 4/12 有 2–5 个候选 UUID（并发同 agent 派发）⇒ **时间窗 join 不可靠，必须存 join 键**。
 10. **测试隔离纪律的已知缺口（非本控制面范围）**：`_test_async_panel.ts` 仍可经 `notifyAsyncCompletion` 弹真实 toast（可用 `PI_NOTIFY_DISABLE=1` 抑制，测试 runner 未统一设置）；`_test_readconfig_preserve_keys.ts` 会临时改写真实 `config.json` 字节（`finally` 还原，被 SIGKILL/硬超时打断的窗口内会留下夹具配置）。
+11. **`*_full.md` 与 run json 是两套命名空间，从卡片无法定位长输出（2026-10-26 实测，未修）**：`index.ts#L3719` 的 `fileId = runId ?? run_<ts>_<rand>`，async 传的是 **dispatch UUID** ⇒ md 文件名是 UUID、run json 文件名是 `run_xxx`。实测：`_full.md` **125 份全是 UUID 名**，与 220 份 run json 按 `result.runId` 求交 **0/220**；按文件名求交同样 0。而代码里拼好的路径只拼进**返回给父 agent 的文本**（`index.ts#L3712-L3726`），**不落 run json** ⇒ GUI 侧没有任何字段能指向完整输出。另：`failureReason` 顶层键 2/220 有值但**零生产者**（`grep -rn failureReason extensions/ scripts/` = 0，历史遗留死字段）。
 
 ### 已实证（勿拔高、也勿贬低）
 

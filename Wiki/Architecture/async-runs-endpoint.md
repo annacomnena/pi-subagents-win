@@ -2,7 +2,7 @@
 title: 异步 Run 卡片端点（GET /v1/runs）
 kind: architecture
 status: current
-updated: 2026-10-22
+updated: 2026-10-26
 source_paths:
   - extensions/runtime-host/server.ts
   - extensions/runtime-host/server.ts#case "/v1/runs"
@@ -168,6 +168,36 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 `readFileSync` + `JSON.parse`（`listAsyncRunSummaries(dir, 10000)` 实测 median 26.36 ms，
 与本端点 min-card P95 36 ms 同量级 ⇒ 端点没有引入额外放大）。
 
+### 复核（2026-10-26，分母 = 220 份；契约逐条核对无漂移）
+
+契约表（请求/响应/ETag/三态语义）与源码**逐条一致**；上表读数按新分母重测，只更新数字：
+
+| 查询 | 响应体 | min / median / P95 / max (ms) | count/total |
+|---|---|---|---|
+| `?limit=50`（GUI 实参） | 18,727 B | 25.6 / 27.7 / 55.3 / 55.3 | 50 / 220 |
+| `?limit=50&includeRecentCalls=1`（**GUI 实际请求**） | 52,329 B | 28.2 / 28.9 / 33.1 / 33.1 | 50 / 220 |
+| `?limit=200` | 73,388 B | 27.8 / 28.5 / 54.7 / 54.7 | 200 / 220 |
+| `?limit=200&includeRecentCalls=1` | 202,917 B | 29.5 / 31.1 / 43.0 / 43.0 | 200 / 220 |
+| `?limit=999&includeRecentCalls=1`（越界 → 夹紧到 200 ✅） | 202,917 B | 29.1 / 30.0 / 33.4 / 33.4 | **200** / 220 |
+
+条件请求：以上四个 200 各自带 `If-None-Match` 复请求均 → **304，body 0 字节**。
+
+数据分布（同一 220 分母，2026-10-26T02:36Z）：
+
+| 指标 | 读数 |
+|---|---|
+| `status` | completed 171 / failed 30 / cancelled 17 / **running 2** |
+| 带 `pid` | **5/220**（2 running + 3 failed-僵尸；后者经 `writeRecordAtomic` 保留） |
+| 有 `lastActivity` | **22/220** = 17 cancelled（kill）+ 3 failed（zombie）+ 2 running（脉搏） |
+| 有 `turnClock` / `lastToolTurn` | **5/220** |
+| `result.usage` | 216/220（运行中 2 条无 `result`） |
+| `result.usageEvents` 非空 | **78/220**（日期全部落在 2026-10-17..10-20，即瘦身提交之前） |
+
+**「凡 `.then` 跑过就丢」现由分母级证实**：`completed` **171/171** 的 `pid`/`lastActivity`/`turnClock` 全为 0；
+四个 status 里唯三保留者都**不经 `.then`**（kill / 僵尸收口 / 运行中脉搏）。
+
+`_test_runs_endpoint.ts` 复跑 = **23 组全绿**（T1a–T10）。
+
 ## 不得用作「运行中」的证据（清单）
 
 以下都不是「这个 run 正在跑」的证明，改动展示逻辑前逐条核对：
@@ -227,8 +257,13 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 
 ## Open Questions
 
-- 终态记录的 `pid`/`lastActivity` 会被落盘瘦身抹掉（现仅 1/154 保留）⇒ 终态卡片目前只能显示
-  「已完成/失败/已取消」，无法回答「它跑了多久」。补齐需要改落盘写点，不在本端点范围内。
+- 终态记录的 `pid`/`lastActivity` 会被落盘瘦身抹掉（2026-10-26 复核：`completed` **171/171** 全缺；
+  全目录仅 5/220 有 pid，且无一来自 `.then`）⇒ 终态卡片目前只能显示「已完成/失败/已取消」，
+  无法回答「它跑了多久」。补齐需要改落盘写点，不在本端点范围内。
+  注：「多久」的**正确数据其实已在盘上**（`result.durationMs`，197/220 有），只是卡片未投影 ——
+  这条比改落盘写点便宜得多。
+- `loopVerdict` 的 `no_progress` 分支**当前结构性不可触发**：`turnClock === lastToolTurn` 实测 5/5
+  （两者同源于 `result.usage.turns`）⇒ 差值恒 0，永远达不到阈值 3。有效判据只剩 `repeating`。
 - 运行中记录的 `usage` 恒缺（`result` 未生成）⇒ 卡片显示「—」。要有实时用量需要逐事件回写，代价见
   [[异步 Run 控制面（list / kill）]] 的 (c) 路径。
 - `includeRecentCalls=1` 的体积（151 KB）在 154 条时安全，但记录数线性增长；超过 ~400 条需重新评估

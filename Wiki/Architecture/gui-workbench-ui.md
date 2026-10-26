@@ -2,7 +2,7 @@
 title: GUI 工作台 UI（token / 组件 / 导航）
 kind: architecture
 status: current
-updated: 2026-10-22
+updated: 2026-10-26
 source_paths:
   - gui/src/index.css
   - gui/src/writeCard.ts
@@ -20,6 +20,8 @@ source_paths:
   - gui/src/pages/Sidebar.tsx
   - gui/src/pages/TimelinePage.tsx
   - gui/src/pages/RuntimeOverlay.tsx
+  - gui/src/pages/RunsPage.tsx
+  - gui/src/runsView.ts
   - gui/src/pages/SessionList.tsx
   - gui/src/workspaceGroup.ts
   - gui/src/workspaceRailExpand.ts
@@ -96,8 +98,8 @@ GUI 工作台（`gui/`）的视觉与导航现状：Anthropic 暖纸语义 token
 | # | 文件:行 | 改什么 |
 |---|---|---|
 | 1 | `gui/src/store.ts:44` | `RuntimeOverlaySection` union 加值（接口 `:140-141`、初值/setter `:342-343` 泛化，零改） |
-| 2 | `gui/src/pages/RuntimeOverlay.tsx:29-39` | `SECTIONS` 表加 `{ id, zh, icon }`（lucide 图标必填，窄栅 68px 只显图标） |
-| 3 | `gui/src/pages/RuntimeOverlay.tsx:111-129` | 右内容栏 `{sec.id === "<新id>" && <新页 />}` 分支 |
+| 2 | `gui/src/pages/RuntimeOverlay.tsx:31-43` | `SECTIONS` 表加 `{ id, zh, icon }`（lucide 图标必填，窄栅 68px 只显图标） |
+| 3 | `gui/src/pages/RuntimeOverlay.tsx:116-131` | 右内容栏 `{sec.id === "<新id>" && <新页 />}` 分支（`runs` 在 `:128`） |
 | 4 | 入口处（顶栏 `TopBar.tsx:207-215` 的「运行时」图标钮，或左栏 footer `Sidebar.tsx:78-87`） | `setRuntimeOverlay("<新id>")`；无入口 = 不可发现 |
 | 5 | `gui/src/_test_session_first.ts:55` | F3a 逐 section 断言列表 = **全部 8 个值**（含 `runs`）；**2026-10-22 加固**：列表由 `Record<RuntimeOverlaySection, true>` 穷尽性对象派生 ⇒ 新增 union 成员时 `tsc --noEmit` **直接红**（编译期强制），不再依赖人工记得改 |
 
@@ -109,14 +111,20 @@ GUI 里能放「运行中对象」的位置有 **6 类**，各自的现成数据
 
 | # | 挂载面 | 文件:行 | 今天承载什么 | 数据来源 | 变更成本 / IA 影响 |
 |---|---|---|---|---|---|
-| 1 | **Coverage 覆盖层 section** | `pages/RuntimeOverlay.tsx:31-43` + `:111-129` | 8 个状态/设置页（attention/master/workstream/runtime/**runs**/wechat/autonomy/appearance） | 各页自取（`snapshot.*`、`/v1/autonomy/frontier`、`/v1/wechat/*`） | **最低**：4 处编辑、无路由改动、组件原样复用；IA 影响=「设置层多一项」 |
+| 1 | **Coverage 覆盖层 section** | `pages/RuntimeOverlay.tsx:31-43` + `:116-131` | 8 个状态/设置页（attention/master/workstream/runtime/**runs**/wechat/autonomy/appearance） | 各页自取（`snapshot.*`、`/v1/autonomy/frontier`、`/v1/wechat/*`） | **最低**：4 处编辑、无路由改动、组件原样复用；IA 影响=「设置层多一项」 |
 | 2 | **WorkstreamPage 运行卡片** | `pages/WorkstreamPage.tsx:45,52-58,215-237` | `snapshot.runs` 按 `taskSelector.runSubjects` / `externalTaskId` 过滤后的 `status`+`summary` | `store.snapshot.runs`（6s 轮询 + ETag/304） | **低**：只改一个 `<ul>` 的渲染；但**过滤谓词写死在 L52-58**，非 workstream 归属的 run 永远不显示 |
 | 3 | **左栏会话列表行** | `pages/SessionList.tsx:147-220`（行体）、`:223`（容器）、`:259-330`（分组滚动区） | 会话行三段式：16px 状态槽 / 标题+徽标 / `basename(cwd)·相对时间` | `store.chatSessions`（6s，`server.ts:1925-1951` 下发 `title/titleSource/isMaster/isScopeMaster/masterProtected`） | **中**：新增一行「按 run 聚合」需要新数据源 + 新分组键；**IA 影响=左栏语义从「会话」扩到「会话+运行」** |
 | 4 | **顶栏状态条** | `pages/TopBar.tsx:129-215` | host 端点/journal 计数/信箱积压/服务点/上下文用量/待决策徽标/主题/运行时入口 | `health`(2s)、`chatSessions`、`chatUsageBySession`（transcript 同源）、`interactions`(2s) | **低-中**：加一个计数徽标 ≈ +8 行；顶栏右区已是 `gap-3` 密集区，宽度是硬约束（窄屏 `hidden md:inline`/`lg:inline` 已有先例） |
 | 5 | **TimelinePage 过滤器 + 行** | `pages/TimelinePage.tsx:13-19`（FILTERS）、`:107-125`（行渲染） | journal 人话时间线（`type.startsWith("run.")` 已是「任务运行」档） | `store.timeline`（WS journal 250ms tick 增量 + `/v1/timeline` 6s **按需门控**） | **最低**：run 事件已入 timeline；但**只有 dispatch/terminal 事件**，没有「per-turn 进度」，且是**历史**不是「当前态」 |
 | 6 | **新建独立页（主路由 Tab）** | `store.ts:37` + `App.tsx:19-22` + 入口 `Sidebar.tsx:57-74` | — | 需新数据源 | **最高**：3 处类型强耦合编辑 + 1 个入口 + `TabId` 收窄历史（`store.ts:35-36` 注释明写「会话为主重构 S4 收窄」）⇒ **IA 影响最大，直接违背「中央永远是对话视图」的既定口径**（`plans/0922_zcode_ui_layout_research.md:13`） |
 
-**另有两处「隐式挂载面」不算列表页但有先例**：`ChatPage` transcript 行（`pages/ChatPage.tsx:687-702` 的 `RowView` 按 `row.kind` 分派 5 种行 + `:1189-1265` 页面主体与滚动视口，数据源 `/v1/sessions/:id/transcript` + WS `transcript:<sid>`，行契约 `gui/src/api/types.ts:396-410`）与 `AutonomyPage` 的 `runId → phase` 内联文本（`pages/AutonomyPage.tsx:71,84-92`，数据源 `/v1/autonomy/frontier`，5s 轮询 `:126`）。
+**async run 的渲染出口现状（2026-10-26 实测复核，与上面 6 类挂载面并行的一条独立链路）**：
+- **唯一出口 = 挂载面 1 内的 `pages/RunsPage.tsx`**（`RuntimeOverlay.tsx:128` 是它全仓唯一 import 处；`gui/src` 引用 `RunCard`/`AsyncRunStatus` 的文件 **4/41**，其中界面文件仅 1 个）。`gui/src/pages/ChatPage.tsx` 对 subagent/async **零引用**，`WorkstreamPage` 只读 `snapshot.runs`（**tab run**，与 async 同名不同物，其 Card 标题也叫「运行（N）」`WorkstreamPage.tsx:215`）⇒ **async 与 tab 是零交叉引用的两个界面**。
+- **六问覆盖（口径 `plans/20261021_research_guivis_partS5.md` §B）实测：能 0 / 部分 4（Q1 时长 Q2 花费 Q4 卡住 Q5 打转）/ 不能 2（Q3 步骤 Q6 输出）**。Q1 只有 `RelTime(startedAt)`「N 分钟前」无时长减法；Q2 渲染 in/out/cost 三项、`cacheRead/cacheWrite/turns` 有字段零渲染；Q5 服务端只对 `status==="running"` 计算 `loopVerdict` ⇒ 实测 200 条里仅 **2** 条非 `unknown`；Q3/Q6 所需字段（`phase`/`currentTool`/`result.text`/`reportPath`/`artifacts`）**不在 `RunCard` 契约内**。
+- **刷新面**：RunsPage 用**裸 `window.setInterval(refresh, 5000)`**（`pages/RunsPage.tsx:94`），**不走 `usePoll`** ⇒ 无 `visibilitychange` 暂停；且覆盖层 8 个 section 全挂载（`RuntimeOverlay.tsx:116-122` 用 `hidden` 而非条件渲染）⇒ 停在别的 section 也 5s 一拍。
+- **WS 订阅不在 App 级**：`useEventStream` 调用点 = **1**（`pages/ChatPage.tsx:729`，`enabled: activeId !== null`），服务端 topic 只有 `transcript:<sid>`/`outbox`/`journal`/`interactions`（`extensions/runtime-host/ws.ts:678/682/688`）⇒ **async run 无 WS 通道**，5s 轮询已与盘上脉搏同频（`ACTIVITY_PERSIST_INTERVAL_MS=5_000`，`extensions/subagent-kill.ts:133`）。
+
+**另有两处「隐式挂载面」不算列表页但有先例**：`ChatPage` transcript 行（`pages/ChatPage.tsx:687-702` 的 `RowView` 按 `row.kind` 分派 **5** 种行（`turnHeader|userInput|assistantText|reasoning|toolCall`，`gui/src/api/types.ts:397-410`，**无 subagent-run 行类型**）+ `:1189-1265` 页面主体与滚动视口，数据源 `/v1/sessions/:id/transcript` + WS `transcript:<sid>`）与 `AutonomyPage` 的 `runId → phase` 内联文本（`pages/AutonomyPage.tsx:71,84-92`，数据源 `/v1/autonomy/frontier`，5s 轮询 `:126`）。
 
 **「这个 run 是哪个会话派发的」的既有桥（挂载面 3 必需）**：`~/.pi/agent/links.jsonl` 的 `kind:"async"` 行（写点 `extensions/index.ts:4419-4424` 单发 / `:4327`/`:4333` 并行）与 `kind:"tab"` 行（`:3423` local master / `:5123`/`:5184` trace-fusion）。读侧已有两个先例可直接照：`extensions/runtime-host/timeline.ts:181-193`（`listLinks` → `targetId → actor` enrichment，best-effort 静默降级）与 `extensions/runtime-host/delivery-reconciler-loop.ts:198-210`（派发者解析）；左栏筛选「本会话派发的 run」就是这条桥（`subagent-kill.ts` 的 `resolveSessionRun` 同源）。
 
@@ -167,15 +175,17 @@ GUI 里能放「运行中对象」的位置有 **6 类**，各自的现成数据
 - 适配层组件与 variant/tone 映射：`gui/src/ui/index.tsx`（BUTTON_VARIANT_MAP L21-26、BADGE_TONES L87-98、naBadge L109）
 - 布局/路由/组件门面：`gui/src/App.tsx`（`PAGES: Record<TabId,…>` L19-22、`const Page` L63、三栏壳 L68-92）、`gui/src/ui/index.tsx`（适配层总入口，prop API 见各组件注释）
 - 暗色常驻已废止：`main.tsx` 挂 `DEFAULT_THEME = "warm-light"`（2026-10-19 用户改口径），暗色为可选档（`gui/src/theme.ts:26` + `gui/src/main.tsx:11-15`）
-- 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/TimelinePage.tsx`（Esc 监听 + 页头返回钮）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS L29-39 七项、右栏 section 分支 L111-129、头部注释 z 序与入口语义）
+- 导航与覆盖层：`gui/src/pages/Sidebar.tsx`（次级导航组 L54-72、footer L73-87）、`gui/src/pages/TimelinePage.tsx`（Esc 监听 + 页头返回钮）、`gui/src/pages/RuntimeOverlay.tsx`（SECTIONS **L31-43 八项**（含 `runs` L38）、右栏 section 分支 L116-131（`runs` → `<RunsPage/>` L128）、头部注释 z 序与入口语义）
 - 会话列表标题契约：`extensions/runtime-host/session-title.ts`（解析链 + `MACHINE_INJECTED_TAGS` registry 四标签（file/skill/system-reminder/recent-working-set，各带注入源注释）→ 生成 `LEADING_OPEN_TAG/LEADING_CLOSED_BLOCK/LEADING_UNCLOSED_BLOCK/TRAILING_INJECTED_BLOCK` 通用正则、领头/尾部循环剥、只剥 registry 内标签防误伤、剥空回退 P3、P1 `ledgerProbeFirstLine` 开标签行跳过同为 registry 通用）、`extensions/hotspot/inject.ts`（注入恒 `text: ${text}\n\n${sel.block}` 追加在首条 user 消息末尾）、测试 `extensions/_test_session_title.ts`（T12a/T12b：尾部 recent-working-set 块 → title 不含标签、回退 P3；T13a–T13e：纯 skill→null、skill+正文→取正文、领头 skill+尾部 RWS→取中间正文、registry 外 XML 不剥防误伤、存量回归，`npm run test:session-title`）、`extensions/runtime/transcript.ts`（`readHead` 分块扫描常量 `HEAD_READ_BYTES/HEAD_CHUNK_BYTES/HEAD_SCAN_MAX_BYTES`、`StringDecoder` 跨块解码、`FIRST_USER_TEXT_CAP`）、`gui/src/workspaceGroup.ts`（`GROUP_VISIBLE_LIMIT = 3`、`resolveGroupOpen`）、`gui/src/workspaceRailExpand.ts`（`saw-ws-overflow` 展开态）、`extensions/runtime-host/server.ts:1925-1951`（`titleSource` 字段下发）
-- 覆盖层 section 与主动性入口：`gui/src/store.ts:44`（`RuntimeOverlaySection` 七值 union）、`gui/src/pages/RuntimeOverlay.tsx:29-39`（SECTIONS 表，含 `appearance` 第 7 项）、`gui/src/pages/AutonomyPage.tsx`
+- 覆盖层 section 与主动性入口：`gui/src/store.ts:44`（`RuntimeOverlaySection` **八值** union：attention/master/workstream/runtime/runs/wechat/autonomy/appearance）、`gui/src/pages/RuntimeOverlay.tsx:31-43`（SECTIONS 表，`appearance` 第 8 项、`runs` 第 5 项）、`gui/src/pages/AutonomyPage.tsx`
 - 轮询门控与条件请求：`gui/src/App.tsx:32-61`（timeline `usePoll` 第三参门控 L40；`usePoll` 三参签名 `gui/src/usePoll.ts:12`）、`gui/src/api/client.ts:62-68,71-110`（etagCache/notModifiedCache + 304 同引用）、`extensions/runtime-host/server.ts:891-908`（`sha1Etag`/`matchEtag`/`respondNotModified`）+ `:1841-1859`（snapshot 接入，ETag 剔除 `generatedAt`）
 - write 卡契约：`gui/src/writeCard.ts`（常量 L12,14、`readWriteArgs` L32、`countLines` L57、`inkHeightCss` L111、`WRITE_ERROR_CAVEAT` L116）、`gui/src/pages/WriteCard.tsx`（`WriteCardBody` L38、水位 ref 写进 `useEffect` L67-70、注脚 L107）、`gui/src/pages/ChatPage.tsx`（L77 `WRITE_SETTLE_MS`、L382 `isWrite`、L393-410 `settling`、L413 `holdOpen`、L463 解析、L531 分支）、`gui/src/index.css`（`.write-card` L597、行高 L598、视口 L692、贴底 L700、error 段 L662-683、三档墨色 L746-755）、测试 `gui/src/_test_write_card.ts`；上游写盘语义 `@earendil-works/pi-coding-agent/dist/core/tools/write.js:16-19,30-54`；不可观测边界 `extensions/runtime-host/ws.ts:813`（tail 250ms）+ `gui/src/api/types.ts:506`（快照无 tool args）。提交：`d7964db`（落笔卡 + error 态按实测写盘语义收口）、`cb1ea8f`（本节首次入库）、L4 审查修复见 `plans/20261021_write_card/l4_review_close.md`（4 项 blocking：对比度/收笔被截断/吞入参/恒真断言）。
 - 提交：`ffdef07`（会话列表标题契约节）、`b619edb`（StringDecoder 跨块 UTF-8 + 注释同步）、`eef10cb`（每组可见行 6→3）、`6ee8191`（覆盖层第 6 section + AutonomySettings 迁出微信页）。
-- **2026-10-22 校准轮（本节行号与读数系统核对，代码为准）**：`TabId` 在 `store.ts:37`（非 L31）；主壳在 `App.tsx:68-92`；`PAGES` 表 `App.tsx:19-22`；轮询编排 `App.tsx:32-61`；`SECTIONS` `RuntimeOverlay.tsx:29-39` + 右栏分支 `:111-129`；`BADGE_TONES` L87-98 / `naBadge` L109；`TooltipProvider` `App.tsx:68`；`titleSource` 下发 `server.ts:1925-1951`（原记 1404 已漂）；`index.css` 的 shadcn `@custom-variant` 在 **1014-1074**（原记 384-445 已漂）与 `.md-prose` 在 **1076+**（原记 447-498）；`focus` 行为已从「全局 outline 清零」改为 `:focus:not(:focus-visible){outline:none}` + `:focus-visible{outline:2px solid var(--color-focus-ring)}`（`index.css:334-349`）；对比度门实测 **142 对**（原记 118）；卡片高亮条用 `--color-accent`（非 `--color-brand`）；`Card` 标题是 `font-display text-ui-lg`（非 `text-ui-sm`）。另新增两节：“新增一页 / 一个 section 的改动面（IA 契约）”与“可承载‘运行态’的挂载面清单”。
+- **2026-10-22 校准轮（本节行号与读数系统核对，代码为准）**：`TabId` 在 `store.ts:37`（非 L31）；主壳在 `App.tsx:68-92`；`PAGES` 表 `App.tsx:19-22`；轮询编排 `App.tsx:32-61`；`SECTIONS` `RuntimeOverlay.tsx:29-39` + 右栏分支 `:111-129`（**该两处行号已再漂，以 2026-10-26 条目为准：L31-43 / L116-131**）；`BADGE_TONES` L87-98 / `naBadge` L109；`TooltipProvider` `App.tsx:68`；`titleSource` 下发 `server.ts:1925-1951`（原记 1404 已漂）；`index.css` 的 shadcn `@custom-variant` 在 **1014-1074**（原记 384-445 已漂）与 `.md-prose` 在 **1076+**（原记 447-498）；`focus` 行为已从「全局 outline 清零」改为 `:focus:not(:focus-visible){outline:none}` + `:focus-visible{outline:2px solid var(--color-focus-ring)}`（`index.css:334-349`）；对比度门实测 **142 对**（原记 118）；卡片高亮条用 `--color-accent`（非 `--color-brand`）；`Card` 标题是 `font-display text-ui-lg`（非 `text-ui-sm`）。另新增两节：“新增一页 / 一个 section 的改动面（IA 契约）”与“可承载‘运行态’的挂载面清单”。
+
+- **2026-10-26 校准轮（只读，呈现面勘察）**：GUI 侧 async-run 渲染面实测复核——引用 `RunCard`/`AsyncRunStatus` 的文件 **4/41**（界面文件仅 `pages/RunsPage.tsx`）；`usePoll` 调用点 **13**（App 12 + ChatPage 1，RunsPage 不在其中，用裸 `setInterval` 5s）；`useEventStream` 调用点 **1**（`ChatPage.tsx:729`，非 App 级）；`/v1/runs?limit=200&includeRecentCalls=1` = **202,880 B / 34 ms / total 220 count 200**，liveness `unknown 196 / alive 2 / dead 2`、`pid` 非空 **4/200**、`loopVerdict` 非 unknown **2/200**；测试读数 `test:gui-runs-view` **12 组**（`recentwork.md` 的「10 组」已过期）、`test:gui-contrast` **142 对 / 5 组**、`test:gui-session-first` **14 组**。报告 `plans/20261026_gui_presentation_S_B_gui.md`。
 
 ## Links Out
 
 - [[GUI 消息管道与延迟贡献项]]
-- [[Tab 运行账本与运行态数据面]] — 左栏会话标题的 P1 台账、`/v1/snapshot.runs` 字段面与 GUI 侧消费现状（仅 WorkstreamPage / AutonomyPage 两处间接展示）
+- [[Tab 运行账本与运行态数据面]] — 左栏会话标题的 P1 台账、`/v1/snapshot.runs` 字段面与 GUI 侧消费现状（tab run：WorkstreamPage / AutonomyPage；**async run：只有 `pages/RunsPage.tsx` 一个出口**，两裔零交叉引用）

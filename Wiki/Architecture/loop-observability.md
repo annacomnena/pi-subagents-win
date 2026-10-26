@@ -2,7 +2,7 @@
 title: 工具调用可观测与循环判定
 kind: architecture
 status: current
-updated: 2026-10-22
+updated: 2026-10-26
 source_paths:
   - extensions/recent-calls.ts
   - node_modules/@earendil-works/pi-agent-core/dist/types.d.ts
@@ -140,6 +140,7 @@ empty entries thr=3 turnClock=3 -> no_progress
 ⇒ **`threshold ≥ 6` 时 `repeating` 永远不可能命中**（除非调用方绕过 `clampN` 直接喂 ≥thr 条）。`no_progress` 不受此限（只依赖 `turnClock - lastToolTurn`）。这是**配置交互边界**，不是缺陷；改 `threshold` 时应知道这一上限。
 - **tab 路径（2026-10-16 修复，原已知限制已闭合）**：`turnClock = collectTabWindow(...).windowTurns`（尾部有界窗口内的 assistant 回合数，`index.ts#L4216-L4219`）；`lastToolTurn = max(entries.turn)`（`#L4217`）。修复前 `turnClock = lastToolTurn` ⇒ 差值恒 0，tab 只能判 `repeating`；现在最后一次工具调用之后每多一个纯文本 assistant 回合差值 +1 → `no_progress` 可触发。窗口相对计数是真实会话回合数的**下界**（尾部窗口可能从会话中段开始），`turnClock ≥ thr` 守卫保持保守不虚报；窗口内零工具调用但回合已达标（`entries=[] && windowTurns ≥ thr`）也交 `classifyLoop` 判 `no_progress`，仅回合数不足时才降级 `no-detail`/unknown（`#L4221-L4224`）。
 - **async 路径**：先取 `target.recentCalls ?? target.result?.recentCalls`（运行中增量写回的明细，`index.ts#L4240`），再 `lastToolTurn = max(target.lastToolTurn, 环内最大 turn)`（`#L4246-L4247`）、`turnClock = result.usage.turns || target.turnClock || lastToolTurn`（`#L4248`）。`AsyncRunRecord.lastToolTurn?`/`turnClock?`（`index.ts#L2306-L2307`）即增量写回落下的字段。
+- **async 的 `no_progress` 对运行中 run 结构性不可触发（2026-10-26 实测复核，**尚未修**）**：写点 `index.ts#L4449-L4450` 令 `lastToolTurn = max(calls[].turn)`、`turnClock = max(turn, lastToolTurn)`，而 `calls[].turn` 就是 `result.usage.turns`（`index.ts#L1428`）⇒ **两值恒等**；且该写点**只在 tool 事件触发**，纯文本回合根本不推进 `turnClock`。实测（分母 220 份 run json）：有 `turnClock` 的 5 条**差值全为 0**（含 2 条 running：`38/38`、`44/44`）⇒ 运行中只剩 `repeating` 一条有效判据。**tab 路径 2026-10-16 已修同一类缺陷**（改用 `windowTurns`，见本节上一条），async 路径漏了同一个修法；调阈值无效，必须换回合计数载体。报告：`plans/20261026_research_subagent_gui_presentation.md` §2.1 D3。
 - **终态记录的 verdict 不可当「卡住」证据**（2026-10-22 全量实测）：153 份终态 run 跑同一判定（n=3/thr=3）得 `ok 125 / unknown 13 / no_progress 15`，而 **15/15 的 `no_progress` 全部落在 `completed`**——因为终态用 `result.usage.turns` 当 `turnClock`，长任务收尾段天然「多回合无工具调用」。且 `lastToolTurn`/`turnClock` 在终态记录上实测 **1/153**（被 `.then` 整份覆盖抹掉，见 [[异步 Run 控制面（list / kill）]]），所以终态判定实际退化为环内最大 turn 自比。**verdict 只对 `status:"running"` 记录有诊断意义**；`no-detail`（13 份）则来自 `recentCalls` 为空（僵尸/无工具调用）。
 
 ### 4. `loopGuard` 配置
