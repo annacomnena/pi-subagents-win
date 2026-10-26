@@ -45,7 +45,7 @@ async subagent 的 run 记录（`~/.pi/agent/subagent-runs/*.json`）此前**只
 ### 请求
 
 ```
-GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
+GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1&sessionId=<id1,id2,...>
 ```
 
 | 项 | 规则 |
@@ -54,6 +54,7 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 | 数据源 | `subagent-kill.ts::DEFAULT_RUNS_DIR`（= `env PI_SUBAGENT_RUNS_DIR` 覆盖，否则 `~/.pi/agent/subagent-runs`） |
 | 注入 | `RuntimeHostServerOptions.runsDir?`（测试注入夹具目录；**测试不得读真实目录**） |
 | 排序 | `running` 优先 → `startedAt` 降序；`limit` 在**排序之后**截断 |
+| **会话过滤（2026-10-26 P1）** | `?sessionId=a,b`（≤5 个）。**fail-closed 校验先于条件请求判定**（否则 `If-None-Match: *` 会把非法参数洗成 304）：重复参数 / 空串 / 空 token / >5 / 非法字符 ⇒ **400 `bad-session-scope`**；通过后去重 + locale 无关排序规范化（同时用于过滤与 ETag，故 `b,a` 与 `a,b` 同 ETag）；命中口径 = `link.sessionId === sid \|\| link.ownerSessionId === sid`；过滤在 `listAsyncRunCards` **内部、排序后、limit 前**（严禁先取 limit 条再筛） |
 | 副作用 | **零写盘**：不写 run json、不碰 registry、不 kill；单份坏 json 跳过（never-throw） |
 | 方法 | 仅 GET（`POST /v1/runs` → 405） |
 
@@ -91,6 +92,9 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 | `taskPreview` | 空白压单空格 + 截 40 字符（与 `listAsyncRunSummaries` 同口径） |
 | `recentCalls` | **仅** `includeRecentCalls=1` 出现；最近 **3** 条、**newest-first**；`argsDigest` 截 `ARGS_DIGEST_MAX_CHARS`(160) |
 | `loopVerdict` | **仅** `includeRecentCalls=1` 出现；`classifyLoop` 三值，**只对 `status==="running"` 计算，终态恒 `"unknown"`** |
+| **`durationMs`**（2026-10-26） | `number` 或 `null`，来自 `result.durationMs`。**语义 = 末次尝试耗时**：`runSingle()` 每次尝试各自起钟（`index.ts#L1250`→`#L1478/#L1488`），`runWithFallback` 可多次调用，`withAllAttemptUsage()` 只聚合用量不聚合时长 ⇒ 有 fallback/重试时它 **不是整趟墙钟、也不是各次之和**。展示侧必须把「末次」写在**可见文本**里 |
+| **`dispatchedBy`**（2026-10-26） | `string` 或 `null`，来自 `links.jsonl` 的**直接派发者**；同一 `targetId` 出现多个不同派发者（冲突）⇒ `null`（不取「第一个」）；无 link ⇒ 键不出现 |
+| **`attribution` / `attributionDetail`**（2026-10-26，顶层字段） | `attribution` = `complete \| partial \| unavailable`；`attributionDetail = {resolved, tabUnmapped, missing, conflict}`，分母 = **过滤前、去重后的可读 run 总数**，计数在 `limit` 截断前统计。`tabUnmapped` = 派发者是 `tab_*` 且无 `ownerSessionId` 可映射（**存量记录不做事后回填**）。`unavailable` = `links.jsonl` 不可读或坏行率 > 10%（`RUNS_LINKS_BAD_LINE_RATIO`）⇒ **只降级归属元数据，卡片与缺省全量查询不受影响**（不得把「读不出」当「没派发」） |
 | `asof` | 响应时间戳；**不参与 ETag** |
 | **不得**出现 | `idleMs` / `ageMs` / 任何 `now -` 相对量 |
 
@@ -219,11 +223,24 @@ GET /v1/runs?limit=<1..200，缺省 50>&includeRecentCalls=0|1
 | GUI 纯函数 | `gui/src/runsView.ts`（`deriveRunDisplay`/`runningCount`/`partitionRuns`/`livenessTally`/`formatUsage`/`loopBadge`） | 判活 + 分组的唯一实现入口，可 node 直载测试 |
 | GUI 视图 | `gui/src/pages/RunsPage.tsx`（RuntimeOverlay `SECTIONS` 项「运行」） | 5s 轮询；失败保留旧数据；`running` 组只放 `countsAsRunning` 的记录，其余进「最近记录」 |
 | 契约类型 | `gui/src/api/types.ts`（`RunCard`/`RunLiveness`/`AsyncRunStatus`/`RunsResponse`） | `AsyncRunStatus` 与 tab run 的 `RunStatus`（七态）**故意区分命名** |
-| 测试 | `extensions/_test_runs_endpoint.ts`（23 组：T1–T10，含 T10 非法 pid 边界）、`gui/src/_test_runs_view.ts`（12 组：R1–R8，R7 = `partitionRuns` 页面分组口径，R8 = `RunsPage` 源码级页面接线） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
+| 测试 | `extensions/_test_runs_endpoint.ts`（**45 组**：T1–T16，含 T10 非法 pid 边界、T11 attribution 三态、T12 会话过滤/limit 顺序、T13 参数 fail-closed、T14 规范化与 ETag、T15 新字段、T16 读失败降级）、`gui/src/_test_runs_view.ts`（12 组：R1–R8，R7 = `partitionRuns` 页面分组口径，R8 = `RunsPage` 源码级页面接线）、`gui/src/_test_right_rail.ts`（31 组：右栏时长双口径/三空态/门控真值表/IA 冻结） | 夹具照真实字段集；含反向断言「unknown 不算运行中」 |
 
 **命名陷阱（本仓已踩）**：`gui/src/api/types.ts` 已有 `RunStatus`（tab run 的 journal 投影七态
 `created/dispatched/running/waiting/completed/failed/cancelled/orphaned`）。async run 的状态是另一套四态
 ⇒ 新类型叫 `AsyncRunStatus`，不要复用旧名（`tsc` 会以 duplicate identifier 挡住，但混读更难查）。
+
+## 归属数据源：`links.jsonl` 双身份（2026-10-26 P1）
+
+「这条 run 是谁派的」只能从 `~/.pi/agent/links.jsonl` 的 `kind:"async"` 行读（写点
+`extensions/index.ts#L4426` 单发 / `#L4332`/`#L4338` parallel）。两个字段并存，**语义不同**：
+
+| 字段 | 口径 | 陷阱 |
+|---|---|---|
+| `sessionId` | `sessionIdentity()`：**优先 `PI_TAB_RUN_ID`** ⇒ tab 里记 `tab_<runId>`，主/普通会话记 pi UUID | 只看它，则 tab 派发的 run **无法按 pi 会话归属**（实测 223 份 run 里 **154 条直接派发者是 tab**，uuid 仅 69；滚动 7 天 links 150/207=72.5% 为 tab） |
+| `ownerSessionId` | 同一写点上的 `ctx.sessionManager.sessionId`（pi 会话 UUID），**additive、拿不到就不写键** | 存量记录（本字段上线前的 975 条）没它 ⇒ 一律计 `tabUnmapped`；**不做事后回填**（实测「会话 JSONL 里出现 `tab_xxx` 字符串」不能当归属证据——自己的会话文件里就命中，只因上下文提到过它） |
+
+消费口径：`?sessionId=` 命中 = `link.sessionId === sid || link.ownerSessionId === sid`。
+**已有消费者不受影响**：`resolveSessionRun` / `scopedRunIds` 仍只比 `sessionId`（未改一行）。
 
 ## Evidence
 

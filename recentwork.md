@@ -23,7 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
-| 61 | P1 | **subagent 运行态在 GUI 上的呈现（二轮研究，2026-10-26）**：M1 之后复测——六问覆盖 **0 能 / 4 部分 / 2 不能**；四个结构性缺陷（D1 `.then` 整份覆盖 ⇒ `completed 171/171` 丢 pid/lastActivity/turnClock；D2 kill 占位体 + `result.runId` 写成文件名 ⇒ 账本 join cancelled **0/17**；D3 `turnClock≡lastToolTurn` ⇒ `no_progress` 对运行中**恒不触发**（实测 5/5 差值 0）；D4 `_full.md` UUID 名与 run json **交集 0/220**）；**4/6 项「数据已在盘上只差投影」**（`durationMs` 197/220、`text` 194/220、`error` 73/220） | SBS-RUNS-M1 | 方案重排 M2a（零数据面，纯投影+`usePoll`）→ M2b（修 D1/D2 + 账本 join）→ M2c（修 D3 需新载体）；**待用户挑档开工** | 本区 |
+| 61 | P1 | **GUI 右侧栏「本会话派发」+ `/v1/runs?sessionId=` 按会话过滤（P1 已落 `8c3a72d`）**：研究结论（六问 0 能/4 部分/2 不能、四结构性缺陷 D1–D4）+ P1 实现（写时双身份 `ownerSessionId`、fail-closed 先于 ETag、三态 attribution、卡片 `durationMs`/`dispatchedBy`、`rightRail/` 壳+注册表+派发面板、五条件门控 `usePoll`）。测试 `test:runs-endpoint` 45 / `test:gui-right-rail` 31 / contrast 142 对，L4 PASS-WITH-FIXES 已修 | SBS-RUNS-M1 | 待 `/runtime-host restart` 生效；CDP 渲染实测未做（需无人用机窗口）；P2 = tab 历史回溯/徽标、P3 = 第二块面板 | 本区 |
 | 60 | P1 | **折叠块自动展开/合上**：`running` 工具卡自动展开、结束自动合上；思考用「流式刚结束 4s」信号展开。三态判定（true/false/null）保护历史卡片与用户手动操作。真实链路 CDP 实测通过 | Item 59 | 已落 commit；`streamJustEnded` 那半边待真实流式复测 | 本区 |
 | 59 | P1 | **GUI 流式打印「正在思考」**：pi 扩展 `message_update` → 节流 150ms 覆盖写 `state/streaming/<sid>.json` → `GET /v1/streaming/:sid` → GUI 200ms 轮询渲染临时块（CSS 动画填平）。含 8 组单测（含真实接线 + 变异验证）+ CDP 端到端 5 态 | none | 已落 2 commit；**需 `/reload` 或新会话才生效**（扩展在启动时加载） | 本区 |
 | 58 | P1 | **ChatPage 虚拟化时间线（独立任务，未开工）**：只渲染视口内行，替掉「首屏 200 行 + 贴底分块补齐」；需处理滚动锚定 / 贴底判定 / toolCall 展开高度缓存。动机：CDP 实测首屏长任务 90ms（200 行 DOM + markdown 全渲染） | Item 56/57 | 待排期开工；先写计划再实现（滚动行为回归风险高，需 CDP 复测基线） | 本区 |
@@ -98,6 +98,17 @@
 - **未决/未测**：`.then` × `killAsyncRun` 并发仍无实测；「工具开始即写盘」事件时序未验证（M2c 前提）；WS 提 App 级副作用未测；本轮**未开浏览器**（纯函数测试 14 组、零渲染级测试）⇒ UI 观感属推断；`SBS-RUNS-M1` 记的 `test:gui-runs-view` 10 组已过期（实测 12 组）。
 - **顺带发现**：`failureReason` 顶层键 2/220 有值但**零生产者**（死字段）；`runsView.ts:145-154 fmtCompact` 与 `format.ts:60-71 fmtTokens` 逻辑逐行重复；`RunsPage.tsx:69` 用 `text-foreground-subtlest` 渲 `argsDigest`，与信息分级「subtlest 仅装饰」冲突。
 - **Wiki**：✏️ `async-runs-endpoint.md`（2026-10-26 复核表 + 两条 Open Question 修正）、✏️ `gui-workbench-ui.md`（行号校准 + async 呈现出口/六问/刷新面/WS 四段）；`wiki-nav rebuild` 30 pages。
+
+#### P1 落地（2026-10-26，commit `8c3a72d`）—— 右侧栏「本会话派发」
+
+- **用户改口径**：不要覆盖层第 5 个 section，要**右侧常驻侧栏**显示本会话派出去的东西，且侧栏后续要能承载其它内容 ⇒ 设计稿 v3（`plans/20261026_right_rail_dispatched_runs_plan.md`，经 sol 两轮评审）。
+- **数据面**：`LinkRecord.ownerSessionId?`（写时双身份；`sessionId` 历史口径不动）+ `?sessionId=` fail-closed 校验（**先于 ETag**，否则 `If-None-Match:*` 会洗成 304）+ 规范化去重排序（同集合同 ETag）+ **过滤在排序后、limit 前** + `attribution{complete|partial|unavailable}` + `attributionDetail{resolved,tabUnmapped,missing,conflict}`（分母=过滤前去重后可读 run）+ 卡片 `durationMs`（**末次尝试耗时**）/`dispatchedBy`（冲突为 null）。
+- **呈现面**：`gui/src/rightRail/`（壳 + 轻注册表 + 派发面板 + `railState` 纯逻辑）、`App.tsx` 三列、`store.railOpen/railPanel`（内存态 + `matchMedia(≥1280px)` 初值）、TopBar 单钮 + 窄屏抽屉、`formatUsage` 补回合、`RunsPage` 裸 `setInterval` → 门控 `usePoll`。
+- **两条纪律被写进实现与测试**：①`status==="running"` ≠ 运行中（判据只走 `deriveRunDisplay`）②时长终态用 `durationMs` 且**可见文本**带「末次」，`running+dead` 不得写「至今」，**绝不用 `lastActivity` 当已跑时长**。
+- **实测**：`test:runs-endpoint` **45 组** / `test:gui-right-rail` **31 组** / `gui-runs-view` 12 / `contrast` **142 对** / `session-first` 14 / `test:gui-store` 全绿；`npx tsc -p gui/tsconfig.json --noEmit` exit 0（⚠ 根目录**无** tsconfig，`npx tsc --noEmit` 是假绿）；`gui:build` ✓；`smoke:extension-load` OK。
+- **L4 独立复核**：`plans/20261026_right_rail_P1_AB_L4_review.md`（PASS-WITH-FIXES；4 处变异全命中+字节级还原）；提的 2 条呈现项已在同提交修掉；`package.json` 被他会话整文件重排（tab→2 空格 + CRLF）已按「只多一行 script」还原并剔除他会话那一行。
+- **数据事实**：223 份 run 中**直接派发者是 tab 的 154 条**（uuid 69）；滚动 7 天 async links 150/207=**72.5%** 为 tab ⇒ 不做双身份则右栏基本空。
+- **未闭合**：CDP 渲染实测未做；端点需 `/runtime-host restart`、GUI 需新会话加载；`durationMs` 仍是末次尝试（整趟墙钟需改写路径）；`attributionDetail` 是全机口径（可能显示「另有 N 条 tab 来源未关联」而在本会话并无关系）。
 
 <a id="sbs-runs-m1"></a>
 ### SBS-RUNS-M1 - 档 A：GUI「运行」section + `GET /v1/runs` 只读端点（2026-10-22）

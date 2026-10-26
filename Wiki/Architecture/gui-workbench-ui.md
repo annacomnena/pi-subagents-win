@@ -117,12 +117,22 @@ GUI 里能放「运行中对象」的位置有 **6 类**，各自的现成数据
 | 4 | **顶栏状态条** | `pages/TopBar.tsx:129-215` | host 端点/journal 计数/信箱积压/服务点/上下文用量/待决策徽标/主题/运行时入口 | `health`(2s)、`chatSessions`、`chatUsageBySession`（transcript 同源）、`interactions`(2s) | **低-中**：加一个计数徽标 ≈ +8 行；顶栏右区已是 `gap-3` 密集区，宽度是硬约束（窄屏 `hidden md:inline`/`lg:inline` 已有先例） |
 | 5 | **TimelinePage 过滤器 + 行** | `pages/TimelinePage.tsx:13-19`（FILTERS）、`:107-125`（行渲染） | journal 人话时间线（`type.startsWith("run.")` 已是「任务运行」档） | `store.timeline`（WS journal 250ms tick 增量 + `/v1/timeline` 6s **按需门控**） | **最低**：run 事件已入 timeline；但**只有 dispatch/terminal 事件**，没有「per-turn 进度」，且是**历史**不是「当前态」 |
 | 6 | **新建独立页（主路由 Tab）** | `store.ts:37` + `App.tsx:19-22` + 入口 `Sidebar.tsx:57-74` | — | 需新数据源 | **最高**：3 处类型强耦合编辑 + 1 个入口 + `TabId` 收窄历史（`store.ts:35-36` 注释明写「会话为主重构 S4 收窄」）⇒ **IA 影响最大，直接违背「中央永远是对话视图」的既定口径**（`plans/0922_zcode_ui_layout_research.md:13`） |
+| 7 | **右侧栏（`RightRail`，2026-10-26 P1 落地）** | `gui/src/rightRail/{panels.ts,RightRail.tsx,DispatchedPanel.tsx,railState.ts}` + `App.tsx:89` 三列 | 「本会话派发的 async subagent」：状态/agent/时长/费用/回合/最近工具，点行展开 | `/v1/runs?sessionId=<chatActiveId>`（5s，门控 `usePoll` + ETag/304） | **低**：新增面板 = 往 `RAIL_PANELS` 加一项 + 一个组件，**不改壳**；IA 影响 = 「对话旁多一层常驻信息列」，不动路由、不动中央 |
 
 **async run 的渲染出口现状（2026-10-26 实测复核，与上面 6 类挂载面并行的一条独立链路）**：
 - **唯一出口 = 挂载面 1 内的 `pages/RunsPage.tsx`**（`RuntimeOverlay.tsx:128` 是它全仓唯一 import 处；`gui/src` 引用 `RunCard`/`AsyncRunStatus` 的文件 **4/41**，其中界面文件仅 1 个）。`gui/src/pages/ChatPage.tsx` 对 subagent/async **零引用**，`WorkstreamPage` 只读 `snapshot.runs`（**tab run**，与 async 同名不同物，其 Card 标题也叫「运行（N）」`WorkstreamPage.tsx:215`）⇒ **async 与 tab 是零交叉引用的两个界面**。
 - **六问覆盖（口径 `plans/20261021_research_guivis_partS5.md` §B）实测：能 0 / 部分 4（Q1 时长 Q2 花费 Q4 卡住 Q5 打转）/ 不能 2（Q3 步骤 Q6 输出）**。Q1 只有 `RelTime(startedAt)`「N 分钟前」无时长减法；Q2 渲染 in/out/cost 三项、`cacheRead/cacheWrite/turns` 有字段零渲染；Q5 服务端只对 `status==="running"` 计算 `loopVerdict` ⇒ 实测 200 条里仅 **2** 条非 `unknown`；Q3/Q6 所需字段（`phase`/`currentTool`/`result.text`/`reportPath`/`artifacts`）**不在 `RunCard` 契约内**。
 - **刷新面**：RunsPage 用**裸 `window.setInterval(refresh, 5000)`**（`pages/RunsPage.tsx:94`），**不走 `usePoll`** ⇒ 无 `visibilitychange` 暂停；且覆盖层 8 个 section 全挂载（`RuntimeOverlay.tsx:116-122` 用 `hidden` 而非条件渲染）⇒ 停在别的 section 也 5s 一拍。
 - **WS 订阅不在 App 级**：`useEventStream` 调用点 = **1**（`pages/ChatPage.tsx:729`，`enabled: activeId !== null`），服务端 topic 只有 `transcript:<sid>`/`outbox`/`journal`/`interactions`（`extensions/runtime-host/ws.ts:678/682/688`）⇒ **async run 无 WS 通道**，5s 轮询已与盘上脉搏同频（`ACTIVITY_PERSIST_INTERVAL_MS=5_000`，`extensions/subagent-kill.ts:133`）。
+
+### 右侧栏契约（壳 / 面板分离，2026-10-26 P1）
+
+- **壳**：`rightRail/RightRail.tsx` —— 只管几何（320px）、折叠（宽度归零 + `pointer-events-none` + `opacity-0`，与左栏同范式）、面板切换、**条件挂载**。`<1280px` 默认收起，但顶栏入口可开成固定定位抽屉（不是功能消失）。
+- **注册表**：`rightRail/panels.ts` = `RailPanel { id, zh, icon, render }` 数组（当前仅 `dispatched`）。**新增面板 = 加一项 + 一个组件，不改壳**；不得提前造通用 `RailState`/徽标订阅体系。
+- **状态**：`store.railOpen` / `store.railPanel`（**内存态**，不写 config.json、不持久化）；`railOpen` 初值 = `matchMedia("(min-width: 1280px)")`。
+- **空态/错误归面板**，不归壳（否则未来面板被迫共享不必要契约）。
+- **轮询门控（五条件，任一不满足即不请求）**：`railOpen ∧ railPanel==="dispatched" ∧ chatActiveId!==null ∧ activeTab==="chat" ∧ runtimeOverlay===null`。`usePoll` 第三参是 **boolean**（`usePoll.ts:12`）；**CSS `hidden` 不停轮询**，必须条件挂载。切会话要显式补拍一次，并丢弃旧会话的迟到响应（`usePoll` 依赖只有 interval/enabled，`usePoll.ts:52`）。新鲜度用**最后成功请求时间**，不要只用响应 `asof`（304 会复用旧对象，`client.ts:82-86`）。
+- **时长双口径**（`runsView.ts::runDurationDisplay`，唯一实现）：终态 `durationMs` 且**可见文本**带「末次」（它是末次尝试，不是整趟墙钟）；运行中 `now − startedAt` 标「至今」；`running` 但 `liveness==="dead"` ⇒ 改「已跑 …（进程已退出）」，不得与徽标矛盾；不可得一律 `—`，**绝不**用 `lastActivity` 当已跑时长。
 
 **另有两处「隐式挂载面」不算列表页但有先例**：`ChatPage` transcript 行（`pages/ChatPage.tsx:687-702` 的 `RowView` 按 `row.kind` 分派 **5** 种行（`turnHeader|userInput|assistantText|reasoning|toolCall`，`gui/src/api/types.ts:397-410`，**无 subagent-run 行类型**）+ `:1189-1265` 页面主体与滚动视口，数据源 `/v1/sessions/:id/transcript` + WS `transcript:<sid>`）与 `AutonomyPage` 的 `runId → phase` 内联文本（`pages/AutonomyPage.tsx:71,84-92`，数据源 `/v1/autonomy/frontier`，5s 轮询 `:126`）。
 
