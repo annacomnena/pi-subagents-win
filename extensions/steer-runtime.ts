@@ -15,10 +15,21 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { appendFileSync, readdirSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { getTabRunId, isMainSession, isSubagent, setCurrentSessionId } from "./identity.ts";
 import { defaultTabRunsDir, isUnconfirmedFallback, readTabDispatch, readTabResultFile, readTabState, resolveTabLedger } from "./tab-runs.ts";
+import {
+	defaultTimersDir,
+	dueAtFromDelay,
+	mailboxDirForTab,
+	MAX_TIMER_MESSAGE,
+	newTimerId,
+	validateTimerRecord,
+	writeTimerAtomic,
+	type TimerRecord,
+} from "./timers.ts";
 import {
 	defaultSteerDir,
 	expirePendingSteerRecords,
@@ -50,6 +61,110 @@ export interface SteerRuntimeOptions {
 	runsDir?: string;
 	/** sweep 间隔（缺省 60s）。 */
 	sweepIntervalMs?: number;
+	/** timer 邮箱根目录（缺省 defaultTimersDir()；测试注入隔离目录）。 */
+	timersDir?: string;
+}
+
+// ── 空闲 tab 唤醒兜底（2026-10-26 实测事故）───────────────────────────────
+//
+// 事故形态：`tab-steer` 只把记录写进 steering 队列，消费发生在**活跃 turn 的 tool 边界**。
+// 目标 tab 若处于空闲（`turn=idle`，例如刚用 `pi -r` 重开、或已回完上一轮），则
+//   - 没有 turn ⇒ 永远没有 tool 边界 ⇒ 记录**永久 pending**；
+//   - 而账本 `lastActivityAt` 仍在心跳刷新 ⇒ `targetTabAlive` 判「活」⇒ sweep 也**不做 undelivered**；
+//   - 主会话侧因此得到「已投递」的假象，实际**静默失联**（沉默比报错更危险）。
+//
+// 兜底：目标 alive 但**当前无活跃 turn** 时，往它的 timer 邮箱丢一条**立即到期**的 nudge。
+// timer 由**目标进程自己的 pump**（timers-runtime::pumpDueTimers）取出并 `sendUserMessage`
+// ⇒ 起一个新 turn ⇒ 下个 tool 边界消费队列里的 steer。这条通道不依赖派发账本，与
+// 「归档但仍活」的代偿路径同构。
+
+/** nudge 消息前缀（幂等判据：同一 tab 已有未消费 nudge 时不重复丢）。 */
+export const STEER_IDLE_NUDGE_MARK = "[[steer-idle-nudge]]";
+
+/**
+ * 目标是否「活着但没有活跃 turn」（⇒ steer 不会被消费，需要唤醒）。
+ * 判据只用 tab-runs 既有字段，零新判态逻辑。
+ */
+export function tabNeedsIdleWake(
+	runsDir: string,
+	tabRunId: string,
+	opts?: { readState?: typeof readTabState },
+): { needsWake: boolean; reason: string; turn?: string } {
+	if (!isSafeSteerComponent(tabRunId)) return { needsWake: false, reason: "unsafe-id" };
+	try {
+		const readState = opts?.readState ?? readTabState;
+		const state = readState(runsDir, tabRunId);
+		if (!state) return { needsWake: false, reason: "no-ledger" };
+		if (state.terminal === true) return { needsWake: false, reason: "terminal" };
+		const turn = String(state.turn ?? "unknown");
+		// 只有 working 才有「下一个 tool 边界」；idle/unknown/error 都不保证会走到边界。
+		if (turn === "working") return { needsWake: false, reason: "turn-working", turn };
+		return { needsWake: true, reason: `turn-${turn}`, turn };
+	} catch {
+		return { needsWake: false, reason: "read-error" };
+	}
+}
+
+export interface IdleWakeResult {
+	dropped: boolean;
+	reason: string;
+	timerId?: string;
+}
+
+/**
+ * 往目标 tab 的 timer 邮箱丢一条立即到期的唤醒 nudge。
+ *
+ * 幂等：邮箱里已存在未消费（status=pending）的 nudge ⇒ 不再重复丢（防 nudge 风暴）。
+ * 失败一律 best-effort 返回 `dropped:false`，不阻断 steer 主流程。
+ */
+export function dropIdleWakeNudge(
+	timersDir: string,
+	tabRunId: string,
+	pendingSteerCount: number,
+	opts?: { now?: Date; nudgeDelayMs?: number },
+): IdleWakeResult {
+	try {
+		if (!isSafeSteerComponent(tabRunId)) return { dropped: false, reason: "unsafe-id" };
+		const box = mailboxDirForTab(timersDir, tabRunId);
+		// 幂等守卫：邮箱里已有未消费的 nudge ⇒ 不再丢（防 nudge 风暴）。
+		// 先整体捕获条目再扫：目录不存在/nil 一律视为空（不阻断主流程）。
+		let boxEntries: string[] = [];
+		try { boxEntries = readdirSync(box); } catch { boxEntries = []; }
+		for (const name of boxEntries) {
+			if (!name.endsWith(".json")) continue;
+			let raw: { message?: unknown; status?: unknown } | null = null;
+			try { raw = JSON.parse(readFileSync(join(box, name), "utf8")) as { message?: unknown; status?: unknown }; } catch { raw = null; }
+			if (raw === null) continue; // 半截文件：忽略（不当作"已有 nudge"）
+			if (raw.status === "pending" && typeof raw.message === "string" && raw.message.includes(STEER_IDLE_NUDGE_MARK)) {
+				return { dropped: false, reason: "nudge-already-pending" };
+			}
+		}
+
+		const now = opts?.now ?? new Date();
+		const body = [
+			STEER_IDLE_NUDGE_MARK,
+			`steer 队列有 ${Math.max(1, pendingSteerCount)} 条待消费消息。`,
+			"tab-steer 只在活跃 turn 的 tool 边界消费；你当前无活跃 turn，所以一直没收到。",
+			"请调用 steer-status 读取，或继续正常推进工作即可（队列会在首个 tool 边界被消费）。",
+		].join(" ");
+		const record: TimerRecord = {
+			id: newTimerId(now),
+			version: 1,
+			dueAt: dueAtFromDelay(opts?.nudgeDelayMs ?? 0, now),
+			message: body.slice(0, MAX_TIMER_MESSAGE),
+			target: { tabRunId },
+			source: "tab-steer:idle-wake",
+			label: "steer-idle-nudge",
+			status: "pending",
+			createdAt: now.toISOString(),
+		};
+		const check = validateTimerRecord(record);
+		if (!check.ok || !check.value) return { dropped: false, reason: `nudge-invalid:${check.errors.join(";")}` };
+		writeTimerAtomic(timersDir, check.value, { tabRunId });
+		return { dropped: true, reason: "nudged", timerId: record.id };
+	} catch (e) {
+		return { dropped: false, reason: `nudge-failed:${e instanceof Error ? e.message : String(e)}` };
+	}
 }
 
 // ── 目标活性判据（§3.5：写前守卫与 sweep 共用同一组合）─────────────────
@@ -190,6 +305,7 @@ function renderRecord(r: SteerRecord): string {
 export function registerSteerTools(pi: ExtensionAPI, opts: SteerRuntimeOptions = {}): () => void {
 	const steerDir = opts.steerDir ?? defaultSteerDir();
 	const runsDir = opts.runsDir ?? (process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir());
+	const timersDir = opts.timersDir ?? defaultTimersDir();
 
 	let sessionGen = 0;
 	let interval: ReturnType<typeof setInterval> | null = null;
@@ -275,6 +391,11 @@ export function registerSteerTools(pi: ExtensionAPI, opts: SteerRuntimeOptions =
 				return text(`steer 落盘失败: ${e instanceof Error ? e.message : String(e)}`, true);
 			}
 
+			// 空闲唤醒兜底（见 STEER_IDLE_NUDGE_MARK 注释）：目标活着但无活跃 turn ⇒
+			// 丢一条立即到期的 nudge，让目标自己的 pump 起 turn，否则记录会永久 pending。
+			const wake = tabNeedsIdleWake(runsDir, tabRunId);
+			const nudge = wake.needsWake ? dropIdleWakeNudge(timersDir, tabRunId, 1) : { dropped: false, reason: wake.reason };
+
 			const waitMs = typeof rawParams === "object" && rawParams !== null
 				? (rawParams as { waitMs?: unknown }).waitMs
 				: undefined;
@@ -283,11 +404,15 @@ export function registerSteerTools(pi: ExtensionAPI, opts: SteerRuntimeOptions =
 				final = await waitForTerminal(steerDir, tabRunId, valid.value.id, waitMs);
 			}
 			const status = final?.status ?? "pending";
+			const wakeNote = nudge.dropped
+				? `  wake=nudged（目标当前无活跃 turn：[${wake.reason}]；已向它的 timer 邮箱投一条立即到期唤醒，由它自己的 pump 起 turn 后消费队列）`
+				: `  wake=none（${wake.needsWake ? nudge.reason : wake.reason}）`;
 			return text([
 				`🚩 steer ${status}: ${valid.value.id}`,
 				`  target=tab:${tabRunId} mode=${mode} waitMs=${typeof waitMs === "number" ? waitMs : 0}`,
 				`  message=${body.slice(0, 100)}`,
-				status === "pending" ? "  note=仍为 pending（目标可能正忙/未消费）；用 steer-status 复查" : "",
+				wakeNote,
+				status === "pending" ? `  note=仍为 pending；目标 turn=${wake.turn ?? "unknown"}（${wake.needsWake ? "无活跃 turn ⇒ 不会有 tool 边界，必须唤醒" : "有活跃 turn ⇒ 应会在下个边界消费"}）；用 steer-status 复查` : "",
 				status === "delivered" ? "  note=delivered = 已入 steering 队列，下一个 tool 边界才生效" : "",
 			].filter(Boolean).join("\n"));
 		},
