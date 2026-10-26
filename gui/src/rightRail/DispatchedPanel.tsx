@@ -224,6 +224,8 @@ export function DispatchedPanel() {
 	const rows = resp?.runs ?? [];
 	const empty = pickDispatchedEmpty({ hasSession: chatActiveId !== null, resp, failed: sameSession && box.error !== "" });
 	const notice = attributionNotice(resp);
+	// 旧 host 未重启时 `?sessionId=` 被忽略、响应也没 `attribution`（该字段自 P1 起必现）⇒ 全机记录冒充本会话。
+	const staleServer = resp !== null && typeof (resp as { attribution?: unknown }).attribution !== "string";
 
 	return (
 		<div className="flex min-h-0 flex-col gap-1.5 p-2" data-rail-panel={PANEL_DISPATCHED}>
@@ -245,6 +247,15 @@ export function DispatchedPanel() {
 						{box.error}
 						{rows.length > 0 ? "；显示最后成功读到的数据" : ""}
 					</span>
+				</p>
+			)}
+
+			{/* 旧 host 静默失效保护（AGENTS R-2）：端口未重启时 `?sessionId=` 被忽略 ⇒ 返回的是**全机**记录，
+			    不提示就会把别人的 run 当成「本会话派发」。响应缺 `attribution` 字段是该情形的可判定信号。 */}
+			{staleServer && (
+				<p role="status" className="flex items-start gap-1 text-ui-xs text-warning" title="运行时宿主还是旧代码">
+					<AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+					<span>后端未启用会话过滤（需 <code>/runtime-host restart</code>）：当前列表是全机记录，**不是**本会话派发。</span>
 				</p>
 			)}
 

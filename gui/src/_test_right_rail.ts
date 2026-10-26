@@ -318,6 +318,15 @@ const runsResp = (over: Partial<RunsResponse>): RunsResponse => ({
 	// 「运行中」计数若在右栏出现也必须走 countsAsRunning（本 P1 未做徽标，锁住口径不被绕过）
 	assert.ok(!/runningCount|countsAsRunning/.test(panelCode) || panelCode.includes("deriveRunDisplay"), "若引入计数必须仍经 deriveRunDisplay");
 	ok("RR4c 右栏未自造运行中计数（徽标留 P2，口径入口已锁定）");
+
+	// 旧 host 静默失效保护（AGENTS R-2）：响应缺 attribution 字段 ⇒ 端口未重启、`?sessionId=` 被忽略，
+	// 此时列表是全机记录，必须显式告警（否则别人的 run 会被当成本会话派发）。
+	const panelSrc = read("rightRail/DispatchedPanel.tsx");
+	assert.ok(/staleServer/.test(panelSrc), "面板必须有 staleServer 判定");
+	assert.ok(/attribution\??:\s*unknown/.test(panelSrc) && /\.attribution\s*!==\s*"string"/.test(panelSrc), "判定信号 = 响应缺 attribution 字段");
+	assert.ok(panelSrc.includes("runtime-host restart"), "告警文案必须给出修复动作（/runtime-host restart）");
+	assert.ok(!/attribution: "complete"/.test(panelSrc), "不得把缺失 attribution 当 complete");
+	ok("RR4d 旧 host（响应无 attribution）⇒ 显式告警「当前是全机记录」，不静默冒充本会话");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
