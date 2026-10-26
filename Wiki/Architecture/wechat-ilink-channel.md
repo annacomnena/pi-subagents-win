@@ -2,7 +2,7 @@
 title: 微信 iLink 通道
 kind: concept
 status: current
-updated: 2026-10-20
+updated: 2026-10-23
 source_paths:
   - extensions/runtime/liveness.ts
   - extensions/runtime-host/channel-supervisor.ts
@@ -48,7 +48,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 - 通道定位：iLink 是 Client Plane 的一端，只做状态呈现与一次审批（D1②、D2）；微信里发"确认"不构成第二因素（D4）。
 - 传输：长轮询（HTTP 超时默认 95000ms，必须 >90s），无公网 webhook。
-- Reply sink：真机入站信封顶层无 `context_token`（已实测，至少 4 条）；回复按 `to_user_id` 直发，不依赖最近入站 context token。凭据与 token 不进入日志/GUI。
+- Reply sink：当前 `parser.ts:9,245` 丢弃 `context_token`，`send.ts:138–148` 按 `to_user_id` 发送且省略该字段【源码已验证】。**旧「入站无 token」前提 stale**：2026-10-23 只读回放 5/5 信封有 token；同日无 token 直发 HTTP 200、按客户端口径业务码为 0 且有 `message_id`【真机已验证：`plans/wechat-outbound-research/replay.json`、`probe.json`】。这只证明 token 非所有请求的硬性必填，**不证明长期主动推送无限可用**；服务端发送资格、额度与有效期仍须另行校准。凭据与 token 不进入日志/GUI。
 - Token/QR 生命周期："无人开 UI 即失能"——以真网测量为准，失效以首次 401/403 时间戳判定。
 - 进程放置：受监督 worker，不进 daemon 事件循环。
 - 安全约束：仅访问 `https://ilinkai.weixin.qq.com` + allowlist 附件 CDN 主机；`send` 当前仅 text。
@@ -57,7 +57,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 ## 出站协议契约（真机校准 2026-09-24）
 
 - **请求**：`POST {base}/ilink/bot/sendmessage`；鉴权头同 getupdates（`AuthorizationType: ilink_bot_token`、`Authorization: Bearer <bot_token>`、`X-WECHAT-UIN`，另有 JSON content-type）。出处：`extensions/channel-wechat/send.ts#L110-L113`；`plans/0924_wechat_w3a_calibration.md`。
-- **Body**：`base_info.channel_version="2.0.0"`；`msg` 含 `from_user_id:""`、`to_user_id`、`client_id`、`message_type:2`、`message_state:2`、`item_list:[{type:1,text_item:{text}}]`；**不带 `context_token`**。出处：`extensions/channel-wechat/send.ts#L121-L128`；校准依据：`plans/0924_wechat_w3a_calibration.md`。
+- **Body**：`base_info.channel_version="2.0.0"`；`msg` 含 `from_user_id:""`、`to_user_id`、`client_id`、`message_type:2`、`message_state:2`、`item_list:[{type:1,text_item:{text}}]`；**当前实现不带 `context_token`，不是服务端无条件允许长期主动推送的保证**。出处：`extensions/channel-wechat/send.ts:138–148`【源码已验证】；历史校准依据：`plans/0924_wechat_w3a_calibration.md`。
 - **真机响应**：HTTP 200 + `{message_id}`；无 `ret`/`errcode`/`errmsg`。`send.ts` 将缺失业务码按 0 处理，因此该响应判为成功。出处：`extensions/channel-wechat/send.ts#L159-L170`；`plans/0924_wechat_w3a_calibration.md`。
 - **client_id 去重（已定，人工确认）**：服务端**按 `client_id` 去重——相同 id 双发只投递 1 条**（第四轮固定 id 连发 2 次均 `ret=0`，用户手机只收到 1 条；B + 人工确认）⇒ **多收件人必须 per-recipient clientId**。出处：`plans/0925_wechat_media_probe_results.md` §11.5；见「`client_id` 去重语义」节。
 - **出站 URL 渲染（已定，人工确认）**：`text_item.text` 原样发出的 URL **被微信端渲染为链接形态**（B + 人工确认）；是否出卡片缩略图、可点性未验证。出处：同上 §11.5 判定表 #2。
@@ -610,7 +610,7 @@ iLink 属 Client Plane：长轮询、无公网 webhook；探针、绑定、接�
 
 ## Open Questions
 
-- 真网待测：①bot_token 失效/续期语义未测；②真机入站信封顶层无 `context_token`（至少 4 条实测），其过期语义不适用当前直发路径；③同 buf 重放已测（`--replay-seq` 只读回放，见「采集方法备忘」）；④空批推进游标已测；~~⑤相同 `client_id` 的服务端去重未定论~~ → **已定（人工确认）：同 id 双发只投 1 条**，见「`client_id` 去重语义」节；⑥并发 poll+send 限流/429 未测（读端点 3× 已测无 429）；⑦附件 **host 已测**（`novac2c.cdn.weixin.qq.com`，命中 `.qq.com` allowlist，6/6 hops=0），**单文件体积上限/长语音/大文件表现/下载耗时未测**。另：**出站文本长度——服务端 4001 字符 `ret=0` 接受（B），微信端是否截断未定（U，用户「不太确定」）**；**bot 回声**——第四轮窗口内未观测到（非穷尽）；**出站 URL 已渲染为链接形态（人工确认）**。
+- 真网待测：①bot_token 失效/续期语义未测；②~~真机入站信封顶层无 `context_token`（至少 4 条实测）~~ → **前提已过时**：2026-10-23 只读回放 5/5 信封有 token（`plans/wechat-outbound-research/replay.json`）；当前 `send.ts:138–148` 仍不带 token，且无 token 直发实测成功（`probe.json`）⇒ token 非每次发送硬性必填，但其是否携带独立额度/回复资格未证，过期语义仍未校准；③同 buf 重放已测（`--replay-seq` 只读回放，见「采集方法备忘」）；④空批推进游标已测；~~⑤相同 `client_id` 的服务端去重未定论~~ → **已定（人工确认）：同 id 双发只投 1 条**，见「`client_id` 去重语义」节；⑥并发 poll+send 限流/429 未测（读端点 3× 已测无 429）；⑦附件 **host 已测**（`novac2c.cdn.weixin.qq.com`，命中 `.qq.com` allowlist，6/6 hops=0），**单文件体积上限/长语音/大文件表现/下载耗时未测**。另：**出站文本长度——服务端 4001 字符 `ret=0` 接受（B），微信端是否截断未定（U，用户「不太确定」）**；**bot 回声**——第四轮窗口内未观测到（非穷尽）；**出站 URL 已渲染为链接形态（人工确认）**。
 - 媒体（Phase ③ 残留 U 项，**第四轮 + 人工确认后已大幅收口**）：~~① P6-cdn / ② P6-send / ③ P2 长度 / ④ P3 去重 / ⑤ P8 URL 渲染与回声~~ **均已收口**（①② = 真机 B + 1×1 PNG 人工确认；③ = 服务端接受 B、**截断仍 U**；④ = **1 条 → 去重成立，人工确认**；⑤ = 链接形态人工确认、回声窗口内未观测到）；**⑩ 是否强制 `context_token`** → 出站 send 段已证**不需**（B）。**仍开的残余**：⑥ **P4-poll+send** 并发 429/`Retry-After`；⑦ **真机 302 实况**（6/6 hops=0，越域拒绝只有 stub 证据）；⑧ **附件体积上限 / 长语音 / 下载耗时 / probe 与 worker 双游标互抢**；⑨ **`type=5`（video）与群/小程序卡片 item 形状**；**新增：⑪ 大媒体（>100B）与其它 `media_type`；⑫ 上传失败/重试语义；⑬ 4001 字符截断与 URL 卡片缩略图形态**。
 - 真机 `msgs[]` 消息条目形状已在 2026-09-24 校准，见「真机消息条目形状」节；不再列作未确认项。
 - 出站广播待实测：① `agent_settled` 在 Esc/中断路径的触发面未真机实测（不触发 → 该轮不广播 + 一行 `no-stash`）；② 多收件人放量下的 429/限流未测（沿用真网待测⑥）；~~③ 服务端 `client_id` 去重语义仍未定论~~ → **已定（人工确认）：同 id 双发只投 1 条 ⇒ per-recipient clientId 是硬要求**，见「`client_id` 去重语义」节；④ 出站文本长度——4000 为本地预算，协议层 4001 已证被服务端接受（B），**微信端截断未定（U）**。
