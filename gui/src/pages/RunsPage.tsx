@@ -19,23 +19,19 @@
  * 首次失败给「重试」出口（照 `AutonomyPage.tsx#FrontierViz` 范式）。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { AlertTriangle, Activity, PlayCircle } from "lucide-react";
 import { api } from "../api/client";
 import type { RunCard, RunsResponse } from "../api/types";
 import { Badge, Button, Card, EmptyState, PageIntro, RelTime, ShortId, Term } from "../ui";
-import { deriveRunDisplay, formatUsage, livenessTally, loopBadge, partitionRuns, runningCount, type RunTone } from "../runsView";
+import { TONE_TO_BADGE, deriveRunDisplay, formatUsage, livenessTally, loopBadge, partitionRuns, runningCount } from "../runsView";
+import { usePoll } from "../usePoll";
+import { useGui } from "../store";
 
 /** 每页最多显示多少条（服务端 limit 上限 200；这里只要「最近的一屏」）。 */
 const PAGE_LIMIT = 50;
-
-/** `RunTone` → 既有 `Badge tone`（ok→green / warn→yellow / danger→red / na→na）。 */
-const TONE_TO_BADGE: Record<RunTone, "green" | "yellow" | "red" | "na"> = {
-	ok: "green",
-	warn: "yellow",
-	danger: "red",
-	na: "na",
-};
+/** 轮询档位（2026-10-26 P1B：裸 setInterval 改 usePoll，带门控）。 */
+const POLL_MS = 5000;
 
 /** 单条 run 卡片（一行一 run；agent / 任务 / 启动+年龄 / 三态徽标 / 用量 / 最近调用 / 循环判据）。 */
 function RunRow({ run }: { run: RunCard }) {
@@ -80,6 +76,10 @@ export function RunsPage() {
 	// undefined = 首次加载中 / RunsResponse = 有数据（失败时保留旧数据）
 	const [data, setData] = useState<RunsResponse | undefined>(undefined);
 	const [error, setError] = useState("");
+	// 门控（2026-10-26 P1B）：右栏与本页打**同一个端点**（/v1/runs），所以两路必须互斥：
+	// 本页只在「覆盖层开着 ∧ 当前 section=runs」时轮询（RuntimeOverlay 把 8 个 section 全部常挂
+	// 在 DOM（只有 CSS hidden）⇒ 不加 section 判定就会在打开其它 section 时也一直拉）。
+	const runtimeOverlay = useGui((s) => s.runtimeOverlay);
 	const refresh = useCallback(async () => {
 		const r = await api.runs({ limit: PAGE_LIMIT, includeRecentCalls: true });
 		if (r.ok) {
@@ -89,11 +89,8 @@ export function RunsPage() {
 			setError(`读取运行记录失败 HTTP ${r.status}`);
 		} // 失败保留旧数据；首次失败时给「重试」，避免永久停在加载态。
 	}, []);
-	useEffect(() => {
-		void refresh();
-		const t = window.setInterval(() => void refresh(), 5000);
-		return () => window.clearInterval(t);
-	}, [refresh]);
+	// 裸 setInterval → usePoll：可见时暂停、恢复补拍、上一拍未完不重叠（否则覆盖层开久会堆积请求）。
+	usePoll(refresh, POLL_MS, runtimeOverlay === "runs");
 
 	const title = <Term zh="异步任务" en="async runs" hint="subagent-win 派发的异步 run 记录（~/.pi/agent/subagent-runs/*.json）的只读投影。5 秒轮询，ETag 命中时服务端回 304。" />;
 

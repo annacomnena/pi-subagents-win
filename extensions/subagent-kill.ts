@@ -32,6 +32,8 @@ import { join } from "node:path";
 // 卡片投影的循环判据与摘要截断与 TUI 侧同源（classifyLoop / ARGS_DIGEST_MAX_CHARS），
 // 不复制阈值：两边口径漂移会让「GUI 说卡住」与「工具说 ok」互相打脸。
 import { ARGS_DIGEST_MAX_CHARS, classifyLoop, truncateUtf8, type RecentCallEntry } from "./recent-calls.ts";
+// 归属元数据（P1A）：只借类型，不借实现——links 的读盘/统计仍留在 links.ts（单一入口）。
+import type { LinkRecord } from "./links.ts";
 
 /**
  * runs 目录解析口径（单一来源，启动时读一次 env）：
@@ -489,10 +491,59 @@ export interface RunCard {
 	lastActivity: string | null;
 	/** `result.usage`；缺失（运行中常态）⇒ null。**不从 result 之外推断**。 */
 	usage: RunCardUsage | null;
+	/**
+	 * 末次尝试耗时（ms，2026-10-26 additive）。
+	 *
+	 * ⚠️ **不是整趟墙钟**：`runSingle()` 每次尝试各自起钟（`index.ts:1478/1488`），
+	 * `runWithFallback` 有 fallback/重试时会多次调用，而 `withAllAttemptUsage()` **只聚合用量
+	 * 不聚合时长** ⇒ 有 `priorFailures` 的 run 这里只是**最后一次尝试**的耗时。
+	 * UI 必须照“末次尝试耗时”措辞展示；缺失（运行中/旧记录）⇒ null，**不反推 startedAt↔endedAt**。
+	 */
+	durationMs: number | null;
+	/**
+	 * 直接派发者（`links.jsonl` kind=async 的 `sessionId`：pi 会话 UUID 或 `tab_<runId>`）。
+	 *
+	 * 口径（2026-10-26）：“直接”= 发起该 run 的那一条 link，**不取兄弟 run、不取第一个匹配**。
+	 * - 冲突（同一 targetId 有多个不同派发者）⇒ **null**，绝不取第一个；
+	 * - 无 link（missing）⇒ 本键**不出现**（与冲突的 null 区分）。
+	 */
+	dispatchedBy?: string | null;
 	/** 仅 includeRecentCalls=1 出现；最近 3 条，**newest-first**。 */
 	recentCalls?: RunCardCall[];
 	/** 仅 includeRecentCalls=1 出现；只对 `status==="running"` 给 verdict，终态恒 "unknown"。 */
 	loopVerdict?: RunCardVerdict;
+}
+
+/**
+ * 归属可判定性（`GET /v1/runs` 的 `attribution`，2026-10-26）。
+ * - `complete`：每条可读 run 都能解析出**唯一**直接派发者，且该身份**可直接**与 scope 比较
+ *   （UUID 直接用；`tab_*` 有 `ownerSessionId` 才可映射）。
+ * - `partial`：存在 `tabUnmapped` / `missing` / `conflict` 中的任意一项（详见 `attributionDetail`）。
+ * - `unavailable`：`links.jsonl` 不可读/解析异常率异常 ⇒ **归属元数据不可用**，
+ *   而不是“没有派发”（两者绝不能混为一谈）。
+ */
+export type RunAttribution = "complete" | "partial" | "unavailable";
+
+/** 归属三类残差计数（分母 = **过滤前、去重后**的可读 run 总数；计数在 limit 截断前）。 */
+export interface RunAttributionDetail {
+	/** 唯一派发者且可直接与 scope 比较。 */
+	resolved: number;
+	/** 派发者是 `tab_*` 且无 `ownerSessionId` ⇒ 无法映射到 pi 会话（存量记录的形态）。 */
+	tabUnmapped: number;
+	/** 无 kind=async link。 */
+	missing: number;
+	/** 同一 targetId 有多个不同派发者（或同一派发者多个 owner）⇒ 不猜。 */
+	conflict: number;
+}
+
+/** `indexRunAttribution` 的产出：归属三态 + 计数 + 两张 per-run 索引。 */
+export interface RunAttributionIndex {
+	attribution: RunAttribution;
+	attributionDetail: RunAttributionDetail;
+	/** runId → 直接派发者（唯一）；冲突 ⇒ null；无 link ⇒ **不出现该键**。 */
+	dispatchedBy: Map<string, string | null>;
+	/** runId → 可与 scope 比对的身份集合（`sessionId` + 可用的 `ownerSessionId`）。 */
+	matchableIds: Map<string, string[]>;
 }
 
 /** `?limit` 缺省 50 / 上限 200（与端点契约一致）。 */
@@ -552,13 +603,94 @@ function recentCallsOf(record: KillableRunRecord): RecentCallEntry[] {
 }
 
 /**
+ * 归属索引（纯函数，2026-10-26 P1A）：把「runId 集合 × links 账本」归约为三态 + 计数 + 两张索引。
+ *
+ * 输入纪律：
+ * - `runIds`：**过滤前、去重后**的可读 runId（分母就在这里固定）；
+ * - `links`：`null` = 账本不可读/解析异常率异常 ⇒ **`unavailable`**（不是“没有派发”）。
+ *
+ * 判据（每条 run 独立）：
+ * 1. 无 kind=async link（`sessionId` 非空且 ≠"unknown"）⇒ `missing`；
+ * 2. 不同派发者 >1 ⇒ `conflict`（`dispatchedBy=null`，**不取第一个**）；
+ * 3. 单一派发者但 owner 候选 >1 ⇒ 也计 `conflict`（映射歧义，宁可不猜）；
+ * 4. 单一派发者且 `tab_*` 无 `ownerSessionId` ⇒ `tabUnmapped`（存量记录）；
+ * 5. 其余 ⇒ `resolved`（UUID 直接用；`tab_*` 有 owner 可映射）。
+ */
+export function indexRunAttribution(
+	runIds: readonly string[],
+	links: readonly LinkRecord[] | null,
+): RunAttributionIndex {
+	const detail: RunAttributionDetail = { resolved: 0, tabUnmapped: 0, missing: 0, conflict: 0 };
+	const dispatchedBy = new Map<string, string | null>();
+	const matchableIds = new Map<string, string[]>();
+	if (links === null) {
+		// 账本不可用：**不**输出任何 per-run 归属（不谎报 missing/complete），计数全 0 并整体标 unavailable。
+		return { attribution: "unavailable", attributionDetail: detail, dispatchedBy, matchableIds };
+	}
+	// 一次遍历建 targetId → links 索引（避免 O(run×link) 重扫；links 实测可到数千行）。
+	const byTarget = new Map<string, LinkRecord[]>();
+	for (const link of links) {
+		if (link.kind !== "async") continue;
+		if (typeof link.sessionId !== "string" || link.sessionId.length === 0 || link.sessionId === "unknown") continue;
+		if (typeof link.targetId !== "string" || link.targetId.length === 0) continue;
+		const arr = byTarget.get(link.targetId);
+		if (arr === undefined) byTarget.set(link.targetId, [link]);
+		else arr.push(link);
+	}
+	for (const runId of runIds) {
+		const own = byTarget.get(runId);
+		if (own === undefined || own.length === 0) {
+			detail.missing += 1;
+			continue;
+		}
+		const dispatchers = [...new Set(own.map((l) => l.sessionId))].sort();
+		if (dispatchers.length > 1) {
+			detail.conflict += 1;
+			dispatchedBy.set(runId, null);
+			continue;
+		}
+		const dispatcher = dispatchers[0]!;
+		const owners = [
+			...new Set(
+				own
+					.map((l) => l.ownerSessionId)
+					.filter((v): v is string => typeof v === "string" && v.length > 0),
+			),
+		].sort();
+		if (owners.length > 1) {
+			// 同一 run 的多个 link 指向不同属主 ⇒ 映射歧义（例：同 run 被两个会话重复登记）。
+			detail.conflict += 1;
+			dispatchedBy.set(runId, null);
+			continue;
+		}
+		dispatchedBy.set(runId, dispatcher);
+		matchableIds.set(runId, owners.length === 1 ? [dispatcher, owners[0]!] : [dispatcher]);
+		if (dispatcher.startsWith("tab_") && owners.length === 0) detail.tabUnmapped += 1;
+		else detail.resolved += 1;
+	}
+	const incomplete = detail.tabUnmapped + detail.missing + detail.conflict > 0;
+	return { attribution: incomplete ? "partial" : "complete", attributionDetail: detail, dispatchedBy, matchableIds };
+}
+
+/**
  * 列出 run 卡片（running 优先 → `startedAt` 降序；`limit` 截断在排序**之后**）。
- * 返回 `total` = 截断前的记录数（UI 用它表达「显示 N / 共 M」）。
+ * 返回 `total` = **过滤后**、截断前的记录数（UI 用它表达「显示 N / 共 M」）。
+ *
+ * 过滤（`sessionScope`，2026-10-26 P1A）在**本函数内部**、排序后、`limit` **之前**执行——
+ * 若交给调用方“先取 50 条再筛”，小会话会被全局前 50 摊平到空。
+ * 口径：`link.sessionId === sid || link.ownerSessionId === sid`（双身份，见 links.ts）。
  */
 export function listAsyncRunCards(
 	runsDir: string = DEFAULT_RUNS_DIR,
-	opts: { limit?: number; includeRecentCalls?: boolean } = {},
-): { total: number; runs: RunCard[] } {
+	opts: {
+		limit?: number;
+		includeRecentCalls?: boolean;
+		/** `links.jsonl` 的 async 记录；`null`/缺省 ⇒ 归属不可用（不影响卡片本身）。 */
+		links?: readonly LinkRecord[] | null;
+		/** 规范化后的 scope（已去重/排序）；缺省/空 ⇒ 本机全量。 */
+		sessionScope?: readonly string[];
+	} = {},
+): { total: number; runs: RunCard[]; attribution: RunAttribution; attributionDetail: RunAttributionDetail } {
 	const limitRaw = opts.limit;
 	const limit =
 		typeof limitRaw === "number" && Number.isInteger(limitRaw) && limitRaw > 0
@@ -566,9 +698,12 @@ export function listAsyncRunCards(
 			: RUNS_LIMIT_DEFAULT;
 	const includeRecentCalls = opts.includeRecentCalls === true;
 	const records = readRunRecords(runsDir);
+	// 分母：过滤前、去重后的可读 runId（去重是因为“读到的记录数”与“可读 run 数”不是同一个量）。
+	const attributionIndex = indexRunAttribution([...new Set(records.map((r) => r.id))], opts.links ?? null);
 	const cards: RunCard[] = records.map((r) => {
 		const { liveness, pid } = classifyRunLiveness(r.pid);
 		const lastIso = r.lastActivity ?? r.pidRecordedAt ?? r.startedAt;
+		const durRaw = (r.result as { durationMs?: unknown } | undefined)?.durationMs;
 		const card: RunCard = {
 			id: r.id,
 			agent: typeof r.agent === "string" ? r.agent : null,
@@ -579,7 +714,11 @@ export function listAsyncRunCards(
 			startedAt: r.startedAt ?? null,
 			lastActivity: lastIso ?? null,
 			usage: usageOf(r),
+			// 末次尝试耗时（见 RunCard.durationMs 注释）；非 finite 数值一律 null（不臆造）。
+			durationMs: typeof durRaw === "number" && Number.isFinite(durRaw) ? durRaw : null,
 		};
+		const by = attributionIndex.dispatchedBy.get(r.id);
+		if (by !== undefined) card.dispatchedBy = by;
 		if (includeRecentCalls) {
 			// newest-first（与 formatRecentCalls 的展示口径一致）；record 内是 newest-last 环形。
 			const ring = recentCallsOf(r);
@@ -605,7 +744,18 @@ export function listAsyncRunCards(
 		if (ra !== rb) return ra - rb;
 		return (b.startedAt ?? "").localeCompare(a.startedAt ?? "");
 	});
-	return { total: cards.length, runs: cards.slice(0, limit) };
+	// 过滤在排序后、limit 前（§3.2）；scope 为空/缺省 ⇒ 本机全量，**不依赖 links**。
+	const scope = opts.sessionScope ?? [];
+	const scopeSet = new Set(scope.filter((s) => typeof s === "string" && s.length > 0));
+	const visible = scopeSet.size === 0
+		? cards
+		: cards.filter((c) => (attributionIndex.matchableIds.get(c.id) ?? []).some((sid) => scopeSet.has(sid)));
+	return {
+		total: visible.length,
+		runs: visible.slice(0, limit),
+		attribution: attributionIndex.attribution,
+		attributionDetail: attributionIndex.attributionDetail,
+	};
 }
 
 function fmtClock(iso?: string): string {

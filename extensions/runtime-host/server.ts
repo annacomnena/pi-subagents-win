@@ -47,11 +47,17 @@
  *     journal message.expired 回执（sweepExpiredOutboxItems；目标会话永不重启时 pending
  *     不再是永久孤儿——任一项至多存活到下次 host 启动；桥侧另在每个消费 tick 扫）。
  *     唯一读投影例外，best-effort never-throw；POST /v1/commands 仍是唯一命令入口。
- *   - `GET /v1/runs?limit&includeRecentCalls`（2026-10-22 档 A）：async subagent run 的**只读**
- *     卡片投影（`subagent-kill.ts::listAsyncRunCards`）。三态 `liveness=alive|dead|unknown`：
- *     pid 为活数 → alive / 死数 → dead / **无 pid → unknown**（实测 152/154 无 pid 是常态；
- *     `unknown` 永不当 running 展示，也不当失败）。独立端点而不塞 `/v1/snapshot`：后者已
- *     412 KB 且 runs 占 81%。ETag 排除 `asof`；纯读零写盘。
+ *   - `GET /v1/runs?limit&includeRecentCalls&sessionId`（2026-10-22 档 A；2026-10-26 P1A 加 `sessionId`）：
+ *     async subagent run 的**只读**卡片投影（`subagent-kill.ts::listAsyncRunCards`）。三态
+ *     `liveness=alive|dead|unknown`：pid 为活数 → alive / 死数 → dead / **无 pid → unknown**
+ *     （实测 152/154 无 pid 是常态；`unknown` 永不当 running 展示，也不当失败）。独立端点而不塞
+ *     `/v1/snapshot`：后者已 412 KB 且 runs 占 81%。ETag 排除 `asof`；纯读零写盘。
+ *     P1A（右侧栏「本会话派发」数据面）：`?sessionId=a,b`（≤5 个、**fail-closed 且在条件请求之前**，
+ *     否则 `If-None-Match: *` 会把非法参数洗成 304）→ 规范化（去重 + locale 无关排序）后
+ *     在 `listAsyncRunCards` **内部、limit 之前**过滤（`link.sessionId` 或 `link.ownerSessionId` 命中）；
+ *     `total` = 过滤后可读数；新增 `attribution`/`attributionDetail`（分母 = 过滤前、去重后的可读 run）
+ *     与卡片 `dispatchedBy`/`durationMs`。缺省无该参数 = 本机全量，**且 links 读失败不影响全量**
+ *     （只把 attribution 降为 `unavailable`）。
  *   - 0923 微信 iLink 绑定 5 端点（v1：绑定/解绑/状态）：`POST /v1/wechat/bind/start`（幂等）/
  *     `GET /v1/wechat/bind/status` / `GET /v1/wechat/bind/qr-image`（daemon 代理转 data URL）/
  *     `POST /v1/wechat/bind/cancel` / `POST /v1/wechat/unbind`。鉴权沿用 authorizeCommand 链
@@ -175,6 +181,7 @@ import { startWechatReplyWatcher } from "./wechat-reply.ts";
 import { listReplyIntents, replyIntentDir } from "../runtime/wechat-reply.ts";
 import { readAttachment } from "../runtime/registry.ts";
 import { DEFAULT_RUNS_DIR, listAsyncRunCards } from "../subagent-kill.ts";
+import { defaultLinksPath, readLinksWithStats, type LinkRecord } from "../links.ts";
 import { masterAddress } from "../runtime/address.ts";
 import { WechatStore, type InboundRecord } from "../channel-wechat/store.ts";
 import { resolveDistDir, serveStatic } from "./static.ts";
@@ -897,6 +904,78 @@ export function buildSnapshotView(
 /** ETag（强校验器形式 "<sha1hex>"）。 */
 function sha1Etag(s: string): string {
 	return `"${createHash("sha1").update(s).digest("hex")}"`;
+}
+
+// ── /v1/runs 的 `?sessionId=` 校验（2026-10-26 P1A，右侧栏数据面）─────────────
+// 纪律：**fail-closed 且在条件请求之前**。若先跑 matchEtag，客户端带 `If-None-Match: *` 就会把
+// 非法参数变成 304「假成功」——非法输入必须看得见地 400。
+
+/** 单次查询允许的**原始** token 数上限（去重前计数：`a,a,a,a,a,a` 也算 6）。 */
+export const RUNS_SESSION_SCOPE_MAX_TOKENS = 5;
+/** 允许的会话 id 字符集（pi 会话 UUID / `tab_*` 都在内；拒绝空白与分隔符混淆）。 */
+const RUNS_SESSION_ID_CHARS = /^[A-Za-z0-9_.:-]+$/;
+
+/**
+ * 解析 `?sessionId=`（逗号分隔多值）→ **去重 + 确定性排序**后的规范化 scope。
+ *
+ * 同一规范化结果同时用于：过滤、ETag 输入（因此 `?sessionId=b,a` 与 `?sessionId=a,b` 必须同 ETag
+ * ——排序用 locale 无关的 `Array.prototype.sort()`，不用 `localeCompare`）。
+ * 缺省（无该参数）⇒ `[]` = 本机全量。
+ */
+export function parseRunsSessionScope(params: URLSearchParams): string[] {
+	const all = params.getAll("sessionId");
+	if (all.length === 0) return [];
+	if (all.length > 1) {
+		throw new HttpError(400, {
+			error: "bad-session-scope",
+			hint: "sessionId 只能出现一次（多值用逗号分隔，如 ?sessionId=a,b）",
+		});
+	}
+	const raw = all[0] ?? "";
+	if (raw.length === 0) {
+		throw new HttpError(400, { error: "bad-session-scope", hint: "sessionId 不得为空串（不要本机全量请省略该参数）" });
+	}
+	const tokens = raw.split(",");
+	if (tokens.length > RUNS_SESSION_SCOPE_MAX_TOKENS) {
+		throw new HttpError(400, {
+			error: "bad-session-scope",
+			hint: `sessionId 最多 ${RUNS_SESSION_SCOPE_MAX_TOKENS} 个（实际 ${tokens.length}）`,
+		});
+	}
+	for (const t of tokens) {
+		if (t.length === 0) {
+			throw new HttpError(400, { error: "bad-session-scope", hint: "sessionId 含空 token（如 `a,,b` / 首尾逗号）" });
+		}
+		if (!RUNS_SESSION_ID_CHARS.test(t)) {
+			throw new HttpError(400, {
+				error: "bad-session-scope",
+				hint: `sessionId 含非法字符：${JSON.stringify(t)}（只允许 [A-Za-z0-9_.:-]）`,
+			});
+		}
+	}
+	return [...new Set(tokens)].sort();
+}
+
+/** `links.jsonl` 解析异常率上限（超此値 ⇒ 账本不可信 ⇒ `unavailable`）。 */
+const RUNS_LINKS_BAD_LINE_RATIO = 0.1;
+
+/**
+ * 为 `/v1/runs` 读 async 归属账本（never-throw）。
+ *
+ * 返回 `null` ⇒ 归属元数据不可用（`attribution:"unavailable"`），两种情形：
+ * 1. 文件不可读（权限/IO 错——`readLinksWithStats` 会抛，这里接住）；
+ * 2. 解析异常率 > 10%（坏行占比过高：账本已被写坏，此时不得把“读不出”当“没有派发”）。
+ *
+ * 关键：**这条失败链只降级归属元数据，不影响卡片本身**（缺省查询仍 200 全量）。
+ */
+function readRunsLinksForAttribution(linksPath?: string): LinkRecord[] | null {
+	try {
+		const stats = readLinksWithStats(linksPath ?? defaultLinksPath());
+		if (stats.badLines > 0 && stats.badLines > stats.lines * RUNS_LINKS_BAD_LINE_RATIO) return null;
+		return stats.links;
+	} catch {
+		return null;
+	}
 }
 
 /** If-None-Match 命中判定（支持逗号分隔列表 / W/ 弱前缀 / `*`）。 */
@@ -1911,12 +1990,19 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 追加 154 份 run 即便只投影 min-card 也要 +80 KB（+19.5%），且 buildRunsSection 是同步投影。
 					// 数据源 = `subagent-kill.ts::DEFAULT_RUNS_DIR`（PI_SUBAGENT_RUNS_DIR 口径）；**纯读、零写盘**。
 					const runsQ = u.searchParams;
+					// ① 校验**先于** ETag 判定（fail-closed；否则 `If-None-Match: *` 会把非法参数洗成 304）。
+					const runsScope = parseRunsSessionScope(runsQ);
 					const runsLimitRaw = runsQ.get("limit");
 					const runsLimit = runsLimitRaw === null ? undefined : Number(runsLimitRaw);
 					const includeRecentCalls = (runsQ.get("includeRecentCalls") ?? "") === "1";
+					// ② links 读取（never-throw）：失败/解析异常率 >10% ⇒ 归属元数据 unavailable，
+					// **但不影响卡片本身** —— 缺省查询（本机全量）绝不因账本坏掉而变空。
+					const runsLinks = readRunsLinksForAttribution(opts.linksPath);
 					const cards = listAsyncRunCards(opts.runsDir ?? DEFAULT_RUNS_DIR, {
 						...(runsLimit !== undefined && Number.isFinite(runsLimit) ? { limit: runsLimit } : {}),
 						includeRecentCalls,
+						links: runsLinks,
+						sessionScope: runsScope,
 					});
 					// ETag 排除 asof（响应时间戳不是状态；否则每拍都 miss）——手法同 /v1/snapshot。
 					// asof 也**不在**卡片里放任何 `now-` 相对量：相对量会让 ETag 永不命中，年龄由 GUI 用
@@ -1926,6 +2012,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						asof: new Date().toISOString(),
 						count: cards.runs.length,
 						total: cards.total,
+						attribution: cards.attribution,
+						attributionDetail: cards.attributionDetail,
 						runs: cards.runs,
 					};
 					const runsEtag = sha1Etag(JSON.stringify({ ...runsBody, asof: undefined }));

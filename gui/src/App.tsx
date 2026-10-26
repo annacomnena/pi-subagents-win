@@ -1,6 +1,10 @@
 /**
- * App.tsx — 三栏布局（拍板 5：顶栏 + 左栏 + 中央；右侧 Inspector v0 砍）+
- * 全局轮询编排（2s 档 events/attention/health，6s 档 snapshot/timeline）。
+ * App.tsx — 三栏布局（拍板 5：顶栏 + 左栏 + 中央；右侧 Inspector v0 砍）+ 全局轮询编排
+ * （2s 档 events/attention/health，6s 档 snapshot/timeline）。
+ *
+ * 2026-10-26 P1B：中央右侧新增**右栏**（`rightRail/RightRail.tsx`，320px，默认 ≥1280px 展开）
+ * —— 它是「挂载面槽位」而不是新路由页：**不加 `TabId`、不改 `PAGES`**（IA 冻结，验收 13）。
+ * 右栏自带门控轮询（展开 ∧ 面板=派发 ∧ chat 视图 ∧ 无覆盖层），不在这里控。
  */
 
 import { TopBar } from "./pages/TopBar";
@@ -8,6 +12,7 @@ import { Sidebar } from "./pages/Sidebar";
 import { TimelinePage } from "./pages/TimelinePage";
 import { ChatPage } from "./pages/ChatPage";
 import { RuntimeOverlay } from "./pages/RuntimeOverlay";
+import { RightRail } from "./rightRail/RightRail";
 import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
 import { usePoll } from "./usePoll";
@@ -79,6 +84,9 @@ export default function App() {
 				<main className="min-w-0 flex-1 overflow-hidden">
 					<Page />
 				</main>
+				{/* 右栏（2026-10-26 P1B）：320px 常驻；折叠 = 宽度归零 + pointer-events-none + opacity-0；
+				 * <1280px 默认收起，顶栏入口打开后变固定定位抽屉（带背板）。 */}
+				<RightRail />
 			</div>
 			{/* 「运行时」全屏覆盖层（null=不渲染；值=打开并定位 section） */}
 			{runtimeOverlay !== null && <RuntimeOverlay />}

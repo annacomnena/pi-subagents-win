@@ -118,7 +118,7 @@ import {
 	updateWorkstream,
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
-import { recordLink, sessionIdentity, listLinks, type LinkKind } from "./links.ts";
+import { recordLink, sessionIdentity, listLinks, ownerSessionIdOf, type LinkKind } from "./links.ts";
 import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, isWorkflowTab, registerCapabilityFlags } from "./capabilities.ts";
@@ -4312,6 +4312,9 @@ export default function (pi: ExtensionAPI) {
 				const tasks = p.tasks as TaskInput[];
 				if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 				const asyncSid = sessionIdentity(_ctx as never);
+				// 双身份（2026-10-26 右侧栏 P1A）：`sessionId` 保持历史口径（tab 里是 tab_<runId>），
+				// `ownerSessionId` 另记 pi 会话 id —— 使「tab 派发的 run」可按 pi 会话精确归属（写时事实，不做事后启发式）。
+				const asyncOwnerSid = ownerSessionIdOf(_ctx as { sessionManager?: { sessionId?: string } });
 				bindAsyncPanelUi((_ctx as { ui?: ExtensionCommandContext["ui"] })?.ui);
 				const asyncRunIds: string[] = [];
 				const asyncLines: string[] = [];
@@ -4329,13 +4332,13 @@ export default function (pi: ExtensionAPI) {
 						const record: AsyncRunRecord = { id: runId, agent: t.agent, task: t.task ?? "", model: effModel, status: "failed", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined,
 							result: { status: "failed", text: "", usage: emptyUsageSummary(), usageEvents: [], runId, error: `unknown agent: ${t.agent}`, agent: t.agent } };
 						writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
-						recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${t.agent} unknown` });
+						recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${t.agent} unknown`, ...(asyncOwnerSid ? { ownerSessionId: asyncOwnerSid } : {}) });
 						asyncLines.push(`${runId} [${label}] failed: unknown agent: ${t.agent}`);
 						return;
 					}
 					const record: AsyncRunRecord = { id: runId, agent: agentDef?.name ?? t.agent, task: t.task ?? "", model: effModel, status: "running", startedAt: new Date().toISOString(), cwd: t.cwd ? resolveSubagentCwd(t.cwd) : undefined, ...(__wallMs !== undefined ? { maxWallMs: __wallMs, maxWallSource: __wallSrc } : {}) };
 					writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
-					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}` });
+					recordLink({ sessionId: asyncSid, kind: "async", targetId: runId, detail: `parallel[${idx}] agent=${label} ${String(t.task ?? "").slice(0, 60)}`, ...(asyncOwnerSid ? { ownerSessionId: asyncOwnerSid } : {}) });
 					// 运行中循环观测：≤1 次/5s 合并写回 run json（复用 kill 的读-改-写合并语义，不回滚 kill 字段）。
 					const persistRecentCalls = createThrottledRunMerger(runId, RUNS_DIR);
 					runWithFallback(agentDef, t.task ?? "", t.systemPrompt, t.model, t.timeoutMs, undefined, () => touchRunActivity(runId), {
@@ -4421,11 +4424,14 @@ export default function (pi: ExtensionAPI) {
 				const record: AsyncRunRecord = { id: runId, agent: p.agent, task: p.task ?? "", status: "running", startedAt: new Date().toISOString(), cwd: p.cwd ? resolveSubagentCwd(p.cwd) : undefined };
 				writeFileSync(join(RUNS_DIR, `${runId}.json`), JSON.stringify(slimRunRecordForDisk(record)));
 				// 溯源：记录「本会话唤起了这个异步子 agent」
+				// 双身份（P1A）：`ownerSessionId` 另记 pi 会话 id（拿不到就不写该键，不写占位值）。
+				const asyncOwnerSid = ownerSessionIdOf(_ctx as { sessionManager?: { sessionId?: string } });
 				recordLink({
 					sessionId: sessionIdentity(_ctx as never),
 					kind: "async",
 					targetId: runId,
 					detail: `agent=${p.agent ?? "subagent"} ${String(p.task ?? "").slice(0, 60)}`,
+					...(asyncOwnerSid ? { ownerSessionId: asyncOwnerSid } : {}),
 				});
 				const agentDef = p.agent ? agents.find((a) => a.name === p.agent) ?? null : null;
 				// 墙钟预算（C2-c）：显式参数优先于 env；缺省不启用

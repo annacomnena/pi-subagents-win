@@ -11,7 +11,7 @@
  *   R2 **反向断言**：running+unknown ⇒ countsAsRunning === false 且 label !== "运行中"
  *   R3 终态三值 → completed / failed / cancelled，均 countsAsRunning=false（终态 liveness 不参与判活）
  *   R4 runningCount：只数 countsAsRunning；两条 status=running 但只有一条真活 ⇒ 1
- *   R5 formatUsage：null → "—"；有值 → in/out + cost；缺失 cost 不出 $
+ *   R5 formatUsage：null → "—"；有值 → in/out + cost + 回合（turns，2026-10-26 P1B 补）；缺失 cost 不出 $
  *   R6 livenessTally 分母 = 传入条数；loopBadge 只对 repeating/no_progress 出徽标
  *   R7 partitionRuns：页面分组口径（只有 running+alive 进 running 组；M6 变异暴露的页面层零判别力缺口）
  *
@@ -130,9 +130,12 @@ const card = (over: Partial<RunCard>): RunCard => ({
 	assert.ok(s.includes("106k in"), `含紧凑输入量（实际 ${s}）`);
 	assert.ok(s.includes("22.1k out"), `含紧凑输出量（实际 ${s}）`);
 	assert.ok(s.includes("$0.343"), `cost 三位小数（实际 ${s}）`);
+	assert.ok(s.includes("26 回合"), `回合数进同一格式串（实际 ${s}）`);
 	assert.ok(!s.includes("undefined") && !s.includes("null"));
-	assert.equal(formatUsage({ input: 205, output: 99, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 }), "205 in / 99 out · $0.000");
-	ok("R5 formatUsage：null→「—」；有值→紧凑 in/out + 三位小数 cost");
+	// 2026-10-26 P1B：右栏「费用/回合」一行要 turns ⇒ 补进 formatUsage（**不写第二套格式化器**）。
+	// 本行是既有断言的**新契约值**（旧值 "205 in / 99 out · $0.000"）。
+	assert.equal(formatUsage({ input: 205, output: 99, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 }), "205 in / 99 out · $0.000 · 2 回合");
+	ok("R5 formatUsage：null→「—」；有值→紧凑 in/out + 三位小数 cost + 回合数");
 }
 
 // ── R6 统计小件 ────────────────────────────────────────────────────

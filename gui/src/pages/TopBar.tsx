@@ -8,8 +8,9 @@
  * [无后端支撑]=不渲染：更新徽标、终端/side-pane 钮、Git 摘要、trace。
  */
 
-import { Moon, PanelLeft, Settings, Sun } from "lucide-react";
+import { Moon, PanelLeft, PanelRight, Settings, Sun } from "lucide-react";
 import { useGui } from "../store";
+import { railPanelName } from "../rightRail/panels";
 import { pendingDecisionBadge } from "../interactionBadge";
 import { fmtPct100, fmtPressurePct, fmtRel, fmtTime, fmtTokens, pressurePct } from "../format";
 import { Badge } from "../ui/badge";
@@ -44,6 +45,10 @@ export function TopBar() {
 	const chatActiveId = useGui((s) => s.chatActiveId);
 	const sidebarCollapsed = useGui((s) => s.sidebarCollapsed);
 	const setSidebarCollapsed = useGui((s) => s.setSidebarCollapsed);
+	// 2026-10-26 P1B：右栏入口（**一个**图标钮；当前面板名只进 tooltip，不占宽度）。
+	const railOpen = useGui((s) => s.railOpen);
+	const setRailOpen = useGui((s) => s.setRailOpen);
+	const railPanel = useGui((s) => s.railPanel);
 	// 会话为主重构 S4 沿用：待决策/运行时入口 → 「运行时」全屏覆盖层（定位 section）
 	const setRuntimeOverlay = useGui((s) => s.setRuntimeOverlay);
 	const badge = pendingDecisionBadge(interactions);
@@ -203,6 +208,17 @@ export function TopBar() {
 						onClick={toggleTheme}
 					>
 						{theme === "warm-dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+					</Button>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon-lg"
+						aria-label="右侧面板"
+						aria-pressed={railOpen}
+						title={`右侧面板：${railPanelName(railPanel)}（${railOpen ? "已展开，点击收起" : "已收起，点击展开"}）`}
+						onClick={() => setRailOpen(!railOpen)}
+					>
+						<PanelRight className="size-4" />
 					</Button>
 					<Button
 						type="button"

@@ -32,6 +32,7 @@ import type {
 	WechatToggleBody,
 	WechatUnbindBody,
 } from "./types";
+import { sessionScopeParam } from "./runsScope";
 
 export type ConnState = "up" | "down";
 
@@ -146,13 +147,25 @@ export const api = {
 	 * 第四参数 = ETag cache key：服务端按「除 asof 之外的响应体」发 ETag，命中回 304 ⇒
 	 * 客户端拿上次 200 的**同一引用**（`runs` section 每 5s 轮询，稳态下零重渲染）。
 	 * 超时 8000ms：154 份 run json 全读+parse 实测 median 26ms，但冷盘/杀毒扫描下留余量。
+	 *
+	 * 2026-10-26 P1B：`sessionId` = 「本会话派发」scope（服务端在截断前过滤）。
+	 * **query 与 ETag cache key 必须用同一规范化串**（`runsScope.ts`：去重 + locale 无关排序），
+	 * 否则 `?sessionId=b,a` / `?sessionId=a,b` 会落到两个缓存槽（服务端 ETag 却是同一个）。
 	 */
-	runs: (opts?: { limit?: number; includeRecentCalls?: boolean }): Promise<FetchResult<RunsResponse>> => {
+	runs: (opts?: {
+		limit?: number;
+		includeRecentCalls?: boolean;
+		/** 会话 scope（单 id 或已规范化的逗号串）；空/非法 ⇒ 不带该参数（本机全量）。 */
+		sessionId?: string | null;
+	}): Promise<FetchResult<RunsResponse>> => {
 		const q = new URLSearchParams();
 		if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
 		if (opts?.includeRecentCalls === true) q.set("includeRecentCalls", "1");
+		// 规范化：允许调用方传「已拼好的逗号串」或单个 id（都按 token 重切一遍再排序）。
+		const scope = sessionScopeParam((opts?.sessionId ?? "").split(","));
+		if (scope !== null) q.set("sessionId", scope);
 		const qs = q.toString();
-		// ETag cache key **必须带 query**：同一路径下不同 limit/includeRecentCalls 的响应体不同，
+		// ETag cache key **必须带 query**：同一路径下不同 limit/includeRecentCalls/sessionId 的响应体不同，
 		// 共用 key 会把 A 查询的 ETag 拿去校验 B 查询，命中时会把 A 的缓存数据当成 B 的结果。
 		return fetchJson<RunsResponse>(`/v1/runs${qs ? `?${qs}` : ""}`, undefined, 8000, `/v1/runs${qs ? `?${qs}` : ""}`);
 	},

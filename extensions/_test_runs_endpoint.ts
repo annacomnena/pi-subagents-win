@@ -13,6 +13,15 @@
  *      W/ 前缀与列表形式也命中；内容变化 → 200 且 ETag 变
  *   T7 纯读：整轮调用前后夹具目录树（文件名 + 内容哈希）不变
  *   T8 never-throw：runsDir 不存在 / 含坏 json ⇒ 200 且坏文件被跳过
+ *   T11 归属三态纯函数（indexRunAttribution）：complete/partial/unavailable + 四类残差
+ *   T12 会话过滤（`?sessionId=`）：过滤在截断前、total=过滤后数、双身份（tab+owner）命中
+ *   T13 参数 fail-closed：6 类非法参数 ⇒ 400，**带 `If-None-Match: *` 仍 400**（不是 304）
+ *   T14 规范化：`b,a` 与 `a,b` 同 ETag；A 与 B 不同；304 空体
+ *   T15 卡片新字段：dispatchedBy（冲突⇒null）/ durationMs（末次尝试，缺失⇒null）
+ *   T16 links 不可读 / 解析异常率高 ⇒ `attribution:"unavailable"` 但缺省查询仍 200 全量
+ *
+ * 隔离纪律：links 账本用 `PI_LINKS_PATH` + 显式 `linksPath` 双双改道（绝不读真实
+ * `~/.pi/agent/links.jsonl`——否则断言会随本机历史漂移）。
  *
  * 夹具纪律（AGENTS §5）：字段形状照**真实 run json 实测字段集**（154 份实测：
  * id/agent/task/status/startedAt/result 100%，recentCalls 153/154，pid 仅 1/154），
@@ -30,15 +39,19 @@ import { join } from "node:path";
 const ROOT = mkdtempSync(join(tmpdir(), "runs-endpoint-"));
 process.env.PI_RUNTIME_DIR = join(ROOT, "runtime");
 process.env.PI_SUBAGENT_RUNS_DIR = join(ROOT, "subagent-runs-env");
+// 归属账本隔离（P1A）：同目录临时文件，零污染 ~/.pi/agent/links.jsonl。
+process.env.PI_LINKS_PATH = join(ROOT, "links.jsonl");
 mkdirSync(process.env.PI_RUNTIME_DIR, { recursive: true });
 
 // 动态 import（AGENTS「模块加载时读 env」纪律）：`subagent-kill.ts` 在**模块加载时**固定
 // `DEFAULT_RUNS_DIR = env.PI_SUBAGENT_RUNS_DIR ?? ~/.pi/agent/subagent-runs`，静态 import 会被
 // 提升到上面两行 env 赋值之前执行 ⇒ 夹具 env 失效并读到真实目录。必须 await import。
 const { createRuntimeHostServer } = (await import("./runtime-host/server.ts")) as typeof import("./runtime-host/server.ts");
-const { DEFAULT_RUNS_DIR, RUNS_LIMIT_MAX, classifyRunLiveness, isPidAlive, listAsyncRunCards } = await import("./subagent-kill.ts");
+const { DEFAULT_RUNS_DIR, RUNS_LIMIT_MAX, classifyRunLiveness, indexRunAttribution, isPidAlive, listAsyncRunCards } = await import("./subagent-kill.ts");
+const { parseRunsSessionScope } = (await import("./runtime-host/server.ts")) as typeof import("./runtime-host/server.ts");
 import type { RuntimeHostHandle } from "./runtime-host/server.ts";
-import type { RunCard } from "./subagent-kill.ts";
+import type { RunCard, RunAttributionDetail } from "./subagent-kill.ts";
+import type { LinkRecord } from "./links.ts";
 
 let n = 0;
 const ok = (name: string): void => {
@@ -56,7 +69,7 @@ const T0 = "2026-10-22T06:00:00.000Z";
 const iso = (min: number): string => new Date(Date.parse(T0) + min * 60_000).toISOString();
 
 /** 真实记录里出现过的完整字段集（照 §1 活体样本 + 终态样本）。 */
-function writeRun(id: string, over: Record<string, unknown>): void {
+function writeRun(id: string, over: Record<string, unknown>, dir: string = FIX): void {
 	const rec = {
 		id,
 		agent: "general",
@@ -76,7 +89,7 @@ function writeRun(id: string, over: Record<string, unknown>): void {
 		],
 		...over,
 	};
-	writeFileSync(join(FIX, `${id}.json`), JSON.stringify(rec), "utf8");
+	writeFileSync(join(dir, `${id}.json`), JSON.stringify(rec), "utf8");
 }
 
 // a) running + 活 pid（process.pid 恒活）
@@ -135,7 +148,11 @@ writeRun("run_dead", {
 		assert.ok(k in alive, `契约字段 ${k} 必须存在`);
 	}
 	for (const banned of ["idleMs", "ageMs", "idle"]) assert.ok(!(banned in alive), `不得包含 ${banned}（会让 ETag 永不命中）`);
-	ok("T1b 卡片字段面冻结且不含 idleMs/相对量");
+	// P1A 新增字段（version:1 后只增不改）：durationMs 恒存在（值可为 null）；
+	// dispatchedBy 只在有 link 时出现（本夹具未传 links ⇒ 不存在）。
+	assert.ok("durationMs" in completed, "durationMs 恒存在（值可为 null）");
+	assert.equal(!("dispatchedBy" in alive), true, "未传 links ⇒ dispatchedBy 不存在（与冲突的 null 区分）");
+	ok("T1b 卡片字段面冻结且不含 idleMs/相对量（+ durationMs/dispatchedBy 新增字段口径）");
 
 	assert.equal(alive.liveness, "alive", "running + 活 pid → alive");
 	assert.equal(alive.pid, process.pid);
@@ -218,6 +235,7 @@ const beforeHash = treeHash(FIX);
 			journalPath: join(ROOT, "journal.jsonl"),
 			sessionsDir: join(ROOT, "sessions"),
 			runsDir: FIX,
+			linksPath: join(ROOT, "links.jsonl"),
 			lockWaitMs: 1000,
 		});
 		const base = `http://127.0.0.1:${h.info.port}`;
@@ -293,7 +311,12 @@ const beforeHash = treeHash(FIX);
 
 // ── T8 never-throw ─────────────────────────────────────────────────
 {
-	assert.deepEqual(listAsyncRunCards(join(ROOT, "does-not-exist"), { limit: 5 }), { total: 0, runs: [] }, "目录缺失 → 空投影");
+	assert.deepEqual(listAsyncRunCards(join(ROOT, "does-not-exist"), { limit: 5 }), {
+		total: 0,
+		runs: [],
+		attribution: "unavailable",
+		attributionDetail: { resolved: 0, tabUnmapped: 0, missing: 0, conflict: 0 },
+	}, "目录缺失 → 空投影（未传 links ⇒ 归属 unavailable）");
 	writeFileSync(join(FIX, "bad.json"), "{not json", "utf8");
 	const { total } = listAsyncRunCards(FIX, { limit: 10 });
 	assert.equal(total, 4, "坏 json 被跳过（4 条有效记录）");
@@ -321,6 +344,337 @@ const beforeHash = treeHash(FIX);
 	}
 	assert.equal(classifyRunLiveness(DEAD_PID).liveness, "dead", "合法但不存在的 pid 仍是 dead（不能被上面收成 unknown）");
 	ok("T10 非法 pid（负/0/浮点/字符串/NaN/Infinity/null/undefined）一律 unknown，合法死 pid 仍 dead");
+}
+
+// ── T11 归属三态纯函数 ─────────────────────────────────────────────
+// 口径（§3.2）：分母 = 过滤前、去重后可读 run 数；三类残差互斥计数。
+const link = (o: { sessionId: string; targetId: string; ownerSessionId?: string; kind?: string; at?: string }): LinkRecord =>
+	({
+		sessionId: o.sessionId,
+		kind: (o.kind ?? "async") as LinkRecord["kind"],
+		targetId: o.targetId,
+		detail: "d",
+		at: o.at ?? iso(0),
+		pid: 1234,
+		...(o.ownerSessionId !== undefined ? { ownerSessionId: o.ownerSessionId } : {}),
+	});
+const ZERO: RunAttributionDetail = { resolved: 0, tabUnmapped: 0, missing: 0, conflict: 0 };
+const SX = "01a17608-0000-4000-8000-00000000000a";
+const SY = "01a17608-0000-4000-8000-00000000000b";
+const TAB1 = "tab_mvevitap_dlxf";
+{
+	// a) 全部 UUID 派发者 ⇒ complete
+	const a = indexRunAttribution(["r1", "r2"], [link({ sessionId: SX, targetId: "r1" }), link({ sessionId: SY, targetId: "r2" })]);
+	assert.equal(a.attribution, "complete", "全 UUID ⇒ complete");
+	assert.deepEqual(a.attributionDetail, { ...ZERO, resolved: 2 });
+	assert.equal(a.dispatchedBy.get("r1"), SX, "dispatchedBy = 直接派发者");
+	ok("T11a 全可解析 ⇒ complete / resolved=分母");
+
+	// b) tab 且在写时就记了 ownerSessionId ⇒ resolved（P1A 双身份的核心价值）
+	const b = indexRunAttribution(["r1"], [link({ sessionId: TAB1, targetId: "r1", ownerSessionId: SX })]);
+	assert.equal(b.attribution, "complete", "tab + ownerSessionId ⇒ 可映射 ⇒ complete");
+	assert.deepEqual(b.matchableIds.get("r1"), [TAB1, SX], "双身份两路都可命中（sessionId + ownerSessionId）");
+	assert.equal(b.dispatchedBy.get("r1"), TAB1, "dispatchedBy 是**直接**派发者（tab id），不是映射后的 pi 会话");
+	ok("T11b tab + ownerSessionId ⇒ resolved，且 dispatchedBy 仍报直接派发者");
+
+	// c) tab 且无 ownerSessionId（存量记录）⇒ tabUnmapped，不可映射
+	const c = indexRunAttribution(["r1"], [link({ sessionId: TAB1, targetId: "r1" })]);
+	assert.equal(c.attribution, "partial");
+	assert.deepEqual(c.attributionDetail, { ...ZERO, tabUnmapped: 1 });
+	assert.deepEqual(c.matchableIds.get("r1"), [TAB1], "只有 tab id 可与 scope 比对（UUID scope 命中不了——存量边界）");
+	ok("T11c tab 无 owner ⇒ tabUnmapped（存量旧记录不做事后回填）");
+
+	// d) 无 link ⇒ missing；非 async kind 不算归属证据
+	const d = indexRunAttribution(["r1", "r2"], [link({ sessionId: SX, targetId: "r1", kind: "tab" })]);
+	assert.equal(d.attribution, "partial");
+	assert.deepEqual(d.attributionDetail, { ...ZERO, missing: 2 });
+	assert.equal(d.dispatchedBy.has("r1"), false, "非 async link 不算归属（kind=tab 不得当成 async 派发者）");
+	ok("T11d 无 async link ⇒ missing（kind≠async 不作数）");
+
+	// e) 同一 targetId 多个不同派发者 ⇒ conflict，dispatchedBy=null（不取第一个）
+	const e = indexRunAttribution(["r1"], [link({ sessionId: SX, targetId: "r1" }), link({ sessionId: SY, targetId: "r1" })]);
+	assert.equal(e.attribution, "partial");
+	assert.deepEqual(e.attributionDetail, { ...ZERO, conflict: 1 });
+	assert.equal(e.dispatchedBy.get("r1"), null, "冲突 ⇒ dispatchedBy=null（**不取第一个**）");
+	assert.equal(e.matchableIds.has("r1"), false, "冲突时不给可命中身份（不猜）");
+	ok("T11e 多派发者 ⇒ conflict=1 且 dispatchedBy=null");
+
+	// f) 同派发者但多个 owner ⇒ 映射歧义 ⇒ 也计 conflict（保守）
+	const f = indexRunAttribution(["r1"], [
+		link({ sessionId: TAB1, targetId: "r1", ownerSessionId: SX }),
+		link({ sessionId: TAB1, targetId: "r1", ownerSessionId: SY }),
+	]);
+	assert.deepEqual(f.attributionDetail, { ...ZERO, conflict: 1 }, "同派发者多 owner ⇒ conflict（映射歧义不猜）");
+	assert.equal(f.dispatchedBy.get("r1"), null);
+	ok("T11f 同派发者多 owner ⇒ conflict（保守口径）");
+
+	// g) 账本不可用 ⇒ unavailable，且**不**把 run 当 missing（不是“没有派发”）
+	const g = indexRunAttribution(["r1", "r2"], null);
+	assert.equal(g.attribution, "unavailable");
+	assert.deepEqual(g.attributionDetail, ZERO, "unavailable 时残差计数全 0（不得混成 missing）");
+	assert.equal(g.dispatchedBy.size, 0);
+	ok("T11g links=null ⇒ unavailable（与 missing 严格区分）");
+}
+
+// ── T12 会话过滤（纯函数层：过滤在截断前、双身份命中、total=过滤后数）────────
+const FIX2 = join(ROOT, "runs-scoped");
+mkdirSync(FIX2, { recursive: true });
+const LINK2 = join(ROOT, "links-scoped.jsonl");
+const SESSIONS = {
+	a: "01a17608-1111-4000-8000-0000000000aa",
+	b: "01a17608-1111-4000-8000-0000000000bb",
+	c: "01a17608-1111-4000-8000-0000000000cc",
+};
+const TAB_A = "tab_scoped_aaaa";
+const TAB_OLD = "tab_scoped_old";
+// 9 条可读 run：a 三个（含 1 条 tab+owner）、b 两个、c 一个、conflict 一个、tab 存量一个、无 link 一个。
+for (const [id, min] of [
+	["r_a1", 1], ["r_a2", 2], ["r_a3", 3], ["r_b1", 4], ["r_b2", 5],
+	["r_c1", 6], ["r_conf", 7], ["r_tabold", 8], ["r_none", 9],
+] as [string, number][]) {
+	writeRun(id, { startedAt: iso(min), lastActivity: iso(min) }, FIX2);
+}
+writeFileSync(
+	LINK2,
+	[
+		link({ sessionId: SESSIONS.a, targetId: "r_a1" }),
+		link({ sessionId: TAB_A, targetId: "r_a2", ownerSessionId: SESSIONS.a }),
+		link({ sessionId: SESSIONS.a, targetId: "r_a3" }),
+		link({ sessionId: SESSIONS.b, targetId: "r_b1" }),
+		link({ sessionId: SESSIONS.b, targetId: "r_b2" }),
+		link({ sessionId: SESSIONS.c, targetId: "r_c1" }),
+		link({ sessionId: SESSIONS.b, targetId: "r_conf" }),
+		link({ sessionId: SESSIONS.c, targetId: "r_conf" }),
+		link({ sessionId: TAB_OLD, targetId: "r_tabold" }),
+	].map((l) => JSON.stringify(l)).join("\n") + "\n",
+	"utf8",
+);
+const { readLinksWithStats } = (await import("./links.ts")) as typeof import("./links.ts");
+const LINKS2 = readLinksWithStats(LINK2).links;
+assert.equal(LINKS2.length, 9, "夹具前提：9 条 link");
+{
+	// 本机全量（无 scope）⇒ 不依赖 links 的“全量”语义：9 条全在
+	const all = listAsyncRunCards(FIX2, { limit: 100, links: LINKS2 });
+	assert.equal(all.total, 9, "无 scope ⇒ 9 条（total=`可读总数`）");
+	assert.equal(all.attribution, "partial", "存在 tabUnmapped/conflict/missing ⇒ partial");
+	assert.deepEqual(all.attributionDetail, { resolved: 6, tabUnmapped: 1, missing: 1, conflict: 1 }, "四类计数（分母：过滤前、去重后）");
+	ok("T12a 无 scope ⇒ 全量 9 + attributionDetail 四类各命中一次");
+
+	const a = listAsyncRunCards(FIX2, { limit: 100, links: LINKS2, sessionScope: [SESSIONS.a] });
+	assert.deepEqual(a.runs.map((r) => r.id), ["r_a3", "r_a2", "r_a1"], "scope=A ⇒ 只回 A 的 3 条（含 tab+owner 那条）");
+	assert.equal(a.total, 3, "total = **过滤后**数，不是本机总数 9");
+	ok("T12b scope=A ⇒ 3 条（tab+ownerSessionId 精确命中；total=过滤后）");
+
+	const ab = listAsyncRunCards(FIX2, { limit: 100, links: LINKS2, sessionScope: [SESSIONS.a, SESSIONS.b] });
+	assert.equal(ab.total, 5, "scope=A,B ⇒ 5（多会话 union）");
+	const cOnly = listAsyncRunCards(FIX2, { limit: 100, links: LINKS2, sessionScope: [SESSIONS.c] });
+	assert.deepEqual(cOnly.runs.map((r) => r.id), ["r_c1"], "scope=C ⇒ 1 条（冲突的 r_conf 不归属任何一方）");
+	ok("T12c 多会话 union；冲突 run 不落入任何 scope");
+
+	// limit 必须在**过滤后**生效（否则小会话会被全局前 N 摊平到空）
+	const aLimited = listAsyncRunCards(FIX2, { limit: 2, links: LINKS2, sessionScope: [SESSIONS.a] });
+	assert.equal(aLimited.runs.length, 2, "limit=2 在过滤后生效 ⇒ 拿到 2 条");
+	assert.equal(aLimited.total, 3, "total 仍 = 过滤后数 3（不受 limit 影响）");
+	assert.deepEqual(aLimited.runs.map((r) => r.id), ["r_a3", "r_a2"], "先排序→过滤→截断（顺序可观测）");
+	ok("T12d limit 在过滤之后截断（total 保持过滤后全集）");
+
+	// 无 link ⇒ 任何 scope 都不命中（含“未知归属”不得被任意会话认为自己的）
+	const unknownHit = listAsyncRunCards(FIX2, { limit: 100, links: LINKS2, sessionScope: [SESSIONS.a, SESSIONS.b, SESSIONS.c] });
+	assert.equal(unknownHit.total, 6, "A+B+C ⇒ 6（r_none/r_tabold/r_conf 三个不落入任何会话）");
+	assert.equal(unknownHit.runs.some((r) => r.id === "r_none"), false, "无 link 的 run 不得被任意会话命中");
+	ok("T12e 未知归属的 run 不被任何 scope 命中");
+
+	// links 不可用 + 有 scope ⇒ 空集但 attribution 如实说 unavailable（不谎报“没有派发”）
+	const unavail = listAsyncRunCards(FIX2, { limit: 100, links: null, sessionScope: [SESSIONS.a] });
+	assert.equal(unavail.total, 0);
+	assert.equal(unavail.attribution, "unavailable", "过滤需 links ⇒ 不可用时只能如实报 unavailable");
+	ok("T12f links 不可用 + scope ⇒ 空集 + attribution=unavailable（不谎报空=没派发）");
+}
+
+// ── T13 参数 fail-closed（含 `If-None-Match: *` 仍 400）────────────────
+const PARAMS = (s: string): URLSearchParams => new URLSearchParams(s);
+{
+	// 通过：去重 + 确定性排序（locale 无关）
+	assert.deepEqual(parseRunsSessionScope(PARAMS("")), [], "缺省 ⇒ 空 scope = 本机全量");
+	assert.deepEqual(parseRunsSessionScope(PARAMS("sessionId=b,a")), ["a", "b"], "排序");
+	assert.deepEqual(parseRunsSessionScope(PARAMS("sessionId=b,a,b")), ["a", "b"], "去重");
+	assert.deepEqual(parseRunsSessionScope(PARAMS(`sessionId=${TAB_A}`)), [TAB_A], "tab id 允许（含下划线）");
+	assert.deepEqual(parseRunsSessionScope(PARAMS(`sessionId=${SESSIONS.a}`)), [SESSIONS.a], "UUID 允许（含连字符）");
+	ok("T13a 合法参数：去重 + 排序 + tab/UUID 字符集");
+
+	for (const [label, qs] of [
+		["空串", "sessionId="],
+		["空 token（A,,B）", "sessionId=a,,b"],
+		["首逗号", "sessionId=,a"],
+		["尾逗号", "sessionId=a,"],
+		["同名参数重复", "sessionId=a&sessionId=b"],
+		["6 个原始 token", "sessionId=a,b,c,d,e,f"],
+		["重复 token 也算原始 6 个", "sessionId=a,a,a,a,a,a"],
+		["非法字符（空格）", "sessionId=a%20b"],
+		["非法字符（斜杠）", "sessionId=a/b"],
+		["非法字符（星号）", "sessionId=*"],
+	] as [string, string][]) {
+		assert.throws(
+			() => parseRunsSessionScope(PARAMS(qs)),
+			/^Error: http 400$|http 400/,
+			`${label} ⇒ 400（fail-closed）`,
+		);
+	}
+	ok("T13b 十类非法参数全部 fail-closed（空串/空 token/重复参数/6 token/非法字符）");
+}
+
+// ── T14/T15/T16 HTTP：规范化 ETag / 卡片新字段 / 归属 unavailable ────────
+{
+	let h: RuntimeHostHandle | null = null;
+	try {
+		h = await createRuntimeHostServer({
+			hostPath: join(ROOT, "host2.json"),
+			stateDir: join(ROOT, "state2"),
+			mailboxDir: join(ROOT, "mailbox2"),
+			journalPath: join(ROOT, "journal2.jsonl"),
+			sessionsDir: join(ROOT, "sessions2"),
+			runsDir: FIX2,
+			linksPath: LINK2,
+			lockWaitMs: 1000,
+		});
+		const base = `http://127.0.0.1:${h.info.port}`;
+
+		// T13c 非法参数在**条件请求之前**被拒：带 `If-None-Match: *` 仍必须是 400
+		for (const qs of ["sessionId=", "sessionId=a,,b", "sessionId=a&sessionId=b", "sessionId=a,b,c,d,e,f", "sessionId=a%20b"]) {
+			const r = await fetch(`${base}/v1/runs?${qs}`, { headers: { "if-none-match": "*" } });
+			assert.equal(r.status, 400, `?${qs} + INM:* ⇒ 400（**不是** 304；实际 ${r.status}）`);
+			const body = (await r.json()) as { error?: string; hint?: string };
+			assert.equal(body.error, "bad-session-scope", "错误体 {error,hint} 风格");
+			assert.equal(typeof body.hint, "string", "带可操作 hint");
+		}
+		ok("T13c HTTP：5 类非法参数带 If-None-Match:* 仍 400（校验先于 ETag 判定）");
+
+		// T14a 规范化：b,a 与 a,b 命中同一 ETag
+		const q1 = `sessionId=${SESSIONS.b},${SESSIONS.a}`;
+		const q2 = `sessionId=${SESSIONS.a},${SESSIONS.b}`;
+		const q3 = `sessionId=${SESSIONS.a},${SESSIONS.a},${SESSIONS.b}`;
+		const rA = await fetch(`${base}/v1/runs?${q1}`);
+		assert.equal(rA.status, 200);
+		const eA = rA.headers.get("etag");
+		assert.ok(eA);
+		const rB = await fetch(`${base}/v1/runs?${q2}`);
+		assert.equal(rB.headers.get("etag"), eA, "?b,a 与 ?a,b ⇒ 同一 ETag（排序用 locale 无关 sort）");
+		const rC = await fetch(`${base}/v1/runs?${q3}`);
+		assert.equal(rC.headers.get("etag"), eA, "重复 token 去重后同 ETag");
+		ok("T14a 规范化：b,a / a,b / a,a,b ⇒ 同一 ETag");
+
+		// T14b 不同 scope ⇒ 不同 ETag（且 count 正确）
+		const rOnlyA = await fetch(`${base}/v1/runs?sessionId=${SESSIONS.a}`);
+		const bOnlyA = (await rOnlyA.json()) as { count: number; total: number; etagless?: never };
+		assert.notEqual(rOnlyA.headers.get("etag"), eA, "A 与 A+B 不同 ETag");
+		assert.equal(bOnlyA.total, 3, "?sessionId=A ⇒ total=3（过滤后）");
+		assert.equal(bOnlyA.count, 3);
+		const rAll = await fetch(`${base}/v1/runs`);
+		const bAll = (await rAll.json()) as { total: number; attribution: string; attributionDetail: RunAttributionDetail };
+		assert.equal(bAll.total, 9, "缺省（无 sessionId）⇒ 本机全量 9");
+		assert.notEqual(rAll.headers.get("etag"), rOnlyA.headers.get("etag"));
+		assert.equal(bAll.attribution, "partial");
+		assert.deepEqual(bAll.attributionDetail, { resolved: 6, tabUnmapped: 1, missing: 1, conflict: 1 });
+		ok("T14b A 与 A+B 不同 ETag；缺省仍本机全量且带 attribution");
+
+		// T14c 304 复请求 ⇒ 0 字节
+		const r304 = await fetch(`${base}/v1/runs?${q2}`, { headers: { "if-none-match": eA! } });
+		assert.equal(r304.status, 304, "规范等价 URL + INM ⇒ 304");
+		assert.equal((await r304.text()).length, 0, "304 body 0 字节");
+		ok("T14c 304 复请求 body 0 字节");
+
+		// T15 dispatchedBy / durationMs
+		// 先给 r_b1 写真 durationMs（终态）与 r_b2 写“非法” durationMs（字符串）
+		writeRun("r_b1", { startedAt: iso(4), lastActivity: iso(4), result: { status: "completed", text: "d", usageEvents: [], durationMs: 123456, priorFailures: [{ attempt: 1 }] } }, FIX2);
+		writeRun("r_b2", { startedAt: iso(5), lastActivity: iso(5), result: { status: "completed", text: "d", usageEvents: [], durationMs: "1234" } }, FIX2);
+		const rb = (await (await fetch(`${base}/v1/runs?sessionId=${SESSIONS.b}`)).json()) as { runs: RunCard[] };
+		const cardB1 = rb.runs.find((r) => r.id === "r_b1")!;
+		const cardB2 = rb.runs.find((r) => r.id === "r_b2")!;
+		assert.equal(cardB1.durationMs, 123456, "durationMs 透传 record.result.durationMs（末次尝试）");
+		assert.equal(cardB1.dispatchedBy, SESSIONS.b, "dispatchedBy = 直接派发者");
+		assert.equal(cardB2.durationMs, null, "非数值 durationMs ⇒ null（不臆造）");
+		const cardNone = ((await (await fetch(`${base}/v1/runs?includeRecentCalls=1`)).json()) as { runs: RunCard[] }).runs.find((r) => r.id === "r_none")!;
+		assert.equal(cardNone.durationMs, null, "无 result.durationMs ⇒ null");
+		assert.equal("dispatchedBy" in cardNone, false, "无 link ⇒ dispatchedBy 键不出现（≠ 冲突 null）");
+		const cardConf = ((await (await fetch(`${base}/v1/runs`)).json()) as { runs: RunCard[] }).runs.find((r) => r.id === "r_conf")!;
+		assert.equal(cardConf.dispatchedBy, null, "冲突 ⇒ dispatchedBy=null（不取第一个）");
+		assert.equal(cardConf.durationMs, null, "无 result.durationMs ⇒ null（冲突不影响其它字段）");
+		ok("T15 dispatchedBy 冲突 null / 无 link 键不出现 / durationMs 透传与缺失");
+	} finally {
+		if (h !== null) await h.close();
+	}
+}
+
+// ── T16 links 不可读 / 解析异常率高 ⇒ unavailable，但全量查询仍 200 ────────
+{
+	const BAD_DIR = join(ROOT, "links-as-dir");
+	mkdirSync(BAD_DIR, { recursive: true }); // readFileSync 目录 ⇒ EISDIR ⇒ 读失败
+	const RATIO = join(ROOT, "links-ratio.jsonl");
+	// 3 行里 1 行坏 = 33% > 10% 阈值 ⇒ unavailable
+	writeFileSync(RATIO, [JSON.stringify(link({ sessionId: SESSIONS.a, targetId: "r_a1" })), "{not json", JSON.stringify(link({ sessionId: SESSIONS.a, targetId: "r_a2" }))].join("\n") + "\n", "utf8");
+	const OK_RATIO = join(ROOT, "links-ratio-ok.jsonl");
+	const okLines = Array.from({ length: 20 }, (_, i) => JSON.stringify(link({ sessionId: SESSIONS.a, targetId: `r_${i}` })));
+	okLines[0] = "{not json"; // 1/20 = 5% ≤ 10% ⇒ 仍可用（坏行跳过）
+	writeFileSync(OK_RATIO, okLines.join("\n") + "\n", "utf8");
+
+	let h: RuntimeHostHandle | null = null;
+	try {
+		h = await createRuntimeHostServer({
+			hostPath: join(ROOT, "host3.json"),
+			stateDir: join(ROOT, "state3"),
+			mailboxDir: join(ROOT, "mailbox3"),
+			journalPath: join(ROOT, "journal3.jsonl"),
+			sessionsDir: join(ROOT, "sessions3"),
+			runsDir: FIX2,
+			linksPath: BAD_DIR,
+			lockWaitMs: 1000,
+		});
+		const base = `http://127.0.0.1:${h.info.port}`;
+		const r = await fetch(`${base}/v1/runs`);
+		assert.equal(r.status, 200, "links 不可读**不得**让端点失败");
+		const b = (await r.json()) as { total: number; attribution: string; attributionDetail: RunAttributionDetail; runs: RunCard[] };
+		assert.equal(b.attribution, "unavailable", "links 不可读 ⇒ attribution=unavailable");
+		assert.deepEqual(b.attributionDetail, ZERO, "unavailable 时残差全 0（不混成 missing）");
+		assert.equal(b.total, 9, "缺省（全量）查询仍返回 9 条——读失败不能把全量入口打空");
+		assert.equal(b.runs.every((x) => !("dispatchedBy" in x)), true, "归属不可用 ⇒ 卡片不带 dispatchedBy");
+		ok("T16a links 读失败 ⇒ 200 + unavailable + 全量 9 条仍在");
+	} finally {
+		if (h !== null) await h.close();
+	}
+
+	try {
+		h = await createRuntimeHostServer({
+			hostPath: join(ROOT, "host4.json"),
+			stateDir: join(ROOT, "state4"),
+			mailboxDir: join(ROOT, "mailbox4"),
+			journalPath: join(ROOT, "journal4.jsonl"),
+			sessionsDir: join(ROOT, "sessions4"),
+			runsDir: FIX2,
+			linksPath: RATIO,
+			lockWaitMs: 1000,
+		});
+		const base = `http://127.0.0.1:${h.info.port}`;
+		const b = (await (await fetch(`${base}/v1/runs`)).json()) as { attribution: string; total: number };
+		assert.equal(b.attribution, "unavailable", "坏行占比 33% > 10% ⇒ unavailable（不是“跳过坏行照常可信”）");
+		assert.equal(b.total, 9, "仍然 200 全量");
+		await h.close();
+		h = await createRuntimeHostServer({
+			hostPath: join(ROOT, "host5.json"),
+			stateDir: join(ROOT, "state5"),
+			mailboxDir: join(ROOT, "mailbox5"),
+			journalPath: join(ROOT, "journal5.jsonl"),
+			sessionsDir: join(ROOT, "sessions5"),
+			runsDir: FIX2,
+			linksPath: OK_RATIO,
+			lockWaitMs: 1000,
+		});
+		const base2 = `http://127.0.0.1:${h.info.port}`;
+		const b2 = (await (await fetch(`${base2}/v1/runs`)).json()) as { attribution: string };
+		assert.equal(b2.attribution, "partial", "坏行占比 5% ≤ 10% ⇒ 账本仍可用（坏行跳过，残差如实计 missing）");
+		ok("T16b 解析异常率阈值：33%>10% ⇒ unavailable；5% ⇒ 仍可用");
+	} finally {
+		if (h !== null) await h.close();
+	}
 }
 
 // ── 环境口径：DEFAULT_RUNS_DIR 读 env（未被本测试污染真实目录）──────

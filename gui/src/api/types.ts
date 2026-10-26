@@ -841,10 +841,45 @@ export interface RunCard {
 	lastActivity: string | null;
 	/** `result.usage`；缺失（运行中常态）⇒ null。**不要从别处推断**。 */
 	usage: RunUsage | null;
+	/**
+	 * 末次尝试耗时（ms，2026-10-26 P1A additive；服务端 `run.result.durationMs`）。
+	 *
+	 * ⚠️ **不是整趟墙钟**：`runSingle()` 每次尝试各自起钟，fallback/重试时 `runWithFallback` 会多次
+	 * 调用而用量聚合只聚合 usage ⇒ 有 `priorFailures` 的 run 这里只是**最后一次尝试**的耗时。
+	 * UI 必须照「末次尝试耗时」措辞展示；缺失（运行中/旧记录）⇒ null，**不反推 startedAt↔endedAt**。
+	 */
+	durationMs?: number | null;
+	/**
+	 * 直接派发者（`links.jsonl` kind=async 的 `sessionId`：pi 会话 UUID 或 `tab_<runId>`）。
+	 * 冲突（同一 targetId 多个不同派发者）⇒ **null**；无 link（missing）⇒ **本键不出现**。
+	 */
+	dispatchedBy?: string | null;
 	/** 仅 `includeRecentCalls=1` 出现；最近 3 条，newest-first。 */
 	recentCalls?: RunCall[];
 	/** 仅 `includeRecentCalls=1` 出现；只对 status=running 给 verdict，终态恒 "unknown"。 */
 	loopVerdict?: RunLoopVerdict;
+}
+
+/**
+ * 归属可判定性（`GET /v1/runs` 的 `attribution`，2026-10-26 P1A）。
+ *
+ * - `complete`：每条可读 run 都能解析出**唯一**直接派发者且可与 scope 直接比较；
+ * - `partial`：存在 `tabUnmapped` / `missing` / `conflict`（详见 `attributionDetail`）；
+ * - `unavailable`：`links.jsonl` 不可读/解析异常率异常 ⇒ **归属元数据不可用**，
+ *   不是「没有派发」（两者绝不能混为一谈）。
+ */
+export type RunAttribution = "complete" | "partial" | "unavailable";
+
+/** 归属残差计数（分母 = **过滤前、去重后**的可读 run 总数；计数在 limit 截断前）。 */
+export interface RunAttributionDetail {
+	/** 唯一派发者且可直接与 scope 比较。 */
+	resolved: number;
+	/** 派发者是 `tab_*` 且无 `ownerSessionId` ⇒ 无法映射到 pi 会话（存量记录的形态）。 */
+	tabUnmapped: number;
+	/** 无 kind=async link。 */
+	missing: number;
+	/** 同一 targetId 有多个不同派发者（或同一派发者多个 owner）⇒ 不猜。 */
+	conflict: number;
 }
 
 /** GET /v1/runs 响应（`version:1` 后只增不改；ETag 排除 asof）。 */
@@ -854,7 +889,11 @@ export interface RunsResponse {
 	asof: string;
 	/** 本次返回条数（= runs.length，已按 limit 截断）。 */
 	count: number;
-	/** 截断前总记录数（「显示 N / 共 M」用）。 */
+	/** 截断前总数：**有 `?sessionId=` 时 = 该 scope 的匹配数**，缺省 = 本机可读总数。 */
 	total: number;
+	/** 归属三态（2026-10-26 P1A additive）。 */
+	attribution: RunAttribution;
+	/** 归属残差计数（`attribution==="partial"` 时看它）。 */
+	attributionDetail: RunAttributionDetail;
 	runs: RunCard[];
 }

@@ -31,6 +31,7 @@ import type {
 } from "./api/types";
 import type { StreamServerFrame, StreamState } from "./useEventStream";
 import { toast } from "./ui/toast";
+import { PANEL_DISPATCHED, railOpenDefault } from "./rightRail/railState";
 
 /** 主视图 Tab（会话为主重构 S4 收窄）：chat=永久默认主视图；timeline=次级全页（排障刚需）。
  *  原 master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（runtimeOverlay）。 */
@@ -137,6 +138,17 @@ interface GuiState {
 	/** 左栏折叠（ZCode 1:1 第 3 步）：折叠 = 宽度动画到 0 + opacity-0 + pointer-events-none。 */
 	sidebarCollapsed: boolean;
 	setSidebarCollapsed: (v: boolean) => void;
+	/**
+	 * 右侧面板展开态（2026-10-26 P1B；设计稿 §3.1/§3.4）。
+	 *
+	 * **内存态**：不写 config.json、不持久化、无 WebStorage —— 与 `theme.ts` 同口径。
+	 * 初值在**挂载时**求值 `matchMedia("(min-width: 1280px)")`（`≥1280px` 默认展开）。
+	 */
+	railOpen: boolean;
+	setRailOpen: (v: boolean) => void;
+	/** 右栏当前面板 id（`rightRail/panels.ts::RAIL_PANELS` 的 `id`；未知 id 由壳回落第一个）。 */
+	railPanel: string;
+	setRailPanel: (id: string) => void;
 	runtimeOverlay: RuntimeOverlaySection | null;
 	setRuntimeOverlay: (s: RuntimeOverlaySection | null) => void;
 
@@ -334,11 +346,28 @@ function pushNotifyToast(rec: NotifyRecordBody): void {
 	});
 }
 
+/**
+ * 右栏默认展开态（2026-10-26 P1B；设计稿 §3.1：`≥1280px` 默认展开，`<1280px` 默认收起但入口可开抽屉）。
+ *
+ * 在**模块求值时**求值一次（= 「按挂载时求值」；本仓 gui 是浏览器 SPA，无 SSR）。
+ * 判据本体在 `rightRail/railState.ts::railOpenDefault`（纯函数、带 fallback：
+ * 无 `matchMedia`（node 测试 / 非浏览器）⇒ 收起，绝不拆）。
+ */
+function initialRailOpen(): boolean {
+	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+	return railOpenDefault((q) => window.matchMedia(q).matches);
+}
+
 export const useGui = create<GuiState>((set, get) => ({
 	activeTab: "chat",
 	setActiveTab: (t) => set({ activeTab: t }),
 	sidebarCollapsed: false,
 	setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
+	// 右栏（P1B）：展开态按挂载时视口求值；面板 id 用常量而不是字符串字面量（避免两处漂移）。
+	railOpen: initialRailOpen(),
+	setRailOpen: (v) => set({ railOpen: v }),
+	railPanel: PANEL_DISPATCHED,
+	setRailPanel: (id) => set({ railPanel: id }),
 	runtimeOverlay: null,
 	setRuntimeOverlay: (s) => set({ runtimeOverlay: s }),
 
