@@ -174,7 +174,8 @@
 		"test:model-failure-classify": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_failure_classify.ts",
 		"test:model-retry": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_retry.ts",
 		"test:gui-composer": "npm run test:gui-composer --prefix gui",
-		"test:steer-idle-wake": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_steer_idle_wake.ts"
+		"test:steer-idle-wake": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_steer_idle_wake.ts",
+		"test:audit-rotation": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_audit_rotation.ts"
 	},
 	"dependencies": {
 		"usearch": "2.26.0"

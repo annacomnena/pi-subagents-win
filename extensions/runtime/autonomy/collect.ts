@@ -18,7 +18,7 @@
  *   本层不产生任何 wake/注入：Wake Gate 判定由调用层用 evaluateWakeGate（纯）消费返回的 diff。
  */
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "../journal.ts";
 import { collectGlobalView, defaultAgentDir } from "../global-view.ts";
@@ -44,11 +44,48 @@ export function autonomyDir(stateDir?: string): string {
 	return join(stateDir ?? join(defaultRuntimeDir(), "state"), "autonomy");
 }
 
+/**
+ * audit.jsonl 轮转阈值（字节）。超过则重命名为 `audit-<utcstamp>.jsonl`，**不删历史**。
+ *
+ * 为什么要轮转：该文件只追加、无上限。实测曾增至 30 MB / 28 万行，导致
+ * ①`/autonomy status` 读尾部时把整个文件读进内存（见 `readAuditTail` 的修复）；
+ * ②任何按行扫描的工具变慢。轮转把单文件控制在可控量级，且保留全部历史。
+ */
+const AUDIT_ROTATE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 若 `audit.jsonl` 超过阈值则轮转为带 UTC 时间戳的归档文件。
+ * never-throw：轮转失败不影响写入（宁可继续追加也不丢审计）。
+ *
+ * 归档命名 `audit-<YYYYMMDDTHHMMSSZ>.jsonl`；同名已存在时追加 pid 后缀避免覆盖。
+ */
+export function rotateAuditIfNeeded(opts?: { stateDir?: string; maxBytes?: number }): string | null {
+	try {
+		const dir = autonomyDir(opts?.stateDir);
+		const active = join(dir, "audit.jsonl");
+		if (!existsSync(active)) return null;
+		const size = statSync(active).size;
+		const limit = opts?.maxBytes ?? AUDIT_ROTATE_BYTES;
+		if (size <= limit) return null;
+
+		const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+		let target = join(dir, `audit-${stamp}.jsonl`);
+		if (existsSync(target)) target = join(dir, `audit-${stamp}-${process.pid}.jsonl`);
+		renameSync(active, target);
+		return target;
+	} catch {
+		/* never-throw：轮转失败就继续追加 */
+		return null;
+	}
+}
+
 /** best-effort 审计行（never-throw）：`state/autonomy/audit.jsonl`（纯函数只返回行，写盘在此——wake.ts 审计分离先例）。 */
 export function appendAuditLine(line: string, opts?: { stateDir?: string }): void {
 	try {
 		const dir = autonomyDir(opts?.stateDir);
 		mkdirSync(dir, { recursive: true });
+		// 追加前检查是否需要轮转（轮转后再追加，新文件从这一行开始）
+		rotateAuditIfNeeded(opts);
 		appendFileSync(join(dir, "audit.jsonl"), `${line}\n`, "utf8");
 	} catch {
 		/* never-throw：审计不阻塞主流程 */
@@ -287,13 +324,68 @@ export function appendAuditEvent(cat: "gating" | "wake" | "kill", concl: AuditCo
 	}
 }
 
-/** 容忍读 audit.jsonl 尾部 ≤limit 行（默认 5，/autonomy status 用）；缺失/不可读 → []。 */
+/**
+ * 从文件**末尾反向**读最多 `maxBytes` 字节，返回按行切开的尾部片段。
+ *
+ * 为什么不用 readFileSync+split：旧实现为了取尾部 5 行会把**整个** audit.jsonl
+ * 读进内存并 split 成数组（实测 30 MB / 28 万行），耗时与内存都随文件增长而恶化——
+ * 这是 `/autonomy status` 越来越慢的直接原因之一。
+ *
+ * 做法：fstat 取大小 → 定位起点 → 只读尾部窗口 → 丢弃第一行（可能被截断）。
+ * 文件小于窗口时从头读，行为与旧实现等价。
+ */
+function readTailWindow(path: string, maxBytes: number): string[] {
+	const fd = openSync(path, "r");
+	try {
+		const size = fstatSync(fd).size;
+		if (size === 0) return [];
+		const window = Math.min(size, Math.max(1, maxBytes));
+		const start = size - window;
+		const buf = Buffer.allocUnsafe(window);
+		let read = 0;
+		while (read < window) {
+			const n = readSync(fd, buf, read, window - read, start + read);
+			if (n <= 0) break;
+			read += n;
+		}
+		const text = buf.subarray(0, read).toString("utf8");
+		const lines = text.split("\n");
+		// 从中间切开时首行可能是半截——丢弃它（除非确实从文件头开始读）
+		if (start > 0 && lines.length > 0) lines.shift();
+		return lines;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
+ * 容忍读 audit.jsonl 尾部 ≤limit 行（默认 5，`/autonomy status` 用）；缺失/不可读 → `[]`。
+ *
+ * 实现要点（性能修复）：只读尾部**固定字节窗口**，不读全文件；若尾部窗口内行数不足
+ * `limit`，逐步扩大窗口（最多重试 3 次，直到覆盖整个文件）。这样常态下 O(窗口) 而非 O(文件)。
+ */
 export function readAuditTail(opts?: { stateDir?: string; limit?: number }): string[] {
 	const limit = Math.max(1, opts?.limit ?? 5);
 	try {
-		const lines = readFileSync(join(autonomyDir(opts?.stateDir), "audit.jsonl"), "utf8").split("\n");
-		while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-		return lines.slice(-limit);
+		const path = join(autonomyDir(opts?.stateDir), "audit.jsonl");
+		// 初始窗口 64 KB：足够容纳数千行，也远小于任何历史实测文件大小。
+		let windowBytes = 64 * 1024;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const lines = readTailWindow(path, windowBytes);
+			while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+			if (lines.length >= limit) return lines.slice(-limit);
+			// 行数不够：可能窗口太小（超长行/文件小），扩大重试；
+			// 窗口已覆盖整个文件仍不够 ⇒ 就是只有这么多行，直接返回。
+			let fileSize = 0;
+			try {
+				fileSize = statSync(path).size;
+			} catch {
+				return [];
+			}
+			if (windowBytes >= fileSize) return lines.slice(-limit);
+			windowBytes *= 8;
+		}
+		return [];
 	} catch {
 		return [];
 	}

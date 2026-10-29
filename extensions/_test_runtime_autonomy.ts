@@ -871,6 +871,13 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// 不再触发 needs_user → 需要 import runtime/autonomy 字面量 → 排除
 				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
 				if (p === join(EXT_ROOT, "_test_resident_lms_needsuser.ts")) continue;
+				// 2026-10-29 audit 轮转 + 尾部反向读修复：新测试直接验证
+				// `appendAuditLine` / `rotateAuditIfNeeded` / `readAuditTail`（runtime/autonomy/collect.ts）
+				// → 需要 import runtime/autonomy 字面量 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
+				if (p === join(EXT_ROOT, "_test_audit_rotation.ts")) continue;
+				// 同上：性能探针（稳态基准取证），只读调用 readAuditTail → 排除
+				if (p === join(EXT_ROOT, "_probe_perf.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
