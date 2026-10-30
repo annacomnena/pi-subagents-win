@@ -446,11 +446,11 @@ await (async () => {
 		};
 		assertNoBareMembers(json, "");
 	}
-	// master-dispatch mode 具体化：4 个 Literal 成员
+	// master-dispatch mode 具体化：5 个 Literal 成员（2026-10-30 新增 solo 零派发模式）
 	const md = tools.find((t) => t.name === "master-dispatch")!;
 	const mdJson = JSON.parse(JSON.stringify(md.parameters)) as { properties: { mode: { anyOf: Array<Record<string, unknown>> } } };
-	assert.equal(mdJson.properties.mode.anyOf.length, 4);
-	assert.deepEqual(mdJson.properties.mode.anyOf.map((m) => m.const).sort(), ["adaptive", "execute", "research", "workflow"]);
+	assert.equal(mdJson.properties.mode.anyOf.length, 5);
+	assert.deepEqual(mdJson.properties.mode.anyOf.map((m) => m.const).sort(), ["adaptive", "execute", "research", "solo", "workflow"]);
 	ok("D1 全部 master 工具 parameters schema 合法（递归 TypeBox + provider 序列化无裸标量 Union 成员）");
 }
 

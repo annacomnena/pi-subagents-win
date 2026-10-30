@@ -451,7 +451,7 @@ export interface MasterDispatchTabArgs {
 	taskId: string;
 	title?: string;
 	cwd?: string;
-	mode: "workflow" | "research" | "execute" | "adaptive";
+	mode: "workflow" | "research" | "execute" | "adaptive" | "solo";
 	prompt: string;
 	model?: string;
 	timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }>;
@@ -840,7 +840,8 @@ export function registerMasterTools(
 				Type.Literal("research"),
 				Type.Literal("execute"),
 				Type.Literal("adaptive"),
-			], { description: "缺省 workflow" })),
+				Type.Literal("solo"),
+			], { description: "缺省 workflow；solo = 零派发（全部工作自己做，严禁派任何 subagent；配额受限时用）" })),
 			model: Type.Optional(Type.String({ description: "覆盖模型（provider/id 或短名）" })),
 			timers: Type.Optional(Type.Array(Type.Object({
 				delayMs: Type.Number({}),
@@ -902,8 +903,8 @@ export function registerMasterTools(
 				}
 				cwdArg = verdict.cwd;
 			}
-			const mode: "workflow" | "research" | "execute" | "adaptive" =
-				params.mode === "research" ? "research" : params.mode === "execute" ? "execute" : params.mode === "adaptive" ? "adaptive" : "workflow";
+			const mode: "workflow" | "research" | "execute" | "adaptive" | "solo" =
+				params.mode === "research" ? "research" : params.mode === "execute" ? "execute" : params.mode === "adaptive" ? "adaptive" : params.mode === "solo" ? "solo" : "workflow";
 			const res = opts.dispatchTab({
 				taskId: (params.taskId ?? "").trim(),
 				prompt: (params.prompt ?? "").trim(),
