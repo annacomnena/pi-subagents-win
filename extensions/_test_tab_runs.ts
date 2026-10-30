@@ -28,6 +28,7 @@ import {
 	type TabDispatchRecord,
 	type TabState,
 } from "./tab-runs.ts";
+import { LAUNCH_MODES } from "./launch.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(__dirname, "fixtures");
@@ -405,6 +406,44 @@ const WORKFLOW = "workflow" as const;
 
 	rmSync(runsDir2, { recursive: true, force: true });
 	console.log("ok - 归档回退：waiting 不归档 / 终态可归档 / archived-alive 可投递 / archived-dead 不复活 / 错误可诊断");
+}
+
+
+// ── mode 枚举与 LaunchMode 单一事实源一致性（2026-10-30 事故回归）──────────────
+// 事故：新增 solo 模式时只改了 launch.ts，validateTabDispatchRecord 里的硬编码
+// 数组 ["workflow","research","execute","adaptive","trace"] 不认 solo ⇒
+// readTabDispatch 返回 null ⇒ tab-finish 拿不到 taskId 报「taskId required」，
+// 监管/steer/tab-status 全部失去账本。这是双写漂移，不是单点笔误。
+{
+	const base = {
+		id: "tab_test_mode",
+		version: 1,
+		taskId: "M4",
+		mode: "solo",
+		title: "t",
+		cwd: "C:/x",
+		dispatchedAt: new Date().toISOString(),
+		dispatchStatus: "dispatched",
+	};
+	// 1. 每种 LaunchMode 都必须通过（含 solo）——直接遍历单一事实源，未来新增模式自动覆盖
+	for (const m of LAUNCH_MODES) {
+		const r = validateTabDispatchRecord({ ...base, mode: m });
+		assert.equal(r.ok, true, `mode="${m}"（LaunchMode 成员）必须被账本校验接受；errors=${r.errors.join(",")}`);
+	}
+	// 2. trace（TabMode 独有，不进 launch.ts 前缀体系）必须继续接受
+	assert.equal(validateTabDispatchRecord({ ...base, mode: "trace" }).ok, true, "trace 模式必须继续被接受");
+	// 3. 负控：非法 mode 必须被拒（防止把校验写成永真）
+	const bad = validateTabDispatchRecord({ ...base, mode: "not-a-mode" });
+	assert.equal(bad.ok, false, "非法 mode 必须被拒");
+	assert.ok(
+		bad.errors.some((e) => e.startsWith("mode must be")),
+		`拒绝理由必须具名 mode must be…，实际：${bad.errors.join(",")}`,
+	);
+	// 4. 单一事实源断言：错误信息里列出的枚举必须与 LAUNCH_MODES 完全一致
+	//    （防止再有人改成硬编码数组却不加新成员）
+	const listed = bad.errors.find((e) => e.startsWith("mode must be"))!.replace("mode must be ", "").replace("|trace", "").split("|");
+	assert.deepEqual(listed.sort(), [...LAUNCH_MODES].sort(), "拒绝理由列出的枚举必须等于 LAUNCH_MODES");
+	console.log("ok - mode 枚举与 LaunchMode 单一事实源一致（5 模式 + trace 全通过 / 非法被拒 / 错误信息同步）");
 }
 
 console.log("tab-runs tests passed");

@@ -19,7 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { modePrefix, type LaunchMode } from "./launch.ts";
+import { LAUNCH_MODES, modePrefix, type LaunchMode } from "./launch.ts";
 
 // ── 类型 ───────────────────────────────────────────────────────────
 
@@ -591,8 +591,14 @@ export function validateTabDispatchRecord(raw: unknown): { ok: boolean; errors: 
 		errors.push("dispatchStatus must be dispatched|launch_failed");
 	}
 	const mode = str(record.mode);
-	if (mode && !["workflow", "research", "execute", "adaptive", "trace"].includes(mode)) {
-		errors.push("mode must be workflow|research|execute|adaptive|trace");
+	// 允许集必须**从 LaunchMode 单一事实源派生**（2026-10-30 教训）：
+	// 旧实现硬编码 ["workflow","research","execute","adaptive","trace"]，
+	// 新增 solo 模式后校验器不认 ⇒ readTabDispatch 返回 null ⇒
+	// tab-finish 拿不到 taskId 报「taskId required」、监管/steer 全部失去账本。
+	// 硬编码数组与 LaunchMode 枚举的双写就是这次事故的根因。
+	const ALLOWED_TAB_MODES: readonly string[] = [...LAUNCH_MODES, "trace"];
+	if (mode && !ALLOWED_TAB_MODES.includes(mode)) {
+		errors.push(`mode must be ${LAUNCH_MODES.join("|")}|trace`);
 	}
 	if (errors.length > 0) return { ok: false, errors };
 	const value: TabDispatchRecord = {
