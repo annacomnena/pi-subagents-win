@@ -209,11 +209,26 @@ export function registerTabTelemetry(
 	const ownPid = process.pid;
 	/** 最近一次心跳时刻；由 heartbeat timer 刷新，writeState 带上（不参与任何业务判据）。 */
 	let lastHeartbeatAt: string | undefined;
+	/**
+	 * 本 tab 自己的会话文件路径（`session_start` 写一次，后续每次写 state 必须继传）。
+	 *
+	 * 2026-10-30 事故：之前只在 `session_start` 那次传了 `sessionPath`，
+	 * 而 `writeState` 用**新对象**写盘 ⇒ 后续 `agent_start` / 心跳一刷就把
+	 * `sessionPath` 抹掉了（实测所有 tab state 的 `sessionPath` 全是 ABSENT）。
+	 *
+	 * 后果：daemon 无法从 sessionId 反查到 tab 的 pid，导致
+	 * 「活着的 tab 判死」或「死掉的会话拉不起来」。这里落成模块变量、
+	 * 每次写盘继传，兼得两者。
+	 */
+	let ownSessionPath: string | undefined;
 
 	const writeState = (phase: TabState["phase"], turn: TabState["turn"], extra: Partial<TabState> = {}): void => {
 		if (finished) return; // 已终态不再覆盖
 		const runId = resolveRunId();
 		if (!runId) return; // 非标签页进程：身份未就绪/无身份，跳过
+		if (typeof extra.sessionPath === "string" && extra.sessionPath) {
+			ownSessionPath = extra.sessionPath; // 首次（或变更）时记住
+		}
 		writeTabState(runsDir, runId, {
 			id: runId,
 			pid: ownPid,
@@ -225,6 +240,8 @@ export function registerTabTelemetry(
 			lastAssistantText: lastAssistantText || undefined,
 			lastStopReason,
 			usage: { ...usageAccum },
+			// 继传：不传则被新对象抹掉（实测事故）
+			...(ownSessionPath ? { sessionPath: ownSessionPath } : {}),
 			...extra,
 		});
 	};

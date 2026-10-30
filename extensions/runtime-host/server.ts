@@ -431,9 +431,10 @@ let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["max
  * 实测：活着的 tab `pid 90508` 正是此形态 ⇒ 永远判 no-live-process ⇒ dead
  * ⇒ 每发一条消息拉起一个 tab。
  *
- * 正确判据：`tab-runs/<runId>.state.json` 里写了该 tab 自己进程的 `pid`
- * （`tab-runs-runtime.ts:250`）。按 cwd 桶 + taskId 把会话对到 tab 记录，
- * 再 `isProcessAlive(pid)` —— 不受启动形态影响。
+ * 正确判据：`tab-runs/<runId>.state.json` 里的 `sessionPath`（tab 自己的会话文件）
+ * + `pid`。`sessionPath` 是**直接映射**，不靠任何内容匹配（bootstrap prompt 前缀
+ * 已被证明不可靠：`lms-<scope>` 类 tab 的 prompt 是「你是 agent://…」开头，
+ * 而 `probeSessionsForDispatch` 依赖「根据<mode>进行工作<taskId>」前缀 ⇒ 返回 0 条）。
  *
  * 非 tab 会话（`pi --session <file>` 直接起的，如主会话）回落到命令行**精确匹配**
  * `--session <该会话文件>`；匹配不到只判 unknown（**不是 dead**，因为 @prompt
@@ -447,34 +448,75 @@ function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLi
 	let runId: string | undefined;
 	let pid: number | undefined;
 
-	// ① 主路径：找该会话对应的 tab 记录（按 cwd 桶 + taskId 前缀匹配），读 state.pid
+	// ① 主路径：枚举 tab state，按 **sessionPath 里的 sessionId** 直接匹配。
+	//    比 `probeSessionsForDispatch`（依赖 bootstrap prompt 前缀）可靠得多。
 	try {
-		const file = findSessionFile(sessionsDir, sessionId);
-		const rec = file !== null ? readSessionHeaderRecord(file) : null;
-		const sessionCwd = typeof rec?.cwd === "string" ? rec.cwd : null;
-		if (sessionCwd) {
-			const bucket = sessionBucketForCwd(sessionCwd);
-			for (const d of listTabDispatches(defaultTabRunsDir(), 200)) {
-				if (!d.cwd || sessionBucketForCwd(d.cwd) !== bucket) continue;
-				// 用 probe：确认该 tab 记录确实指向这个 sessionId
-				const probes = probeSessionsForDispatch(d);
-				if (!probes.some((pr) => pr.sessionId === sessionId)) continue;
-				const st = readTabState(defaultTabRunsDir(), d.id);
-				const r = livenessFromTabState(st, isProcessAlive);
-				if (r.evidenceKind === "tab-pid-alive") {
-					runId = d.id; pid = st?.pid;
-					evidenceListPush(evidences, { kind: "tab-pid-alive", runId: d.id, pid: st!.pid! });
-				} else if (r.evidenceKind === "tab-pid-dead") {
-					runId = d.id; pid = st?.pid;
-					evidenceListPush(evidences, { kind: "tab-pid-dead", runId: d.id, pid: st!.pid! });
-				}
+		const runsDir = defaultTabRunsDir();
+		for (const d of listTabDispatches(runsDir, 500)) {
+			const st = readTabState(runsDir, d.id);
+			if (!st) continue;
+			// sessionPath 里含该会话的 sessionId 才算命中（用 sessionId 回查，不用内容猜测）
+			const sp = typeof st.sessionPath === "string" ? st.sessionPath : "";
+			if (!sp.includes(sessionId)) continue;
+			runId = d.id;
+			pid = st.pid;
+			const r = livenessFromTabState(st, isProcessAlive);
+			if (r.evidenceKind === "tab-pid-alive") {
+				evidenceListPush(evidences, { kind: "tab-pid-alive", runId: d.id, pid: st.pid! });
+			} else if (r.evidenceKind === "tab-pid-dead") {
+				evidenceListPush(evidences, { kind: "tab-pid-dead", runId: d.id, pid: st.pid! });
 			}
+			// 同一会话理论上只有一条 tab；不 break 以便收集多份证据（merge 会取最强）
 		}
 	} catch {
 		evidenceListPush(evidences, { kind: "probe-unavailable", reason: "tab-state-read-failed" });
 	}
 
-	// ② 回落：命令行精确含 `--session <该会话文件>`
+	// ② 旧 state 兜底（本修复之前写的 state **没有 sessionPath**）：
+	//    利用「同一 cwd 桶内，tab 的 dispatchedAt 与该会话文件的创建时间接近」
+	//    来配对 —— 只在尚未找到任何证据时启用，且**只产出 alive/dead 证据**
+	//    （真实 pid + isProcessAlive，不是猜测）。
+	//    为什么需要：修好 `writeState` 只会让**将来**的 tab 有 sessionPath，
+	//    现存 18 个 tab state 全部缺该字段（实测 18/18 ABSENT）。
+	if (evidences.length === 0) {
+		try {
+			const file = findSessionFile(sessionsDir, sessionId);
+			const rec = file !== null ? readSessionHeaderRecord(file) : null;
+			const sessionCwd = typeof rec?.cwd === "string" ? rec.cwd : null;
+			const sessionTs = typeof rec?.timestamp === "string" ? Date.parse(rec.timestamp) : NaN;
+			if (sessionCwd && Number.isFinite(sessionTs)) {
+				const bucket = sessionBucketForCwd(sessionCwd);
+				const runsDir = defaultTabRunsDir();
+				// 候选：同桶 + 无 sessionPath（旧记录）+ dispatchedAt 在会话创建后 10 分钟内
+				let best: { id: string; delta: number; pid?: number } | null = null;
+				for (const d of listTabDispatches(runsDir, 500)) {
+					if (!d.cwd || sessionBucketForCwd(d.cwd) !== bucket) continue;
+					const st = readTabState(runsDir, d.id);
+					if (!st || typeof st.pid !== "number") continue;
+					if (typeof st.sessionPath === "string" && st.sessionPath) continue; // 新记录已在主路径处理
+					const dm = Date.parse(d.dispatchedAt);
+					if (!Number.isFinite(dm)) continue;
+					const delta = Math.abs(dm - sessionTs);
+					if (delta > 10 * 60_000) continue; // 超过 10 分钟不认为是同一会话
+					if (!best || delta < best.delta) best = { id: d.id, delta, pid: st.pid };
+				}
+				if (best) {
+					runId = best.id;
+					pid = best.pid;
+					evidenceListPush(
+						evidences,
+						isProcessAlive(best.pid!)
+							? { kind: "tab-pid-alive", runId: best.id, pid: best.pid! }
+							: { kind: "tab-pid-dead", runId: best.id, pid: best.pid! },
+					);
+				}
+			}
+		} catch {
+			evidenceListPush(evidences, { kind: "probe-unavailable", reason: "legacy-match-failed" });
+		}
+	}
+
+	// ③ 回落：命令行精确含 `--session <该会话文件>`
 	try {
 		const file = findSessionFile(sessionsDir, sessionId);
 		if (file) {
