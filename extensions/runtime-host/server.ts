@@ -141,7 +141,7 @@ import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 // 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
-import { decideSendAction, isSpawnPermitted, resumeTabTitle } from "../runtime/session-resume.ts";
+import { decideSendAction, isSpawnPermitted, livenessFromProbe, resumeTabTitle } from "../runtime/session-resume.ts";
 import { parseObjectAddress } from "../runtime/address.ts";
 import { spawnPiTab } from "../tab-launch-core.ts";
 import { piSessionAddress } from "../runtime/address.ts";
@@ -405,6 +405,49 @@ const SESSION_SCAN_TTL_MS = 60_000;
 let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["maxSessionFile"] } | null = null;
 
 /** 会话根 + 一层子目录的 `(mtimeMs,size)` 指纹（stat-only，O(目录数) 而非 O(文件数)）。失败 → null。 */
+/**
+ * 枚举进程表，看有没有**带该 sessionId 的 pi 进程**。
+ *
+ * 为什么不用 `sessionAlive()`：它读的是 `timers/sessions/<sid>.json` 的
+ * `lastActiveAt`，语义是「最近 15 秒内有过活动」，**不是「进程活着」**。
+ * 2026-10-30 事故：正常对话时模型思考 >15s ⇒ 心跳过期 ⇒ 误判 dead ⇒
+ * 每发一条消息拉起一个新 tab。
+ *
+ * 三态返回（**探不到 ≠ 已死**，AGENTS §0）：
+ * - `has-live-process`：命令行里含 `--session <该会话文件>` 或 `--session-id <sid>`
+ * - `no-live-process`：枚举成功且确证无匹配
+ * - `probe-unavailable`：枚举失败/平台不支持
+ */
+function probeSessionProcess(sessionId: string): "has-live-process" | "no-live-process" | "probe-unavailable" {
+	if (!sessionId) return "probe-unavailable";
+	try {
+		if (process.platform === "win32") {
+			// 只拉 pi 进程（命令行含 pi-coding-agent）再在 JS 侧匹配 sessionId，
+			// 避免把 sid 拼进 PowerShell 字符串造成注入风险。
+			const script =
+				`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ` +
+				`Where-Object { $_.CommandLine -like '*pi-coding-agent*cli.js*' } | ` +
+				`ForEach-Object { $_.CommandLine }`;
+			const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+				encoding: "utf8",
+				timeout: 15_000,
+				windowsHide: true,
+			});
+			const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+			// 精确匹配：`--session <path>...<sid>.jsonl` 或 `--session-id <sid>`。
+			// 不用裸子串（防 sid 前缀碰巧出现在别处）。
+			const hit = lines.some((cmd) => cmd.includes(sessionId));
+			return hit ? "has-live-process" : "no-live-process";
+		}
+		// POSIX：ps -ax -o command
+		const out = execFileSync("ps", ["-ax", "-o", "command"], { encoding: "utf8", timeout: 15_000 });
+		const hit = out.split("\n").some((cmd) => cmd.includes("pi-coding-agent") && cmd.includes(sessionId));
+		return hit ? "has-live-process" : "no-live-process";
+	} catch {
+		return "probe-unavailable";
+	}
+}
+
 /**
  * 读会话文件头记录的 cwd（S2 拉起前置检查）。
  *
@@ -1424,22 +1467,28 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						const parsedTo = parseObjectAddress(peekForResume.to);
 						if (parsedTo?.scheme === "pi" && opts.spawnSessionTab) {
 							const targetSid = parsedTo.value;
+							// ⚠️ 2026-10-30 事故修正：**绝不能**用 sessionAlive() 当「进程活着」。
+							// sessionAlive 的语义是「最近 15 秒内有过活动」（timers/sessions/<sid>.json
+							// 的 lastActiveAt，阈 SESSION_HEARTBEAT_GRACE_MS=15s）——
+							// 正常对话里模型思考 >15s 就心跳过期 ⇒ 误判 dead ⇒ 每发一条消息拉起一个 tab。
+							// 正确做法：枚举进程表，看是否真有带该 sessionId 的 pi 进程。
+							const probe = probeSessionProcess(targetSid);
+							const liveness = livenessFromProbe(probe);
 							const sd = opts.sessionsDir ?? defaultSessionsDir();
 							const file = findSessionFile(sd, targetSid);
-							const alive = file !== null && sessionAlive(opts.timersDir ?? defaultTimersDir(), targetSid, new Date(), SESSION_HEARTBEAT_GRACE_MS);
 							const tl = checkTrustedLocalChannel(req, hostToken, self.port);
 							const decision = decideSendAction({
 								sessionFile: file,
-								liveness: alive ? "alive" : "dead",
+								liveness,
 								sessionCwd: file !== null ? readSessionCwdFromFile(file) : null,
 								cwdExists: (c) => { try { return statSync(c).isDirectory(); } catch { return false; } },
 								permitted: isSpawnPermitted({ trustedLocal: tl.ok, guiEnabled: readGuiEnabled(configPath) }),
 							});
-							resumeOutcome = { action: decision.action, reason: decision.reason };
+							resumeOutcome = { action: decision.action, reason: decision.reason, probe };
 							if (decision.action === "spawn-then-send") {
 								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
 								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title: resumeTabTitle(targetSid) });
-								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120) };
+								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), probe };
 							}
 						}
 					}

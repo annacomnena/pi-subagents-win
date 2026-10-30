@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import {
 	decideSendAction,
 	isSpawnPermitted,
+	livenessFromProbe,
 	resumeTabTitle,
 } from "./runtime/session-resume.ts";
 
@@ -150,6 +151,51 @@ const ALWAYS_FALSE = (): boolean => false;
 	for (let i = 0; i < 50; i += 1) seen.add(decideSendAction(input).action);
 	assert.deepEqual([...seen], ["spawn-then-send"], "同输入必须恒定（无随机/无时间窗）");
 	ok("确定性：50 次同输入恒定 spawn-then-send（不引入时间窗/随机）");
+}
+
+// ── ⑩ 【2026-10-30 事故回归】unknown（缺证据）绝不拉起 ──────────────────
+// 事故：首版把 sessionAlive()（=「最近 15s 有活动」）当成「进程活着」用。
+// 正常对话时模型思考 >15s ⇒ 心跳过期 ⇒ 判 dead ⇒ 每发一条消息拉起一个 tab。
+// 修复：引入三态，unknown（探不到/弱信号）⇒ 只发不拉。
+{
+	const d = decideSendAction({
+		sessionFile: "C:/s/x.jsonl",
+		liveness: "unknown",
+		sessionCwd: "G:/a",
+		cwdExists: ALWAYS_TRUE,
+		permitted: true,
+	});
+	assert.equal(d.action, "send", "unknown ⇒ 只发不拉（缺证据不得触发有副作用的拉起）");
+	assert.equal(d.reason, "liveness-unknown");
+	ok("【事故回归】liveness=unknown ⇒ send 而非 spawn-then-send（缺证据 = 不动）");
+}
+
+// ── ⑪ 三态映射：探不到 ≠ 已死 ──────────────────────────────────────
+{
+	assert.equal(livenessFromProbe("has-live-process"), "alive");
+	assert.equal(livenessFromProbe("no-live-process"), "dead");
+	assert.equal(livenessFromProbe("probe-unavailable"), "unknown",
+		"探不到必须映射到 unknown，绝不能当 dead（AGENTS §0）");
+	ok("三态映射：has-live→alive / no-live→dead / probe-unavailable→**unknown**（不是 dead）");
+}
+
+// ── ⑫ 穷举三态 × 权限：只有 dead+permitted 可拉起 ────────────────────
+{
+	const base = { sessionFile: "C:/s.jsonl", sessionCwd: "G:/a", cwdExists: ALWAYS_TRUE };
+	const spawnCases: string[] = [];
+	for (const lv of ["alive", "dead", "unknown"] as const) {
+		for (const permitted of [true, false]) {
+			const d = decideSendAction({ ...base, liveness: lv, permitted });
+			if (d.action === "spawn-then-send") spawnCases.push(`${lv}/${permitted}`);
+			if (lv !== "dead" || !permitted) {
+				assert.notEqual(d.action, "spawn-then-send",
+					`liveness=${lv} permitted=${permitted} 绝不得拉起，实际 ${d.action}`);
+			}
+		}
+	}
+	assert.deepEqual(spawnCases, ["dead/true"],
+		`只有 dead+permitted 可拉起，实际可拉起组合：${JSON.stringify(spawnCases)}`);
+	ok("穷举三态×权限：**只有** dead+permitted 会 spawn（alive/unknown/无权限一律不拉）");
 }
 
 console.log(`\nsession-resume tests passed (${n} checks)`);
