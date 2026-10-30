@@ -45,6 +45,7 @@ source_paths:
 - [[Master 开机自启与防双开]] — `pi-runtime-host-boot`/`pi-master-resume-boot` 与 boot-resume P1–P6/G1–G3、G2.5 心跳判据、P2 transfer-window 24h（`status: current`）
 - [[Steer 通道（立即插入消息）]] — Master → 运行中 tab 的立即投递：steer/abort 两档、落盘回执状态机、写前守卫与 scope、已知限制 NF-1（`status: current`）
 - [[异步 Run 控制面（list / kill）]] — async subagent 的观察与终止：list 脉搏、整棵进程树 kill、双重安全校验、幂等终态（`status: current`）
+- [[本地端点压测的客户端污染]] — 系统代理（urllib 读、http.client 不读）造成 60 倍差、`timings` 边界、reasoning 开关判定（`status: current`）
 
 ## Links Out
 
@@ -70,6 +71,7 @@ source_paths:
 - [[Steer 通道（立即插入消息）]]
 - [[异步 Run 控制面（list / kill）]]
 - [[Tab 运行账本与运行态数据面]]
+- [[本地端点压测的客户端污染]]
 
 ## Backlinks
 
