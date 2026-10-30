@@ -142,6 +142,7 @@ import {
 } from "./timers.ts";
 import {
 	buildWorkflowTabPrompt,
+	isLaunchMode,
 	launchTaskTitle,
 	modePrefix,
 	parseLaunchRequest,
@@ -3553,7 +3554,7 @@ export default function (pi: ExtensionAPI) {
 			"在 Windows Terminal 中并行打开一个或多个可见、独立的 pi 交互标签页。",
 			"先分析当前会话并只提交彼此独立、启动条件已满足的任务；不要为编排请求本身打开标签页。",
 			"每项必须提供 taskId、具体 prompt；prompt 会自动以 `根据workflow进行工作<taskId>` 开头，并附加 workflow-orchestrator 强制约束块（先 read 技能、委派 subagent-win 各角色执行、禁止单 agent 一路干完）。",
-			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）| adaptive（自适应：任务书含根因+方案+文件域+验收标准时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链；前缀 `根据adaptive进行工作<taskId>`）。",
+			"任务模式 mode：workflow（默认，完整链路）| research（深度研究：只并行搜索 + 研究报告 plans/*_research.md + Wiki 主题页维护，不做计划与实现；前缀 `根据research进行工作<taskId>`）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾；前缀 `根据execute进行工作<taskId>`）| adaptive（自适应：任务书含根因+方案+文件域+验收标准时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链；前缀 `根据adaptive进行工作<taskId>`）| solo（零派发：全部工作自己完成，严禁派任何 subagent；套餐额度受限时用，收尾必须写自审局限的降级声明；前缀 `根据solo进行工作<taskId>`）。",
 			"一次调用传入全部任务以保证并行启动。",
 			"标签自动生成规范名 `<仓库名>[-worktree]-<taskId>-<标签>`（仓库名取自 git origin/toplevel，worktree 路径自动加 -worktree- 标记，标签取显式 title 或从 prompt 首行提取）；不再使用无意义的 wlc 默认名。",
 			"每项返回 tab runId（只属于可见 tab）：用 tab-status 查询状态、reclaim-tabs 回收结果后编排下一批；不要把它与 subagent-win async runId 混用。每项可传 timers: [{delayMs, message, label?, repeatMs?}] 写入该标签页邮箱，到期自动发送推进消息（仅主会话的 tab 编排）。",
@@ -3566,7 +3567,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: Type.Optional(Type.String({ description: "新标签页工作目录；缺省用当前目录。独立 worktree 场景必填，如 G:/code/worktrees/GreenCAD-123" })),
 				model: Type.Optional(Type.String({ description: "仅用户明确要求或配置不适用时覆盖新 pi 会话模型" })),
 				title: Type.Optional(Type.String({ description: "标签名（可选）：仅作为标签部分，自动剥离开头的 pi-/wlc- 前缀；缺省从 prompt 首行提取" })),
-				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）| adaptive（自适应：任务书四要素齐全时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链）" })),
+				mode: Type.Optional(Type.String({ description: "任务模式（可选）：workflow（默认，完整链路 搜索→计划→审查→实现→审查→Wiki 收尾）| research（深度研究：仅并行搜索 + 研究报告 + Wiki 主题页维护，不做计划与实现）| execute（快速执行：结论已明确，跳过搜索与计划，仅实现→审查→Wiki 收尾）| adaptive（自适应：任务书四要素齐全时用，tab 启动自评完备度选链深 A0自执行快链/A快链/B中链/C全链）| solo（零派发：全部工作自己完成，严禁派任何 subagent；套餐额度受限时用，收尾必须写自审局限的降级声明）" })),
 				timers: Type.Optional(Type.Array(Type.Object({
 					delayMs: Type.Number({ description: "延时毫秒：到期后系统自动向该标签页发送消息推进工作" }),
 					message: Type.String({ description: "到期自动发送的推进指令" }),
@@ -3666,7 +3667,7 @@ export default function (pi: ExtensionAPI) {
 			const timersDir = defaultTimersDir();
 
 			const results = input.map((item, idx) => {
-				const mode: LaunchMode = item.mode === "research" ? "research" : item.mode === "execute" ? "execute" : item.mode === "adaptive" ? "adaptive" : "workflow";
+				const mode: LaunchMode = isLaunchMode(item.mode) ? item.mode : "workflow";
 				return launchWorkflowTab(
 					{
 						taskId: item.taskId ?? "",
@@ -4983,12 +4984,12 @@ export default function (pi: ExtensionAPI) {
 			// 只有用户显式选择模式时才绑定 workflow 约束。任务编号本身只是业务标识，
 			// 不应把普通的单任务启动自动升级成 workflow。
 			const taskNum = request.task.match(/\b\d{3,5}\b/)?.[0] ?? "";
-			const explicitMode = request.execute || request.research || request.adaptive;
-			const explicitWorkflowPrefix = /根据(?:workflow|research|execute|adaptive)进行工作\s*\d{3,5}/.test(request.task);
+			const explicitMode = request.execute || request.research || request.adaptive || request.solo;
+			const explicitWorkflowPrefix = /根据(?:workflow|research|execute|adaptive|solo)进行工作\s*\d{3,5}/.test(request.task);
 			const workflowBound = explicitMode || explicitWorkflowPrefix;
 			const skillRef = existsSync(WORKFLOW_SKILL_FILE) ? WORKFLOW_SKILL_FILE : undefined;
 			const skillArgs = existsSync(WORKFLOW_SKILL_ROOT) ? [WORKFLOW_SKILL_ROOT] : undefined;
-			const mode: LaunchMode = request.execute ? "execute" : request.research ? "research" : request.adaptive ? "adaptive" : "workflow";
+			const mode: LaunchMode = request.execute ? "execute" : request.research ? "research" : request.adaptive ? "adaptive" : request.solo ? "solo" : "workflow";
 			const prompt = workflowBound
 				? buildWorkflowTabPrompt({ taskId: taskNum, title: request.title, prompt: request.task, model: request.model }, skillRef, mode)
 				: request.task;
@@ -5030,7 +5031,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const modelHint = request.model ? ` (model: ${request.model})` : "";
-			const modeName = request.execute ? "快速执行" : request.research ? "深度研究" : request.adaptive ? "自适应" : "workflow";
+			const modeName = request.execute ? "快速执行" : request.research ? "深度研究" : request.adaptive ? "自适应" : request.solo ? "零派发" : "workflow";
 			const boundHint = workflowBound ? ` (workflow 约束已绑定 · ${modeName}模式)` : "";
 			ctx.ui.notify(`✅ 已启动标签页 [${boundTitle}]${modelHint}${boundHint}，pi 将在新终端中运行`, "info");
 		},

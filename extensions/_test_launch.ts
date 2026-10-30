@@ -6,6 +6,8 @@ import {
 	buildWindowsTerminalArgs,
 	buildWorkflowTabPrompt,
 	cleanupWtPromptArg,
+	LAUNCH_MODES,
+	isLaunchMode,
 	_resetLauncherCache,
 	healthyLauncher,
 	probeWtHelp,
@@ -57,6 +59,7 @@ assert.deepEqual(orchestration, {
 	research: false,
 	execute: false,
 	adaptive: false,
+	solo: false,
 });
 
 const direct = parseLaunchRequest("-t pi-wlc-1007 --model Zhipu/glm-5.2 修复 1007");
@@ -69,6 +72,7 @@ assert.deepEqual(direct, {
 	research: false,
 	execute: false,
 	adaptive: false,
+	solo: false,
 });
 
 const withCwd = parseLaunchRequest("--direct --cwd /home/user/worktrees/MyProject-123 实施 123");
@@ -532,5 +536,85 @@ try {
 assert.ok(doomed.error && doomed.error.length > 0, `双坏应 fail closed：${doomed.error}`);
 assert.equal(cap.length, 0, "fail-closed 路径绝不得 spawn（拦截 child_process.spawn 为证）");
 }
+
+
+// ── solo（零派发）模式 ────────────────────────────────────────────────────────
+// 动机：套餐额度受限时，local master 必须能「全部自己做、一个 subagent 都不派」。
+// 此前四种模式（workflow/research/execute/adaptive）全部强制委派，
+// workflowDisciplineBlock 里写着「delegate stages to subagent-win agents」，
+// 与「禁止派发」直接冲突。solo 是第五种模式，必须满足三条硬约束。
+
+// 1. 模式枚举与前缀
+assert.deepEqual(
+	["workflow", "research", "execute", "adaptive", "solo"],
+	LAUNCH_MODES,
+	"LAUNCH_MODES 必须包含五种模式",
+);
+assert.equal(modePrefix("2001", "solo"), "根据solo进行工作2001");
+assert.equal(isLaunchMode("solo"), true);
+assert.equal(isLaunchMode("nope"), false);
+assert.equal(isLaunchMode(undefined), false);
+
+// 2. CLI 解析（--solo / -s 双写法，且要能从文本里剥掉）
+assert.equal(parseLaunchRequest("--solo 干活 2001").solo, true);
+assert.equal(parseLaunchRequest("-s 干活 2001").solo, true);
+assert.equal(parseLaunchRequest("--solo 干活 2001").task, "干活 2001", "--solo 必须被剥出 task");
+assert.equal(parseLaunchRequest("普通任务 2001").solo, false);
+// 互不干扰：--solo 不得污染其它模式标志
+const soloReq = parseLaunchRequest("--solo 干活 2001");
+assert.equal(soloReq.execute, false);
+assert.equal(soloReq.research, false);
+assert.equal(soloReq.adaptive, false);
+
+// 3. 纪律块：必须禁止派发，且不得残留「委派/项目经理」这类相反指令
+const soloBlock = workflowDisciplineBlock("2001", skillPath, "solo");
+assert.ok(soloBlock.includes("零派发"), soloBlock);
+assert.ok(!soloBlock.includes("你是项目经理"), `solo 块不得出现「你是项目经理」：${soloBlock}`);
+assert.ok(!soloBlock.includes("禁止自己一路干完"), "solo 块不得禁止自己干活（那正是 solo 要做的事）");
+assert.ok(!soloBlock.includes("delegate stages"), "solo 块不得残留英文委派指令");
+// 必须显式点名禁止 subagent-win 与 launch-tabs
+assert.ok(
+	soloBlock.includes("subagent-win"),
+	"solo 块必须显式点名禁止 subagent-win（否则模型会按默认纪律去派）",
+);
+assert.ok(soloBlock.includes("launch-tabs"), "solo 块必须显式禁止嵌套 launch-tabs");
+// 必须要求「自审矛盾 · 降级声明」——独立审查在 solo 下无法满足，不许假装
+assert.ok(soloBlock.includes("降级声明"), "solo 块必须要求写自审局限的降级声明");
+assert.ok(
+	soloBlock.includes("无法满足") && soloBlock.includes("实现与判定不得同一主体"),
+	"solo 块必须点名 AGENTS §4.1 的自审矛盾",
+);
+// 仍必须保留 tab-finish 回报（不回报 = 主会话永远等）
+assert.ok(soloBlock.includes("tab-finish"), "solo 块仍须强制 tab-finish 回报");
+
+// 4. 完整 prompt 组装：前缀 + 纪律块 + 原 handoff，且二次调用不重复前缀
+const soloPrompt = buildWorkflowTabPrompt(
+	{ taskId: "2001", prompt: "实现 M4 时间轴" },
+	skillPath,
+	"solo",
+);
+assert.ok(soloPrompt.startsWith("根据solo进行工作2001\n\n> 【工作方式约束"), soloPrompt.slice(0, 80));
+assert.ok(soloPrompt.endsWith("实现 M4 时间轴"), "原 handoff 必须保留在末尾");
+assert.ok(!soloPrompt.includes("你是项目经理"), "组装后的 solo prompt 不得含委派指令");
+const soloPromptAgain = buildWorkflowTabPrompt(
+	{ taskId: "2001", prompt: soloPrompt },
+	skillPath,
+	"solo",
+);
+assert.equal(
+	soloPromptAgain.split("\n")[0],
+	"根据solo进行工作2001",
+	"已带前缀时不得重复叠加",
+);
+assert.equal(
+	(soloPromptAgain.match(/根据solo进行工作2001/g) ?? []).length,
+	1,
+	`solo 前缀只应出现一次：${(soloPromptAgain.match(/根据solo进行工作2001/g) ?? []).length}`,
+);
+
+// 5. 对照：workflow 模式仍保留委派（防止我把四种旧模式一起改坏）
+const wfBlock = workflowDisciplineBlock("2001", skillPath, "workflow");
+assert.ok(wfBlock.includes("你是项目经理"), "workflow 模式的原委派纪律必须保持不变");
+assert.ok(wfBlock.includes("禁止自己一路干完"), "workflow 模式的原纪律必须保持不变");
 
 console.log("launch tests passed");

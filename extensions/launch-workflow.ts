@@ -175,7 +175,7 @@ export function masterDispatchLaunch(
 		taskId: string;
 		title?: string;
 		cwd?: string;
-		mode: "workflow" | "research" | "execute" | "adaptive";
+		mode: "workflow" | "research" | "execute" | "adaptive" | "solo";
 		prompt: string;
 		model?: string;
 		timers?: Array<{ delayMs?: number; message?: string; label?: string; repeatMs?: number }>;

@@ -36,6 +36,8 @@ export interface LaunchRequest {
 	execute: boolean;
 	/** 自适应模式：任务书四要素（根因+方案+文件域+验收标准）齐全但不确定假设是否仍成立，tab 启动时自评完备度选链深 A0自执行快链/A快链/B中链/C全链。 */
 	adaptive: boolean;
+	/** 零派发模式：全部工作自己完成，严禁派任何 subagent（套餐额度受限时用）。 */
+	solo: boolean;
 }
 
 export interface LaunchTask {
@@ -96,6 +98,13 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 		text = `${text.slice(0, adaptiveMatch.index)} ${text.slice((adaptiveMatch.index ?? 0) + adaptiveMatch[0].length)}`.trim();
 	}
 
+	let solo = false;
+	const soloMatch = text.match(/(?:^|\s)(--solo|-s)(?=\s|$)/);
+	if (soloMatch) {
+		solo = true;
+		text = `${text.slice(0, soloMatch.index)} ${text.slice((soloMatch.index ?? 0) + soloMatch[0].length)}`.trim();
+	}
+
 	let title: string | undefined;
 	const titleMatch = text.match(/^-t\s+(\S+)(?:\s+(.*))?$/s);
 	if (titleMatch) {
@@ -104,7 +113,7 @@ export function parseLaunchRequest(input: string): LaunchRequest {
 		direct = true;
 	}
 
-	return { task: text, title, model, cwd, direct, research, execute, adaptive };
+	return { task: text, title, model, cwd, direct, research, execute, adaptive, solo };
 }
 
 /**
@@ -187,7 +196,7 @@ export function taskTitleLabel(title: string | undefined, prompt: string): strin
 		if (cleaned) return cleaned;
 	}
 	const firstLine =
-		prompt.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !/^(##|>|根据workflow进行工作|根据research进行工作|根据execute进行工作|根据adaptive进行工作)/.test(l)) ?? "";
+		prompt.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !/^(##|>|根据workflow进行工作|根据research进行工作|根据execute进行工作|根据adaptive进行工作|根据solo进行工作)/.test(l)) ?? "";
 	const label = firstLine
 		.replace(/^[*#\-\s]+/, "")
 		.replace(/^(?:Item\s+\d+\s*[—\-:]*\s*)/i, "")
@@ -231,13 +240,20 @@ export function deriveLaunchTitle(task: string): string {
 	return task.replace(/\s+/g, " ").slice(0, 30).trim() || "pi-task";
 }
 
-/** 任务会话模式：workflow（完整链路）| research（深度研究：只搜索 + 研究报告 + Wiki 维护）| execute（快速执行：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）| adaptive（自适应：tab 启动时按任务书信息完备度自选链深 A0自执行快链/A快链/B中链/C全链）。 */
-export type LaunchMode = "workflow" | "research" | "execute" | "adaptive";
+/** 任务会话模式：workflow（完整链路）| research（深度研究：只搜索 + 研究报告 + Wiki 维护）| execute（快速执行：结论已明确，跳过搜索与计划，实现→审查→Wiki 收尾）| adaptive（自适应：tab 启动时按任务书信息完备度自选链深 A0自执行快链/A快链/B中链/C全链）| solo（零派发：全部工作自己完成，禁止派任何 subagent）。 */
+export type LaunchMode = "workflow" | "research" | "execute" | "adaptive" | "solo";
+
+export const LAUNCH_MODES: LaunchMode[] = ["workflow", "research", "execute", "adaptive", "solo"];
+
+export function isLaunchMode(v: unknown): v is LaunchMode {
+	return typeof v === "string" && (LAUNCH_MODES as string[]).includes(v);
+}
 
 export function modePrefix(taskId: string, mode: LaunchMode): string {
 	if (mode === "research") return `根据research进行工作${taskId}`;
 	if (mode === "execute") return `根据execute进行工作${taskId}`;
 	if (mode === "adaptive") return `根据adaptive进行工作${taskId}`;
+	if (mode === "solo") return `根据solo进行工作${taskId}`;
 	return `根据workflow进行工作${taskId}`;
 }
 
@@ -294,6 +310,22 @@ export function workflowDisciplineBlock(taskId: string, skillPath?: string, mode
 			reportLine,
 		].join("\n");
 	}
+	if (mode === "solo") {
+		// 零派发模式：完全禁止派 subagent，全部工作自己完成。
+		// 关键设计：**不豁免自审矛盾**——独立审查在这个模式下无法满足，
+		// 因此强制要求写「降级声明」，把「哪些结论我没能独立验证」显式列出来，
+		// 而不是假装做了独立审查（2026-10-29 L4 那次独立性降级的教训）。
+		return [
+			`> 【工作方式约束 · 强制 · 零派发 SOLO】本会话是**零派发**任务会话（任务号 ${taskId}）：**全部工作由你自己完成，严禁派发任何 subagent**。`,
+			`> 1. ⛔ **绝对禁止**调用 \`subagent-win\`（任何 agent：searcher / planner / plan-reviewer / implementer / code-reviewer / consultant / general）——本仓当前套餐额度受限，任何派发都是违规。也禁止 \`launch-tabs\` / \`/launch\`。`,
+			`> 2. 第一步 ${skillRef}，但**只读其中的流程纪律与验收标准，忽略所有「委派/派发」要求**——那些要求与本次零派发约束冲突，以本条为准。同样 read 仓库根 AGENTS.md。`,
+			"> 3. 你要**自己**完成完整链路：检索（read / grep / codegraph，不做全量搜索）→ 计划（写 plans/）→ 实现（edit / write）→ 自测（跑测试命令）→ 文档收尾（recentwork / changelog / Wiki 按仓规）。",
+			"> 4. ⚠️【自审矛盾 · 必须显式降级，不许假装】零派发模式下**无法满足「实现与判定不得同一主体」**（AGENTS §4.1）。因此收尾必须写一份**降级声明**，至少含三段：\n>    - **我做了什么判定**（列出每条结论）\n>    - **哪些判定我无法独立验证**（自测覆盖不到的、需要异进程/异模型的、需要真实窗口/人工目视的）\n>    - **建议外部复核的最小集**（哪几条最值得别人重跑，附命令）\n>    绝不用「已测试通过」笼统替代具体覆盖面，绝不把自测当成独立审查。",
+			"> 5. 每条断言必须指得出生产侧 `file:line`；判据不许写软（放宽阈值凑绿）、不许写空（永真/永假）、不许删。",
+			`> 6. 任务临时发现只进回复或 plans/*_research.md；禁止 task${taskId}/Item/计划步骤进 Wiki；Wiki 只更新对应功能/主题正式页，改动后调 wiki-nav rebuild。`,
+			reportLine,
+		].join("\n");
+	}
 	if (mode === "adaptive") {
 		return [
 			`> 【工作方式约束 · 强制 · 自适应】本会话是自适应工作流任务会话（任务号 ${taskId}）：链深不在派发时固定，由你在启动时按任务书信息完备度自评决定。你必须按 workflow-orchestrator 技能的「自适应模式（adaptive）」执行：`,
@@ -324,12 +356,13 @@ export function workflowDisciplineBlock(taskId: string, skillPath?: string, mode
 }
 
 /**
- * Compose a workflow-, research- or execute-bound tab prompt:
+ * Compose a workflow-, research-, execute-, adaptive- or solo-bound tab prompt:
  *
  *   根据workflow进行工作<taskId>   (mode: "workflow")
  *   根据research进行工作<taskId>   (mode: "research")
  *   根据execute进行工作<taskId>   (mode: "execute")
  *   根据adaptive进行工作<taskId>   (mode: "adaptive")
+ *   根据solo进行工作<taskId>   (mode: "solo" — 零派发，全部自己做)
  *
  *   > 【工作方式约束 · 强制】…
  *
