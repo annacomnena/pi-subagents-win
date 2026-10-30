@@ -75,11 +75,26 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 
 // ── ④ 证据合并优先级 ──────────────────────────────────────────────
 {
-	// dead 优先于 alive（tab state 是权威；命令行命中可能是另一个进程/pid 复用）
+	// 【曾经的错误】旧版这里断言「dead 必须优先于 alive」，理由写作「tab state 是权威」
+	// —— **那条断言把 bug 当成了规范锁死**，这正是 6 个测试全绿却抓不住重复拉起的原因。
+	//
+	// 正确语义分层：`tab-pid-dead` 只证明「**某个历史实例**退了」，
+	// 它不能证明「**这个逻辑会话现在没有活进程**」。
+	// 「要不要拉起」只能看「现在有没有活实例」。
 	assert.equal(
-		mergeEvidence([{ kind: "session-flag-alive", pid: 1 }, { kind: "tab-pid-dead", runId: "t", pid: 2 }]).kind,
-		"tab-pid-dead",
-		"dead 必须优先于 alive（tab state 权威，命令行命中可能是重复打开）",
+		mergeEvidence([{ kind: "session-flag-alive", pid: 291780 }, { kind: "tab-pid-dead", runId: "t", pid: 242324 }]).kind,
+		"session-flag-alive",
+		"当下观测到的活进程必须高于历史 tab 记录的 dead",
+	);
+	assert.equal(
+		mergeEvidence([{ kind: "tab-pid-dead", runId: "old", pid: 1 }, { kind: "tab-pid-alive", runId: "new", pid: 2 }]).kind,
+		"tab-pid-alive",
+		"同一会话旧实例 dead + 新实例 alive ⇒ alive",
+	);
+	assert.equal(
+		mergeEvidence([{ kind: "tab-pid-alive", runId: "new", pid: 2 }, { kind: "tab-pid-dead", runId: "old", pid: 1 }]).kind,
+		"tab-pid-alive",
+		"顺序不得影响结果",
 	);
 	// alive 优先于 absent
 	assert.equal(
@@ -97,7 +112,7 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 		]).kind,
 		"tab-pid-dead",
 	);
-	ok("证据合并：dead > alive > absent > unavailable（弱证据不得压过强证据）");
+	ok("证据合并：alive(当下) > dead(历史) > absent/unavailable（弱证据不得压过强证据）");
 }
 
 // ── ⑤ GUI「活跃中」筛选 ──────────────────────────────────────────
@@ -118,6 +133,66 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 	const dead = decideSendActionAllowed("dead");
 	assert.equal(dead, true, "只有 dead 才允许拉起");
 	ok("端到端：alive/unknown 不拉，只有 dead 才拉（owner 报的 bug 直接回归）");
+}
+
+// ── ⑦ 【关键回归】两次消息，spawn 次数必须为 1 ──────────
+//
+// 这是 sol 在 plans/20261030_sol_diagnosis_session_respawn.md §7 设计并实测红的用例。
+// 它验的是**环境变化**：第一次消息把会话拉起来了（新进程出现），
+// 第二次消息必须看到那个新进程、复用而不重复拉起。
+//
+// 旧测试全部只验「单个证据的静态映射」，没有一条验「一次副作用改变了下一次读的结果」。
+{
+	// 模拟真实现场：旧 tab 记录 pid 242324 已死，命令行探测到新实例 291780
+	const oldTabDead: LivenessEvidence = { kind: "tab-pid-dead", runId: "tab_old", pid: 242324 };
+	let resumedPid: number | null = null; // 拉起后才有：291780
+	let spawns = 0;
+
+	const decideFor = (): "send" | "spawn-then-send" => {
+		const evs: LivenessEvidence[] = [oldTabDead]; // 旧 tab 永远在那里（历史不会消失）
+		if (resumedPid !== null) evs.push({ kind: "session-flag-alive", pid: resumedPid });
+		return decideSendActionAllowed(livenessFromEvidence(mergeEvidence(evs))) ? "spawn-then-send" : "send";
+	};
+
+	const reads: Array<{ message: number; action: string; spawns: number }> = [];
+	for (let message = 1; message <= 2; message++) {
+		const action = decideFor();
+		if (action === "spawn-then-send") {
+			spawns += 1;
+			resumedPid = 291780; // 拉起产生新进程，从下一次读开始可见
+		}
+		reads.push({ message, action, spawns });
+	}
+
+	assert.equal(spawns, 1, "第二次消息必须复用第一次拉起的进程，不能再开一个 tab");
+	assert.equal(reads[0].action, "spawn-then-send", "第一次：旧实例死了 ⇒ 应拉起");
+	assert.equal(reads[1].action, "send", "第二次：新实例活着 ⇒ 只发不拉");
+	ok("【关键回归】两次消息 ⇒ spawn 恰为 1（旧 tab dead + 新实例 alive 共存场景）");
+}
+
+// ── ⑧ 【关键回归】旧 dead 不能被「命令行缺失」或「探针失败」洗白，但也不能被当成当下死 ──
+{
+	// 只有旧 dead ⇒ 仍应拉起（合法恢复）
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "tab-pid-dead", runId: "t", pid: 1 }])),
+		"dead",
+		"只有历史 dead ⇒ 仍应拉起（不能因为改成 alive 优先就永远不恢复死会话）",
+	);
+	// 旧 dead + absent ⇒ absent 不参与拉高，仍是 dead
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "tab-pid-dead", runId: "t", pid: 1 }, { kind: "session-flag-absent" }])),
+		"dead",
+		"absent 不得把 dead 抹成 unknown",
+	);
+	// 旧 dead + 探针失败 ⇒ **仍有风险**（sol §8 明确指出未解决）：
+	// 探针失败时不能确认“无活实例”，理论上应 unknown；但 现在为保持“死会话能恢复”仍是 dead。
+	// 此处只如实锁定当前行为，不假装已解决。
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "tab-pid-dead", runId: "t", pid: 1 }, { kind: "probe-unavailable", reason: "timeout" }])),
+		"dead",
+		"已知残留风险：旧 dead + 探针超时仍会拉起（sol §8 第 1 条，未修）",
+	);
+	ok("残留风险已如实锁定：旧 dead + 探针失败仍会拉起（未解决，不掩盖）");
 }
 
 console.log(`\nsession-liveness tests passed (${n} checks)`);

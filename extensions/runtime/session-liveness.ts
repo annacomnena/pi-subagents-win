@@ -108,22 +108,35 @@ export function livenessFromTabState(
  * 合并多份证据，取**最强**的那份。
  *
  * 优先级（强 → 弱）：
- *   1. `tab-pid-dead`   —— 明确死，可安全拉起
- *   2. `tab-pid-alive`  —— 明确活，绝不能重复拉起
- *   3. `session-flag-alive` —— 活（非 tab 形态）
+ *   1. `tab-pid-alive`     —— 明确活（有 pid + isProcessAlive）
+ *   1. `session-flag-alive`—— 明确活（命令行当下观测）
+ *   3. `tab-pid-dead`      —— **历史**某实例已死
  *   4. `session-flag-absent` / `probe-unavailable` —— 无结论
  *
- * **dead 优先于 alive** 是有意的：如果 tab state 说 pid 死了，同时命令行又匹配到
- * 一个同 sessionId 的进程，那更可能是**另一个**进程（pid 复用/重复打开），
- * 此时按 tab state 的明确证据走更安全——最坏结果是多拉一个 tab（可见、可关），
- * 而误判 alive 会让消息永远躺在 outbox 里没人消费。
+ * ## 为什么 alive 必须高于 dead（2026-10-30 第五次修正）
+ *
+ * 旧规则是 dead 最高，理由是「tab state 是权威」。**这个理由错在两点：**
+ *
+ * ① **时间性错位**：tab 记录是**历史的**（例：`tab_mvuld64u_m023` 是 06:28
+ *    那次派发，进程 242324 后来死了），而命令行是**当下的**。会话被拉起后，
+ *    新进程不属于任何 tab 记录 ⇒ 旧 dead 永远压过新 alive。
+ *
+ * ② **语义层级错**：`tab-pid-dead` 只能证明「**某个**历史实例退了」，
+ *    它不能证明「**这个逻辑会话现在没有活进程**」。一个会话可以有多个前后
+ *    相继的运行实例，问「要不要拉起」只能看「**现在**有没有活实例」。
+ *
+ * 实测后果（真实数据）：`01a18b7f-…` 在 `pid 291780` 下正常运行，但因为旧 tab
+ * 记录 `pid 242324` 已死，每发一条消息就再开一个标签页。
+ *
+ * **反向风险仍然守住**：只有**观测到** alive 才判 alive。
+ * `absent` / `probe-unavailable` 仍是 unknown ⇒ 不拉起（见 `livenessFromEvidence`）。
  */
 export function mergeEvidence(evidences: readonly LivenessEvidence[]): LivenessEvidence {
 	const rank = (e: LivenessEvidence): number => {
 		switch (e.kind) {
-			case "tab-pid-dead": return 4;
-			case "tab-pid-alive": return 3;
-			case "session-flag-alive": return 2;
+			case "tab-pid-alive": return 4;
+			case "session-flag-alive": return 3;
+			case "tab-pid-dead": return 2;
 			case "session-flag-absent": return 1;
 			case "probe-unavailable": return 0;
 			default: return 0;

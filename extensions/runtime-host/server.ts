@@ -455,7 +455,7 @@ let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["max
 export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLivenessVerdict> {
 	const index = new Map<string, SessionLivenessVerdict>();
 	const runsDir = defaultTabRunsDir();
-	/** sessionId → 最强的 tab 证据（dead 优先，与 mergeEvidence 同规则） */
+	/** sessionId → 最强的 tab 证据（**alive 优先**，与 mergeEvidence 同规则） */
 	const bySession = new Map<string, { runId: string; pid: number; alive: boolean }>();
 
 	try {
@@ -473,8 +473,10 @@ export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLive
 			const sid = m[1];
 			const alive = isProcessAlive(st.pid);
 			const prev = bySession.get(sid);
-			// dead 优先（tab state 是权威；同会话多条记录时取最强）
-			if (!prev || (!alive && prev.alive)) {
+			// alive 优先（与 mergeEvidence 一致）。旧规则是 dead 优先，导致
+			// 「同一会话旧实例已死 + 新实例活着」时报 dead ⇒ 列表显示 inactive，
+			// 并且调用方会以为该会话需要拉起。
+			if (!prev || (alive && !prev.alive)) {
 				bySession.set(sid, { runId: d.id, pid: st.pid, alive });
 			}
 		}
@@ -506,35 +508,127 @@ export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLive
 	}
 
 	// 所有会话先默认 unknown（最保守：不拉起）；命中的改写
-	let all: Array<{ sessionId: string }> = [];
+	let all: Array<{ sessionId: string; cwd?: string }> = [];
 	try {
-		all = listPiSessions(sessionsDir).map((s) => ({ sessionId: s.sessionId }));
+		all = listPiSessions(sessionsDir).map((s) => ({ sessionId: s.sessionId, cwd: s.cwd }));
 	} catch {
 		all = [];
 	}
+
+	// 命令行证据：**整个周期只枚举一次进程表**（不是每条会话一次）。
+	// sol 2026-10-30 指出：旧索引完全不含命令行来源 ⇒ 与单条 probe 判据不一致，
+	// 「被拉起的新实例」在列表里不可见（恒为旧 pid 的 dead）。
+	// 注：一次 PowerShell ~2s，因此索引内联仍只适合低频调用；高频列表应异步缓存
+	// （sol 建议的 freshness/error 模型，尚未实施，此处先保证**判据正确**）。
+	const liveBySid = new Map<string, number>();
+	try {
+		const base = scanSessionCommandLines();
+		for (const [sid, pid] of base) liveBySid.set(sid, pid);
+	} catch {
+		/* 枚举失败 → 不加命令行证据（不当作“无活实例”） */
+	}
+
 	for (const s of all) {
 		const hit = bySession.get(s.sessionId);
-		if (!hit) continue;
-		const evidence: LivenessEvidence = hit.alive
-			? { kind: "tab-pid-alive", runId: hit.runId, pid: hit.pid }
-			: { kind: "tab-pid-dead", runId: hit.runId, pid: hit.pid };
+		const livePid = liveBySid.get(s.sessionId);
+		// 合并：命令行 alive 高于 tab 历史 dead（与 mergeEvidence 同规则）
+		let evidence: LivenessEvidence | null = null;
+		if (hit) {
+			evidence = hit.alive
+				? { kind: "tab-pid-alive", runId: hit.runId, pid: hit.pid }
+				: { kind: "tab-pid-dead", runId: hit.runId, pid: hit.pid };
+		}
+		if (livePid !== undefined) {
+			const cmdEv: LivenessEvidence = { kind: "session-flag-alive", pid: livePid };
+			evidence = evidence ? mergeEvidence([evidence, cmdEv]) : cmdEv;
+		}
+		if (!evidence) continue;
+		const selPid = "pid" in evidence && evidence.pid > 0 ? evidence.pid : (hit?.pid ?? undefined);
 		index.set(s.sessionId, {
 			sessionId: s.sessionId,
 			liveness: livenessFromEvidence(evidence),
 			evidence,
-			runId: hit.runId,
-			pid: hit.pid,
+			...(hit ? { runId: hit.runId } : {}),
+			...(selPid !== undefined ? { pid: selPid } : {}),
 		});
 	}
-	// 已在 map 里的会话（bySession 未覆盖但 index 里有）一并保留
-	for (const [sid, v] of bySession) {
+	// 命令行命中但无 tab 记录的会话（典型：被拉起后的新实例）也必须入索引
+	for (const [sid, pid] of liveBySid) {
 		if (index.has(sid)) continue;
-		const evidence: LivenessEvidence = v.alive
-			? { kind: "tab-pid-alive", runId: v.runId, pid: v.pid }
-			: { kind: "tab-pid-dead", runId: v.runId, pid: v.pid };
-		index.set(sid, { sessionId: sid, liveness: livenessFromEvidence(evidence), evidence, runId: v.runId, pid: v.pid });
+		const evidence: LivenessEvidence = { kind: "session-flag-alive", pid };
+		index.set(sid, { sessionId: sid, liveness: "alive", evidence, pid });
 	}
 	return index;
+}
+
+/**
+ * 缓存版 `buildLivenessIndex`（GUI 列表专用）。
+ *
+ * 为何需要：批量索引里含一次 PowerShell 进程枚举，实测 2753ms。
+ * `/v1/sessions` 在 GUI 端可能每 6s 一次轮询 ⇒ 不缓存就是“把超时事故重演”。
+ *
+ * freshness 语义（sol 建议的最小实现）：
+ * - TTL 内复用快照（GUI 的 activity 只是展示，陈旧 5s 无害）
+ * - **POST 决策不用本缓存**：真正 spawn 前必须走 `probeSessionLiveness` 实时核验
+ * - 缓存过期时同步重建（不后台刷新，避免与 shutdown 竞争）
+ */
+const LIVENESS_INDEX_TTL_MS = 5_000;
+let livenessIndexCache: { at: number; dir: string; index: Map<string, SessionLivenessVerdict> } | null = null;
+
+function getCachedLivenessIndex(sessionsDir: string): Map<string, SessionLivenessVerdict> {
+	const now = Date.now();
+	const c = livenessIndexCache;
+	if (c !== null && c.dir === sessionsDir && now - c.at < LIVENESS_INDEX_TTL_MS) return c.index;
+	const index = buildLivenessIndex(sessionsDir);
+	livenessIndexCache = { at: Date.now(), dir: sessionsDir, index };
+	return index;
+}
+
+/** 供测试/命令失效缓存（daemon 重启或显式刷新时用）。 */
+export function invalidateLivenessIndexCache(): void {
+	livenessIndexCache = null;
+}
+
+/**
+ * 枚举一次进程表，返回 `sessionId → pid` 映射（活着的 pi 进程）。
+ * 供 `buildLivenessIndex` 批量使用（一次 PowerShell），不逐条调用。
+ * never-throw：失败返回空 Map（代表“没拿到命令行证据”，**不代表无活实例**）。
+ */
+function scanSessionCommandLines(): Map<string, number> {
+	const out = new Map<string, number>();
+	try {
+		const sidRe = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl/i;
+		if (process.platform === "win32") {
+			const script =
+				`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ` +
+				`Where-Object { $_.CommandLine -like '*pi-coding-agent*cli.js*' } | ` +
+				`ForEach-Object { "" + $_.ProcessId + "|" + $_.CommandLine }`;
+			const text = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+				encoding: "utf8", timeout: 15_000, windowsHide: true,
+			});
+			for (const line of text.split(/\r?\n/)) {
+				const bar = line.indexOf("|");
+				if (bar <= 0) continue;
+				const pid = Number.parseInt(line.slice(0, bar).trim(), 10);
+				const cmd = line.slice(bar + 1);
+				if (!Number.isInteger(pid) || pid <= 0) continue;
+				if (!cmd.includes("--session")) continue;
+				const m = sidRe.exec(cmd);
+				if (m) out.set(m[1], pid);
+			}
+			return out;
+		}
+		const text = execFileSync("ps", ["-ax", "-o", "pid=,command="], { encoding: "utf8", timeout: 15_000 });
+		for (const line of text.split("\n")) {
+			const mm = /^\s*(\d+)\s+(.*)$/.exec(line);
+			if (!mm || !mm[2].includes("--session")) continue;
+			const m = sidRe.exec(mm[2]);
+			if (m) out.set(m[1], Number.parseInt(mm[1], 10));
+		}
+	} catch {
+		/* never-throw */
+	}
+	return out;
 }
 
 function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLivenessVerdict {
@@ -617,9 +711,9 @@ function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLi
 	try {
 		const file = findSessionFile(sessionsDir, sessionId);
 		if (file) {
-			const found = probeCommandLineForSessionFlag(file);
-			if (found === "found") evidenceListPush(evidences, { kind: "session-flag-alive", pid: 0 });
-			else if (found === "absent") evidenceListPush(evidences, { kind: "session-flag-absent" });
+			const probe = probeCommandLineForSessionFlag(file);
+			if (probe.kind === "found") evidenceListPush(evidences, { kind: "session-flag-alive", pid: probe.pid });
+			else if (probe.kind === "absent") evidenceListPush(evidences, { kind: "session-flag-absent" });
 			else evidenceListPush(evidences, { kind: "probe-unavailable", reason: "cmdline-probe-failed" });
 		}
 	} catch {
@@ -627,12 +721,17 @@ function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLi
 	}
 
 	const evidence = mergeEvidence(evidences);
+	// 顶层 `pid` / `runId` 必须从**最终选中的证据**派生。
+	// 旧实现用的是循环变量 `runId` / `pid`（最后一个访问的旧 tab，242324）——
+	// 当选中证据是 `session-flag-alive(291780)` 时，对外却报旧 pid，调用方/日志全被误导。
+	const selectedRunId = "runId" in evidence ? evidence.runId : undefined;
+	const selectedPid = "pid" in evidence && evidence.pid > 0 ? evidence.pid : undefined;
 	return {
 		sessionId,
 		liveness: livenessFromEvidence(evidence),
 		evidence,
-		...(runId ? { runId } : {}),
-		...(typeof pid === "number" ? { pid } : {}),
+		...(selectedRunId ?? runId ? { runId: selectedRunId ?? runId } : {}),
+		...(selectedPid !== undefined ? { pid: selectedPid } : {}),
 	};
 }
 
@@ -651,29 +750,53 @@ function readSessionHeaderRecord(file: string): { type?: unknown; cwd?: unknown;
 }
 
 /**
- * 命令行里有**精确**的 `--session <该会话文件>` 吗。仅用于非 tab 会话回落判定。
- * never-throw：探针失败返回 "error"（调用方判 unknown，不判 dead）。
+ * 命令行探针结果。**必须带真实 pid** —— 旧实现只返回 `"found"`，然后在调用处
+ * 伪造 `pid: 0`，导致对外报的 pid 与实际活进程脱节（sol 2026-10-30 指出）。
+ * never-throw：探针失败返回 `error`（调用方判 unknown，**不判 dead**）。
  */
-function probeCommandLineForSessionFlag(sessionFile: string): "found" | "absent" | "error" {
+type CommandLineProbe = { kind: "found"; pid: number } | { kind: "absent" } | { kind: "error" };
+
+/**
+ * 命令行里有**精确**的 `--session <该会话文件>` 吗。仅用于非 tab 会话回落判定。
+ *
+ * ⚠ 已知局限（sol 指出，本次不修，记在此防遗忘）：
+ * `includes("--session") && includes(base)` 并未证明 base 就是 `--session` 的**参数**
+ * （理论上命令行可在别处出现该文件名），也没证明加载后没有切到其它会话。
+ * 当前实测到的 291780 命令行确实直接带目标文件，不是靠裸 UUID 推断。
+ * 真正加固应解析 argv 并校验会话身份（配合 session_start 实例登记）。
+ */
+function probeCommandLineForSessionFlag(sessionFile: string): CommandLineProbe {
 	try {
+		const base = sessionFile.split(/[\\/]/).pop() ?? sessionFile;
 		if (process.platform === "win32") {
+			// 一并取 ProcessId（旧脚本只取 CommandLine ⇒ 拿不到 pid）
 			const script =
 				`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ` +
 				`Where-Object { $_.CommandLine -like '*pi-coding-agent*cli.js*' } | ` +
-				`ForEach-Object { $_.CommandLine }`;
+				`ForEach-Object { "" + $_.ProcessId + "|" + $_.CommandLine }`;
 			const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
 				encoding: "utf8", timeout: 10_000, windowsHide: true,
 			});
-			// 精确：命令行里出现该会话的**文件名**（含唯一 sessionId），且带 --session
-			const base = sessionFile.split(/[\\/]/).pop() ?? sessionFile;
-			const hit = out.split(/\r?\n/).some((cmd) => cmd.includes("--session") && cmd.includes(base));
-			return hit ? "found" : "absent";
+			for (const line of out.split(/\r?\n/)) {
+				const bar = line.indexOf("|");
+				if (bar <= 0) continue;
+				const pid = Number.parseInt(line.slice(0, bar).trim(), 10);
+				const cmd = line.slice(bar + 1);
+				if (!Number.isInteger(pid) || pid <= 0) continue;
+				if (cmd.includes("--session") && cmd.includes(base)) return { kind: "found", pid };
+			}
+			return { kind: "absent" };
 		}
-		const out = execFileSync("ps", ["-ax", "-o", "command"], { encoding: "utf8", timeout: 10_000 });
-		const base = sessionFile.split("/").pop() ?? sessionFile;
-		return out.split("\n").some((cmd) => cmd.includes("--session") && cmd.includes(base)) ? "found" : "absent";
+		// POSIX：`ps -ax -o pid=,command=` 同时在一次调用里拿 pid
+		const out = execFileSync("ps", ["-ax", "-o", "pid=,command="], { encoding: "utf8", timeout: 10_000 });
+		for (const line of out.split("\n")) {
+			const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+			if (!m) continue;
+			if (m[2].includes("--session") && m[2].includes(base)) return { kind: "found", pid: Number.parseInt(m[1], 10) };
+		}
+		return { kind: "absent" };
 	} catch {
-		return "error";
+		return { kind: "error" };
 	}
 }
 
@@ -1722,7 +1845,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 							if (decision.action === "spawn-then-send") {
 								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
 								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title: resumeTabTitle(targetSid) });
-								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), probe };
+								// 注意：`probe` 变量已不存在（改用 `verdict`）——旧代码引用它会被外层 catch 吞掉，
+								// 导致“拉起失败”永远不登账。这里用 verdict.evidence 代替。
+								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), evidence: verdict.evidence };
 							}
 						}
 					}
@@ -2466,8 +2591,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						// isScopeMaster = 命中某 scope attachment 且该 scope 解码 basename == 会话 cwd basename
 						//（解码失败不标；session-pin.ts 纯读 never-throw；字段 additive，仅 true 挂出）。
 						const pins = computeSessionPinFlags(sessions);
-						// 存活索引：一次遍历建表（O(N+M)），不逐条跑探针
-						const livenessIndex = buildLivenessIndex(sessDir);
+						// 存活索引：一次遍历建表。含一次 PowerShell 进程枚举（~2.4s）⇒ 必须缓存，
+						// 不能每 6s 一次的列表轮询都重跑（否则重演一次超时事故）。
+						const livenessIndex = getCachedLivenessIndex(sessDir);
 						body = {
 							version: 1,
 							count: sessions.length,
