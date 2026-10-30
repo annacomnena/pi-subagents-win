@@ -145,6 +145,7 @@ import {
 } from "../tab-runs.ts";
 import { isProcessAlive } from "../runtime/liveness.ts";
 import {
+	activityOf,
 	livenessFromEvidence,
 	livenessFromTabState,
 	mergeEvidence,
@@ -2377,10 +2378,16 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 								// 契约字段是 titleSource（GUI types.ts 与 SessionList 全 tab 组折叠判据均读它）；
 								// SessionTitle.source 是解析链内部字段名，上线时显式映射，不再直接 spread。
 								const t = titles.get(s.sessionId);
+								const lv = probeSessionLiveness(s.sessionId, sessDir);
+								// 活跃状态（owner 2026-10-30：「最近更新/按创建」→「最近更新/活跃中」）。
+								// 与 mtime **正交**：刚读过但进程已退 ⇒ mtime 新但 inactive；
+								// 进程活着但长思考 ⇒ mtime 旧但 active；缺证据 ⇒ unknown（不当作 inactive）。
 								return {
 									...s,
 									title: t !== undefined ? t.title : s.sessionId,
-								titleSource: t !== undefined ? t.source : ("id" as const),
+									activity: activityOf(lv.liveness),
+									...(typeof lv.pid === "number" ? { pid: lv.pid } : {}),
+									titleSource: t !== undefined ? t.source : ("id" as const),
 									...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
 									...(pin?.isMaster ? { isMaster: true as const } : {}),
 									...(pin?.isScopeMaster ? { isScopeMaster: true as const } : {}),
