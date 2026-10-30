@@ -41,6 +41,7 @@ import { registerWikiNav } from "./wiki-nav.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
 import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
+import { defaultSessionsDir, findSessionFile } from "./runtime/transcript.ts";
 import { globalViewLogic, parseGlobalViewArgs } from "./runtime/global-view.ts";
 import { runtimeHostStatus, startRuntimeHost, stopRuntimeHost } from "./runtime-host/server.ts";
 import { setAutonomyEnabled } from "./runtime-host/autonomy-config.ts";
@@ -3078,7 +3079,7 @@ export default function (pi: ExtensionAPI) {
 		description: "幂等确保目标仓 local master 存活：/local-master-ensure <cwd> [--no-wait] [--timeout <ms>]（活 master 且消费证据新鲜零动作；消费侧未证明 → consume-unverified；不带 forceStale/token）。仅在用户明确要求时使用",
 		handler: async (args, ctx) => {
 			// M1：解析抽成导出纯函数（flag 与位置参数任意顺序；--timeout 的值不得被当成 cwd）
-			const { cwd: cwdArg, noWait, timeoutMs: parsedTimeout } = parseLocalMasterEnsureArgs(args);
+			const { cwd: cwdArg, noWait, timeoutMs: parsedTimeout, forceNew } = parseLocalMasterEnsureArgs(args);
 			const sid = durableSessionIdentity(ctx as never);
 			const audit = (result: string): void =>
 				auditLocalMasterEnsure({
@@ -3107,8 +3108,25 @@ export default function (pi: ExtensionAPI) {
 					sessionId: sid,
 					waitForReady: !noWait,
 					...(typeof parsedTimeout === "number" && Number.isFinite(parsedTimeout) ? { timeoutMs: parsedTimeout } : {}),
+					...(forceNew ? { forceNew: true } : {}),
 				},
-				{ spawn: ensureLocalMasterTab },
+				{
+					spawn: ensureLocalMasterTab,
+					// 2026-10-30：续接本地依赖。两处都 never-throw（缺 session / 读不出 cwd ⇒ 回落新建）。
+					findSessionFile: (sessionId: string) => {
+						try { return findSessionFile(defaultSessionsDir(), sessionId); } catch { return null; }
+					},
+					readSessionCwd: (sessionId: string) => {
+						try {
+							const f = findSessionFile(defaultSessionsDir(), sessionId);
+							if (!f) return null;
+							// 首行是 {type:"session", cwd}；只读第一行，不整文件解析。
+							const head = readFileSync(f, "utf8").split("\n", 1)[0] ?? "";
+							const rec = JSON.parse(head) as { type?: string; cwd?: unknown };
+							return rec.type === "session" && typeof rec.cwd === "string" ? rec.cwd : null;
+						} catch { return null; }
+					},
+				},
 			);
 			audit(`${r.status}${r.reason ? `:${r.reason}` : ""}`);
 			ctx.ui.notify(formatLocalMasterEnsureResult(r), ensureResultIsError(r) ? "warning" : "info");
@@ -3428,8 +3446,10 @@ export default function (pi: ExtensionAPI) {
 		emitRuntimeEventOnce(tabDispatchToRuntimeEvent(dispatch));
 		recordLink({ sessionId: args.sessionId, kind: "tab", targetId: runId, detail: `local-master=${args.scope}` });
 		// 角色区间门适用域：local-master 常驻 tab（无角色归属），costTier 角色区间门不适用。
+		// 2026-10-30 owner 裁决：续接原 owner 会话（args.resumeSessionFile 由 decideResume 产出）。
 		const result = spawnPiTab({
 			wtPath, piCli, cwd: args.cwd, title, prompt: args.prompt, tabRunId: runId, runsDir,
+			...(args.resumeSessionFile ? { sessionFile: args.resumeSessionFile } : {}),
 			onSpawnError: markFailed,
 		});
 		if (result.error) {

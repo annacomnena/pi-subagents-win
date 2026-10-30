@@ -82,6 +82,8 @@ export interface LocalMasterEnsureArgs {
 	noWait: boolean;
 	/** `--timeout` 的值（仅有限数值时给出；非法/缺失 → 不给，走 clampEnsureTimeout 缺省）。 */
 	timeoutMs?: number;
+	/** `--new-generation`：人已同意开新一代（默认 false=续接原 owner 会话）。 */
+	forceNew?: boolean;
 }
 
 /**
@@ -96,11 +98,16 @@ export interface LocalMasterEnsureArgs {
 export function parseLocalMasterEnsureArgs(args?: string): LocalMasterEnsureArgs {
 	const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 	const tIdx = parts.indexOf("--timeout");
-	const positional = parts.filter((p, i) => !p.startsWith("--") && i !== tIdx + 1);
+	// 修复（2026-10-30）：旧实现 `i !== tIdx + 1` 在 **`--timeout` 缺席时**（tIdx=-1）
+	// 变成 `i !== 0` ⇒ 误把第一个位置参数（cwd）排掉 ⇒ cwd 恒为空串。
+	// 只有 tIdx>=0 时才需要排除「--timeout 的值」。
+	const positional = parts.filter((p, i) => !p.startsWith("--") && !(tIdx >= 0 && i === tIdx + 1));
 	const raw = tIdx >= 0 ? Number(parts[tIdx + 1]) : undefined;
 	return {
 		cwd: (positional[0] ?? "").trim(),
 		noWait: parts.includes("--no-wait"),
+		// 2026-10-30 owner 裁决：默认续接；`--new-generation` 是**显式例外**（人已同意开新）。
+		forceNew: parts.includes("--new-generation"),
 		...(typeof raw === "number" && Number.isFinite(raw) ? { timeoutMs: raw } : {}),
 	};
 }
@@ -571,6 +578,11 @@ export interface LocalMasterSpawnArgs {
 	prompt: string;
 	taskId: string;
 	launchAt: string;
+	/**
+	 * 续接的会话文件（绝对路径）。undefined ⇒ 全新会话（现状）。
+	 * 2026-10-30 owner 裁决：local master 默认续接原 owner 会话。
+	 */
+	resumeSessionFile?: string;
 }
 
 export type LocalMasterSpawn = (args: LocalMasterSpawnArgs) => { runId?: string; error?: string };
@@ -589,8 +601,60 @@ export interface LocalMasterEnsureDeps {
 	consumeFreshMs?: number;
 	isAlive?: (pid: number) => boolean;
 	isDirectory?: (cwd: string) => boolean;
+	/** 按 sessionId 解出 session 文件绝对路径（缺省无；测试注入）。 */
+	findSessionFile?: (sessionId: string) => string | null;
+	/** 读会话文件头记录的 cwd（续接硬约束：必须与当前 cwd 一致）；缺省无。 */
+	readSessionCwd?: (sessionId: string) => string | null;
 	stateDir?: string;
 	pollIntervalMs?: number;
+}
+
+// ── 续接裁决（纯函数，可单测）────────────────────────────────────
+
+/** 续接裁决结果。`resume` 带可续接的 session 文件；`new` 走全新会话。 */
+export type ResumeDecision =
+	| { action: "resume"; sessionFile: string; reason: "owner-session-found" }
+	| { action: "new"; reason: "no-attachment" | "session-file-missing" | "force-new" | "cwd-mismatch" };
+
+/**
+ * 判定 local master 该续接还是新建。**纯函数**，不碰磁盘（所有 IO 由调用方注入）。
+ *
+ * owner 裁决（2026-10-30）：「local master 本身应当续接；除非我或者 local 自己认为
+ * 应当开新的一代并且用户同意了开新而不是压缩」。
+ *
+ * ⇒ **默认续接**；`forceNew` 是显式例外，调用方只有在**已获得用户同意**后才能传 true。
+ * 本函数**绝不自动判定开新**（没有时间窗/上下文长度启发式）。
+ *
+ * 三个拒绝续接的理由（均回落新建，不报错）：
+ * - `no-attachment`：本 scope 无 owner，无历史可续
+ * - `session-file-missing`：attachment 存在但 session 文件已丢（清理/迁移），无从续
+ * - `cwd-mismatch`：会话记录的 cwd 与当前 cwd 不同。**这是硬约束**：实测 pi 对
+ *   `Stored session working directory does not exist` 会直接拒绝启动；即便存在，
+ *   续接到跳仓的会话也会把 local master 带到错的目录
+ */
+export function decideResume(input: {
+	ownerSessionId: string | null;
+	/** 该 sessionId 对应的 session 文件绝对路径（调用方用 findSessionFile 解析）；null=找不到。 */
+	sessionFile: string | null;
+	/** 会话文件头记录的 cwd；null=读不出（当作不匹配）。 */
+	sessionCwd: string | null;
+	/** 当前 cwd（本仓）。 */
+	cwd: string;
+	/** 人已同意开新一代时为 true（默认 false）。 */
+	forceNew?: boolean;
+}): ResumeDecision {
+	if (input.forceNew === true) return { action: "new", reason: "force-new" };
+	if (!input.ownerSessionId) return { action: "new", reason: "no-attachment" };
+	if (!input.sessionFile) return { action: "new", reason: "session-file-missing" };
+	if (!input.sessionCwd || normalizeCwdKey(input.sessionCwd) !== normalizeCwdKey(input.cwd)) {
+		return { action: "new", reason: "cwd-mismatch" };
+	}
+	return { action: "resume", sessionFile: input.sessionFile, reason: "owner-session-found" };
+}
+
+/** Windows 路径比较键：斜杠归一 + 小写 + 去尾斜杠（不碰盘，纯字符串）。 */
+export function normalizeCwdKey(p: string): string {
+	return p.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 // ── 编排 ───────────────────────────────────────────────────────────
@@ -602,7 +666,7 @@ export interface LocalMasterEnsureDeps {
  * 本函数只做 precheck → in-flight → spawn → 就绪轮询。
  */
 export async function ensureLocalMaster(
-	input: { cwd: string; sessionId: string; waitForReady?: boolean; timeoutMs?: number },
+	input: { cwd: string; sessionId: string; waitForReady?: boolean; timeoutMs?: number; /** 人已同意开新一代；默认 false=续接 */ forceNew?: boolean },
 	deps: LocalMasterEnsureDeps,
 ): Promise<LocalMasterEnsureResult> {
 	const now = deps.now ?? Date.now;
@@ -685,6 +749,22 @@ export async function ensureLocalMaster(
 		};
 	}
 
+	// ── 续接裁决（2026-10-30 owner：local master 默认续接原 owner 会话）──
+	// 注意：本块**必须在 in-flight 防重之后**（只有真 spawn 时才需确定续接哪份），
+	// 且**绝不能自动判定开新**——forceNew 只来自调用方（人已同意）。
+	const preAttForResume = readAtt(addr);
+	const resume = decideResume({
+		ownerSessionId: preAttForResume?.sessionId ?? null,
+		sessionFile: preAttForResume?.sessionId
+			? (deps.findSessionFile ?? (() => null))(preAttForResume.sessionId)
+			: null,
+		sessionCwd: preAttForResume?.sessionId
+			? (deps.readSessionCwd ?? (() => null))(preAttForResume.sessionId)
+			: null,
+		cwd,
+		forceNew: input.forceNew === true,
+	});
+
 	// ── spawn：可见 tab + bootstrap prompt（不带 token/forceStale/global 指令）──
 	const launchAt = new Date(now()).toISOString();
 	let spawned: { runId?: string; error?: string };
@@ -694,9 +774,13 @@ export async function ensureLocalMaster(
 			cwd,
 			scope: scopeKey,
 			agentAddress: addr,
-			prompt: buildLocalMasterBootstrapPrompt(scopeKey, addr, cwd),
+			prompt: resume.sessionFile
+				// 续接：bootstrap prompt 追加「续接会话」提示，否则它会以为自己刚 genesis
+				? `${buildLocalMasterBootstrapPrompt(scopeKey, addr, cwd)}\n\n── 续接会话 ──\n本会话是**续接**的（原 owner 会话），不是 genesis。你应保留既有对话上下文；但**务必先用 /master-status 核验当前归属行 owner 是你、generation 与 liveness 一致**——历史上下文可能已过时（其他会话可能在这段时间接管过）。以盘上现状为准，不以记忆为准。`
+				: buildLocalMasterBootstrapPrompt(scopeKey, addr, cwd),
 			taskId: ensureTaskId(scopeKey),
 			launchAt,
+			...(resume.sessionFile ? { resumeSessionFile: resume.sessionFile } : {}),
 		});
 	} catch (e) {
 		spawned = { error: e instanceof Error ? e.message : String(e) };

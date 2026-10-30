@@ -177,6 +177,14 @@ export interface PiLaunchArgsOptions {
 	execPath: string;
 	model?: string;
 	/**
+	 * 续接已有会话（`--session <file>`）。
+	 *
+	 * 2026-10-30：local master 续接（owner 裁决「local master 本身应当续接」）。
+	 * **必须是绝对路径**且文件存在，且该会话记录的 cwd 必须仍存在——
+	 * 实测 pi 会报 `Stored session working directory does not exist` 并拒绝启动。
+	 */
+	sessionFile?: string;
+	/**
 	 * Skill roots/files guaranteed via --skill (canonical-path deduped against
 	 * package-registered skills, so passing the same skills/ root is a no-op
 	 * guarantee rather than a duplicate).
@@ -207,6 +215,8 @@ export function buildWindowsTerminalArgs(
 		piArgs.push("--exclude-tools", options.excludeTools.join(","));
 	}
 	if (options.sessionProfile) piArgs.push("--session-profile", options.sessionProfile);
+	// 续接已有会话：位置在 prompt 之前、身份 flag 附近（pi 解析顺序无关，但保持可读）
+	if (options.sessionFile) piArgs.push("--session", options.sessionFile);
 	if (options.traceRunId) piArgs.push("--trace-run-id", options.traceRunId);
 	if (options.traceLane) piArgs.push("--trace-lane", options.traceLane);
 	if (options.tabRunId) piArgs.push("--tab-run-id", options.tabRunId);
@@ -307,6 +317,12 @@ export interface TabLaunchOptions {
 	runsDir?: string;
 	/** 会话身份（trace worker 注入；workflow 路径不传）。 */
 	sessionProfile?: string;
+	/**
+	 * 续接已有会话（绝对路径，`pi --session <file>`）。
+	 * 2026-10-30 owner 裁决：local master 应续接；GUI 拉起任意 session 也走此字段。
+	 * 调用方必须自验：文件存在 + 会话记录的 cwd 仍存在（否则 pi 会拒绝启动）。
+	 */
+	sessionFile?: string;
 	traceRunId?: string;
 	traceLane?: string;
 	/** 工具排除名单（trace worker §17：隔离 launch/timer/wiki 写工具）；仅显式传入才发射。 */
@@ -434,6 +450,7 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 			skills,
 			tabRunId,
 			sessionProfile: options.sessionProfile,
+			sessionFile: options.sessionFile,
 			traceRunId: options.traceRunId,
 			traceLane: options.traceLane,
 			excludeTools: options.excludeTools,
