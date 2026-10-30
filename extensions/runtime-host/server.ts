@@ -441,6 +441,102 @@ let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["max
  * `--session <该会话文件>`；匹配不到只判 unknown（**不是 dead**，因为 @prompt
  * 等形态命令行也看不到 sessionId）。
  */
+/**
+ * 批量建索：一次算出「所有 tab state」与「所有会话的 activity」。
+ *
+ * 为什么必须批量：`/v1/sessions` 有 1000+ 会话，单条调用 `probeSessionLiveness`
+ * 每次都要遍历 500 条 tab dispatch ⇒ O(N×500) ≈ 50 万次 readTabState，
+ * 实测直接把请求拖到 curl 超时（我自己引入的性能事故）。
+ *
+ * 批量版只做两轮 O(N+M)：
+ *   1. 遍历一遍 tab dispatch → 建 `sessionId → {runId, pid, alive}` 映射
+ *   2. 遍历一遍会话 → O(1) 查表
+ */
+export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLivenessVerdict> {
+	const index = new Map<string, SessionLivenessVerdict>();
+	const runsDir = defaultTabRunsDir();
+	/** sessionId → 最强的 tab 证据（dead 优先，与 mergeEvidence 同规则） */
+	const bySession = new Map<string, { runId: string; pid: number; alive: boolean }>();
+
+	try {
+		const dispatches = listTabDispatches(runsDir, 500);
+		const states: Array<{ id: string; st: NonNullable<ReturnType<typeof readTabState>>; cwd?: string; dispatchedAt?: string }> = [];
+		for (const d of dispatches) {
+			const st = readTabState(runsDir, d.id);
+			if (!st || typeof st.pid !== "number") continue;
+			states.push({ id: d.id, st, cwd: d.cwd, dispatchedAt: d.dispatchedAt });
+			const sp = typeof st.sessionPath === "string" ? st.sessionPath : "";
+			if (!sp) continue; // 旧记录无 sessionPath ⇒ 走下面的 legacy 兜底
+			// 从路径里抽 sessionId：`<ts>_<sessionId>.jsonl`
+			const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(sp);
+			if (!m) continue;
+			const sid = m[1];
+			const alive = isProcessAlive(st.pid);
+			const prev = bySession.get(sid);
+			// dead 优先（tab state 是权威；同会话多条记录时取最强）
+			if (!prev || (!alive && prev.alive)) {
+				bySession.set(sid, { runId: d.id, pid: st.pid, alive });
+			}
+		}
+
+		// legacy 兜底（旧 state 无 sessionPath）：同 cwd 桶 + dispatchedAt 与会话 timestamp
+		// 相差 < 10min 就近配对。只对**尚未**入索引的会话做，且只产出真实 pid 证据。
+		const legacy = states.filter((x) => !(typeof x.st.sessionPath === "string" && x.st.sessionPath));
+		if (legacy.length > 0) {
+			for (const s of listPiSessions(sessionsDir)) {
+				if (bySession.has(s.sessionId)) continue;
+				if (!s.cwd) continue;
+				const bucket = sessionBucketForCwd(s.cwd);
+				const sessTs = Date.parse(s.startedAt);
+				if (!Number.isFinite(sessTs)) continue;
+				let best: { id: string; pid: number; delta: number } | null = null;
+				for (const x of legacy) {
+					if (!x.cwd || sessionBucketForCwd(x.cwd) !== bucket) continue;
+					const dm = Date.parse(x.dispatchedAt ?? "");
+					if (!Number.isFinite(dm)) continue;
+					const delta = Math.abs(dm - sessTs);
+					if (delta > 10 * 60_000) continue;
+					if (!best || delta < best.delta) best = { id: x.id, pid: x.st.pid!, delta };
+				}
+				if (best) bySession.set(s.sessionId, { runId: best.id, pid: best.pid, alive: isProcessAlive(best.pid) });
+			}
+		}
+	} catch {
+		/* 索引建失败 → 全部回落 unknown，不影响主流程 */
+	}
+
+	// 所有会话先默认 unknown（最保守：不拉起）；命中的改写
+	let all: Array<{ sessionId: string }> = [];
+	try {
+		all = listPiSessions(sessionsDir).map((s) => ({ sessionId: s.sessionId }));
+	} catch {
+		all = [];
+	}
+	for (const s of all) {
+		const hit = bySession.get(s.sessionId);
+		if (!hit) continue;
+		const evidence: LivenessEvidence = hit.alive
+			? { kind: "tab-pid-alive", runId: hit.runId, pid: hit.pid }
+			: { kind: "tab-pid-dead", runId: hit.runId, pid: hit.pid };
+		index.set(s.sessionId, {
+			sessionId: s.sessionId,
+			liveness: livenessFromEvidence(evidence),
+			evidence,
+			runId: hit.runId,
+			pid: hit.pid,
+		});
+	}
+	// 已在 map 里的会话（bySession 未覆盖但 index 里有）一并保留
+	for (const [sid, v] of bySession) {
+		if (index.has(sid)) continue;
+		const evidence: LivenessEvidence = v.alive
+			? { kind: "tab-pid-alive", runId: v.runId, pid: v.pid }
+			: { kind: "tab-pid-dead", runId: v.runId, pid: v.pid };
+		index.set(sid, { sessionId: sid, liveness: livenessFromEvidence(evidence), evidence, runId: v.runId, pid: v.pid });
+	}
+	return index;
+}
+
 function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLivenessVerdict {
 	if (!sessionId) {
 		return { sessionId, liveness: "unknown", evidence: { kind: "probe-unavailable", reason: "empty-session-id" } };
@@ -2370,6 +2466,8 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						// isScopeMaster = 命中某 scope attachment 且该 scope 解码 basename == 会话 cwd basename
 						//（解码失败不标；session-pin.ts 纯读 never-throw；字段 additive，仅 true 挂出）。
 						const pins = computeSessionPinFlags(sessions);
+						// 存活索引：一次遍历建表（O(N+M)），不逐条跑探针
+						const livenessIndex = buildLivenessIndex(sessDir);
 						body = {
 							version: 1,
 							count: sessions.length,
@@ -2378,15 +2476,17 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 								// 契约字段是 titleSource（GUI types.ts 与 SessionList 全 tab 组折叠判据均读它）；
 								// SessionTitle.source 是解析链内部字段名，上线时显式映射，不再直接 spread。
 								const t = titles.get(s.sessionId);
-								const lv = probeSessionLiveness(s.sessionId, sessDir);
+								const lv = livenessIndex.get(s.sessionId);
 								// 活跃状态（owner 2026-10-30：「最近更新/按创建」→「最近更新/活跃中」）。
 								// 与 mtime **正交**：刚读过但进程已退 ⇒ mtime 新但 inactive；
 								// 进程活着但长思考 ⇒ mtime 旧但 active；缺证据 ⇒ unknown（不当作 inactive）。
+								// 用索引表 O(1) 查，不逐条跑探针（那是 O(N×500) 性能事故）。
+								const activity = lv ? activityOf(lv.liveness) : ("unknown" as const);
 								return {
 									...s,
 									title: t !== undefined ? t.title : s.sessionId,
-									activity: activityOf(lv.liveness),
-									...(typeof lv.pid === "number" ? { pid: lv.pid } : {}),
+									activity,
+									...(lv && typeof lv.pid === "number" ? { pid: lv.pid } : {}),
 									titleSource: t !== undefined ? t.source : ("id" as const),
 									...(protectedSid !== null && s.sessionId === protectedSid ? { masterProtected: true as const } : {}),
 									...(pin?.isMaster ? { isMaster: true as const } : {}),
