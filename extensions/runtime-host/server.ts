@@ -135,13 +135,29 @@ import {
 } from "./commands.ts";
 import { validateStreamGen } from "../runtime/stream-gen.ts";
 import { readLiveness } from "../runtime/liveness.ts";
+// 2026-10-30 会话存活状态机（S2 探针 + GUI「活跃中」筛选共用单一事实源）
+import {
+	defaultTabRunsDir,
+	listTabDispatches,
+	probeSessionsForDispatch,
+	readTabState,
+	sessionBucketForCwd,
+} from "../tab-runs.ts";
+import { isProcessAlive } from "../runtime/liveness.ts";
+import {
+	livenessFromEvidence,
+	livenessFromTabState,
+	mergeEvidence,
+	type LivenessEvidence,
+	type SessionLivenessVerdict,
+} from "../runtime/session-liveness.ts";
 import { readSessionUsage } from "../runtime/session-usage.ts";
 import { readNotify } from "../runtime/notify-bridge.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 // 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
-import { decideSendAction, isSpawnPermitted, livenessFromProbe, resumeTabTitle } from "../runtime/session-resume.ts";
+import { decideSendAction, isSpawnPermitted, resumeTabTitle } from "../runtime/session-resume.ts";
 import { parseObjectAddress } from "../runtime/address.ts";
 import { spawnPiTab } from "../tab-launch-core.ts";
 import { piSessionAddress } from "../runtime/address.ts";
@@ -406,47 +422,122 @@ let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["max
 
 /** 会话根 + 一层子目录的 `(mtimeMs,size)` 指纹（stat-only，O(目录数) 而非 O(文件数)）。失败 → null。 */
 /**
- * 枚举进程表，看有没有**带该 sessionId 的 pi 进程**。
+ * 判定某会话的存活状态。**用 pid，不用命令行匹配**。
  *
- * 为什么不用 `sessionAlive()`：它读的是 `timers/sessions/<sid>.json` 的
- * `lastActiveAt`，语义是「最近 15 秒内有过活动」，**不是「进程活着」**。
- * 2026-10-30 事故：正常对话时模型思考 >15s ⇒ 心跳过期 ⇒ 误判 dead ⇒
- * 每发一条消息拉起一个新 tab。
+ * ── 2026-10-30 第二次事故（这次是真正的根因）──
  *
- * 三态返回（**探不到 ≠ 已死**，AGENTS §0）：
- * - `has-live-process`：命令行里含 `--session <该会话文件>` 或 `--session-id <sid>`
- * - `no-live-process`：枚举成功且确证无匹配
- * - `probe-unavailable`：枚举失败/平台不支持
+ * 第一版枚举 node.exe 命令行找 sessionId。**但 pi tab 的常态启动形态是**
+ * `pi --tab-run-id X @prompt.md` —— **命令行里根本没有 sessionId**！
+ * 实测：活着的 tab `pid 90508` 正是此形态 ⇒ 永远判 no-live-process ⇒ dead
+ * ⇒ 每发一条消息拉起一个 tab。
+ *
+ * 正确判据：`tab-runs/<runId>.state.json` 里写了该 tab 自己进程的 `pid`
+ * （`tab-runs-runtime.ts:250`）。按 cwd 桶 + taskId 把会话对到 tab 记录，
+ * 再 `isProcessAlive(pid)` —— 不受启动形态影响。
+ *
+ * 非 tab 会话（`pi --session <file>` 直接起的，如主会话）回落到命令行**精确匹配**
+ * `--session <该会话文件>`；匹配不到只判 unknown（**不是 dead**，因为 @prompt
+ * 等形态命令行也看不到 sessionId）。
  */
-function probeSessionProcess(sessionId: string): "has-live-process" | "no-live-process" | "probe-unavailable" {
-	if (!sessionId) return "probe-unavailable";
+function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLivenessVerdict {
+	if (!sessionId) {
+		return { sessionId, liveness: "unknown", evidence: { kind: "probe-unavailable", reason: "empty-session-id" } };
+	}
+	const evidences: LivenessEvidence[] = [];
+	let runId: string | undefined;
+	let pid: number | undefined;
+
+	// ① 主路径：找该会话对应的 tab 记录（按 cwd 桶 + taskId 前缀匹配），读 state.pid
+	try {
+		const file = findSessionFile(sessionsDir, sessionId);
+		const rec = file !== null ? readSessionHeaderRecord(file) : null;
+		const sessionCwd = typeof rec?.cwd === "string" ? rec.cwd : null;
+		if (sessionCwd) {
+			const bucket = sessionBucketForCwd(sessionCwd);
+			for (const d of listTabDispatches(defaultTabRunsDir(), 200)) {
+				if (!d.cwd || sessionBucketForCwd(d.cwd) !== bucket) continue;
+				// 用 probe：确认该 tab 记录确实指向这个 sessionId
+				const probes = probeSessionsForDispatch(d);
+				if (!probes.some((pr) => pr.sessionId === sessionId)) continue;
+				const st = readTabState(defaultTabRunsDir(), d.id);
+				const r = livenessFromTabState(st, isProcessAlive);
+				if (r.evidenceKind === "tab-pid-alive") {
+					runId = d.id; pid = st?.pid;
+					evidenceListPush(evidences, { kind: "tab-pid-alive", runId: d.id, pid: st!.pid! });
+				} else if (r.evidenceKind === "tab-pid-dead") {
+					runId = d.id; pid = st?.pid;
+					evidenceListPush(evidences, { kind: "tab-pid-dead", runId: d.id, pid: st!.pid! });
+				}
+			}
+		}
+	} catch {
+		evidenceListPush(evidences, { kind: "probe-unavailable", reason: "tab-state-read-failed" });
+	}
+
+	// ② 回落：命令行精确含 `--session <该会话文件>`
+	try {
+		const file = findSessionFile(sessionsDir, sessionId);
+		if (file) {
+			const found = probeCommandLineForSessionFlag(file);
+			if (found === "found") evidenceListPush(evidences, { kind: "session-flag-alive", pid: 0 });
+			else if (found === "absent") evidenceListPush(evidences, { kind: "session-flag-absent" });
+			else evidenceListPush(evidences, { kind: "probe-unavailable", reason: "cmdline-probe-failed" });
+		}
+	} catch {
+		evidenceListPush(evidences, { kind: "probe-unavailable", reason: "cmdline-probe-threw" });
+	}
+
+	const evidence = mergeEvidence(evidences);
+	return {
+		sessionId,
+		liveness: livenessFromEvidence(evidence),
+		evidence,
+		...(runId ? { runId } : {}),
+		...(typeof pid === "number" ? { pid } : {}),
+	};
+}
+
+function evidenceListPush(arr: LivenessEvidence[], e: LivenessEvidence): void {
+	arr.push(e);
+}
+
+/** 读会话文件首行（`{type:"session", cwd}`）。never-throw。 */
+function readSessionHeaderRecord(file: string): { type?: unknown; cwd?: unknown; timestamp?: unknown } | null {
+	try {
+		const head = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
+		return JSON.parse(head) as { type?: unknown; cwd?: unknown; timestamp?: unknown };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 命令行里有**精确**的 `--session <该会话文件>` 吗。仅用于非 tab 会话回落判定。
+ * never-throw：探针失败返回 "error"（调用方判 unknown，不判 dead）。
+ */
+function probeCommandLineForSessionFlag(sessionFile: string): "found" | "absent" | "error" {
 	try {
 		if (process.platform === "win32") {
-			// 只拉 pi 进程（命令行含 pi-coding-agent）再在 JS 侧匹配 sessionId，
-			// 避免把 sid 拼进 PowerShell 字符串造成注入风险。
 			const script =
 				`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ` +
 				`Where-Object { $_.CommandLine -like '*pi-coding-agent*cli.js*' } | ` +
 				`ForEach-Object { $_.CommandLine }`;
 			const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-				encoding: "utf8",
-				timeout: 15_000,
-				windowsHide: true,
+				encoding: "utf8", timeout: 10_000, windowsHide: true,
 			});
-			const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-			// 精确匹配：`--session <path>...<sid>.jsonl` 或 `--session-id <sid>`。
-			// 不用裸子串（防 sid 前缀碰巧出现在别处）。
-			const hit = lines.some((cmd) => cmd.includes(sessionId));
-			return hit ? "has-live-process" : "no-live-process";
+			// 精确：命令行里出现该会话的**文件名**（含唯一 sessionId），且带 --session
+			const base = sessionFile.split(/[\\/]/).pop() ?? sessionFile;
+			const hit = out.split(/\r?\n/).some((cmd) => cmd.includes("--session") && cmd.includes(base));
+			return hit ? "found" : "absent";
 		}
-		// POSIX：ps -ax -o command
-		const out = execFileSync("ps", ["-ax", "-o", "command"], { encoding: "utf8", timeout: 15_000 });
-		const hit = out.split("\n").some((cmd) => cmd.includes("pi-coding-agent") && cmd.includes(sessionId));
-		return hit ? "has-live-process" : "no-live-process";
+		const out = execFileSync("ps", ["-ax", "-o", "command"], { encoding: "utf8", timeout: 10_000 });
+		const base = sessionFile.split("/").pop() ?? sessionFile;
+		return out.split("\n").some((cmd) => cmd.includes("--session") && cmd.includes(base)) ? "found" : "absent";
 	} catch {
-		return "probe-unavailable";
+		return "error";
 	}
 }
+
 
 /**
  * 读会话文件头记录的 cwd（S2 拉起前置检查）。
@@ -1467,14 +1558,18 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						const parsedTo = parseObjectAddress(peekForResume.to);
 						if (parsedTo?.scheme === "pi" && opts.spawnSessionTab) {
 							const targetSid = parsedTo.value;
-							// ⚠️ 2026-10-30 事故修正：**绝不能**用 sessionAlive() 当「进程活着」。
-							// sessionAlive 的语义是「最近 15 秒内有过活动」（timers/sessions/<sid>.json
-							// 的 lastActiveAt，阈 SESSION_HEARTBEAT_GRACE_MS=15s）——
-							// 正常对话里模型思考 >15s 就心跳过期 ⇒ 误判 dead ⇒ 每发一条消息拉起一个 tab。
-							// 正确做法：枚举进程表，看是否真有带该 sessionId 的 pi 进程。
-							const probe = probeSessionProcess(targetSid);
-							const liveness = livenessFromProbe(probe);
+							// ⚠️ 2026-10-30 两次事故修正：
+							// ① 【首次】不能用 sessionAlive() 当「进程活着」——它读的是
+							//    timers/sessions/<sid>.json 的 lastActiveAt（「最近 15s 有活动」），
+							//    模型思考 >15s 就心跳过期 ⇒ 误判 dead ⇒ 每发一句拉起一个 tab。
+							// ② 【二次】也不能枚举命令行找 sessionId —— pi tab 的**常态**启动形态是
+							//    `pi --tab-run-id X @prompt.md`，命令行里**根本没有 sessionId**！
+							//    实测活着的 tab pid 90508 正是此形态 ⇒ 永远判 dead。
+							// 正确做法：用 tab state 里的 pid（`tab-runs-runtime.ts:250` 自写），
+							// 非 tab 会话才回落命令行精确匹配 `--session <文件>`。
 							const sd = opts.sessionsDir ?? defaultSessionsDir();
+							const verdict = probeSessionLiveness(targetSid, sd);
+							const liveness = verdict.liveness;
 							const file = findSessionFile(sd, targetSid);
 							const tl = checkTrustedLocalChannel(req, hostToken, self.port);
 							const decision = decideSendAction({
@@ -1484,7 +1579,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 								cwdExists: (c) => { try { return statSync(c).isDirectory(); } catch { return false; } },
 								permitted: isSpawnPermitted({ trustedLocal: tl.ok, guiEnabled: readGuiEnabled(configPath) }),
 							});
-							resumeOutcome = { action: decision.action, reason: decision.reason, probe };
+							resumeOutcome = { action: decision.action, reason: decision.reason, liveness, evidence: verdict.evidence };
 							if (decision.action === "spawn-then-send") {
 								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
 								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title: resumeTabTitle(targetSid) });

@@ -136,6 +136,7 @@
 		"test:local-master-ensure": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_local_master_launch.ts",
 		"test:local-master-resume": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_local_master_resume.ts",
 		"test:session-resume": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_resume.ts",
+		"test:session-liveness": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_liveness.ts",
 		"test:escalation-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_escalation_gate.ts",
 		"test:incident-visibility": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_incident_visibility.ts",
 		"test:builtin-cmd-bridge": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_builtin_cmd_bridge.ts",
