@@ -86,6 +86,8 @@
  */
 
 import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, type Stats } from "node:fs";
+// S2（2026-10-30）：daemon 侧须自己拉起可见 WT tab，需要 `where wt.exe`
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, dirname, resolve } from "node:path";
@@ -138,6 +140,10 @@ import { readNotify } from "../runtime/notify-bridge.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
+// 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
+import { decideSendAction, isSpawnPermitted, resumeTabTitle } from "../runtime/session-resume.ts";
+import { parseObjectAddress } from "../runtime/address.ts";
+import { spawnPiTab } from "../tab-launch-core.ts";
 import { piSessionAddress } from "../runtime/address.ts";
 import {
 	BOOTSTRAP_OTT_TTL_MS,
@@ -399,6 +405,73 @@ const SESSION_SCAN_TTL_MS = 60_000;
 let sessionScanCache: { fp: string; at: number; value: HealthView["memory"]["maxSessionFile"] } | null = null;
 
 /** 会话根 + 一层子目录的 `(mtimeMs,size)` 指纹（stat-only，O(目录数) 而非 O(文件数)）。失败 → null。 */
+/**
+ * 读会话文件头记录的 cwd（S2 拉起前置检查）。
+ *
+ * 只读**首行**（`{type:"session", cwd}`），不整文件解析：
+ * 大会话文件可能几十 MB，而 cwd 只在首行。never-throw（读不出 → null）。
+ */
+function readSessionCwdFromFile(file: string): string | null {
+	try {
+		const head = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
+		const rec = JSON.parse(head) as { type?: unknown; cwd?: unknown };
+		return rec.type === "session" && typeof rec.cwd === "string" ? rec.cwd : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * S2 生产实现：拉起已死会话（新开一个**可见** WT tab）。
+ *
+ * owner 裁决（2026-10-30）：「新开一个可见 wt tab。这样用户想去 wt 中看也行
+ * 想在 gui 继续说话也行」。
+ *
+ * 复用 `spawnPiTab`（含 wt 探活 + preflight + fail-closed），但**不传 prompt**：
+ * 续接会话不需要 bootstrap 文本（历史已在会话里），而 `--session` 已由
+ * `sessionFile` 字段翻译成 argv。
+ *
+ * 注意：本函数在 **daemon 进程**里跑。`findWindowsTerminal` / `findPiCli` 都在
+ * `index.ts`（扩展加载侧，daemon 不可达，否则会把整个扩展图拖进 daemon）。
+ * 所以这里用最小本地实现：`where wt.exe` + `PI_CLI_PATH`/`process.argv[1]` 推导。
+ * **两者都缺 ⇒ 如实返回 error（不静默降级）**，让 GUI 看到「无法拉起」。
+ */
+function defaultSpawnSessionTab(args: { sessionFile: string; cwd: string; title: string }): { runId?: string; error?: string } {
+	// ① wt.exe：仍用 `where`（WindowsApps 受保护，existsSync 不可靠）
+	let wtPath: string | null = null;
+	try {
+		wtPath = execFileSync("where", ["wt.exe"], { encoding: "utf8", shell: true }).split("\n")[0].trim() || null;
+	} catch {
+		wtPath = null;
+	}
+	if (!wtPath) return { error: "未找到 Windows Terminal (wt.exe)，无法拉起会话" };
+
+	// ② pi CLI：PI_CLI_PATH 优先；否则用当前 node 跑 pi 的 cli.js（daemon 自身就是 node）
+	let piCli = process.env.PI_CLI_PATH && existsSync(process.env.PI_CLI_PATH) ? process.env.PI_CLI_PATH : "";
+	if (!piCli) {
+		// 从 daemon 的 argv 推：daemon 用 `node --import loader server.ts` 起的，
+		// 拿不到 pi cli 路径 ⇒ 尝试 npm 全局标准位置（与 index.ts 候选链同思路的窄子集）。
+		for (const cand of [
+			join(dirname(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+			join(process.env.APPDATA ?? "", "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+		]) {
+			if (cand && existsSync(cand)) { piCli = cand; break; }
+		}
+	}
+	if (!piCli) return { error: "未找到 pi CLI（可设 PI_CLI_PATH），无法拉起会话" };
+
+	const r = spawnPiTab({
+		wtPath,
+		piCli,
+		cwd: args.cwd,
+		title: args.title,
+		// 续接不需要 bootstrap 文本：历史已在会话里。空串占位（wtPromptArg 会内联为空）。
+		prompt: "",
+		sessionFile: args.sessionFile,
+	});
+	return r.error ? { error: r.error } : { runId: r.runId ?? args.title };
+}
+
 function sessionsDirFingerprint(sessionsDir: string): string | null {
 	try {
 		const parts: string[] = [];
@@ -1082,6 +1155,13 @@ export interface RuntimeHostServerOptions {
 	configPath?: string;
 	/** G6-P1：pi sessions 根目录（缺省 defaultSessionsDir()；测试注入隔离）。 */
 	sessionsDir?: string;
+	/**
+	 * 2026-10-30 owner 裁决 S2：向已死会话发消息时**拉起它**（新开可见 WT tab）。
+	 * 注入形状：接收 sessionFile + cwd + title，返回 runId 或 error。
+	 * **缺省 undefined ⇒ 不拉起**（回落现状：只写 outbox，等它自己起来消费）。
+	 * 测试完全注入，不碰真实 wt.exe。
+	 */
+	spawnSessionTab?: (args: { sessionFile: string; cwd: string; title: string }) => { runId?: string; error?: string };
 	/** 2026-10-22：async run 记录目录（缺省 `subagent-kill.ts::DEFAULT_RUNS_DIR`，即 env
 	 *  PI_SUBAGENT_RUNS_DIR 口径）。测试注入夹具目录；**不得读真实目录**。 */
 	runsDir?: string;
@@ -1333,6 +1413,37 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					trustedMasterInjection = undefined;
 				}
 				const frame = parseCommandRequest(raw);
+				// ── S2（2026-10-30 owner）：向**已死会话**发消息 ⇒ 先拉起它（新开可见 WT tab）──
+				// 门控：只允许 GUI（trustedLocal ∧ guiEnabled）。微信端只能与 global 通信，
+				// 不发 session.message，天然够不到。
+				// 缺省 opts.spawnSessionTab === undefined ⇒ 不拉起（零行为变化）。
+				let resumeOutcome: { action: string; reason: string } | null = null;
+				try {
+					const peekForResume = JSON.parse(raw) as { type?: unknown; to?: unknown; payload?: unknown };
+					if (peekForResume?.type === "session.message" && typeof peekForResume.to === "string") {
+						const parsedTo = parseObjectAddress(peekForResume.to);
+						if (parsedTo?.scheme === "pi" && opts.spawnSessionTab) {
+							const targetSid = parsedTo.value;
+							const sd = opts.sessionsDir ?? defaultSessionsDir();
+							const file = findSessionFile(sd, targetSid);
+							const alive = file !== null && sessionAlive(opts.timersDir ?? defaultTimersDir(), targetSid, new Date(), SESSION_HEARTBEAT_GRACE_MS);
+							const tl = checkTrustedLocalChannel(req, hostToken, self.port);
+							const decision = decideSendAction({
+								sessionFile: file,
+								liveness: alive ? "alive" : "dead",
+								sessionCwd: file !== null ? readSessionCwdFromFile(file) : null,
+								cwdExists: (c) => { try { return statSync(c).isDirectory(); } catch { return false; } },
+								permitted: isSpawnPermitted({ trustedLocal: tl.ok, guiEnabled: readGuiEnabled(configPath) }),
+							});
+							resumeOutcome = { action: decision.action, reason: decision.reason };
+							if (decision.action === "spawn-then-send") {
+								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
+								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title: resumeTabTitle(targetSid) });
+								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120) };
+							}
+						}
+					}
+				} catch { resumeOutcome = null; /* never-throw：拉起失败不影响发消息主路径 */ }
 				const outcome = executeCommand(frame, {
 					stateDir: opts.stateDir,
 					journalPath: opts.journalPath,
@@ -1343,6 +1454,10 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// R1 注：TOCTOU（预检活→执行时死）落 post-claim 旧护栏 409 会占 key，同 key 重试重放 409，需换 key（fail-closed；claim 顺序不动）。
 					...(trustedMasterInjection !== undefined ? { trustedMasterInjection } : {}),
 				});
+				// S2：拉起结果并入回执（可观测；不影响原有 outcome 语义）
+				if (resumeOutcome !== null && resumeOutcome.action !== "send") {
+					(outcome as { resume?: unknown }).resume = resumeOutcome;
+				}
 				// M3：窄路径被拒补 denied 审计行（字段同 accepted，无正文；best-effort 不影响回执）。
 				// 唯一 denied 落盘点在 server 层：executor 预检/护栏保持零副作用（M2），
 				// 此处只记“peek 命中 master 目标且策略已计算”的两类窄路径拒绝
@@ -2450,7 +2565,11 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
-	createRuntimeHostServer()
+	createRuntimeHostServer({
+		// S2（2026-10-30 owner）：向已死会话发消息时拉起它（新开可见 WT tab）。
+		// daemon 是独立 detached 进程（不经 index.ts），所以 spawn 实现必须在此注入。
+		spawnSessionTab: defaultSpawnSessionTab,
+	})
 		.then(({ info, close }) => {
 			console.log(`runtime-host listening on 127.0.0.1:${info.port} (instanceId=${info.instanceId}, pid=${info.pid}, host.json=${hostInfoPath()})`);
 			const shutdown = (): void => {
