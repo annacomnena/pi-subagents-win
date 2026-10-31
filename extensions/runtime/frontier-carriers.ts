@@ -171,7 +171,7 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	const lines = section.split("\n");
 	const byteLen = (s: string): number => new TextEncoder().encode(s).length;
 	/** 单个条目在本预算下的取用上限（字符，非字节；留余量）。 */
-	const PER_ITEM_BUDGET = 420;
+	const PER_ITEM_BUDGET = 260;
 	/** 从整条目里取「标题 + 至多 2 行正文」，不超 PER_ITEM_BUDGET。
 	 *  设计取舍（实测）：
 	 *    - 整条（不裁） → 只进 1 条（单条 1.4K~11.6K 字符）
@@ -217,13 +217,18 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	const NOTE_RESERVE = 110;
 	const contentCap = Math.max(0, capBytes - NOTE_RESERVE);
 
-	const tryPush = (block: string): boolean => {
+	const tryPush = (block: string, cap: number = contentCap): boolean => {
 		const cost = byteLen(block) + 1; // +1 = 换行
-		if (used + cost > contentCap) return false;
+		if (used + cost > cap) return false;
 		parts.push(block);
 		used += cost;
 		return true;
 	};
+	/** Task Index 块的预算上限：占总预算 40%。
+	 *  为什么要分账：索引行信息密度高（一屏总览），但 Summary 列很长（单行 400+ 字符）。
+	 *  不分账时实测：索引会吃掉 5 行 × 200 字符 ≈ 1KB，把 Item 条目饿到只剩 1 条；
+	 *  而 Item 条目才是「现在在干什么」的直接证据。40/60 分账后两者都有。 */
+	const INDEX_CAP = capBytes * 0.4;
 
 	// ① 标题行
 	const heading = lines.find((l) => GATE_ACTIVE_HEADING.test(l));
@@ -243,13 +248,36 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	}
 	if (cur.length > 0) blocks.push(cur.join("\n"));
 
-	// ② Task Index 优先（信息密度最高）
+	// 分类（三类块，互斥不重叠）
 	const indexBlocks = blocks.filter((b) => GATE_INDEX_HEADING.test(b.split("\n")[0] ?? ""));
-	const itemBlocks = blocks.filter((b) => /^###\s+Item\s+\d+/m.test(b) && !GATE_INDEX_HEADING.test(b.split("\n")[0] ?? ""));
-	const otherBlocks = blocks.filter((b) => !indexBlocks.includes(b) && !itemBlocks.includes(b));
+	const isIndex = (b: string): boolean => GATE_INDEX_HEADING.test(b.split("\n")[0] ?? "");
+	const itemBlocks = blocks.filter((b) => !isIndex(b) && /^###\s+Item\s+\d+/m.test(b));
+	const otherBlocks = blocks.filter((b) => !isIndex(b) && !/^###\s+Item\s+\d+/m.test(b));
 
+	// ② Task Index 优先（信息密度最高）—— **按行裁，不整块拒**
+	//    实测本仓 Task Index 块 = 9,962 字符 / 15,532 字节，整块塞不进 2KB 预算，
+	//    于是整块被 `tryPush` 拒掉 ⇒ 最有用的一屏总览反而一条都进不去。
+	//    改为：表头 + 分隔行务必保留，后续数据行逐行加入直到预算用尽。
 	for (const b of indexBlocks) {
-		if (!tryPush(b.trimEnd())) omitted++;
+		const bl = b.split("\n");
+		const kept: string[] = [];
+		for (const ln of bl) {
+			// 表格行的 Summary 列极长（实测单行 400+ 字符）⇒ 逐行裁到 ~200 字符，
+			// 牺牲细节换行数：交接者需要知道「有哪几条、大致是什么」，细节可重读文件。
+			const line = ln.length > 150 && /^\|/.test(ln) ? `${ln.slice(0, 150)}… |` : ln;
+			if (!tryPush(line, INDEX_CAP)) { omitted += 1; break; }
+			kept.push(line);
+		}
+		// 若数据行被截，补一行如实告知（不静默）
+		if (kept.length < bl.length && kept.length > 2) {
+			const total = bl.filter((l) => /^\|/.test(l)).length;
+			const shown = kept.filter((l) => /^\|/.test(l)).length;
+			const noteRow = `| … 共 ${total} 行，此处 ${shown} 行 |`;
+			if (used + byteLen(noteRow) + 1 <= contentCap) {
+				parts.push(noteRow);
+				used += byteLen(noteRow) + 1;
+			}
+		}
 	}
 	// ③ Item 条目：**每条只取标题 + 前几行**（不是整条）
 	//    实测单条 1.4K~11.6K 字符 —— 整条只能塞进 1 条，而交接者要的是「有哪些活」。

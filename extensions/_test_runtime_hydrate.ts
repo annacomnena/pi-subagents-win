@@ -245,6 +245,38 @@ try {
 	} finally {
 		rmSync(OVERFLOW_REPO, { recursive: true, force: true });
 	}
+
+	// ── 7. 超长 Task Index：必须按行裁而非整块拒 ────────────────
+	//
+	// 实测本仓 Task Index 块 = 9,962 字符 / 15,532 字节，整块远超 2048 预算。
+	// 若`tryPush(整块)` ⇒ **整块被拒** ⇒ 最有用的一屏总览一条都进不去（修复前的真实现状）。
+	// 断言：索引表头必须可见 + 至少 1 条数据行 + 行数声明。
+	const IDX_REPO = mkdtempSync(join(tmpdir(), "hydrate-idx-"));
+	try {
+		const idxLines = [
+			"# RW", "", "## Active Tasks", "", "### Task Index", "",
+			"| Item | Priority | Summary | Dependency | Next action | 详情 |",
+			"|---|---|---|---|---|---|",
+		];
+		// 60 行 × ~250 字符 ≈ 15KB —— 与本仓实际 Task Index 同量级
+		for (let i = 1; i <= 60; i++) {
+			idxLines.push(`| ${100 + i} | P1 | **INDEX_ROW_${i}** ${`摘要正文${i}。`.repeat(20)} | none | 待做 | 本区 |`);
+		}
+		idxLines.push("", "### Item 1 — 后续条目", "", "- 内容");
+		writeFileSync(join(IDX_REPO, "recentwork.md"), idxLines.join("\n"), "utf8");
+
+		const idxDoc = buildHandoff({ stateDir: STATE, mailboxDir: MAILBOX, journalPath: JOURNAL, repoRoot: IDX_REPO });
+		// (a) 表头必须可见（若整块被拒，连表头都没有）
+		assert.ok(idxDoc.markdown.includes("| Item | Priority | Summary"), "Task Index 表头必须可见（整块被拒时这是空的）");
+		// (b) 至少一条数据行
+		assert.ok(/INDEX_ROW_\d+/.test(idxDoc.markdown), "Task Index 至少要有 1 条数据行");
+		// (c) 被截时必须有行数声明
+		assert.ok(/共 \d+ 行，此处 \d+ 行/.test(idxDoc.markdown), "索引被截时必须声明「共 N 行，此处 M 行」");
+		// (d) 索引不得吃光预算：后续 Item 条目仍要能进
+		assert.ok(idxDoc.markdown.includes("### Item 1 — 后续条目"), "索引占预算不得超过 40%，Item 条目仍须能进");
+	} finally {
+		rmSync(IDX_REPO, { recursive: true, force: true });
+	}
 } finally {
 	rmSync(RUNTIME, { recursive: true, force: true });
 	rmSync(REPO, { recursive: true, force: true });
