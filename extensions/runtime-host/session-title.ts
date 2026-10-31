@@ -293,8 +293,88 @@ let titleCache = new Map<string, SessionTitle>();
 let titleCacheLedger: TabLedgerEntry[] | null = null;
 const TITLE_CACHE_MAX = 5000;
 
-/** 批量解析：台账整目录读一次（缺失/全损 = 空台账，P2/P3 照常）。 */
-export function resolveSessionTitles(sessions: SessionSummary[], runsDir: string = tabRunsDir()): Map<string, SessionTitle> {
+/**
+ * 拉起（S2）一个已死会话时，给新 WT 标签页起的标题。**纯函数**。
+ *
+ * owner 2026-10-31：「我希望拉起的会话的 tab 标题更好一些，现在是 `resume 01a18b7f`」。
+ * 纯 sessionId 前 8 位对用户没任何信息量——GUI 列表里明明有可读标题，
+ * 拉起时却没用上。
+ *
+ * 标题构造优先级（与 GUI 列表的解析链对齐，但不直接调 `resolveSessionTitle`：
+ * 那个要 `firstUserText`，而这里手上只有 cwd + 最近一句诉求）：
+ *   1. 已有可读标题（CALLER 传入，通常来自 GUI 列表的 title）
+ *   2. 「仓库名 · 最近诉求」 —— 例 `GreenCAD · 帮我执行build脚本`
+ *   3. 只有仓库名 —— 例 `GreenCAD`
+ *   4. `resume <short>` —— 最终兑底
+ *
+ * @param sessionId 会话 id（兑底用）
+ * @param cwd       会话 cwd（取 basename 作仓库名）
+ * @param recentUserText 最近一条 user 文本（可空）
+ * @param knownTitle 已知可读标题（可空）
+ */
+export function deriveResumeTabTitle(args: {
+	sessionId: string;
+	cwd?: string | null;
+	recentUserText?: string | null;
+	knownTitle?: string | null;
+}): string {
+	const REPO_MAX = 22;
+	const TOPIC_MAX = 30;
+
+	const repo = (() => {
+		const c = String(args.cwd ?? "").trim();
+		if (!c) return "";
+		// Windows/ POSIX 路径都取最后一段（去尾部分隔符）
+		const seg = c.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() ?? "";
+		// 家目录（`C:\Users\<名>` / `/home/<名>`）不是仓库：它的 basename 是**用户名**，
+		// 当仓库名会误导（例：`Annacomnena · 测试没问题了…` 看起来像某个项目）。
+		// 这种场景直接留空，标题只写诉求。
+		const isHome = /^[A-Za-z]:[\\/]Users[\\/][^\\/]+$/i.test(c) || /^\/(?:home|Users)\/[^/]+$/i.test(c);
+		if (isHome) return "";
+		return seg.slice(0, REPO_MAX);
+	})();
+
+	// 已知标题如果已经是可读的（不是纯 UUID / 不是 resume xxxx），直接用
+	const known = String(args.knownTitle ?? "").trim();
+	// UUID 形状（含最后一段 12 位，或仅 8 位短 id）—— 不算可读标题
+	const isUuidish = (s: string): boolean =>
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ||
+		/^[0-9a-f]{8}$/i.test(s);
+	if (known && !isUuidish(known) && !/^resume\b/i.test(known)) {
+		return known.slice(0, REPO_MAX + TOPIC_MAX + 3);
+	}
+
+	// 最近的诉求（行内去噪）
+	const topic = (() => {
+		const raw = String(args.recentUserText ?? "");
+		if (!raw.trim()) return "";
+		// 剥离 Web Console / 微信远程输入的包装头（实测格式：
+		// 「（Web Console 远程输入｜dedupe:outbox:<64hex>） 正文 [evt:async:outbox_...]」）
+		let t = raw
+			.replace(/^\s*[（(]\s*(?:Web\s*Console|微信)[^）)]*[）)]\s*/i, "")
+			.replace(/\[evt:async:[^\]]*\]/gi, "")
+			.replace(/dedupe:[\w:.-]+/gi, "")
+			.trim();
+		// 再走一遍现有剥离链（剥机器注入块、跳前缀行、去 markdown 噪音）
+		const derived = deriveTitleFromFirstUserText(t);
+		if (derived) return derived.slice(0, TOPIC_MAX);
+		// deriveTitle 只截 24；这里再宽一点取首个有意义行
+		const firstLine =
+			t
+				.split(/\r?\n/)
+				.map((l) => l.trim())
+				.find((l) => l && !/^(##|>|根据(workflow|research|execute|adaptive|solo)进行工作)/.test(l)) ?? "";
+		return firstLine.replace(/^[*#\-\s]+/, "").slice(0, TOPIC_MAX).trim();
+	})();
+
+	if (repo && topic) return `${repo} · ${topic}`;
+	if (repo) return repo;
+	if (topic) return topic;
+	const short = String(args.sessionId ?? "").trim().slice(0, 8);
+	return short ? `resume ${short}` : "resume session";
+}
+
+/** 批量解析：台账整目录读一次（缺失/全损 = 空台账，P2/P3 照常）。 */export function resolveSessionTitles(sessions: SessionSummary[], runsDir: string = tabRunsDir()): Map<string, SessionTitle> {
 	const ledger = loadTabLedger(runsDir);
 	if (ledger !== titleCacheLedger) {
 		titleCache = new Map();

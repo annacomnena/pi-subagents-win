@@ -85,7 +85,7 @@
  * **禁** Pi API / extensions/index.ts。
  */
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, type Stats } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, readSync, rmSync, statSync, type Stats } from "node:fs";
 // S2（2026-10-30）：daemon 侧须自己拉起可见 WT tab，需要 `where wt.exe`
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -121,7 +121,7 @@ import {
 	projectSession,
 	projectSessionTail,
 } from "../runtime/transcript.ts";
-import { resolveSessionTitles, tabRunsDir } from "./session-title.ts";
+import { deriveResumeTabTitle, resolveSessionTitles, tabRunsDir } from "./session-title.ts";
 import { computeSessionPinFlags } from "./session-pin.ts";
 import { SESSION_HEARTBEAT_GRACE_MS, defaultTimersDir, sessionAlive } from "../timers.ts";
 import { buildRuntimeSnapshot, type RuntimeSnapshot } from "./snapshot.ts";
@@ -158,7 +158,7 @@ import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 // 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
-import { decideSendAction, isSpawnPermitted, resumeTabTitle } from "../runtime/session-resume.ts";
+import { decideSendAction, isSpawnPermitted } from "../runtime/session-resume.ts";
 import { parseObjectAddress } from "../runtime/address.ts";
 import { spawnPiTab } from "../tab-launch-core.ts";
 import { piSessionAddress } from "../runtime/address.ts";
@@ -780,6 +780,57 @@ function readSessionHeaderRecord(file: string): { type?: unknown; cwd?: unknown;
 	try {
 		const head = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
 		return JSON.parse(head) as { type?: unknown; cwd?: unknown; timestamp?: unknown };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 读会话文件里**最后一条** user 文本（用于拉起 tab 的标题）。
+ * never-throw：任何失败 → null。
+ *
+ * 为什么用尾部而不是首条：拉起一个死会话的语义是「继续这段对话」，
+ * 用户最认得的是**最近一句诉求**，不是开头那句 bootstrap prompt。
+ * 只扫最后 256KB（大文件如 700KB 也不会全读）。
+ */
+function readLastUserText(file: string): string | null {
+	try {
+		const st = statSync(file);
+		const WINDOW = 256 * 1024;
+		const start = Math.max(0, st.size - WINDOW);
+		const len = st.size - start;
+		const buf = Buffer.alloc(len);
+		const fd = openSync(file, "r");
+		try {
+			readSync(fd, buf, 0, len, start);
+		} finally {
+			closeSync(fd);
+		}
+		const lines = buf.toString("utf8").split("\n");
+		// 从后往前找最后一条 user 消息
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = lines[i].trim();
+			if (!line.startsWith("{")) continue;
+			let rec: unknown;
+			try {
+				rec = JSON.parse(line);
+			} catch {
+				continue; // 窗口截断的首行可能不完整，跳过
+			}
+			const r = rec as { type?: unknown; message?: { role?: unknown; content?: unknown } };
+			if (r.type !== "message") continue;
+			if (r.message?.role !== "user") continue;
+			const c = r.message.content;
+			if (typeof c === "string") return c;
+			if (Array.isArray(c)) {
+				const text = c
+					.map((x) => (x && typeof x === "object" && typeof (x as { text?: unknown }).text === "string" ? (x as { text: string }).text : ""))
+					.join("\n")
+					.trim();
+				if (text) return text;
+			}
+		}
+		return null;
 	} catch {
 		return null;
 	}
@@ -1880,7 +1931,14 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 							resumeOutcome = { action: decision.action, reason: decision.reason, liveness, evidence: verdict.evidence };
 							if (decision.action === "spawn-then-send") {
 								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
-								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title: resumeTabTitle(targetSid) });
+								// 标题：不再是纯 `resume 01a18b7f`（owner 2026-10-31 反馈）。
+								// 用「仓库名 · 最近一句诉求」，让用户在任务栏/标签栏里能一眼认出是哪个会话。
+								const title = deriveResumeTabTitle({
+									sessionId: targetSid,
+									cwd: sessionCwd,
+									recentUserText: readLastUserText(decision.sessionFile),
+								});
+								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title });
 								// 注意：`probe` 变量已不存在（改用 `verdict`）——旧代码引用它会被外层 catch 吞掉，
 								// 导致“拉起失败”永远不登账。这里用 verdict.evidence 代替。
 								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), evidence: verdict.evidence };

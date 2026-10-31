@@ -35,6 +35,7 @@ process.env.PI_SESSIONS_DIR = mkdtempSync(join(tmpdir(), "session-title-sessions
 import { taskTitleLabel } from "./launch.ts";
 import { listPiSessions } from "./runtime/transcript.ts";
 import {
+	deriveResumeTabTitle,
 	deriveTitleFromFirstUserText,
 	loadTabLedger,
 	resolveSessionTitle,
@@ -408,6 +409,74 @@ ok("T10 批量解析：P1/P2/P3 各归其位（cwd 桶隔离生效）");
 	// 台账命中需 firstUserText 带 mode 前缀；本用例正文无前缀 ⇒ 仍 P2（证明缓存不误升 P1，也不误降）
 	assert.deepEqual(t3, { title: "新标题文字（更长一点）", source: "first-user" }, "T11 台账新增不匹配条目 ⇒ 仍 P2（不误命中）");
 	ok("T11 缓存失效：文件变化必重算；台账引用身份参与失效判定");
+}
+
+// ── T14 拉起 tab 标题（owner 2026-10-31 反馈：`resume 01a18b7f` 没信息量）──
+{
+	const SID = "01a18b7f-4405-7741-9f91-18f20e5a8d80";
+	// ① 仓库 + 诉求
+	assert.equal(
+		deriveResumeTabTitle({ sessionId: SID, cwd: "G:\\code\\GreenCAD", recentUserText: "等一下，你多使用codegraph查查" }),
+		"GreenCAD · 等一下，你多使用codegraph查查",
+		"仓库名 · 最近诉求",
+	);
+	// ② 家目录不得当仓库名（basename 是用户名，会误导）
+	assert.equal(
+			deriveResumeTabTitle({ sessionId: SID, cwd: "C:\\Users\\Annacomnena", recentUserText: "测试没问题了" }),
+		"测试没问题了",
+		"家目录不算仓库 ⇒ 标题只写诉求",
+	);
+	assert.equal(
+		deriveResumeTabTitle({ sessionId: SID, cwd: "/home/alice", recentUserText: "部署一下" }),
+		"部署一下",
+		"POSIX 家目录同理",
+	);
+	// ③ 只有仓库名
+	assert.equal(deriveResumeTabTitle({ sessionId: SID, cwd: "G:\\code\\GreenCAD" }), "GreenCAD", "无诉求 ⇒ 只写仓库名");
+	// ④ 兜底
+	assert.equal(deriveResumeTabTitle({ sessionId: SID }), "resume 01a18b7f", "全缺 ⇒ 保持旧行为兑底");
+	// ⑤ Web Console / 微信 包装头必须剥掉（否则标题全是 dedupe hash）
+	assert.equal(
+		deriveResumeTabTitle({
+			sessionId: SID,
+			cwd: "G:\\code\\GreenCAD",
+			recentUserText: "（Web Console 远程输入｜dedupe:outbox:4f41fbca4c08ca48） 刚刚重启了 [evt:async:outbox_4f41:47ba6e]",
+		}),
+		"GreenCAD · 刚刚重启了",
+		"剥远程输入包装头与 evt 标签",
+	);
+	assert.equal(
+		deriveResumeTabTitle({
+			sessionId: SID,
+			cwd: "G:\\code\\GreenCAD",
+			recentUserText: "（微信 o9cq80…chat） 帮我看看这个",
+		}),
+		"GreenCAD · 帮我看看这个",
+		"微信包装头同理",
+	);
+	// ⑥ 机器注入块 / 派发前缀不得成为标题（复用现有剥离链）
+	assert.equal(
+		deriveResumeTabTitle({
+			sessionId: SID,
+			cwd: "G:\\code\\GreenCAD",
+			   recentUserText: "根据workflow进行工作M4\n\n## 背景\n真实诉求在这里",
+		}),
+		"GreenCAD · 真实诉求在这里",
+		"跳过派发前缀行与 markdown 标题行",
+	);
+	// ⑦ 已知可读标题优先
+	assert.equal(
+		deriveResumeTabTitle({ sessionId: SID, cwd: "G:\\code\\GreenCAD", knownTitle: "M4-时间轴确定性回放" }),
+		"M4-时间轴确定性回放",
+		"已有可读标题直接用",
+	);
+	// 已知标题是纯 UUID ⇒ 不用它
+	assert.equal(
+		deriveResumeTabTitle({ sessionId: SID, cwd: "G:\\code\\GreenCAD", knownTitle: SID }),
+		"GreenCAD",
+		"纯 UUID 不算可读标题",
+	);
+	ok("T14 拉起 tab 标题：仓库·诉求 / 家目录不当仓库 / 剥远程包装头 / 保留兑底");
 }
 
 // 清理
