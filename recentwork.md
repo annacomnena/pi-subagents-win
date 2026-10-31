@@ -23,6 +23,9 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 64 | P1 | **steer 空闲 tab 唤醒兜底**（`4093f61`）：目标 `turn !== working` 时 steer 记录**永久 pending**、账本仍刷新 ⇒ 主会话拿「已投递」假象；修法 = 往目标 timer 邮箱投立即到期 nudge 让它自己起 turn（幂等防风暴）+ 顺带修 `join` 未导入致 `ledger-fallback.jsonl` 从未落盘 | none | 已落 commit；`test:steer-idle-wake` 4 组/24 断言；**真实端到端（nudge→pump→新 turn→边界消费）仍未验**；需重启后对新 tab 生效 | [↓](#item-64) |
+| 63 | P1 | **autonomy audit.jsonl 轮转 + 尾部定长窗口读**（`0cfbd59`）：29.4MB/28.4 万行无上限，`/autonomy status` 取尾 5 行要读全文件（123ms 且线性恶化）；修法 = 8MB 阈值 rename 归档（只归档不删）+ `fstat` 定位尾部 64KB 窗口（扩 8x×3 次），实测 **0.39ms vs 123.24ms（313x）** | none | 已落 commit；**真机已验证轮转在生产发生**（`audit-20261030T000837Z.jsonl` 32.5MB 与新生 `audit.jsonl` 并存）；**未闭合**：归档文件无 GC | [↓](#item-63) |
+| 62 | P1 | **第 5 种任务模式 `solo`（零派发）**（`56e5d0b`+`83b02d8`）：`/launch --solo｜-s` 与 `launch-tabs`/`master-dispatch` 的 `mode:"solo"` 双入口；tab 自干严禁派任何 subagent（配额受限时用），前缀 `根据solo进行工作<id>`，收尾必须带自审降级声明 | none | 已完成（两条入口 + README 模式表已同步）；`test:launch` 与 `test:master-dispatch` 16 项全绿 | [↓](#item-62) |
 | 61 | P1 | **GUI 右侧栏「本会话派发」+ `/v1/runs?sessionId=` 按会话过滤（P1 已落 `8c3a72d`）**：研究结论（六问 0 能/4 部分/2 不能、四结构性缺陷 D1–D4）+ P1 实现（写时双身份 `ownerSessionId`、fail-closed 先于 ETag、三态 attribution、卡片 `durationMs`/`dispatchedBy`、`rightRail/` 壳+注册表+派发面板、五条件门控 `usePoll`）。测试 `test:runs-endpoint` 45 / `test:gui-right-rail` 31 / contrast 142 对，L4 PASS-WITH-FIXES 已修 | SBS-RUNS-M1 | 待 `/runtime-host restart` 生效；CDP 渲染实测未做（需无人用机窗口）；P2 = tab 历史回溯/徽标、P3 = 第二块面板 | 本区 |
 | 60 | P1 | **折叠块自动展开/合上**：`running` 工具卡自动展开、结束自动合上；思考用「流式刚结束 4s」信号展开。三态判定（true/false/null）保护历史卡片与用户手动操作。真实链路 CDP 实测通过 | Item 59 | 已落 commit；`streamJustEnded` 那半边待真实流式复测 | 本区 |
 | 59 | P1 | **GUI 流式打印「正在思考」**：pi 扩展 `message_update` → 节流 150ms 覆盖写 `state/streaming/<sid>.json` → `GET /v1/streaming/:sid` → GUI 200ms 轮询渲染临时块（CSS 动画填平）。含 8 组单测（含真实接线 + 变异验证）+ CDP 端到端 5 态 | none | 已落 2 commit；**需 `/reload` 或新会话才生效**（扩展在启动时加载） | 本区 |
@@ -78,6 +81,42 @@
 | 5 | P1 | 微信 iLink 探针（七项未知项待真网测量） | none | 真网测量并回填 Wiki | 本区 |
 | 4 | P0 | runtime daemon 切片一（G0 完整 10/10 待实测） | none | 跑 G0 十轮 + 人工核对 | 本区 |
 | SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
+
+<a id="item-64"></a>
+### Item 64 - steer 空闲 tab 唤醒兜底 + `join` 未导入的静默失败（2026-10-26，`4093f61`）
+
+- **事故（实测）**：`tab-steer` 只把记录写进 steering 队列，消费发生在**活跃 turn 的 tool 边界**。目标 tab 空闲（`turn=idle`，如 `pi -r` 重开或已回完上一轮）时没有 turn ⇒ 永远没有 tool 边界 ⇒ 记录**永久 pending**；而账本 `lastActivityAt`/`heartbeatAt` 仍在刷新 ⇒ `targetTabAlive` 判「活」⇒ sweep 也不置 `undelivered`。主会话因此得到「已投递」的**假象**，实际静默失联（沉默比报错危险）。实测一条消息 pending 超 1h，目标 pid 早已死亡。
+- **修法**：新增 `tabNeedsIdleWake(runsDir, tabRunId)`（纯函数，只用 tab-runs 既有字段：`unsafe-id`/`no-ledger`/`terminal`/`turn-working` ⇒ `needsWake:false`，其余 ⇒ `{needsWake:true, reason:"turn-<x>"}`）+ `dropIdleWakeNudge(timersDir, tabRunId, pendingCount)`：往**目标自己的 timer 邮箱**丢一条**立即到期**（`dueAtFromDelay(0)`）nudge，由目标进程自己的 `timers-runtime::pumpDueTimers` 取出 `sendUserMessage(deliverAs:"followUp")` ⇒ 起新 turn ⇒ 下个 tool 边界消费队列。该通道**不依赖派发账本**（与「归档但仍活」的代偿路径同构）。
+- **幂等**：邮箱里已有 `status:"pending"` 且 message 含 `STEER_IDLE_NUDGE_MARK`（`[[steer-idle-nudge]]`）的条目 ⇒ 不重复丢（防 nudge 风暴）；nudge 记录落盘前过 `validateTimerRecord`；不安全 id 直接拒。
+- **顺带修的既有缺陷（本次踩出）**：`steer-runtime.ts` 从未 `import { join }`，而它被用于 `appendFileSync(join(runsDir,"ledger-fallback.jsonl"))` —— 该写入一直抛 `join is not defined` 并被 `catch {}` 吞掉 ⇒「归档/无账本但仍活」的**可观测记录从未落盘**（正是上述静默失联的另一半成因）。
+- **观测面**：`tab-steer` 回执新增 `wake=nudged|none` 行（含目标 turn 状态与「无活跃 turn ⇒ 必须有唤醒」判定）；`steer-status` 的 pending 提示不再含糊。
+- **Verification**：`npm run test:steer-idle-wake` **4 组 / 24 断言**（turn 判据边界、落盘过 `validateTimerRecord`、幂等不风暴、不安全 id 拒绝）实测 `> [steer-idle-wake] 4 groups / 24 assertions passed`；`test:steer` 与 `test:steer-consumer` 回归全绿。
+- **未闭合（诚实）**：① nudge → 目标 pump → `sendUserMessage` → 新 turn → 下个边界消费 这条**真实端到端无证据**（只有单测），A2 仍列 UNKNOWN；② 扩展在 `session_start` 加载 ⇒ 修复对**存量会话/存量 tab 不生效**，需重启；③ nudge 用 `deliverAs:"followUp"`，若目标恰在 streaming 中该消息是否会被 compaction 拒绝，未实测。
+- **Wiki**：✏️ `Wiki/Architecture/steer-channel.md`（Current Contract 新增「空闲 tab 唤醒兜底」段 + UNKNOWN A2 补「部分推进」子条 + frontmatter `source_paths`/`updated`）。
+
+<a id="item-63"></a>
+### Item 63 - autonomy `audit.jsonl` 轮转 + 尾部定长窗口读（2026-10-29，`0cfbd59`）
+
+- **问题（实测）**：`state/autonomy/audit.jsonl` 只追加、无轮转、无上限，实测增至 **29.4 MB / 284,053 行**。① `/autonomy status` 取尾部 5 行时把全部 28 万行读进内存再丢 99.998%，单次 **123 ms** 且随文件线性恶化；② 任何按行扫描该文件的工具同样变慢。这是 `/autonomy status` 返回「状态不可读」的技术成因之一（另一半 `state_projection_inconsistent` 逻辑矛盾不在本次范围）。
+- **修复 1（轮转）**：新增 `rotateAuditIfNeeded(opts?)` + `AUDIT_ROTATE_BYTES = 8 MB`（`collect.ts:54`），超阈值把 `audit.jsonl` rename 为 `audit-<YYYYMMDDTHHMMSSZ>.jsonl`（同名冲突追加 `-<pid>`，`collect.ts:72-73`）。**只归档、不删除**（审计价值在事后可查）；`appendAuditLine` 追加前调用，轮转失败 **never-throw**（宁可继续追加也不丢审计）。
+- **修复 2（尾部窗口读）**：`readAuditTail` 重写（`collect.ts:367`）—— `fstat` 取大小 → 只读尾部固定字节窗口（初始 64 KB）→ 窗口从中间切开时丢弃首行；行数不足按 **8x 扩大重试至多 3 次**，窗口已覆盖全文件则直返。
+- **实测对比（真实 29.4 MB 文件）**：新实现 **0.39 ms** vs 旧实现 **123.24 ms**，提速 **313x**，结果逐行相同。稳态基准（`_probe_perf.ts`，预热后多次平均）：6.8MB 0.17 vs 24.91ms（149x）/ 17.1MB 0.19 vs 49.46ms（260x）/ 34.2MB 0.15 vs 89.04ms（580x）。
+- **Verification**：`npm run test:audit-rotation` **17 项**（轮转正向/负控、小文件行为不变、大文件必须取完整行无半截、缺失文件返回 `[]`、性能可分辨性）；实测 `✅ 全部通过：17 项断言`。**变异验证（关键）**：把 `readAuditTail` 改回「读全文件」后性能断言**实际变红**（`15.03ms vs 13.31ms，1x`，未达 10x）⇒ 该断言真能分辨两种实现。`_test_runtime_autonomy.ts` 回归 **79/79**。`smoke:extension-load` OK。
+- **生产侧真机证据**：`state/autonomy/` 现并存 `audit-20261030T000837Z.jsonl`（**32,527,652 B**，末行 `ts=2026-10-30T00:05:21Z`）与新生 `audit.jsonl`（303,846 B → 持续增长，末行 `ts=2026-10-30T03:59:33Z`）⇒ 轮转确已在生产路径发生，不是只在测试里成立。
+- **未闭合**：① 归档文件**无 GC**（只增不减，需人工清理或后续排期）；② 未处理 `state_projection_inconsistent`（`frontier.json` 里 subagent-win 项目 `idleMs≈2.8 天` 却仍 `Working`），那是独立的状态机矛盾。
+- **Wiki**：✏️ `Wiki/Architecture/autonomy-suite.md`（`readAuditTail` 条目重写 + 新增 `rotateAuditIfNeeded` 条目 + Open Questions 的「audit 轮转仍无（R5）」**标为已闭合**并附真机证据，保留「归档无 GC」为残留）。
+
+<a id="item-62"></a>
+### Item 62 - 第 5 种任务模式 `solo`（零派发，2026-10-30，`56e5d0b`+`83b02d8`）
+
+- **动机**：配额受限时，tab 的「必须派 subagent 做各阶段」纪律会让任务直接卡死；需要一个**显式声明「我自己干完、一个子代理都不派」**的模式，而不是靠 agent 自觉违规。
+- **实现（两条入口，缺一不可）**：
+  - `56e5d0b`：`LaunchMode` 扩为 `workflow|research|execute|adaptive|solo`（`launch.ts:244`），`LAUNCH_MODES` 同步；前缀 `根据solo进行工作<taskId>`（`launch.ts:256`）；**direct 入口**解析 `/launch --solo` 与短别名 `-s`（`launch.ts:101-105`）；`launch-tabs` tool 的 `mode` schema 与 `index.ts:4987-5034` 的 explicitMode/mode/modeName 三处分支同步。
+  - `83b02d8`：`master-dispatch` 的 `mode` 参数补上 `Type.Literal("solo")`（`master-tools.ts:843`）与三元链（`:906-907`）—— 否则走 master-dispatch 通道派 solo tab 会被静默降级成 `workflow`。
+- **语义（写进描述，不靠默会）**：全工作自己做，**严禁派任何 `subagent-win`**；收尾**必须**写「自审局限」的降级声明（说明缺了独立 L4 复核会漏什么）。
+- **Verification**：`npm run test:launch` → `launch tests passed`；`npm run test:master-dispatch` → **16 pass**（含 D1 全 master 工具参数 schema 合法 + 递归 TypeBox 序列化）。
+- **未闭合**：① `solo` 目前是**纪律而非机制强制**（无 `assertDelegationAllowed` 硬接线，与 localStorage 其它角色一致——派发侧只看「是否 subagent」）；② tab 启动自评链深（adaptive）与 solo 的交互未定义（solo 下不应自评链深）；③ Wiki 无「任务模式」主题页，模式表只在 README，未建页（判断：四+一种模式的枚举属 README 级事实，跨任务主题页当前无复用场景）。
+- **文档**：✏️ `README.md`（「Four task modes」表 → 五模式表 + `solo` 行；`launch-tabs` 前缀列表补 `solo`；Full workflow 段补一句「solo 是显式反面」）；✏️ `Wiki/Architecture/tab-run-ledger.md`（`TabDispatchRecord.mode` 枚举补 `solo` + 历史分布读数的口径提醒）。
 
 <a id="item-61"></a>
 ### Item 61 - subagent 运行态在 GUI 上的呈现（二轮研究，2026-10-26）

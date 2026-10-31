@@ -44,3 +44,7 @@ Wiki/_hotspot.trash.jsonl
 
 # 本机工作区工具产物（.workbuddy/，非本仓内容；仅追加，勿改写上面条目）
 .workbuddy/
+
+# Python 字节码缓存（tools/gdcg.py 跑测试时产生）
+__pycache__/
+*.pyc

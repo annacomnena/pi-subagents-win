@@ -2,16 +2,18 @@
 title: Steer 通道（立即插入消息）
 kind: concept
 status: current
-updated: 2026-10-18
+updated: 2026-10-30
 source_paths:
   - extensions/steer.ts
   - extensions/steer-consumer.ts
-  - extensions/steer-runtime.ts
+  - extensions/steer-runtime.ts::tabNeedsIdleWake
+  - extensions/steer-runtime.ts::dropIdleWakeNudge
   - extensions/supervision-runtime.ts::supervisePush
   - extensions/injection-gate.ts
   - extensions/index.ts
   - extensions/_test_steer.ts
   - extensions/_test_steer_consumer.ts
+  - extensions/_test_steer_idle_wake.ts
   - extensions/_test_steer_takeover_worker.ts
 ---
 
@@ -83,6 +85,8 @@ Steer 通道让**主会话（Master）向某个正在运行的标签页会话立
 | `steer-status` | `{ tabRunId?, id? }` | 读回执并按需过滤；顺带做一次惰性 sweep |
 
 - **scope**：主会话可写/查任意 tab；**标签页只能给自己**（`validateSteerRequest` 的 `myRunId` 自限 + `steer-status` 身份自限）；**subagent 一律拒绝**（execute 首行 `isSubagent()`）。
+- **空闲 tab 唤醒兜底（2026-10-26 `4093f61`，补上一个静默失联死角）**：原实现里终态只能靠目标的**活跃 turn tool 边界**消费。目标如果 `turn !== working`（`pi -r` 重开、或已回完上轮），就永远没边界 ⇒ 记录**永久 pending**；而账本 `lastActivityAt` 仍在刷 ⇒ `targetTabAlive` 判「活」⇒ sweep 也不置 `undelivered` ⇒ 主会话拿到**「已投递」的假象**。修法：`tabNeedsIdleWake(runsDir, tabRunId)`（纯函数，只用 tab-runs 已有字段：`unsafe-id`/`no-ledger`/`terminal`/`turn-working` 均返回 `needsWake:false`，其余返回 `{needsWake:true, reason:\`turn-${turn}\`}`）+ `dropIdleWakeNudge()`：往**目标自己的 timer 邮箱**（`mailboxDirForTab`）丢一条**立即到期**（`dueAtFromDelay(0)`）的 nudge，由目标进程自己的 `timers-runtime::pumpDueTimers` 取出 `sendUserMessage(deliverAs:"followUp")` ⇒ 起新 turn ⇒ 下个 tool 边界消费队列。**幂等**：邮箱已有 `status:"pending"` 且 message 含 `STEER_IDLE_NUDGE_MARK` 的条目则不重复丢（防 nudge 风暴）；nudge 落盘过 `validateTimerRecord`。**不依赖派发账本**（这正是它能代偿的原因，与「归档但仍活」同构）。观测面：`tab-steer` 回执新增 `wake=nudged|none` 行。
+- **顺带修的静默缺陷（`4093f61`）**：`steer-runtime.ts` 从未 import `join`，而它被用于 `appendFileSync(join(runsDir,"ledger-fallback.jsonl"))` —— 该写入一直抛 `join is not defined` 且被 `catch {}` 吞掉 ⇒「归档/无账本但仍活」的可观测记录**从未落盘**（即上述事故的另一半成因）。现已 `import { join } from "node:path"`。
 - **监管理推动复用本通道**：主会话工具 `supervise-push` 不新建投递机制，直接 `newSteerId` + `writeSteerAtomic` 写 `source:"supervise-push"` 的 steer 记录（`mode` 缺省 `"steer"`）。因此**本页的两档投递语义就是推动的语义**：对已 settled 的 idle tab，`steer` 档无下一个 tool 边界 ⇒ 不起新 turn，需显式用 `abort` 档。详见 [[主动性套件（Autonomy Suite）]]「主动推动 supervise-push」。
 - **写前守卫（拒绝而非写后清理）**：`tabRunId` 非法 → 拒；无派发账本（`readTabDispatch` 为空）→ `unknown tab`；已终态（`readTabResultFile` 非空或 `readTabState().terminal===true`）→ `tab already terminal`；`message` 空/超长、`mode` 非法 → 拒。以上一律返回 `isError` 且**不产生任何文件**。
 - 路径注入（如 `tabRunId:"../../evil"`）由安全组件守卫拒绝。
@@ -114,6 +118,7 @@ Steer 通道让**主会话（Master）向某个正在运行的标签页会话立
 
 1. **A1**：忙碌 tab 在下一个 tool 边界插入、不打断在跑工具——单测只证明「原样 `sendUserMessage(deliverAs:"steer")` 恰好一次」，生效时点由 pi `agent-session.js` 决定，真实 tab 端到端**未执行**。
 2. **A2**：空闲 tab 收到即起新 turn（`deliveredAt - createdAt < 2000ms`）——端到端**未执行**；且 `STEER_TICK_MS = 5000` 与 2000ms 指标存在天然张力（`fs.watch` 丢事件时只能等 tick）。
+   - **部分推进（2026-10-26 `4093f61`）**：「空闲 tab 根本没有 turn ⇒ 不可能被消费」这个**结构性成因**已修（见「空闲 tab 唤醒兜底」：`turn !== working` 时投立即到期 nudge 让目标自己起 turn）；`test:steer-idle-wake` 4 组 / 24 断言（turn 判据边界、落盘过 `validateTimerRecord`、幂等不风暴、不安全 id 拒绝）。**但真实端到端仍无证据**：nudge → 目标 pump → `sendUserMessage` → 新 turn → 下个边界消费 这条链手上**只有单测**，未在真实 TUI tab 观察过；且 `timers-runtime` 侧需 `session_start` 注册 pump（扩展在会话启动加载）⇒ 修复需重启后才在存量 tab 生效。
 3. **A6**：真实「未启动 / 已退出 tab」的僵尸收敛——单测已证等价语义（写前守卫 + 惰性 sweep → `undelivered`），真实派发后不启动/退出的端到端**未做**。
 4. **A5′**：两个**真实 pi 进程**同时 watch 同一 steer 目录只注入一次——已用真实多进程验证到完整消费链（认领→发送）200 轮 exactly-once，但**未用两个真实 `pi` CLI 实例**端到端 watch 同一目录。
 5. **M2（A3/A8）**：abort 档单测已覆盖固定序列（abort 严格早于 send）、`still-streaming-after-abort`、`no-ctx`、`stale-ctx`、会话替换后 ctx 刷新、空 body 纯打断；但**真实 TUI 端到端手测（A3 杀挂死 pwsh、A8 `/new` 后 abort）仍未执行**——`ctx.abort()` 在真实 TUI 下是否 killProcessTree 生效、isIdle 翻转时延，待人工按「M2 人工手测」执行。

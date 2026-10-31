@@ -228,9 +228,9 @@ External CLIs are spawned in their no-approval / auto-approve modes (`--dangerou
 /launch --direct <task>                 # single tab, derived title
 ```
 
-`launch-tabs` is the explicit workflow launcher: it normalizes every prompt to `根据workflow进行工作<taskId>` (or `根据research/execute/adaptive进行工作<taskId>`) and appends a **workflow discipline block**. A direct `/launch -t` or `/launch --direct` tab remains a plain task by default; a task number alone never enables workflow constraints. Direct tabs receive workflow constraints only when the user explicitly supplies a mode flag or workflow prefix.
+`launch-tabs` is the explicit workflow launcher: it normalizes every prompt to `根据workflow进行工作<taskId>` (or `根据research/execute/adaptive/solo进行工作<taskId>`) and appends a **workflow discipline block**. A direct `/launch -t` or `/launch --direct` tab remains a plain task by default; a task number alone never enables workflow constraints. Direct tabs receive workflow constraints only when the user explicitly supplies a mode flag or workflow prefix.
 
-Four task modes:
+Four task modes (+ one quota-relief mode):
 
 | Mode | Prefix | Pipeline |
 |---|---|---|
@@ -238,12 +238,13 @@ Four task modes:
 | `research` | `根据research进行工作<id>` | parallel searchers → research report → Wiki maintenance (no implementation) |
 | `execute` | `根据execute进行工作<id>` | skip search/planning → implement → review → Wiki wrap-up |
 | `adaptive` | `根据adaptive进行工作<id>` | tab self-assesses handoff completeness at startup → A fast lane (verify ≤3 tool calls → implement → review → Wiki) / B medium (mini plan → quick review → implement → review → Wiki) / C full chain; upgrades allowed & declared, downgrades forbidden |
+| `solo` | `根据solo进行工作<id>` | **zero delegation** — the tab does all the work itself and must never spawn any `subagent-win` role; used when the model quota is tight. Wrap-up must include a self-audit downgrade note (what the missing independent review would otherwise have caught). Entered via `mode:"solo"` on `launch-tabs`/`master-dispatch`, or `/launch --solo` in direct mode |
 
 **lite mode** is not a tab mode — it runs **inside the current session**; the full discipline is in the Lite workflow subsection below.
 
 ### Full workflow — the tab chain
 
-A `workflow`/`research`/`execute`/`adaptive` tab is not a lone worker: on startup it reads the bundled `workflow-orchestrator` skill and acts as a **project manager** — it breaks the task into stages and delegates each stage to a **role agent** via `subagent-win` (headless subagents inside the tab):
+A `workflow`/`research`/`execute`/`adaptive` tab is not a lone worker: on startup it reads the bundled `workflow-orchestrator` skill and acts as a **project manager** — it breaks the task into stages and delegates each stage to a **role agent** via `subagent-win` (headless subagents inside the tab). A `solo` tab is the **explicit opposite**: it is forbidden to delegate at all (see the mode table).
 
 ```text
 searcher → planner → plan-reviewer → implementer → code-reviewer → (consultant when stuck)

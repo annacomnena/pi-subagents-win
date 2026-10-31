@@ -2,7 +2,7 @@
 title: 主动性套件（Autonomy Suite）
 kind: concept
 status: current
-updated: 2026-10-22
+updated: 2026-10-30
 source_paths:
   - extensions/runtime/autonomy/config.ts::normalizeAutonomy
   - extensions/runtime/autonomy/frontier.ts
@@ -123,7 +123,8 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
   - `readWakeGateState`：容忍读 `state/autonomy/wake-gate.json` → null（缺失/坏 JSON/字段漂移）。
   - `writeWakeGateState`：原子 tmp+rename，返回是否实际写盘。
   - `appendAuditEvent(cat, concl, reason, stateDir?)`：结构化行 `ts=<ISO> cat=<gating|wake|kill> concl=<...> reason=<...> acted=false` 落 `state/autonomy/audit.jsonl`；**`acted=false` 恒真**（v2 无自动动作）；reason 消毒（CR/LF/TAB→空格、截断 200、空→`"-"`）保护行式格式；**与 v1 `appendAuditLine`（无 ts 前缀）两格式共存**。
-  - `readAuditTail`：容忍读 audit.jsonl 尾部 ≤limit 行（默认 5，`/autonomy status` 用）。
+  - `readAuditTail`：容忍读 audit.jsonl 尾部 ≤limit 行（默认 5，`/autonomy status` 用）。**2026-10-29（`0cfbd59`）已重写**：不再 `readFileSync` 全文件，改为 `fstat` 取大小 → 只读尾部固定字节窗口（初始 64 KB；行数不足按 8x 扩大，最多 3 次，窗口已覆盖全文件则直返）。实测 29.4 MB 文件 **0.39 ms vs 旧 123.24 ms（313x）**，结果逐行相同。
+  - `rotateAuditIfNeeded` + `AUDIT_ROTATE_BYTES = 8 MB`（`0cfbd59`）：`appendAuditLine` 追加前调用，超阈值把 `audit.jsonl` rename 为 `audit-<YYYYMMDDTHHMMSSZ>.jsonl`（同名冲突追加 `-<pid>`），**只归档不删除**；轮转失败 never-throw（宁可继续追加也不丢审计）。
   - `collectAutonomyInputs` + optional `configPath`（**纯加法**：不传 = 原行为逐字节不变；gate 经 configPath 注入 temp config 时透传，否则 collect 无参双读真实包根 config → 判定分叉 + 误导性 `gating no-wake reason=autonomy-disabled` 杂行，工程约束 3 / W6 钉死）。
 - **状态类型**（`wake-gate.ts:WakeGateState`）：+ optional `lastReason`（**仅此一个字段**，D-G；`lastDecisionAt` 本就每次评估更新，不另加时间戳）。纯模块保持纯，v1 测试构造不含此字段不受影响。
 - **master-status 增量行**（`master-tools.ts:masterStatusLogic`）：lines 末尾条件展开 `...(autonomyFootprintExists() ? [autonomyStatusLine()] : [])`；**谓词**：`cfg.enabled===true || kill 在场 || frontier 快照 || wake-gate state` 任一为真才显示；纯净默认态 → 无此行 → `/master-status` 与 master-status tool 输出**逐字节一致**（opt-in 可见性，D7 形态）。行内容四要素：enabled / kill(reason@ts) / frontier(asof, projects) / wake-gate(lastReason@lastDecisionAt)；两 helper 均 never-throw（读失败 → 行缺席或 `(unreadable)`，W3 钉死）。`getMasterStatus`/`MasterStatusView` 契约未动 → GUI/runtime-host 投影零影响。
@@ -452,7 +453,7 @@ global master 从"被动等指令"走向"主动推导 + 显式动作"的套件�
 - **三条派发路径尚未接自动登记**：`/launch` 直开 tab、`local-master-ensure` spawn、trace-fusion lane tab —— 这些 tab 仍落在旧默认（无账本 ⇒ `NOT_MONITORED`）。
 
 - **OQ-1（notify 间接 wake）**：notify 信件是 wake 形态、可被 legacy scope wake 链认领（间接 spawn 风险）；其是否构成「autonomy 搭 legacy spawn 通道派自己的活」（设计 §1.4 结构性防火墙）未完全闭合。既有缓解 = `subject` 恒 `autonomy-notify/<rule>`（不以 `run://tab/` 开头）+ 只 deliver 不消费 + 效应面 = 恰一信件文件。**已补两项缓解**：① **效应 C 缓解已落地**——发信前查 scope owner 的 L1.5 门（无主 `scope-ownerless` / 死主 `scope-owner-stale` 拒投，liveness 判不了则放行），掐断「信滞留 pending → backlog 计数 → level 恒触发 → gate 稳态翻转」的产生条件；② **短环 B 可见化**——同 project 1h 内 notify 后再有动作 ⇒ 事件行 `suspectedEcho:true` + status `⚠echo`（只标记不改判定）。**仍开放：通道 D**——被信件唤醒的**下游 spawn 不在动作事务承诺面**（事务只管自身效应与回退，信被认领后派生的会话不归本事务管辖），其是否构成派活防火墙破口未闭合。
-- **audit 轮转仍无**（R5）：enabled 常开 ≈ 3 行/次评估 ≈ 2.6 万行/天（24h），无轮转无上限；先例 `master-injection.ts:268-287`（~1MB 两代 rename）留后续任务。
+- ~~**audit 轮转仍无**（R5）~~ **已闭合（2026-10-29 `0cfbd59`）**：`rotateAuditIfNeeded` 在 `AUDIT_ROTATE_BYTES = 8 MB` 阈值触发 rename 归档（`audit-<stamp>.jsonl`，只归档不删除、失败 never-throw），`readAuditTail` 同步改为尾部定长窗口读（29.4 MB 文件 123ms → 0.39ms）。**真机证据**：`state/autonomy/` 现存 `audit-20261030T000837Z.jsonl`（32.5 MB，末行 `ts=2026-10-30T00:05:21Z`）与新生 `audit.jsonl`（从 0 起增长，末行 `ts=2026-10-30T03:59:33Z`）并存 —— 轮转确已在生产路径发生。**残留（未闭合）**：存量归档文件无 GC（只增不减，需人工/后续排期）；本次修复**未**清理修复前已有的 29.4 MB 存量文件（已由本次轮转自然归档）。
 - **watchdog 数据源缺口仍挂**：三项恒 `unknown` 的判据无数据源（与 `global-view` 卫生行缺口同源）；v2 状态面不展示 watchdog（D-D）。
 - **envelope.priority 队列仍 pending**（L1-B 未决 3，独立接线面）。
 - `no-meaningful-change` 分支在 collect 生产路径休眠（recordOnly 恒非空，frontier.ts:281）；`maintainBatchAnchor` 的"全空 diff 重置"分支同源休眠（W4.4 单测覆盖）。
