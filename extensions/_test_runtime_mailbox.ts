@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,7 @@ import { masterAddress } from "./runtime/address.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import {
 	ackLetter,
+	archiveTerminalLetters,
 	claimLetters,
 	defaultMailboxDir,
 	deliverCommand,
@@ -31,6 +32,7 @@ import {
 	backlogFromScan,
 	listLetters,
 	mailboxBacklog,
+	mailboxDirFor,
 	markDelivered,
 	releaseClaimed,
 	scanMailboxLetters,
@@ -232,6 +234,125 @@ try {
 			viaDirect.map((a) => a.id).sort(),
 			"buildAttentionItems：共享信件扫描与自扫输出一致",
 		);
+	}
+
+	// ── archiveTerminalLetters：只归档终态且超龄的信 ───────────────────
+	//
+	// 实证背景（2026-10-31 真机）：`ackLetter` 只改 status，**从不删除文件**，
+	// `agent___master_default` 目录涨到 164 项，其中 162 封已 ack（最早垮 1.5 个月）。
+	// 代价不在磁盘而在每拍扫描成本（同 `audit.jsonl` 涨到 30MB 的缺陷同构）。
+	//
+	// 下面用 4 组断言锁住归档的**安全边界**（不只是「能归档」）：
+	//   ① 终态+超龄 → 归入 _archive-YYYY-MM/
+	//   ② **非终态一律不动**（pending/claimed/delivered）—— 移走 claimed = 丢信
+	//   ③ 终态但**未超龄**不动（保留短期回查窗口）
+	//   ④ 归档后 `listRecipientDirs` 不得把归档目录当收件人（否则降成本为零）
+	{
+		const MB = join(process.env.PI_RUNTIME_DIR!, "mbox-archive");
+		const DAY = 24 * 60 * 60 * 1000;
+		const now = Date.parse("2026-11-01T00:00:00.000Z");
+
+		// 注意：`ackLetter` 的 `ackedAt` 用**真实系统时钟**（`new Date()`），无法注入。
+		// 所以不能靠“先 ack 再把 now 设到未来”来造超龄信（那样 ackedAt 仍是刚才，
+		// 相对 now 只差几秒 ⇒ 不超龄）。改为**直接写带历史 ackedAt 的信件文件**，
+		// 这也正是真机形状：文件里的 ackedAt 是一个月前的值。
+		const dir = mailboxDirFor(master, MB);
+		const mkdirp = (p: string): void => { mkdirSync(p, { recursive: true }); };
+		mkdirp(dir);
+		const writeLetter = (id: string, status: string, ackedAt?: string, sentAt = "2026-09-01T00:00:00.000Z"): void => {
+			const letter = {
+				frame: {
+					frame: "message", id, kind: "REPORT", from: "agent://a", to: master,
+					subject: "archive-test", requiresAck: true, sentAt, body: { summary: "x" },
+				},
+				status,
+				...(ackedAt ? { ackedAt } : {}),
+			};
+			writeFileSync(join(dir, `${id}.json`), `${JSON.stringify(letter, null, 2)}\n`, "utf8");
+		};
+
+		writeLetter("msg_old_acked", "acked", "2026-10-01T00:00:00.000Z"); // 31 天前 ack ⇒ 应归档
+		writeLetter("msg_fresh_acked", "acked", "2026-10-30T00:00:00.000Z"); // 2 天前 ack ⇒ 保留
+		writeLetter("msg_old_pending", "pending"); // 旧但 pending ⇒ 绝不动
+		writeLetter("msg_old_claimed", "claimed"); // 旧但 claimed ⇒ 绝不动（移走 = 丢信）
+		writeLetter("msg_old_expired", "expired", "2026-09-15T00:00:00.000Z"); // 终态且超龄 ⇒ 应归档
+
+		const archived = archiveTerminalLetters({ mailboxDir: MB, afterDays: 7, now });
+		assert.equal(archived, 2, "应归档 2 封（old_acked + old_expired）");
+
+		// ① 超龄终态已离开扫描路径，且归入 _archive-YYYY-MM/
+		assert.equal(existsSync(join(dir, "msg_old_acked.json")), false, "超龄 acked 应已离开扫描路径");
+		const archDir = join(dir, "_archive-2026-10");
+		assert.ok(existsSync(join(archDir, "msg_old_acked.json")), "应归入 _archive-2026-10/");
+		assert.ok(existsSync(join(dir, "_archive-2026-09", "msg_old_expired.json")), "expired 应按自身月份归入 _archive-2026-09/");
+		// 归档文件内容必须完整（能回查）
+		const back = JSON.parse(readFileSync(join(archDir, "msg_old_acked.json"), "utf8")) as { status: string };
+		assert.equal(back.status, "acked", "归档后内容不得变形");
+
+		// ② 非终态一律不动（红线①）
+		assert.ok(existsSync(join(dir, "msg_old_pending.json")), "**pending 绝不得归档**");
+		assert.ok(existsSync(join(dir, "msg_old_claimed.json")), "**claimed 绝不得归档**（移走 = 丢信）");
+		// ③ 终态但未超龄也不动（红线②）
+		assert.ok(existsSync(join(dir, "msg_fresh_acked.json")), "未超龄的 acked 应保留");
+
+		// ④ 归档目录不得泄漏到「收件人」列表
+		//
+		// ⚠ 这里曾写过一条断言 `scanMailboxLetters(keys).some(k => k.includes("_archive")) === false`
+		//   —— **它是空判据**：`_archive-*` 在 `<recipient>/` 内部，而 `listLettersSynthetic`
+		//   只扫 `*.json` 不递归，所以无论有没有 filter 这条永远为真（变异验证实测：
+		//   去掉 filter 后该断言仍绿）。已改成测 `mailboxBacklog` 的 **pending+claimed 总数**：
+		//   若归档目录被当成收件人且里面有 pending 信，总数会多出来。
+		const backlog = mailboxBacklog(MB);
+		const nonTerminalTotal = backlog.reduce((s, r) => s + r.pending + r.claimed, 0);
+		assert.equal(
+			nonTerminalTotal,
+			2,
+			`非终态应是 pending(1) + claimed(1) = 2；实际 ${nonTerminalTotal}（归档的终态信不得计入 backlog）`,
+		);
+		const recipientNames = backlog.map((r) => r.recipient);
+		assert.equal(
+			recipientNames.some((r) => r.startsWith("_")),
+			false,
+			`内部目录不得被当成收件人（实际 ${JSON.stringify(recipientNames)}）`,
+		);
+
+		// ⑤ 幂等：再跑一次不应重复迁移
+		assert.equal(archiveTerminalLetters({ mailboxDir: MB, afterDays: 7, now }), 0, "重复调用应为 0（幂等）");
+		// ⑥ 红线③ never-throw：目录不存在也不抛
+		assert.equal(archiveTerminalLetters({ mailboxDir: join(MB, "nonexistent"), now }), 0, "目录不存在应返回 0 不抛");
+
+		// ⑦ **状态过滤**的强判别力测试（上面的 ②只有弱判别力，必须补这一段）
+		//
+		// 为什么上面那几条不够：非终态信没有 `ackedAt`，走 mtime 分支；而 mtime 是刚刚
+		// 写入的，`afterDays: 7` 下天然不超龄 ⇒ “不该归档”永远不成立，**即使把
+		// `isArchivableStatus` 改成 `return true` 也全绿**（变异实测确认）。
+		// 修法：把 `afterDays` 压到接近 0（一切文件都超龄），此时**唯一**能阻止
+		// pending/claimed 被归档的就只剩状态过滤本身。
+		const MB2 = join(process.env.PI_RUNTIME_DIR!, "mbox-state-filter");
+		const dir2 = mailboxDirFor(master, MB2);
+		mkdirSync(dir2, { recursive: true });
+		const writeRaw = (id: string, status: string): void => {
+			const letter = {
+				frame: { frame: "message", id, kind: "REPORT", from: "agent://a", to: master, subject: "s", requiresAck: true, sentAt: "2026-09-01T00:00:00.000Z", body: { summary: "x" } },
+				status,
+			};
+			writeFileSync(join(dir2, `${id}.json`), `${JSON.stringify(letter, null, 2)}\n`, "utf8");
+		};
+		writeRaw("sf_pending", "pending");
+		writeRaw("sf_claimed", "claimed");
+		writeRaw("sf_delivered", "delivered");
+		writeRaw("sf_acked", "acked");
+		// afterDays 极小 ⇒ 所有文件（含刚写的）都超龄 ⇒ 只剩状态过滤在起作用。
+		// 注意：不能用 `afterDays: 0.000001` + 当前时钟（cutoff 几乎等于 now，文件 mtime
+		// 与 now 的毫秒级差异决定结果 ⇒ 不稳定）。正确做法：`afterDays` 正常（1 天），
+		// 但把 `now` 推到 **1 天后** ⇒ 一切刚写的文件都已超龄，而状态过滤仍生效。
+		const future = Date.now() + 2 * 24 * 60 * 60 * 1000;
+		const movedByStatus = archiveTerminalLetters({ mailboxDir: MB2, afterDays: 1, now: future });
+		assert.equal(movedByStatus, 1, `超龄时只应归档 acked 一封（实际 ${movedByStatus}）—— 状态过滤失效就会多移`);
+		assert.ok(existsSync(join(dir2, "sf_pending.json")), "超龄也不得归档 pending");
+		assert.ok(existsSync(join(dir2, "sf_claimed.json")), "超龄也不得归档 claimed（移走 = 丢信）");
+		assert.ok(existsSync(join(dir2, "sf_delivered.json")), "超龄也不得归档 delivered（尚未 ack）");
+		assert.equal(existsSync(join(dir2, "sf_acked.json")), false, "超龄 acked 应被归档");
 	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });

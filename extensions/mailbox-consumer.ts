@@ -30,8 +30,10 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	ackLetter,
+	archiveTerminalLetters,
 	claimLetters,
 	defaultMailboxDir,
+	expireSweep,
 	listLetters,
 	mailboxDirFor,
 	releaseClaimed,
@@ -609,6 +611,23 @@ export function registerWakeLoop(
 				writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
 			} catch {
 				/* 心跳永不破坏会话 */
+			}
+			// 2026-10-31 邮箱维护（接上两个一直“写了但没人调”的函数）：
+			//   `expireSweep`  —— 非终态且过 TTL → expired（此前**零调用**，TTL 形同虚设）
+			//   `archiveTerminalLetters` —— 超龄终态信 → `<recipient>/_archive-YYYY-MM/`
+			// 实证代价：`agent___master_default` 目录涨到 164 项，其中 162 封已 ack
+			// （最早 2026-09-17，垮 1.5 个月）；每拍 `mailboxBacklog`/`scanMailboxLetters`
+			// 都要 readdir + 逐封 stat。与 audit.jsonl 涨到 30MB 是同一类缺陷。
+			//
+			// 为什么挂在 tick 而不是单独定时器：这里本来就有 30s 心跳，多一个 interval
+			// 只增加竞态面。为什么每 30s 都跑：两个函数都是 never-throw + 无变化时只做
+			// readdir/stat（实测单 recipient 162 文件 <5ms）；归档后文件数单调下降。
+			// 仍然只写自有 namespace 外的 mailbox 自身目录，不动任何别的状态。
+			try {
+				expireSweep(undefined, { mailboxDir: opts.mailboxDir });
+				archiveTerminalLetters({ mailboxDir: opts.mailboxDir });
+			} catch {
+				/* 维护永不破坏唤醒循环 */
 			}
 			try {
 				const decisions = evaluateWakes({

@@ -463,6 +463,10 @@ function listRecipientDirs(mailboxDir: string): string[] {
 	if (!existsSync(mailboxDir)) return [];
 	return readdirSync(mailboxDir, { withFileTypes: true })
 		.filter((d) => d.isDirectory())
+		// 排除内部目录（2026-10-31）：`_archive-YYYY-MM/`（终态信件归档）与
+		// `_stale-*`（历史遗留标记目）。不收的话归档目录会被当成「另一个收件人」
+		// 参与 backlog 统计与扫描 —— 归档就失去了降成本的意义。
+		.filter((d) => !d.name.startsWith("_"))
 		.map((d) => join(mailboxDir, d.name));
 }
 
@@ -507,6 +511,106 @@ function writeJsonAtomic(path: string, value: unknown): void {
 	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
 	writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 	renameSync(tmp, path);
+}
+
+// ── 终态信件归档（2026-10-31）─────────────────────────────────────
+//
+// 问题（真机实测）：`<recipient>/` 目录**永不清理**。`ackLetter` 只把 status 改成
+// `acked`，文件留在原地。实测 `agent___master_default` 目录 164 项，其中 **162 封
+// 已 ack**（最早 2026-09-17，垮了 1.5 个月）、只有 1 封 pending。
+//
+// 代价不是磁盘（单封信 <1KB），而是**每拍的扫描成本**：`mailboxBacklog` /
+// `scanMailboxLetters` 要 readdir + 逐封 stat（缓存失效时还 + readFile）。
+// 这与 `audit.jsonl` 涨到 30MB 是同一类缺陷，修法也照 `rotateAuditIfNeeded` 的范式：
+// **归档而不删除**，保留全部审计能力。
+//
+// 与 `expireSweep` 的分工：
+//   - `expireSweep` 管**非终态且过了 TTL** → 置 `expired`（仍是活文件，仍需参与扫描）
+//   - 本函数管**已终态**（`acked` / `expired`）的超龄文件 → 移出扫描路径
+//
+// 红线：
+//   ① 只动 `acked` / `expired`。`pending` / `claimed` / `delivered` **一律不动**
+//      （`claimed` 可能是另一个消费者正在处理，移走 = 丢信）。
+//   ② 未到保留期的终态信也不动（保留短期可回查窗口）。
+//   ③ never-throw：任何异常都当“本次未归档”，绝不影响正常的信件读写。
+
+/** 终态信件保留天数（缺省 7 天）。超过则归档到 `<recipient>/_archive-<YYYYMM>/`。 */
+export const MAILBOX_ARCHIVE_AFTER_DAYS = 7;
+
+/** 终态判定：只有这两个状态可以归档。 */
+function isArchivableStatus(s: string): boolean {
+	return s === "acked" || s === "expired";
+}
+
+/**
+ * 把超龄的**终态**信件归档到 `<recipient>/_archive-<YYYY-MM>/`。
+ *
+ * 为什么按月分目录而不是单个大文件：一封信一个 JSON 文件，合并成 jsonl 需要重写码
+ * （且丢失与现有工具链的兼容）；按月归档 **不改变单个文件的形状**，
+ * `readLetterCached` / 任何直接 read 某个 messageId 的调用仍可工作。
+ *
+ * @returns 归档的文件数（0 = 无需动作或失败）
+ */
+export function archiveTerminalLetters(opts: {
+	mailboxDir?: string;
+	/** 只处理这一个收件人（缺省 = 全部收件人）。 */
+	recipient?: ObjectAddress;
+	/** 保留天数（缺省 `MAILBOX_ARCHIVE_AFTER_DAYS`）。 */
+	afterDays?: number;
+	now?: number;
+} = {}): number {
+	try {
+		const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
+		const days = opts.afterDays ?? MAILBOX_ARCHIVE_AFTER_DAYS;
+		if (!Number.isFinite(days) || days <= 0) return 0;
+		const now = opts.now ?? Date.now();
+		const cutoff = now - days * 24 * 60 * 60 * 1000;
+		const dirs = opts.recipient
+			? [mailboxDirFor(opts.recipient, mailboxDir)]
+			: listRecipientDirs(mailboxDir);
+		let moved = 0;
+		for (const dir of dirs) {
+			if (!existsSync(dir)) continue;
+			for (const f of readdirSync(dir)) {
+				if (!f.endsWith(".json")) continue;
+				const path = join(dir, f);
+				let letter: Letter;
+				try {
+					letter = JSON.parse(readFileSync(path, "utf8")) as Letter;
+				} catch {
+					continue; // 坏 JSON / 并发删除 ⇒ 跳过（不猜）
+				}
+				if (!isArchivableStatus(letter.status)) continue; // 红线①
+				// 时间基准：优先 ackedAt（终态发生时刻），否则文件 mtime。
+				// 为什么不用 frame.sentAt：一封很早发的信可能刚被 ack，拿 sentAt 会立即归档，
+				// 把“刚处理完还能回查”的窗口砍成 0。
+				const tsRaw = letter.ackedAt ?? null;
+				const ts = tsRaw !== null && Number.isFinite(Date.parse(tsRaw)) ? Date.parse(tsRaw) : null;
+				let basis = ts;
+				if (basis === null) {
+					try {
+						basis = statSync(path).mtimeMs;
+					} catch {
+						continue;
+					}
+				}
+				if (basis > cutoff) continue; // 红线②
+				const yyyymm = new Date(basis).toISOString().slice(0, 7); // YYYY-MM
+				const archiveDir = join(dir, `_archive-${yyyymm}`);
+				try {
+					mkdirSync(archiveDir, { recursive: true });
+					renameSync(path, join(archiveDir, f));
+					LETTER_CACHE.delete(path); // 缓存同步（否则归档后在缓存里仍可见）
+					moved += 1;
+				} catch {
+					continue; // 跨盘/权限/同名冲突 ⇒ 这一封不动
+				}
+			}
+		}
+		return moved;
+	} catch {
+		return 0; // never-throw（红线③）
+	}
 }
 
 /** FabricFrame 类型仅用于文档化导出约束（防止未来误传非协议帧）。 */
