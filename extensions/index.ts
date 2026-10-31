@@ -3578,6 +3578,30 @@ export default function (pi: ExtensionAPI) {
 				"mechanical generation, bulk renames, or when the transformation itself is the thing being tested — " +
 				"but even then, verify the result with `read` right after, never trust the write succeeded.",
 		);
+		// 实测（2026-10-31，owner 提问「用 pwsh 是不是好点」后逐一验证）：
+		//
+		// 需求：让 node 拿到**字面** `\n`（不是换行）。期望 hex 尾段 5c6e。
+		//   ① write 建 .mjs 再 node 跑      → 6162635c6e646566  ✅
+		//   ② node -e（外层单引号/内层双）  → 6162630a646566    ❌ \n 变真换行
+		//   ③ node -e（外层双引号/内层单）  → 6162630a646566    ❌ 同样
+		//   ④ 换 pwsh 跑同样的 -e           → 6162630a646566    ❌ 同样
+		//   ⑤ 直接传参 node x.mjs 'abc\ndef' → 6162635c6e646566  ✅
+		//
+		// 结论：**换 shell 没用**。这是 `-e/-c` 内联本身的层数问题（shell 解析 →
+		// node 收到源码串 → JS 引擎再解析字面量），嵌套层一多就不可控。
+		// 另外 MSYS/GitBash 确实与 Windows 路径语义有歧义（实测 `>` 写 `/tmp/arg.txt`
+		// 后 node 去开 `C:\tmp\arg.txt` 报 ENOENT）——又一层不确定性。
+		lines.push(
+			"Note: For any non-trivial inline script, write a real file (`write`) and run that, instead of `node -e` / " +
+				"`python -c`. Verified: putting a literal backslash-n into a `-e` one-liner fails regardless of shell — " +
+				"bash single-quoted, bash double-quoted, and pwsh all delivered a real newline instead (hex 0a) where the " +
+				"file-based version correctly kept 5c 6e. The reason is nesting depth: shell parses, then node evaluates the " +
+				"source string, then the JS engine parses string literals again — each layer can eat one backslash. Switching " +
+				"shells does not fix it. Passing an argument to an existing script file is fine. Also beware path semantics: " +
+				"bash here is MSYS/GitBash, so a bash-side `/tmp/x` is NOT the `/tmp/x` a Windows-native tool sees " +
+				"(it resolves to `C:\\tmp\\x`) — use an explicit Windows path or a project-relative one. If you already wrote a " +
+				"broken one-liner, do not keep re-quoting it: switch to a file.",
+		);
 		lines.push(
 			"Note: A `codegraph` tool is available (symbol-level lookup: query / explore / context / impact / status / " +
 				"files / sync). Use it to LOCATE code; use `read` to actually read it. It is per-repository — it will say " +
