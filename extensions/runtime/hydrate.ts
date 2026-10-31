@@ -24,7 +24,7 @@ import { mailboxBacklog, listLetters } from "./mailbox.ts";
 import { masterAddress, type ObjectAddress } from "./address.ts";
 import { readAttachment, readCutover, readHandoffToken } from "./registry.ts";
 import { enrichRunRefs, listTasks, listWorkstreams } from "./workstreams.ts";
-import { extractActiveTasksSection, buildRecentWorkExcerpt } from "./frontier-carriers.ts";
+import { extractActiveTasksSection, buildRecentWorkExcerpt, truncateUtf8ToBytes } from "./recentwork-text.ts";
 
 export interface HydrateOptions {
 	stateDir?: string;
@@ -146,17 +146,25 @@ export function buildHandoff(opts: HydrateOptions = {}): HandoffDocument {
 			const section = extractActiveTasksSection(buf);
 			if (section === null) {
 				// 无 `## Active Tasks` 区段（可能只剩归档）⇒ 如实回退整文件头，并在 manifest 标注原因
-				rwExcerpt = truncateUtf8(buf, RECENTWORK_CAP_BYTES);
+				rwExcerpt = truncateUtf8ToBytes(buf, RECENTWORK_CAP_BYTES);
 				rwNote = `no Active Tasks section — fell back to head (${buf.length} chars total)`;
 			} else {
 				// 按结构价值取块（标题 + Task Index + Item 条目），而非机械字节截断：
 				// 实测区段自身头部也可能很长（首个 ### Item 偏移 9,979 / 16,990），
 				// 机械截断会让 3 个仓里的 2 个**一条任务条目都进不去**。
 				rwExcerpt = buildRecentWorkExcerpt(section, RECENTWORK_CAP_BYTES);
+				// 2026-11-01 L4 修正：原实现用 `section.length`（**字符**）与
+				// `RECENTWORK_CAP_BYTES`（**字节**）比较 ⇒ 中文区段会被误判“完整”。
+				// 实测反例：1837 字符 / 3757 字节的区段被截断了，note 却谎报
+				// `full Active Tasks section (1837 chars)`。改用字节口径。
+				const sectionBytes = Buffer.byteLength(section, "utf8");
+				// 且“是否完整”应由**实际产出**判定，而不是由区段大小推断：
+				// `buildRecentWorkExcerpt` 会按块取舍，漏过块就说明不是完整。
+				const omittedSome = /未列入/.test(rwExcerpt);
 				rwNote =
-					section.length > RECENTWORK_CAP_BYTES
-						? `Active Tasks section, structural prefix (section ${section.length} chars; file ${buf.length})`
-						: `full Active Tasks section (${section.length} chars; file ${buf.length})`;
+					sectionBytes <= RECENTWORK_CAP_BYTES && !omittedSome
+						? `full Active Tasks section (${sectionBytes}B; file ${Buffer.byteLength(buf, "utf8")}B)`
+						: `Active Tasks section, structural prefix (section ${sectionBytes}B; file ${Buffer.byteLength(buf, "utf8")}B)`;
 			}
 		} catch {
 			rwExcerpt = null;
@@ -200,10 +208,3 @@ export function buildHandoff(opts: HydrateOptions = {}): HandoffDocument {
 	return { markdown, manifest, path };
 }
 
-function truncateUtf8(s: string, maxBytes: number): string {
-	const bytes = new TextEncoder().encode(s);
-	if (bytes.length <= maxBytes) return s;
-	let end = maxBytes;
-	while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
-	return new TextDecoder().decode(bytes.slice(0, end)) + "…[truncated]";
-}

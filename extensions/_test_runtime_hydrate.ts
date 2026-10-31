@@ -277,6 +277,62 @@ try {
 	} finally {
 		rmSync(IDX_REPO, { recursive: true, force: true });
 	}
+
+	// ── 8. 无 `###` 子标题 / 无编号条目：正文不得丢失（L4 N-2 + P1#3 回归锁）──
+	//
+	// L4 审查实测的**真回归**（旧实现 `aa3abce` 本来能整段放下，修复后反而丢了）：
+	//   · 区段内无 `###` ⇒ 全部正文进同一个 other 块；而 other 块只在
+	//     `itemBlocks.length > 0 && omitted === itemBlocks.length` 时才被尝试
+	//     ⇒ `itemBlocks.length === 0` 时永不进入 ⇒ **正文一条不剩**（100%→0%）。
+	//   · 无编号条目（`### SBS-RUNS-M1`，真实仓 10,466B，是活跃任务）归入 other
+	//     ⇒ 同样被跳过 ⇒ 永不进包且 `omitted` 不计数（静默丢失）。
+	// 现实现：other 块（跳过纯空白）**无条件尝试**。
+	const NOH3_REPO = mkdtempSync(join(tmpdir(), "hydrate-noh3-"));
+	try {
+		// (a) 区段内完全无 `###`
+		writeFileSync(
+			join(NOH3_REPO, "recentwork.md"),
+			"## Active Tasks\n\n- TASK_A 已交付\n- TASK_B 待实机确认\n- TASK_C 阻塞\n",
+			"utf8",
+		);
+		const noH3Doc = buildHandoff({ stateDir: STATE, mailboxDir: MAILBOX, journalPath: JOURNAL, repoRoot: NOH3_REPO });
+		assert.ok(noH3Doc.markdown.includes("TASK_A"), "区段无 ### 时正文不得丢失（旧实现全丢）");
+		assert.ok(noH3Doc.markdown.includes("TASK_C"), "最后一条也要在");
+
+		// (b) 有编号 Item + 无编号条目共存 ⇒ 无编号条目也必须能进
+		writeFileSync(
+			join(NOH3_REPO, "recentwork.md"),
+			[
+				"## Active Tasks", "",
+				"### Item 1 — 有编号的", "", "- 内容一", "",
+				"### SBS-RUNS-M1 里程碑任务", "", "- MILESTONE_TASK 关键信息", "",
+			].join("\n"),
+			"utf8",
+		);
+		const mixedDoc = buildHandoff({ stateDir: STATE, mailboxDir: MAILBOX, journalPath: JOURNAL, repoRoot: NOH3_REPO });
+		assert.ok(mixedDoc.markdown.includes("### Item 1"), "编号条目应在");
+		assert.ok(mixedDoc.markdown.includes("MILESTONE_TASK"), "无编号条目也不得被跳过（旧实现只在所有 Item 都失败时才试 other 块）");
+	} finally {
+		rmSync(NOH3_REPO, { recursive: true, force: true });
+	}
+
+	// ── 9. 超长标题的条目不得因 `budgetLeft` 下限而丢失（L4 P1#4）──
+	//
+	// 旧实现 `budgetLeft > 40` 下限：标题本身就占满预算（≤40 剩余）时该行不截断
+	// ⇒ itemHead 仍达 14KB ⇒ tryPush 永久失败 ⇒ 条目丢失，而预算还剩 1,892B 闲置。
+	const LONGHEAD_REPO = mkdtempSync(join(tmpdir(), "hydrate-longhead-"));
+	try {
+		const longTitle = "### Item 7 — " + "超长标题".repeat(60); // ≈ 380+ 字符
+		writeFileSync(
+			join(LONGHEAD_REPO, "recentwork.md"),
+			["## Active Tasks", "", longTitle, "", "X".repeat(14000), ""].join("\n"),
+			"utf8",
+		);
+		const longDoc = buildHandoff({ stateDir: STATE, mailboxDir: MAILBOX, journalPath: JOURNAL, repoRoot: LONGHEAD_REPO });
+		assert.ok(longDoc.markdown.includes("Item 7"), "超长标题的条目不得丢失（预算不得闲置而丢条目）");
+	} finally {
+		rmSync(LONGHEAD_REPO, { recursive: true, force: true });
+	}
 } finally {
 	rmSync(RUNTIME, { recursive: true, force: true });
 	rmSync(REPO, { recursive: true, force: true });
