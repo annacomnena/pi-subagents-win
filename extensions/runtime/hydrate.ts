@@ -24,6 +24,7 @@ import { mailboxBacklog, listLetters } from "./mailbox.ts";
 import { masterAddress, type ObjectAddress } from "./address.ts";
 import { readAttachment, readCutover, readHandoffToken } from "./registry.ts";
 import { enrichRunRefs, listTasks, listWorkstreams } from "./workstreams.ts";
+import { extractActiveTasksSection, buildRecentWorkExcerpt } from "./frontier-carriers.ts";
 
 export interface HydrateOptions {
 	stateDir?: string;
@@ -132,20 +133,43 @@ export function buildHandoff(opts: HydrateOptions = {}): HandoffDocument {
 
 	// ── RecentWork（仓库惯例，F23）─────────────────────────────────
 	const rwPath = join(repoRoot, "recentwork.md");
+	// 2026-10-31 修正：原实现取**整文件前 2048 字节**，而三个仓的 recentwork.md 开头都是
+	// 「Maintenance Rules」写入端规范，真正任务状态在 1 KB 之后 —— 实测交接包只拿到
+	// 1.2%~1.7% 且**任务索引行 0~1 条**（GreenCAD / battlesandbox 为 0 条）。
+	// 改为先切 `## Active Tasks` 区段（与主动性套件 readGateStatus 同一判据），再对区段
+	// 做 2048 上限截断：两个消费者读**同一份东西**，不再各有一套读法。
 	let rwExcerpt: string | null = null;
+	let rwNote: string;
 	if (existsSync(rwPath)) {
 		try {
 			const buf = readFileSync(rwPath, "utf8");
-			rwExcerpt = truncateUtf8(buf, RECENTWORK_CAP_BYTES);
+			const section = extractActiveTasksSection(buf);
+			if (section === null) {
+				// 无 `## Active Tasks` 区段（可能只剩归档）⇒ 如实回退整文件头，并在 manifest 标注原因
+				rwExcerpt = truncateUtf8(buf, RECENTWORK_CAP_BYTES);
+				rwNote = `no Active Tasks section — fell back to head (${buf.length} chars total)`;
+			} else {
+				// 按结构价值取块（标题 + Task Index + Item 条目），而非机械字节截断：
+				// 实测区段自身头部也可能很长（首个 ### Item 偏移 9,979 / 16,990），
+				// 机械截断会让 3 个仓里的 2 个**一条任务条目都进不去**。
+				rwExcerpt = buildRecentWorkExcerpt(section, RECENTWORK_CAP_BYTES);
+				rwNote =
+					section.length > RECENTWORK_CAP_BYTES
+						? `Active Tasks section, structural prefix (section ${section.length} chars; file ${buf.length})`
+						: `full Active Tasks section (${section.length} chars; file ${buf.length})`;
+			}
 		} catch {
 			rwExcerpt = null;
+			rwNote = "read error";
 		}
+	} else {
+		rwNote = /[/\\]/.test(repoRoot) ? "absent at repoRoot" : "unresolvable root";
 	}
 	manifest.push({
 		name: "recentwork",
 		present: rwExcerpt !== null,
 		source: rwPath,
-		note: rwExcerpt === null ? (/[/\\]/.test(repoRoot) ? "absent at repoRoot" : "unresolvable root") : `${rwExcerpt.length} chars excerpt`,
+		note: rwNote,
 	});
 	section.push(`## RecentWork\n${rwExcerpt ?? "(absent — no recentwork.md at repoRoot)"}`);
 
