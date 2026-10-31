@@ -485,6 +485,8 @@ export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLive
 		// 相差 < 10min 就近配对。只对**尚未**入索引的会话做，且只产出真实 pid 证据。
 		const legacy = states.filter((x) => !(typeof x.st.sessionPath === "string" && x.st.sessionPath));
 		if (legacy.length > 0) {
+			// 阶段 1：为每个尚未配对的会话找最近的 legacy 候选（只收集，不落定）
+			const candidates: Array<{ sessionId: string; tabId: string; pid: number; delta: number }> = [];
 			for (const s of listPiSessions(sessionsDir)) {
 				if (bySession.has(s.sessionId)) continue;
 				if (!s.cwd) continue;
@@ -500,7 +502,17 @@ export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLive
 					if (delta > 10 * 60_000) continue;
 					if (!best || delta < best.delta) best = { id: x.id, pid: x.st.pid!, delta };
 				}
-				if (best) bySession.set(s.sessionId, { runId: best.id, pid: best.pid, alive: isProcessAlive(best.pid) });
+				if (best) candidates.push({ sessionId: s.sessionId, tabId: best.id, pid: best.pid, delta: best.delta });
+			}
+			// 阶段 2：互扣筛选（同一 tab 被多会话争抢 ⇒ 全弃用）
+			//
+			// 2026-10-31 实测事故（sol §8.6 预警）：同 cwd 隔 2 分半的两个会话
+			// `01a175ba` / `01a175bd` 都被配给同一个 `pid 433784`（已死）。旧逻辑
+			// 只看「时间最近」没有任何身份依据。共享的 legacy 配对必然至少一个错，
+			// 且无法判断是哪个 ⇒ **全部弃用**降为 unknown 比随便选一个安全：
+			// 宁可该会话需用户手动恢复，也不能因邻居的记录把活会话误判死而重复开窗。
+			for (const c of filterContestedLegacyPairs(candidates)) {
+				bySession.set(c.sessionId, { runId: c.tabId, pid: c.pid, alive: isProcessAlive(c.pid) });
 			}
 		}
 	} catch {
@@ -587,6 +599,30 @@ function getCachedLivenessIndex(sessionsDir: string): Map<string, SessionLivenes
 /** 供测试/命令失效缓存（daemon 重启或显式刷新时用）。 */
 export function invalidateLivenessIndexCache(): void {
 	livenessIndexCache = null;
+}
+
+/**
+ * legacy 配对结果互扣筛选（**纯函数**，便于单测）。
+ *
+ * 输入：`候选 = [{ sessionId, tabId }]`（同一 tab 可被多个会话列为候选）。
+ * 输出：只保留那些 **tab 记录未被多个会话争抢** 的配对。
+ *
+ * 为何要丢：同一 tab 被多个会话共享 ⇒ 至少有一个是错的，且**无法判断是哪个**
+ * （没有身份依据，只有「同 cwd + 时间接近」）。此时全丢 → 那些会话降为 unknown
+ * （不自动拉起，用户可手动开），优先保证不因邻居的 tab 记录把活会话误判死。
+ *
+ * 2026-10-31 实测：`01a175ba` / `01a175bd`（同 cwd 隔 2 分半）都被配给 `pid 433784`。
+ */
+export function filterContestedLegacyPairs(
+	candidates: ReadonlyArray<{ sessionId: string; tabId: string }>,
+): Array<{ sessionId: string; tabId: string }> {
+	const owners = new Map<string, Set<string>>();
+	for (const c of candidates) {
+		const set = owners.get(c.tabId) ?? new Set<string>();
+		set.add(c.sessionId);
+		owners.set(c.tabId, set);
+	}
+	return candidates.filter((c) => (owners.get(c.tabId)?.size ?? 0) === 1);
 }
 
 /**

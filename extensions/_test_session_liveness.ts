@@ -14,6 +14,7 @@
  */
 
 import assert from "node:assert/strict";
+import { filterContestedLegacyPairs } from "./runtime-host/server.ts";
 import {
 	activityOf,
 	decideSendActionAllowed,
@@ -193,6 +194,42 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 		"已知残留风险：旧 dead + 探针超时仍会拉起（sol §8 第 1 条，未修）",
 	);
 	ok("残留风险已如实锁定：旧 dead + 探针失败仍会拉起（未解决，不掩盖）");
+}
+
+// ── ⑨ 【2026-10-31 实测回归】多会话共享同一 legacy tab 记录 ⇒ 全弃用 ──
+//
+// 现场：同 cwd（G:\code\GreenCAD）隔 2 分半的两个会话
+// `01a175ba-c020` / `01a175bd-1178` 都被 legacy 就近配对到同一个 `pid 433784`（已死）。
+// 旧行为：两个都报 dead / 同一个 pid —— 至少有一个是错的，且无法判断是哪个。
+{
+	const kept = filterContestedLegacyPairs([
+		{ sessionId: "01a175ba-c020", tabId: "tab_shared" },
+		{ sessionId: "01a175bd-1178", tabId: "tab_shared" },
+	]);
+	assert.equal(kept.length, 0, "同一 tab 被两个会话争抢 ⇒ 两个都弃用（降 unknown，不自动拉起）");
+
+	// 不争抢的正常情况必须保留
+	const normal = filterContestedLegacyPairs([
+		{ sessionId: "s1", tabId: "tab_a" },
+		{ sessionId: "s2", tabId: "tab_b" },
+	]);
+	assert.equal(normal.length, 2, "一对一无争抢 ⇒ 全部保留");
+
+	// 三个会话抢两个 tab：争抢的那个丢掉，单独的保住
+	const mixed = filterContestedLegacyPairs([
+		{ sessionId: "s1", tabId: "tab_x" },
+		{ sessionId: "s2", tabId: "tab_x" },
+		{ sessionId: "s3", tabId: "tab_y" },
+	]);
+	assert.deepEqual(mixed.map((m) => m.sessionId), ["s3"], "只保留唯一认领的配对");
+
+	// 同一会话重复候选同一 tab（应视为一个认领，不算争抢）
+	const same = filterContestedLegacyPairs([
+		{ sessionId: "s1", tabId: "tab_z" },
+		{ sessionId: "s1", tabId: "tab_z" },
+	]);
+	assert.equal(same.length, 2, "同一会话的重复候选不算争抢（按 sessionId 去重判）");
+	ok("【实测回归】同一 legacy tab 被多会话争抢 ⇒ 全部弃用降 unknown（防邻居记录误判）");
 }
 
 console.log(`\nsession-liveness tests passed (${n} checks)`);
