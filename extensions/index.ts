@@ -38,6 +38,10 @@ import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { resolveWorkerModel as resolveTraceWorkerModel, type AvailableModelRef } from "./trace-fusion/models.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
+// codegraph：外部 codegraph CLI 的工具包装（2026-10-31）。
+// 之前只有提示文字提到 codegraph，从未注册成工具 ⇒ 实测 8492 次调用里
+// codegraph 使用 **0 次**（不是模型不爱用，是根本看不到这个工具）。
+import { registerCodegraph } from "./codegraph.ts";
 import { registerSessionHooks } from "./session-hooks.ts";
 import { getPendingReminder } from "./runtime/master-succession.ts";
 import { anyLedgerPresent, formatRecentScopes, listRecentScopes } from "./runtime/recent-scopes.ts";
@@ -2574,6 +2578,8 @@ export default function (pi: ExtensionAPI) {
 	if (isSubagent()) {
 		registerCodexHeaders(pi);
 		registerWikiNav(pi);
+		// 子 agent 是最需要 codegraph 的角色（检索符号）⇒ 也给它们
+		registerCodegraph(pi);
 		return;
 	}
 
@@ -3463,6 +3469,10 @@ export default function (pi: ExtensionAPI) {
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
+
+	// codegraph：代码知识图谱检索（符号级定位）。与 wiki-nav 互补：
+	// wiki 给「这个主题在哪、以前怎么做的」，codegraph 给「这个符号定义/调用在哪一行」。
+	registerCodegraph(pi);
 
 	// ── Windows 通知 hook（受 config.json notifications 开关控制）──
 

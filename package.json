@@ -51,6 +51,7 @@
     "test:session-control": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_control.ts",
     "test:streaming-snapshot": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_streaming_snapshot.ts",
 		"test:session-title": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_title.ts",
+		"test:codegraph": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_codegraph.ts",
 		"test:session-pin": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_pin.ts",
 		"test:recent-scopes": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_recent_scopes.ts",
 		"test:global-view": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_global_view.ts",
