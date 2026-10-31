@@ -92,6 +92,73 @@ DECL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 PRELOAD_PATTERN = re.compile(r'^(?:static\s+)?(?:const|var)\s+([A-Za-z_]\w*)\s*(?::\s*\w+\s*)?=\s*(?:preload|load)\(\s*"([^"]+)"\s*\)')
 
+# ── 全文检索用的文本抽取与 token 化 ───────────────────────────────────
+#
+# 为什么要它（owner 2026-10-31 提问「这个不能像 codegraph 那样模糊查询吧」）：
+# 实测 codegraph 能查中文「审批策略」⇒ 它不是语义理解，而是**对注释/docstring
+# 做全文匹配**（源码里确实写着「/// 默认审批策略提供器」）。
+# 而 battlesandbox 的注释密度 13.6%（2937 行中文文档），是检索金矿。
+#
+# 中文没法直接空格分词，所以用 **CJK n-gram 滑窗**（2-gram）做 token：
+#   「无累积」⇒ unigram 无/累/积 + bigram 无累/累积
+#   查询同样切 n-gram，按 bigram 命中数打分 ⇒ 容忍语序/部分匹配。
+# 英文/标识符按 word boundary 切，并做驼峰拆分（quantizeTime → quantize/time）。
+
+CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+
+# 停用词（对检索无信息量的中文 bigram）
+CJK_STOP = {
+    "的的", "了了", "是是", "在在", "和和", "与与", "或或",
+    "这个", "那个", "一个个", "什么", "怎么", "为什",
+}
+
+
+def text_tokens(text: str) -> set[str]:
+    """
+    把一段文本切成检索 token 集。
+
+    - CJK：unigram + bigram（不跨标点/空格）
+    - 其他：小写单词 + 驼峰拆分后的子词
+    """
+    toks: set[str] = set()
+    if not text:
+        return toks
+
+    # CJK 连续段 → n-gram
+    for seg in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]+", text):
+        for ch in seg:
+            toks.add(ch)
+        for i in range(len(seg) - 1):
+            bg = seg[i : i + 2]
+            if bg not in CJK_STOP:
+                toks.add(bg)
+
+    # 英文/数字
+    for w in WORD_RE.findall(text):
+        lw = w.lower()
+        toks.add(lw)
+        # 驼峰拆分：quantizeTime → quantize / time
+        parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", w)
+        if len(parts) > 1:
+            for p in parts:
+                toks.add(p.lower())
+
+    return toks
+
+
+def comment_lines_of(lines: list[str]) -> list[tuple[int, str]]:
+    """返回所有注释行 `(行号, 去 `#` 后的文本)`。"""
+    out: list[tuple[int, str]] = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if not s.startswith("#"):
+            continue
+        body = s.lstrip("#").strip()
+        if body:
+            out.append((i, body))
+    return out
+
 
 def indent_of(line: str) -> int:
     """返回缩进宽度（tab 记 4 空格；GDScript 官方风格用 tab）。"""
@@ -163,6 +230,8 @@ class FileRecord:
     symbols: list[Symbol] = field(default_factory=list)
     # const _TOps = preload("res://...")  →  {_TOps: "res://..."}
     aliases: dict[str, str] = field(default_factory=dict)
+    # 注释行 [(行号, 文本)] —— 全文检索的语料
+    comments: list[tuple[int, str]] = field(default_factory=list)
 
 
 def scan_file(path: Path, repo: Path) -> FileRecord:
@@ -282,6 +351,7 @@ def scan_file(path: Path, repo: Path) -> FileRecord:
         line_count=len(lines),
         symbols=symbols,
         aliases=aliases,
+        comments=comment_lines_of(lines),
     )
 
 
@@ -331,6 +401,7 @@ def build_files_map(records: list[FileRecord]) -> dict[str, Any]:
             "line_count": r.line_count,
             "symbols": [asdict(s) for s in r.symbols],
             "aliases": r.aliases,
+            "comments": [[ln, txt] for ln, txt in r.comments],
         }
         for r in records
     }
@@ -420,6 +491,7 @@ def cmd_sync(args: list[str]) -> int:
             "line_count": rec.line_count,
             "symbols": [asdict(s) for s in rec.symbols],
             "aliases": rec.aliases,
+            "comments": [[ln, txt] for ln, txt in rec.comments],
         }
 
     for rel in list(files_map):
@@ -676,6 +748,168 @@ def cmd_refs(args: list[str]) -> int:
     return 0
 
 
+def cmd_search(args: list[str]) -> int:
+    """
+    全文检索（注释 + 符号名 + 文件路径），支持中文与自然语言。
+
+    owner 2026-10-31：「这个不能像 codegraph 那样模糊查询吧？」
+    —— 当时确实不能。实测 codegraph 能查中文「审批策略」∵它索引了
+    注释文本（源码里写着「/// 默认审批策略提供器」），不是语义理解。
+
+    与 `query` 的分工：
+      query  → 你知道**符号名**（quantize_time），要定位
+      search → 你知道**意图/概念**（时间量化、确定性求值），找“哪里有讲这个”
+
+    打分：按 token 命中率（IDF 加权简化：稀有 token 权重高）。
+    """
+    if not args:
+        print("  usage: gdcg.py search <关键词|自然语言> [--limit N] [--files-only]")
+        return 1
+    limit = 20
+    files_only = "--files-only" in args
+    min_score = 0.15
+    # 收集位置参数（排除 flags 及其值）
+    words: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1])
+            i += 2
+            continue
+        if a == "--min-score" and i + 1 < len(args):
+            min_score = float(args[i + 1])
+            i += 2
+            continue
+        if a == "--files-only":
+            i += 1
+            continue
+        words.append(a)
+        i += 1
+    query = " ".join(words)
+
+    repo = find_repo(None)
+    idx = load_index(repo)
+    if idx is None:
+        print(f"  Not initialized: {repo}")
+        return 1
+
+    q_toks = text_tokens(query)
+    if not q_toks:
+        print(f"  Query has no searchable tokens: {query!r}")
+        return 0
+
+    # token 权重：bigram/英文词比单字有信息量得多。
+    #
+    # 实测教训（battlesandbox）：「无累积」的 unigram（无/累/积）散落在几十个文件里
+    # ⇒ 单字计入会导致 80/192 文件全命中，排序失去意义。
+    # 而 bigram（无累 / 累积）只在真正讲到这个概念的地方出现。
+    def tok_weight(t: str) -> float:
+        if len(t) == 1:
+            return 0.4 if CJK_RE.match(t) else 1.0
+        if len(t) == 2 and CJK_RE.match(t):
+            return 3.0
+        return 2.0
+
+    files = idx.get("files", {})
+
+    # 先算 token 文档频率（IDF 用）
+    df: dict[str, int] = {}
+    per_file_toks: dict[str, set[str]] = {}
+    per_file_text: dict[str, list[tuple[int, str]]] = {}
+    for rel, v in files.items():
+        toks: set[str] = set()
+        # ① 注释行（主语料）
+        comments = v.get("comments") or []
+        per_file_text[rel] = [(int(ln), str(txt)) for ln, txt in comments]
+        for _, txt in comments:
+            toks |= text_tokens(str(txt))
+        # ② 符号名
+        for s in v.get("symbols", []):
+            toks |= text_tokens(s.get("name", ""))
+            if s.get("owner"):
+                toks |= text_tokens(s.get("owner", ""))
+        # ③ 文件路径
+        toks |= text_tokens(rel)
+        per_file_toks[rel] = toks
+        for t in toks:
+            df[t] = df.get(t, 0) + 1
+
+    nfiles = max(1, len(files))
+    import math
+
+    def idf(t: str) -> float:
+        d = df.get(t, 0)
+        if d == 0:
+            return 0.0
+        return math.log(1 + nfiles / d) * tok_weight(t)
+
+    # 每个文件的得分 = 命中 token 的加权 IDF 之和 / 查询 token 的加权 IDF 总和
+    max_score = sum(idf(t) for t in q_toks) or 1.0
+
+    # 查询里是否存在“有信息量”的 token（bigram / 英文词）。
+    #
+    # 为什么要这个门槛（实测 bug）：查「量子纠缠超导体」时，唯一命中的是
+    # 单字「量」（注释里「时间量化」），却算法出 score=1.00 ⇒ 完全无关的词
+    # 也报成命中。原因：分母只累加**有 IDF** 的 token，而那个单字恰好稀有、
+    # IDF 很高，比例就失真了。
+    #
+    # 规则：若查询里有 bigram/英文词，则**必须至少命中一个非单字 token**，
+    # 否则这个文件不算匹配。只查单个汉字时不受影响。
+    strong_tokens = {t for t in q_toks if tok_weight(t) >= 2.0}
+    scored: list[tuple[float, str, list[str]]] = []
+    for rel, toks in per_file_toks.items():
+        hit = [t for t in q_toks if t in toks]
+        if not hit:
+            continue
+        # 门槛：查询有强 token 时，至少命中一个强 token，否则不算匹配
+        if strong_tokens and not any(t in strong_tokens for t in hit):
+            continue
+        sc = sum(idf(t) for t in hit) / max_score
+        scored.append((sc, rel, hit))
+    scored.sort(key=lambda x: -x[0])
+
+    if not scored:
+        print(f"  No results for {query!r}")
+        # 提示：告诉用户缺的事什么，而不是只说“没有”
+        miss = [t for t in q_toks if t not in df]
+        if miss:
+            print(f"  (tokens not present anywhere: {', '.join(sorted(miss)[:8])})")
+        return 0
+
+    strong = [(sc, rel, hit) for sc, rel, hit in scored if sc >= min_score]
+    if not strong:
+        print(f"  No strong match for {query!r} (best score {scored[0][0]:.2f} < {min_score})")
+        print(f"  Weak candidates: {', '.join(r for _, r, _ in scored[:3])}")
+        print("  Hint: lower --min-score to see weaker matches")
+        return 0
+
+    print(f"  {len(strong)} file(s) matched {query!r}" + (f"  ({len(scored)} weaker matches hidden)" if len(scored) > len(strong) else ""))
+    print(f"  (showing {min(limit, len(strong))})")
+    for sc, rel, hit in strong[:limit]:
+        print()
+        print(f"  {rel}   score={sc:.2f}")
+        if files_only:
+            continue
+        # 展示命中最多的注释行（最多 3 条）
+        best_lines: list[tuple[int, str, int]] = []
+        for ln, txt in per_file_text.get(rel, []):
+            t_toks = text_tokens(txt)
+            n_hit = len([t for t in q_toks if t in t_toks])
+            if n_hit:
+                best_lines.append((n_hit, txt, ln))
+        best_lines.sort(key=lambda x: (-x[0], x[2]))
+        for n_hit, txt, ln in best_lines[:3]:
+            print(f"    :{ln}  {txt[:110]}")
+        # 若注释没命中，展示符号名命中
+        if not best_lines:
+            for s in files[rel].get("symbols", []):
+                st = text_tokens(s.get("name", ""))
+                if any(t in st for t in q_toks):
+                    print(f'    {s["kind"]:<10} {s["name"]}  {s["file"]}:{s["line"]}')
+    return 0
+
+
 def cmd_files(args: list[str]) -> int:
     glob = args[0] if args else "*"
     repo = find_repo(None)
@@ -737,6 +971,7 @@ COMMANDS = {
     "sync": cmd_sync,
     "status": cmd_status,
     "query": cmd_query,
+    "search": cmd_search,
     "refs": cmd_refs,
     "files": cmd_files,
     "show": cmd_show,

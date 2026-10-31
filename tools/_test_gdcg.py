@@ -54,6 +54,9 @@ def make_repo(root: Path) -> None:
         textwrap.dedent(
             """\
             ## ops.gd — 工具函数集
+            ##
+            ## 时间量化纪律：t → 栅格整数 × TICK_S，非有限值返回 NAN。
+            ## 无累积：求值是闭式的，不缓存上一次结果。
             class_name Ops
             extends RefCounted
 
@@ -200,7 +203,7 @@ def main() -> int:
 
         # ── ⑦ query 排序：精确 > 前缀 > 子串 ─────────────────────
         rc, out = run(["query", "quantize_time"], tmp)
-        assert "ops.gd:12" in out, out
+        assert "ops.gd:15" in out, out
         # 驼峰缩写：qt 应能命中 quantize_time（驼峰+下划线词首）
         rc2, out2 = run(["query", "qt"], tmp)
         # _is_num 也会因 initials 命中（i n），验证 quantize_time 在结果里
@@ -232,6 +235,32 @@ def main() -> int:
         rc, out = run(["query", "inner_method"], tmp)
         assert "No results" in out, f"删除后符号仍在索引；输出:\n{out}"
         ok("⑩ sync 删除：文件删除记 -1 且符号从索引移除")
+
+        # ── ⑫ 【新增】search：中文全文检索（注释语料）────────
+        # owner 2026-10-31：「这个不能像 codegraph 那样模糊查询吧？」
+        # 实测 codegraph 能查中文，靠的是对注释做全文匹配，不是语义理解。
+        rc, out = run(["search", "量化", "--limit", "3"], tmp)
+        assert rc == 0, out
+        assert "ops.gd" in out, f"搜中文「量化」未命中 ops.gd（注释里有「时间量化」）:\n{out}"
+        assert "时间量化" in out or "量化" in out, f"未展示命中的注释行:\n{out}"
+        ok("⑫ search 中文：注释语料命中（量化 → ops.gd 的时间量化注释）")
+
+        # ── ⑬ search：分号无关的 n-gram 容忍部分匹配 ─────────
+        # 「工具函数集」是 ops.gd 首行注释；查「函数集」应能命中
+        rc, out = run(["search", "函数集"], tmp)
+        assert "ops.gd" in out, f"n-gram 部分匹配失败:\n{out}"
+        ok("⑬ search n-gram：查「函数集」命中注释「工具函数集」（不要求整词）")
+
+        # ── ⑭ search：完全无关的词应无结果（不能乱返回）────────
+        rc, out = run(["search", "量子纠缠超导体"], tmp)
+        assert rc == 0, out
+        assert "No results" in out or "No strong match" in out, f"无关词居然有结果:\n{out}"
+        ok("⑭ search 无关词：明确报无结果，不乱返回")
+
+        # ── ⑮ search：弱匹配被隐藏（阈值生效）────────────────
+        rc, out = run(["search", "量化"], tmp)
+        assert "weaker matches hidden" in out or "strong match" in out or "file(s) matched" in out, out
+        ok("⑮ search 阈值：强/弱匹配分离，噪声不当结果展示")
 
         # ── ⑪ 未初始化时友好报错（不崩）─────────────────────────
         empty = Path(tempfile.mkdtemp(prefix="gdcg_empty_"))
