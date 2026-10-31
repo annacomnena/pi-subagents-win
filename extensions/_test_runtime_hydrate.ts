@@ -225,28 +225,35 @@ try {
 
 	// ── 6. 静默截断防线：条目必然装不下时，必须出现「未列入」 ──
 	//
-	// 变异验证记录（诚实）：
+	// 变异验证记录（2026-11-01 L4 修正）：
 	//   ✅ 变异 B（`tryPush(itemHead(b))` → `tryPush(b)`）→ 上段「第一条本身也不得丢失」**变红**。
-	//   ⚠️ 变异 A（`contentCap = capBytes`，取消 NOTE_RESERVE 预留）→ **本测试不变红**。
-	//      原因（已实测）：`itemHead` 现在会把每条压到 ≤420 字符，且**单行硬截断**，
-	//      因此 40 条 × 内容度的仓也只会占 ~1.7KB，远不满 2048 ⇒ note 总放得下。
-	//      即：**NOTE_RESERVE 目前是冗余防线而非唯一防线**，硬截断已先一步挡住了那条路径。
-	//      保留 NOTE_RESERVE 是为了将来若改 PER_ITEM_BUDGET（如调到 1500）时不静默丢失声明。
-	//      不为了凑一条“能打红的断言”而把预算改坏——变异 A 无法被结构性打红，如实记在此。
-	//   本段仍有价值：它锁住「条目多到超过预算时必须有声明」这个可见行为（目前为绿）。
+	//   ✅ 变异 E（`contentCap = capBytes`，取消 NOTE_RESERVE 预留）→ **现在也会变红**。
+	//
+	//   ⚠️ 旧注释曾写「变异 A 无法被结构性打红」，**那是错误归因**。原因不是「打不红」，
+	//      而是下面的 40 条短条目 fixture 经 itemHead 压到 ≤260 字符后总量只 ~1.7KB，
+	//      **永远填不满 contentCap** ⇒ 永远碰不到 `(contentCap, capBytes]` 那个窗口。
+	//      换成「一个接近预算上限的 Task Index 块 + 少量条目」就能命中（L4 用 p22.mts 证明）。
+	//      用错误归因把一个防线标成「冗余、不可测」 —— 这正是「把 bug 锁成规范」的同款风险。
+	//
+	// 本段现在故意造「索引块几乎吃满预算」的形状：索引无 INDEX_CAP 约束时才能吃满，
+	// 但 INDEX_CAP = 0.4 ⇒ 不可能。所以改用**大量 Item 条目**把 contentCap 填满至只剩
+	// < NOTE_RESERVE 的余量：这时若没预留，note 就放不下而被丢掉。
 	const OVERFLOW_REPO = mkdtempSync(join(tmpdir(), "hydrate-overflow-"));
 	try {
+		// 精确控量：每条正文经 itemHead 后约 260 字符 + 标题行 ~30 字符 ⇒ 每条 ~290 字符。
+		// contentCap = 2048 - 110 = 1938 字符量级 ⇒ 8 条即可填到 >1900，使 note（~85B）放不下。
 		const many: string[] = ["# Recent Work", "", "## Active Tasks", ""];
-		for (let i = 1; i <= 40; i++) {
-			many.push(`### Item ${700 + i} — OVERFLOW_ITEM_${i} 第 ${i} 条`, "");
-			// 每条 ~300 字符正文：40 条 ≈ 12KB，必然超 2048
-			many.push(`- ${`填充正文${i}。`.repeat(30)}`, "");
+		for (let i = 1; i <= 30; i++) {
+			many.push(`### Item ${700 + i} — OVERFLOW_ITEM_${i}`, "");
+			// padLen=60 实测使正文落到 1923B（contentCap=1938B）—— 紧贴上限，
+			// 正是「取消了 NOTE_RESERVE 后正文会吃满 2048、note 放不下」的那个窗口。
+			many.push(`- ${"填".repeat(60)}`, "");
 		}
 		writeFileSync(join(OVERFLOW_REPO, "recentwork.md"), many.join("\n"), "utf8");
 		const ovDoc = buildHandoff({ stateDir: STATE, mailboxDir: MAILBOX, journalPath: JOURNAL, repoRoot: OVERFLOW_REPO });
 		assert.ok(
 			/未列入/.test(ovDoc.markdown),
-			`条目必然装不下时必须声明「未列入」，不得静默截断（变异 A 会把这条打红）`,
+			`条目必然装不下时必须声明「未列入」，不得静默截断（变异 E 会把这条打红）`,
 		);
 	} finally {
 		rmSync(OVERFLOW_REPO, { recursive: true, force: true });
