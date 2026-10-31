@@ -122,7 +122,6 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	};
 	const parts: string[] = [];
 	let used = 0;
-	let omitted = 0;
 	/** 给末尾「未列入」声明预留的空间（**必须先扣**，否则会把预算吃满导致声明被丢，
 	 *  那就是静默截断 —— 实测 subagent-win/battlesandbox 已经踩中过：2046/2048 用满 →
 	 *  note 放不下 → return body（无任何声明）。 */
@@ -170,18 +169,30 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	//    实测本仓 Task Index 块 = 9,962 字符 / 15,532 字节，整块塞不进 2KB 预算，
 	//    于是整块被 `tryPush` 拒掉 ⇒ 最有用的一屏总览反而一条都进不去。
 	//    改为：表头 + 分隔行务必保留，后续数据行逐行加入直到预算用尽。
+	//
+	//    ⚠ 2026-11-01 口径修正：块内行被截**不算「块未列入」**。
+	//    旧实现在这里 `omitted += 1; break`，但该索引块明明已经产出（表头 + 几行数据），
+	//    于是 note 说「共 22 块、19 未列入 ⇒ 隐含 3 块已列入」而实际产出 4 块
+	//    （实测本仓：index 1 + item 3 + other 0 = 4）。行级截断只影响块内「共 N 行」声明，
+	//    行级截断只影响块内自带的「共 N 行，此处 M 行」声明，不污染块级分母/分子。
+
+	let indexBlocksKept = 0;
 	for (const b of indexBlocks) {
 		const bl = b.split("\n");
 		const kept: string[] = [];
+		let truncatedHere = false;
 		for (const ln of bl) {
-			// 表格行的 Summary 列极长（实测单行 400+ 字符）⇒ 逐行裁到 ~200 字符，
+			// 表格行的 Summary 列极长（实测单行 400+ 字符）⇒ 逐行裁到 ~150 字符，
 			// 牺牲细节换行数：交接者需要知道「有哪几条、大致是什么」，细节可重读文件。
 			const line = ln.length > 150 && /^\|/.test(ln) ? `${ln.slice(0, 150)}… |` : ln;
-			if (!tryPush(line, INDEX_CAP)) { omitted += 1; break; }
+			if (!tryPush(line, INDEX_CAP)) { truncatedHere = true; break; }
 			kept.push(line);
 		}
+		if (kept.length > 0) indexBlocksKept += 1; // 该块**已列入**（至少表头进了）
+		if (!truncatedHere) continue;
+
 		// 若数据行被截，补一行如实告知（不静默）
-		if (kept.length < bl.length && kept.length > 2) {
+		if (kept.length > 2) {
 			const total = bl.filter((l) => /^\|/.test(l)).length;
 			const shown = kept.filter((l) => /^\|/.test(l)).length;
 			const noteRow = `| … 共 ${total} 行，此处 ${shown} 行 |`;
@@ -194,30 +205,37 @@ export function buildRecentWorkExcerpt(section: string, capBytes: number): strin
 	// ③ Item 条目：**每条只取标题 + 前几行**（不是整条）
 	//    实测单条 1.4K~11.6K 字符 —— 整条只能塞进 1 条，而交接者要的是「有哪些活」。
 	//    只取首段能在同一预算下覆盖 3~8 倍多的条目数。
-	let anyItemPushed = false;
+	let itemsKept = 0;
 	for (const b of itemBlocks) {
-		if (tryPush(itemHead(b))) anyItemPushed = true;
-		else omitted++;
+		if (tryPush(itemHead(b))) itemsKept++;
 	}
-	void anyItemPushed; // 保留可观测位（旧 ④ 判据用到，现在 other 块无条件尝试）
 	// ④ **其它块无条件尝试**（2026-11-01 L4 修正 P0/P1）：
 	//    旧实现只在 `itemBlocks.length > 0 && omitted === itemBlocks.length` 时才试，
 	//    于是三条真实丢失路径全部静默：
 	//      · 无编号条目（`### SBS-RUNS-M1`，真实仓 10,466B，是**活跃任务**）
 	//      · 区段内完全无 `###` 子标题（全部正文进一个块）⇒ 正文一条不剩
 	//      · `omitted` 混入 index 失败计数 ⇒ `omitted === itemBlocks.length` 判据误判
-	//    改为：跳过纯空白块后**总是**尝试，失败则计入 omitted（不再 `break`，否则
-	//    其余 other 块连数都不数）。
+	//    改为：跳过纯空白块后**总是**尝试。
+	let othersKept = 0;
 	for (const b of otherBlocks) {
 		if (b.trim() === "") continue; // 纯空块不占预算也不计数（否则分母虚增）
-		if (!tryPush(b.trimEnd())) omitted++;
+		if (tryPush(b.trimEnd())) othersKept++;
 	}
 
 	const body = parts.join("\n");
 	if (byteLen(body) === 0) return truncateUtf8ToBytes(section, capBytes);
-	// 如实声明被省略的块（不静默截断）。分母只数**非空**块，与分子口径一致。
+	// 如实声明被省略的块（不静默截断）。
+	//
+	// 2026-11-01 口径重构：之前用 `omitted` 反推已列入数，而 `omitted` 里混过
+	// 索引块**行级**截断的计数 ⇒ note 说「隐含 3 块已列入」而实际产出 4 块
+	// （本仓实测：index 1 + item 3 + other 0 = 4）。现改成两边都直接数：
+	//   totalBlocks = 所有**非空**块
+	//   keptBlocks  = 真正产出的块
+	//   omitted     = totalBlocks - keptBlocks（不再靠读时自行加减）
 	const nonEmptyOther = otherBlocks.filter((b) => b.trim() !== "").length;
 	const totalBlocks = indexBlocks.length + itemBlocks.length + nonEmptyOther;
+	const keptBlocks = indexBlocksKept + itemsKept + othersKept;
+	const omitted = totalBlocks - keptBlocks;
 	if (omitted > 0) {
 		const note = `\n…（本区段共 ${totalBlocks} 个块，${omitted} 个因体积未列入；完整内容见文件）`;
 		return byteLen(body) + byteLen(note) <= capBytes ? body + note : body;

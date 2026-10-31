@@ -279,7 +279,28 @@ try {
 		// (c) 被截时必须有行数声明
 		assert.ok(/共 \d+ 行，此处 \d+ 行/.test(idxDoc.markdown), "索引被截时必须声明「共 N 行，此处 M 行」");
 		// (d) 索引不得吃光预算：后续 Item 条目仍要能进
-		assert.ok(idxDoc.markdown.includes("### Item 1 — 后续条目"), "索引占预算不得超过 40%，Item 条目仍须能进");
+		assert.ok(idxDoc.markdown.includes("### Item 1 — 后续条目"), "索引占预算不得超 40%，Item 条目仍须能进");
+		// (e) **块级口径必须自洽**（L4 P2#9 指出的盲区：note 分母/分子无测试）
+		//
+		// 旧实现：索引块内部**行级**截断也 `omitted += 1`，但该块明明已产出
+		// ⇒ note 说「共 N 块、K 未列入」而实际产出数对不上（实测本仓：声称 3、实际 4）。
+		// 现实现：totalBlocks / keptBlocks 两边都直接数，omitted = 差。
+		const rwStartIdx = idxDoc.markdown.indexOf("## RecentWork");
+		const idxRw = idxDoc.markdown.slice(rwStartIdx, idxDoc.markdown.indexOf("## Charter", rwStartIdx));
+		const noteM = idxRw.match(/共 (\d+) 个块，(\d+) 个因体积未列入/);
+		if (noteM) {
+			const total = Number(noteM[1]);
+			const omit = Number(noteM[2]);
+			const impliedKept = total - omit;
+			const realIdx = (idxRw.match(/^###\s+Task Index/m) ?? []).length;
+			const realItem = (idxRw.match(/^###\s+Item\s+\d+/gm) ?? []).length;
+			const realOther = (idxRw.match(/^###\s+(?!Item\s+\d+)(?!Task Index)/gm) ?? []).length;
+			assert.equal(
+				impliedKept,
+				realIdx + realItem + realOther,
+				`note 的块级口径必须自洽：隐含已列入 ${impliedKept} vs 实际 ${realIdx + realItem + realOther}（行级截断不得污染块级计数）`,
+			);
+		}
 	} finally {
 		rmSync(IDX_REPO, { recursive: true, force: true });
 	}
