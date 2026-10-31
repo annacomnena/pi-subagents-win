@@ -207,6 +207,12 @@ try {
 		);
 		assert.ok(deepDoc.markdown.includes("DEEPITEM_THIRD"), "第三条也必须能进来");
 		assert.ok(deepDoc.markdown.includes("DEEPITEM_FIRST"), "第一条本身也不得丢失（应硬截断而非跳过）");
+		// L4 审查 §8：这个 sentinel 原先只写在 fixture 里、**没有任何 assert 引用它**
+		// （死 sentinel，给人「测过了」的错觉）。现在真正启用。
+		assert.ok(
+			deepDoc.markdown.includes("SHOULD_SURVIVE_TRUNCATION"),
+			"第二条的正文（非标题的普通行）必须穿透预算限制到达交接包",
+		);
 		// (b) 预算真实生效
 		const rwStart = deepDoc.markdown.indexOf("## RecentWork");
 		const rwEnd = deepDoc.markdown.indexOf("## Charter", rwStart);
