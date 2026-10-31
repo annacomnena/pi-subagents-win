@@ -3553,6 +3553,39 @@ export default function (pi: ExtensionAPI) {
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
 		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
 		lines.push("Note: Models with <200K context should split large exploration into parallel subtasks; task findings stay in replies or plans/*_research.md, not task-oriented Wiki pages.");
+		// 工具使用 建议（2026-10-31 owner 反馈 + 实测数据）：
+		//
+		// 实测（最近 40 个会话 8492 次工具调用）：bash 6715(79%)、其中 1482 次(22%)用
+		// python 脚本改文件；edit 只有 460(5%)；codegraph **0 次**。
+		//
+		// 两个根因：
+		//   ① codegraph 当时根本没注册成工具（现已注册，但模型不知道可用）；
+		//   ② edit 要求 oldText 精确匹配且不能重叠，跨几十行的大改要拆成多次小调用 ⇒
+		//      模型倾向 "bash + python 一次性改完"。代价是真实的：实测翻车三次
+		//      （缩进丢失 / `\\n` 被展开 / 字符串未闭合），每次都要靠报错回头修。
+		//
+		// 这里只写成「建议」而非硬禁令（owner 2026-10-31 明确要求）：
+		// 批量/生成式写入（新建文件、机械性生成、大范围重命名）用 bash 是合理的；
+		// 但**改现有源码**时原生工具几乎总是更好。
+		lines.push(
+			"Note: Prefer the native `edit` / `write` tools for source changes, and keep `bash` for running things. " +
+				"This is a recommendation, not a ban. Reasons it usually pays off: `edit` fails loudly on a bad match " +
+				"(instead of silently writing a mangled file), keeps tabs/indentation intact, shows a reviewable diff, " +
+				"and avoids shell-quoting pitfalls — `\\n` inside a heredoc gets expanded, `\\\\n` gets double-expanded, " +
+				"and multi-line strings get merged, which has produced real breakage (lost indentation, unterminated " +
+				"string literals). For a multi-site change, call `edit` once with several entries in `edits[]` rather " +
+				"than one giant script. `bash` + python remains fine for genuinely batch-ish work: creating many files, " +
+				"mechanical generation, bulk renames, or when the transformation itself is the thing being tested — " +
+				"but even then, verify the result with `read` right after, never trust the write succeeded.",
+		);
+		lines.push(
+			"Note: A `codegraph` tool is available (symbol-level lookup: query / explore / context / impact / status / " +
+				"files / sync). Use it to LOCATE code; use `read` to actually read it. It is per-repository — it will say " +
+				"'not initialized' for repos without a `.codegraph/` index (do not work around it; fall back to read/grep/" +
+				"wiki-nav). Results carry a staleness warning when the index lags the working tree: if you see one, either " +
+				"run action:\"sync\" first or treat reported line numbers with suspicion. Note that GDScript (`*.gd`) is " +
+				"not supported by codegraph at all.",
+		);
 		lines.push("Note: If a subagent returns [subagent-failure kind=USAGE_CAP] (GLM package/quota limit), pick a same-costTier substitute — a model in the same costTier that also lies inside the role's [min,max] interval (check with /tiers show) — then retry with model= override; never escalate above max or downgrade below min, and if all same-tier substitutes are exhausted, STOP and ask the user. Do not retry the same model.");
 		lines.push("Visible workflow launch: when the user asks `/launch` without `-t`/`--direct`, first analyze the current conversation, identify all independent ready tasks, then call `launch-tabs` once with all tasks. Do not open a tab for the orchestration sentence. Each launch-tabs prompt must contain the relevant workflow handoff; its first line is normalized to `根据workflow进行工作<taskId>` and a mandatory workflow-discipline block is appended (read the workflow-orchestrator skill, act as project manager and delegate stages to subagent-win agents, never complete the task in one shot). Three task modes → replaced with: Four task modes are available on launch-tabs tasks: `workflow` (default full chain), `research` (deep research only: parallel searchers → research report in plans/YYYYMMDD_research_<topic>.md → Wiki theme-page maintenance, no implementation; tab starts with `根据research进行工作<taskId>`), `execute` (conclusion already settled: skip search and planning → implementer → code-reviewer → Wiki wrap-up; tab starts with `根据execute进行工作<taskId>`), and `adaptive` (tab self-assesses handoff completeness at startup and picks its own chain depth A0自执行快链/A快链/B中链/C全链 — use when the handoff already carries root cause + approach + file scope + acceptance criteria, i.e. you could write the acceptance criteria yourself; tab starts with `根据adaptive进行工作<taskId>`).");
 		lines.push("Tab reclaim + timer orchestration (ultra-long task infra): launch-tabs returns a `runId` per tab; use `tab-status` to inspect phase (dispatched/attached/working/waiting/completed/failed/cancelled/orphaned/unconfirmed), `reclaim-tabs({runIds, wait, timeoutMs})` to collect results and get ready[]/pending[]/awaitingInput[]/failed[]/orphaned[] for the next batch — never treat `waiting` or missing-result as done (resultMissing/unconfirmed). `set-timer({message, delayMs, target})` makes the system auto-send a user message when the timer expires (target=self or a tab's runId via launch-tabs `timers` param) to push work forward; `list-timers`/`cancel-timer`/`/timers` manage them. Closed loop: launch-tabs(batch N) → set-timer to advance → reclaim-tabs(batch N) → launch-tabs(batch N+1).");
