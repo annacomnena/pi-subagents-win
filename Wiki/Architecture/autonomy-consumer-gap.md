@@ -175,3 +175,84 @@ return "ACTIVE";
 **从来没被当成命令用**。
 
 **判据：一个计算的结果，要问「谁在消费它」，而不是问「它算对了吗」。**
+
+---
+
+## 附录：action 子系统的同类缺口（2026-10-31 实测）
+
+上面讲的是「计算图 → 没人消费」。action 子系统是它的下游，**接线是通的**
+（`runAutonomyActions` 挂在 tick 上，实测 22 次 executed + postverified），
+但有一个**结构与语义不匹配**的缺陷。
+
+### `consecFail` 是 per-key，`frozen` 是全局
+
+`breaker.ts::recordFailure`：
+
+```typescript
+export function recordFailure(state: BreakerState, key: string, now: number): BreakerState {
+	const n = (state.consecFail[key] ?? 0) + 1;
+	const frozen = state.frozen || n >= BUDGET.consecFailLimit;   // ← 全局！
+	return { ...state, inFlight: ..., consecFail: { ...state.consecFail, [key]: n }, frozen, ... };
+}
+```
+
+`consecFail` 的键是 `trigger×actionClass×project`（`run.ts:152` 的 `failKey`），
+但 `frozen` 是**整个 action 子系统**的开关。
+
+**⇒ 任何一个 key 连败 2 次，所有项目的 action 一起停摆。**
+
+### 这解释了「为什么早退分支不记失败」
+
+`run.ts` 的 git 前置检查有两条早退分支，都直接 `return "denied"` 而不调 `recordFailure`：
+
+```typescript
+if (!pre.ok) { emit("rejected", { reason: `git-pre:${pre.reason}` }); return "denied"; }
+// ...
+emit("rejected", { reason: "git-repo-not-found(fail-closed)" }); return "denied";
+```
+
+**这不是遗漏，是在规避上面那个缺陷**：家目录 `c:/users/annacomnena` 永远不是 git 仓，
+如果在这里记失败，两次之后就会冻结所有项目的 action。
+
+### 代价已量化
+
+`state/autonomy/actions/actions.jsonl`（189 条）：
+
+| kind | 次数 |
+|---|---|
+| attempted / precheck / executed / postverified | 各 22 |
+| skipped | 21 |
+| rejected | 80 |
+
+rejected 的原因分布：
+
+| reason | 次数 | 性质 |
+|---|---|---|
+| `git-repo-not-found(fail-closed)` | 25 | 重试也不会变 |
+| `git-pre:git-unknown(fail-closed)` | 24 | 重试也不会变 |
+| `scope-owner-stale` | 16 | 重试可能变（master 拉起后） |
+| `budget-new-per-hour` | 15 | 正常限流 |
+
+前两项合计 **49 次（61%）**，全是同一个非 git 项目反复重试。
+
+**当前无害**：fail-closed 拒绝，零写入、零副作用。只是浪费每帧一次 git 探测。
+
+### 正确修法（未做）
+
+把「连败 → 冷却」从全局 `frozen` 降到 **per-key 冷却**：
+
+```
+BreakerState 增加 cooldownUntil: Record<string, number>
+recordFailure: 达标后只设 cooldownUntil[key]，不动全局 frozen
+policy.decide: 先查 cooldownUntil[key] > now → SKIP(per-key-cooldown)
+```
+
+需要改 `BreakerState` 形状 + 旧账本迁移 + 新测试（含「一个 key 冷却不影响其他 key」的正控）。
+**不宜在无人监护时改**——`frozen` 是最后一道安全闸，改错会让真正危险的 action 放行。
+
+### 一条方法论补充
+
+判断「要不要在早退分支记失败」时，**不能只看「忘了记」**，要看
+**「记了会有什么副作用」**。这里的答案揭示了一个更深的结构缺陷
+（per-key 的度量驱动全局的开关），而修表面现象（补上 recordFailure）
+会让缺陷从「浪费」升级为「误冻结」。

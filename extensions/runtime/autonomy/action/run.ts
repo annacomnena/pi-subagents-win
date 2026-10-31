@@ -240,6 +240,22 @@ function runOneAction(t: FrontierTrigger, actionClass: string, ctx: RunOneCtx): 
 	// 三条都拿不到 ⇒ 仍 DENY（fail-closed 语义**不变**：读不到就是拒绝，只是不再读错对象）。
 	const repoRoot = ctx.repoRoot ?? discoverRepoRootForProject(t.project) ?? discoverRepoRoot();
 	let gitBaseline: string[] | null = null;
+	// 2026-10-31 诊断：这两条早退分支**故意不调** `recordFailure`，因为它的副作用是
+	// `frozen = true`，而 **frozen 是全局的**（整个 action 子系统停摆），
+	// 但 `consecFail` 的键是 per-key 的（`trigger×class×project`）。
+	// ⇒ 一旦在这两条分支记失败，家目录这种「永远不是 git 仓」的项目就能把
+	// **所有项目**的 action 一起冻结。当前位置是在规避这个缺陷。
+	//
+	// 代价（已量化，actions.jsonl 189 条）：同一个不可能成功的动作被反复重试
+	//   git-repo-not-found   25 次
+	//   git-pre:git-unknown  24 次
+	// 合计 49 次（占全部 80 次 rejected 的 61%），全是 `c:/users/annacomnena`
+	// （家目录，非 git 仓）。当前**无害**（fail-closed，零写入），只是浪费。
+	//
+	// 正确修法（未做，需设计讨论）：把「连败→冷却」从全局 `frozen` 降到
+	// **per-key 冷却**（`consecFail[key]` 达限后只在 `cooldownUntil[key]` 窗口内
+	// 跳过该 key，不动全局 frozen）。需改 BreakerState 形状 + 迁移 + 测试，
+	// 不宜在夜间无人监护时改。已记入 Wiki `autonomy-consumer-gap.md`。
 	if (repoRoot) {
 		const pre = gitPrecheck(repoRoot, { tracked: false }); // P1 报告 = untracked/仓外
 		if (!pre.ok) {
