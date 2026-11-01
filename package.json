@@ -153,6 +153,7 @@
 		"test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts",
 		"test:autonomy-diagnose": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_diagnose.ts",
 		"test:autonomy-dedupe": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_dedupe.ts",
+		"test:autonomy-tick-sim": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_tick_sim.ts",
 		"test:supervision-default-on": "npx tsx extensions/_test_runtime_supervision_default_on.ts",
 		"test:supervision-push": "npx tsx extensions/_test_runtime_supervision_push.ts",
 		"test:supervise-gate": "npx tsx extensions/_test_supervise_gate.ts",
