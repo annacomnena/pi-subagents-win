@@ -239,6 +239,68 @@ try {
 		assert.equal(d.wakeGate.batchFirstSeenAt, new Date(9_500).toISOString());
 	});
 
+	// ══ C8-C11：阶段 2 去重账本读数（2026-11-01）═══════════════
+	check("C8 账本空 ⇒ entries=0 / ages=null / working=false", () => {
+		clearState();
+		setupState({ heartbeat: true, wakeGate: { lastDecisionAt: 5000, lastWakeAt: 4000, batchFirstSeenAt: 4000, lastReason: "ordinary" } });
+		const x = diagnoseAutonomy({ now: 6000 });
+		assert.equal(x.wakeGate.dedupeEntries, 0);
+		assert.equal(x.wakeGate.dedupeOldestAgeMs, null);
+		assert.equal(x.wakeGate.dedupeNewestAgeMs, null);
+		assert.equal(x.wakeGate.dedupeWorking, false);
+	});
+
+	check("C9 账本有 2 条 ⇒ entries=2 且 age 计算正确", () => {
+		clearState();
+		const now = 10_000_000;
+		setupState({
+			heartbeat: true,
+			wakeGate: {
+				lastDecisionAt: now,
+				lastWakeAt: now,
+				batchFirstSeenAt: now,
+				lastReason: "ordinary",
+				dedupe: {
+					"a:b:c": new Date(now - 600_000).toISOString(), // 10 分钟前（最旧）
+					"d:e:f": new Date(now - 60_000).toISOString(), // 1 分钟前（最新）
+				},
+			},
+		});
+		const x = diagnoseAutonomy({ now });
+		assert.equal(x.wakeGate.dedupeEntries, 2);
+		assert.equal(x.wakeGate.dedupeOldestAgeMs, 600_000);
+		assert.equal(x.wakeGate.dedupeNewestAgeMs, 60_000);
+	});
+
+	check("C10 dedupeWorking：账本非空 ∧ lastReason=all-deduped ⇒ true", () => {
+		clearState();
+		const now = 10_000_000;
+		setupState({
+			heartbeat: true,
+			wakeGate: { lastDecisionAt: now, lastWakeAt: now - 5000, batchFirstSeenAt: now, lastReason: "all-deduped", dedupe: { k: new Date(now - 1000).toISOString() } },
+		});
+		const x = diagnoseAutonomy({ now });
+		assert.equal(x.wakeGate.dedupeWorking, true, "账本非空 + all-deduped ⇒ 去重在生效");
+	});
+
+	check("C11 dedupeWorking：账本非空但 lastReason=ordinary ⇒ false", () => {
+		clearState();
+		const now = 10_000_000;
+		setupState({
+			heartbeat: true,
+			wakeGate: { lastDecisionAt: now, lastWakeAt: now, batchFirstSeenAt: now, lastReason: "ordinary", dedupe: { k: new Date(now - 1000).toISOString() } },
+		});
+		const x = diagnoseAutonomy({ now });
+		assert.equal(x.wakeGate.dedupeWorking, false);
+	});
+
+	check("C12 verdict 提到账本空但 ordinary 时给警告", () => {
+		clearState();
+		setupState({ heartbeat: true, wakeGate: { lastDecisionAt: 5000, lastWakeAt: 5000, batchFirstSeenAt: 5000, lastReason: "ordinary" } });
+		const x = diagnoseAutonomy({ now: 6000 });
+		assert.ok(x.verdict.includes("去重账本为空但 lastReason=ordinary"), `verdict 应给警告，实际：${x.verdict}`);
+	});
+
 	// ══ D. 两个关键异常信号的判别力（核心）══════════════════════════
 	console.log("\nD. 异常信号判别力");
 

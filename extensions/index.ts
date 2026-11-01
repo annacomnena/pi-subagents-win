@@ -2827,6 +2827,10 @@ export default function (pi: ExtensionAPI) {
 					lines.push(
 						`闸门  reason=${d.wakeGate.lastReason} alwaysWake=${d.wakeGate.suspiciousAlwaysWake ? "🔴是" : "否"} staleAnchor=${d.wakeGate.suspiciousStaleAnchor ? "🔴是" : "否"}`,
 					);
+					// 2026-11-01 阶段 2：去重账本可见化（否则无法降察去重是否生效）
+					lines.push(
+						`去重  ${d.wakeGate.dedupeEntries} 条${d.wakeGate.dedupeNewestAgeMs === null ? "" : `（最新 ${Math.round(d.wakeGate.dedupeNewestAgeMs / 60000)}m 前，最旧 ${Math.round((d.wakeGate.dedupeOldestAgeMs ?? 0) / 60000)}m 前）`}${d.wakeGate.dedupeWorking ? "  正在拦截重复唤醒" : ""}`,
+					);
 					if (d.actions.available) {
 						lines.push(`动作  ${d.actions.total} 条 ${JSON.stringify(d.actions.kindHistogram)}`);
 						for (const r of d.actions.rejects.slice(0, 8)) {

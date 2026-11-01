@@ -189,6 +189,10 @@ export function diagnoseAutonomy(opts: DiagnoseOptions = {}): AutonomyDiagnosis 
 			suspiciousAlwaysWake: false,
 			suspiciousStaleAnchor: false,
 			batchAnchorAgeMs: null,
+			dedupeEntries: 0,
+			dedupeOldestAgeMs: null,
+			dedupeNewestAgeMs: null,
+			dedupeWorking: false,
 		},
 		actions: { available: false, total: 0, kindHistogram: {}, rejects: [], deterministicRejectRatio: null },
 		verdict: "",
@@ -280,6 +284,26 @@ export function diagnoseAutonomy(opts: DiagnoseOptions = {}): AutonomyDiagnosis 
 			out.wakeGate.lastWakeAt = toIso(wg.lastWakeAt);
 			out.wakeGate.lastReason = typeof wg.lastReason === "string" ? wg.lastReason : null;
 			out.wakeGate.batchFirstSeenAt = toIso(wg.batchFirstSeenAt);
+
+			// 2026-11-01 阶段 2：去重账本状态
+			{
+				const ledger = wg.dedupe ?? {};
+				const entries = Object.entries(ledger);
+				out.wakeGate.dedupeEntries = entries.length;
+				let oldest: number | null = null;
+				let newest: number | null = null;
+				for (const [, v] of entries) {
+					const t = Date.parse(v);
+					if (!Number.isFinite(t)) continue;
+					const age = Math.max(0, now - t);
+					if (oldest === null || age > oldest) oldest = age;
+					if (newest === null || age < newest) newest = age;
+				}
+				out.wakeGate.dedupeOldestAgeMs = oldest;
+				out.wakeGate.dedupeNewestAgeMs = newest;
+				// 去重是否在生效：账本非空 **且** 最近一次判定是 all-deduped
+				out.wakeGate.dedupeWorking = entries.length > 0 && out.wakeGate.lastReason === "all-deduped";
+			}
 
 			// 信号 1：每次决策都 wake ⇒ 门形同虚设
 			if (
@@ -390,6 +414,17 @@ function buildVerdict(d: AutonomyDiagnosis): string {
 		const exec = d.actions.kindHistogram.executed ?? 0;
 		const rej = d.actions.kindHistogram.rejected ?? 0;
 		bits.push(`actions：executed ${exec} / rejected ${rej}（共 ${d.actions.total} 条）`);
+	}
+
+	// 2026-11-01 阶段 2：去重账本状态（区分「未跑」与「在生效」）
+	if (d.wakeGate.dedupeEntries > 0) {
+		const newest = d.wakeGate.dedupeNewestAgeMs === null ? "?" : `${Math.round(d.wakeGate.dedupeNewestAgeMs / 60000)}m`;
+		bits.push(`去重账本 ${d.wakeGate.dedupeEntries} 条（最近 ${newest} 前）${d.wakeGate.dedupeWorking ? "，正在拦截重复唤醒" : ""}`);
+	} else if (d.wakeGate.lastReason === "ordinary") {
+		// 本帧放行了但账本空 ⇒ 记账路径可能未生效
+		bits.push("⚠ 去重账本为空但 lastReason=ordinary —— 记账路径可能未生效（或进程尚未重启加载新代码）");
+	} else {
+		bits.push("去重账本为空（尚未有真触发放行过）");
 	}
 
 	if (bits.length === 1 && !d.wakeGate.suspiciousAlwaysWake && !d.wakeGate.suspiciousStaleAnchor) {
