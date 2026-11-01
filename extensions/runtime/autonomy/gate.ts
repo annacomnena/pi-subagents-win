@@ -158,8 +158,33 @@ export function evaluateAutonomyWakeGate(opts?: {
 		}
 		// 任务书目标 4 字面执行：engaged 模式每次判定落一行（含 no-wake）；体积代价见 R5（本批不补轮转）。
 		appendAuditEvent("wake", decision.wake ? "wake" : "no-wake", decision.reason, opts?.stateDir);
+		// 2026-11-01 阶段 2：把本帧新放行的 dedupeKey 写入账本（ISO 时间戳）。
+		// 只记**新键**（evaluateWakeGate 已过滤已去重的）——否则旧键会被反复刷新时间戳，
+		// 永远出不了去重窗。另**清理过期键**，防账本无上限增长。
+		let nextDedupe = anchored.dedupe ?? {};
+		if (decision.dedupeKeysToRecord && decision.dedupeKeysToRecord.length > 0) {
+			const iso = new Date(now).toISOString();
+			nextDedupe = { ...nextDedupe };
+			for (const k of decision.dedupeKeysToRecord) nextDedupe[k] = iso;
+		}
+		// 清理：超过 24h（去重窗的 24 倍）的条目直接丢弃（账本不无限增长）。
+		{
+			const keepAfter = now - 24 * 60 * 60_000;
+			const pruned: Record<string, string> = {};
+			for (const [k, v] of Object.entries(nextDedupe)) {
+				const t = Date.parse(v);
+				if (Number.isFinite(t) && t >= keepAfter) pruned[k] = v;
+			}
+			nextDedupe = pruned;
+		}
 		writeWakeGateState(
-			{ ...anchored, lastDecisionAt: now, lastWakeAt: decision.wake ? now : anchored.lastWakeAt, lastReason: decision.reason },
+			{
+				...anchored,
+				lastDecisionAt: now,
+				lastWakeAt: decision.wake ? now : anchored.lastWakeAt,
+				lastReason: decision.reason,
+				dedupe: nextDedupe,
+			},
 			{ stateDir: opts?.stateDir },
 		);
 		return { engaged: true, proceed: decision.wake, reason: decision.reason };

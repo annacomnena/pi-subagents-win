@@ -275,7 +275,8 @@ export function readWakeGateState(opts?: { stateDir?: string }): WakeGateState |
 			(raw.lastWakeAt !== null && typeof raw.lastWakeAt !== "number") ||
 			(raw.batchFirstSeenAt !== null && typeof raw.batchFirstSeenAt !== "number") ||
 			(raw.lastReason !== undefined && raw.lastReason !== null && typeof raw.lastReason !== "string") ||
-			(raw.lastDiffFingerprint !== undefined && raw.lastDiffFingerprint !== null && typeof raw.lastDiffFingerprint !== "string")
+			(raw.lastDiffFingerprint !== undefined && raw.lastDiffFingerprint !== null && typeof raw.lastDiffFingerprint !== "string") ||
+			(raw.dedupe !== undefined && raw.dedupe !== null && typeof raw.dedupe !== "object")
 		) {
 			return null;
 		}
@@ -299,6 +300,9 @@ export function writeWakeGateState(state: WakeGateState, opts?: { stateDir?: str
 		// 2026-11-01：指纹必须持久化，否则进程重启后无法判断「是不是同一批」
 		// （重启后内存丢失 ⇒ 退化成每帧重置锚点 ⇒ debounce 失效）。
 		if (state.lastDiffFingerprint !== undefined) value.lastDiffFingerprint = state.lastDiffFingerprint;
+		// 2026-11-01 阶段 2：去重账本也必须持久化 —— 否则进程重启后窗归零，
+		// 同一批触发会立刻重新放行（30s tick 下就是重启即刷屏）。
+		if (state.dedupe !== undefined) value.dedupe = state.dedupe;
 		writeJsonAtomic(join(dir, "wake-gate.json"), value);
 		return true;
 	} catch {

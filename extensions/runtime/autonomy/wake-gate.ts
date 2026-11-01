@@ -43,14 +43,58 @@ export interface WakeGateState {
 	 * optional：v1 测试构造的 state 不含此字段 ⇒ 首次见到时按「新一批」处理（安全默认）。
 	 */
 	lastDiffFingerprint?: string | null;
+	/**
+	 * 2026-11-01 阶段 2：逐 trigger 的去重账本 `dedupeKey → 上次唤醒时刻(ISO)`。
+	 *
+	 * ## 为什么需要它：现有两个节流阀在 30s tick 下全部失效
+	 *
+	 * - `debounceMs = 2s`：锚点年龄 ≥ 30s（一个 tick）⇒ **永远已过**
+	 * - `ordinaryCooldownMs = 15s`：`lastDecisionAt` 是 30s 前 ⇒ **永远已过**
+	 *
+	 * 两个参数是按「秒级 tick」设计的，而生产 tick 是 **30 秒**（`mailbox-consumer.ts`
+	 * 的 `setInterval(30_000)`）。尺度错配 ⇒ `decision.wake` 恒为 true
+	 * （真机实测 `lastWakeAt === lastDecisionAt`）。
+	 *
+	 * 本账本提供**真正有效的**小时级去重：同一个 dedupeKey 在 `dedupeWindowMs` 内
+	 * 只放行一次。它不改变「门该不该开」的语义，只是给「同一件事」加了一个
+	 * 时间闸。
+	 *
+	 * 键的构成（`triggerDedupeKey()`）：`rule:project[:evidence]`。
+	 * 不含 approximate：同一 (rule, project) 的 approximate 变化不足以算「新事件」。
+	 */
+	dedupe?: Record<string, string>;
 }
 
 export interface WakeGateDecision {
 	wake: boolean;
-	/** no-wake: autonomy-disabled | kill-switch:<r> | no-meaningful-change | record-only | approx-only | debounce | cooldown；wake: ordinary | bypass:<class> */
+	/** no-wake: autonomy-disabled | kill-switch:<r> | no-meaningful-change | record-only | approx-only | debounce | cooldown | all-deduped；wake: ordinary | bypass:<class> */
 	reason: string;
 	bypass: BypassClass | null;
 	auditLine: string;
+	/**
+	 * 2026-11-01 阶段 2：本帧放行且**应当记入去重账本**的键。
+	 * 调用方在 writeWakeGateState 时把它们写成 ISO 时间戳。
+	 * 空数组 = 本帧无新键（不写）。
+	 */
+	dedupeKeysToRecord?: string[];
+}
+
+/**
+ * 构造单条 trigger 的去重键。
+ *
+ * 键 = `rule:project`（+ `:evidence` 如果 evidence 是稳定标识）。
+ * 为什么**不含** approximate：同一 (rule, project) 的 approximate 翻来翻去不足以
+ * 算「新事件」；把它算进去会导致同一件事被反复当成新的。
+ *
+ * 为什么含 evidence：对 `ws_mail_backlog` 这类规则，`pending:1` → `pending:5`
+ * 是真实的新情况（积压变多了），应当重新唤醒。但对 `blocked_overdue`，evidence 里含
+ * `idleMin=211` 这类每帧都变的量 —— 所以 evidence 只在**无 runId 时**才入键。
+ */
+export function triggerDedupeKey(t: FrontierTrigger): string {
+	const base = `${t.rule}:${t.project}`;
+	// runId 存在 ⇒ evidence 里很可能含逐帧变化的量（idleMin=…），不入键
+	if (t.runId) return base;
+	return t.evidence ? `${base}:${t.evidence}` : base;
 }
 
 /** bypass 类解析（纯）：approx 触发永不升级 bypass（v1 近似只记录）。 */
@@ -72,6 +116,8 @@ export function evaluateWakeGate(input: {
 	state: WakeGateState;
 	cfg: AutonomyConfig["wakeGate"];
 	now: number;
+	/** test-only：去重窗（缺省 1h）。生产不传。 */
+	dedupeWindowMs?: number;
 }): WakeGateDecision {
 	const { gating, diff, state, cfg, now } = input;
 	const decide = (wake: boolean, reason: string, bypass: BypassClass | null): WakeGateDecision => ({
@@ -95,11 +141,50 @@ export function evaluateWakeGate(input: {
 	if (diff.triggers.length === 0) return decide(false, "record-only", null);
 	if (real.length === 0) return decide(false, "approx-only", null);
 	// 4. debounce（§24，默认 2s）：短促连续变化聚合（bypass 同样受其约束）
+	//
+	// ⚠ 2026-11-01 实测：生产 tick 是 30s（mailbox-consumer 的 setInterval(30_000)），
+	// 而 debounceMs 缺省 2s ⇒ 锚点年龄 ≥ 30s ⇒ **本分支永远不命中**。
+	// 同理 cooldown(15s) 也永远不命中。两个节流阀在 30s tick 下全部失效，
+	// 这就是 `decision.wake` 恒为 true 的直接成因。保留它们不删（未来若改小 tick 会再生效），
+	// 真正有效的去重靠下面的 6.
 	if (state.batchFirstSeenAt !== null && now - state.batchFirstSeenAt < cfg.debounceMs) return decide(false, "debounce", null);
 	// 5. cooldown（§24，默认 15s）：ordinary 触发窗内继续聚合；bypass 直达（跳过 cooldown）
 	const bypass = resolveBypass(diff.triggers);
 	if (bypass === null && state.lastDecisionAt !== null && now - state.lastDecisionAt < cfg.ordinaryCooldownMs) {
 		return decide(false, "cooldown", null);
 	}
-	return decide(true, bypass ? `bypass:${bypass}` : "ordinary", bypass);
+
+	// 6. **逐 trigger 去重（2026-11-01 阶段 2，真正有效的节流）**
+	//
+	// 尺度：`dedupeWindowMs` 缺省 1h。同一个 dedupeKey 在这个窗内只放行一次。
+	// 为什么需要：上文 4/5 在 30s tick 下失效 ⇒ 同一批未处理的触发会**每 30 秒**
+	// 重复唤醒。在没接 spawn 之前这无害（只污染审计），一旦接线就是刷屏事故。
+	//
+	// bypass 类（needs_user）**不受去重约束**："有人要我处理"是持续事实，
+	// 但如果 1h 内已提过就不必再提 —— 仍然受去重约束，但窗口更短（bypassWindowMs）。
+	// 目前统一用 dedupeWindowMs，不单独给 bypass 开口（避免两套语义）。
+	const dedupeWindowMs = input.dedupeWindowMs ?? 60 * 60_000;
+	const ledger = state.dedupe ?? {};
+	const freshKeys: string[] = [];
+	const seenKeys: string[] = [];
+	for (const t of real) {
+		const key = triggerDedupeKey(t);
+		const last = ledger[key];
+		const lastMs = typeof last === "string" ? Date.parse(last) : Number.NaN;
+		if (Number.isFinite(lastMs) && now - lastMs < dedupeWindowMs) {
+			seenKeys.push(key);
+		} else {
+			freshKeys.push(key);
+		}
+	}
+	if (freshKeys.length === 0 && real.length > 0) {
+		// 所有真触发都在去重窗内 ⇒ 本帧不唤醒（这才是真正的"同一件事不重复吵"）
+		const d = decide(false, "all-deduped", null);
+		return d;
+	}
+
+	const decision = decide(true, bypass ? `bypass:${bypass}` : "ordinary", bypass);
+	// 只记**新键**：已去重的不刷新时间戳（否则永远出不了窗）
+	decision.dedupeKeysToRecord = freshKeys;
+	return decision;
 }
