@@ -81,6 +81,7 @@ import { installNotifyBridge } from "./runtime/notify-bridge.ts";
 import { readAutonomyConfig } from "./runtime/autonomy/config.ts";
 import { clearKillSwitch, engageKillSwitch, evaluateAutonomyGating, readKillSwitch } from "./runtime/autonomy/kill-switch.ts";
 import { summarizeActionsStatus } from "./runtime/autonomy/action/run.ts";
+import { diagnoseAutonomy } from "./runtime/autonomy/diagnose.ts";
 import { readAttachment } from "./runtime/registry.ts";
 import { isObjectAddress, masterAddress, type ObjectAddress } from "./runtime/address.ts";
 import { deliverLetter, newMessageId } from "./runtime/mailbox.ts";
@@ -2750,7 +2751,7 @@ export default function (pi: ExtensionAPI) {
 	// 「主动性套件」卡片（setAutonomyEnabled 原子写 config，保留其它字段）。
 	// 全部状态读为容忍读 never-throw。
 	pi.registerCommand("autonomy", {
-		description: "autonomy 套件总门：/autonomy on|off|status|kill [reason]|clear（当前不执行自动动作）",
+		description: "autonomy 套件总门：/autonomy on|off|status|diagnose|kill [reason]|clear（diagnose = 只读诊断）",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0] ?? "status";
@@ -2791,7 +2792,56 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub !== "status") {
-				ctx.ui.notify("用法：/autonomy on|off|status|kill [reason]|clear", "warning");
+				ctx.ui.notify("用法：/autonomy on|off|status|diagnose|kill [reason]|clear", "warning");
+				return;
+			}
+			// ── /autonomy diagnose（阶段 0，2026-11-01）──
+			// 纯只读诊断：**不调 collectAutonomyInputs**（它有副作用，会写 frontier.json +
+			// 追加审计行），只 read 既有状态文件。可反复跑而不改变任何状态。
+			// 存在的理由：主动性套件的不透明性 —— 「它到底在干什么」原本要手工 grep
+			// 五六个文件才能回答。把三类观察（门是否失效 / 锚点是否卡死 / actions
+			// 拒绝原因分布）固化成一次调用。
+			if (sub === "diagnose") {
+				let out: string;
+				try {
+					const d = diagnoseAutonomy();
+					const lines: string[] = [];
+					lines.push("autonomy diagnose（只读，不改变状态）");
+					lines.push("");
+					lines.push(`结论：${d.verdict}`);
+					lines.push("");
+					lines.push(`闸门  enabled=${d.config.enabled} actions=${d.config.actionsEnabled} kill=${d.kill.engaged}`);
+					lines.push(
+						`心跳  ${d.heartbeat.ageMs === null ? "(无)" : `${Math.round(d.heartbeat.ageMs / 1000)}s`} fresh=${d.heartbeat.fresh}`,
+					);
+					lines.push(
+						`快照  ${d.frontier.projectCount} 个项目 ${JSON.stringify(d.frontier.stateHistogram)} 龄 ${d.frontier.ageMs === null ? "?" : `${Math.round(d.frontier.ageMs / 1000)}s`}`,
+					);
+					lines.push(`监管  ${JSON.stringify(d.frontier.supervisionHistogram)}`);
+					lines.push(
+						`触发  ${d.frontier.triggers.length} 条（meaningful ${d.frontier.meaningfulCount} / approx ${d.frontier.approximateCount}）`,
+					);
+					for (const t of d.frontier.triggers.slice(0, 12)) {
+						lines.push(`  ${t.approximate ? "[approx]" : "[真]"} ${t.rule} ${t.project.slice(0, 44)}`);
+					}
+					lines.push(
+						`闸门  reason=${d.wakeGate.lastReason} alwaysWake=${d.wakeGate.suspiciousAlwaysWake ? "🔴是" : "否"} staleAnchor=${d.wakeGate.suspiciousStaleAnchor ? "🔴是" : "否"}`,
+					);
+					if (d.actions.available) {
+						lines.push(`动作  ${d.actions.total} 条 ${JSON.stringify(d.actions.kindHistogram)}`);
+						for (const r of d.actions.rejects.slice(0, 8)) {
+							lines.push(`  ${r.deterministic ? "[确定性]" : "[正常]  "} ${String(r.count).padStart(3)}× ${r.reason}`);
+						}
+					}
+					if (d.warnings.length > 0) {
+						lines.push("");
+						for (const w of d.warnings) lines.push(`⚠ ${w}`);
+					}
+					out = lines.join("\n");
+				} catch (e) {
+					out = `autonomy diagnose 失败：${e instanceof Error ? e.message : String(e)}`;
+				}
+				ctx.ui.notify(out, "info");
 				return;
 			}
 			// status：全容忍读，never-throw（D-I 列表项逐行渲染）

@@ -151,6 +151,7 @@
 		"test:message-outbox": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_message_outbox.ts",
 		"test:expectations": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_expectations.ts",
 		"test:autonomy-actions": "npx tsx extensions/_test_runtime_autonomy_actions.ts",
+		"test:autonomy-diagnose": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_diagnose.ts",
 		"test:supervision-default-on": "npx tsx extensions/_test_runtime_supervision_default_on.ts",
 		"test:supervision-push": "npx tsx extensions/_test_runtime_supervision_push.ts",
 		"test:supervise-gate": "npx tsx extensions/_test_supervise_gate.ts",
