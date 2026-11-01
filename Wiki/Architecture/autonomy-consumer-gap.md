@@ -1,14 +1,41 @@
 # Autonomy 计算图的消费者缺口
 
-> 校准状态：**current（2026-10-31 源码级核实 + 真机读数）**
+> 校准状态：**current（2026-11-01 修正：原文的「没有消费者」结论是错的，已重写）**
 > 关联：`autonomy-suite.md`（契约与开关）、`wake-delivery-ledger.md`（交付账本）
 >
-> 本文记录一个**结构性事实**，不是任务记录：`buildFrontier` 算出的触发有一条完整的
-> 生产链，但**没有消费者**。它直接决定了「状态计算图能不能自己唤醒 agent」这个问题的答案。
-
----
-
-## 结论：算得对，但没人执行
+> ## ⚠ 2026-11-01 重大修正
+>
+> 本文初版（2026-10-31）断言「`buildFrontier` 的触发**没有消费者**」。
+> **那个结论是错的。** 真消费者是 `runAutonomyActions()`（`action/run.ts:90`），
+> 它通过 `readFrontierSnapshot()` 从**落盘的 frontier.json** 读取触发，按
+> `TRIGGER_CLASS_MAP` 映射到动作类，并真实执行（写诊断报告 / 发通知信）。
+>
+> **真机证据**（`state/autonomy/actions/actions.jsonl`，209 条）：
+> ```
+> executed 22 次：
+>   notify-local-master  21 次（battlesandbox 11 / GreenCAD 9 / probe 1）
+>   diagnostic-report     1 次
+>   按规则：needs_user 18 / working_to_failed 2 / blocked_overdue 2
+> ```
+> 那 21 封信真实存在——就在 2026-11-01 归档的 223 封终态信里。
+>
+> ## 那原本的问题到底是什么
+>
+> 不是「没消费者」，而是两条平行路径**各自独立消费、互不知道**：
+>
+> ```
+> buildFrontier → frontier.json
+>                    ├→ runAutonomyActions()   动作面（真的执行，见上）
+>                    └→ evaluateWakeGate()     唤醒面（只产 proceed，不 spawn）
+> ```
+>
+> 动作面是通的；**唤醒面**（「该不该叫醒人/起新 run」）确实只产出 `proceed`
+> 一个 bit，从不自己 spawn。这两件事性质不同：
+> - 动作面 = 本地文件事务（写报告 / 投一封本地信），无 LLM、无进程，风险低
+> - 唤醒面 = 起一个新 run，涉及进程、配额、并发，风险高
+>
+> 所以架构上「动作面自动、唤醒面手动」是**有意的保守设计**，不是遗漏。
+> 本文后续各节描述的是**唤醒面**的现状（那些事实仍然成立）。
 
 ```
 collectAutonomyInputs()  collect.ts:184
@@ -60,7 +87,13 @@ export function maintainBatchAnchor(state: WakeGateState, diff: FrontierDiff, no
 
 `?? now` = **只在首次出现时置一次**，之后不刷新。它本该在 diff 被消费后清为 `null`。
 
-因为**没有消费者**，`hasDiff` 永远为真，锚点永久卡在首次值。真机实测：
+因为 **`hasDiff` 永远为真**（`recordOnly` 几乎恒非空），锚点永久卡在首次值。
+
+> 2026-11-01 修正：初版写「因为没有消费者」，这个归因不准确 —— 锚点卡死的直接原因是
+> `?? now` 这个写法（只置一次不刷新），与有没有消费者无关。已在阶段 1 修复：
+> 改为按 diff 指纹刷新（`gate.ts::maintainBatchAnchor` + `diffFingerprint()`）。
+
+真机实测（修前）：
 
 ```
 batchFirstSeenAt = 1790332810040  =  2026-09-25T10:40:10Z
