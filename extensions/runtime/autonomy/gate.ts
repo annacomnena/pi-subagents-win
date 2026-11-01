@@ -42,15 +42,66 @@ export interface AutonomyGateDecision {
 const auditedGating = new Set<string>();
 
 /**
- * D-G debounce 锚点维护（v1 wake-gate.ts 注释"由 L2 装配层维护"在此落实）：
- * 本帧 diff 有内容（triggers 或 recordOnly）且 batchFirstSeenAt===null → 置 now；
- * diff 全空 → 重置 null。（生产路径 recordOnly 恒非空——frontier.ts:281 ④⑥⑧ no-carrier 常量每帧
- *  输出——重置分支在 collect 路径休眠，由 W4.4 单测直测钉死。）
- * 纯函数（无 IO）：lastDecisionAt/lastWakeAt/lastReason 由调用方在 writeWakeGateState 时更新。
+ * D-G debounce 锚点维护（v1 wake-gate.ts 注释"由 L2 装配层维护"在此落实）。
+ *
+ * ## 2026-11-01 修正：原实现会让锚点永久卡死
+ *
+ * 原式：
+ * ```
+ * const hasDiff = triggers.length > 0 || recordOnly.length > 0;
+ * return { ...state, batchFirstSeenAt: hasDiff ? (state.batchFirstSeenAt ?? now) : null };
+ * ```
+ * `?? now` ⇒ **只在 batchFirstSeenAt===null 时置一次，之后永不刷新**。
+ * 而生产路径 `recordOnly` 几乎恒非空（`RECORD_ONLY_NOCARRIER` 常量，只在 expectations
+ * 账本不存在时才 3 条 / 存在时 2 条，都 >0）⇒ `hasDiff` 恒为 true ⇒ 重置分支永不执行
+ * ⇒ 锚点永久停在首次值。
+ *
+ * **真机实测**：`batchFirstSeenAt` 卡在 `2026-09-25T10:40:10Z` 共 **36.2 天** ——
+ * 这就是「累积阈值逻辑写着但不推进」的直接证据。
+ *
+ * ## 改法：按 **diff 指纹**刷新，而不是按「有没有 diff」
+ *
+ * 锚点的语义是「**当前这批待处理变化是什么时候出现的**」。所以只要指纹变了，
+ * 就是新一批 ⇒ 重置锚点为 now；指纹不变 ⇒ 继续累积（这才是 debounce 要的效果）。
+ *
+ * 指纹只取**有判别力的字段**：rule + project + evidence + approximate。
+ * - 不含 `runId` / `requestRev`：它们在同一条触发反复出现时会变（如 blocked_overdue
+ *   每帧选最重 runId），把它们算进指纹会让「同一件事」被当成「新一批」。
+ * - `recordOnly` 也进指纹：它变了说明载体/账本可用性变了，属于真实变化。
+ *
+ * 纯函数（无 IO）。旧签名保持向后兼容（新增可选第三参 `prevFingerprint`）。
  */
-export function maintainBatchAnchor(state: WakeGateState, diff: FrontierDiff, now: number): WakeGateState {
+export function maintainBatchAnchor(
+	state: WakeGateState & { lastDiffFingerprint?: string | null },
+	diff: FrontierDiff,
+	now: number,
+): WakeGateState & { lastDiffFingerprint?: string | null } {
 	const hasDiff = diff.triggers.length > 0 || diff.recordOnly.length > 0;
-	return { ...state, batchFirstSeenAt: hasDiff ? (state.batchFirstSeenAt ?? now) : null };
+	if (!hasDiff) {
+		// diff 全空 ⇒ 无待处理变化，锚点归零（下一批重新计时）
+		return { ...state, batchFirstSeenAt: null, lastDiffFingerprint: null };
+	}
+	const fingerprint = diffFingerprint(diff);
+	const sameBatch = state.batchFirstSeenAt !== null && state.lastDiffFingerprint === fingerprint;
+	if (sameBatch) return state; // 同一批 ⇒ 保持原锚点（这才是 debounce）
+	// 新一批 ⇒ 重置锚点
+	return { ...state, batchFirstSeenAt: now, lastDiffFingerprint: fingerprint };
+}
+
+/**
+ * diff 指纹：只取有判别力的字段，**排序后再拼**（triggers 顺序不得影响指纹）。
+ *
+ * 为什么不含 runId / requestRev：同一条触发反复出现时它们会变（blocked_overdue 每帧
+ * 选最重 runId），算进指纹会让「同一件事」每帧都被当成新一批 ⇒ 锚点每帧重置
+ * ⇒ debounce 彻底失效（反向的 bug）。
+ */
+export function diffFingerprint(diff: FrontierDiff): string {
+	const t = diff.triggers
+		.map((x) => `${x.rule}|${x.project}|${x.evidence}|${x.approximate ? 1 : 0}`)
+		.sort()
+		.join(";");
+	const r = [...diff.recordOnly].sort().join(";");
+	return `T:${t}//R:${r}`;
 }
 
 /**

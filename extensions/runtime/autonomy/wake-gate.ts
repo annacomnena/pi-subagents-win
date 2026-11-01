@@ -33,6 +33,16 @@ export interface WakeGateState {
 	batchFirstSeenAt: number | null;
 	/** v2（Task 2006 D-G）：最近一次 wake-gate 判定 reason（展示用；optional——v1 测试构造的 state 不含此字段，不受影响）。 */
 	lastReason?: string | null;
+	/**
+	 * 2026-11-01：上一个 batch 的 diff 指纹（`diffFingerprint()` 产物）。
+	 *
+	 * 用途：让 `maintainBatchAnchor` 能区分「同一批变化仍在持续」与「换了一批新的」。
+	 * 旧实现用 `batchFirstSeenAt ?? now` ⇒ 只在 null 时置一次，导致锚点永久卡死
+	 * （真机实测卡 36.2 天）。现在指纹变了就重置锚点。
+	 *
+	 * optional：v1 测试构造的 state 不含此字段 ⇒ 首次见到时按「新一批」处理（安全默认）。
+	 */
+	lastDiffFingerprint?: string | null;
 }
 
 export interface WakeGateDecision {

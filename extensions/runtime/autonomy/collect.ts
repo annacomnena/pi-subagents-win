@@ -274,7 +274,8 @@ export function readWakeGateState(opts?: { stateDir?: string }): WakeGateState |
 			(raw.lastDecisionAt !== null && typeof raw.lastDecisionAt !== "number") ||
 			(raw.lastWakeAt !== null && typeof raw.lastWakeAt !== "number") ||
 			(raw.batchFirstSeenAt !== null && typeof raw.batchFirstSeenAt !== "number") ||
-			(raw.lastReason !== undefined && raw.lastReason !== null && typeof raw.lastReason !== "string")
+			(raw.lastReason !== undefined && raw.lastReason !== null && typeof raw.lastReason !== "string") ||
+			(raw.lastDiffFingerprint !== undefined && raw.lastDiffFingerprint !== null && typeof raw.lastDiffFingerprint !== "string")
 		) {
 			return null;
 		}
@@ -295,6 +296,9 @@ export function writeWakeGateState(state: WakeGateState, opts?: { stateDir?: str
 			batchFirstSeenAt: state.batchFirstSeenAt,
 		};
 		if (state.lastReason !== undefined) value.lastReason = state.lastReason;
+		// 2026-11-01：指纹必须持久化，否则进程重启后无法判断「是不是同一批」
+		// （重启后内存丢失 ⇒ 退化成每帧重置锚点 ⇒ debounce 失效）。
+		if (state.lastDiffFingerprint !== undefined) value.lastDiffFingerprint = state.lastDiffFingerprint;
 		writeJsonAtomic(join(dir, "wake-gate.json"), value);
 		return true;
 	} catch {

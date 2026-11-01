@@ -367,14 +367,39 @@ check("W4.3 enabled 无 kill 空盘面：首帧 record-only / 二帧 record-only
 		rmSync(rt.root, { recursive: true, force: true });
 	}
 });
-check("W4.4 maintainBatchAnchor 直测：diff 全空→重置 null；有 diff→置 now；既有锚点不覆写（生产路径 recordOnly 恒非空，重置分支休眠）", () => {
+check("W4.4 maintainBatchAnchor 直测：空→重置；首批→置 now；同指纹→保持；新指纹→重置（2026-11-01 指纹化）", () => {
 	const base: WakeGateState = { lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: 111 };
 	const reset = maintainBatchAnchor(base, { triggers: [], recordOnly: [], meaningfulChanges: 0 }, 999);
 	assert.equal(reset.batchFirstSeenAt, null, "diff 全空 → 重置 null");
+
 	const set = maintainBatchAnchor({ lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: null }, { triggers: [], recordOnly: ["x"], meaningfulChanges: 0 }, 999);
-	assert.equal(set.batchFirstSeenAt, 999, "有 diff（recordOnly）→ 置 now");
-	const keep = maintainBatchAnchor(base, { triggers: [{ rule: "stagnation", project: "p", evidence: "e", approximate: false }], recordOnly: [], meaningfulChanges: 1 }, 999);
-	assert.equal(keep.batchFirstSeenAt, 111, "既有锚点不覆写（批窗起点）");
+	assert.equal(set.batchFirstSeenAt, 999, "首批（无指纹）→ 置 now");
+
+	// ⚠ 2026-11-01 修正：原断言断言「既有锚点不覆写」（恒保持 111），
+	// 而那正是「锚点卡死 36.2 天」的 bug 本身 —— **测试把 bug 锁成了规范**。
+	// 现按指纹语义拆为两条，覆盖原意图（同一批持续时不重置）但不再锁死缺陷：
+	const trig = { rule: "stagnation" as const, project: "p", evidence: "e", approximate: false };
+
+	// (a) 同一批（指纹相同）⇒ 必须保持原锚点（这才是 debounce 的意图）
+	const firstSeen = maintainBatchAnchor({ lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: null }, { triggers: [trig], recordOnly: [], meaningfulChanges: 1 }, 500);
+	assert.equal(firstSeen.batchFirstSeenAt, 500, "首批置 500");
+	const sameBatch = maintainBatchAnchor(firstSeen, { triggers: [trig], recordOnly: [], meaningfulChanges: 1 }, 999);
+	assert.equal(sameBatch.batchFirstSeenAt, 500, "**同指纹不得重置**（debounce 生效）");
+
+	// (b) 新一批（指纹变了）⇒ 必须重置为新时刻（旧实现永不重置 ⇒ 卡死 36 天）
+	const otherTrig = { rule: "needs_user" as const, project: "p2", evidence: "e2", approximate: false };
+	const newBatch = maintainBatchAnchor(firstSeen, { triggers: [otherTrig], recordOnly: [], meaningfulChanges: 1 }, 12345);
+	assert.equal(newBatch.batchFirstSeenAt, 12345, "**指纹变 ⇒ 必须重置**（修「卡死 36 天」）");
+
+	// (c) 旧 state 无指纹字段（v1 兼容）⇒ 按「新一批」处理（安全默认）
+	const legacy = maintainBatchAnchor(base, { triggers: [trig], recordOnly: [], meaningfulChanges: 1 }, 777);
+	assert.equal(legacy.batchFirstSeenAt, 777, "无指纹的旧 state → 视为新一批（不能永久卡在 111）");
+
+	// (d) triggers 顺序不得影响指纹（排序后再拼）
+	const t2 = { rule: "ws_mail_backlog" as const, project: "mb", evidence: "pending:1", approximate: false };
+	const a = maintainBatchAnchor({ lastDecisionAt: null, lastWakeAt: null, batchFirstSeenAt: null }, { triggers: [trig, t2], recordOnly: [], meaningfulChanges: 2 }, 100);
+	const b = maintainBatchAnchor(a, { triggers: [t2, trig], recordOnly: [], meaningfulChanges: 2 }, 200);
+	assert.equal(b.batchFirstSeenAt, 100, "仅顺序不同不得视为新一批");
 });
 // gate-error 分支：计划裁定不可动态触达（全部输入面 never-throw/容忍读）→ 静态审查项，不设运行时断言。
 
