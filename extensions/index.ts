@@ -5451,6 +5451,32 @@ export default function (pi: ExtensionAPI) {
 			);
 		};
 
+		/** ③ 融合模型：设置面能设，消费链才够得着（2026-11-02）。 */
+		const configureFusionModel = async (ctx: ExtensionCommandContext): Promise<void> => {
+			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
+			const cur = readFusionModels(block).fusionModel;
+			const allModels = ctx.modelRegistry.getAvailable()
+				.slice()
+				.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+			const labels = ["不使用融合（collect 完成后零动作，报告等人读）", ...allModels.map((m) => `${m.provider}/${m.id}`)];
+			const picked = await ctx.ui.select(`融合模型（当前 ${cur ?? "(未设)"}）：`, labels);
+			if (!picked) return;
+			const patch = picked.startsWith("不使用") ? { fusionModel: undefined } : { fusionModel: picked };
+			const r = writeTfBlock(tfConfigPath(), patch);
+			if (!r.ok) {
+				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
+				return;
+			}
+			ctx.ui.notify(
+				`✅ 融合模型：${picked.startsWith("不使用") ? "已关闭（跳过，零模型调用）" : picked}
+` +
+					`生效范围：下一次 trace-fusion run 的 collect 完成后自动派融合（只读，产物 <runDir>/fusion/fusion.md）。
+` +
+					`备份：${r.backupPath}`,
+				"info",
+			);
+		};
+
 		/** ① 模型设置：三路 lane 分别选（也可以三路同一个）。 */
 		const configureModels = async (ctx: ExtensionCommandContext): Promise<void> => {
 			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
@@ -5510,6 +5536,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (sub === "models") return configureModels(ctx);
 				if (sub === "config" || sub === "settings") return configureParams(ctx);
+				if (sub === "fusion") return configureFusionModel(ctx);
 
 				// 无参数 或 show：展示当前设置（这是用户「忘了自己设了什么」时的唯一查面）
 				if (!text || sub === "show" || sub === "status") {
@@ -5523,6 +5550,7 @@ export default function (pi: ExtensionAPI) {
 							"  /trace-fusion <任务>    启动三路诊断",
 							"  /trace-fusion models    设置三路模型",
 							"  /trace-fusion config    设置并发度/时限",
+							"  /trace-fusion fusion  设置融合模型（未设 ⇒ 不融合）",
 						].join("\n"),
 						"info",
 					);
