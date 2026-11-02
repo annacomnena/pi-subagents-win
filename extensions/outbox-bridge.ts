@@ -357,10 +357,26 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 					report.consumed.push({ outboxId: item.id, action: "failed", reason: error });
 				} else if (status === "unconfirmed") {
 					// ── C-3：**不把返回值当送达**（P3）──────────────────────────────
-					// 生产形态（send 不 return）恒落此分支。不 confirm、不回写 delivered、**不释放**
-					// claim（消息可能已入 context；重投交给 10min 租约语义，防重复注入）。交付是否成立
-					// 完全由 `consumed` ACK 决定（见上方闭环）；60s 未 consumed ⇒ B 判 failed_delivery
-					// + incident；item 仍 pending，TTL 后转 expired（不产生永久孤儿）。
+					// 生产形态（send 不 return）恒落此分支。**不写 delivered** —— 交付是否成立完全由
+					// `consumed` ACK 决定（见上方闭环）；60s 未 consumed ⇒ B 判 failed_delivery + incident。
+					//
+					// 2026-11-02 修「同一消息重复注入」：原实现此处**不 confirm**（也不释放）claim，
+					// 理由是「重投交给 10min 租约语义」。但实测这个理由走向了反面：`claimInjection`
+					// 的 `staleAfterMs` 正好是 10min，而 ACK 闭环的观察延迟实测 5～10min ⇒
+					// 租约先过期、后一个 consumer 抢到 claim 再注入一次。真机铁证（msg 30d8d06b）：
+					//   13:36:59.985 第一次注入（unconfirmed，不 confirm）
+					//   13:47:05.301 claim 被重写（旧 claimedAt 已 stale，间隔 10min05s）
+					//   13:47:05.306 第二次注入
+					// 修法：**注入已实际发生**就 confirm（写 injected 收据、删 .claiming.json）——
+					// 这与「不写 delivered」不矛盾：injected ≠ delivered，前者是「消息送进了会话」，
+					// 后者仍由 ACK 独享。confirm 后 `claimInjection` 返回 `injected-already`，
+					// 任何后续 consumer 都不会重投（见 _test_outbox_duplicate_injection A3）。
+					// confirm 失败（claim 已被他人接管）⇒ 什么都不做，交给对方。
+					const confirmedUnconfirmed = confirmInjection(claimKey, holder);
+					if (!confirmedUnconfirmed) {
+						report.consumed.push({ outboxId: item.id, action: "skipped", reason: "unconfirmed-confirm-failed" });
+						return;
+					}
 					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "attempted-unconfirmed" });
 				} else {
 					// no-injector：原 skipped 路径（同步预检 typeof!==function 已 continue，理论不可达；双保险）。
