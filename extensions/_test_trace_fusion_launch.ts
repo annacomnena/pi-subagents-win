@@ -28,6 +28,7 @@ if (gitVer.status !== 0) {
 import { launchTraceRun, newTraceRunId, readTraceRunMeta, type TabSpawner } from "./trace-fusion/launch-workers.ts";
 import { ensureDirTrusted } from "./trace-fusion/trust.ts";
 import { buildTraceWorkerPrompt } from "./trace-fusion/worker-prompt.ts";
+import { defaultTabRunsDir } from "./tab-runs.ts";
 import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig } from "./trace-fusion/types.ts";import type { TabLaunchOptions } from "./tab-launch-core.ts";
 
 const cfg = (over: Partial<TraceFusionConfig> = {}): TraceFusionConfig => ({
@@ -139,6 +140,21 @@ try {
 	}
 	// §24.2 deadline
 	assert.equal(new Date(reread!.laneDeadlineAt).getTime() - new Date(reread!.createdAt).getTime(), 45 * 60_000);
+
+	// §24.3 状态机接线（2026-11-02 #4）：**派发那一刻**必须预置 `<id>.state.json`。
+	// 为什么必须在此断言：wt 启动失败发生在 writeTabDispatch 之后 ⇒ 若不预置，
+	// 该 lane 永无 state 文件，死亡判据（pid 探活 / 心跳）无从生效。
+	{
+		const seedIds = ["A", "B", "C"].map((l) => reread!.lanes[l].tabRunId);
+		for (const id of seedIds) {
+			const p = join(defaultTabRunsDir(), `${id}.state.json`);
+			assert.ok(existsSync(p), `lane ${id} 必须预置 state.json（seedDispatchState 接线）`);
+			const st = JSON.parse(readFileSync(p, "utf8")) as { pid?: number; heartbeatAt?: string; terminal?: boolean };
+			assert.equal(typeof st.pid, "number", `lane ${id} 预置状态必须带 pid`);
+			assert.ok(st.heartbeatAt, `lane ${id} 预置状态必须带心跳`);
+			assert.equal(st.terminal, false, "预置状态不是终态");
+		}
+	}
 
 	// ── workerModel 传递 ────────────────────────────────────────
 	const { spawner: sp2, calls: calls2 } = makeFakeSpawner();

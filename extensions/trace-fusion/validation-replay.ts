@@ -36,7 +36,7 @@ export interface ReplayCmdResult {
 	exitCode: number | null;
 	/** 摘要输出（stdout+stderr，截断）。 */
 	excerpt: string;
-	status: "ran" | "refused-non-readonly" | "timeout" | "budget-exhausted" | "no-command";
+	status: "ran" | "refused-non-readonly" | "refused-main-root" | "timeout" | "budget-exhausted" | "no-command";
 	/** 声称 pass 而实测非 0 ⇒ true（packet 里最该看的一列）。 */
 	claimedPassButFailed: boolean;
 }
@@ -51,13 +51,24 @@ export interface LaneReplayFacts {
 	refused: number;
 	timedOut: number;
 	results: ReplayCmdResult[];
+	/** 2026-11-02 安全边界：本 lane 命令的**实际执行目录**（必须是隔离工作目录）。 */
+	cwdUsed?: string;
+	/** 执行目录说明（隔离工作目录 / 主仓库被拒 / 无隔离目录）。 */
+	cwdNote?: string;
 }
 
 export interface ReplayOptions {
 	runDir: string;
 	lane: LaneId;
-	/** 命令工作目录（= `meta.repoRoot`）。 */
+	/** 命令工作目录（兼容旧参数名；缺省执行目录）。 */
 	repoRoot: string;
+	/**
+	 * 执行目录（2026-11-02 #1）：优先用 lane 自己的隔离工作目录。
+	 * 与 `mainRoot` 归一化相等 ⇒ **整 lane 拒执行**（主仓库绝不跑模型生成的命令）。
+	 */
+	cwd?: string;
+	/** 主仓库根（命中即拒）；不传 = 不启用主仓库拒绝门（旧行为）。 */
+	mainRoot?: string;
 	/** 执行 seam（测试注入）。缺省 = spawnSync(shell)。 */
 	exec?: (cmd: string, cwd: string, timeoutMs: number) => { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
 	timeoutMs?: number;
@@ -71,11 +82,41 @@ const DEFAULT_BUDGET_MS = 90_000;
 const DEFAULT_EXCERPT_CHARS = 400;
 
 /**
- * 只读判据。命中任一禁用面 ⇒ 拒绝执行。
+ * 只读判据（两道门，2026-11-02 安全边界修复 #1）。
  *
- * 判据是「已知破坏面」的黑名单，不是「只读命令」的白名单——后者写不全，且会拒掉
- * lane 里合法的多路管道组合。已知破坏面列在这里，宁可**多拒**不可漏拒。
+ * 门 1：**白名单**（新增）。命令的每一段（按 `|`/`&&`/`||`/`;`/换行切）的**首词**必须在
+ * 只读命令集里；`git` 还要求子命令在只读子命令集里；解释器只允许「跑文件」不允许内联代码。
+ * 不在名单 ⇒ 拒（理由写明哪个词不在名单）。
+ *
+ * 门 2：**黑名单**（原有已知破坏面）兼容保留：命中删除/git 写/装包/网络/进程电源/提权/
+ * 写重定向/管道给解释器 ⇒ 拒。
+ *
+ * 为什么必须有门 1：门 2 只能拦住**我们想得到**的破坏面；模型写出的命令里出现我们没列到的
+ * 工具（如 `git filter-branch`、`icacls`、`reg export`、自制脚本里自带 rm）时，旧版**默认放行**。
+ * 主仓库里跑模型生成的命令 ⇒ 默认放行不可接受。
  */
+const READONLY_HEADS = new Set([
+	"ls", "dir", "pwd", "echo", "cat", "type", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "nl",
+	"grep", "rg", "egrep", "fgrep", "find", "fd", "tree", "stat", "file", "du", "df", "lslocks", "which", "where", "whereis",
+	"basename", "dirname", "realpath", "readlink", "diff", "cmp", "comm", "strings", "od", "hexdump", "xxd", "md5sum", "sha1sum", "sha256sum",
+	"sed", "awk", "gawk", "jq", "yq", "column", "fold", "tr",
+	"git", "svn", "jq", "tar", "unzip", "gzip", "less", "more",
+	"cd", "pushd", "popd", "env", "set", "export", "timeout", "time", "sleep", "true", "false", "test", "[", "printf",
+	"node", "bun", "deno", "python", "python3", "py", "pwsh", "powershell", "cmd", "bash", "sh", "npx", "npm", "pnpm", "yarn", "go", "cargo", "make", "dotnet", "mvn", "gradle",
+]);
+
+/** git 只读子命令（不在表里的 git 子命令一律拒，包括 `git filter-branch`/`git worktree add` 等）。 */
+const GIT_READONLY_SUBS = new Set([
+	"show", "log", "diff", "status", "ls-files", "ls-tree", "blame", "grep", "cat-file", "rev-parse",
+	"describe", "shortlog", "merge-base", "merge-tree", "config", "remote", "branch", "tag", "show-ref",
+	"for-each-ref", "name-rev", "reflog", "count-objects", "hash-object", "verify-object", "verify-commit",
+	"verify-tag", "annotate", "cherry", "whatchanged", "version", "help",
+]);
+
+/** 解释器：只允许「跑已存在的脚本文件」，不得内联代码；脚本后缀限白名单。 */
+const SCRIPT_RUNNERS = new Set(["node", "bun", "deno", "python", "python3", "py", "npx", "npm", "pnpm", "yarn", "go", "cargo", "make", "dotnet", "mvn", "gradle"]);
+const SCRIPT_SUFFIXES = /\.(ts|mts|cts|js|mjs|cjs|py|json|md|sql|ps1|sh|bat)\b/i;
+const SEG_SPLIT = /\s*(?:\|(?![^\s|]*\|)|&&|\|\||;|\n)\s*/;
 const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
 	{ re: /\b(rm|rmdir|del|erase|rd)\b/, why: "删除" },
 	{ re: /\bRemove-Item\b|\bresrmdir\b/i, why: "删除" },
@@ -95,8 +136,57 @@ const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
 ];
 
 export function readonlyVerdict(cmd: string): { ok: boolean; why?: string } {
+	// 门 2（黑名单，已知破坏面）：优先报「为什么危」，比「不认识」更可操作
 	for (const f of FORBIDDEN) {
 		if (f.re.test(cmd)) return { ok: false, why: f.why };
+	}
+	// 门 1（白名单）：逐段验首词。未知首词 = 拒（旧版默认放行）
+	for (const rawSeg of cmd.split(SEG_SPLIT)) {
+		const seg = rawSeg.trim();
+		if (!seg) continue;
+		const tokens = seg.split(/\s+/);
+		let idx = 0;
+		// 前缀：`cd <dir>` / `timeout N` / 环境变量赋值 `FOO=bar cmd` / `git -C <dir>`
+		if (tokens[0] === "cd") continue;
+		if (tokens[0] === "timeout") { idx = 2; }
+		while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) idx++;
+		const head = (tokens[idx] ?? "").replace(/^\/+/, "").toLowerCase();
+		if (!head) continue;
+		if (!READONLY_HEADS.has(head)) {
+			return { ok: false, why: `白名单外命令「${head}」（主仓库不执行未列白的工具）` };
+		}
+		if (head === "git") {
+			const rest = tokens.slice(idx + 1);
+			// 跳全局旗标（-C <dir> / -c <kv> / --git-dir 等），找子命令
+			let sub = "";
+			for (let i = 0; i < rest.length; i++) {
+				const t = rest[i];
+				if (t === "-C" || t === "-c" || t === "--git-dir" || t === "--work-tree") { i++; continue; }
+				if (t.startsWith("-")) continue;
+				sub = t.toLowerCase();
+				break;
+			}
+			if (!sub) return { ok: false, why: "git 无可识别子命令" };
+			if (!GIT_READONLY_SUBS.has(sub)) return { ok: false, why: `git 非只读子命令「${sub}」` };
+		}
+		if (SCRIPT_RUNNERS.has(head)) {
+			const body = tokens.slice(idx + 1).join(" ");
+			if (/\s-[ace]\b|\s--eval\b|\s--command\b/.test(` ${body}`)) {
+				return { ok: false, why: `${head} 内联代码（解释器 -e/-c/-eval）` };
+			}
+			if (head === "npm" || head === "pnpm" || head === "yarn" || head === "npx") {
+				// 包工具在只读面里只允许 ls/run/test/dot；其他（install/publish）门 2 已拦
+				if (!/\b(ls|run|test|dot|exec|version|why|outdated)\b/.test(body)) {
+					return { ok: false, why: `${head} 非只读子命令` };
+				}
+			}
+			if (/\b(node|bun|deno|python3?|py)\b/.test(head) && !SCRIPT_SUFFIXES.test(body) && !/\s--?(version|help|h|v)\b/.test(` ${body}`)) {
+				return { ok: false, why: `${head} 未指向脚本文件（无法判断它要执行什么）` };
+			}
+		}
+		if (head === "sed" && !/\s-[en]/.test(` ${tokens.slice(idx + 1).join(" ")}`)) {
+			return { ok: false, why: "sed 未带 -n/-e（无法确认它不写文件）" };
+		}
 	}
 	return { ok: true };
 }
@@ -135,6 +225,19 @@ export function replayLaneValidation(opts: ReplayOptions): LaneReplayFacts {
 		const exec = opts.exec ?? defaultExec;
 		const started = Date.now();
 
+		// ── 安全边界（2026-11-02 #1）：主仓库绝不执行模型生成的命令 ──
+		// 执行目录 = 调用方给的 cwd（应为 lane 隔离工作目录）；与 mainRoot 归一化相等 ⇒ 整 lane 拒执。
+		const normDir = (p: string): string => p.replace(/[\\/]+$/, "").toLowerCase().replace(/\\/g, "/");
+		const cwdUsed = opts.cwd ?? opts.repoRoot;
+		const isMainRoot = opts.mainRoot !== undefined && normDir(cwdUsed) === normDir(opts.mainRoot);
+		facts.cwdUsed = cwdUsed;
+		facts.cwdNote = isMainRoot
+			? "主仓库根 ⇒ 整 lane 拒执行（模型生成命令不得在用户仓库里跑）"
+			: existsSync(cwdUsed)
+				? "隔离工作目录"
+				: "隔离工作目录不存在 ⇒ 命令将在该路径下失败（如实暴露）";
+		if (isMainRoot) facts.cwdNote = "主仓库根 ⇒ 整 lane 拒执行（模型生成命令不得在用户仓库里跑）";
+
 		raw.forEach((item, index) => {
 			const rec = (item ?? {}) as Record<string, unknown>;
 			const cmd = typeof rec.command === "string" ? rec.command.trim() : "";
@@ -153,6 +256,11 @@ export function replayLaneValidation(opts: ReplayOptions): LaneReplayFacts {
 				facts.results.push(base);
 				return;
 			}
+			if (isMainRoot) {
+				facts.refused++;
+				facts.results.push({ ...base, status: "refused-main-root", excerpt: "拒绝执行：执行目录解析为主仓库根" });
+				return;
+			}
 			if (Date.now() - started >= budgetMs) {
 				facts.results.push({ ...base, status: "budget-exhausted" });
 				return;
@@ -163,7 +271,7 @@ export function replayLaneValidation(opts: ReplayOptions): LaneReplayFacts {
 				facts.results.push({ ...base, status: "refused-non-readonly", excerpt: `拒绝执行（${verdict.why}）` });
 				return;
 			}
-			const r = exec(cmd, opts.repoRoot, timeoutMs);
+			const r = exec(cmd, cwdUsed, timeoutMs);
 			if (r.timedOut) {
 				facts.timedOut++;
 				facts.results.push({ ...base, status: "timeout", excerpt: "超时" });
@@ -195,11 +303,11 @@ export function renderReplaySection(all: LaneReplayFacts[]): string[] {
 	const lines: string[] = [];
 	lines.push("### Validation 复跑（确定性执行 lane 自己声明的验证命令，零模型调用）");
 	lines.push("");
-	lines.push("| lane | 条数 | 实跑 | 实跑失败 | **声称 pass 实测失败** | 拒绝执行(非只读) | 超时 |");
-	lines.push("|---|---|---|---|---|---|---|");
+	lines.push("| lane | 条数 | 实跑 | 实跑失败 | **声称 pass 实测失败** | 拒绝执行 | 超时 | 执行目录 |");
+	lines.push("|---|---|---|---|---|---|---|---|");
 	for (const f of all) {
 		lines.push(
-			`| ${f.lane} | ${f.total} | ${f.ran} | ${f.failed} | **${f.claimedPassButFailed}** | ${f.refused} | ${f.timedOut} |`,
+			`| ${f.lane} | ${f.total} | ${f.ran} | ${f.failed} | **${f.claimedPassButFailed}** | ${f.refused} | ${f.timedOut} | \`${f.cwdUsed ?? "?"}\`（${f.cwdNote ?? "?"}） |`,
 		);
 	}
 	lines.push("");
@@ -224,8 +332,9 @@ export function renderReplaySection(all: LaneReplayFacts[]): string[] {
 		lines.push("");
 	}
 	lines.push(
-		"> 复跑工作目录 = 主仓库根；「拒绝执行」= 命令命中禁用面（删除/写 git/装包/网络/进程控制/写重定向），" +
-			"**未执行**，不是失败。exit 码只说明命令成败，不说明结论对错。",
+		"> **安全边界（2026-11-02 #1）**：复跑只在 **lane 隔离工作目录** 里跑，**主仓库根一律拒执行**；" +
+		"命令还需同时过两道只读门（白名单首词 + 已知破坏面黑名单）。「拒绝执行」= **未执行**，不是失败。" +
+		"exit 码只说明命令成败，不说明结论对错。",
 	);
 	lines.push("");
 	return lines;

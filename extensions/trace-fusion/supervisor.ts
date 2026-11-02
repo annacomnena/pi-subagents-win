@@ -26,11 +26,14 @@ import { spawnPiTab } from "../tab-launch-core.ts";
 import { readTraceFusionConfig } from "./config.ts";
 import { readLaneQueue, resumeQueuedLane, type ResumeQueuedLaneOutcome } from "./lane-queue.ts";
 import { readTraceRunMeta } from "./launch-workers.ts";
+import { isProcessAlive } from "../runtime/liveness.ts";
+import type { LaneFacts } from "./lane-facts.ts";
+import { laneFacts, degradedFacts, seedDispatchState, TERMINAL_LANE_STATUSES, writeDegradedLanes } from "./lane-facts.ts";
 import { defaultRunsDir, TRACE_LANES, type LaneId, type TraceRunMeta } from "./types.ts";
 
 export type AutoCollectOutcome =
 	| { isTrace: false }
-	| { isTrace: true; phase: "progress"; runId: string; done: number }
+	| { isTrace: true; phase: "progress"; runId: string; done: number; laneFacts?: LaneFacts[] }
 	| { isTrace: true; phase: "already-done"; runId: string }
 	| { isTrace: true; phase: "busy"; runId: string }
 	/**
@@ -53,6 +56,10 @@ export type AutoCollectOutcome =
 	| { isTrace: true; phase: "foreign"; runId: string };
 
 export interface SupervisorOptions {
+	/** 时钟 seam（测试注入）。 */
+	now?: () => number;
+	/** 进程存活探针 seam（测试注入）；缺省 = 真实 `process.kill(pid,0)`。 */
+	isAlive?: (pid: number) => boolean;
 	runsDir?: string;
 	tabRunsDir?: string;
 	/** 子进程 spawn seam（测试注入）。默认 detached 后台进程。 */
@@ -91,14 +98,15 @@ function tryResumeQueuedLane(
 	hit: TraceRunMeta,
 	opts: SupervisorOptions,
 	tabRunsDir: string,
+	queue?: ReturnType<typeof readLaneQueue>,
 ): { outcome: Extract<ResumeQueuedLaneOutcome, { resumed: true }> } | null {
 	try {
-		const q = readLaneQueue(hit.runDir);
+		const q = queue ?? readLaneQueue(hit.runDir);
 		if (!q || q.lanes.length === 0) return null;
 		// 无注入的 wt/pi 路径 ⇒ 不猜、不续发（宁可不派，也不拿错路径 spawn）
 		if (!opts.wtExe || !opts.piCli) return null;
 		// 跨进程互斥：抢不到 ⇒ 另一个会话正在续发这一条，本轮不重复派。
-		if (!tryClaimResume(hit.runDir)) return null;
+		if (!tryClaimResume(hit.runDir, { now: opts.now })) return null;
 		const cfg = readTraceFusionConfig();
 		const resumed = resumeQueuedLane({
 			meta: hit,
@@ -120,9 +128,9 @@ function tryResumeQueuedLane(
 const RESUME_CLAIM_FRESH_MS = 90_000;
 
 /** 原子认领续发权：'wx' 独占；已存在但新鲜 → false；陈旧 → 接管。 */
-function tryClaimResume(runDir: string): boolean {
+function tryClaimResume(runDir: string, opts: { now?: () => number } = {}): boolean {
 	const claimPath = join(runDir, "resume.claim");
-	const payload = `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`;
+	const payload = `${JSON.stringify({ pid: process.pid, at: new Date(opts.now?.() ?? Date.now()).toISOString() })}\n`;
 	for (let attempt = 0; attempt < 2; attempt++) {
 		try {
 			writeFileSync(claimPath, payload, { flag: "wx" });
@@ -130,7 +138,8 @@ function tryClaimResume(runDir: string): boolean {
 		} catch {
 			try {
 				const prev = JSON.parse(readFileSync(claimPath, "utf8")) as { at?: string };
-				if (prev.at && Date.now() - Date.parse(prev.at) <= RESUME_CLAIM_FRESH_MS) return false;
+				const nowMs = opts.now?.() ?? Date.now();
+				if (prev.at && nowMs - Date.parse(prev.at) <= RESUME_CLAIM_FRESH_MS) return false;
 			} catch {
 				return false; // 解析不了 → 保守当作别人持有
 			}
@@ -215,18 +224,29 @@ export function isDispatcherSession(meta: TraceRunMeta, opts?: { sessionScopeKey
 /** 对单个已知 running run 的收集决策（maybe 与 catch-up 共用）。 */
 function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: string): AutoCollectOutcome {
 	const tabRunsDir = opts.tabRunsDir ?? join(runsDir, "..", "tab-runs");
-	const done = TRACE_LANES.filter((lane) => {
-		const id = hit.lanes[lane].tabRunId;
-		return id ? existsSync(join(tabRunsDir, `${id}.result.json`)) : false;
-	}).length;
+	// 待发队列：**在队的 lane 尚未派发，不得进入收集分母**（否则「A 完、B 刚派、C 在队」
+	// 会被当作全部终态）。续发段之后还要用同一份队列快照。
+	const queue = readLaneQueue(hit.runDir);
+	const queuePending = new Set(queue?.lanes ?? []);
+	const factsOf = () => laneFacts(hit, tabRunsDir, { now: opts.now, isAlive: opts.isAlive, queuePending });
+	let facts = factsOf();
+	// 分母 = 预期参与的 lane：skipped / dispatch-failed / 在队待发 都不进分母。
+	// 旧 meta（无 laneStatus 且无队列）⇒ 三路全参与，零回归。
+	const participating = TRACE_LANES.filter((lane) => {
+		const f = facts.find((x) => x.lane === lane);
+		return f?.status === "done" || f?.status === "running";
+	});
+	const expectedIds = participating.map((lane) => hit.lanes[lane].tabRunId).filter((id) => id !== "");
+	const done = expectedIds.filter((id) => existsSync(join(tabRunsDir, `${id}.result.json`))).length;
 
 	// ── laneConcurrency 续发（2026-10-30）：未全终态时才可能要派下一条 ──
 	// 队列文件不存在 ⇒ 历史全并发行为，本段零作用（不碰存量路径）。
 	// 2026-11-02 修正：续发成功**不得**返回 "started"——那时 B 才刚跑、C 还在队列；
 	// 调用方会据此声称「三路终态 + cross-test 已启动」（已两次误报）。分离为 "resumed"。
 	if (done < TRACE_LANES.length) {
-		const resumed = tryResumeQueuedLane(hit, opts, tabRunsDir);
+		const resumed = tryResumeQueuedLane(hit, opts, tabRunsDir, queue);
 		if (resumed && resumed.outcome.resumed) {
+			facts = factsOf(); // 续发后重取：新派的 lane 现在才进分母
 			return {
 				isTrace: true,
 				phase: "resumed",
@@ -238,8 +258,15 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 		}
 	}
 
-	if (done < TRACE_LANES.length) return { isTrace: true, phase: "progress", runId: hit.runId, done };
+	const factsSummary = degradedFacts(facts);
 
+	if (done < expectedIds.length) return { isTrace: true, phase: "progress", runId: hit.runId, done, laneFacts: factsSummary };
+
+	// 参与 lane 已全部终态 ⇒ 可收集。有 lane 不可用（skipped/dispatch-failed/进程死）时
+	// 降级收集，并把降级原因写进 meta（不得静默，AGENTS.md R-2）。
+	if (factsSummary.length > 0) {
+		writeDegradedLanes(hit, facts, opts.now);
+	}
 	if (existsSync(join(hit.runDir, "cross-test.json"))) {
 		return { isTrace: true, phase: "already-done", runId: hit.runId };
 	}

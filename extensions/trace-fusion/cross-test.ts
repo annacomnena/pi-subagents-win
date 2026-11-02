@@ -262,6 +262,12 @@ export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport)
 			// 复跑 lane 自声明的验证命令（2026-11-02）：packet 的 Instruction 说
 			// 「可执行证据压过自报置信度」，不跑命令就是空话（c2f5 lane B 四条全自报 pass、实测全红）。
 			replayRepoRoot: meta.repoRoot,
+			// 2026-11-02 #1 安全边界：命令在 **lane 隔离工作目录** 里跑，主仓库根传入仅作拒绝用。
+			replayCwdByLane: { A: meta.lanes.A.worktree, B: meta.lanes.B.worktree, C: meta.lanes.C.worktree },
+			replayMainRoot: meta.repoRoot,
+			// 2026-11-02 #2：把不可用 lane（meta.degradedLanes）传进 packet，
+			// 让融合者知道本次实际在场几路、以什么理由缺席（旧版不告知）。
+			degradedLanes: (meta as unknown as { degradedLanes?: Array<{ lane: string; status: string; reason: string }> }).degradedLanes,
 			// 行号引用越界校验：小模型的行号大量不可信（c2f5 三路各一处越界），
 			// 本项把「有多少行号根本不存在」变成机械读数，不再烧模型逐条核。
 			citationRepoRoot: meta.repoRoot,

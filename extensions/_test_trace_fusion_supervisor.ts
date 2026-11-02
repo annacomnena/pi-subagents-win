@@ -24,7 +24,13 @@ const tabRunsDir = join(root, "tab-runs");
 mkdirSync(tabRunsDir, { recursive: true });
 
 /** 手工搭一个 running run（免 git——决策逻辑不碰 git）。 */
-function makeRun(runId: string, tabIds: Record<"A" | "B" | "C", string>, status = "running", dispatcher?: string): void {
+function makeRun(
+	runId: string,
+	tabIds: Record<"A" | "B" | "C", string>,
+	status = "running",
+	dispatcher?: string,
+	laneStatus?: Partial<Record<"A" | "B" | "C", { status: string; reason?: string }>>,
+): void {
 	const runDir = join(runsDir, runId);
 	mkdirSync(runDir, { recursive: true });
 	writeFileSync(join(runDir, "meta.json"), JSON.stringify({
@@ -42,14 +48,37 @@ function makeRun(runId: string, tabIds: Record<"A" | "B" | "C", string>, status 
 		laneDeadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
 		...(dispatcher !== undefined ? { dispatcherSessionId: dispatcher } : {}),
 		lanes: {
-			A: { lane: "A", worktree: join(root, "wa"), tabRunId: tabIds.A, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] } },
-			B: { lane: "B", worktree: join(root, "wb"), tabRunId: tabIds.B, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] } },
-			C: { lane: "C", worktree: join(root, "wc"), tabRunId: tabIds.C, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] } },
+			A: { lane: "A", worktree: join(root, "wa"), tabRunId: tabIds.A, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] }, ...(laneStatus?.A ? { laneStatus: laneStatus.A.status, laneStatusReason: laneStatus.A.reason } : {}) },
+			B: { lane: "B", worktree: join(root, "wb"), tabRunId: tabIds.B, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] }, ...(laneStatus?.B ? { laneStatus: laneStatus.B.status, laneStatusReason: laneStatus.B.reason } : {}) },
+			C: { lane: "C", worktree: join(root, "wc"), tabRunId: tabIds.C, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] }, ...(laneStatus?.C ? { laneStatus: laneStatus.C.status, laneStatusReason: laneStatus.C.reason } : {}) },
 		},
 	}, null, 2) + "\n", "utf8");
 }
 
 const laneResult = (tabId: string): void => writeFileSync(join(tabRunsDir, `${tabId}.result.json`), JSON.stringify({ status: "completed", summary: "s" }));
+
+/**
+ * 给夹具 lane 造「活的 tab state」（2026-11-02 状态机修复）。
+ *
+ * 真实派发那一刻 supervisor 会 `seedDispatchState` 写 state.json（带派发者 pid + 心跳）；
+ * 夹具免 git 直接搭 meta，所以必须自己补上——否则「有 tabRunId 无 state 无结果」的 lane
+ * 无心跳可判 ⇒ 保守算在跑。写活 state 后，「在队待发」必须靠队列快照排除，
+ * 这正是本修复要验的形状。
+ */
+const laneStateLive = (tabId: string): void =>
+	writeFileSync(
+		join(tabRunsDir, `${tabId}.state.json`),
+		JSON.stringify({
+			id: tabId,
+			phase: "working",
+			turn: "working",
+			terminal: false,
+			pid: process.pid,
+			lastActivityAt: new Date().toISOString(),
+			heartbeatAt: new Date().toISOString(),
+		}),
+		"utf8",
+	);
 
 try {
 	makeRun("tfl-sv", { A: "tabA", B: "tabB", C: "tabC" });
@@ -156,8 +185,21 @@ try {
 	}
 
 	// ---- 2026-11-02 缺陷 C：续发锁 —— 已持新鲜 claim 时不得重复 spawn 同一 lane
+	// 2026-11-02 状态机返修：本夹具里 B/C **在队且尚未派发（无 tabRunId、无 state）** ⇒
+	// 不进收集分母；A 已终态 ⇒ 参与 lane 已全部终态 ⇒ 允许**降级收集**（带 laneFacts），
+	// 续发必须被锁拦住。旧版期望「progress」的真实成因是：无 tabRunId 让 done 永远 <3 ⇒
+	// 永不收集，把「2/3 降级」堵死（本次修的缺陷本体）。
 	{
-		makeRun("tfl-relock", { A: "tabLA", B: "", C: "" });
+		makeRun(
+			"tfl-relock",
+			{ A: "tabLA", B: "", C: "tabLC" },
+			"running",
+			undefined,
+			{ B: { status: "skipped", reason: "KV 池不足" } },
+		);
+		laneStateLive("tabLA");
+		laneStateLive("tabLC");
+		laneResult("tabLC");
 		writeFileSync(join(runsDir, "tfl-relock", "lane-queue.json"),
 			JSON.stringify({ lanes: ["B", "C"], concurrency: 1 }));
 		laneResult("tabLA");
@@ -165,14 +207,19 @@ try {
 		writeFileSync(join(runsDir, "tfl-relock", "resume.claim"),
 			JSON.stringify({ pid: 4242, at: new Date().toISOString() }));
 		let dupSpawn = 0;
+		let collectSpawn = 0;
 		const locked = maybeAutoCollectTraceRun("tabLA", {
 			runsDir, tabRunsDir, wtExe: "wt.exe", piCli: "pi.js",
 			spawnTab: () => { dupSpawn++; return { ok: true, pid: 1 } as never; },
-			spawnWorker: () => {},
+			spawnWorker: () => { collectSpawn++; },
 		});
 		assert.ok(locked.isTrace);
-		assert.equal(locked.isTrace && locked.phase, "progress", "锁被持有 → 降级为 progress，不重复派发");
+		assert.equal(locked.isTrace && locked.phase, "started", "在队 lane 不进分母 ⇒ A 终态即可降级收集（旧版在此永远 progress，锁死了 2/3 降级）");
 		assert.equal(dupSpawn, 0, "锁生效：不得双 spawn 同一 lane");
+		assert.equal(collectSpawn, 1, "收集必须真的发生");
+		const rawMeta = JSON.parse(readFileSync(join(runsDir, "tfl-relock", "meta.json"), "utf8")) as { degradedLanes?: { lane: string }[] };
+		assert.ok(Array.isArray(rawMeta.degradedLanes) && rawMeta.degradedLanes.length === 1, "降级必须写进 meta（B 被 skip，不得静默）");
+		assert.ok(String(rawMeta.degradedLanes?.[0]?.reason ?? "").includes("KV 池不足"), "降级原因要可读");
 	}
 
 	// ---- 2026-11-02 缺陷 B/D：归属过滤 —— dispatcherSessionId 不匹配的会话不得驱动该 run

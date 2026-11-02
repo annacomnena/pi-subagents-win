@@ -187,6 +187,11 @@ export interface FusionPacketInput {
 	baseCommit: string;
 	/** 选填：run 模式（diagnose/implement）。有则写进 Hard Facts。 */
 	mode?: string;
+	/**
+	 * 选填（2026-11-02 #2）：**不可用 lane 清单**（skipped / dispatch-failed / 进程死 / 终态无结果）。
+	 * 给了就写进 Hard Facts，让融合者知道本次只有几路在场、以什么理由缺席。
+	 */
+	degradedLanes?: Array<{ lane: string; status: string; reason: string }>;
 	/** 选填：verification.jsonl 收集到的命令条数（硬事实：真跑了几条）。 */
 	validationCommandCount?: number;
 	/** 选填：collect 阶段发现的违规写入（硬事实）。 */
@@ -204,6 +209,13 @@ export interface FusionPacketInput {
 	 * 值为命令工作目录（= meta.repoRoot）。只跑只读命令，详见 validation-replay.ts 安全面。
 	 */
 	replayRepoRoot?: string;
+	/**
+	 * 2026-11-02 安全边界 #1：每 lane 的**隔离执行目录**（= meta.lanes[l].worktree）。
+	 * 与 `replayMainRoot` 归一化相等 ⇒ 整 lane 拒执行（主仓库绝不跑模型生成命令）。
+	 */
+	replayCwdByLane?: Partial<Record<LaneId, string>>;
+	/** 主仓库根（命中即拒）；与执行目录相同时也拒。 */
+	replayMainRoot?: string;
 	/** 复跑执行 seam（测试注入；缺省 = spawnSync）。 */
 	replayExec?: (cmd: string, cwd: string, timeoutMs: number) => { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
 	replayTimeoutMs?: number;
@@ -423,6 +435,8 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 					runDir: input.runDir,
 					lane: l,
 					repoRoot: input.replayRepoRoot as string,
+					cwd: input.replayCwdByLane?.[l] ?? input.replayRepoRoot,
+					mainRoot: input.replayMainRoot,
 					exec: input.replayExec,
 					timeoutMs: input.replayTimeoutMs,
 					totalBudgetMs: input.replayBudgetMs,
@@ -485,6 +499,18 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 		lines.push(`- ⚠ **主仓库基线外改动（${input.dirtyViolations.length}）**：${input.dirtyViolations.slice(0, 5).join("; ")}`);
 	} else {
 		lines.push("- 主仓库违规写入：无（基线对比通过）");
+	}
+	// 2026-11-02 #2：**不可用 lane 必须进硬事实**。旧版 packet 不告诉你哪一路根本不存在
+	// （被 skip / 派发失败 / tab 进程死）：融合者只看见该 lane 的 trajectory 缺失，
+	// 无从判断是「三路分歧」还是「只有两路在场」。
+	if (input.degradedLanes && input.degradedLanes.length > 0) {
+		lines.push(`- ⚠ **不可用 lane（${input.degradedLanes.length}）⇒ 本次只有 ${3 - input.degradedLanes.length}/3 路在场**：`);
+		for (const d of input.degradedLanes) {
+			lines.push(`  - ${d.lane}：\`${d.status}\` —— ${d.reason}`);
+		}
+		lines.push("  ⇒ 必须按**在场路数**判分歧：不得把缺席路计为「不同意」，也不得因两路一致就当已验证（样本量只有 2）。");
+	} else {
+		lines.push("- 不可用 lane：无（三路均在参与）");
 	}
 	lines.push("");
 	lines.push("> 以上均为计数/存在性，**不含对错判定**。八节齐全 ≠ 结论正确；JSON 合法 ≠ 内容有据。");

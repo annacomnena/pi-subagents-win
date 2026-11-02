@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readonlyVerdict, replayLaneValidation, renderReplaySection } from "./trace-fusion/validation-replay.ts";
+import { readonlyVerdict, replayLaneValidation, renderReplaySection, type LaneReplayFacts } from "./trace-fusion/validation-replay.ts";
 import { buildFusionPacket } from "./trace-fusion/fusion-packet.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tf-replay-"));
@@ -113,6 +113,53 @@ try {
 		assert.ok(g.results.every((r) => r.status === "budget-exhausted" || r.status === "no-command"), "预算耗尽不得继续执行");
 	}
 
+	// ── ⑤ #1 安全边界：主仓库根一律拒执行；执行目录必须是隔离工作目录 ──
+	{
+		mkLane("B", [{ command: "rm -rf C:/Users", result: "pass" }, { command: "ls -1 lanes/B", result: "pass" }]);
+		let hits = 0;
+		const countingExec = (cmd: string, cwd: string) => {
+			hits++;
+			void cmd; void cwd;
+			return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+		};
+		const mainRoot = join(root, "mainrepo");
+		// 5a：执行目录解析为主仓库根 ⇒ 整 lane 拒，且**零执行**（不得跑了再判失败）
+		const fMain = replayLaneValidation({ runDir, lane: "B", repoRoot: mainRoot, cwd: mainRoot, mainRoot, exec: countingExec });
+		assert.equal(fMain.ran, 0, "主仓库根不得执行任何命令");
+		assert.equal(hits, 0, "主仓库根 ⇒ exec 必须零调用");
+		assert.ok(fMain.results.every((r) => r.status === "refused-main-root"), "逐条要落 refused-main-root");
+		assert.ok(String(fMain.cwdNote).includes("主仓库"), "cwdNote 要说明为何拒（不得静默，R-2）");
+
+		// 5b：执行目录 = lane 隔离工作目录 ⇒ 正常跑
+		const laneWt = join(root, "wt-A");
+		const fIso = replayLaneValidation({ runDir, lane: "B", repoRoot: mainRoot, cwd: laneWt, mainRoot, exec: countingExec });
+		assert.equal(fIso.cwdUsed, laneWt, "执行目录 = lane 隔离工作目录");
+		assert.ok(fIso.ran >= 1, `隔离目录里正常执行只读命令，实得 ran=${fIso.ran}`);
+		const md2 = renderReplaySection([fMain, fIso]);
+		assert.ok(md2.join("\n").includes("执行目录"), "表头必须带执行目录列（不得隐藏在哪个仓跑的）");
+		assert.ok(md2.join("\n").includes("refused-main-root"), "主仓库拒绝要逐条可见");
+	}
+
+	// ── ⑥ #1 白名单门：白名单外命令必拒（旧版默认放行）；c2f5 真实形状命令必放行 ──
+	{
+		const deny = ["git filter-branch --all", "git worktree add ../x", "mytool --scan .", 'node -e "process.exit(0)"', "python -c 'print(1)'", "git commit -m x"];
+		for (const c of deny) {
+			assert.equal(readonlyVerdict(c).ok, false, `必拒（旧版默认放行）：${c}`);
+		}
+		const allow = [
+			"git status --porcelain | grep -q x",
+			"ls -1 lanes/B/trajectory.md && wc -l < lanes/B/trajectory.md",
+			"cat lanes/B/validation.json > /dev/null",
+			"git -C C:/repo show deadbeef:extensions/x.ts | wc -l",
+			"node --experimental-strip-types extensions/_test_trace_fusion_citation_check.ts",
+			"sed -n '10,40p' lanes/A/trajectory.md",
+		];
+		for (const c of allow) {
+			const v = readonlyVerdict(c);
+			assert.equal(v.ok, true, `c2f5 真实形状命令必须放行（白名单不得把复跑面堵死）：${c} → ${v.why}`);
+		}
+	}
+
 	// ── ③ 接线：packet 必须真的调用复跑，且未给 repoRoot 时零调用 ──
 	{
 		const mkPacketInput = (extra: Record<string, unknown>) => ({
@@ -130,11 +177,19 @@ try {
 			calls++;
 			return { exitCode: 1, timedOut: false, stdout: "", stderr: "" };
 		};
-		const p1 = buildFusionPacket(mkPacketInput({ replayRepoRoot: root, replayExec: exec }) as never);
+		const p1 = buildFusionPacket(mkPacketInput({
+			replayRepoRoot: root,
+			replayExec: exec,
+			// 2026-11-02 #1：packet 必须把每 lane 的隔离执行目录与主仓库根传下去
+			replayCwdByLane: { A: join(root, "wt-A"), B: join(root, "wt-B"), C: join(root, "wt-C") },
+			replayMainRoot: root,
+		} as never));
 		assert.ok(calls > 0, "给了 replayRepoRoot 就必须真的执行命令（接线）");
 		assert.ok(p1.markdown.includes("Validation 复跑"), "packet 必须带复跑段");
 		assert.equal(p1.replay.length, 3, "三路都要有复跑事实");
 		const aFact = p1.replay.find((r) => r.lane === "A");
+		assert.ok(aFact && aFact.cwdUsed === join(root, "wt-A"), `packet 必须用隔离工作目录执行，实得 ${aFact?.cwdUsed}`);
+		assert.ok(String(aFact?.cwdNote).includes("隔离"), "cwdNote 要说明目录性质");
 		// 本用例的 exec 对所有命令都返回 exit=1，而 A 路两条都自报 pass ⇒ 应记 2
 		assert.ok(aFact && aFact.claimedPassButFailed === 2, `packet 里的 A 路应记录自报 pass 实测失败=2，实得 ${aFact ? aFact.claimedPassButFailed : "无 A 路"}`);
 

@@ -25,7 +25,7 @@
  * 停在 running 的账本 watcher 永远不通知 = 静默失效，测试里对此有专门断言。
  */
 
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
 import { buildPiArgv } from "../runner-argv.ts";
@@ -42,6 +42,10 @@ export const FUSION_EXCLUDE_TOOLS = [
 	"trace-fusion",
 	"tab-finish",
 	"tab-report",
+	// 2026-11-02 #1 安全边界：**运行时**只读强制。旧版只有提示词里写「只读」，
+	// write/edit 仍然可用 ⇒ 提示词被无视时无兼平。工具直接不存，才是硬约束。
+	"write",
+	"edit",
 ];
 
 export const FUSION_DEFAULT_WALL_MS = 30 * 60_000;
@@ -66,9 +70,21 @@ export interface FusionDispatchInput {
 	runsDir?: string;
 	linksPath?: string;
 	now?: () => number;
+	/** 子进程启动时刻的参考值（测试可注入；缺省 = 真实 Date.now()）。 */
+	spawnNow?: () => number;
 }
 
 export type FusionStatus = "skipped" | "launched" | "completed" | "failed" | "timeout" | "spawn-error";
+
+/** 融合者的真实成本读数（旧版写死 0 ⇒ 「融合花多少钱」不可知）。 */
+export interface FusionUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	turns: number;
+}
 
 export interface FusionDispatchResult {
 	status: FusionStatus;
@@ -78,6 +94,51 @@ export interface FusionDispatchResult {
 	reportPath?: string;
 	/** 零模型调用（未配置）时 true。 */
 	zeroModelCall: boolean;
+	/** 子进程退出码（null = 未取到/信号终止）；#3 判定依据。 */
+	exitCode?: number | null;
+	/** 从 json 流解析出的真实用量；解析不出 = null（不得写 0 冒充「花了 0 元」）。 */
+	usage?: FusionUsage | null;
+}
+
+/**
+ * 从融合子进程的 `--mode json` 日志里解析用量（与主仓 subagent 解析同一形状：
+ * `type==="message_end" && message.role==="assistant"` 的 `usage`）。
+ *
+ * 解析不出 ⇒ 返回 null（**不是 0**）：0 会被读成「本次融合没花钱」，属于静默失效。
+ * 只取尾部 maxBytes（日志可能很大）。
+ */
+export function parseFusionUsage(logPath: string, maxBytes = 8_000_000): FusionUsage | null {
+	try {
+		const size = statSync(logPath).size;
+		let text = readFileSync(logPath, "utf8");
+		if (size > maxBytes) text = text.slice(-maxBytes);
+		const out: FusionUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+		let seen = 0;
+		for (const line of text.split("\n")) {
+			const t = line.trim();
+			if (!t.startsWith("{")) continue;
+			let ev: unknown;
+			try {
+				ev = JSON.parse(t);
+			} catch {
+				continue; // 尾部可能被截断
+			}
+			const e = ev as { type?: string; message?: { role?: string; usage?: Record<string, number & { total?: number }> } };
+			if (e?.type !== "message_end" || e?.message?.role !== "assistant") continue;
+			const u = e.message.usage as (Record<string, number> & { cost?: number | { total?: number } }) | undefined;
+			if (!u) continue;
+			seen++;
+			out.input += Number(u.input ?? 0) || 0;
+			out.output += Number(u.output ?? 0) || 0;
+			out.cacheRead += Number(u.cacheRead ?? 0) || 0;
+			out.cacheWrite += Number(u.cacheWrite ?? 0) || 0;
+			out.cost += Number(typeof u.cost === "object" ? (u.cost?.total ?? 0) : (u.cost ?? 0)) || 0;
+			out.turns += 1;
+		}
+		return seen > 0 ? out : null;
+	} catch {
+		return null;
+	}
 }
 
 /** 融合提示词（纯函数）。 */
@@ -167,7 +228,8 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		task: prompt,
 		excludeTools: FUSION_EXCLUDE_TOOLS,
 	});
-	const startedAt = new Date().toISOString();
+	const startedMs = input.spawnNow?.() ?? Date.now();
+	const startedAt = new Date(startedMs).toISOString();
 	writeRunRecord(runsDir, fusionRunId, {
 		id: fusionRunId,
 		status: "running",
@@ -201,6 +263,10 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 
 	const budget = Math.max(60_000, Math.trunc(input.wallBudgetMs ?? FUSION_DEFAULT_WALL_MS));
 	let timedOut = false;
+	// #3（2026-11-02）：必须拿退出码。「只要文件存在就算成功」会把非零退出（崩了/预算耗尽/模型报错）
+	// 读成 completed，而旧产物存在时更是把**上一次融合的文件**当成本次结果。
+	let exitCode: number | null = null;
+	let exitSignal: string | null = null;
 	const done = new Promise<"exit" | "timeout" | "error">((resolve) => {
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -214,16 +280,43 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 			(e as Error & { __fuse?: string }).__fuse = String(e?.message ?? e);
 			resolve("error");
 		});
-		child.once("exit", () => {
+		child.once("exit", (code: number | null, signal: string | null) => {
 			clearTimeout(timer);
+			exitCode = code;
+			exitSignal = signal;
 			if (!timedOut) resolve("exit");
 		});
 	});
 	const outcome = await done;
 	if (outFd !== undefined) closeSync(outFd);
 	const finishedAt = new Date().toISOString();
+	const usage = parseFusionUsage(outPath);
 	const produced = existsSync(outputPath);
-	const status: FusionStatus = outcome === "timeout" ? "timeout" : produced ? "completed" : "failed";
+	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）
+	const fresh = produced && statSync(outputPath).mtimeMs >= startedMs - 2_000;
+	let status: FusionStatus;
+	let reason: string;
+	if (outcome === "timeout") {
+		status = "timeout";
+		reason = produced && fresh
+			? `墙钟预算 ${budget}ms 耗尽，已终止子进程（退出时已有本次产物，但 turn 未完，不得当完整结果）`
+			: `墙钟预算 ${budget}ms 耗尽，已终止子进程`;
+	} else if (outcome === "error") {
+		status = "failed";
+		reason = "子进程 error 事件（未能正常启动/执行）";
+	} else if (exitCode !== 0) {
+		status = "failed";
+		reason = `子进程非零退出（exit=${exitCode ?? `signal ${exitSignal ?? "?"}`}），不得计为融合成功`;
+	} else if (!produced) {
+		status = "failed";
+		reason = "子进程 exit=0 但未产出融合文件（详见 fusion.stdout.log）";
+	} else if (!fresh) {
+		status = "failed";
+		reason = `融合产物早于本次启动（mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()} < startedAt），属陈旧产物，不得计为本次结果`;
+	} else {
+		status = "completed";
+		reason = `融合产物已生成：${outputPath}`;
+	}
 	writeRunRecord(runsDir, fusionRunId, {
 		id: fusionRunId,
 		status, // 必须终态：停在 running 的账本 watcher 永不通知 ⇒ 静默失效
@@ -231,16 +324,16 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		model: input.fusionModel,
 		startedAt,
 		finishedAt,
+		exitCode,
+		exitSignal,
+		produced,
+		productFresh: fresh,
 		text: produced ? `融合产物：${outputPath}` : timedOut ? "墙钟预算耗尽，未见融合产物" : "子进程退出但未产出融合文件",
-		cost: { total: 0, input: 0, output: 0 },
+		// 成本读数：从 json 流解析；解析不出记 null（不得写 0 冒充「本次未花钱」）
+		cost: usage ? { total: usage.cost, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite } : null,
+		turns: usage?.turns ?? null,
 	});
-	const reason =
-		status === "completed"
-			? `融合产物已生成：${outputPath}`
-			: status === "timeout"
-				? `墙钟预算 ${budget}ms 耗尽，已终止子进程`
-				: "子进程退出但未产出融合文件（详见 fusion.stdout.log）";
-	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false };
+	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false, exitCode, usage };
 }
 
 /**
@@ -279,15 +372,37 @@ export async function runFusionStep(opts: {
 	} catch (err) {
 		res = { status: "spawn-error", reason: `融合步骤异常：${(err as Error).message}`, zeroModelCall: false };
 	}
-	opts.log(`fusion: ${res.status} — ${res.reason}`);
+	opts.log(`fusion: ${res.status} — ${res.reason}${res.usage ? ` [成本 $${res.usage.cost.toFixed(4)} / ${res.usage.turns} turns / cacheRead ${res.usage.cacheRead}]` : " [成本读数缺失：json 流未解析出 usage]"}`);
 	try {
 		const metaPath = join(opts.meta.runDir, "meta.json");
 		const raw = existsSync(metaPath) ? JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown> : {};
+		// phase / result 正交（2026-11-02 #3）：completed 不再同时表示「收集完成」与「融合成功」两件事。
+		// phase = 流水线走到哪；result = 本次融合的真实结局。
+		const phase = res.status === "skipped" ? "collected" : res.status === "completed" ? "fused" : "fusing-failed";
+		const result: Record<FusionStatus, string> = {
+			skipped: "skipped",
+			launched: "running",
+			completed: "succeeded",
+			failed: "failed",
+			timeout: "timeout",
+			"spawn-error": "failed",
+		};
 		writeFileSync(
 			metaPath,
 			JSON.stringify({
 				...raw,
-				fusion: { status: res.status, reason: res.reason, model: opts.fusionModel ?? null, fusionRunId: res.fusionRunId ?? null, reportPath: res.reportPath ?? null, at: new Date().toISOString() },
+				phase,
+				fusion: {
+					status: res.status,
+					result: result[res.status],
+					reason: res.reason,
+					model: opts.fusionModel ?? null,
+					fusionRunId: res.fusionRunId ?? null,
+					reportPath: res.reportPath ?? null,
+					exitCode: res.exitCode ?? null,
+					usage: res.usage ?? null,
+					at: new Date().toISOString(),
+				},
 			}, null, 2) + "\n",
 			"utf8",
 		);

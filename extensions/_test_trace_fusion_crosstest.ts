@@ -24,7 +24,7 @@ if (gitVer.status !== 0) {
 	process.exit(0);
 }
 
-import { runCrossTest, normalizeCommand, poolCommands } from "./trace-fusion/cross-test.ts";
+import { runCrossTest, normalizeCommand, poolCommands, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import type { TraceRunMeta, LaneId } from "./trace-fusion/types.ts";
 import type { RunCollectReport } from "./trace-fusion/artifacts.ts";
@@ -163,6 +163,33 @@ try {
 	assert.ok(md.includes("flaky"));
 	const json = JSON.parse(readFileSync(join(meta.runDir, "cross-test.json"), "utf8")) as { cells: unknown[] };
 	assert.equal(json.cells.length, 3);
+
+	// ── 接线（#1 安全边界 + #2 降级告知）：packet 只在 diagnose 路径生成 ⇒ 断言打在诊断链上 ──
+	{
+		const metaD = makeRun();
+		for (const lane of ["A", "B", "C"] as const) simulateLane(metaD, lane, { fix: lane, validation: { validationCommands: ["ls -1"], testFiles: [] } });
+		const metaDRaw = JSON.parse(readFileSync(join(metaD.runDir, "meta.json"), "utf8")) as Record<string, unknown>;
+		metaDRaw.degradedLanes = [{ lane: "B", status: "skipped", reason: "KV 池不足" }];
+		writeFileSync(join(metaD.runDir, "meta.json"), JSON.stringify(metaDRaw, null, 2), "utf8");
+		const diagMeta = { ...metaD, mode: "diagnose", degradedLanes: metaDRaw.degradedLanes } as TraceRunMeta;
+		finishDiagnoseRun(diagMeta, collectRunArtifacts(diagMeta));
+		const mdD = readFileSync(join(diagMeta.runDir, "cross-test-report.md"), "utf8");
+		// 1) 复跑执行目录必须公开，且是 lane 隔离目录（不是主仓库）
+		assert.ok(mdD.includes("执行目录"), "报告必须公开复跑执行目录（不得隐藏在哪跑的）");
+		assert.ok(mdD.includes("隔离工作目录"), `复跑必须标为隔离工作目录，片段：${mdD.slice(mdD.indexOf("Validation 复跑"), mdD.indexOf("Validation 复跑") + 300)}`);
+		// 2) 不可用 lane 必须透传并进报告
+		assert.ok(mdD.includes("不可用 lane（1）"), "meta.degradedLanes 必须透传到报告");
+		assert.ok(mdD.includes("只有 2/3 路在场"), "必须写清在场路数");
+		assert.ok(mdD.includes("KV 池不足"), "缺席理由要进报告");
+		// 3) 无降级时也要明说（不得沉默）
+		const metaN = makeRun();
+		for (const lane of ["A", "B", "C"] as const) simulateLane(metaD, lane, { fix: lane, validation: { validationCommands: ["ls -1"], testFiles: [] } });
+		const diagN = { ...metaN, mode: "diagnose" } as TraceRunMeta;
+		finishDiagnoseRun(diagN, collectRunArtifacts(diagN));
+		const mdN = readFileSync(join(diagN.runDir, "cross-test-report.md"), "utf8");
+		assert.ok(mdN.includes("不可用 lane：无"), "无降级时也要写出（可分辨，不是默认静默）");
+	}
+
 
 	// ── path collision：A 与 B 报同一个 testFiles ──────────────────────
 	const meta2 = makeRun(true);

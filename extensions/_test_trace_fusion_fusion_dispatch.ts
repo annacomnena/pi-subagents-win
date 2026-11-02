@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS } from "./trace-fusion/fusion-dispatch.ts";
@@ -30,12 +30,15 @@ const fakeSpawn = (cmd: string, argv: string[], opts: object) => {
 	return child;
 };
 /** 在下一 tick 让子进程"退出"，并可先写融合产物。 */
-const fakeSpawnThatFinishes = (produce: boolean) => (cmd: string, argv: string[], opts: object) => {
+const fakeSpawnThatFinishes = (produce: boolean, targetDir?: string) => (cmd: string, argv: string[], opts: object) => {
 	const child = fakeSpawn(cmd, argv, opts);
 	setImmediate(() => {
-		const runDir = join(root, "run");
+		const runDir = targetDir ?? join(root, "run");
 		const out = join(runDir, "fusion", "fusion.md");
-		if (produce) writeFileSync(out, "# 融合\n", "utf8");
+		if (produce) {
+			mkdirSync(join(runDir, "fusion"), { recursive: true });
+			writeFileSync(out, "# 融合\n", "utf8");
+		}
 		child.emit("exit", 0);
 	});
 	return child;
@@ -91,6 +94,11 @@ try {
 		for (const t of FUSION_EXCLUDE_TOOLS) {
 			assert.ok(argv.includes(t), `argv 必须排除 ${t}（融合者不得拥有该能力）`);
 		}
+		// 2026-11-02 #1 安全边界：**运行时**只读强制 = write/edit 工具直接不存在，
+		// 不能只靠提示词里那句「只读」（提示词被无视时无兼平）。
+		for (const t of ["write", "edit"]) {
+			assert.ok(FUSION_EXCLUDE_TOOLS.includes(t), `融合者必须被排除 ${t} 工具（只读靠运行时强制，不靠提示词）`);
+		}
 		assert.ok(argv.includes("local-qwen38/medium"), "argv 必须用用户设置的融合模型");
 		assert.ok((calls[0].opts as { cwd?: string }).cwd === root, "cwd 必须是仓根");
 
@@ -109,7 +117,7 @@ try {
 		assert.equal(mine[0].sessionId, "sid-dispatcher", "完成通知必须归属派发者会话");
 		assert.equal(mine[0].kind, "async", "必须走 async 账本形状（watcher 只认这个 kind）");
 
-		assert.equal(r.status, "completed");
+		assert.equal(r.status, "completed", `reason=${r.reason}`);
 		assert.ok(existsSync(r.reportPath as string), "reportPath 要指向融合产物");
 	}
 
@@ -125,12 +133,80 @@ try {
 	{
 		const dir2 = join(root, "run2");
 		mkdirSync(dir2, { recursive: true });
-		const r = await dispatchFusion({ ...base, runDir: dir2, fusionModel: "m", spawnFn: fakeSpawnThatFinishes(false) as never });
+		const r = await dispatchFusion({ ...base, runDir: dir2, fusionModel: "m", spawnFn: fakeSpawnThatFinishes(false, dir2) as never });
 		assert.equal(r.status, "failed", "退出但无产物必须判 failed");
 		const files = (await import("node:fs")).readdirSync(runsDir).filter((f) => f.startsWith("run_"));
 		const statuses = files.map((f) => (JSON.parse(readFileSync(join(runsDir, f), "utf8")) as { status: string }).status);
 		assert.ok(!statuses.includes("running"), "任何终局都不得留下 running 账本");
 		assert.ok(statuses.includes("failed"), "无产物要落 failed");
+	}
+
+	// ── #3 判据 a：exit != 0 ⇒ failed（旧版只看文件存在 ⇒ 崩了也算成功） ──
+	{
+		const dirE = join(root, "runExit");
+		mkdirSync(join(dirE, "fusion"), { recursive: true });
+		const spawnExit1 = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			setImmediate(() => {
+				writeFileSync(join(dirE, "fusion", "fusion.md"), "# 半截\n", "utf8"); // 产物写了
+				child.emit("exit", 1); // 但进程非零退出（典型：中途崩）
+			});
+			return child;
+		};
+		const before = (await import("node:fs")).readdirSync(runsDir).filter((f) => f.startsWith("run_")).length;
+		const r = await dispatchFusion({ ...base, runDir: dirE, fusionModel: "m", spawnFn: spawnExit1 as never });
+		assert.equal(r.status, "failed", "非零退出不得计为 completed（旧版：文件在就 completed）");
+		assert.equal(r.exitCode, 1, "退出码要带出来");
+		assert.ok(r.reason.includes("exit=1"), `理由要写明退出码，实得 ${r.reason}`);
+		const newRecs = (await import("node:fs")).readdirSync(runsDir).filter((f) => f.startsWith("run_")).slice(before);
+		assert.equal(newRecs.length, 1, "本次应新增一条账本");
+		const rec = JSON.parse(readFileSync(join(runsDir, newRecs[0]), "utf8")) as { exitCode?: number };
+		assert.equal(rec.exitCode, 1, "账本必须记退出码（事后可审）");
+	}
+
+	// ── #3 判据 b：产物陈旧（mtime 早于启动）⇒ failed，不得拿上次产物当本次结果 ──
+	{
+		const dirS = join(root, "runStale");
+		mkdirSync(join(dirS, "fusion"), { recursive: true });
+		const stalePath = join(dirS, "fusion", "fusion.md");
+		writeFileSync(stalePath, "# 上一次的融合产物\n", "utf8");
+		const old = new Date(Date.now() - 60 * 60_000); // 1h 前
+		utimesSync(stalePath, old, old);
+		const r = await dispatchFusion({ ...base, runDir: dirS, fusionModel: "m", spawnFn: fakeSpawnThatFinishes(false, dirS) as never });
+		assert.equal(r.status, "failed", "exit=0 且文件存在但是旧产物 ⇒ 不得计 completed");
+		assert.ok(r.reason.includes("陈旧"), `理由要写明陈旧，实得 ${r.reason}`);
+	}
+
+	// ── #3 判据 c：usage 从 json 流解析（旧版写死 cost=0 ⇒ 成本不可知） ──
+	{
+		const dirU = join(root, "runUsage");
+		mkdirSync(join(dirU, "fusion"), { recursive: true });
+		const spawnWithLog = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			const o = opts as { stdio: [unknown, number, number] };
+			const fd = o.stdio[1] as number;
+			writeFileSync(fd, JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 1000, output: 20, cacheRead: 500, cacheWrite: 0, cost: { total: 0.125 } } } }) + "\n", { fd });
+			writeFileSync(fd, JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 900, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.075 } } } }) + "\n", { fd });
+			setImmediate(() => {
+				writeFileSync(join(dirU, "fusion", "fusion.md"), "# fused", "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		const r = await dispatchFusion({ ...base, runDir: dirU, fusionModel: "m", spawnFn: spawnWithLog as never });
+		assert.equal(r.status, "completed", `reason=${r.reason}`);
+		assert.ok(r.usage, "必须解析出 usage（不得为 null/0）");
+		assert.equal(r.usage!.turns, 2, "两条 assistant 消息 ⇒ 2 turns");
+		assert.ok(Math.abs(r.usage!.cost - 0.2) < 1e-9, `成本应累加为 0.2，实得 ${r.usage!.cost}`);
+		assert.equal(r.usage!.cacheRead, 500);
+	}
+
+	// ── #3 判据 d：解析不出 usage ⇒ null（不得写 0 冒充「本次未花钱」） ──
+	{
+		const dirN = join(root, "runNoUsage");
+		const r = await dispatchFusion({ ...base, runDir: dirN, fusionModel: "m", spawnFn: fakeSpawnThatFinishes(true, dirN) as never });
+		assert.equal(r.status, "completed", `reason=${r.reason}`);
+		assert.equal(r.usage, null, "无 json 用量行 ⇒ null（写 0 = 静默失效，AGENTS.md R-2）");
 	}
 
 	// ── 主材料缺失 ⇒ 零动作 ──

@@ -203,15 +203,18 @@ function tabCwds(): Array<string | undefined> {
 function normPath(p: string): string {
 	return resolve(p).replace(/[\\/]+$/, "").toLowerCase();
 }
-function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?: string; taskId?: string }> {
+function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?: string; taskId?: string; id?: string; file?: string }> {
 	const tabRunsDir = join(AGENT_DIR, "tab-runs");
 	if (!existsSync(tabRunsDir)) return [];
 	const out: Array<{ requestedModel?: string; cwd?: string; taskId?: string }> = [];
 	for (const f of readdirSync(tabRunsDir)) {
-		if (!f.endsWith(".json")) continue;
+		// 2026-11-02 状态机修复后：派发时新增预置 `<id>.state.json`（seedDispatchState），
+		// 只过滤 `.json` 会把遥测状态文件算成派发账本 ⇒ 6/3。过滤规则与生产端 tab-runs.ts
+		// 扫派发账本的规则保持一致（.state/.result/.tmp 均不算）。
+		if (!f.endsWith(".json") || f.endsWith(".state.json") || f.endsWith(".result.json") || f.endsWith(".tmp")) continue;
 		try {
-			const rec = JSON.parse(readFileSync(join(tabRunsDir, f), "utf8")) as { requestedModel?: string; cwd?: string; taskId?: string; mode?: string };
-			if (rec) out.push(rec);
+			const rec = JSON.parse(readFileSync(join(tabRunsDir, f), "utf8")) as { requestedModel?: string; cwd?: string; taskId?: string; mode?: string; id?: string };
+			if (rec) out.push({ ...rec, file: f });
 		} catch { /* 坏文件跳过 */ }
 	}
 	void runsDir;
@@ -242,6 +245,15 @@ function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?
 		const recs = dispatchRecords("");
 		assert.equal(recs.length, 3, "三份 dispatch 账本");
 		for (const d of recs) assert.equal(d.requestedModel, undefined, "config 无 workerModel ⇒ requestedModel 为空");
+		// 状态机接线（2026-11-02 #4）：diagnose 路径派发时也必须预置 `<id>.state.json`
+		// （wt 启动失败发生在账本写入之后 ⇒ 不预置则该 lane 永无 state，死亡判据无从生效）
+		for (const d of recs) {
+			const stPath = join(AGENT_DIR, "tab-runs", `${d.id}.state.json`);
+			assert.ok(existsSync(stPath), `diagnose lane 必须预置 state.json（id=${d.id}）`);
+			const st = JSON.parse(readFileSync(stPath, "utf8")) as { pid?: number; heartbeatAt?: string };
+			assert.equal(typeof st.pid, "number", "预置状态必须带 pid");
+			assert.ok(st.heartbeatAt, "预置状态必须带心跳");
+		}
 	});
 
 	await check("M2 canonical model 生效（账本 + spawn 同源）", async () => {

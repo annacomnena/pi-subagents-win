@@ -234,6 +234,23 @@ try {
 		console.log("  ✓ ④ 抽取失败降级（不抛）");
 	}
 
+	// ── ⑤ #2：不可用 lane 必须进 Hard Facts（不得让融合者把「只有两路」读成「三路分歧」） ──
+	{
+		const pk = buildFusionPacket({
+			runDir: join(root, "完全不存在"),
+			task: "t",
+			baseCommit: "c",
+			degradedLanes: [{ lane: "B", status: "skipped", reason: "KV 池不足" }],
+		});
+		assert.ok(pk.markdown.includes("不可用 lane（1）"), "必须写出不可用 lane 计数");
+		assert.ok(pk.markdown.includes("只有 2/3 路在场"), "必须写出在场路数");
+		assert.ok(pk.markdown.includes("KV 池不足"), "缺席理由要可见");
+		assert.ok(pk.markdown.includes("在场路数"), "必须给「按在场路数判分歧」的执行约束");
+		const pk0 = buildFusionPacket({ runDir: join(root, "完全不存在"), task: "t", baseCommit: "c" });
+		assert.ok(pk0.markdown.includes("不可用 lane：无"), "未传时也要明说三路均在参与（不得沉默）");
+		console.log("  ✓ ⑤ #2 降级 lane 进硬事实");
+	}
+
 	console.log("trace-fusion fusion-packet tests passed");
 } finally {
 	try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }); } catch { /* 尽力 */ }

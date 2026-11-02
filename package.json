@@ -68,6 +68,7 @@
 		"test:trace-fusion-validation-replay": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_validation_replay.ts",
 		"test:trace-fusion-citation-check": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_citation_check.ts",
 		"test:trace-fusion-fusion-dispatch": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_fusion_dispatch.ts",
+		"test:trace-fusion-lane-facts": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_lane_facts.ts",
 		"test:trace-fusion-param": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_param.ts",
 		"test:trace-fusion-lane-queue": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_lane_queue.ts",
 		"test:trace-fusion-fusion-packet": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_fusion_packet.ts",

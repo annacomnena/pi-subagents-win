@@ -26,6 +26,7 @@ import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type Tra
 import { buildTraceWorkerPrompt, buildDiagnoseWorkerPrompt } from "./worker-prompt.ts";
 import { ensureDirTrusted } from "./trust.ts";
 import { sessionScopeKey } from "../identity.ts";
+import { seedDispatchState } from "./lane-facts.ts";
 
 /**
  * 当前进程的会话指纹（写入 meta.dispatcherSessionId）。
@@ -136,6 +137,19 @@ export interface TraceLaneMeta {
 	worktree: string;
 	tabRunId: string;
 	provision: ProvisionReport;
+	/**
+	 * lane 参与状态（2026-11-02，状态机修复）。
+	 *
+	 * 起因：supervisor 原来**固定等 A/B/C 三份 result.json**，而被 skip 的 lane /
+	 * spawn 失败的 lane 根本没有 tabRunId ⇒ `done` 永远 < 3 ⇒ **永不自动收集**，
+	 * run 停在 `running` 占住 `active-run-mutex` ⇒ 一次 wt.exe 启动失败就能锁死 trace-fusion。
+	 * 宣称的「2/3 降级」在代码里根本不可达。
+	 *
+	 * 收集判据改为「**预期参与的 lane 集合**」：`skipped` / `dispatch-failed` 是一等终态，
+	 * 不进分母。缺省（字段缺失的旧 meta）= `active` ⇒ 零回归。
+	 */
+	laneStatus?: "active" | "skipped" | "dispatch-failed";
+	laneStatusReason?: string;
 }
 
 export interface TraceRunMeta {
@@ -251,6 +265,7 @@ export function dispatchDiagnoseLane(input: DispatchDiagnoseLaneInput): Dispatch
 		dispatchStatus: "dispatched",
 	};
 	writeTabDispatch(defaultTabRunsDir(), dispatch);
+	seedDispatchState(defaultTabRunsDir(), laneRunId, { title, cwd: repoRoot });
 	const launchErrorsLog = join(runDir, "launch-errors.log");
 	const spawn = input.spawnTab({
 		wtPath: input.wtExe,
@@ -378,6 +393,10 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			});
 			if (!r.ok) {
 				diagnoseErrors.push(`lane ${lane}：${r.error}`);
+				// 一等终态：这一路不会再有 result.json，必须进 meta，否则收集判据永远差一个
+				lanes[lane].laneStatus = "dispatch-failed";
+				lanes[lane].laneStatusReason = r.error;
+				writeFileSync(metaPath(runDir), JSON.stringify({ ...meta, lanes }, null, 2) + "\n", "utf8");
 				return false;
 			}
 			laneMeta.tabRunId = r.tabRunId!;
@@ -392,7 +411,9 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		const skipLanes = input.skipLanes ?? {};
 		const skipped = TRACE_LANES.filter((l) => skipLanes[l] !== undefined);
 		for (const lane of skipped) {
-			lines.push(`⚠ TRACE ${lane} 已放弃（不派发）：${skipLanes[lane]}`);
+			lanes[lane].laneStatus = "skipped";
+			lanes[lane].laneStatusReason = skipLanes[lane];
+			lines.push(`⚠ TRACE ${lane} 已放弃（不派发，**不计入收集分母**）：${skipLanes[lane]}`);
 		}
 		const activeLanes = TRACE_LANES.filter((l) => skipLanes[l] === undefined);
 		const concurrency = input.config.laneConcurrency ?? 3;
@@ -508,6 +529,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		};
 		// 账本写入 tab-runs 目录（tab-status/reclaim-tabs 从那里读），而非 trace runs dir
 		writeTabDispatch(defaultTabRunsDir(), dispatch);
+		seedDispatchState(defaultTabRunsDir(), laneRunId, { title, cwd: laneMeta.worktree });
 		// review 修正（Luna major）：异步 spawn 失败（wt.exe 启动后才报错）也回写账本 + 留痕
 		const launchErrorsLog = join(runDir, "launch-errors.log");
 		const spawn = spawnTab({
