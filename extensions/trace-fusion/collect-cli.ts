@@ -16,10 +16,13 @@ import { readTraceRunMeta } from "./launch-workers.ts";
 import { collectRunArtifacts } from "./artifacts.ts";
 import { runCrossTest, finishDiagnoseRun } from "./cross-test.ts";
 import { readTraceFusionConfig } from "./config.ts";
+import { runFusionStep } from "./fusion-dispatch.ts";
 import { defaultRunsDir } from "./types.ts";
 
-function main(): void {
+async function main(): Promise<void> {
 	const runId = process.argv[2] ?? "";
+	// 第三参 = supervisor 传入的 pi CLI 路径（fusion 消费链用）；其次退 PI_CLI_PATH
+	const piCli = process.argv[3] ?? process.env.PI_CLI_PATH;
 	const here = dirname(fileURLToPath(import.meta.url));
 	const runDir = join(defaultRunsDir(), runId);
 	const logPath = join(runDir, "collect-worker.log");
@@ -63,6 +66,17 @@ function main(): void {
 			"utf8",
 		);
 		log("meta -> completed");
+
+		// ── fusionModel 消费链（2026-11-02）─────────────────────────────
+		// 模型只来自用户设置（config.json 的 traceFusion.fusionModel）；未设 ⇒ 零动作零模型调用，
+		// 但跳过理由必须写进 meta.fusion 与 worker 日志（AGENTS.md R-2：降级不得静默）。
+		await runFusionStep({
+			meta,
+			reportPath: matrix.reportPath,
+			fusionModel: config.fusionModel,
+			piCli,
+			log,
+		});
 		releaseClaim();
 	} catch (err) {
 		releaseClaim();
@@ -76,4 +90,4 @@ function main(): void {
 // Windows 上 fileURLToPath 返回反斜杠，只归一化 argv[1] 会永不相等（真实首跑踩坑）
 const norm = (p: string): string => p.replace(/\\/g, "/");
 const asMain = Boolean(process.argv[1]) && norm(fileURLToPath(import.meta.url)) === norm(process.argv[1]);
-if (asMain) main();
+if (asMain) void main();

@@ -56,7 +56,7 @@ export interface SupervisorOptions {
 	runsDir?: string;
 	tabRunsDir?: string;
 	/** 子进程 spawn seam（测试注入）。默认 detached 后台进程。 */
-	spawnWorker?: (entryScript: string, runId: string) => void;
+	spawnWorker?: (entryScript: string, runId: string, piCli?: string) => void;
 	/** laneConcurrency 续发所需：wt / pi CLI 路径（由调用方注入，避免反向依赖 index.ts）。 */
 	wtExe?: string;
 	piCli?: string;
@@ -150,9 +150,9 @@ export function collectCliPath(): string {
 	return join(here, "collect-cli.ts");
 }
 
-/** 后台 worker 默认实现。 */
-function defaultSpawnWorker(entryScript: string, runId: string): void {
-	const child = spawn(process.execPath, ["--experimental-strip-types", entryScript, runId], {
+/** 后台 worker 默认实现。第三参 = pi CLI 路径（fusion 消费链需要，2026-11-02）。 */
+function defaultSpawnWorker(entryScript: string, runId: string, piCli?: string): void {
+	const child = spawn(process.execPath, ["--experimental-strip-types", entryScript, runId, ...(piCli ? [piCli] : [])], {
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,
@@ -248,7 +248,7 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 	}
 
 	const spawnWorker = opts.spawnWorker ?? defaultSpawnWorker;
-	spawnWorker(collectCliPath(), hit.runId);
+	spawnWorker(collectCliPath(), hit.runId, opts.piCli);
 	return { isTrace: true, phase: "started", runId: hit.runId, runDir: hit.runDir };
 }
 

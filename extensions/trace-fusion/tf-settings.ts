@@ -195,6 +195,6 @@ export function renderSettingsSummary(configPath: string): string[] {
 	lines.push(`模式：${s.mode}　并发度：${s.laneConcurrency}${s.laneConcurrency === 1 ? "（严格串行）" : ""}`);
 	lines.push(`lane 时限：${s.maxWallClockPerLaneMin}min　最大轮数：${s.maxRounds}`);
 	lines.push(`lane 模型：A=${lanes.A ?? globalWorker ?? "(lane 默认)"} | B=${lanes.B ?? globalWorker ?? "(lane 默认)"} | C=${lanes.C ?? globalWorker ?? "(lane 默认)"}`);
-	lines.push(`融合模型：${fusion.fusionModel ?? "(未设)"}（当前未实现消费）`);
+	lines.push(`融合模型：${fusion.fusionModel ?? "(未设)"} —— 未设则 collect 完成后**零动作**（跳过理由会写进 meta.fusion）`);
 	return lines;
 }
