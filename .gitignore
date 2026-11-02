@@ -18,6 +18,11 @@ gui/package-lock.json
 # ── 任务计划 / 研究笔记（本地任务临时文件，不应进版本库）──
 plans/
 
+# ── 配置文件备份（R-1 要求改前备份，但备份本身不进库）──
+*.bak-*
+config.json.bak*
+models.json.bak*
+
 # ── 系统 / 编辑器 ──
 .DS_Store
 Thumbs.db

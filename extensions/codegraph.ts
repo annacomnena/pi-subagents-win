@@ -55,12 +55,36 @@ import { Type } from "typebox";
  *   ① `.codegraph/` 就在 startDir（**不向上跳**）——直接就是本目录的
  *   ② 向上找到的位置 X 是 git 仓库根（X/.git 存在）且 startDir 在 X 子树内
  * 否则返回 null（宁可报“本仓未初始化”，也不能返回别的仓库的结果）。
+ *
+ * ⚠ 2026-11-02 补充：**`.codegraph/` 存在 ≠ 它是索引**。
+ * codegraph CLI 还有一个**全局遥测目录** `~/.codegraph/`（只有 `daemons/`、
+ * `telemetry*.json`、`update-check.json`，**没有 `codegraph.db`**）。
+ * 老实现只看目录是否存在，于是在任何“自己没建索引、但父目录是家目录”的仓库里
+ * 都会命中家目录的遥测目录，`status` 返回全 `?` 而不是“本仓未初始化”——**静默误导**。
+ * 判据：只有包含 `codegraph.db` 的 `.codegraph/` 才算索引根。
  */
+/**
+ * `.codegraph/` 目录是否真的是**索引**（而非 CLI 的全局遥测目录）。
+ *
+ * 实测两个形状（2026-11-02）：
+ *   真索引：`codegraph.db` / `daemon.log` / `daemon.pid`
+ *   遥测目录：`daemons/` / `telemetry.json` / `telemetry-queue.jsonl` / `update-check.json`
+ * 只认 `codegraph.db`：遥测目录永远不会有它，而真索引建库时必有。
+ */
+export function isCodegraphIndex(dir: string): boolean {
+	try {
+		if (!existsSync(dir)) return false;
+		return existsSync(join(dir, "codegraph.db"));
+	} catch {
+		return false;
+	}
+}
+
 export function findCodegraphRoot(startDir: string): string | null {
 	let dir = resolve(startDir);
 	const origin = dir;
 	for (;;) {
-		if (existsSync(join(dir, ".codegraph"))) {
+		if (isCodegraphIndex(join(dir, ".codegraph"))) {
 			// ① 就地命中：不向上跳，直接信任
 			if (dir === origin) return dir;
 			// ② 向上命中：要求该位置是 git 仓库根（有边界，不是目录伞）

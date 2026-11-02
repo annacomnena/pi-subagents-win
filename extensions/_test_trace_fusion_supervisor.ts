@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { catchUpAutoCollect, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { catchUpAutoCollect, isDispatcherSession, maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tfl-sv-test-"));
 const runsDir = join(root, "runs");
@@ -127,6 +127,77 @@ try {
 	});
 	assert.deepEqual(ups2, [], "claim 已持有 → 幂等不重 spawn");
 	assert.deepEqual(caught, ["tfl-catch"]);
+
+	// ---- 2026-11-02 缺陷 A：串行续发必须返回 "resumed"，绝不能是 "started"
+	// （旧版两者共用 "started"，调用方据此发「三路终态 + cross-test 已启动」——
+	//  实测 a726 在 lane A 刚完、B 刚派、C 还在队列时就发了这条假通知）
+	{
+		makeRun("tfl-resume", { A: "tabRA", B: "", C: "" });
+		writeFileSync(join(runsDir, "tfl-resume", "lane-queue.json"),
+			JSON.stringify({ lanes: ["B", "C"], concurrency: 1 }));
+		laneResult("tabRA"); // A 完成 → 应续发 B
+		let resumeSpawned = 0;
+		const res = maybeAutoCollectTraceRun("tabRA", {
+			runsDir, tabRunsDir,
+			wtExe: "wt.exe",
+			piCli: "pi.js",
+			// spawnTab 只在续发路径被调用
+			spawnTab: () => { resumeSpawned++; return { ok: true, pid: 1 } as never; },
+			spawnWorker: () => { throw new Error("续发成功时不得启 collect"); },
+		});
+		assert.ok(res.isTrace);
+		assert.equal(res.phase, "resumed", `续发必须返回 resumed，实得 ${res.isTrace ? res.phase : "n/a"}`);
+		if (res.isTrace && res.phase === "resumed") {
+			assert.equal(res.lane, "B", "应续发 B");
+			assert.ok(res.tabRunId.length > 0, "resumed 必须带 tabRunId（调用方要拼真实文案）");
+			assert.deepEqual(res.remaining, ["C"], "remaining 应为 C");
+		}
+	}
+
+	// ---- 2026-11-02 缺陷 C：续发锁 —— 已持新鲜 claim 时不得重复 spawn 同一 lane
+	{
+		makeRun("tfl-relock", { A: "tabLA", B: "", C: "" });
+		writeFileSync(join(runsDir, "tfl-relock", "lane-queue.json"),
+			JSON.stringify({ lanes: ["B", "C"], concurrency: 1 }));
+		laneResult("tabLA");
+		// 预置新鲜 resume.claim（模拟另一个会话正在续发）
+		writeFileSync(join(runsDir, "tfl-relock", "resume.claim"),
+			JSON.stringify({ pid: 4242, at: new Date().toISOString() }));
+		let dupSpawn = 0;
+		const locked = maybeAutoCollectTraceRun("tabLA", {
+			runsDir, tabRunsDir, wtExe: "wt.exe", piCli: "pi.js",
+			spawnTab: () => { dupSpawn++; return { ok: true, pid: 1 } as never; },
+			spawnWorker: () => {},
+		});
+		assert.ok(locked.isTrace);
+		assert.equal(locked.isTrace && locked.phase, "progress", "锁被持有 → 降级为 progress，不重复派发");
+		assert.equal(dupSpawn, 0, "锁生效：不得双 spawn 同一 lane");
+	}
+
+	// ---- 2026-11-02 缺陷 B/D：归属过滤 —— dispatcherSessionId 不匹配的会话不得驱动该 run
+	{
+		const ownerFp = "tab_owner_session";
+		const otherFp = "tab_other_session";
+		// 直接测纯函数语义：无字段 → 放行（legacy）；有字段 → 比对
+		const withOwner = (fp: string | undefined) =>
+			({ runId: "x", dispatcherSessionId: fp }) as unknown as Parameters<typeof isDispatcherSession>[0];
+		// 本进程指纹由 sessionScopeKey() 决定；测试进程通常无身份 → 返回 undefined → 放行
+		// 因此这里只断言「无字段必须放行」这条零回归底线，以及函数可安全调用
+		assert.equal(isDispatcherSession(withOwner(undefined)), true, "存量 meta 无归属字段 → 必须放行（零回归）");
+		// 注入身份验证「拒绝」分支（否则测试进程无身份，永远走 legacy 放行 = 没测到核心）
+		const savedTab = process.env.PI_TAB_RUN_ID;
+		process.env.PI_TAB_RUN_ID = "tab_test_owner";
+		try {
+			assert.equal(isDispatcherSession(withOwner("tab_test_owner")), true, "指纹匹配 → 放行");
+			assert.equal(isDispatcherSession(withOwner("tab_other_session")), false, "指纹不匹配 → 必须拒绝");
+			// 无字段在有身份时仍放行（存量 run 零回归）
+			assert.equal(isDispatcherSession(withOwner(undefined)), true, "有身份 + 无字段 → 仍放行");
+		} finally {
+			if (savedTab === undefined) delete process.env.PI_TAB_RUN_ID;
+			else process.env.PI_TAB_RUN_ID = savedTab;
+		}
+		void otherFp;
+	}
 
 	// runsDir 不存在 → isTrace false（容错）
 	const missing = maybeAutoCollectTraceRun("tabA", { runsDir: join(root, "nope"), tabRunsDir });

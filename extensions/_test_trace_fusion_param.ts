@@ -421,6 +421,64 @@ function dispatchRecords(runsDir: string): Array<{ requestedModel?: string; cwd?
 		assert.equal(spawnCapture.length, 0, "被拒 ⇒ 零 spawn");
 	});
 
+	await check("C7 per-lane 模型：非法 lane **被放弃**（不回落默认代跑）+ 其余 lane 照常", async () => {
+		installCpStubs();
+		useCase("c7", {});
+		// A 合法（在 CATALOG 里）、B 不存在 ⇒ B 被放弃，A/C 照常（2026-11-02 用户裁定：放弃而不是整体拒）
+		const r = await tool!.execute(
+			"",
+			{ task: "x", workerModelByLane: { A: "Zhipu/glm-5.3", B: "testone/does-not-exist", C: "shuai/gpt-6.1-sol" } },
+			undefined, undefined, ctxFor(),
+		);
+		assert.notEqual(r.isError, true, `非法单路不应拒绝整趟 run：${r.content[0].text}`);
+		const text = r.content[0].text;
+		assert.match(text, /已放弃 1 路/, `必须显式告知放弃了 1 路，实际：${text.slice(0, 400)}`);
+		assert.match(text, /lane B/, `必须点明是哪一路被放弃，实际：${text.slice(0, 400)}`);
+		// 关键：被放弃的 lane 不得 spawn（否则它会用默认模型代跑）
+		// lane 身份在 spawn env 的 PI_TRACE_LANE（不是 args 里）
+		const spawnedLanes = spawnCapture.map((c) => c.env?.PI_TRACE_LANE).filter(Boolean) as string[];
+		assert.ok(!spawnedLanes.includes("B"), `被放弃的 lane B 绝不能 spawn，实际 spawn：${spawnedLanes.join(",") || "(无)"}`);
+		assert.ok(spawnedLanes.includes("A"), `合法的 lane A 应照常派发，实际 spawn：${spawnedLanes.join(",") || "(无)"}`);
+	});
+
+	await check("C7b 三路全非法 ⇒ 必错（不白开一趟 run）+ 零 spawn", async () => {
+		installCpStubs();
+		useCase("c7b", {});
+		const r = await tool!.execute(
+			"",
+			{ task: "x", workerModelByLane: { A: "no/one", B: "no/two", C: "no/three" } },
+			undefined, undefined, ctxFor(),
+		);
+		assert.equal(r.isError, true, "全非法必须拒绝（否则会开一趟空 run）");
+		assert.match(r.content[0].text, /都不可用/);
+		assert.equal(spawnCapture.length, 0, "全非法 ⇒ 零 spawn");
+	});
+
+	await check("C8 per-lane 模型：非对象/数组 ⇒ 拒", async () => {
+		installCpStubs();
+		useCase("c8", {});
+		const r = await tool!.execute("", { task: "x", workerModelByLane: ["a"] }, undefined, undefined, ctxFor());
+		assert.equal(r.isError, true, "数组必须拒绝");
+		assert.match(r.content[0].text, /必须是/, `文案应说明形状要求，实际：${r.content[0].text}`);
+		assert.equal(spawnCapture.length, 0, "非法 ⇒ 零 spawn");
+	});
+
+	await check("C9 schema：workerModelByLane 为 A/B/C 对象；laneConcurrency 为 1|2|3 对象型 anyOf（无裸标量 Union）", async () => {
+		const p = JSON.parse(JSON.stringify(tool!.parameters)) as {
+			properties: {
+				workerModelByLane: { type: string; properties: Record<string, unknown> };
+				laneConcurrency: { anyOf: Array<Record<string, unknown>> };
+			};
+		};
+		assert.equal(p.properties.workerModelByLane.type, "object", "workerModelByLane 必须是 object");
+		assert.deepEqual(Object.keys(p.properties.workerModelByLane.properties).sort(), ["A", "B", "C"], "只应有 A/B/C 三个键");
+		assert.equal(p.properties.laneConcurrency.anyOf.length, 3, "laneConcurrency 应有 3 个成员");
+		assert.deepEqual(p.properties.laneConcurrency.anyOf.map((m) => m.const).sort(), [1, 2, 3], "应为 1/2/3 三个 const");
+		for (const m of p.properties.laneConcurrency.anyOf) {
+			assert.equal(typeof m, "object", "anyOf 成员必须是对象（裸标量 Union 会让 provider 序列化失败）");
+		}
+	});
+
 	process.chdir(savedCwd);
 	restoreCpStubs();
 

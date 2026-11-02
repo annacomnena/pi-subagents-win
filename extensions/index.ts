@@ -31,6 +31,13 @@ import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
 import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
+import {
+	readTfBlock,
+	normalizeUserSettings,
+	readLaneModels,
+	writeTfBlock,
+	renderSettingsSummary,
+} from "./trace-fusion/tf-settings.ts";
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { cleanTraceRun } from "./trace-fusion/clean.ts";
 import { registerHotspot } from "./hotspot/index.ts";
@@ -2616,20 +2623,34 @@ export default function (pi: ExtensionAPI) {
 	// trace-fusion lane tab 则由 supervisor 自动后台收集（不注入 reclaim 提示）
 	collect(registerEventBus(pi, {
 		onTabFinished: (finishedTabRunId) => {
-			const outcome = maybeAutoCollectTraceRun(finishedTabRunId);
+			const outcome = maybeAutoCollectTraceRun(finishedTabRunId, {
+				// laneConcurrency 续发需要真实 wt/pi 路径；解析只在 index.ts 有（不往 supervisor 反向引，避免循环依赖）
+				wtExe: findWindowsTerminal() ?? undefined,
+				piCli: findPiCli(),
+			});
 			if (!outcome.isTrace) return false; // 普通 tab → 默认 toast + reclaim 注入
-			if (outcome.phase === "started") {
-				// L3：await send 结果吞掉 busy 拒绝（防逃逸到 bindCore 报成 Extension "<runtime>" error）；
-				// 通知尽力而为（busy/failed 不阻塞），收集已在后台，用 /trace-fusion-status 查进度。
+			// 2026-11-02 修正：三种相位文案必须分开——旧版只要 "started" 就声称「三路终态」，
+			// 而续发下一条 lane 也返回 "started"。实测（a726 / 21f9）lane A 刚完、B 刚派、
+			// C 还在队列时就发了「三路终态」，两路会话都收错报，且各会话内重复投递 2–3 次。
+			if (outcome.phase === "resumed") {
+				// 只是续发一条 lane：不声称终态、不提 cross-test
+				const rest = outcome.remaining.length ? `，待发 ${outcome.remaining.join("/")}` : "，队列已空";
+				notifyFollowUpQuietly(
+					pi.sendUserMessage,
+					`🧬 trace-fusion run ${outcome.runId} 串行续发 lane ${outcome.lane} [${outcome.tabRunId}]${rest}。\n进度：/trace-fusion-status`,
+					{ source: "index:trace-fusion", runId: outcome.runId },
+				);
+			} else if (outcome.phase === "started") {
+				// 唯一可声称「三路终态」的相位：cross-test 真的已 spawn。
 				// C-3：`pi.sendUserMessage` 生产恒返回 `undefined` ⇒ 返回值不是送达证明；本调用点
 				// **不声称已送达**（无独立交付账本），但未确认/失败必留痕（`notifyFollowUpQuietly`）。
 				notifyFollowUpQuietly(
 					pi.sendUserMessage,
-					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。
-进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
+					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。\n进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
 					{ source: "index:trace-fusion", runId: outcome.runId },
 				);
 			}
+			// progress / busy / already-done：静默（无新事可报，重复注入只消耗 turn）
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
 		},
 	}));
@@ -5196,13 +5217,27 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			task: Type.String({ description: "任务描述（各 lane 逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
 			model: Type.Optional(Type.String({ description: "per-call 模型（provider/id 或唯一短名）。优先级：本参数 > config.workerModel > lane 默认；非法模型直接报错（不静默回落）" })),
+			workerModelByLane: Type.Optional(Type.Object({
+				A: Type.Optional(Type.String({ description: "TRACE A 的模型" })),
+				B: Type.Optional(Type.String({ description: "TRACE B 的模型" })),
+				C: Type.Optional(Type.String({ description: "TRACE C 的模型" })),
+			}, { description: "per-lane 模型覆盖（2026-11-02）：三路可各用不同模型（异构才有融合价值）。优先级：本参数[lane] > config.workerModelByLane[lane] > model > config.workerModel。未设的 lane 自动回落" })),
+			laneConcurrency: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
+				description: "并发度（缺省沿用 config，通常为 1）：1=严格串行（省共享 KV 池）、2=双路、3=三路全并发。本机 KV 池是共享的，三路并发可能在中等任务上撞池",
+			})),
 			cwd: Type.Optional(Type.String({ description: "per-call 目标仓库（必须是绝对路径；缺省 = 当前目录）。校验沿用 preflight（git 仓库/HEAD/merge 状态），路径先规范化成绝对路径" })),
 		}),
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
 			if (!capabilities().launchTabs) {
 				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
 			}
-			const params = rawParams as { task?: string; model?: unknown; cwd?: unknown };
+			const params = rawParams as {
+				task?: string;
+				model?: unknown;
+				workerModelByLane?: { A?: string; B?: string; C?: string };
+				laneConcurrency?: 1 | 2 | 3;
+				cwd?: unknown;
+			};
 			const task = (params.task ?? "").trim();
 			if (!task) {
 				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
@@ -5226,6 +5261,52 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `trace-fusion: ${resolved.error}` }], isError: true };
 				}
 				workerModel = resolved.model;
+			}
+			// per-lane 模型（2026-11-02）：逐 lane 校验；非法 lane **被放弃**（不回落默认），并在返回里显式告知。
+			let workerModelByLane: Partial<Record<"A" | "B" | "C", string>> | undefined;
+			let droppedLanes: Array<"A" | "B" | "C"> = [];
+			let droppedLaneReasons: string[] = [];
+			if (params.workerModelByLane !== undefined) {
+				const raw = params.workerModelByLane;
+				if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+					return { content: [{ type: "text", text: "trace-fusion: workerModelByLane 必须是 {A?:string,B?:string,C?:string} 对象。" }], isError: true };
+				}
+				const available: AvailableModelRef[] = (() => {
+					try {
+						const reg = (ctx as unknown as { modelRegistry?: { getAvailable?: () => unknown } }).modelRegistry;
+						const list = reg?.getAvailable?.();
+						return Array.isArray(list) ? (list as AvailableModelRef[]) : [];
+					} catch {
+						return [];
+					}
+				})();
+				const acc: Partial<Record<"A" | "B" | "C", string>> = {};
+				const laneModelErrors: string[] = [];
+				for (const lane of ["A", "B", "C"] as const) {
+					const v = (raw as Record<string, unknown>)[lane];
+					if (v === undefined) continue;
+					const r = resolveTraceWorkerModel(v, available);
+					if (!r.ok) {
+						// 2026-11-02 用户裁定：**放弃这一路**，不让一个错模型崩掉整趟 run。
+						// 关键区别（R-2 的真正含义）：不是「静默跳过」而是「移除该 lane 并显式告知」。
+						// 该 lane 会被剔除出 TRACE_LANES 派发集（见下方 requestedLanes），而不是回落成默认模型跑。
+						laneModelErrors.push(`lane ${lane}＝${String(v)}：${r.error}`);
+						continue;
+					}
+					if (r.model) acc[lane] = r.model;
+				}
+				// 三路都非法 ⇒ 等于没给任何有效 lane，必错（否则会白白开一趟 run）
+				if (laneModelErrors.length > 0 && Object.keys(acc).length === 0) {
+					return {
+						content: [{ type: "text", text: ["trace-fusion：所有指定的 lane 模型都不可用。", ...laneModelErrors].join("\n") }],
+						isError: true,
+					};
+				}
+				if (laneModelErrors.length > 0) {
+					droppedLaneReasons = laneModelErrors;
+					droppedLanes = (["A", "B", "C"] as const).filter((l) => (raw as Record<string, unknown>)[l] !== undefined && !(l in acc));
+				}
+				if (Object.keys(acc).length > 0) workerModelByLane = acc;
 			}
 			let wtExe: string | null;
 			let piCli: string;
@@ -5260,15 +5341,25 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			const tfConfig = readTraceFusionConfig();
-			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档
+			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档。
+			// per-call laneConcurrency（2026-11-02）：显式传入 > config；非法值已在 schema 层被 Type.Union 拦掉。
+			const effectiveConfig = {
+				...tfConfig,
+				mode: "diagnose" as const,
+				...(params.laneConcurrency !== undefined ? { laneConcurrency: params.laneConcurrency } : {}),
+			};
 			const result = launchTraceRun({
 				task,
 				repoRoot,
 				wtExe,
 				piCli,
-				config: { ...tfConfig, mode: "diagnose" },
-				// 参数化 ①：已校验的 per-call 模型（undefined ⇒ 回落到 config.workerModel）
+				config: effectiveConfig,
+				// 参数化 ①：已校验的 per-call 模型（undefined ⇒ 回落 config）
 				workerModel,
+				// per-lane 覆盖：优先级见 workerModelFor（本参数[lane] > config[lane] > workerModel > config.workerModel）
+				workerModelByLane,
+				// 非法 lane 模型已在上层转为「放弃该路」（不回落默认），原因透传给编排与报告
+				skipLanes: droppedLanes.length > 0 ? Object.fromEntries(droppedLanes.map((l) => [l, "模型非法/不可用"])) : undefined,
 				runsDir: defaultTraceFusionRunsDir(),
 			});
 			const lines = result.lines ?? [];
@@ -5281,52 +5372,165 @@ export default function (pi: ExtensionAPI) {
 				}
 			} catch { /* 溯源尽力而为 */ }
 			const laneIds = TRACE_LANES.map((l) => `${l}=${result.meta.lanes[l].tabRunId}`).join(", ");
+			const queued = TRACE_LANES.filter((l) => !result.meta.lanes[l].tabRunId && !droppedLanes.includes(l));
 			return { content: [{ type: "text", text: [
 				`✅ trace-fusion diagnose run 已启动：${result.meta.runId}`,
+				...(droppedLanes.length > 0 ? [`⚠ 已放弃 ${droppedLanes.length} 路（不会用默认模型代跑）：`, ...droppedLaneReasons.map((e) => `  - ${e}`)] : []),
 				...lines,
 				`lane tabs: ${laneIds}`,
-				"三路完成后自动后台收集（无需干预）；进度 /trace-fusion-status。",
-				"完成后：读 ~/.pi/agent/trace-fusion-runs/<runId>/lanes/{A,B,C}/trajectory.md，融合三份诊断（一致根因→高置信；分歧→仲裁）后单次实现。",
+				...(queued.length > 0 ? [`待发队列（前行终态后自动派发）：${queued.join(", ")}`] : []),
+				"三路完成后自动后台收集（无需干预）。",
+				`融合对照表（读这个，不要直接读三份全文）：${result.meta.runDir}/cross-test-report.md`,
+				"该报告是确定性抽取（零模型调用）：分歧节优先看；三路都未填的节说明证据不足。",
 			].join("\n") }] };
 		},
 	});
 
-	// ── /trace-fusion-loop 命令（trace-fusion C6，只允许主会话）──
-	// 设计稿 §5.1：主入口。编排 preflight → snapshot → 三 worktree → 三 trace worker tab。
+	// ── /trace-fusion（2026-11-02 重构：三命令取代四个运维命令）──
+	// 用户裁定（交互角度只需要三件事）：
+	//   ① 模型 —— `/trace-fusion models`（三路 lane 各用哪个模型）
+	//   ② 参数 —— `/trace-fusion config`（并发度/时限/轮数）
+	//   ③ 开始 —— `/trace-fusion <任务>`
+	// 退场：/trace-fusion-status、-collect（运维面，对使用者是噪声；状态靠启动通知+完成事件）。
+	// 保留：/trace-fusion-clean（worktree 占磁盘，必须有手动释放入口）。
 	if (canOrchestrateTabs) {
-		pi.registerCommand("trace-fusion-loop", {
-			description: "三路独立 trace rollout + 证据融合（/trace-fusion-loop <任务>）",
+		const tfConfigPath = () => join(PKG_DIR, "config.json");
+
+		/** 启动前共用：环境解析 + 失败即告知。 */
+		const resolveLaunchEnv = (ctx: ExtensionCommandContext): { wtExe: string; piCli: string } | null => {
+			let wtExe: string | null;
+			let piCli: string;
+			try {
+				wtExe = findWindowsTerminal();
+				piCli = findPiCli();
+			} catch (err) {
+				ctx.ui.notify(`❌ 启动环境不可用：${err instanceof Error ? err.message : String(err)}`, "error");
+				return null;
+			}
+			if (!wtExe) {
+				ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。", "error");
+				return null;
+			}
+			return { wtExe, piCli };
+		};
+
+		/** ② 参数设置：交互式修改并发度/时限/轮数（read-modify-write 单键 + 备份）。 */
+		const configureParams = async (ctx: ExtensionCommandContext): Promise<void> => {
+			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
+			const cur = normalizeUserSettings(block);
+
+			const concLabels = [
+				`1（严格串行：省 KV 池，墙钟 3×）${cur.laneConcurrency === 1 ? " ✓" : ""}`,
+				`2（双路并发）${cur.laneConcurrency === 2 ? " ✓" : ""}`,
+				`3（三路全并发：快，但共享 KV 池可能不够）${cur.laneConcurrency === 3 ? " ✓" : ""}`,
+			];
+			const picked = await ctx.ui.select("lane 并发度（本机 KV 池是共享的，三路并发可能撞池）:", concLabels);
+			if (!picked) return;
+			const laneConcurrency = (concLabels.indexOf(picked) + 1) as 1 | 2 | 3;
+
+			const timeLabels = ["15 分钟", "30 分钟", "45 分钟（默认）", "60 分钟", "90 分钟"];
+			const timeVals = [15, 30, 45, 60, 90];
+			const pickedT = await ctx.ui.select(`单 lane 墙钟时限（当前 ${cur.maxWallClockPerLaneMin}min）:`, timeLabels);
+			if (!pickedT) return;
+			const maxWallClockPerLaneMin = timeVals[timeLabels.indexOf(pickedT)];
+
+			const r = writeTfBlock(tfConfigPath(), { laneConcurrency, maxWallClockPerLaneMin });
+			if (!r.ok) {
+				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
+				return;
+			}
+			ctx.ui.notify(
+				`✅ 已保存：并发度 ${laneConcurrency}，lane 时限 ${maxWallClockPerLaneMin}min\n备份：${r.backupPath}`,
+				"info",
+			);
+		};
+
+		/** ① 模型设置：三路 lane 分别选（也可以三路同一个）。 */
+		const configureModels = async (ctx: ExtensionCommandContext): Promise<void> => {
+			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
+			const curLanes = readLaneModels(block);
+			const allModels = ctx.modelRegistry.getAvailable()
+				.slice()
+				.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
+			if (allModels.length === 0) {
+				ctx.ui.notify("❌ 无可用模型（检查 /model 或 models.json）。", "error");
+				return;
+			}
+
+			const clearLabel = "(用 lane 默认模型)";
+			const modelLabels = [
+				clearLabel,
+				...allModels.map((m) => {
+					const ref = `${m.provider}/${m.id}`;
+					const detail = m.name && m.name !== m.id ? ` — ${m.name}` : "";
+					const ctxW = (m as { contextWindow?: number }).contextWindow;
+					return `${ref}${detail}${ctxW ? ` (ctx ${Math.round(ctxW / 1024)}K)` : ""}`;
+				}),
+			];
+
+			const next: Partial<Record<"A" | "B" | "C", string | undefined>> = {};
+			for (const lane of ["A", "B", "C"] as const) {
+				const current = curLanes[lane];
+				const labeled = modelLabels.map((l) =>
+					l === clearLabel && current ? `${l} [当前: ${current}]` : l === `${current}` ? `${l} ✓` : l,
+				);
+				const picked = await searchableSelect(ctx, `TRACE ${lane} 用哪个模型?`, labeled);
+				if (!picked) break; // 取消 ⇒ 不写入任何已选的（避免半套设置）
+				if (picked.startsWith(clearLabel)) next[lane] = undefined;
+				else next[lane] = picked.replace(/ ✓$/, "").replace(/ \(ctx \d+K\)$/, "").split(" — ")[0].trim();
+			}
+			if (Object.keys(next).length === 0) return;
+
+			const r = writeTfBlock(tfConfigPath(), { workerModelByLane: next });
+			if (!r.ok) {
+				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
+				return;
+			}
+			const applied = Object.entries(next)
+				.map(([k, v]) => `${k}=${v ?? "(默认)"}`)
+				.join(" | ");
+			ctx.ui.notify(`✅ lane 模型已保存：${applied}\n备份：${r.backupPath}`, "info");
+		};
+
+		pi.registerCommand("trace-fusion", {
+			description: "三路独立诊断 + 融合：/trace-fusion <任务> 启动 | models 设模型 | config 设参数",
 			handler: async (args, ctx) => {
-				// review 修正（Luna critical）：不信任 factory 阶段的 canOrchestrateTabs 布尔，
-				// handler 内再验一次能力（profile 时序变化时的兑底防线）。
 				if (!capabilities().launchTabs) {
 					ctx.ui.notify("⛔ 当前会话无 trace-fusion 启动权限（仅主会话）", "error");
 					return;
 				}
-				const task = (args ?? "").trim();
-				if (!task) {
-					ctx.ui.notify("用法：/trace-fusion-loop <任务描述>\n将对当前仓库开三个独立 worktree tab 并行求解，完成后证据融合。", "error");
+				const text = (args ?? "").trim();
+				const sub = text.split(/\s+/)[0]?.toLowerCase() ?? "";
+
+				if (sub === "models") return configureModels(ctx);
+				if (sub === "config" || sub === "settings") return configureParams(ctx);
+
+				// 无参数 或 show：展示当前设置（这是用户「忘了自己设了什么」时的唯一查面）
+				if (!text || sub === "show" || sub === "status") {
+					const lines = renderSettingsSummary(tfConfigPath());
+					ctx.ui.notify(
+						[
+							"🧬 trace-fusion 当前设置",
+							...lines,
+							"",
+							"用法：",
+							"  /trace-fusion <任务>    启动三路诊断",
+							"  /trace-fusion models    设置三路模型",
+							"  /trace-fusion config    设置并发度/时限",
+						].join("\n"),
+						"info",
+					);
 					return;
 				}
-				let wtExe: string | null;
-				let piCli: string;
-				try {
-					wtExe = findWindowsTerminal();
-					piCli = findPiCli();
-				} catch (err) {
-					ctx.ui.notify(`❌ 启动环境不可用：${err instanceof Error ? err.message : String(err)}`, "error");
-					return;
-				}
-				if (!wtExe) {
-					ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。", "error");
-					return;
-				}
+
+				const env = resolveLaunchEnv(ctx);
+				if (!env) return;
 				const tfConfig = readTraceFusionConfig();
 				const result = launchTraceRun({
-					task,
+					task: text,
 					repoRoot: process.cwd(),
-					wtExe,
-					piCli,
+					wtExe: env.wtExe,
+					piCli: env.piCli,
 					config: tfConfig,
 					runsDir: defaultTraceFusionRunsDir(),
 				});
@@ -5335,142 +5539,27 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`❌ trace-fusion 启动失败：${result.error}`, "error");
 					return;
 				}
-				// 溯源：本会话唤起了这三个 lane tab
 				try {
 					for (const lane of TRACE_LANES) {
-						recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+						recordLink({
+							sessionId: sessionIdentity(ctx as never),
+							kind: "tab",
+							targetId: result.meta.lanes[lane].tabRunId,
+							detail: `trace-fusion ${result.meta.runId} lane=${lane}`,
+						});
 					}
 				} catch {
 					/* 溯源失败不阻塞 */
 				}
 				ctx.ui.notify(
 					`🧬 run ${result.meta.runId} 已启动：TRACE A/B/C 三路独立求解中。\n` +
-					`状态：/trace-fusion-status；中止：/trace-fusion-abort；\n` +
-					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。`,
+					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。\n` +
+					`完成时会自动通知；报告在 ${result.meta.runDir}/cross-test-report.md`,
 					"info",
 				);
 			},
 		});
 
-		// ── /trace-fusion-status（§24.1：磁盘是唯一真相源，主会话重启后重建视图）──
-		pi.registerCommand("trace-fusion-status", {
-			description: "查看 trace-fusion run 状态（从磁盘重建，不依赖内存态）",
-			handler: async (_args, ctx) => {
-				const runsDir = defaultTraceFusionRunsDir();
-				if (!existsSync(runsDir)) {
-					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
-					return;
-				}
-				const runs = readdirSync(runsDir, { withFileTypes: true })
-					.filter((e) => e.isDirectory())
-					.map((e) => {
-						try {
-							return JSON.parse(readFileSync(join(runsDir, e.name, "meta.json"), "utf8")) as TraceRunMeta;
-						} catch {
-							return null;
-						}
-					})
-					.filter((m): m is TraceRunMeta => m !== null)
-					.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-					.slice(0, 5);
-				if (runs.length === 0) {
-					ctx.ui.notify("尚无任何 trace-fusion run。", "info");
-					return;
-				}
-				const lines: string[] = [];
-				for (const m of runs) {
-					lines.push(`📦 ${m.runId} [${m.status}] ${m.task.slice(0, 50)}`);
-					lines.push(`   base ${m.baseCommit.slice(0, 12)} · deadline ${m.laneDeadlineAt}`);
-					for (const lane of TRACE_LANES) {
-						const l = m.lanes[lane];
-						const finished = l.tabRunId ? readTabResultFile(defaultTabRunsDir(), l.tabRunId) : null;
-						const timedOut = Date.now() > new Date(m.laneDeadlineAt).getTime();
-						const artifacts = existsSync(join(m.runDir, "lanes", lane, "patch.diff")) ? "patch✓" : "patch✗";
-						lines.push(`   ${lane}: ${finished ? `终态 ${finished.status}` : timedOut ? "⏱ 超时未完成" : "运行中"} · ${artifacts} · ${l.worktree}`);
-					}
-					for (const f of ["collect.json", "cross-test.json", "cross-test-report.md"]) {
-						if (existsSync(join(m.runDir, f))) lines.push(`   产物：${f}`);
-					}
-				}
-				ctx.ui.notify(lines.join("\n"), "info");
-			},
-		});
-
-		// ── /trace-fusion-collect（review 修正 Luna major：把 C7/C8 接入生产生命周期）──
-		// 三路终态（或人工确认）后调用：权威收集 → deterministic cross-test → meta 终态。
-		pi.registerCommand("trace-fusion-collect", {
-			description: "收集 trace-fusion artifacts 并跑 deterministic cross-test（/trace-fusion-collect [runId]）",
-			handler: async (args, ctx) => {
-				const raw = (args ?? "").trim();
-				const force = /(^|\s)--force(\s|$)/.test(raw);
-				const runId = raw.replace(/--force/g, "").trim();
-				const runsDir = defaultTraceFusionRunsDir();
-				let runDir: string | null = null;
-				if (runId) {
-					runDir = existsSync(join(runsDir, runId, "meta.json")) ? join(runsDir, runId) : null;
-				} else {
-					// 默认取最新的 running run，否则最新 run
-					const candidates = existsSync(runsDir)
-						? readdirSync(runsDir, { withFileTypes: true }).filter((e) => e.isDirectory() && existsSync(join(runsDir, e.name, "meta.json"))).map((e) => e.name).sort().reverse()
-						: [];
-					for (const name of candidates) {
-						const m = readTraceRunMeta(join(runsDir, name));
-						if (m?.status === "running") { runDir = join(runsDir, name); break; }
-					}
-					runDir = runDir ?? (candidates[0] ? join(runsDir, candidates[0]) : null);
-				}
-				if (!runDir) {
-					ctx.ui.notify("未找到 trace-fusion run。用法：/trace-fusion-collect [runId]", "error");
-					return;
-				}
-				const meta = readTraceRunMeta(runDir);
-				if (!meta) {
-					ctx.ui.notify(`run meta 不可读：${runDir}`, "error");
-					return;
-				}
-				const tfConfig = readTraceFusionConfig();
-				// review 复核修正（Luna major）：三 lane 未全部终态时拒绝收集（除非 --force）——
-				// 运行中的 worker 仍在改 worktree，提前收集会拿到撕裂证据并错误终结 run。
-				const pending = TRACE_LANES.filter((lane) => {
-					const l = meta.lanes[lane];
-					return !(l.tabRunId && readTabResultFile(defaultTabRunsDir(), l.tabRunId));
-				});
-				if (pending.length > 0 && !force) {
-					ctx.ui.notify(
-						`⏳ 以下 lane 尚未 tab-finish：${pending.join(", ")}。\n` +
-						`等待完成后重试；确要放弃等待并对当前状态出报告，用 /trace-fusion-collect ${meta.runId} --force（后续 lane 的修改不再进入证据）。`,
-						"info",
-					);
-					return;
-				}
-				ctx.ui.notify(`📦 收集 ${meta.runId} 的 lane artifacts（三段式 patch/叙事/终态）…`, "info");
-				const collect = collectRunArtifacts(meta);
-				// diagnose 模式（2026-09-17）：不在用户主仓库执行 pooled commands，
-				// 落盘跳过型报告 + 违规写入确定性检查
-				const matrix = meta.mode === "diagnose"
-					? finishDiagnoseRun(meta, collect)
-					: (() => {
-						ctx.ui.notify(`🧪 跑 deterministic cross-test（${collect.commandPool.length} 条 pooled commands）…`, "info");
-						return runCrossTest(meta, collect, {
-							provisioning: tfConfig.provisioning,
-							mainRoot: meta.repoRoot,
-						});
-					})();
-				// deterministic 层终态：报告就绪，等待人工裁决（fusion/consult 为 v0.4）
-				const finished = { ...meta, status: "completed" as const };
-				writeFileSync(join(runDir, "meta.json"), JSON.stringify(finished, null, 2) + "\n", "utf8");
-				const pass = matrix.cells.filter((c) => c.result === "pass").length;
-				const fail = matrix.cells.filter((c) => c.result === "fail").length;
-				ctx.ui.notify(
-					`✅ cross-test 完成：${pass} pass / ${fail} fail / ${matrix.cells.length - pass - fail} 其它。\n` +
-					`报告：${matrix.reportPath}\n三份 trajectory 与 patch 在 ${meta.runDir}\\lanes\\，等待人工裁决。`,
-					"info",
-				);
-			},
-		});
-
-		// ── /trace-fusion-clean（v0.5 提前落地：§15「用完即删」的执行机制）──
-		// implement 模式一轮真实 run 占 12GB+；清理 worktree、保留 runDir artifact（patch/trajectory）。
 		pi.registerCommand("trace-fusion-clean", {
 			description: "清理 trace-fusion run 的 worktree 占用（保留 artifact）：/trace-fusion-clean <runId> [--force]",
 			handler: async (args, ctx) => {

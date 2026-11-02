@@ -29,6 +29,8 @@ export interface TraceFusionConfig {
 	 */
 	mode?: "diagnose" | "implement";
 	workerModel?: string;
+	/** per-lane worker 模型（2026-10-30）：lane → `provider/id`；未设的 lane 回落到 workerModel。 */
+	workerModelByLane?: Partial<Record<LaneId, string>>;
 	fusionModel?: string;
 	consultMode: "auto" | "always" | "never";
 	consultModel?: string;
@@ -41,6 +43,14 @@ export interface TraceFusionConfig {
 	finalizerStallTimeoutMin: number;
 	/** v1 同时允许的 active run 数。 */
 	maxActiveRuns: number;
+	/**
+	 * 并行度（treats KV 共享池约束，2026-10-30）——决定同时派发几条 lane。
+	 * 背景：服务端 KV 池是**所有 slot 共享的**（本机实测 nl_ctx 名义 262144/slot，
+	 * 实际可用池 ~204800），三路并发在中等任务上必然撞池（第三条会裸 fetch failed）。
+	 * 1 = 严格串行（只在前一条 lane 终态后才派下一条）；2 = 双路并发；3 = 三路全并发（原行为）。
+	 * 缺省 3 = **与今天逐字节一致**（不改变存量用户行为）。
+	 */
+	laneConcurrency?: 1 | 2 | 3;
 	provisioning: TraceFusionProvisioning;
 }
 
@@ -53,6 +63,8 @@ export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
 	maxWallClockPerLaneMin: 45,
 	finalizerStallTimeoutMin: 30,
 	maxActiveRuns: 1,
+	// 缺省 3 = 保持历史全并发行为；本机共享 KV 池场景应显式设为 1 或 2。
+	laneConcurrency: 3,
 	provisioning: {
 		junction: ["node_modules"],
 		copy: [".env", ".env.local"],

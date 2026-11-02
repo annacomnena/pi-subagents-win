@@ -96,8 +96,11 @@ for (const n of flagNames) console.log(`  ${n}`);
 // 两者均未同步本快照 ⇒ 存量漂移。本任务（local owner 派发平面）只**校实**快照，不改注册面。
 // 2026-10-12：steer 通道（立即插入消息 M1）新增 2 tool——tab-steer / steer-status（steer-runtime.ts）。
 // 同批修复存量漂移（补 local-master-ensure，index.ts 0923 后注册的本地 master 工具，此前被 tool 断言漏项遮挡）。
+// 2026-11-02：补**存量漂移**——`codegraph` 工具 ← 引入于 `735dd50`（2026-10-31「把 codegraph 注册成 pi 工具」），
+// 该提交未同步本快照 ⇒ toolNames 断言恒红（与本轮 laneConcurrency 改动无关，已用 stash 前后对跑证实）。
 assert.deepEqual(toolNames, [
 	"cancel-timer",
+	"codegraph",
 	"global-view",
 	"hotspot",
 	"launch-tabs",
@@ -135,12 +138,13 @@ assert.deepEqual(toolNames, [
 // 同批修复 commands 存量漂移（补 /global-view，index.ts 0923 首阶段注册，与 tools global-view 同批漂移）；
 // 同批修复存量漂移（补 /local-master-ensure、/send-letter、/wechat-remote-run——三者均为此前被 tool 断言失败遮挡的既有注册，与本次 steer 通道无关）；
 // codex-headers / timers / tabs 来自兄弟模块，其余是 index.ts 直接注册
-// （含主会话专属 /launch、/lite、/sub-presets、/trace-fusion-loop）。
+// （含主会话专属 /launch、/lite、/sub-presets；2026-11-02 trace-fusion 四命令合并为 /trace-fusion + /trace-fusion-clean）。
 // 2026-10-14 costTier 门补 /tiers（tiers.ts 命令面，index.ts#3916 接线）。
 assert.deepEqual(commandNames, [
 	"agents",
 	"autonomy",
 	"codex-headers",
+	"compact",
 	"gc",
 	"global-view",
 	"gui",
@@ -157,7 +161,10 @@ assert.deepEqual(commandNames, [
 	"master-status",
 	"master-succession",
 	"master-transfer",
+	"model",
+	"models",
 	"notify",
+	"reload",
 	"runs",
 	"runtime-host",
 	"searcher-mode",
@@ -172,10 +179,8 @@ assert.deepEqual(commandNames, [
 	"tiers",
 	"timers",
 	"today-usage",
+	"trace-fusion",
 	"trace-fusion-clean",
-	"trace-fusion-collect",
-	"trace-fusion-loop",
-	"trace-fusion-status",
 	"wechat",
 	"wechat-remote-run",
 	"workstream",
@@ -196,6 +201,11 @@ assert.deepEqual(commandNames, [
 // 2026-10-16 C-2：async-result-watcher 新增 `context` x1（交付 ACK：检出 eventId ⇒
 // 写 `consumed` —— P3 正解，送达依据从返回值迁到「进入有效 context」）。
 // 注意：`context` 在 emitContext 中为可见消息（不含 system），本仓只读不改。
+// 2026-11-02：补**三处存量漂移**（与 codegraph/命令快照同批暴露，逐项证实来源）：
+//   · `message_start` x1 ← `runtime/session-control-register.ts:266`（会话控制，2026-10-20）
+//   · `message_update` x1 ← `runtime/streaming-snapshot-register.ts:41`（GUI 「正在思考」流式快照，Item 59）
+//   · `turn_start` x1 ← `runtime/streaming-snapshot-register.ts:96`（与 agent_start 同处循环）
+// 三者均未同步本快照 ⇒ eventNames 断言恒红。
 assert.deepEqual(eventNames, [
 	"agent_end",
 	"agent_settled",
@@ -205,11 +215,14 @@ assert.deepEqual(eventNames, [
 	"context",
 	"input",
 	"message_end",
+	"message_start",
+	"message_update",
 	"resources_discover",
 	"session_shutdown",
 	"session_start",
 	"tool_execution_end",
 	"tool_execution_start",
+	"turn_start",
 ]);
 
 // flag 快照：tab-run-id（launch-tabs 身份）+ session-profile / trace-run-id / trace-lane
@@ -224,7 +237,7 @@ assert.deepEqual(
 for (const t of ["subagent-win", "launch-tabs"]) {
 	assert.ok(toolNames.includes(t), `工具 ${t} 必须注册`);
 }
-for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion-loop", "trace-fusion-status", "trace-fusion-collect", "trace-fusion-clean", "hotspot"]) {
+for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion", "trace-fusion-clean", "hotspot"]) {
 	assert.ok(commandNames.includes(c), `命令 ${c} 必须注册`);
 }
 for (const e of ["session_start", "session_shutdown", "before_agent_start"]) {

@@ -20,15 +20,28 @@
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
+import { sessionScopeKey } from "../identity.ts";
 import { readTabResultFile } from "../tab-runs.ts";
+import { spawnPiTab } from "../tab-launch-core.ts";
+import { readTraceFusionConfig } from "./config.ts";
+import { readLaneQueue, resumeQueuedLane, type ResumeQueuedLaneOutcome } from "./lane-queue.ts";
 import { readTraceRunMeta } from "./launch-workers.ts";
-import { defaultRunsDir, TRACE_LANES, type TraceRunMeta } from "./types.ts";
+import { defaultRunsDir, TRACE_LANES, type LaneId, type TraceRunMeta } from "./types.ts";
 
 export type AutoCollectOutcome =
 	| { isTrace: false }
 	| { isTrace: true; phase: "progress"; runId: string; done: number }
 	| { isTrace: true; phase: "already-done"; runId: string }
 	| { isTrace: true; phase: "busy"; runId: string }
+	/**
+	 * laneConcurrency 续发了一条待发 lane（**不是**三路终态）。
+	 * 2026-11-02 拆分：旧版续发与真 collect 共用 "started"，导致调用方
+	 * 只要看到 "started" 就发「三路终态 + cross-test 已启动」——lane A 刚完、
+	 * lane B 刚派、lane C 还在队列时这条文案就不再是真相（实测两路会话都收到误报）。
+	 * 文案与消费者必须按 phase 区分，不得再用 "started" 代表「刚续发」。
+	 */
+	| { isTrace: true; phase: "resumed"; runId: string; lane: LaneId; tabRunId: string; remaining: LaneId[] }
+	/** 三路已全部终态且 cross-test 真的已 spawn（唯一可声称「三路终态」的相位）。 */
 	| { isTrace: true; phase: "started"; runId: string; runDir: string };
 
 export interface SupervisorOptions {
@@ -36,10 +49,90 @@ export interface SupervisorOptions {
 	tabRunsDir?: string;
 	/** 子进程 spawn seam（测试注入）。默认 detached 后台进程。 */
 	spawnWorker?: (entryScript: string, runId: string) => void;
+	/** laneConcurrency 续发所需：wt / pi CLI 路径（由调用方注入，避免反向依赖 index.ts）。 */
+	wtExe?: string;
+	piCli?: string;
+	/** tab spawn seam（续发用；测试注入 fake）。 */
+	spawnTab?: (opts: Parameters<typeof spawnPiTab>[0]) => ReturnType<typeof spawnPiTab>;
 }
 
 /** claim 新鲜阈值：超过视为陈进程遗留，可重新认领（覆盖 lane 墙钟上限 45min + cross-test 余量）。 */
 const CLAIM_FRESH_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * laneConcurrency 续发（2026-10-30）：若该 run 有待发 lane 且并发名额空出，派下一条。
+ *
+ * 只读磁盘状态（lane-queue.json + 各 lane 的 result.json）⇒ 无内存态、可重入、重启后正确。
+ * 任何异常（无队列/无名额/派发失败）一律静默回 false，**不影响收集主流程**。
+ */
+/**
+ * laneConcurrency 续发（带跨进程锁）。
+ *
+ * 2026-11-02 修正两个缺陷：
+ *  1. 返回 outcome 而非 boolean——调用方需要 lane/tabRunId/remaining 拼真实文案，
+ *     旧版只能猜「发生了什么」，结果只能发「三路终态」（实测误报两次）。
+ *  2. **加跨进程锁**。旧版 resumeQueuedLane 无锁：若两个主会话的 event-bus
+ *     同时看到 lane A 完成，都会读到队列 ["B","C"]、都判定有名额、各自 spawn
+ *     一条 B（撞 KV 池）+ 最后写入者覆盖 lane-queue.json ⇒ 幽灵 tabRunId。
+ *     锁与 tryClaimCollect 同族（'wx' 独占 + 新鲜度接管），但用**独立文件**
+ *     `resume.claim`：二者时机不同（续发发生在 collect 之前），不能共用一个锁。
+ */
+function tryResumeQueuedLane(
+	hit: TraceRunMeta,
+	opts: SupervisorOptions,
+	tabRunsDir: string,
+): { outcome: Extract<ResumeQueuedLaneOutcome, { resumed: true }> } | null {
+	try {
+		const q = readLaneQueue(hit.runDir);
+		if (!q || q.lanes.length === 0) return null;
+		// 无注入的 wt/pi 路径 ⇒ 不猜、不续发（宁可不派，也不拿错路径 spawn）
+		if (!opts.wtExe || !opts.piCli) return null;
+		// 跨进程互斥：抢不到 ⇒ 另一个会话正在续发这一条，本轮不重复派。
+		if (!tryClaimResume(hit.runDir)) return null;
+		const cfg = readTraceFusionConfig();
+		const resumed = resumeQueuedLane({
+			meta: hit,
+			tabRunsDir,
+			concurrency: q.concurrency,
+			wtExe: opts.wtExe,
+			piCli: opts.piCli,
+			// 续发时**不看** per-call 覆盖（那份只属首次 launch 调用），只用 config。
+			workerModelFor: (lane) => cfg.workerModelByLane?.[lane] ?? cfg.workerModel,
+			spawnTab: opts.spawnTab ?? ((o) => spawnPiTab(o)),
+		});
+		return resumed.resumed ? { outcome: resumed } : null;
+	} catch {
+		return null; // best-effort：续发失败不得阻断收集
+	}
+}
+
+/** 续发锁的新鲜度窗口：远短于 collect 锁——续发是同步短动作（读队列 + spawn）。 */
+const RESUME_CLAIM_FRESH_MS = 90_000;
+
+/** 原子认领续发权：'wx' 独占；已存在但新鲜 → false；陈旧 → 接管。 */
+function tryClaimResume(runDir: string): boolean {
+	const claimPath = join(runDir, "resume.claim");
+	const payload = `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			writeFileSync(claimPath, payload, { flag: "wx" });
+			return true;
+		} catch {
+			try {
+				const prev = JSON.parse(readFileSync(claimPath, "utf8")) as { at?: string };
+				if (prev.at && Date.now() - Date.parse(prev.at) <= RESUME_CLAIM_FRESH_MS) return false;
+			} catch {
+				return false; // 解析不了 → 保守当作别人持有
+			}
+			try {
+				rmSync(claimPath);
+			} catch {
+				return false;
+			}
+		}
+	}
+	return false;
+}
 
 /** collect-worker 入口脚本路径（与本模块同目录）。 */
 export function collectCliPath(): string {
@@ -83,6 +176,32 @@ function tryClaimCollect(runDir: string): boolean {
 	return false;
 }
 
+/**
+ * 本会话是否有权驱动这个 run（续发 / collect / 通知）。
+ *
+ * 2026-11-02 修缺陷：`isMainSession()` 让所有非 tab 会话都 watch 同一个全局 `tab-runs/`，
+ * 于是 home 会话与本仓会话同时收到同一个 run 的通知（实测 a726 两路各一份、
+ * 单会话内还重复 2–3 次）。旧 meta 没有归属字段，无法判定。
+ *
+ * 判定规则（保守，零回归）：
+ *   - meta 无 dispatcherSessionId（存量 run / 未记录） → **放行**（legacy 行为不变）
+ *   - 有字段且本进程指纹匹配 → 放行
+ *   - 有字段但本进程无指纹（异常环境） → 放行（不因拿不到身份而静默丢掉编排）
+ *   - 有字段且指纹不匹配 → **拒绝**（这条 run 不归本会话）
+ */
+export function isDispatcherSession(meta: TraceRunMeta): boolean {
+	const owner = meta.dispatcherSessionId;
+	if (!owner) return true; // 存量 run：无归属信息，保持 legacy
+	let me: string | undefined;
+	try {
+		me = sessionScopeKey();
+	} catch {
+		return true;
+	}
+	if (!me) return true;
+	return me === owner;
+}
+
 /** 对单个已知 running run 的收集决策（maybe 与 catch-up 共用）。 */
 function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: string): AutoCollectOutcome {
 	const tabRunsDir = opts.tabRunsDir ?? join(runsDir, "..", "tab-runs");
@@ -90,6 +209,25 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 		const id = hit.lanes[lane].tabRunId;
 		return id ? existsSync(join(tabRunsDir, `${id}.result.json`)) : false;
 	}).length;
+
+	// ── laneConcurrency 续发（2026-10-30）：未全终态时才可能要派下一条 ──
+	// 队列文件不存在 ⇒ 历史全并发行为，本段零作用（不碰存量路径）。
+	// 2026-11-02 修正：续发成功**不得**返回 "started"——那时 B 才刚跑、C 还在队列；
+	// 调用方会据此声称「三路终态 + cross-test 已启动」（已两次误报）。分离为 "resumed"。
+	if (done < TRACE_LANES.length) {
+		const resumed = tryResumeQueuedLane(hit, opts, tabRunsDir);
+		if (resumed && resumed.outcome.resumed) {
+			return {
+				isTrace: true,
+				phase: "resumed",
+				runId: hit.runId,
+				lane: resumed.outcome.lane,
+				tabRunId: resumed.outcome.tabRunId,
+				remaining: resumed.outcome.remaining,
+			};
+		}
+	}
+
 	if (done < TRACE_LANES.length) return { isTrace: true, phase: "progress", runId: hit.runId, done };
 
 	if (existsSync(join(hit.runDir, "cross-test.json"))) {
@@ -111,7 +249,6 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 export function maybeAutoCollectTraceRun(finishedTabRunId: string, opts: SupervisorOptions = {}): AutoCollectOutcome {
 	const runsDir = opts.runsDir ?? defaultRunsDir();
 	if (!existsSync(runsDir)) return { isTrace: false };
-
 	let hit: TraceRunMeta | null = null;
 	try {
 		for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
@@ -119,6 +256,8 @@ export function maybeAutoCollectTraceRun(finishedTabRunId: string, opts: Supervi
 			const meta = readTraceRunMeta(join(runsDir, entry.name));
 			if (!meta || meta.status !== "running") continue;
 			if (TRACE_LANES.some((lane) => meta.lanes[lane]?.tabRunId === finishedTabRunId)) {
+				// 归属过滤（2026-11-02）：非派发者会话不得续发/collect/通知。
+				if (!isDispatcherSession(meta)) continue;
 				hit = meta;
 				break;
 			}
@@ -143,6 +282,8 @@ export function catchUpAutoCollect(opts: SupervisorOptions = {}): Extract<AutoCo
 			if (!entry.isDirectory()) continue;
 			const meta = readTraceRunMeta(join(runsDir, entry.name));
 			if (!meta || meta.status !== "running") continue;
+			// 归属过滤：追赶只能由派发者会话做（否则任一新开的主会话都去扫全局 run）
+			if (!isDispatcherSession(meta)) continue;
 			const outcome = outcomeForMeta(meta, opts, runsDir);
 			if (outcome.phase === "started") started.push(outcome);
 		}

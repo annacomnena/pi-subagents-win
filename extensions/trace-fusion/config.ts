@@ -38,6 +38,17 @@ export function readTraceFusionConfig(path: string = traceFusionConfigPath()): T
 		const num = (v: unknown, dflt: number): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : dflt);
 		return {
 			workerModel: typeof u.workerModel === "string" && u.workerModel ? u.workerModel : undefined,
+			// per-lane 模型：只收 A/B/C 三个键的非空字符串值，其它键/空值丢弃（不报错、不静默改。）。
+			workerModelByLane: ((): Partial<Record<"A" | "B" | "C", string>> | undefined => {
+				const raw = u.workerModelByLane;
+				if (!raw || typeof raw !== "object") return undefined;
+				const out: Partial<Record<"A" | "B" | "C", string>> = {};
+				for (const lane of ["A", "B", "C"] as const) {
+					const v = (raw as Record<string, unknown>)[lane];
+					if (typeof v === "string" && v.trim()) out[lane] = v.trim();
+				}
+				return Object.keys(out).length > 0 ? out : undefined;
+			})(),
 			fusionModel: typeof u.fusionModel === "string" && u.fusionModel ? u.fusionModel : undefined,
 			consultMode: u.consultMode === "always" || u.consultMode === "never" ? u.consultMode : "auto",
 			consultModel: typeof u.consultModel === "string" && u.consultModel ? u.consultModel : undefined,
@@ -48,6 +59,10 @@ export function readTraceFusionConfig(path: string = traceFusionConfigPath()): T
 			maxWallClockPerLaneMin: num(u.maxWallClockPerLaneMin, DEFAULT_TRACE_FUSION_CONFIG.maxWallClockPerLaneMin),
 			finalizerStallTimeoutMin: num(u.finalizerStallTimeoutMin, DEFAULT_TRACE_FUSION_CONFIG.finalizerStallTimeoutMin),
 			maxActiveRuns: num(u.maxActiveRuns, DEFAULT_TRACE_FUSION_CONFIG.maxActiveRuns),
+			// laneConcurrency 只接受 1|2|3；其它值（含 0/小数/字符串）一律回默认，不静默釒2 或 4。
+			laneConcurrency: u.laneConcurrency === 1 || u.laneConcurrency === 2 || u.laneConcurrency === 3
+				? u.laneConcurrency
+				: DEFAULT_TRACE_FUSION_CONFIG.laneConcurrency,
 			provisioning: mergeProvisioning(u.provisioning),
 		};
 	} catch {

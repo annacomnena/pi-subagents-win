@@ -28,8 +28,7 @@ if (gitVer.status !== 0) {
 import { launchTraceRun, newTraceRunId, readTraceRunMeta, type TabSpawner } from "./trace-fusion/launch-workers.ts";
 import { ensureDirTrusted } from "./trace-fusion/trust.ts";
 import { buildTraceWorkerPrompt } from "./trace-fusion/worker-prompt.ts";
-import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig } from "./trace-fusion/types.ts";
-import type { TabLaunchOptions } from "./tab-launch-core.ts";
+import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig } from "./trace-fusion/types.ts";import type { TabLaunchOptions } from "./tab-launch-core.ts";
 
 const cfg = (over: Partial<TraceFusionConfig> = {}): TraceFusionConfig => ({
 	...structuredClone(DEFAULT_TRACE_FUSION_CONFIG),
@@ -302,9 +301,134 @@ try {
 			assert.equal(calls.length, 3, "三 tab 已派发");
 			for (const c of calls) {
 				assert.equal(c.cwd?.replace(/\\/g, "/"), repo2.replace(/\\/g, "/"), "tab cwd=主仓库");
-				assert.ok(c.excludeTools?.includes("edit") && c.excludeTools.includes("write"), "diagnose 禁 edit/write");
+				// 2026-11-02 变更：只禁 edit；**write 必须保留**（lane 要用它写 artifact）。
+				// 首跑实测：禁 write ⇒ 模型只能用 bash mkdir/cp 硬凑，产物落错位置、run 白跑。
+				assert.ok(c.excludeTools?.includes("edit"), "diagnose 必须禁 edit（不改代码）");
+				assert.ok(!c.excludeTools?.includes("write"), "diagnose 必须保留 write（写 trajectory.md/validation.json 的唯一正当方式）");
+				assert.ok(c.__prompt.includes("用 `write` 工具"), "prompt 必须明确要求用 write 工具写 artifact");
+				assert.ok(c.__prompt.includes("禁止】用 bash 写文件"), "prompt 必须明确禁止用 bash 写 artifact");
+				assert.ok(c.__prompt.includes("find /") || c.__prompt.includes("盘符根"), "prompt 必须写明 R-13 全盘搜索禁令");
+				assert.ok(c.__prompt.includes("tab-finish 工具") || c.__prompt.includes("tab-finish` 工具"), "prompt 必须强调 tab-finish 是工具不是命令");
+				// 2026-11-02 用户裁定：任务本体必须在开头+结尾各强调一次（系统提示+AGENTS.md 太长会稀释注意力）
+				const taskLine = "任务本体占位-" + Math.random().toString(36).slice(2);
+				void taskLine;
+				assert.ok(c.__prompt.includes("你要回答的问题（唯一目标"), "prompt 开头必须用醒目标题强调任务");
+				assert.ok(c.__prompt.includes("再重申一次你要回答的问题"), "prompt 结尾必须重申任务（对抗注意力涣散）");
+				assert.ok(c.__prompt.includes("结束前自检"), "prompt 结尾必须有自检清单");
+				assert.ok(c.__prompt.includes("直接回答了它"), "自检项必须含「是否直接回答任务」");
+				assert.ok(c.__prompt.includes("合法 JSON"), "自检项必须含 validation.json 合法性（实测 A/B 两条 lane 曾非法）");
 				assert.ok(c.__prompt.includes("只读纪律"), "diagnose prompt 声明只读纪律");
 				assert.ok(c.__prompt.includes("八节"), "diagnose 契约为八节叙事");
+				// 2026-11-02：检索纪律（codegraph 优先）——lane 有 codegraph 却零提示时
+				// 会去 grep 猜符号位置，白白烧掉 45 分钟预算。这里钉死「工具名 + 三种关键用法 + 陈旧闸门」。
+				assert.ok(c.__prompt.includes("codegraph"), "diagnose prompt 必须提示 codegraph（否则 lane 只会 grep）");
+				assert.ok(c.__prompt.includes("query"), "必须给 query 用法（按符号定位）");
+				assert.ok(c.__prompt.includes("impact"), "必须给 impact 用法（改之前查调用方）");
+				assert.ok(c.__prompt.includes("陈旧"), "必须给索引陈旧闸门（行号失真防护）");
+				assert.ok(c.__prompt.includes("回退 grep"), "索引不可用时的回退路径必须写明");
+				// 2026-11-02：复用既有 Wiki 知识（读）+ 禁用写入类动作（rebuild）。
+				assert.ok(!c.excludeTools?.includes("wiki-nav"), "wiki-nav 必须对 lane 可用（复用已验证知识）");
+				assert.ok(c.__prompt.includes("Wiki"), "prompt 必须指向 Wiki 作为先查面");
+				assert.ok(c.__prompt.includes("source_paths"), "必须告诉 lane 按 source_paths 直接跳代码");
+				assert.ok(c.__prompt.includes("rebuild"), "必须点名禁止的动作（rebuild）");
+				assert.ok(c.__prompt.includes("semantic-rebuild"), "semantic-rebuild 也必须点名禁止（调远程 embedding）");
+				// 死项回归：wiki-semantic 不是工具名，不应出现在 exclude 里
+				assert.ok(!c.excludeTools?.includes("wiki-semantic"), "wiki-semantic 不是工具名，exclude 里不该有死项");
+			}
+		}
+	}
+
+	// ── laneConcurrency（2026-10-30）：KV 共享池约束下的分批派发 ──
+	// 锁定：① 缺省 3 = 历史全派行为逐字不变；② 1/2 时只派首发波、余下写队列；
+	//      ③ 队列文件能回读；④ per-lane 模型优先级四级降级。
+	{
+		const repo3 = join(root, "repo-conc");
+		mkdirSync(repo3, { recursive: true });
+		assert.equal(g(["init", "-b", "main"], repo3), 0);
+		writeFileSync(join(repo3, "src.txt"), "code\n");
+		g(["add", "."], repo3);
+		g(["commit", "-m", "init"], repo3);
+
+		const mk = () => makeFakeSpawner();
+
+		// ① 缺省（不传 laneConcurrency ⇒ DEFAULT=3）：三路全派、无队列文件
+		{
+			const { spawner, calls } = mk();
+			const res = launchTraceRun({
+				task: "并发度缺省",
+				repoRoot: repo3, wtExe: "wt.exe", piCli: "pi.cmd",
+				config: { ...cfg(), mode: "diagnose" },
+				runsDir: join(root, "runs-c3"), wtRoot,
+				now: new Date("2026-10-30T01:00:00"), spawnTab: spawner,
+			});
+			assert.equal(res.ok, true, `缺省并发度应派发成功：${!res.ok ? res.error : ""}`);
+			if (res.ok) {
+				assert.equal(DEFAULT_TRACE_FUSION_CONFIG.laneConcurrency, 3, "缺省并发度必须是 3（历史行为）");
+				assert.equal(calls.length, 3, "缺省必须三路全派");
+				assert.equal(existsSync(join(res.meta.runDir, "lane-queue.json")), false, "无待发 ⇒ 不写队列文件");
+			}
+		}
+
+		// ② laneConcurrency=1 严格串行：只派 A，B/C 进队列
+		{
+			const { spawner, calls } = mk();
+			const res = launchTraceRun({
+				task: "串行",
+				repoRoot: repo3, wtExe: "wt.exe", piCli: "pi.cmd",
+				config: { ...cfg(), mode: "diagnose", laneConcurrency: 1 },
+				runsDir: join(root, "runs-c1"), wtRoot,
+				now: new Date("2026-10-30T02:00:00"), spawnTab: spawner,
+			});
+			assert.equal(res.ok, true, `串行应派发成功：${!res.ok ? res.error : ""}`);
+			if (res.ok) {
+				assert.equal(calls.length, 1, "并发度 1 只能派一条");
+				assert.ok(res.meta.lanes.A.tabRunId, "A 已派发");
+				assert.equal(res.meta.lanes.B.tabRunId, "", "B 未派发");
+				assert.equal(res.meta.lanes.C.tabRunId, "", "C 未派发");
+				const qf = join(res.meta.runDir, "lane-queue.json");
+				assert.ok(existsSync(qf), "待发队列必须落盘");
+				const q = JSON.parse(readFileSync(qf, "utf8")) as { lanes: string[]; concurrency: number };
+				assert.deepEqual(q.lanes, ["B", "C"], "队列顺序必须是 B,C");
+				assert.equal(q.concurrency, 1, "队列记录并发度");
+			}
+		}
+
+		// ③ laneConcurrency=2：派 A,B；C 进队列
+		{
+			const { spawner, calls } = mk();
+			const res = launchTraceRun({
+				task: "双路",
+				repoRoot: repo3, wtExe: "wt.exe", piCli: "pi.cmd",
+				config: { ...cfg(), mode: "diagnose", laneConcurrency: 2 },
+				runsDir: join(root, "runs-c2"), wtRoot,
+				now: new Date("2026-10-30T03:00:00"), spawnTab: spawner,
+			});
+			assert.equal(res.ok, true);
+			if (res.ok) {
+				assert.equal(calls.length, 2, "并发度 2 只派两条");
+				const q = JSON.parse(readFileSync(join(res.meta.runDir, "lane-queue.json"), "utf8")) as { lanes: string[] };
+				assert.deepEqual(q.lanes, ["C"], "只剩 C 待发");
+			}
+		}
+
+		// ④ per-lane 模型：config.workerModelByLane 优先于全局 workerModel
+		{
+			const { spawner, calls } = mk();
+			const res = launchTraceRun({
+				task: "per-lane 模型",
+				repoRoot: repo3, wtExe: "wt.exe", piCli: "pi.cmd",
+				config: { ...cfg(), mode: "diagnose", workerModel: "prov/global", workerModelByLane: { B: "prov/lane-b" } },
+				runsDir: join(root, "runs-pm"), wtRoot,
+				now: new Date("2026-10-30T04:00:00"), spawnTab: spawner,
+			});
+			assert.equal(res.ok, true);
+			if (res.ok) {
+				const byTitle = new Map(calls.map((c) => [String(c.title), c.model]));
+				const mA = [...byTitle].find(([t]) => t.includes(" L A".replace(/ /g, "")) || /-LA\b|\[TRACE A\]/.test(t))?.[1];
+				assert.equal(calls.find((c) => /\[TRACE A\]/.test(String(c.title)))?.model, "prov/global", "A 退回全局");
+				assert.equal(calls.find((c) => /\[TRACE B\]/.test(String(c.title)))?.model, "prov/lane-b", "B 用 per-lane");
+				assert.equal(calls.find((c) => /\[TRACE C\]/.test(String(c.title)))?.model, "prov/global", "C 退回全局");
+				void mA;
 			}
 		}
 	}

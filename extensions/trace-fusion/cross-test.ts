@@ -19,6 +19,8 @@ import { createSingleWorktree, provisionWorktree, removeWorktreeRetry, writeProv
 import type { LaneId, TraceRunMeta, TraceFusionProvisioning } from "./types.ts";
 import type { RunCollectReport } from "./artifacts.ts";
 import { diagnoseDirtyViolations } from "./artifacts.ts";
+import { buildFusionPacket } from "./fusion-packet.ts";
+import { defaultTabRunsDir } from "../tab-runs.ts";
 
 export type CellResult = "pass" | "fail" | "flaky" | "error" | "blocked";
 
@@ -243,10 +245,38 @@ export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport)
 		"",
 		"## 交付物",
 		"",
-		"三份独立诊断+方案在 `lanes/{A,B,C}/trajectory.md`，证据主张在 `lanes/{A,B,C}/validation.json`；",
-		"主会话应读取三者做融合（一致根因 → 高置信；分歧 → 仲裁），合成单一推进方案后单次实现。",
+		"三份独立诊断+方案在 `lanes/{A,B,C}/trajectory.md`，证据主张在 `lanes/{A,B,C}/validation.json`。",
 		"",
 	];
+	// 2026-11-02：接入确定性 Fusion Packet（设计稿 §24「不应全交给模型」/§61）。
+	// 此前这里只写一句「请主会话去读三份」——三份各 5-7K token，主会话要么全读要么跳过，
+	// 融合退化成凭印象。现在先把 8 节抽成对照表，主会话读一页纸。
+	// never-throw：抽取失败绝不能阻断收集（报告本身比融合段重要）。
+	try {
+		const packet = buildFusionPacket({
+			runDir: meta.runDir,
+			task: meta.task,
+			baseCommit: meta.baseCommit,
+			mode: meta.mode,
+			dirtyViolations: violations,
+			// b31e 实跑驱动：Hard Facts 必须能解释「为何缺产物」。B 自报 unconfirmed 但
+			// 旧 packet 只说「缺失」，读者无从判断是崩溃/超时/忘回报。
+			tabRunsDir: defaultTabRunsDir(),
+			laneTabRunIds: {
+				A: meta.lanes.A.tabRunId,
+				B: meta.lanes.B.tabRunId,
+				C: meta.lanes.C.tabRunId,
+			},
+		});
+		lines.push(packet.markdown);
+	} catch (e) {
+		lines.push(`## 三路结构化对照`);
+		lines.push("");
+		lines.push(`⚠ Fusion Packet 构造失败（不影响收集）：${(e as Error).message}`);
+		lines.push("请直接读 `lanes/{A,B,C}/trajectory.md`。");
+		lines.push("");
+	}
+
 	writeFileSync(join(meta.runDir, "cross-test.json"), JSON.stringify({ ...matrix, skipped: "diagnose 模式不在用户仓库执行命令", dirtyViolations: violations }, null, 2) + "\n", "utf8");
 	writeFileSync(matrix.reportPath, lines.join("\n"), "utf8");
 	return matrix;

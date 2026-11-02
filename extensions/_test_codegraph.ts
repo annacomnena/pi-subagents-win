@@ -41,9 +41,11 @@ const ok = (msg: string): void => {
 	const repo = join(base, "myrepo"); // 模拟 G:/code/battlesandbox（有 .git，无自己的索引）
 	const own = join(base, "own"); // 有 .git + 自己的索引
 	mkdirSync(join(umbrella, ".codegraph"), { recursive: true });
+	writeFileSync(join(umbrella, ".codegraph", "codegraph.db"), ""); // 真索引（大杂饼也是真索引）
 	mkdirSync(join(repo, ".git"), { recursive: true });
 	mkdirSync(join(own, ".git"), { recursive: true });
 	mkdirSync(join(own, ".codegraph"), { recursive: true });
+	writeFileSync(join(own, ".codegraph", "codegraph.db"), ""); // 真索引必须有 codegraph.db
 	mkdirSync(join(own, "sub"), { recursive: true });
 	try {
 		// 就地命中 ⇒ 信任
@@ -62,7 +64,43 @@ const ok = (msg: string): void => {
 	}
 }
 
-// ── ② 结构化投影 ───────────────────────────────────────────────────
+// ── ①b 全局遥测目录误判为索引（2026-11-02 实测缺陷）───────────────
+// 实测：`C:\Users\<user>\.codegraph` 是 codegraph CLI 的**全局遥测目录**
+// （只有 daemons/ + telemetry*.json + update-check.json，**无 codegraph.db**）。
+// 老实现只看“目录存在” ⇒ 把它当索引根 ⇒ 在无自己的 .codegraph 的仓库里
+// status 返回全 `?` 而不是“本仓未初始化”，**静默误导**。
+{
+	const base = join(tmpdir(), `cg_telemetry_test_${Date.now()}`);
+	const fakeHome = base; // 模拟 C:\Users\<user>（非 git）
+	const nonGitRepo = join(base, "notgit", "repo");
+	mkdirSync(join(fakeHome, ".codegraph", "daemons"), { recursive: true });
+	writeFileSync(join(fakeHome, ".codegraph", "telemetry.json"), "{}");
+	writeFileSync(join(fakeHome, ".codegraph", "update-check.json"), "{}");
+	mkdirSync(join(fakeHome, "notgit"), { recursive: true }); // notgit 不是 git 根
+	mkdirSync(join(nonGitRepo, ".git"), { recursive: true }); // repo 是 git 根但无自己的 .codegraph
+	try {
+		assert.equal(
+			findCodegraphRoot(fakeHome),
+			null,
+			"只有 telemetry（无 codegraph.db）的 .codegraph ⇒ 不得当索引根",
+		);
+		assert.equal(
+			findCodegraphRoot(nonGitRepo),
+			null,
+			"向上只能找到全局遥测目录 ⇒ 必须报未初始化，不能返回它",
+		);
+		// 反向控制：真索引（有 codegraph.db）仍须被信任
+		const realRoot = join(base, "real");
+		mkdirSync(join(realRoot, ".codegraph"), { recursive: true });
+		writeFileSync(join(realRoot, ".codegraph", "codegraph.db"), "");
+		assert.equal(findCodegraphRoot(realRoot), realRoot, "含 codegraph.db ⇒ 是真索引，必须信任");
+		ok("①b 全局遥测目录不得当索引根；真索引（codegraph.db）仍被信任");
+	} finally {
+		rmSync(base, { recursive: true, force: true });
+	}
+}
+
+// ── ② 结构化投影 ────────────────────────────────────────────────────────────────────────────────────────────────
 {
 	// 真实 `codegraph query --json` 的形状（取自实测输出）
 	const payload = [

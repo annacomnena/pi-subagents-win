@@ -25,6 +25,19 @@ import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type Pr
 import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type TraceFusionConfig } from "./types.ts";
 import { buildTraceWorkerPrompt, buildDiagnoseWorkerPrompt } from "./worker-prompt.ts";
 import { ensureDirTrusted } from "./trust.ts";
+import { sessionScopeKey } from "../identity.ts";
+
+/**
+ * 当前进程的会话指纹（写入 meta.dispatcherSessionId）。
+ * 取不到（无身份的非标准环境）时返回 undefined —— 不编造，保持 legacy 无归属行为。
+ */
+function currentDispatcherFingerprint(): string | undefined {
+	try {
+		return sessionScopeKey();
+	} catch {
+		return undefined;
+	}
+}
 
 /** spawn seam：默认真 spawnPiTab；测试注入 fake。签名与 spawnPiTab 一致。 */
 export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnResult;
@@ -32,9 +45,15 @@ export type TabSpawner = (opts: Parameters<typeof spawnPiTab>[0]) => TabSpawnRes
 /** 异步 spawn 已失败的 lane runId（writeLaneTimers 的竞态守卫）。 */
 const spawnFailedLanes = new Set<string>();
 
-/** §17：trace worker tab 的工具排除名单（wiki/timer/launch 写能力不可见；subagent-win 保留）。
- *  trace-fusion（主会话主动触发诊断）对 lane 同样不可见。 */
-export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "wiki-nav", "wiki-semantic", "trace-fusion"];
+/** §17：trace worker tab 的工具排除名单（launch/timer 等写能力不可见；subagent-win 保留）。
+ *
+ * 2026-11-02 变更：**移出 `wiki-nav`**——lane 诊断时重用既有 Wiki 知识
+ * （已完成功能的主题页 + source_paths）是实质收益，而 wiki 不是一个“写仓库”的工具
+ * 而是查询面。写入类动作（`rebuild` / `semantic-rebuild`）**改为在 worker prompt 里
+ * 禁止**：本仓的既定纪律是先例（trace-fusion 对 bash 的只读纪律就是这么做的，
+ * 并有 `diagnoseDirtyViolations` 做确定性检出兑底）。
+ * 同批清理：`wiki-semantic` 不是工具名（是内部模块）⇒ 从 exclude 里移除死项。 */
+export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "trace-fusion"];
 
 /**
  * §24.2：向 lane tab 邮箱写两个墙钟计时器——
@@ -89,6 +108,19 @@ export interface LaunchTraceRunInput {
 	 * 注意：config 旧路径**不做校验**（向后兼容；校验只在显式传参时发生）。
 	 */
 	workerModel?: string;
+	/**
+	 * per-lane worker 模型（2026-10-30）：按 lane 覆盖，让三条 lane 跑不同模型。
+	 * 优先级（唯一实现点 = `workerModelFor`）：
+	 *   本字段[lane] > config.workerModelByLane[lane] > 本文件 workerModel > config.workerModel > 不传。
+	 * 未设任何 per-lane 键 ⇒ 行为与历史逐字节一致。
+	 */
+	workerModelByLane?: Partial<Record<LaneId, string>>;
+	/**
+	 * 不派发的 lane（2026-11-02）：由调用方在参数校验阶段判定「该路无法跑」（如模型非法）。
+	 * 语义是 **显式放弃**，不是静默跳过：被跳过的 lane 不 spawn、tabRunId 留空、
+	 * 并在返回 lines 里逐条写原因。run 按已派发数降级（同 partial-failure 语义）。
+	 */
+	skipLanes?: Partial<Record<LaneId, string>>;
 	/** 已解析的环境（命令 handler 负责 findWindowsTerminal/findPiCli）。 */
 	wtExe: string;
 	piCli: string;
@@ -125,6 +157,17 @@ export interface TraceRunMeta {
 	lanes: Record<LaneId, TraceLaneMeta>;
 	/** diagnose 模式：启动时主仓库 porcelain 基线文件路径（collect 时对比检违规写入）。 */
 	dirtyBaselineFile?: string;
+	/**
+	 * 派发者会话指纹（2026-11-02）：`sessionScopeKey()` 的返回值（tab runId 优先，否则持久 UUID）。
+	 *
+	 * 修缺陷：`isMainSession()` 让**所有**非 tab 会话都 watch 同一个全局 `tab-runs/`，
+	 * 而 meta 里没有任何字段能判定「这个 run 是谁派的」，且 lane tab 不进 `links.jsonl`
+	 * ⇒ event-bus 的 `recipient` 恒 undefined ⇒ `isDispatcher` 恒 false ⇒ fencing 全部走
+	 * legacy 无归属兜底 ⇒ 跨会话重复通知（实测 a726 两路会话各收一份、单会话内重复 3 次）。
+	 * 写入后由 `isDispatcherSession(meta)` 用于过滤，不新造机制。
+	 * 旧的 meta（字段缺失）一律当作「无归属」→ 保持 legacy 行为（零回归）。
+	 */
+	dispatcherSessionId?: string;
 }
 
 export type LaunchTraceRunResult =
@@ -154,6 +197,95 @@ export function readTraceRunMeta(runDir: string): TraceRunMeta | null {
 
 const noopProvision = (): ProvisionReport => ({ junction: [], copied: [], commandOk: true, degraded: false, issues: [] });
 
+export interface DispatchDiagnoseLaneInput {
+	task: string;
+	runId: string;
+	baseCommit: string;
+	repoRoot: string;
+	runDir: string;
+	wallClockMin: number;
+	lane: LaneId;
+	shortId: string;
+	repoName: string;
+	workerModel: string | undefined;
+	now: Date;
+	wtExe: string;
+	piCli: string;
+	spawnTab: TabSpawner;
+}
+
+export type DispatchDiagnoseLaneResult =
+	| { ok: true; lane: LaneId; tabRunId: string; title: string }
+	| { ok: false; lane: LaneId; error: string };
+
+/**
+ * 派发一条 diagnose lane：构建 prompt → 写账本 → spawn → 失败回写 launch_failed。
+ *
+ * **唯一的单 lane 派发实现**：`launchTraceRun` 的首发批次与
+ * `supervisor.resumeQueuedLane` 的待发队列都走这里（否则两套语义必然漂移）。
+ * 不写计时器（计时器由调用方决定，因为首发/续发时机不同）。
+ */
+export function dispatchDiagnoseLane(input: DispatchDiagnoseLaneInput): DispatchDiagnoseLaneResult {
+	const { lane, repoRoot, runDir, shortId, repoName, now } = input;
+	const prompt = buildDiagnoseWorkerPrompt({
+		task: input.task,
+		runId: input.runId,
+		lane,
+		baseCommit: input.baseCommit,
+		repoRoot,
+		runDir,
+		wallClockMin: input.wallClockMin,
+	});
+	const laneRunId = newTabRunId(now);
+	const taskId = `${shortId}-L${lane}`;
+	const title = `[TRACE ${lane}] ${repoName}-${taskId}`;
+	const dispatch: TabDispatchRecord = {
+		id: laneRunId,
+		version: 1,
+		taskId,
+		mode: "trace",
+		title,
+		cwd: repoRoot,
+		requestedModel: input.workerModel,
+		dispatchedAt: new Date().toISOString(),
+		dispatchStatus: "dispatched",
+	};
+	writeTabDispatch(defaultTabRunsDir(), dispatch);
+	const launchErrorsLog = join(runDir, "launch-errors.log");
+	const spawn = input.spawnTab({
+		wtPath: input.wtExe,
+		piCli: input.piCli,
+		cwd: repoRoot,
+		title,
+		prompt,
+		model: input.workerModel,
+		tabRunId: laneRunId,
+		sessionProfile: "trace-worker",
+		traceRunId: input.runId,
+		traceLane: lane,
+		// diagnose：只禁 `edit`（改代码的工具）；**保留 `write`** —— lane 必须用它写自己的
+		// artifact（trajectory.md / validation.json）。2026-11-02 首跑实测：禁了 write 后
+		// 模型只能用 bash 的 mkdir/cp/echo 硬凑产物，产物落到错误路径、且永远无法自写结果。
+		// 写主仓库的违规仍由 collect 的 dirty-baseline 对比确定性检出（防线不变）。
+		excludeTools: [...TRACE_WORKER_EXCLUDE_TOOLS, "edit"],
+		onSpawnError: (err) => {
+			writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
+			try {
+				appendFileSync(launchErrorsLog, `${new Date().toISOString()} lane ${lane} [${laneRunId}] async spawn error: ${err.message}\n`, "utf8");
+			} catch { /* 留痕尽力而为 */ }
+			try {
+				rmSync(mailboxDirForTab(defaultTimersDir(), laneRunId), { recursive: true, force: true });
+				spawnFailedLanes.add(laneRunId);
+			} catch { /* 清理尽力而为 */ }
+		},
+	});
+	if (spawn.error) {
+		writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: spawn.error });
+		return { ok: false, lane, error: spawn.error };
+	}
+	return { ok: true, lane, tabRunId: laneRunId, title };
+}
+
 export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult {
 	const lines: string[] = [];
 	const runsDir = input.runsDir ?? defaultRunsDir();
@@ -164,6 +296,15 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 	// 参数化 ①（2026-10-21）：per-call model > config.workerModel > 不传（lane 默认模型）。
 	// 这是模型优先级的**唯一实现点**；config 旧路径不校验（向后兼容，见计划 D8）。
 	const workerModel = input.workerModel ?? input.config.workerModel;
+	/**
+	 * 按 lane 解析 worker 模型（per-lane 覆盖，2026-10-30）。
+	 * 四级降级，先命中先用：per-call[lane] > config[lane] > per-call 全局 > config 全局。
+	 * 与 `workerModel` 的关系：全未设 per-lane 时完全等价于 `workerModel`（行为逐字不变）。
+	 */
+	const workerModelFor = (lane: LaneId): string | undefined =>
+		input.workerModelByLane?.[lane]
+		?? input.config.workerModelByLane?.[lane]
+		?? workerModel;
 
 	// 1. preflight（§14.2：含单 active run 互斥）
 	const pf = runPreflight(input.repoRoot, { runsDir, maxActiveRuns: input.config.maxActiveRuns });
@@ -210,74 +351,59 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 			laneDeadlineAt: deadline.toISOString(),
 			lanes,
 			dirtyBaselineFile: baselineFile,
+			dispatcherSessionId: currentDispatcherFingerprint(),
 		};
 		writeFileSync(metaPath(runDir), JSON.stringify(meta, null, 2) + "\n", "utf8");
 
 		const repoName = basename(repoRoot);
 		const diagnoseErrors: string[] = [];
-		for (const lane of TRACE_LANES) {
+
+		const dispatchLane = (lane: LaneId): boolean => {
 			const laneMeta = lanes[lane];
-			const prompt = buildDiagnoseWorkerPrompt({
+			const r = dispatchDiagnoseLane({
 				task: input.task,
 				runId,
-				lane,
 				baseCommit,
 				repoRoot,
 				runDir,
 				wallClockMin: wallMin,
-			});
-			const laneRunId = newTabRunId(now);
-			const taskId = `${shortId}-L${lane}`;
-			const title = `[TRACE ${lane}] ${repoName}-${taskId}`;
-			const dispatch: TabDispatchRecord = {
-				id: laneRunId,
-				version: 1,
-				taskId,
-				mode: "trace",
-				title,
-				cwd: repoRoot,
-				requestedModel: workerModel,
-				dispatchedAt: new Date().toISOString(),
-				dispatchStatus: "dispatched",
-			};
-			writeTabDispatch(defaultTabRunsDir(), dispatch);
-			const launchErrorsLog = join(runDir, "launch-errors.log");
-			const spawn = spawnTab({
-				wtPath: input.wtExe,
+				lane,
+				shortId,
+				repoName,
+				workerModel: workerModelFor(lane),
+				now,
+				wtExe: input.wtExe,
 				piCli: input.piCli,
-				cwd: repoRoot,
-				title,
-				prompt,
-				model: workerModel,
-				tabRunId: laneRunId,
-				sessionProfile: "trace-worker",
-				traceRunId: runId,
-				traceLane: lane,
-				// diagnose：额外禁 edit/write（只读诊断）；bash 保留（git log/grep 等只读探查），
-				// 违规写入由 collect 的 dirty-baseline 对比确定性检出
-				excludeTools: [...TRACE_WORKER_EXCLUDE_TOOLS, "edit", "write"],
-				onSpawnError: (err) => {
-					writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: err.message });
-					try {
-						appendFileSync(launchErrorsLog, `${new Date().toISOString()} lane ${lane} [${laneRunId}] async spawn error: ${err.message}\n`, "utf8");
-					} catch { /* 留痕尽力而为 */ }
-					try {
-						rmSync(mailboxDirForTab(defaultTimersDir(), laneRunId), { recursive: true, force: true });
-						spawnFailedLanes.add(laneRunId);
-					} catch { /* 清理尽力而为 */ }
-				},
+				spawnTab,
 			});
-			if (spawn.error) {
-				diagnoseErrors.push(`lane ${lane}：${spawn.error}`);
-				writeTabDispatch(defaultTabRunsDir(), { ...dispatch, dispatchStatus: "launch_failed", error: spawn.error });
-				continue;
+			if (!r.ok) {
+				diagnoseErrors.push(`lane ${lane}：${r.error}`);
+				return false;
 			}
-			laneMeta.tabRunId = laneRunId;
-			writeLaneTimers(laneRunId, lane, deadline, now);
-			lines.push(`TRACE ${lane}：${title} [${laneRunId}]`);
-		}
+			laneMeta.tabRunId = r.tabRunId!;
+			writeLaneTimers(r.tabRunId!, lane, deadline, now);
+			lines.push(`TRACE ${lane}：${r.title} [${r.tabRunId}]`);
+			return true;
+		};
 
-		const dispatched = TRACE_LANES.filter((l) => lanes[l].tabRunId);
+		// ── 分批派发（laneConcurrency）：KV 共享池约束（设计注释见 types.ts）──
+		// 缺省 3 = 一个 batch 全派 = 与历史行为逐字一致（spawn 是 unref 异步，本函数不会被阻塞）。
+		// skipLanes（2026-11-02）：调用方判定「该路无法跑」⇒ 既不派也不进队列，并逐条记 reason。
+		const skipLanes = input.skipLanes ?? {};
+		const skipped = TRACE_LANES.filter((l) => skipLanes[l] !== undefined);
+		for (const lane of skipped) {
+			lines.push(`⚠ TRACE ${lane} 已放弃（不派发）：${skipLanes[lane]}`);
+		}
+		const activeLanes = TRACE_LANES.filter((l) => skipLanes[l] === undefined);
+		const concurrency = input.config.laneConcurrency ?? 3;
+		const dispatchedLanes: LaneId[] = [];
+		const wave = activeLanes.slice(0, concurrency);
+		for (const lane of wave) {
+			if (dispatchLane(lane)) dispatchedLanes.push(lane);
+		}
+		const pendingLanes = activeLanes.slice(concurrency);
+
+		const dispatched = dispatchedLanes;
 		if (dispatched.length === 0) {
 			const failed = { ...meta, status: "failed" as const };
 			writeFileSync(metaPath(runDir), JSON.stringify(failed, null, 2) + "\n", "utf8");
@@ -285,6 +411,11 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		}
 		writeFileSync(metaPath(runDir), JSON.stringify({ ...meta, lanes }, null, 2) + "\n", "utf8");
 		if (diagnoseErrors.length > 0) lines.push(`⚠ ${diagnoseErrors.length} 个 lane 派发失败（run 降级 ${dispatched.length}/3）：${diagnoseErrors.join("; ")}`);
+		if (pendingLanes.length > 0) {
+			const qFile = join(runDir, "lane-queue.json");
+			writeFileSync(qFile, JSON.stringify({ lanes: pendingLanes, concurrency }, null, 2) + "\n", "utf8");
+			lines.push(`并发度 ${concurrency}：首发 ${wave.join(",")}；待发 ${pendingLanes.join(",")}（前者终态后由 supervisor 自动派发，队列 ${qFile}）`);
+		}
 		lines.push(`deadline：${meta.laneDeadlineAt}（${wallMin}min/lane）；产物为三份诊断+方案（无 patch），交主会话融合`);
 		return { ok: true, meta: { ...meta, lanes }, lines };
 	}
@@ -335,6 +466,7 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		laneWallClockMin: wallMin,
 		laneDeadlineAt: deadline.toISOString(),
 		lanes,
+		dispatcherSessionId: currentDispatcherFingerprint(),
 	};
 	writeFileSync(metaPath(runDir), JSON.stringify(meta, null, 2) + "\n", "utf8");
 
