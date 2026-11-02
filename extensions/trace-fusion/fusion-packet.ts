@@ -23,6 +23,7 @@ import type { LaneId } from "./types.ts";
 import { TRACE_LANES } from "./types.ts";
 import { DIAGNOSE_SECTIONS } from "./worker-prompt.ts";
 import { replayLaneValidation, renderReplaySection, type LaneReplayFacts } from "./validation-replay.ts";
+import { checkLaneCitations, renderCitationSection, type CitationFacts } from "./citation-check.ts";
 
 /** 8 节的简名（去掉中文括注，供表头显示）。 */
 export function sectionShortName(full: string): string {
@@ -207,6 +208,17 @@ export interface FusionPacketInput {
 	replayExec?: (cmd: string, cwd: string, timeoutMs: number) => { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
 	replayTimeoutMs?: number;
 	replayBudgetMs?: number;
+	/**
+	 * 选填：给了就按**诊断基点 commit** 机械核验各 lane trajectory 里的 `file:line` 引用
+	 * （越界 / 基点无此文件）。值为仓根。
+	 * 实测依据：c2f5 三路各有一处越界（A 引 :315 > 基点 300 行；C 引 :495-506 > 基点 483 行），
+	 * 此前只能靠融合模型/主会话逐条核。
+	 */
+	citationRepoRoot?: string;
+	citationGitShow?: (repoRoot: string, baseCommit: string, relPath: string, timeoutMs: number) => { ok: boolean; lines: number };
+	/** 基点文件清单 seam（测试注入；缺省 = `git ls-tree -r --name-only`）。 */
+	citationGitList?: (repoRoot: string, baseCommit: string, timeoutMs: number) => string[] | null;
+	citationMaxFiles?: number;
 }
 
 /**
@@ -290,6 +302,8 @@ export interface FusionPacket {
 	validationFacts: Record<string, ValidationFacts>;
 	/** 每路 validation 命令的**复跑**硬事实（仅当 input.replayRepoRoot 给出）。 */
 	replay: LaneReplayFacts[];
+	/** 每路行号引用的越界硬事实（仅当 input.citationRepoRoot 给出）。 */
+	citations: CitationFacts[];
 }
 
 /**
@@ -415,6 +429,20 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 				}),
 			)
 		: [];
+	// 行号引用越界校验（2026-11-02）：给了 citationRepoRoot 才做；按基点 commit 判。
+	const citationAll: CitationFacts[] = input.citationRepoRoot
+		? TRACE_LANES.map((l) =>
+				checkLaneCitations({
+					runDir: input.runDir,
+					lane: l,
+					repoRoot: input.citationRepoRoot as string,
+					baseCommit: input.baseCommit,
+					gitShow: input.citationGitShow,
+					gitList: input.citationGitList,
+					maxFiles: input.citationMaxFiles,
+				}),
+			)
+		: [];
 	// result.json 事实（b31e 实跑驱动）：解释「为什么缺产物」——B 自报 unconfirmed。
 	const resultFacts: Record<string, ResultFacts> = {};
 	for (const l of lanes) {
@@ -463,6 +491,9 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 	lines.push("");
 
 	// ── Conflicts（设计稿 §61）：把分歧压成一张可执行的分组表 ──
+	if (citationAll.length > 0) {
+		lines.push(...renderCitationSection(citationAll));
+	}
 	if (replayAll.length > 0) {
 		lines.push("### Validation 复跑（确定性执行 lane 自己声明的验证命令，零模型调用）");
 		lines.push("");
@@ -513,5 +544,5 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 	lines.push("- 引用结论时必须能回指到具体 `file:line` 或 `validation.json` 条目，不能只给说法。");
 	lines.push("");
 
-	return { markdown: lines.join("\n"), lanes, divergentSections, allMissingSections, validationFacts, replay: replayAll };
+	return { markdown: lines.join("\n"), lanes, divergentSections, allMissingSections, validationFacts, replay: replayAll, citations: citationAll };
 }

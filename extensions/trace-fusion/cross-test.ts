@@ -262,6 +262,9 @@ export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport)
 			// 复跑 lane 自声明的验证命令（2026-11-02）：packet 的 Instruction 说
 			// 「可执行证据压过自报置信度」，不跑命令就是空话（c2f5 lane B 四条全自报 pass、实测全红）。
 			replayRepoRoot: meta.repoRoot,
+			// 行号引用越界校验：小模型的行号大量不可信（c2f5 三路各一处越界），
+			// 本项把「有多少行号根本不存在」变成机械读数，不再烧模型逐条核。
+			citationRepoRoot: meta.repoRoot,
 			// b31e 实跑驱动：Hard Facts 必须能解释「为何缺产物」。B 自报 unconfirmed 但
 			// 旧 packet 只说「缺失」，读者无从判断是崩溃/超时/忘回报。
 			tabRunsDir: defaultTabRunsDir(),
