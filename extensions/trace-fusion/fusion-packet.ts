@@ -22,6 +22,7 @@ import { join } from "node:path";
 import type { LaneId } from "./types.ts";
 import { TRACE_LANES } from "./types.ts";
 import { DIAGNOSE_SECTIONS } from "./worker-prompt.ts";
+import { replayLaneValidation, renderReplaySection, type LaneReplayFacts } from "./validation-replay.ts";
 
 /** 8 节的简名（去掉中文括注，供表头显示）。 */
 export function sectionShortName(full: string): string {
@@ -191,8 +192,21 @@ export interface FusionPacketInput {
 	dirtyViolations?: string[];
 	/** 选填：tab-runs 目录（读 result.json 用）。未给则跳过 result 事实。 */
 	tabRunsDir?: string;
-	/** 选填：lane → tabRunId（读 result.json 用）。 */
+	/** 返填：lane → tabRunId（读 result.json 用）。 */
 	laneTabRunIds?: Partial<Record<string, string>>;
+	/**
+	 * 选填：给了就**复跑**各 lane 自己声明的验证命令（2026-11-02）。
+	 *
+	 * 为什么需要：c2f5 的 lane B 四条 validation **全部自报 pass，实测全部失败**，
+	 * 而 Hard Facts 只数「带 command 条数」从不执行 ⇒  packet 的 Instruction
+	 * 「可执行证据压过自报置信度」在 harness 里根本没兑现。本字段就是去兑现它。
+	 * 值为命令工作目录（= meta.repoRoot）。只跑只读命令，详见 validation-replay.ts 安全面。
+	 */
+	replayRepoRoot?: string;
+	/** 复跑执行 seam（测试注入；缺省 = spawnSync）。 */
+	replayExec?: (cmd: string, cwd: string, timeoutMs: number) => { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
+	replayTimeoutMs?: number;
+	replayBudgetMs?: number;
 }
 
 /**
@@ -274,6 +288,8 @@ export interface FusionPacket {
 	allMissingSections: string[];
 	/** 每路的 validation.json 硬事实（计数）。 */
 	validationFacts: Record<string, ValidationFacts>;
+	/** 每路 validation 命令的**复跑**硬事实（仅当 input.replayRepoRoot 给出）。 */
+	replay: LaneReplayFacts[];
 }
 
 /**
@@ -386,6 +402,19 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 	// ── Hard Facts（设计稿 §61）：只写可机械核验的东西，不写推断 ──
 	const validationFacts: Record<string, ValidationFacts> = {};
 	for (const l of lanes) validationFacts[l.lane] = extractValidationFacts(input.runDir, l.lane);
+	// 复跑（2026-11-02）：给了 replayRepoRoot 才跑；不给则零行为（零回归）。
+	const replayAll: LaneReplayFacts[] = input.replayRepoRoot
+		? TRACE_LANES.map((l) =>
+				replayLaneValidation({
+					runDir: input.runDir,
+					lane: l,
+					repoRoot: input.replayRepoRoot as string,
+					exec: input.replayExec,
+					timeoutMs: input.replayTimeoutMs,
+					totalBudgetMs: input.replayBudgetMs,
+				}),
+			)
+		: [];
 	// result.json 事实（b31e 实跑驱动）：解释「为什么缺产物」——B 自报 unconfirmed。
 	const resultFacts: Record<string, ResultFacts> = {};
 	for (const l of lanes) {
@@ -434,6 +463,11 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 	lines.push("");
 
 	// ── Conflicts（设计稿 §61）：把分歧压成一张可执行的分组表 ──
+	if (replayAll.length > 0) {
+		lines.push("### Validation 复跑（确定性执行 lane 自己声明的验证命令，零模型调用）");
+		lines.push("");
+		lines.push(...renderReplaySection(replayAll).slice(2));
+	}
 	lines.push("### Conflicts（分歧分组：谁与谁不同）");
 	lines.push("");
 	if (divergentSections.length === 0) {
@@ -479,5 +513,5 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 	lines.push("- 引用结论时必须能回指到具体 `file:line` 或 `validation.json` 条目，不能只给说法。");
 	lines.push("");
 
-	return { markdown: lines.join("\n"), lanes, divergentSections, allMissingSections, validationFacts };
+	return { markdown: lines.join("\n"), lanes, divergentSections, allMissingSections, validationFacts, replay: replayAll };
 }
