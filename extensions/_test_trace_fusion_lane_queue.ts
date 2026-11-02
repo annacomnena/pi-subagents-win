@@ -44,6 +44,7 @@ try {
 		headBefore: "deadbeef",
 		runDir,
 		wtDir: "",
+		dispatcherSessionId: "sess-dispatcher-0001",
 		laneWallClockMin: 45,
 		laneDeadlineAt: new Date(Date.now() + 45 * 60_000).toISOString(),
 		lanes: {
@@ -140,6 +141,30 @@ try {
 		const { spawner } = makeFakeSpawner();
 		const r = resumeQueuedLane(base(d, meta, { spawnTab: spawner, concurrency: 2 }));
 		assert.equal(r.resumed, true, "并发 2 下 A 在飞但 B 已终态 ⇒ 应派 C");
+	}
+
+	// 溯源链接必须在**拿到真实 tabRunId 的那一刻**写（2026-11-02 乱回事故根因）：
+	// 旧行为只在派发时一次性写三路，串行模式下 B/C 无 tabRunId ⇒ 空 targetId 死账
+	// ⇒ recipientSessionIdFor 查不到归属 ⇒ 完成消息落回「先到先得」并乱投 global master。
+	{
+		const d = mkRun("linktrace");
+		const meta = mkMeta(d, { A: "tab_a", B: "", C: "" });
+		writeLaneQueue(d, { lanes: ["B", "C"], concurrency: 1 });
+		// 并发 1 要续发 B，必须先让 A 终态（否则无名额 ⇒ no-capacity，续发不会发生）
+		mkdirSync(join(d, "tab-runs"), { recursive: true });
+		writeFileSync(join(d, "tab-runs", "tab_a.result.json"), JSON.stringify({ status: "completed" }));
+		const linksPath = join(d, "links.jsonl");
+		const { spawner } = makeFakeSpawner();
+		const r = resumeQueuedLane(base(d, meta, { spawnTab: spawner, linksPath }));
+		assert.equal(r.resumed, true, "应成功续发 B");
+		const lines = readFileSync(linksPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+		const mine = lines.filter((l) => l.kind === "tab");
+		assert.equal(mine.length, 1, "续发只写一条链接");
+		assert.equal(mine[0].targetId, (r as { tabRunId: string }).tabRunId, "targetId 必须是真实 tabRunId");
+		assert.ok(String(mine[0].targetId).startsWith("tab_"), "targetId 不得为空（空 targetId = 死账）");
+		assert.equal(mine[0].sessionId, "sess-dispatcher-0001", "归属必须是派发者会话");
+		assert.ok(String(mine[0].detail).includes("lane=B"), "detail 要带 lane");
+		void meta;
 	}
 
 	console.log("trace-fusion lane-queue tests passed");

@@ -42,7 +42,15 @@ export type AutoCollectOutcome =
 	 */
 	| { isTrace: true; phase: "resumed"; runId: string; lane: LaneId; tabRunId: string; remaining: LaneId[] }
 	/** 三路已全部终态且 cross-test 真的已 spawn（唯一可声称「三路终态」的相位）。 */
-	| { isTrace: true; phase: "started"; runId: string; runDir: string };
+	| { isTrace: true; phase: "started"; runId: string; runDir: string }
+	/**
+	 * 该 tab 属于 trace run，但**本会话不是派发者**。
+	 *
+	 * 必须报为「已消费」而不是 `{isTrace:false}`：后者会让调用方落回默认流程
+	 * （toast + reclaim 注入），完成消息就会投递给 global master。
+	 * 2026-11-02 实测：无 links 归属的 lane tab 就是靠这条路乱投的（a726 单会话内重复 3 次）。
+	 */
+	| { isTrace: true; phase: "foreign"; runId: string };
 
 export interface SupervisorOptions {
 	runsDir?: string;
@@ -54,6 +62,8 @@ export interface SupervisorOptions {
 	piCli?: string;
 	/** tab spawn seam（续发用；测试注入 fake）。 */
 	spawnTab?: (opts: Parameters<typeof spawnPiTab>[0]) => ReturnType<typeof spawnPiTab>;
+	/** 会话身份 seam（测试注入）：不传则用真实的 sessionScopeKey()。 */
+	sessionScopeKey?: () => string | undefined;
 }
 
 /** claim 新鲜阈值：超过视为陈进程遗留，可重新认领（覆盖 lane 墙钟上限 45min + cross-test 余量）。 */
@@ -189,12 +199,12 @@ function tryClaimCollect(runDir: string): boolean {
  *   - 有字段但本进程无指纹（异常环境） → 放行（不因拿不到身份而静默丢掉编排）
  *   - 有字段且指纹不匹配 → **拒绝**（这条 run 不归本会话）
  */
-export function isDispatcherSession(meta: TraceRunMeta): boolean {
+export function isDispatcherSession(meta: TraceRunMeta, opts?: { sessionScopeKey?: () => string | undefined }): boolean {
 	const owner = meta.dispatcherSessionId;
 	if (!owner) return true; // 存量 run：无归属信息，保持 legacy
 	let me: string | undefined;
 	try {
-		me = sessionScopeKey();
+		me = (opts?.sessionScopeKey ?? sessionScopeKey)();
 	} catch {
 		return true;
 	}
@@ -257,7 +267,11 @@ export function maybeAutoCollectTraceRun(finishedTabRunId: string, opts: Supervi
 			if (!meta || meta.status !== "running") continue;
 			if (TRACE_LANES.some((lane) => meta.lanes[lane]?.tabRunId === finishedTabRunId)) {
 				// 归属过滤（2026-11-02）：非派发者会话不得续发/collect/通知。
-				if (!isDispatcherSession(meta)) continue;
+				// 但**不得**返回 {isTrace:false}——那等于让调用方把 lane tab 当普通 tab
+				// 走默认注入，完成消息会落到 global master（实测乱回）。
+				if (!isDispatcherSession(meta, opts.sessionScopeKey ? { sessionScopeKey: opts.sessionScopeKey } : undefined)) {
+					return { isTrace: true, phase: "foreign", runId: meta.runId };
+				}
 				hit = meta;
 				break;
 			}
@@ -273,9 +287,11 @@ export function maybeAutoCollectTraceRun(finishedTabRunId: string, opts: Supervi
  * session_start 追赶：扫描全部 running run，凡三路已终态且未出报告的 → 后台补收集。
  * 返回所有 started 的 outcome（供调用方通知用户）；其 余 phase 不上报。
  */
-export function catchUpAutoCollect(opts: SupervisorOptions = {}): Extract<AutoCollectOutcome, { phase: "started" }>[] {
+export function catchUpAutoCollect(
+	opts: SupervisorOptions = {},
+): Extract<AutoCollectOutcome, { phase: "started" | "resumed" }>[] {
 	const runsDir = opts.runsDir ?? defaultRunsDir();
-	const started: Extract<AutoCollectOutcome, { phase: "started" }>[] = [];
+	const started: Extract<AutoCollectOutcome, { phase: "started" | "resumed" }>[] = [];
 	if (!existsSync(runsDir)) return started;
 	try {
 		for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
@@ -283,9 +299,11 @@ export function catchUpAutoCollect(opts: SupervisorOptions = {}): Extract<AutoCo
 			const meta = readTraceRunMeta(join(runsDir, entry.name));
 			if (!meta || meta.status !== "running") continue;
 			// 归属过滤：追赶只能由派发者会话做（否则任一新开的主会话都去扫全局 run）
-			if (!isDispatcherSession(meta)) continue;
+			if (!isDispatcherSession(meta, opts.sessionScopeKey ? { sessionScopeKey: opts.sessionScopeKey } : undefined)) continue;
 			const outcome = outcomeForMeta(meta, opts, runsDir);
-			if (outcome.phase === "started") started.push(outcome);
+			// 续发也要上报（2026-11-02）：旧版只返回 "started"，续发作为副作用发生但调用方看不见
+			// ⇒ 追赶时派了一条 lane 不会告知任何人，而文案只会说「三路已终态」。
+			if (outcome.phase === "started" || outcome.phase === "resumed") started.push(outcome);
 		}
 	} catch { /* runsDir 异常 → 视为无可追赶 */ }
 	return started;

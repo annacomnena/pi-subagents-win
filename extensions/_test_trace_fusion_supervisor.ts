@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,7 +24,7 @@ const tabRunsDir = join(root, "tab-runs");
 mkdirSync(tabRunsDir, { recursive: true });
 
 /** 手工搭一个 running run（免 git——决策逻辑不碰 git）。 */
-function makeRun(runId: string, tabIds: Record<"A" | "B" | "C", string>, status = "running"): void {
+function makeRun(runId: string, tabIds: Record<"A" | "B" | "C", string>, status = "running", dispatcher?: string): void {
 	const runDir = join(runsDir, runId);
 	mkdirSync(runDir, { recursive: true });
 	writeFileSync(join(runDir, "meta.json"), JSON.stringify({
@@ -40,6 +40,7 @@ function makeRun(runId: string, tabIds: Record<"A" | "B" | "C", string>, status 
 		wtDir: join(root, `wt-${runId}`),
 		laneWallClockMin: 45,
 		laneDeadlineAt: new Date(Date.now() + 3_600_000).toISOString(),
+		...(dispatcher !== undefined ? { dispatcherSessionId: dispatcher } : {}),
 		lanes: {
 			A: { lane: "A", worktree: join(root, "wa"), tabRunId: tabIds.A, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] } },
 			B: { lane: "B", worktree: join(root, "wb"), tabRunId: tabIds.B, provision: { junction: [], copied: [], commandOk: true, degraded: false, issues: [] } },
@@ -202,6 +203,71 @@ try {
 	// runsDir 不存在 → isTrace false（容错）
 	const missing = maybeAutoCollectTraceRun("tabA", { runsDir: join(root, "nope"), tabRunsDir });
 	assert.deepEqual(missing, { isTrace: false });
+
+	// 归属过滤（2026-11-02 乱回事故）：非派发者会话必须报为「已消费的外来 lane」，
+	// 不得返回 {isTrace:false}——那会让调用方把 lane tab 当普通 tab 走默认注入，
+	// 完成消息就会投递给 global master。
+	{
+		makeRun("tfl-owned", { A: "tabOwnA", B: "tabOwnB", C: "tabOwnC" }, "running", "sess-dispatcher-x");
+		const notMine = maybeAutoCollectTraceRun("tabOwnA", {
+			runsDir,
+			tabRunsDir,
+			sessionScopeKey: () => "sess-somebody-else",
+		});
+		assert.equal(notMine.isTrace, true, "trace lane 不得交回默认流程（否则乱投 master）");
+		assert.equal(
+			notMine.isTrace ? notMine.phase : "n/a",
+			"foreign",
+			`非派发者必须得到 foreign，实得 ${notMine.isTrace ? notMine.phase : "isTrace:false"}`,
+		);
+
+		// 派发者本人：照旧进入正常决策（不得被 foreign 拦掉）
+		const mine = maybeAutoCollectTraceRun("tabOwnA", { runsDir, tabRunsDir, sessionScopeKey: () => "sess-dispatcher-x" });
+		assert.equal(mine.isTrace, true, "派发者仍须处理自己的 lane");
+		assert.notEqual(
+			mine.isTrace ? mine.phase : "n/a",
+			"foreign",
+			"派发者本人不得被判 foreign",
+		);
+
+		// 存量 run（无 dispatcherSessionId）：保持 legacy 放行，零回归
+		const legacy = maybeAutoCollectTraceRun("tabA", { runsDir, tabRunsDir, sessionScopeKey: () => "sess-anyone" });
+		assert.equal(legacy.isTrace, true, "存量 run 仍由会话处理");
+		assert.notEqual(legacy.isTrace ? legacy.phase : "n/a", "foreign", "无归属信息的存量 run 不得被 foreign 拦掉");
+
+		// seam 不传时走真实 sessionScopeKey()：不得抛（生产路径零注入）
+		const noSeam = maybeAutoCollectTraceRun("tabOwnA", { runsDir, tabRunsDir });
+		assert.equal(noSeam.isTrace, true, "无 seam 时必须仍给出确定结论");
+	}
+
+	// ---- 2026-11-02 追赶路径必须能续发：实测 `catchUpAutoCollect()` 无参调用
+	// ⇒ opts.wtExe/piCli 均 undefined ⇒ tryResumeQueuedLane 直接 return null
+	// ⇒ 待发 lane 永远饿死（c2f5 的 lane C：A/B 已终态、队列里挂着 C，就是在这饿死的）
+	{
+		makeRun("tfl-catch-resume", { A: "tabCR", B: "", C: "" });
+		writeFileSync(join(runsDir, "tfl-catch-resume", "lane-queue.json"),
+			JSON.stringify({ lanes: ["B", "C"], concurrency: 1 }));
+		laneResult("tabCR"); // A 完成 → 追赶应续发 B
+		let catchSpawned = 0;
+		const c = catchUpAutoCollect({
+			runsDir, tabRunsDir,
+			wtExe: "wt.exe",
+			piCli: "pi.js",
+			spawnTab: () => { catchSpawned++; return { ok: true, pid: 1 } as never; },
+			spawnWorker: () => { throw new Error("未全终态不得启 collect"); },
+		});
+		assert.equal(catchSpawned, 1, "追赶必须真的派一条 lane（无 wt/pi 注入的旧版这里是 0）");
+		const r = c.find((x) => x.phase === "resumed");
+		assert.ok(r, "追赶必须把续发上报（旧版只上报 started，续发对调用方不可见）");
+		if (r && r.phase === "resumed") {
+			assert.equal(r.lane, "B", "应续发 B");
+			assert.equal(r.runId, "tfl-catch-resume", "上报必须带 runId");
+		}
+		// 续发的 tabRunId 必须回写 meta：否则 supervisor 认不出这条 lane，完成时也不会触发收集
+		const meta2 = JSON.parse(readFileSync(join(runsDir, "tfl-catch-resume", "meta.json"), "utf8")) as
+			{ lanes: Record<"A" | "B" | "C", { tabRunId: string }> };
+		assert.ok(meta2.lanes.B.tabRunId.length > 0, "续发的 tabRunId 必须回写 meta.json");
+	}
 
 	console.log("trace-fusion supervisor tests passed");
 } finally {

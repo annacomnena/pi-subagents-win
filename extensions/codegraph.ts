@@ -289,6 +289,120 @@ const DEFAULT_TIMEOUT: Record<CodegraphAction, number> = {
 	sync: 180_000, // 全量 sync 可能很慢
 };
 
+// ── 小模型参数容错（2026-11-02 实测驱动）───────────────────────────────
+//
+// 实测（6 个 lane 会话 / 8 次 codegraph 调用，bonsai-9b）：
+//   · 1/8 传了空参数 {} ⇒ zod 回「参数无效： action: Required」——小模型看不出该怎么做
+//   · 3/8 把整句中文任务当 action:"query" 的 query ⇒ 全部 0 命中（符号名索引搜不了句子）
+//   · explore 实测单次输出 23,185 字节（≈7K token），131K 窗口下三路串行跑很痛
+//
+// 原则：**确定性归一 + 把下一步写进返回文本**，不指望描述文字能被小模型执行。
+
+const ACTION_ALIASES: Record<string, CodegraphAction> = {
+	search: "query",
+	find: "query",
+	lookup: "query",
+	symbol: "query",
+	name: "query",
+	symbols: "query",
+	overview: "explore",
+	topic: "explore",
+	theme: "explore",
+	investigate: "explore",
+	understand: "context",
+	task: "context",
+	background: "context",
+	callers: "impact",
+	dependents: "impact",
+	deps: "impact",
+	dependencies: "impact",
+	"who-calls": "impact",
+	list: "files",
+	tree: "files",
+	reindex: "sync",
+	refresh: "sync",
+};
+
+/** 需要 query 参数的动作（status/sync 不需要）。 */
+const NEEDS_QUERY: ReadonlySet<CodegraphAction> = new Set(["query", "explore", "context", "impact"]);
+
+/** 本工具接受的精确动作名（列出来给模型拄）。 */
+const ACTION_NAMES: readonly CodegraphAction[] = ["query", "explore", "context", "impact", "status", "files", "sync"];
+
+export type NormalizedCall =
+	| { ok: true; action: CodegraphAction; aliasUsed?: string }
+	| { ok: false; text: string };
+
+/**
+ * 把模型写的 action 归一到合法动作名。
+ * 别名命中→直接用；非法/缺失→给出**可拄的示例**（不是 zod 原文）。
+ */
+export function normalizeCodegraphAction(raw: unknown): NormalizedCall {
+	const s = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+	if ((ACTION_NAMES as readonly string[]).includes(s)) return { ok: true, action: s as CodegraphAction };
+	const viaAlias = ACTION_ALIASES[s];
+	if (viaAlias) return { ok: true, action: viaAlias, aliasUsed: s };
+	const examples = [
+		'{ "action": "query", "query": "laneDir" }              // 按符号名定位',
+		'{ "action": "explore", "query": "artifact 产出链路" }     // 一个主题的源码+调用链',
+		'{ "action": "status" }                                  // 看索引新鲜度',
+	].join("\n  ");
+	return {
+		ok: false,
+		text:
+			`codegraph: action 无效${s ? `（收到 "${s}"）` : "（没传 action）"}。\n` +
+			`合法 action 只有这 7 个：${ACTION_NAMES.join(" | ")}\n` +
+			`直接拄其中一个例子：\n  ${examples}\n` +
+			`（若你写的是 search/find/callers 这类常见叫法，本工具会自动归一，用精确名最稳。）`,
+	};
+}
+
+/**
+ * `action:"query"` 收到整句（中文句子 / 多个词 / 超长）时的形状守卫。
+ * 符号索引搜不了句子，实测全部 0 命中。返回提示（不执行），并给出从该句中抽到的标识符候选。
+ */
+export function queryShapeHint(action: CodegraphAction, query: string): string | null {
+	if (action !== "query") return null;
+	const q = query.trim();
+	const hasCJK = /[\u3400-\u9fff]/.test(q);
+	const words = q.split(/\s+/).filter(Boolean);
+	if (!hasCJK && words.length <= 3 && q.length <= 40) return null;
+	const cands = Array.from(
+		new Set(
+			(q.match(/[A-Za-z_$][A-Za-z0-9_$]{3,}/g) ?? [])
+				.filter((w) => /[A-Z_]/.test(w) || w.length >= 6)
+				.slice(0, 6),
+		),
+	);
+	const candLine = cands.length
+		? `从你这句话里抽到的标识符候选（先用这些试 action:"query"）：${cands.map((c) => `"${c}"`).join(", ")}\n`
+		: "你的句子里没有英文标识符，先想清楚要找的**符号名**是什么。\n";
+	return (
+		`codegraph query 要的是**符号名**（如 "laneDir"、"dispatchCodegraph"），不是整句任务。\n` +
+		`你传的是：“${q.slice(0, 90)}${q.length > 90 ? "…" : ""}”——这类输入实测**必定 0 命中**。\n` +
+		candLine +
+		`整句主题请改用：\n  { "action": "context", "query": "<你那句原话>" }   // 按任务构建上下文\n` +
+		`  { "action": "explore", "query": "<短主题词>" }  // 一个主题的源码+调用链\n` +
+		`本次未执行搜索（避开注定空转的一次调用）。`
+	);
+}
+
+/** explore 输出体积上限（实测 23,185 字节/次；131K 窗口下三路串跑很痛）。 */
+const EXPLORE_MAX_CHARS = 12_000;
+
+/** 0 命中时的下一步指引（小模型需要可执行指令，不是“没有结果”）。 */
+function zeroHitGuidance(query: string): string {
+	return (
+		`0 命中。下一步（拄一个用）：\n` +
+		`  1) 换写法：驼峰 laneDir / 下划线 lane_dir / 去掉前缀，符号名区分大小写\n` +
+		`  2) { "action": "files", "query": "**/*.ts" } —— 先看索引里到底有哪些文件\n` +
+		`  3) { "action": "status" } —— 索引陈旧时新代码查不到，先 sync\n` +
+		`  4) 主题词请用 action:"context"；字面串搜索请用 bash 的 grep -rn "${query.slice(0, 30)}" .\n` +
+		`（本仓未支持 GDScript：*.gd 文件用 grep / read，codegraph 查不到。）`
+	);
+}
+
+
 export async function dispatchCodegraph(params: DispatchParams, deps: DispatchDeps): Promise<{ text: string; isError?: boolean }> {
 	const root = deps.findRoot(params.path ?? params.cwd);
 	if (root === null) {
@@ -340,8 +454,12 @@ export async function dispatchCodegraph(params: DispatchParams, deps: DispatchDe
 	}
 
 	if (!params.query || !params.query.trim()) {
-		return { text: `codegraph ${act}: 需要 query 参数（要查找的符号名/任务描述）`, isError: true };
+		return { text: `codegraph ${act}: 需要 query 参数。例子：{ "action": "query", "query": "laneDir" } / { "action": "context", "query": "lane 产物链路" }`, isError: true };
 	}
+
+	// 小模型实测会把整句中文任务当 query 的符号名（3/8）⇒ 直接拦住，不白跑一次注定空的调用
+	const shapeHint = queryShapeHint(act, params.query);
+	if (shapeHint !== null) return { text: shapeHint };
 
 	if (act === "query") {
 		const args = ["query", params.query, "--json", "--limit", String(params.limit ?? 10)];
@@ -353,7 +471,7 @@ export async function dispatchCodegraph(params: DispatchParams, deps: DispatchDe
 		}
 		const hits = projectSymbolHits(payload);
 		const header = `codegraph query "${params.query}" @ ${root} — ${hits.length} 命中`;
-		const body = formatSymbolHits(hits);
+		const body = hits.length ? formatSymbolHits(hits) : zeroHitGuidance(params.query);
 		// 顺手带一条新鲜度提示：query 不带 status 信息，但陈旧索引会给出错误的行号
 		const st = await deps.run(["status", "--json"], root, Math.min(timeout, 20_000));
 		const fresh = judgeIndexFreshness(parseJsonOutput(st.stdout), (deps.now ?? Date.now)());
@@ -364,7 +482,18 @@ export async function dispatchCodegraph(params: DispatchParams, deps: DispatchDe
 		// explore 返回「相关符号源码 + 调用路径」的整块文本，本身已是给模型读的形态
 		const r = await deps.run(["explore", params.query], root, timeout);
 		if (r.code !== 0) return { text: `codegraph explore 失败（exit=${r.code}）：\n${(r.stderr || r.stdout).slice(0, 800)}`, isError: true };
-		return { text: `codegraph explore "${params.query}" @ ${root}\n\n${r.stdout.trim().slice(0, 60_000)}` };
+		const full = r.stdout.trim();
+		// 实测 23,185 字节/次：不截就会一次掉 7K token 进 131K 窗口，且必须告知为何截（R-2）
+		if (full.length > EXPLORE_MAX_CHARS) {
+			return {
+				text:
+					`codegraph explore "${params.query}" @ ${root}\n\n${full.slice(0, EXPLORE_MAX_CHARS)}\n\n` +
+					`…（输出截断：共 ${full.length} 字，只给了前 ${EXPLORE_MAX_CHARS} 字。\n` +
+					`  要看完整内容不要重跑 explore：从上文挑出 file:line 用 read 精读那几行，` +
+					`  或用 action:"query" 按符号名精确定位。）`,
+			};
+		}
+		return { text: `codegraph explore "${params.query}" @ ${root}\n\n${full}` };
 	}
 
 	if (act === "context") {
@@ -409,18 +538,9 @@ export function registerCodegraph(pi: ExtensionAPI): void {
 			"未初始化（无 .codegraph/）时本工具会明确报错并给初始化命令 —— 此时请回退 read/grep/wiki-nav，不要假设它能用。",
 		].join(" "),
 		parameters: Type.Object({
-			action: Type.Union(
-				[
-					Type.Literal("query"),
-					Type.Literal("explore"),
-					Type.Literal("context"),
-					Type.Literal("impact"),
-					Type.Literal("status"),
-					Type.Literal("files"),
-					Type.Literal("sync"),
-				],
-				{ description: "检索动作" },
-			),
+			// 2026-11-02：实测 1/8 调用传了空参数，zod 只回「action: Required」，小模型无法自救。
+			// 改宽 schema 收下字符串，由 normalizeCodegraphAction 做别名归一并给出可拄示例。
+			action: Type.Optional(Type.String({ description: "检索动作" })),
 			query: Type.Optional(Type.String({ description: "query=符号名；explore/context=任务描述；files=glob。必填（除 status/sync）" })),
 			path: Type.Optional(Type.String({ description: "项目路径（缺省用当前 cwd，会自动向上找 .codegraph/）" })),
 			limit: Type.Optional(Type.Number({ description: "最多返回条数（query 默认 10；context 默认 30）" })),
@@ -430,9 +550,12 @@ export function registerCodegraph(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = (ctx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+			// 参数归一（实测小模型会写空参数/别名/句子）：不合法就把下一步写进返回文本
+			const norm = normalizeCodegraphAction(params.action);
+			if (!norm.ok) return { content: [{ type: "text", text: norm.text }], isError: true };
 			const r = await dispatchCodegraph(
 				{
-					action: params.action as CodegraphAction,
+					action: norm.action,
 					...(params.query !== undefined ? { query: params.query } : {}),
 					...(params.path !== undefined ? { path: params.path } : {}),
 					...(params.limit !== undefined ? { limit: params.limit } : {}),

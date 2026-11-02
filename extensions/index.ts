@@ -3453,7 +3453,7 @@ export default function (pi: ExtensionAPI) {
 
 	// 会话生命周期小 hook（session-hooks.ts，R1 抽取；before_agent_start 留在此文件）；
 	// S3：spawn 通道 + 配置读取闭包一并传入（不传 = 不启用自动交接块）
-	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR, spawnSuccessor, masterSuccession: () => readConfig().masterSuccession });
+	registerSessionHooks(pi, { cleanups, isNotifyEnabled: notifyEnabled, pkgDir: PKG_DIR, spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, traceResumePaths: () => ({ wtExe: findWindowsTerminal() ?? undefined, piCli: findPiCli() }) });
 
 	// 标签页回收：生命周期遥测（PI_TAB_RUN_ID 时生效）+ tab-status/reclaim-tabs//tabs
 	registerTabTelemetry(pi);
@@ -5367,8 +5367,14 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: ["trace-fusion 启动失败：", result.error, ...lines].join("\n") }], isError: true };
 			}
 			try {
+				// 2026-11-02 修正：只为**已实际派发**的 lane 写溯源链接。串行模式下 B/C 此时还在队列里
+				// 没有 tabRunId，写出去就是一行空 targetId 的死账（实测）——lane 完成时
+				// recipientSessionIdFor 查不到归属 ⇒ 落回「先到先得」+ master 影子信件 ⇒ 乱回。
+				// 续发时的真链接由 lane-queue 在拿到 tabRunId 后负全责写。
 				for (const lane of TRACE_LANES) {
-					recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: result.meta.lanes[lane].tabRunId, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
+					const tid = result.meta.lanes[lane].tabRunId;
+					if (!tid) continue;
+					recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: tid, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
 				}
 			} catch { /* 溯源尽力而为 */ }
 			const laneIds = TRACE_LANES.map((l) => `${l}=${result.meta.lanes[l].tabRunId}`).join(", ");

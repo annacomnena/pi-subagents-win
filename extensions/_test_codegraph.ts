@@ -23,8 +23,10 @@ import {
 	formatSymbolHits,
 	findCodegraphRoot,
 	judgeIndexFreshness,
+	normalizeCodegraphAction,
 	parseJsonOutput,
 	projectSymbolHits,
+	queryShapeHint,
 	type DispatchDeps,
 } from "./codegraph.ts";
 
@@ -249,6 +251,92 @@ const ok = (msg: string): void => {
 	assert.ok(r.text.includes("解析失败"), "说明是解析失败");
 	assert.ok(r.text.length < 2000, "错误信息不得倾倒海量原始输出");
 	ok("⑦ CLI 失败/坏 JSON：返回 isError + 简洁原因，绝不抛");
+}
+
+// ── ⑨ 小模型参数容错（2026-11-02 实测驱动：6 个 lane 会话 / 8 次调用）──
+// 实测：1/8 传空参数 {} ⇒ zod 只回「action: Required」；3/8 把整句中文当 query 的符号名 ⇒ 全 0 命中。
+{
+	const act = (v: unknown): string => {
+		const r = normalizeCodegraphAction(v);
+		return r.ok ? r.action : "!";
+	};
+	assert.equal(act("search"), "query", "search→query");
+	assert.equal(act("callers"), "impact", "callers→impact");
+	assert.equal(act("overview"), "explore", "overview→explore");
+	assert.equal(act("list"), "files", "list→files");
+	assert.equal(act("CONTEXT"), "context", "大小写不敏感");
+	ok("⑨a action 别名/大小写归一");
+
+	const noAct = normalizeCodegraphAction(undefined);
+	assert.equal(noAct.ok, false, "没传 action 必拒");
+	const t1 = noAct.ok ? "" : noAct.text;
+	assert.ok(t1.includes("没传 action"), "说明是没传 action");
+	assert.ok(t1.includes('"action": "query"'), "给出可拄的完整例子");
+	assert.ok(t1.includes("query | explore | context | impact | status | files | sync"), "列出全部合法动作");
+	assert.ok(!t1.includes("Required"), "不得把 zod 原文丢给模型");
+	assert.equal(normalizeCodegraphAction("seach").ok, false, "拼错的 action 必拒（不静默猜测）");
+	ok("⑨b 空/非法 action 返回带示例的指引，不丢 zod 原文");
+
+	const hint = queryShapeHint("query", "trace-fusion diagnose 模式三路 lane 各自必须产出哪些 artifact 文件");
+	assert.ok(hint !== null, "整句中文当符号名必须被拦住");
+	assert.ok(hint!.includes("必定 0 命中"), "直说这类输入注定空转");
+	assert.ok(hint!.includes("trace-fusion"), "给出从该句抽到的标识符候选");
+	assert.ok(hint!.includes('"action": "context"'), "把整句引到 context");
+	assert.equal(queryShapeHint("query", "laneDir"), null, "短符号名放行");
+	assert.equal(queryShapeHint("context", "trace-fusion 三路 lane 必须产出哪些 artifact 文件"), null, "整句在 context 下放行");
+
+	// 【接线断言，不是函数本体】必须证明守卫真的接在 dispatchCodegraph 里，
+	// 并且拦住时**一次 CLI 都不调用**（避开注定空转的那一次）。
+	let cliCalls = 0;
+	const guardDeps: DispatchDeps = {
+		run: async (a) => {
+			cliCalls += 1;
+			return { stdout: JSON.stringify({ results: [] }), stderr: "", code: 0, timedOut: false };
+		},
+		findRoot: () => "X:/repo",
+		now: () => Date.now(),
+	};
+	const guarded = await dispatchCodegraph(
+		{ action: "query", query: "trace-fusion diagnose 模式三路 lane 各自必须产出哪些 artifact 文件", cwd: "X:/repo" },
+		guardDeps,
+	);
+	assert.ok(guarded.text.includes("必定 0 命中"), "dispatchCodegraph 必须真的走句子守卫");
+	assert.equal(cliCalls, 0, "拦住时不得调用 CLI（不白跑一次注定空的搜索）");
+	ok("⑨c 整句当符号名被拦住并给候选；符号名与 context 整句放行；守卫已接在 dispatch 上且零 CLI 调用");
+
+	const emptyDeps: DispatchDeps = {
+		run: async (a) => ({
+			stdout: a[0] === "status" ? JSON.stringify({ upToDate: true, files: 10 }) : JSON.stringify({ results: [] }),
+			stderr: "",
+			code: 0,
+			timedOut: false,
+		}),
+		findRoot: () => "X:/repo",
+		now: () => Date.now(),
+	};
+	const zero = await dispatchCodegraph({ action: "query", query: "lane_dir", cwd: "X:/repo" }, emptyDeps);
+	assert.ok(zero.text.includes("0 命中"), "报 0 命中");
+	assert.ok(zero.text.includes("换写法"), "给换写法建议");
+	assert.ok(zero.text.includes('"action": "files"'), "给查文件列表的下一步");
+	assert.ok(zero.text.includes("grep -rn"), "字面串引到 grep");
+	assert.ok(zero.text.includes("GDScript"), "提醒 *.gd 本工具查不到");
+	ok("⑨d 0 命中返回可执行的下一步，不是只说没结果");
+
+	const bigDeps: DispatchDeps = {
+		run: async () => ({ stdout: "x".repeat(30_000), stderr: "", code: 0, timedOut: false }),
+		findRoot: () => "X:/repo",
+		now: () => Date.now(),
+	};
+	const ex = await dispatchCodegraph({ action: "explore", query: "artifact 链路", cwd: "X:/repo" }, bigDeps);
+	assert.ok(ex.text.length < 20_000, `explore 输出必须被截到上限（实得 ${ex.text.length}）`);
+	assert.ok(ex.text.includes("输出截断"), "必须显式告知截断");
+	assert.ok(ex.text.includes("read"), "告知看完整内容用 read 精读 file:line");
+	const small = await dispatchCodegraph(
+		{ action: "explore", query: "laneDir", cwd: "X:/repo" },
+		{ ...bigDeps, run: async () => ({ stdout: "y".repeat(3_000), stderr: "", code: 0, timedOut: false }) },
+	);
+	assert.ok(!small.text.includes("输出截断"), "未超上限不得假装截断");
+	ok("⑨e explore 超上限截断并显式告知；未超不截");
 }
 
 console.log(`\ncodegraph tests passed (${n} checks)`);

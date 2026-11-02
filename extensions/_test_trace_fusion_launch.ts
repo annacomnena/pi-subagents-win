@@ -317,6 +317,15 @@ try {
 				assert.ok(c.__prompt.includes("结束前自检"), "prompt 结尾必须有自检清单");
 				assert.ok(c.__prompt.includes("直接回答了它"), "自检项必须含「是否直接回答任务」");
 				assert.ok(c.__prompt.includes("合法 JSON"), "自检项必须含 validation.json 合法性（实测 A/B 两条 lane 曾非法）");
+
+				// 2026-11-02 b31e 实测：lane B 跑 18 次调用、答案完整，但全在聊天里、一个文件没写。
+				// 补救：把「写文件」提成自检的第 0 条前置条件，而不是与内容检查并列。
+				assert.ok(c.__prompt.includes("第 0 条"), "自检必须有第 0 条（写文件是前置条件）");
+				assert.ok(c.__prompt.includes("不能只写在聊天回复里"), "必须明确禁止只把答案留在聊天里");
+				assert.ok(c.__prompt.includes("停，先写文件"), "必须给出可执行的拦截动作");
+				assert.ok(c.__prompt.includes("整趟白跑"), "必须说明后果");
+				assert.ok(c.__prompt.includes("完成（三步，顺序不能变）"), "完成节必须给出 write→write→tab-finish 三步顺序");
+				assert.ok(c.__prompt.includes("没写文件就 tab-finish"), "必须警告不写文件就 tab-finish 的后果");
 				assert.ok(c.__prompt.includes("只读纪律"), "diagnose prompt 声明只读纪律");
 				assert.ok(c.__prompt.includes("八节"), "diagnose 契约为八节叙事");
 				// 2026-11-02：检索纪律（codegraph 优先）——lane 有 codegraph 却零提示时

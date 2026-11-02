@@ -13,6 +13,7 @@ import { durableSessionIdentity, isMainSession, isSubagent } from "./identity.ts
 import { isTraceWorker } from "./capabilities.ts";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
+import type { SupervisorOptions } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { clearSessionStartCwd, recordSessionStartCwd } from "./runtime/master-session-cwd.ts";
 import { writeLiveness, writeScopeLiveness } from "./runtime/liveness.ts";
@@ -34,6 +35,18 @@ export interface SessionHooksDeps {
 	/** S3 自动交接：spawn 通道 + 配置读取闭包（缺省 = 不启用 S3 块） */
 	spawnSuccessor?: SpawnSuccessor;
 	masterSuccession?: () => MasterSuccessionConfig;
+	/**
+	 * trace-fusion 追赶续发所需的真实派发路径（wt / pi CLI）。
+	 *
+	 * 为什么是注入而不是内部解析：lane 续发用 `spawnPiTab` 真实开标签页，必须有 wt 路径；
+	 * 而解析函数只存在于 index.ts（不反向引用，避免循环依赖）。
+	 * 2026-11-02 实测：`catchUpAutoCollect()` 无参调用 ⇒ wtExe/piCli 均为 undefined
+	 * ⇒ `tryResumeQueuedLane` 直接 return null ⇒ **追赶路径永远不会续发**
+	 * ⇒ run 卡在 running、待发 lane 永不派发（c2f5 的 lane C 就是这么饿死的）。
+	 */
+	traceResumePaths?: () => { wtExe?: string; piCli: string; runsDir?: string; tabRunsDir?: string };
+	/** 续发开标签页的 seam（测试注入 fake；缺省 = supervisor 内部的真实 spawnPiTab）。 */
+	traceSpawnTab?: SupervisorOptions["spawnTab"];
 }
 
 /**
@@ -72,13 +85,40 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!isMainSession()) return;
-		const catches = catchUpAutoCollect();
+		// 续发要有真实 wt/pi 路径；无注入时 catchUpAutoCollect 只能补跑已完成 run 的收集（零续发）。
+		const paths = (() => {
+			try {
+				return deps.traceResumePaths?.() ?? {};
+			} catch {
+				return {};
+			}
+		})();
+		const catches = catchUpAutoCollect({
+			wtExe: paths.wtExe,
+			piCli: paths.piCli,
+			runsDir: paths.runsDir,
+			tabRunsDir: paths.tabRunsDir,
+			spawnTab: deps.traceSpawnTab,
+		});
 		if (!catches.length) return;
-		try {
-			pi.sendUserMessage?.(
-				`🧬 trace-fusion 追赶：${catches.map((c) => c.runId).join(", ")} 三路已终态但报告缺失，已后台补跑 cross-test。进度：/trace-fusion-status`,
-				{ deliverAs: "followUp" },
+		const started = catches.filter((c) => c.phase === "started");
+		const resumed = catches.filter((c) => c.phase === "resumed");
+		const parts: string[] = [];
+		if (started.length) {
+			parts.push(`追赶：${started.map((c) => c.runId).join(", ")} 三路已终态但报告缺失，已后台补跑 cross-test`);
+		}
+		// 续发的文案必须与「三路已终态」分开：旧版只会说后者，而续发时还剩 lane 在跑/在排队。
+		if (resumed.length) {
+			parts.push(
+				`追赶续发：${resumed
+					.map((c) => (c.phase === "resumed" ? `lane ${c.lane} [${c.tabRunId}]（待发 ${c.remaining.join(",") || "无"}）@${c.runId}` : ""))
+					.join("; ")}`,
 			);
+		}
+		try {
+			pi.sendUserMessage?.(`🧬 trace-fusion ${parts.join("；")}。进度：/trace-fusion-status`, {
+				deliverAs: "followUp",
+			});
 		} catch { /* 通知尽力而为，收集已在后台 */ }
 		void ctx;
 	});

@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { readTabResultFile } from "../tab-runs.ts";
+import { recordLink } from "../links.ts";
 import type { LaneId, TraceRunMeta } from "./types.ts";
 import { dispatchDiagnoseLane, readTraceRunMeta, writeLaneTimers, type TabSpawner } from "./launch-workers.ts";
 
@@ -80,6 +81,8 @@ export interface ResumeQueuedLaneInput {
 	spawnTab: TabSpawner;
 	/** 重读 meta 的 seam（测试注入）。默认重新 readTraceRunMeta。 */
 	rereadMeta?: (runDir: string) => TraceRunMeta | null;
+	/** 溯源链接落盘路径（测试注入；缺省走 links.ts 默认）。 */
+	linksPath?: string;
 }
 
 export type ResumeQueuedLaneOutcome =
@@ -128,6 +131,22 @@ export function resumeQueuedLane(input: ResumeQueuedLaneInput): ResumeQueuedLane
 	const remaining = q.lanes.slice(1);
 	writeLaneQueue(input.meta.runDir, { lanes: remaining, concurrency: input.concurrency });
 	writeLaneTimers(r.tabRunId, lane, deadline, now);
+
+	// 溯源必须写在**拿到真实 tabRunId 的这一刻**。2026-11-02 实测：旧做法在派发时给三路
+	// 一次性写链接，而串行模式下 B/C 当时还没 tabRunId ⇒ 落盘的是空 targetId 的死账
+	// （links.jsonl 里 targetId 为空），lane 完成时 recipientSessionIdFor 查不到归属
+	// ⇒ 落回「先到先得」+ master 影子信件 ⇒ 完成消息乱投递给 global master。
+	if (input.meta.dispatcherSessionId) {
+		recordLink(
+			{
+				sessionId: input.meta.dispatcherSessionId,
+				kind: "tab",
+				targetId: r.tabRunId,
+				detail: `trace-fusion ${input.meta.runId} lane=${lane} resumed`,
+			},
+			input.linksPath ? { linksPath: input.linksPath } : undefined,
+		);
+	}
 
 	const reread = input.rereadMeta ?? readTraceRunMeta;
 	const fresh = reread(input.meta.runDir);
