@@ -109,8 +109,21 @@ try {
 	{
 		assert.deepEqual(
 			[...COMMAND_TYPES],
-			["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare", "session.message"],
-			"词表 additive（G4 +3 / G5.2 +prepare / G6-P2 +session.message，只加不改）",
+			[
+				"agent.wake",
+				"task.cancel",
+				"workstream.pause",
+				"workstream.resume",
+				"master.handoff.accept",
+				"master.auto-handoff.set",
+				"master.handoff.prepare",
+				"session.message",
+				// 2026-11-03 体检登记：会话侧两个命令已上线，守卫期望清单未同步⇒ 测试长期红。
+				// 本行是追平事实，不是放权：注册表新增了 session.abort / session.slash。
+				"session.abort",
+				"session.slash",
+			],
+			"词表 additive（G4 +3 / G5.2 +prepare / G6-P2 +session.message / 11-03 +session.abort,session.slash，只加不改）",
 		);
 		for (const type of ["workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare"] as const) {
 			const f = newCommandFrame({ type, to: master, issuedBy: "agent://x", commandKey: `k-${type}`, issuedAt: iso() });

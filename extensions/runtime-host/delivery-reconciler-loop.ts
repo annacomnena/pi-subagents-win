@@ -56,6 +56,7 @@ import { defaultRuntimeDir } from "../runtime/journal.ts";
 import { newOutboxItem, outboxDir, outboxItemId, readOutboxItem, writeOutboxItem } from "../runtime/message-outbox.ts";
 import { piSessionAddress } from "../runtime/address.ts";
 import { eventMarker } from "../delivery-ack.ts";
+import { appendAuditLine } from "../runtime/autonomy/collect.ts";
 
 /** 缺省对账节拍（咨询 §6.2：10s 周期对账；与 A 的 10s tick 同频但**不同进程**）。 */
 export const RECONCILE_INTERVAL_MS = 10_000;
@@ -212,10 +213,23 @@ export function resolveDispatcherFromLinks(runId: string, linksPath?: string): s
 	}
 }
 
-/** 定向持久唤醒正文（**必带 eventId 标记** ⇒ 接收端 context 钩子才能写 `consumed`）。 */
-export function buildReconcileWakeBody(event: { eventId: string; runId: string; terminalAt: string }): string {
+/** 定向持久唤醒正文（**必带 eventId 标记** ⇒ 接收端 context 钩子才能写 `consumed`）。
+ *
+ * ## P-3（2026-11-03）：补投次数必须可见
+ * 原先正文恒定 ⇒ 会话侧看到 3 条「对账补投」无法分辨「哪次是第几次」。现在：
+ *   - 第 1 次补投保留原「终态交付未确认」措辞（兼容既有识别/测试）；
+ *   - **第 2 次（即最后一次）必须带“第 2 次补投（第 1 次未确认）”** 字样——会话侧一眼区分；
+ *   - 超过上限（`MAX_B_RETRIES_PER_EVENT=2`）不再产生第 3 次，所以不需要第 3 种措辞。
+ */
+export function buildReconcileWakeBody(
+	event: { eventId: string; runId: string; terminalAt: string },
+	retryOrdinal?: number,
+): string {
+	const head = retryOrdinal !== undefined && retryOrdinal >= 2
+		? `⏱ [B 对账补投] async run ${event.runId} 终态交付**仍未确认**（第 ${retryOrdinal} 次补投（第 ${retryOrdinal - 1} 次未确认）；terminalAt=${event.terminalAt}）。`
+		: `⏱ [B 对账补投] async run ${event.runId} 终态交付未确认（terminalAt=${event.terminalAt}）。`;
 	return [
-		`⏱ [B 对账补投] async run ${event.runId} 终态交付未确认（terminalAt=${event.terminalAt}）。`,
+		head,
 		`下一步: 用 subagent-win({ action: "status", runId: "${event.runId}" }) 取全文。`,
 		eventMarker(event.eventId),
 	].join("\n");
@@ -230,18 +244,38 @@ export function buildReconcileWakeBody(event: { eventId: string; runId: string; 
  * 接收端 `consumed` ACK 决定）。
  */
 export function makeOutboxDeliver(opts: { stateDir: string }): NonNullable<ReconcileOnceOptions["deliver"]> {
-	return (event) => {
+	return (event, _attemptId, retryOrdinal) => {
 		const dedupeKey = `delivery-reconciler:${event.eventId}`;
 		const id = outboxItemId(dedupeKey);
 		const dir = outboxDir(opts.stateDir);
-		if (readOutboxItem(dir, id) !== null) return "sent";
+		const existing = readOutboxItem(dir, id);
+		if (existing !== null) {
+			// 已存在 ⇒ 幂等命中：**不重写（不重复注入）**。
+			// P-3 例外：若该项仍 `pending`（小会话侧还没被桥消费）且这是第 ≥2 次补投，
+			// 把正文换成带「第 N 次补投（第 N-1 次未确认）」的版本 —— 不新增 item（项数不变）、
+			// 不会造成第二次注入，但会话侧看到的消息自带次数。已终态（delivered/failed/expired）
+			// 一律不碰（防把终态项回滚成 pending ⇒ 重复注入）。
+			if (existing.status === "pending" && retryOrdinal !== undefined && retryOrdinal >= 2) {
+				const next = { ...existing, text: buildReconcileWakeBody(event, retryOrdinal), updatedAt: new Date().toISOString() };
+				try {
+					// **写前二次确认**（2026-11-03 L4 审查实测驱动）：上面读到的 pending 与本次整项覆盖之间，
+					// 桥可能已把该项写成 delivered/failed ⇒ 直接 writeOutboxItem 会把**终态回滚成 pending**
+					// （后果 = 重复注入）。二次确认把窗口压缩到一次 IO；**不能消除**（无锁文件写）
+					// ⇒ 登记为已知边界，勿声称已解决。
+					const fresh = readOutboxItem(dir, id);
+					if (fresh === null || fresh.status !== "pending") return "sent";
+					writeOutboxItem(dir, next);
+				} catch { /* best-effort：正文升级失败不影响投递 */ }
+			}
+			return "sent";
+		}
 		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		writeOutboxItem(dir, newOutboxItem({
 			dedupeKey,
 			commandKey: id,
 			to: piSessionAddress(event.dispatcherSessionId),
 			sessionId: event.dispatcherSessionId,
-			text: buildReconcileWakeBody(event),
+			text: buildReconcileWakeBody(event, retryOrdinal),
 			now: new Date(),
 		}));
 		return "sent";
@@ -265,6 +299,17 @@ export interface DeliveryReconcilerLoopOptions {
 	limit?: number;
 	/** 显式 kill switch（缺省读 env）：false ⇒ 零动作不启动。 */
 	killSwitch?: boolean;
+	/**
+	 * P-1 租约终态化开关（缺省读 env `PI_DELIVERY_STALE_FINALIZE`；未设 ⇒ **干跑、零写入**）。
+	 * 显式传入优先于 env（测试/运维用）。
+	 */
+	staleFinalize?: boolean;
+	/** P-1 探活探针（缺省 `runtime/liveness.ts::isProcessAlive`；测试注入）。 */
+	isPidAlive?: (pid: number) => boolean;
+	/** P-1 审计行接收器（缺省 `appendAuditLine` → `state/autonomy/audit.jsonl`）。 */
+	onExpiredLease?: (ev: { eventId: string; runId: string; attemptId: string; reason: string; leaseOwner?: string }) => void;
+	/** P-3 补投上限覆盖（缺省 `MAX_B_RETRIES_PER_EVENT`）。 */
+	maxBRetries?: number;
 	/** 注入点（缺省 = 生产实现，见文件头）。 */
 	resolveDispatcher?: (runId: string) => string | undefined;
 	deliver?: NonNullable<ReconcileOnceOptions["deliver"]>;
@@ -292,6 +337,22 @@ export function deliveryReconcilerEnabled(env: NodeJS.ProcessEnv = process.env):
 }
 
 /**
+ * **P-1 租约终态化开关：缺省 OFF（干跑）**。
+ *
+ * 为何缺省关（任务书硬约束 2：「破坏性修改要默认由调用方显式开启（dry-run 默认）」）：
+ * 该能力会向生产账本**追加终态记录** + 写审计行。即使 append-only 不改写既有 attempt，
+ * 也是生产写入。默认干跑保证「升级 host 不自动开始改数据」；运维先跑
+ * `scripts/delivery-stale-dryrun.ts`（只读）看清单，再用 `PI_DELIVERY_STALE_FINALIZE=1` 开启。
+ *
+ * 为什么用 env 而非 config.json：AGENTS.md R-1 —— 改 config.json 必须 read-modify-write 单键
+ * 且不能整文件重写。env 开关零写入、可逆（删 env 即关），与 `PI_DELIVERY_RECONCILER` 同范式。
+ */
+export function staleFinalizeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	const v = env.PI_DELIVERY_STALE_FINALIZE;
+	return typeof v === "string" && v.trim() === "1";
+}
+
+/**
  * 启动 B 对账循环：
  *   1. kill switch 关 ⇒ 返回**零动作** handle（无 interval、不扫、不写状态）；
  *   2. 读持久状态（cursor 跨重启续接）→ 启动即扫一轮；
@@ -309,6 +370,14 @@ export function startDeliveryReconcilerLoop(opts: DeliveryReconcilerLoopOptions 
 	const deliver = opts.deliver ?? makeOutboxDeliver({ stateDir });
 	const onIncident = opts.onIncident ?? ((inc: { incidentId: string; runId: string; reason: string }): void => {
 		try { opts.log?.(`[delivery-reconciler] incident ${inc.incidentId} run=${inc.runId} reason=${inc.reason}`); } catch { /* best-effort */ }
+	});
+	// P-1：缺省干跑（零写入）；运维/测试显式开 staleFinalize 或设 env PI_DELIVERY_STALE_FINALIZE=1
+	const staleFinalize = opts.staleFinalize ?? staleFinalizeEnabled();
+	// P-1 审计缺省写 `state/autonomy/audit.jsonl`（既有入口 `appendAuditLine`，AGENTS.md R-2）。
+	// 必须传 stateDir：审计行要落在**本循环同一个 state 根**里（不传会落到 defaultRuntimeDir() 的
+	// state 根 —— 生产上两者可能不同（host 显式传 stateDir），测试隔离下则写不到注入目录）。
+	const onExpiredLease = opts.onExpiredLease ?? ((ev: { eventId: string; runId: string; attemptId: string; reason: string; leaseOwner?: string }): void => {
+		appendAuditLine(`delivery stale-lease finalized eventId=${ev.eventId} runId=${ev.runId} attemptId=${ev.attemptId} leaseOwner=${ev.leaseOwner ?? "?"} reason=${ev.reason}`, { stateDir });
 	});
 	const statePath = deliveryReconcilerStatePath(stateDir);
 
@@ -350,6 +419,10 @@ export function startDeliveryReconcilerLoop(opts: DeliveryReconcilerLoopOptions 
 				resolveDispatcher,
 				deliver,
 				onIncident,
+				staleLeaseFinalize: staleFinalize,
+				isPidAlive: opts.isPidAlive,
+				onExpiredLease,
+				maxBRetries: opts.maxBRetries,
 			});
 			state = {
 				cursor: r.nextCursor,

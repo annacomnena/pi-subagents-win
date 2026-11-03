@@ -18,7 +18,8 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { defaultRuntimeDir } from "./journal.ts";
+import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
+import { newEventEnvelope } from "./envelope.ts";
 import { isObjectAddress, type ObjectAddress } from "./address.ts";
 import {
 	newEnvelopeId,
@@ -337,7 +338,7 @@ export function expireSweep(recipient?: ObjectAddress, opts: { mailboxDir?: stri
 			const path = join(dir, f);
 			try {
 				const letter = JSON.parse(readFileSync(path, "utf8")) as Letter;
-				if (letter.status === "acked" || letter.status === "expired") continue;
+				if (letter.status === "acked" || letter.status === "expired" || letter.status === "target-gone") continue;
 				if (!letter.expiresAt) continue;
 				const exp = Date.parse(letter.expiresAt);
 				if (Number.isFinite(exp) && exp <= now) {
@@ -539,7 +540,7 @@ export const MAILBOX_ARCHIVE_AFTER_DAYS = 7;
 
 /** 终态判定：只有这两个状态可以归档。 */
 function isArchivableStatus(s: string): boolean {
-	return s === "acked" || s === "expired";
+	return s === "acked" || s === "expired" || s === "target-gone";
 }
 
 /**
@@ -584,7 +585,7 @@ export function archiveTerminalLetters(opts: {
 				// 时间基准：优先 ackedAt（终态发生时刻），否则文件 mtime。
 				// 为什么不用 frame.sentAt：一封很早发的信可能刚被 ack，拿 sentAt 会立即归档，
 				// 把“刚处理完还能回查”的窗口砍成 0。
-				const tsRaw = letter.ackedAt ?? null;
+				const tsRaw = letter.ackedAt ?? letter.terminalAt ?? null;
 				const ts = tsRaw !== null && Number.isFinite(Date.parse(tsRaw)) ? Date.parse(tsRaw) : null;
 				let basis = ts;
 				if (basis === null) {
@@ -615,3 +616,207 @@ export function archiveTerminalLetters(opts: {
 
 /** FabricFrame 类型仅用于文档化导出约束（防止未来误传非协议帧）。 */
 export type { FabricFrame };
+
+// ── P-2：死信终态化（target-gone，2026-11-03）──────────────────────
+//
+// ## 问题（实测读数，见 `plans/20261103_infra_health_delivery_pollution.md` §4）
+//   收件箱里有 `pending` 信永远无人领：最老 **1124h（47 天）**，另有 950h / 765h；
+//   一条 `claimed` 卡 **22h**（claim 后没 ack）。这些信的目标会话早已不存在（世代已换 / tab 关了），
+//   但没有任何入口把它们落终态：`expireSweep` 只看 `expiresAt`，而**这些信根本没有 TTL**
+//   （实测所有 pending 信 `expiresAt` 均为 null）⇒ 永久堆着，每拍都参与扫描。
+//
+// ## 阈值与依据
+//   - `DEAD_LETTER_MIN_AGE_MS` = **72h（3 天）**。依据两个：
+//     ① 实测最老 47 天 / 其余 40 天、32 天 ⇒ 全部远超 72h，阈值不卡在边界上；
+//     ② 正常夜间积压 / 周末无人也不超过 2 天（本仓心跳阈是 90s、outbox TTL 是 24h），
+//        72h 留了 3× 以上余量 ⇒ 不会把「马上要被消费」的信误杀。
+//   - `claimed` 额外要 `claim` 超 `DEAD_CLAIM_AGE_MS` = **1h**（实测卡了 22h 的那条）：
+//     `claimed` 可能是另一个消费者正在处理（`reclaimAfterMs` 缺省 10min 会接管），
+//     所以判定它「死了」需要更长的观察窗口 —— 1h = 6× reclaim 窗口。
+//
+// ## 判据（三态，与 `outbox-target-liveness.ts` 同口径）
+//   目标会话 `probe` 返回 **`dead`**（pid 死，或 pid 活但心跳超龄 ⇒ PID 已复用）才落终态；
+//   `alive` / `unknown` 一律不动（**不冤枉活会话**；`unknown` 绝不等于 `dead`，同
+//   `session-liveness.ts` 硬不变量）。
+//
+// ## 为什么默认不写盘
+//   与 P-1 同理（任务书硬约束 2）：落终态是**改生产数据**。本函数是纯扫 + 干跑能力，
+//   调用方传 `dryRun:false` 才真写。干跑清单见 `plans/20261103_delivery_stale_dryrun.md`。
+
+/** P-2 阈值：非终态信件超此年龄才可能是死信（见上方依据）。 */
+export const DEAD_LETTER_MIN_AGE_MS = 72 * 60 * 60 * 1000;
+/** P-2 阈值：`claimed` 卡住多久才算「claim 后没人 ack」（6× reclaim 窗口）。 */
+export const DEAD_CLAIM_AGE_MS = 60 * 60 * 1000;
+
+/** 目标存活探针抽象（与 `runtime/message-outbox.ts::TargetLivenessProbe` 同形状）。 */
+export interface DeadLetterProbe {
+	state: "alive" | "dead" | "unknown";
+	basis: string;
+}
+
+export interface DeadLetterRow {
+	/** spool 目录名（= recipient 目录）。 */
+	recipient: string;
+	/** 目标逻辑地址（`letter.frame.to`）。 */
+	to: string;
+	messageId: string;
+	status: Letter["status"];
+	/** 信件发出时刻（ISO）。 */
+	sentAt: string;
+	/** 年龄（ms，相对 now）。 */
+	ageMs: number;
+	/** 为何判死（判据 + 依据）。 */
+	reason: string;
+	filePath: string;
+}
+
+/** 从 spool 目录名反推目标地址（`agent__master_default` → `agent://master_default`）——仅在 frame 缺失时用。 */
+function recipientAddressFromDirName(dirName: string): string | null {
+	const m = /^(agent|pi|workstream|task|run)__+(.+)$/.exec(dirName);
+	return m ? `${m[1]}://${m[2]}` : null;
+}
+
+/** 信件目标地址（优先 frame.to；旧命名/损坏 frame 回退目录名解析）。 */
+function letterTarget(letter: Letter, dirName: string): string {
+	try {
+		const to = (letter.frame as { to?: unknown } | undefined)?.to;
+		if (typeof to === "string" && to.length > 0) return to;
+	} catch { /* ignore */ }
+	return recipientAddressFromDirName(dirName) ?? dirName;
+}
+
+/** 信件年龄基准：`sentAt`（发出时刻）；解析不了 ⇒ null（不判，不猜）。 */
+function letterSentAt(letter: Letter): string | null {
+	try {
+		const f = letter.frame as { sentAt?: unknown; issuedAt?: unknown } | undefined;
+		const t = typeof f?.sentAt === "string" ? f.sentAt : typeof f?.issuedAt === "string" ? f.issuedAt : undefined;
+		return t !== undefined && Number.isFinite(Date.parse(t)) ? t : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * **P-2 死信判定（纯扫描，不写盘）**。
+ *
+ * 判据（全部成立才入清单）：
+ *   ① `status ∈ {pending, claimed}`（`delivered` 不碰：它已进处理管线）；
+ *   ② 年龄 > `DEAD_LETTER_MIN_AGE_MS`（`claimed` 还要 `claimedAt` 至今 > `DEAD_CLAIM_AGE_MS`）；
+ *   ③ `probe(目标地址).state === "dead"`（`alive`/`unknown` 一律跳过）。
+ *
+ * never-throw：探针异常 / 坏 JSON / 目录不可读 ⇒ 跳过（不猜）。
+ */
+export function findDeadLetters(
+	opts: {
+		mailboxDir?: string;
+		probe: (address: string) => DeadLetterProbe;
+		now?: number;
+		minAgeMs?: number;
+		claimAgeMs?: number;
+	} = {} as never,
+): DeadLetterRow[] {
+	const out: DeadLetterRow[] = [];
+	if (typeof opts.probe !== "function") return out;
+	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
+	const now = opts.now ?? Date.now();
+	const minAgeMs = opts.minAgeMs ?? DEAD_LETTER_MIN_AGE_MS;
+	const claimAgeMs = opts.claimAgeMs ?? DEAD_CLAIM_AGE_MS;
+
+	const probeCache = new Map<string, DeadLetterProbe>();
+	for (const dir of listRecipientDirs(mailboxDir)) {
+		const dirName = basename(dir);
+		let files: string[];
+		try {
+			files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			const path = join(dir, f);
+			const letter = readLetterCached(path);
+			if (letter === null) continue;
+			if (letter.status !== "pending" && letter.status !== "claimed") continue; // ①
+			const sentAt = letterSentAt(letter);
+			if (sentAt === null) continue; // 无时间基准 ⇒ 不判
+			const ageMs = now - Date.parse(sentAt);
+			if (!Number.isFinite(ageMs) || ageMs <= minAgeMs) continue; // ②
+			if (letter.status === "claimed") {
+				const claimedMs = letter.claimedAt !== undefined ? now - Date.parse(letter.claimedAt) : Number.NaN;
+				if (!Number.isFinite(claimedMs) || claimedMs <= claimAgeMs) continue; // ② claimed 额外窗口
+			}
+			const to = letterTarget(letter, dirName);
+			let p = probeCache.get(to);
+			if (p === undefined) {
+				try {
+					p = opts.probe(to);
+				} catch {
+					p = { state: "unknown", basis: "probe-threw" };
+				}
+				probeCache.set(to, p);
+			}
+			if (p.state !== "dead") continue; // ③ 只认「确定死了」
+			const ageH = Math.round((ageMs / 3_600_000) * 10) / 10;
+			out.push({
+				recipient: dirName,
+				to,
+				messageId: f.slice(0, -".json".length),
+				status: letter.status,
+				sentAt,
+				ageMs,
+				reason: `target-gone(${p.basis}) age=${ageH}h status=${letter.status}`,
+				filePath: path,
+			});
+		}
+	}
+	out.sort((a, b) => b.ageMs - a.ageMs);
+	return out;
+}
+
+/**
+ * **P-2 落终态**：把清单里的信件置 `target-gone` + 写 `terminalReason` / `terminalAt`。
+ *
+ * @returns 实际落盘的行（干跑 ⇒ 空数组，清单仍可由 `findDeadLetters` 拿到）。
+ *
+ * 为何“后置”校验：清单与落盘之间有窗口，另一个消费者可能刚 ack 它。
+ * 本函数落盘前**重读**该文件并只允许 `pending`/`claimed` → `target-gone`（终态不可再迁移）。
+ *
+ * **R-2 不得静默**：每落一封写一条 journal `message.target-gone`（safe wrapper，写失败不影响
+ * 终态迁移），与 `sweepTargetDeadOutboxItems` 写 `message.failed` 同范式、同 dedupeKey 纪律。
+ */
+export function finalizeDeadLetters(
+	rows: readonly DeadLetterRow[],
+	opts: { now?: number; dryRun?: boolean; journalPath?: string } = {},
+): DeadLetterRow[] {
+	const dryRun = opts.dryRun !== false; // 缺省干跑（任务书硬约束 2）
+	if (dryRun) return [];
+	const at = new Date(opts.now ?? Date.now()).toISOString();
+	const done: DeadLetterRow[] = [];
+	for (const row of rows) {
+		try {
+			const raw = JSON.parse(readFileSync(row.filePath, "utf8")) as Letter;
+			if (raw.status !== "pending" && raw.status !== "claimed") continue; // 竞态：已被处理
+			writeJsonAtomic(row.filePath, { ...raw, status: "target-gone", terminalReason: row.reason, terminalAt: at });
+			LETTER_CACHE.delete(row.filePath); // 缓存同步（否则判定后仍读到旧状态）
+			done.push(row);
+		} catch {
+			continue; // never-throw：单封写失败不影响其他封
+		}
+		try {
+			appendRuntimeEnvelopeSafe(
+				newEventEnvelope({
+					type: "message.target-gone",
+					source: `pi://${row.recipient}`,
+					subject: row.to,
+					at,
+					recordedAt: at,
+					payload: { messageId: row.messageId, recipient: row.recipient, to: row.to, reason: row.reason, ageMs: row.ageMs },
+					dedupeKey: `message.target-gone:${row.messageId}`,
+				}),
+				opts.journalPath ?? defaultJournalPath(),
+			);
+		} catch {
+			/* safe wrapper 自吞，双保险 */
+		}
+	}
+	return done;
+}

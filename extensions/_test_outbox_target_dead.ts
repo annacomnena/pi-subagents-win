@@ -19,7 +19,7 @@
  * D. 不冤枉：目标活 / 探针 unknown ⇒ 一律不动
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -134,15 +134,24 @@ check("A2 pid 活 + 心跳新鲜 ⇒ alive", () => {
 	assert.equal(p.state, "alive", `应为 alive，实际 ${p.state}（${p.basis}）`);
 });
 
-check("A3 pid 活 + 心跳超龄 ⇒ dead（PID 复用：那个号已经不是它了）", () => {
+// A3 断言已**显式改写**（2026-11-03，项 1），由 dead 改为 unknown。
+//
+// 为什么改（不是放宽，是纠错）：scope-liveness 心跳只由 owner 在 agent_start/agent_end 写
+// ⇒ 「心跳超龄」在**空闲会话上必然成立**。真机铁证：local master pid 76520 进程活着、
+// 会话文件仍在写，心跳停在 15 分钟前 ⇒ 旧判据给出 dead ⇒ 一条补投消息被判 failed，
+// error = `目标会话已结束（pid-reused-or-hung(pid=76520,heartbeat-age=14.6min)）`。
+// 这是「活着被判死」。而 dead 会驱动**有副作用**的动作（标 failed / 开新窗口），
+// 故心跳这种弱信号只能支撑 unknown —— 与 `session-resume.ts` 的既有口径一致
+// （「判不了 = 不动」）。PID 复用的检测改由 session-owner 的进程启动时间承担（F 组）。
+check("A3 【改写】pid 活 + 心跳超龄 ⇒ unknown（心跳是弱信号，不够支撑标 failed/开窗口）", () => {
 	const staleAt = new Date(Date.now() - TARGET_HEARTBEAT_STALE_MS - 60_000).toISOString();
 	seedLiveness("sc-a3", "sess-a3", 5678, staleAt);
 	const p = probeTargetSessionLiveness("sess-a3", {
 		stateDir: STATE,
 		probePid: () => ({ state: "alive", basis: "test" }),
 	});
-	assert.equal(p.state, "dead", `应为 dead（pid 复用），实际 ${p.state}（${p.basis}）`);
-	assert.match(p.basis, /reused|hung/, `basis 应指明 PID 复用，实际 ${p.basis}`);
+	assert.equal(p.state, "unknown", `pid 活但心跳超龄应为 unknown（不判死），实际 ${p.state}（${p.basis}）`);
+	assert.match(p.basis, /heartbeat-stale-weak-signal/, `basis 应指明「心跳超龄是弱信号」，实际 ${p.basis}`);
 });
 
 check("A4 pid unknown + 心跳超龄 ⇒ dead（查不到进程 + 久无心跳）", () => {
@@ -314,6 +323,83 @@ check("D4 探针完全缺失 ⇒ 不崩、不动（never-throw）", () => {
 	assert.equal(out.length, 0, "无探针时不得动任何项");
 });
 
+console.log("\nF. 全生命周期 session-owner 记录（项 1 新增取证路径）");
+
+const OWNER_DIR = join(STATE, "session-owner");
+mkdirSync(OWNER_DIR, { recursive: true });
+
+/** 写一条 session-owner 记录（形状照抄 runtime/session-owner.ts）。 */
+function seedOwner(sessionId: string, pid: number, startedAt: string, updatedAt: string): void {
+	writeFileSync(
+		join(OWNER_DIR, `${sessionId}.json`),
+		JSON.stringify({ version: 1, sessionId, pid, startedAt, updatedAt }, null, 2),
+		"utf8",
+	);
+}
+
+check("F1 【根因场景】普通 TUI 会话（无 scope-liveness）靠 session-owner 判 dead", () => {
+	// 这是项 1 存在的全部理由：普通会话没有 scope-liveness 记录，
+	// 旧实现恒 unknown ⇒ S2/B 双失效。
+	seedOwner("sess-f1", 999998, "2026-11-03T09:00:00.000Z", "2026-11-03T10:00:00.000Z");
+	const p = probeTargetSessionLiveness("sess-f1", {
+		stateDir: STATE,
+		probePid: () => ({ state: "dead", basis: "test" }),
+	});
+	assert.equal(p.state, "dead", `有 owner 记录 + pid 死应判 dead，实际 ${p.state}（${p.basis}）`);
+	assert.match(p.basis, /session-owner/, `basis 应指明走了 session-owner 路径，实际 ${p.basis}`);
+});
+
+check("F2 普通 TUI 会话 session-owner pid 活 + 启动时间匹配 ⇒ alive（即使无任何心跳）", () => {
+	seedOwner("sess-f2", 4242, "2026-11-03T09:00:00.000Z", "2026-11-03T09:00:00.000Z");
+	const p = probeTargetSessionLiveness("sess-f2", {
+		stateDir: STATE,
+		probePid: () => ({ state: "alive", basis: "test" }),
+		probeProcessStartedAt: () => "2026-11-03T09:00:05.000Z",
+	});
+	assert.equal(p.state, "alive", `owner 记录 pid 活应判 alive，实际 ${p.state}（${p.basis}）`);
+	assert.match(p.basis, /session-owner/, `basis 应指明走了 session-owner 路径，实际 ${p.basis}`);
+});
+
+check("F3 session-owner 判 PID 复用 ⇒ dead（比心跳更强的判据）", () => {
+	seedOwner("sess-f3", 5151, "2026-11-03T09:00:00.000Z", "2026-11-03T09:00:00.000Z");
+	const p = probeTargetSessionLiveness("sess-f3", {
+		stateDir: STATE,
+		probePid: () => ({ state: "alive", basis: "test" }),
+		probeProcessStartedAt: () => "2026-11-03T11:00:00.000Z", // 晚 2 小时 ⇒ 不是同一个进程
+	});
+	assert.equal(p.state, "dead", `PID 复用应判 dead，实际 ${p.state}（${p.basis}）`);
+	assert.match(p.basis, /reused/, `basis 应指明复用，实际 ${p.basis}`);
+});
+
+check("F4 session-owner 探针不可用 + 无 heartbeat ⇒ unknown（不猜）", () => {
+	seedOwner("sess-f4", 6262, "2026-11-03T09:00:00.000Z", "2026-11-03T09:00:00.000Z");
+	const p = probeTargetSessionLiveness("sess-f4", {
+		stateDir: STATE,
+		probePid: () => ({ state: "unknown", basis: "test" }),
+	});
+	assert.equal(p.state, "unknown", `探针不可用应 unknown，实际 ${p.state}（${p.basis}）`);
+});
+
+check("F5 两者都有且一致（pid 死）⇒ dead（owner 路径优先但结论同源）", () => {
+	seedLiveness("sc-f5", "sess-f5", 999997, new Date().toISOString());
+	seedOwner("sess-f5", 999997, "2026-11-03T09:00:00.000Z", "2026-11-03T10:00:00.000Z");
+	const p = probeTargetSessionLiveness("sess-f5", {
+		stateDir: STATE,
+		probePid: () => ({ state: "dead", basis: "test" }),
+	});
+	assert.equal(p.state, "dead", `pid 死应 dead，实际 ${p.state}（${p.basis}）`);
+});
+
+check("F6 session-owner pid 已死 ⇒ 记录被懒删（不留僵尸）", () => {
+	seedOwner("sess-f6", 999996, "2026-11-03T09:00:00.000Z", "2026-11-03T10:00:00.000Z");
+	probeTargetSessionLiveness("sess-f6", { stateDir: STATE, probePid: () => ({ state: "dead", basis: "test" }) });
+	assert.equal(
+		existsSync(join(OWNER_DIR, "sess-f6.json")),
+		false,
+		"判死后的 owner 记录应被懒删（否则 state 目录无限增长）",
+	);
+});
+
 console.log("\nE. 真机形态回归（用实际数据形状）");
 
 check("E1 复刻真机：心跳停 10 小时 + pid 不存在 ⇒ 判 dead", () => {
@@ -346,6 +432,33 @@ check("E2 复刻真机：3 条消息全部标 failed 且各自带原因", () => 
 		assert.ok((it?.error ?? "").length > 0, "必须有可读的 error");
 	}
 });
+
+// ── W1：默认探针接线自证（**不注入** probePid，走真实进程表 probePidState）──
+// 覆盖缺口来源（2026-11-03 变异验证）：M6 把缺省探针短路成恒 alive，原有 23 条断言全部存活
+// ⇒ 原有断言全用注入的假探针，从没走过 outbox-target-liveness.ts 里 `opts.probePid ?? probePidState`
+// 这条真接线（AGENTS.md §4：判定必须经过真实入口）。本检查开一个真子进程跑 alive→dead 全程。
+{
+	const { spawn } = await import("node:child_process");
+	const sid = "w1-real-probe-session";
+	const child = spawn("cmd", ["/c", "ping", "-n", "8", "127.0.0.1"], { windowsHide: true, stdio: "ignore" });
+	const pid = child.pid;
+	assert.ok(typeof pid === "number" && Number.isInteger(pid) && pid > 0, "W1 前置：子进程 pid 有效");
+	seedLiveness("scope-w1", sid, pid, new Date().toISOString());
+	const live = probeTargetSessionLiveness(sid, { stateDir: STATE });
+	assert.equal(live.state, "alive", `W1① 真实探针应判活（实得 ${live.state}/${live.basis}）`);
+	assert.ok(String(live.basis).includes(String(pid)), `W1① basis 必须带上真实 pid（证明走的是进程表，实得 ${live.basis}）`);
+	child.kill();
+	let dead: { state: string; basis: string } | null = null;
+	for (let i = 0; i < 40 && dead === null; i += 1) {
+		const r = probeTargetSessionLiveness(sid, { stateDir: STATE });
+		if (r.state === "dead") dead = { state: r.state, basis: r.basis };
+		else await new Promise((res) => setTimeout(res, 500));
+	}
+	assert.ok(dead !== null, "W1② 进程消失后真实探针必须判 dead（缺省探针若被短路成恒 alive，本断言必红）");
+	assert.ok(String(dead!.basis).startsWith("pid-dead"), `W1② basis 应为 pid-dead(...)，实得 ${dead!.basis}`);
+	passed += 1;
+	console.log("  ✓ W1 默认探针接线自证（真实进程 alive→dead 全程走 probePidState）");
+}
 
 console.log(`\n_test_outbox_target_dead: ${passed} checks passed`);
 rmSync(ROOT, { recursive: true, force: true });

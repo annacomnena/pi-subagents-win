@@ -59,9 +59,58 @@ function listFilesRecursive(dir: string, out: string[] = []): string[] {
 	// gui/src：浏览器侧绝不持久化 token；URL 构造仅 streamUrl(null)（Vite proxy 注入 cookie）
 	const guiFiles = listFilesRecursive(join(REPO_ROOT, "gui", "src")).filter((f) => /\.(ts|tsx)$/.test(f));
 	assert.ok(guiFiles.length > 0, "K3 前置：gui/src 可读");
+	// ── K3 判据（2026-11-03 体检 + L4 审查驱动的第二版）──────────────────
+	// 意图 = 「浏览器侧不持有凭证」，UI 态持久化合法（saw-ws-sort / saw-ws-expansion / saw-ws-overflow）。
+	// 第一版只查**键名**；L4 审查给出 3 个负例（setItem("ui", token) / 序列化含 token 字段的 state /
+	// localStorage["auth"]=token），主会话实测**全部漏检**（植入后 exit=0）⇒ 键名面守住 ≠ 值面守住。
+	// 现判据四面：① 键名 ② 写入行整行（值面）③ 方括号赋值形式 ④ 持久化文件里不得声明凭证字段。
+	// **已知边界（登记，勿声称已解决）**：这是**词法**判据，不是污点分析 —— 值来自远端响应 /
+	// 跳文件传参时抓不到（把凭证传进持久化函数仍会漏）；K3-fixture 只能证明这四面的覆盖面。
+	const CRED_WORD = /\b(hostToken|sw_host_token|host_token|accessToken|access_token|authToken|auth_token|bearerToken|bearer_token|sessionToken|session_token|apiKey|api_key|clientSecret|client_secret|credential|password|cookie|token)\b/i;
+	const CRED_FIELD = /\b(hostToken|sw_host_token|host_token|accessToken|access_token|authToken|auth_token|bearerToken|bearer_token|apiKey|api_key|clientSecret|client_secret|credential|password|cookie|token)\s*[:=?]/;
+	const STORE_WRITE = /(?:localStorage|sessionStorage)(?:\.(?:setItem|removeItem)\(|\s*\[[^\]]*\]\s*=)/;
+	const isCommentLine = (l: string): boolean => {
+		const t = l.trim();
+		return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
+	};
+	function k3Violations(src: string): string[] {
+		const out: string[] = [];
+		const lines = src.split(/\r?\n/);
+		lines.forEach((line, i) => {
+			if (isCommentLine(line)) return;
+			if (!STORE_WRITE.test(line)) return;
+			if (CRED_WORD.test(line)) out.push(`L${i + 1} 写入行含凭证标识符：${line.trim().slice(0, 90)}`);
+			const keym = /(?:localStorage|sessionStorage)(?:\.(?:setItem|removeItem)\(\s*([^,)]+)|\s*\[([^\]]+)\])/.exec(line);
+			const key = (keym?.[1] ?? keym?.[2] ?? "").trim();
+			if (key && CRED_WORD.test(key)) out.push(`L${i + 1} 存储键名含凭证字样：${key}`);
+		});
+		if (STORE_WRITE.test(src)) {
+			lines.forEach((line, i) => {
+				if (isCommentLine(line)) return;
+				if (CRED_FIELD.test(line)) out.push(`L${i + 1} 持久化文件里声明了凭证字段：${line.trim().slice(0, 90)}`);
+			});
+		}
+		return out;
+	}
+
+	// K3-fixture：**负例必须被判据抓住**（把「判据覆盖面」变成实测对象，不是口头承诺）
+	const K3_NEG = [
+		{ name: "① 值面 setItem(\"ui\", token)", src: 'export const x = 1;\nexport function f(token: string) {\n\tlocalStorage.setItem("ui", token);\n}\n' },
+		{ name: "② 序列化含凭证字段的对象", src: 'interface S { token: string }\nexport function f(s: S) {\n\tlocalStorage.setItem("ui", JSON.stringify(s));\n}\n' },
+		{ name: "③ 方括号赋值 localStorage[\"auth\"] = token", src: 'export const x = 1;\nexport function f(token: string) {\n\tlocalStorage["auth"] = token;\n}\n' },
+	];
+	for (const c of K3_NEG) {
+		assert.ok(k3Violations(c.src).length > 0, `K3-fixture 负例${c.name} 必须被判据抓住（漏检 = 判据失效）`);
+	}
+	const K3_POS = [
+		'const STORAGE_KEY = "saw-ws-sort";\nexport function save(sortBy: string) {\n\tlocalStorage.setItem(STORAGE_KEY, JSON.stringify(sortBy));\n}\n',
+		'export function load(key: string) {\n\tconst raw = localStorage.getItem(key);\n\treturn raw;\n}\n',
+	];
+	for (const src of K3_POS) assert.equal(k3Violations(src).length, 0, "K3-fixture 正例（UI 态持久化）必须合法");
+
 	for (const f of guiFiles) {
 		const src = readFileSync(f, "utf8");
-		assert.ok(!/sessionStorage|localStorage/.test(src), `K3: ${f} 不持久化任何状态到 WebStorage`);
+		for (const v of k3Violations(src)) assert.fail(`K3: ${f} ${v}`);
 		assert.ok(!/\?token=\$\{/.test(src) || f.endsWith("useEventStream.ts"), `K3: ${f} 不拼 token 进 URL`);
 	}
 	// streamUrl 调用面：只允许 null（浏览器不持有 token）；排除函数声明（lookbehind）

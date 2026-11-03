@@ -22,19 +22,24 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isProcessAlive } from "./runtime/liveness.ts";
 import {
 	appendTrace,
 	effectiveStage,
 	effectiveStageOf,
 	ensureEvent,
+	finalizeExpiredLease,
 	listAcks,
 	listAttempts,
 	listEvents,
 	publishIncident,
 	reconcileDecision,
 	recordAttempt,
+	staleLeaseReason,
+	staleLeaseVerdict,
 	terminalRevisionOf,
 	type AttemptStatus,
+	type DeliveryAttempt,
 	type DeliveryEvent,
 	type DeliveryStage,
 } from "./delivery-ledger.ts";
@@ -111,9 +116,11 @@ export interface ReconcileRunResult {
 	eventId: string;
 	runId: string;
 	stage: DeliveryStage;
-	action: "none" | "retry" | "fail_delivery";
+	action: "none" | "retry" | "fail_delivery" | "finalize_expired_lease";
 	incidentId?: string;
 	dispatched: boolean;
+	/** P-1：落终态时的可读原因（审计/观测用）。 */
+	reason?: string;
 }
 
 export interface ReconcileOnceOptions {
@@ -122,13 +129,28 @@ export interface ReconcileOnceOptions {
 	now?: number;
 	limit?: number;
 	cursor?: string | null;
+	/**
+	 * **P-1 租约终态化开关（默认 OFF）**。
+	 *
+	 * 为何默认关：它会向生产账本**写终态记录**（append-only，不改写既有 attempt，但仍是写入）。
+	 * 破坏性回归面必须由调用方显式开启（任务书硬约束 2）。生产入口
+	 * `runtime-host/delivery-reconciler-loop.ts` 用 env `PI_DELIVERY_STALE_FINALIZE=1` 打开。
+	 * 关闭时行为与之前**逐字节一致**（不调判据、不写记录、不写审计）。
+	 */
+	staleLeaseFinalize?: boolean;
+	/** P-1 死亡探针（缺省 `runtime/liveness.ts::isProcessAlive`；测试注入）。 */
+	isPidAlive?: (pid: number) => boolean;
+	/** P-1 落终态后的审计行接收器（生产接 `appendAuditLine`；不传则只写 trace）。 */
+	onExpiredLease?: (ev: { eventId: string; runId: string; attemptId: string; reason: string; leaseOwner?: string }) => void;
+	/** P-3 补投上限覆盖（缺省 `MAX_B_RETRIES_PER_EVENT`）。 */
+	maxBRetries?: number;
 	/** 派发者解析（生产接 links；测试注入）。返回 undefined = fail closed（不建事件）。 */
 	resolveDispatcher?: (runId: string) => string | undefined;
 	/**
 	 * 补投实现（**B 通道的定向持久唤醒**）。生产接 mailbox/timer 写同 eventId 的持久唤醒。
 	 * 返回 attempt 状态；未提供 ⇒ 只判定不投（用于纯判定测试）。
 	 */
-	deliver?: (event: DeliveryEvent, attemptId: string) => Promise<AttemptStatus> | AttemptStatus;
+	deliver?: (event: DeliveryEvent, attemptId: string, retryOrdinal?: number) => Promise<AttemptStatus> | AttemptStatus;
 	/** incident 出口（不调用模型；失败不阻断 incident 本身）。 */
 	onIncident?: (inc: { incidentId: string; eventId: string; runId: string; reason: string }) => void;
 	/** 建立定向持久唤醒（B 通道用 mailbox/timer；与 deliver 二选一，deliver 优先）。 */
@@ -148,6 +170,7 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 	undiscoveredBefore: number;
 }> {
 	const now = opts.now ?? Date.now();
+	const isPidAlive = opts.isPidAlive ?? isProcessAlive;
 	const { runs, nextCursor, scanned } = scanTerminalRuns(opts.runsDir, { limit: opts.limit, cursor: opts.cursor });
 	// 独立 oracle 指标：终态总数 − 已有 event 数 = 未发现终态（咨询 §8.4 `undiscovered_terminal`）
 	const knownEvents = new Set(listEvents(opts.deliverDir, 100_000).map((e) => e.runId));
@@ -184,14 +207,38 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 		const acks = listAcks(opts.deliverDir, event.eventId);
 		// D-2：显式传 incident 状态（统一消费入口 `effectiveStageOf`；incident 开启 ⇒ 终态失败）
 		const view = effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
-		const decision = reconcileDecision(event, view, attempts, now);
+		// P-1：仅在显式开启时注入判据（关闭 ⇒ 与原行为完全一致：不调判据、不写记录、不写审计）
+		const staleLease = opts.staleLeaseFinalize === true
+			? (a: DeliveryAttempt): string | null => staleLeaseVerdict(a, { now, isPidAlive })
+			: undefined;
+		const decision = reconcileDecision(event, view, attempts, now, { staleLease, maxBRetries: opts.maxBRetries });
 
 		if (decision.action === "none") {
 			// 期限/阈值未到：顺手 arm 定向持久唤醒（若提供），保证 idle 时也能被触发
-			if (opts.armWaker && view.stage !== "consumed" && view.stage !== "failed_delivery") {
+			if (opts.armWaker && view.stage !== "consumed" && view.stage !== "failed_delivery" && view.stage !== "expired_dead_lease") {
 				try { opts.armWaker(event); } catch { /* best-effort */ }
 			}
 			results.push({ eventId: event.eventId, runId: run.runId, stage: view.stage, action: "none", dispatched: false });
+			continue;
+		}
+
+		// ── P-1：租约过期 + 持有者死 ⇒ 落终态，**不走 B 补投**（R-2：带 reason 与 leaseOwner + 审计）──
+		if (decision.action === "finalize_expired_lease") {
+			const target = attempts.find((a) => a.attemptId === decision.attemptId);
+			let reason = decision.reason;
+			if (target) {
+				reason = staleLeaseReason(target, now);
+				finalizeExpiredLease(opts.deliverDir, event.eventId, target, now);
+			}
+			// trace 总是写（账本内诊断）；审计行走注入面（生产 = appendAuditLine）
+			appendTrace(opts.deliverDir, {
+				kind: "B-finalize-expired-lease", eventId: event.eventId, runId: run.runId,
+				attemptId: decision.attemptId, reason, leaseOwner: target?.leaseOwner,
+			});
+			try {
+				opts.onExpiredLease?.({ eventId: event.eventId, runId: run.runId, attemptId: decision.attemptId, reason, leaseOwner: target?.leaseOwner });
+			} catch { /* 审计失败不回滚终态 */ }
+			results.push({ eventId: event.eventId, runId: run.runId, stage: "expired_dead_lease", action: "finalize_expired_lease", dispatched: false, reason });
 			continue;
 		}
 
@@ -208,7 +255,7 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 		let dispatched = false;
 		if (opts.deliver) {
 			try {
-				status = await opts.deliver(event, decision.attemptId);
+				status = await opts.deliver(event, decision.attemptId, decision.retryOrdinal);
 				dispatched = true;
 			} catch (e) {
 				status = "failed";

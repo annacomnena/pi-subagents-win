@@ -204,7 +204,21 @@ export function newCommandFrame(input: {
 }
 
 /** mailbox spool 的信封：帧 + 投递状态（§27 状态词表，mailbox.ts 落盘用）。 */
-export const DELIVERY_STATUSES = ["pending", "claimed", "delivered", "acked", "expired"] as const;
+export const DELIVERY_STATUSES = [
+	"pending",
+	"claimed",
+	"delivered",
+	"acked",
+	"expired",
+	/**
+	 * **P-2 死信终态（2026-11-03）**：目标会话已不再存在（pid 死 / 心跳超阈），
+	 * 且信件已超龄 ⇒ 永不送达。与 `expired` 的区别：
+	 *   - `expired` = 时间维度（`expiresAt` 到了，目标可能还活着）；
+	 *   - `target-gone` = 因果维度（目标确定没了，这封信不可能再投递成功）。
+	 * 两者都是终态（不参与 pending/claimed 计数，不被重新领取）。
+	 */
+	"target-gone",
+] as const;
 
 export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number];
 
@@ -217,4 +231,11 @@ export interface Letter<T extends FabricFrame = FabricFrame> {
 	ackedAt?: string;
 	/** TTL（ISO）；扫描时惰性置 expired */
 	expiresAt?: string;
+	/**
+	 * P-2（2026-11-03）：落 `target-gone` 终态时的**可读原因**。
+	 * 必带判据依据（pid 状态 / 心跳年龄），不得静默（AGENTS.md R-2）。
+	 */
+	terminalReason?: string;
+	/** P-2：落终态的时刻（与 frame.sentAt / claimedAt 区分）。 */
+	terminalAt?: string;
 }
