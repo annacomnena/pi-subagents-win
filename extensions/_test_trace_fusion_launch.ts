@@ -16,8 +16,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, basename } from "node:path";
+import { tmpdir } from "node:os";import { join, basename } from "node:path";
 
 const gitVer = spawnSync("git", ["--version"], { encoding: "utf8", windowsHide: true });
 if (gitVer.status !== 0) {
@@ -40,6 +39,16 @@ const cfg = (over: Partial<TraceFusionConfig> = {}): TraceFusionConfig => ({
 });
 
 const root = mkdtempSync(join(tmpdir(), "tfl-c6-test-"));
+
+// **账本隔离（2026-11-03 污染实测驱动）**：fake spawner 的 `simulated spawn failure` 以前直接落
+// 生产账本（`launch-workers.ts:267/268/287` 直接调 `defaultTabRunsDir()`），实测生产目录里堆积
+// **372 条**含该字样的记录 ⇒ 回收面板里一半是测试幽灵。`defaultTabRunsDir()` 现在**调用时读 env**
+// `PI_TAB_RUNS_DIR` ⇒ 顶层设 env 即隔离；本文件末尾再加「零写生产」断言兜底。
+const ISOLATED_TAB_RUNS = join(root, "tab-runs-isolated");
+const PROD_TAB_RUNS = join(process.env.USERPROFILE?.trim() ?? process.env.HOME!, ".pi", "agent", "tab-runs");
+mkdirSync(ISOLATED_TAB_RUNS, { recursive: true });
+const prodCountBefore = existsSync(PROD_TAB_RUNS) ? readdirSync(PROD_TAB_RUNS).filter((f) => f.endsWith(".json")).length : 0;
+process.env.PI_TAB_RUNS_DIR = ISOLATED_TAB_RUNS;
 
 function g(args: string[], cwd: string): number {
 	return spawnSync("git", args, {
@@ -459,6 +468,14 @@ try {
 	}
 
 	console.log("trace-fusion launch tests passed");
+	// **零写生产账本断言（隔离的兑现面，不只是设了 env）**
+	{
+		const prodCountAfter = existsSync(PROD_TAB_RUNS) ? readdirSync(PROD_TAB_RUNS).filter((f) => f.endsWith(".json")).length : 0;
+		assert.equal(prodCountAfter, prodCountBefore, `测试不得往生产 tab-runs 账本写任何记录（前 ${prodCountBefore} 后 ${prodCountAfter}）`);
+		const isolated = existsSync(ISOLATED_TAB_RUNS) ? readdirSync(ISOLATED_TAB_RUNS).filter((f) => f.endsWith(".json")).length : 0;
+		assert.ok(isolated > 0, `隔离账本里确实落了记录（证明写入发生过、只是落了隔离目录，实得 ${isolated}）`);
+		console.log(`ok isolation - 生产 tab-runs ${prodCountBefore}→${prodCountAfter}（零写）；隔离目录 ${isolated} 条`);
+	}
 } finally {
 	try {
 		rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });

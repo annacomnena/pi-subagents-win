@@ -147,8 +147,20 @@ export function defaultSessionsRoot(agentDir: string = join(homedir(), ".pi", "a
 	return join(agentDir, "sessions");
 }
 
-/** 默认标签页账本根目录：~/.pi/agent/tab-runs。 */
+/**
+ * 默认标签页账本根目录：`~/.pi/agent/tab-runs`，**env `PI_TAB_RUNS_DIR` 优先**。
+ *
+ * 为什么 env 收进本函数（2026-11-03 账本污染实测驱动）：消费方历来各自写
+ * `process.env.PI_TAB_RUNS_DIR || defaultTabRunsDir()`，但 `index.ts` 直开路径等
+ * **直接调用本函数**的地方不经过那道 env 门 ⇒ 测试（fake spawner 注入 spawn 失败）
+ * 在生产账本留下 372 条 `simulated spawn failure` 记录（实测 `~/.pi/agent/tab-runs`）。
+ * env 在**调用时**读 ⇒ 静态 import 不受影响，测试在顶层设 env 即可隔离。
+ * 显式传 `agentDir` 的调用（夹具固定目录）**优先于 env**，不被隐式改写。
+ */
 export function defaultTabRunsDir(agentDir: string = join(homedir(), ".pi", "agent")): string {
+	const fallback = join(homedir(), ".pi", "agent");
+	const override = process.env.PI_TAB_RUNS_DIR?.trim();
+	if (override && agentDir === fallback) return override;
 	return join(agentDir, "tab-runs");
 }
 

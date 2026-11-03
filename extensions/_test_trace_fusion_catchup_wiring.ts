@@ -11,12 +11,21 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerSessionHooks } from "./session-hooks.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tf-catchwire-"));
+// **账本隔离（2026-11-03 污染分母实测驱动，plans/_probe_tabruns_writers.mjs）**：
+// 本套件以前每次跑都往生产 tab-runs 账本写 2 条（实测 delta），污染回收面板。
+// `defaultTabRunsDir()` 现在调用时读 env `PI_TAB_RUNS_DIR` ⇒ 顶层设 env 即隔离；
+// 末尾的「零写生产」断言是兑现面（设了 env 不等于隔离成功）。
+const ISOLATED_TAB_RUNS = join(root, "tab-runs-isolated");
+const PROD_TAB_RUNS = join(process.env.USERPROFILE?.trim() ?? process.env.HOME!, ".pi", "agent", "tab-runs");
+const prodCountBefore = existsSync(PROD_TAB_RUNS) ? readdirSync(PROD_TAB_RUNS).filter((f) => f.endsWith(".json")).length : 0;
+process.env.PI_TAB_RUNS_DIR = ISOLATED_TAB_RUNS;
+
 
 try {
 	const runsDir = join(root, "runs");
@@ -92,6 +101,10 @@ try {
 	assert.ok(!/三路已终态/.test(note!), `还剩 C 未跑，不得声称「三路已终态」：${note}`);
 
 	console.log("trace-fusion catch-up wiring tests passed");
+	{
+		const prodCountAfter = existsSync(PROD_TAB_RUNS) ? readdirSync(PROD_TAB_RUNS).filter((f) => f.endsWith(".json")).length : 0;
+		assert.equal(prodCountAfter, prodCountBefore, `测试不得往生产 tab-runs 账本写记录（前 ${prodCountBefore} 后 ${prodCountAfter}）`);
+	}
 } finally {
 	try {
 		rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
