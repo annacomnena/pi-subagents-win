@@ -390,6 +390,16 @@ try {
 				`⑪ 父侧等待(${ENSURE_READY_WAIT_MS}ms) 必须 > 子侧取锁等待(${DAEMON_LOCK_WAIT_MS}ms)；否则锁不空闲时父必在子 listen 前超时`, 
 			);
 			console.log(`⑪ 不变式 ENSURE_READY_WAIT_MS=${ENSURE_READY_WAIT_MS} > DAEMON_LOCK_WAIT_MS=${DAEMON_LOCK_WAIT_MS}`);
+			// **余量守卫（2026-11-03 冷启实测驱动）**：生产规模冷启实测 **22,115 ms**
+			// （`plans/_probe_host_coldstart_prod.mjs`，顶层 6.8 MB 复制件；空目录只要 ~0.83 s）。
+			// 旧预算 23,000 ms 只余 0.9 s ⇒ `boot-ensure` 连续三次超时（子进程仍在重放中）。
+			// 余量必须是**实测值的倍数**，不是刚好超过 ⇒ 断言「≥ 实测 × 2」。
+			const MEASURED_PROD_COLDSTART_MS = 22_115; // 2026-11-03 实测读数（见上方注释的文件名）
+			assert.ok(
+				ENSURE_READY_WAIT_MS >= MEASURED_PROD_COLDSTART_MS * 2,
+				`⑪b 父侧等待(${ENSURE_READY_WAIT_MS}ms) 必须 ≥ 生产规模冷启实测(${MEASURED_PROD_COLDSTART_MS}ms) 的 2 倍；余量刚好超过 = boot-ensure 连续超时的形状`,
+			);
+			console.log(`⑪b 余量 ${ENSURE_READY_WAIT_MS}/${MEASURED_PROD_COLDSTART_MS} = ${(ENSURE_READY_WAIT_MS / MEASURED_PROD_COLDSTART_MS).toFixed(2)}×`);
 		}
 
 		// ── ⑫ 超时不得 kill 仍存活的子进程（旧逻辑会杀，并留下 host.json 残骸）──

@@ -84,8 +84,19 @@ export const DAEMON_LOCK_WAIT_MS = 15_000;
  *
  * 不变式：**ENSURE_READY_WAIT_MS > DAEMON_LOCK_WAIT_MS**。
  * 违反它就退回 2026-10-23 的「父先超时杀子」事故。任何调整都须同时改两处，或只改本式。
+ *
+ * ## 余量按**实测定**（2026-11-03 冷启测量，不再是拍的）
+ *
+ * 实测（`plans/_probe_host_coldstart.mjs` / `plans/_probe_host_coldstart_prod.mjs`，均隔离目录、不碰生产锁）：
+ * - 空目录冷启：**812 / 829 / 837 ms**（3 次）
+ * - **生产规模复制件**冷启（顶层 6.8 MB，含 `events.jsonl` 1.75 MB 等重放负载）：**22,115 ms**
+ *
+ * 旧值 `LOCK(15s) + 8s = 23s` 对生产规模只余 **0.9s** ⇒ `boot-ensure` 连续失败（`state/boot-autostart.log`
+ * 三次读数均为「timeout 23000ms：host.json 未就绪…子进程仍存活，未杀」）：子进程在重放中，父先超时。
+ * 冷启耗时**随生产数据规模增长** ⇒ 余量按测量值的倍数给（不是刚好超过）。
+ * 取 `+45s`（60s）≈ 实测 22.1s 的 2.0 倍，并且只在开机路径上花这个上限。
  */
-export const ENSURE_READY_WAIT_MS = DAEMON_LOCK_WAIT_MS + 8_000;
+export const ENSURE_READY_WAIT_MS = DAEMON_LOCK_WAIT_MS + 45_000;
 
 export function hostInfoPath(): string {
 	return join(defaultRuntimeDir(), "host.json");
