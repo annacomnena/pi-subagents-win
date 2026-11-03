@@ -85,6 +85,19 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_PAYLOAD_BYTES = 1_048_576;
 const MAX_SUBS_PER_CONN = 16;
 
+/**
+ * 重放分批大小（R-14）。
+ *
+ * 旧实现订阅 journal 时把整个 backlog **同步逐条** send，一帧都不让出事件循环。
+ * 真机 journal 曾有 7587 条 ⇒ Node 写缓冲秒满 ⇒ `send()` 返 false ⇒ 立即
+ * `close 1013 backpressure` ⇒ 客户端重连又从 base.seq 重发全量 ⇒ 永远连不上。
+ *
+ * 64 是个保守值：单个 envelope 典型几百字节，64 条约十几 KB，远低于内核 socket
+ * 缓冲；配合 setImmediate 让出，socket 能排空。加大到 256/1024 也无错，只是更容易
+ * 单批撞满；改小则回放变慢（每批一次事件循环）。
+ */
+const REPLAY_BATCH = 64;
+
 // ── 帧编解码（server→client 无掩码；client→server 必须带掩码）──────
 
 const OP_CONT = 0x0;
@@ -419,6 +432,14 @@ interface JournalSub {
 	cursor: JournalSeqCursor;
 	/** G6-P2：非空时只下发命中的 envelope type（outbox 主题 = journal 过滤投影；seq 语义不变）。 */
 	types?: readonly string[];
+	/**
+	 * R-14：回放队列进行中。
+	 *
+	 * tail tick 与回放队列是两个独立异步源，二者都会 send。若不管控，
+	 * 回放的中段与 tick 的新事件会交错 ⇒ seq 乱序（客户端按 seq 判缺口会误判）。
+	 * 置 true 时 tickJournal 直接跳过本订阅，等 onDone 清掉。
+	 */
+	replaying?: boolean;
 }
 
 interface TranscriptSub {
@@ -732,22 +753,82 @@ class StreamHub {
 		if (epochOk && genOk && base.seq <= scan.head) {
 			// 同代续传：补发 (base, head] 后转 live
 			if (!this.send({ type: "ack", topic, mode: "resume", head })) return;
-			for (const e of scan.entries) {
-				if (e.seq <= base.seq) continue;
-				if (!envelopeTypesMatch(e.envelope, types)) continue;
-				if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
-			}
+			// 【R-14 分批重放】旧实现在这里 for 循环**同步逐条** send，整个 backlog 一帧帧
+			// 写 socket。条目多时（真机曾 7587 条）Node 写缓冲秒满 ⇒ send() 返回 false ⇒
+			// 立刻 `close 1013 backpressure` ⇒ 客户端重连 ⇒ 又从 base.seq 重发全量 ⇒
+			// 永远连不上（GUI 「不能继续对话」就是这个）。
+			//
+			// 改为：把待发条目切成**有界小批**，每批用 setImmediate 让出事件循环，
+			// 等 socket 真正排空后再发下一批。断线仍按 seq 恢复（P1 无可靠缓冲的契约不变）。
+			const pending = scan.entries.filter(
+				(e) => e.seq > base.seq && envelopeTypesMatch(e.envelope, types),
+			);
 			this.subs.set(topic, { kind: "journal", cursor: { offset: scan.sizeBytes, nextLineNo: scan.head + 1 }, types });
-			this.log(`subscribe ${topic} -> resume (replay to head ${head.seq})`);
-		} else {
-			// 跨代/越界/空 → snapshot：只回指针，且**不**激活 live tail。客户端必须先 GET
-			// 新代全量，再带该 head 重订阅；否则 GET 期间的 live op 能与旧代 UI 行暂时拼接。
-			// 重订阅的 (base, head] 回放补齐 GET 与订阅之间的竞态，故不会漏事件。
-			this.send({ type: "ack", topic, mode: "snapshot", head: scan.exists ? head : null });
-			this.log(`subscribe ${topic} -> snapshot (head ${scan.exists ? head.seq : "null"})`);
+			this.log(`subscribe ${topic} -> resume (replay to head ${head.seq}, pending ${pending.length})`);
+			// 回放完再开 tail。
+			//
+			// 顺序很关键：tail 发的是 seq > head 的新事件，回放队列发的是 seq <= head 的历史。
+			// 如果先启 tail，两者会**交错**（回放分批间让出事件循环），客户端先收到
+			// 7600 再收到 6800 ⇒ seq 乱序/被当成缺口或重复。旧代码因同步 for 循环恰好
+			// 不会交错，这个约束是隐含的；改异步后必须显式保证。
+			// cursor 已推到 head ⇒ 回放完成后 tail 只接 head 之后的新增，不重发。
+			if (pending.length === 0) {
+				this.startTail();
+				return;
+			}
+			const sub = this.subs.get(topic);
+			if (sub && sub.kind === "journal") sub.replaying = true;
+			this.replayInBatches(topic, pending, () => {
+				const s = this.subs.get(topic);
+				if (s && s.kind === "journal") s.replaying = false;
+				this.startTail();
+			});
 			return;
 		}
-		this.startTail();
+		// 跨代/越界/空 → snapshot：只回指针，且**不**激活 live tail。客户端必须先 GET
+		// 新代全量，再带该 head 重订阅；否则 GET 期间的 live op 能与旧代 UI 行暂时拼接。
+		// 重订阅的 (base, head] 回放补齐 GET 与订阅之间的竞态，故不会漏事件。
+		this.send({ type: "ack", topic, mode: "snapshot", head: scan.exists ? head : null });
+		this.log(`subscribe ${topic} -> snapshot (head ${scan.exists ? head.seq : "null"})`);
+	}
+
+	/**
+	 * 分批回放队列（R-14）。
+	 *
+	 * 每批发 `REPLAY_BATCH` 条，然后等下一轮事件循环（`setImmediate`）继续。
+	 * 目的不是提速，是**让 socket 写缓冲有时间排空**——旧的同步 for 循环一帧都不会让出，
+	 * 所以 backlog 超过内核缓冲就必然撞 `send() === false`。
+	 *
+	 * 约束：
+	 * 1. 每条仍走 `send()` ⇒ 真背压（缓冲满）仍然断线，语义不变（续传靠 seq）。
+	 * 2. 断线/订阅被覆盖 ⇒ 停止本队列，**不调 onDone**（tail 不应开）。
+	 * 3. `onDone` 只在整批发完后调一次（启动 live tail 用）。
+	 */
+	private replayInBatches(
+		topic: string,
+		entries: readonly { seq: number; envelope: unknown }[],
+		onDone?: () => void,
+	): void {
+		let i = 0;
+		const step = (): void => {
+			if (!this.conn || !this.subs.has(topic)) return;
+			const end = Math.min(i + REPLAY_BATCH, entries.length);
+			for (; i < end; i++) {
+				const e = entries[i];
+				// send() 已负责断线（真背压）；断线后 stop（不调 onDone）。
+				if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope as never })) return;
+			}
+			if (i < entries.length) {
+				setImmediate(step);
+				return;
+			}
+			onDone?.();
+		};
+		if (entries.length === 0) {
+			onDone?.();
+			return;
+		}
+		setImmediate(step);
 	}
 
 	// ── interactions 订阅（G6-P3：状态投影，学 ZCode pendingInteractions）──────
@@ -829,6 +910,9 @@ class StreamHub {
 	}
 
 	private tickJournal(topic: string, sub: JournalSub): void {
+		// R-14：回放队列还在跑 ⇒ 本 tick 跳过（否则与回放交错，seq 乱序）。
+		// 回放 onDone 会把 cursor 后的新增一次性补齐（cursor 停在 head，不丢）。
+		if (sub.replaying) return;
 		const journalPath = this.opts.journalPath ?? defaultJournalPath();
 		const r = readJournalTail(journalPath, sub.cursor);
 		if (r.truncated) {
@@ -839,10 +923,17 @@ class StreamHub {
 			return;
 		}
 		sub.cursor = r.cursor;
-		for (const e of r.entries) {
-			if (!envelopeTypesMatch(e.envelope, sub.types)) continue;
-			if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
+		// 【R-14】与订阅回放同样的问题：这里也曾经是同步 for 循环。
+		// 单个 tick 新增量通常很小（十几条），但**突发**场景（批量导入、journal 重建、
+		// 一次 tick 积累上千条）下同样会撞缓冲。超过 REPLAY_BATCH 就转异步分批。
+		const matched = r.entries.filter((e) => envelopeTypesMatch(e.envelope, sub.types));
+		if (matched.length <= REPLAY_BATCH) {
+			for (const e of matched) {
+				if (!this.send({ type: "event", topic, seq: e.seq, envelope: e.envelope })) return;
+			}
+			return;
 		}
+		this.replayInBatches(topic, matched);
 	}
 
 	private tickTranscript(topic: string, sub: TranscriptSub): void {
