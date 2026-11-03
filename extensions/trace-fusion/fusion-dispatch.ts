@@ -250,7 +250,14 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	let outFd: number | undefined;
 	try {
 		outFd = openSync(outPath, "a");
-		child = spawnFn(process.execPath, ["--experimental-strip-types", ...argv.slice(1)], {
+		// 2026-11-03 首跑实测两次踩坑（tfl-20261103-192444-c7e2）：
+		//  ① 旧写法 `[--experimental-strip-types, ...argv.slice(1)]` 丢掉 argv[0]（pi CLI 脚本路径）
+		//     ⇒ node.exe 把 `--mode` 当自己的旗标 ⇒ `bad option: --mode`，exit=9；
+		//  ② 补上 argv[0] 但仍带 `--experimental-strip-types` ⇒ pi 的 cli.js（已编译 JS）
+		//     回 `Unknown option: --experimental-strip-types`，exit=1。
+		// 正确形状 = 与主 subagent 通道逐字一致（index.ts:1285 `spawn(process.execPath, argv)`）：
+		// argv 由 buildPiArgv 生成，argv[0] 就是脚本路径，**不加任何 node 旗标**。
+		child = spawnFn(process.execPath, argv, {
 			cwd: input.repoRoot,
 			windowsHide: true,
 			stdio: ["ignore", outFd, outFd],

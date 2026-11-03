@@ -123,7 +123,10 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			);
 		}
 		try {
-			pi.sendUserMessage?.(`🧬 trace-fusion ${parts.join("；")}。进度：/trace-fusion-status`, {
+			// M2 补丁（2026-11-03）：旧文案指向已退场的 `/trace-fusion-status`
+			// （tf-settings.ts 明令：该运维命令对使用者是噪声，已移出现代入口）。
+			// 状态面只指真实产物路径：runDir/lanes/<lane>/trajectory.md + meta.json。
+			pi.sendUserMessage?.(`🧬 trace-fusion ${parts.join("；")}。产物：runDir/lanes/<lane>/trajectory.md（状态读 runDir/meta.json）`, {
 				deliverAs: "followUp",
 			});
 		} catch { /* 通知尽力而为，收集已在后台 */ }

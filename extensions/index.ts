@@ -5629,7 +5629,7 @@ ${notable[0].reason}
 				const force = /(^|\s)--force(\s|$)/.test(raw);
 				const runId = raw.replace(/--force/g, "").trim();
 				if (!runId) {
-					ctx.ui.notify("用法：/trace-fusion-clean <runId> [--force]；runId 见 /trace-fusion-status", "error");
+					ctx.ui.notify("用法：/trace-fusion-clean <runId> [--force]；runId 见 ~/.pi/agent/trace-fusion-runs/ 目录名（/trace-fusion-status 已退场）", "error");
 					return;
 				}
 				const result = cleanTraceRun(runId, { force, runsDir: defaultTraceFusionRunsDir() });

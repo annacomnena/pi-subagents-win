@@ -91,6 +91,17 @@ try {
 		const r = await dispatchFusion({ ...base, fusionModel: "local-qwen38/medium", laneModel: "bonsai-9b", spawnFn: fakeSpawnThatFinishes(true) as never });
 		assert.equal(calls.length, 1, `应 spawn 一次，实得 ${calls.length}`);
 		const argv = calls[0].argv.join(" ");
+		// 2026-11-03 首跑实测缺口：spawn 的 argv[0] 必须是 **pi CLI 脚本路径**。
+		// 旧写法 `["--experimental-strip-types", ...argv.slice(1)]` 把它丢了 ⇒
+		// node.exe 把 `--mode` 当自己的旗标 ⇒ `bad option: --mode` 退出 9，融合全白跑
+		// （真实读数：tfl-20261103-192444-c7e2 fusion.stdout.log）。
+		assert.equal(calls[0].argv[0], join(root, "cli.js"), `spawn argv[0] 必须是 pi CLI 脚本路径，实得 ${calls[0].argv[0]}`);
+		// ② 实测缺口：给已编译的 cli.js 追加 node 的 --experimental-strip-types ⇒
+		// pi 立刻 `Unknown option: --experimental-strip-types`（exit=1）。argv 必须与
+		// buildPiArgv 输出逐字一致，不掺 node 旗标。
+		assert.ok(!calls[0].argv.some((a: string) => a.startsWith("--experimental-")),
+			`spawn argv 不得掺 node 旗标（cli.js 是已编译 JS），实得 ${calls[0].argv.slice(0, 3).join(" ")}`);
+		assert.ok(argv.includes("--mode json"), "pi 的 --mode json 必须保留在 argv 里");
 		for (const t of FUSION_EXCLUDE_TOOLS) {
 			assert.ok(argv.includes(t), `argv 必须排除 ${t}（融合者不得拥有该能力）`);
 		}

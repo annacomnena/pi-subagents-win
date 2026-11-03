@@ -10,7 +10,7 @@
  *   - 非 trace tab / 无 running run → 交回默认 toast/reclaim 流程
  *   - 未全终态 → 静默
  *   - 三路全终态 → 后台子进程跑 collect + deterministic cross-test（不阻塞 TUI），
- *     完成后 meta 终态化，/trace-fusion-status 可查
+ *     完成后 meta 终态化（状态读 runDir/meta.json；运维命令 /trace-fusion-status 已退场）
  *   - 已有报告或已被认领 → 幂等跳过（claim 文件防双 spawn）
  *
  * 为什么后台子进程：cross-test 含真实 build/test（10-30 分钟级），
