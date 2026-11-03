@@ -2584,7 +2584,14 @@ export default function (pi: ExtensionAPI) {
 	// lane（trace-worker）的 R-13 机械门（2026-11-03）：盘根递归扫描在提示词里已被禁，
 	// 实测 lane 仍跑了三次 `find /`（句柄 699,972）⇒ 禁令不够，落成 tool_call 拦截。
 	// 只影响 lane 会话（isLane=isTraceWorker）；主会话/普通 tab 零作用。
-	registerLaneBashGuard(pi, { isLane: () => isTraceWorker() });
+	// 2026-11-03 首跑补面：融合者（无头 subagent，write/edit 已被排除）用 bash 写报告，
+	// 把路径写丢了个点（`.pi`→`pi`）在主仓外造出野文件 ⇒ 融合子会话一并纳入，
+	// 并给出合法产物目录：env 随 spawn 透传（与 PI_SUBAGENT 同一机制），
+	// 主会话/普通 tab 两个变量都不存在 ⇒ 零拦截。
+	registerLaneBashGuard(pi, {
+		isLane: () => isTraceWorker() || Boolean(process.env.PI_TRACE_FUSION_FUSION_DIR),
+		artifactDir: process.env.PI_TRACE_FUSION_FUSION_DIR,
+	});
 
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
 	// Fast-Path 彻底早退：跳过所有编排器组件、后台定时器、文件监听器与重型钩子，

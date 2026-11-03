@@ -119,7 +119,7 @@ const fakePi = {
 	},
 };
 
-registerLaneBashGuard(fakePi as never, { isLane: () => true });
+registerLaneBashGuard(fakePi as never, { isLane: () => true, artifactDir: "/repo/run/fusion" });
 const callToolCall = (input: unknown, toolName = "bash") => {
 	const h = handlers.find((x) => x.event === "tool_call");
 	assert.ok(h, "registerLaneBashGuard 必须注册 tool_call handler");
@@ -131,7 +131,13 @@ assert.equal(blocked?.block, true, "注册线必须真的 block 盘根递归（�
 assert.ok((blocked?.reason ?? "").includes("R-13"), "拒绝理由必须可解释");
 
 const allowed = callToolCall({ command: "grep -rn laneTerminal extensions/trace-fusion/" });
-assert.equal(allowed, undefined, "正常仓库内搜索必须放行");
+assert.equal(allowed, undefined, "正常仓库内搜索必须放行（grep 的绝对路径是读取，不是写盘）");
+
+// 写盘目标越界（首跑实测：融合者用 bash 重定向把 fusion.md 写到主仓外，路径还写丢了个点）
+const stray = callToolCall({ command: 'cat x | tee "C:/Users/Annacomnena/pi/agent/trace-fusion-runs/t1/fusion/fusion.md"' });
+assert.equal(stray?.block, true, "写到 artifactDir 之外的绝对路径必须拦");
+const inPlace = callToolCall({ command: 'echo hi > "/repo/run/fusion/notes.md"' });
+assert.equal(inPlace, undefined, "写进合法产物目录必须放行");
 
 // 原生 find 工具：目标为盘根也拦；仓库内路径放行
 assert.equal(callToolCall({ path: "/", query: "cli.js" }, "find")?.block, true, "原生 find 工具盘根目标必须拦");
@@ -168,10 +174,17 @@ assert.ok(/lane-bash-guard\.ts/.test(src), "index.ts 必须 import lane-bash-gua
 // 必须是**真调用行**，不是被注释掉的行（上一版只查字串，注释掉的注册能蒙过去）
 assert.ok(/^\s*registerLaneBashGuard\(/m.test(src), "index.ts 必须有一行未被注释的 registerLaneBashGuard 调用");
 assert.ok(/registerLaneBashGuard\([\s\S]{0,160}isLane/.test(src), "注册必须带 isLane 判据（只作用于 trace-worker）");
-// isLane 的真值必须是 trace-worker 探针（写成恒 true 就是把门扣到主会话头上）
+// isLane 必须同时覆盖两类受限会话（2026-11-03 首跑实测补面）：
+// ① lane = isTraceWorker()（写成恒 true = 误杀主会话；恒 false = 门失效）；
+// ② 融合子会话 = PI_TRACE_FUSION_FUSION_DIR 存在（首跑：融合者 write/edit 被排除后用
+//    bash 写盘，把 `.pi` 写成 `pi`，在主仓外造出野文件）。
 assert.ok(
-	/registerLaneBashGuard\(\s*pi\s*,\s*\{\s*isLane:\s*\(\)\s*=>\s*isTraceWorker\(\)\s*\}/.test(src),
-	"注册的 isLane 必须就是 isTraceWorker()（恒 true = 误杀主会话；恒 false = 门失效）",
+	/registerLaneBashGuard\(\s*pi\s*,\s*\{\s*isLane:\s*\(\)\s*=>\s*isTraceWorker\(\)\s*\|\|\s*Boolean\(process\.env\.PI_TRACE_FUSION_FUSION_DIR\)/.test(src),
+	"注册的 isLane 必须是 isTraceWorker() || Boolean(PI_TRACE_FUSION_FUSION_DIR)（缺任一 = 一类会话无门）",
+);
+assert.ok(
+	/registerLaneBashGuard\([\s\S]{0,400}artifactDir:\s*process\.env\.PI_TRACE_FUSION_FUSION_DIR/.test(src),
+	"注册必须把合法产物目录传给守卫（不传 = 野路径写盘无门）",
 );
 
 console.log(

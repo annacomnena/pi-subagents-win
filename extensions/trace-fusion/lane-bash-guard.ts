@@ -173,9 +173,42 @@ export function unwrapWrappers(tokens: string[]): string[] {
 	return out;
 }
 
+/**
+ * 从一条 shell 命令里找「写盘落点」并判越界（2026-11-03 首跑实测）。
+ * 首跑形状：`printf ... > "C:/Users/.../pi/agent/.../fusion.md"`（.pi 被写成 pi）
+ * ⇒ 报告落到主仓外的野路径。故只认**写盘形状**后面的盘符绝对路径：
+ * 重定向 `>`/`>>`、`tee`、`dd of=`。只读命令（read/grep/git show/cat 无重定向）零误杀
+ * ——第一版按「命令里任何盘符路径」判，实测把只读 grep 也拦了（已修）。
+ */
+export function findStrayWriteTarget(command: string, artifactDir: string): string | undefined {
+	const norm = (p: string): string => p.split("\\").join("/").replace(/\/+$/, "").toLowerCase();
+	const dir = norm(artifactDir);
+	const targets = new Set<string>();
+	// 引号内允许空格（路径含空格），故带引号/不带引号各一条
+	for (const m of command.matchAll(/>[^\S\n]*(["'])([A-Za-z]:[\\/][^"']*)\1/g)) targets.add(m[2]);
+	for (const m of command.matchAll(/>[^\S\n]*([A-Za-z]:[\\/][^\s;|&<>]*)/g)) targets.add(m[1]);
+	for (const m of command.matchAll(/\btee[^\S\n]*(?:-a[^\S\n]*)?(["'])([A-Za-z]:[\\/][^"']*)\1/g)) targets.add(m[2]);
+	for (const m of command.matchAll(/\btee[^\S\n]*(?:-a[^\S\n]*)?([A-Za-z]:[\\/][^\s;|&<>]*)/g)) targets.add(m[1]);
+	for (const m of command.matchAll(/\bof=(["']?)([A-Za-z]:[\\/][^\s;|&<>]*)/g)) targets.add(m[2]);
+	for (const t of targets) {
+		const n = norm(t);
+		if (n === dir || n.startsWith(dir + "/")) continue;
+		return t;
+	}
+	return undefined;
+}
+
 export interface LaneBashGuardOptions {
 	/** 当前会话是不是 trace lane（缺省 = 永不拦，防止注册到主会话时误杀）。 */
 	isLane?: () => boolean;
+	/**
+	 * 产物落点目录（2026-11-03 首跑实测缺口）：融合者被排除 write/edit 后，
+	 * 用 bash 自己写 fusion.md，并把路径写丢了个点（`.pi` 写成 `pi`），
+	 * 落到主仓外的野路径 ⇒ 判据正确地判 failed，但文件已经落在用户目录里。
+	 * 传了本目录 ⇒ 额外要求 bash 命令里出现的**绝对写盘落点**必须落在该目录内，
+	 * 否则拦截（只读诊断/融合的写盘只允许发生在指定产物目录）。
+	 */
+	artifactDir?: string;
 }
 
 const NATIVE_SCAN_TOOLS = new Set(["find", "grep", "ls", "directory_tree"]);
@@ -191,12 +224,26 @@ export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unkn
 		const event = eventRaw as { toolName?: string; input?: Record<string, unknown> };
 		if (!isLane()) return undefined;
 		const name = String(event?.toolName ?? "");
-		if (name === "bash" || name === "powershell") {
+		const isShell = name === "bash" || name === "powershell";
+		if (isShell) {
 			const command = String((event.input as { command?: string } | undefined)?.command ?? "");
+			// 写盘落点越界（首跑实测：融合者无 write 工具，用 bash 重定向把 fusion.md 写到主仓外）。
+			// 必须在下面 return 之前查——旧版把它写在本分支之后 ⇒ 对 bash 命令永不可达。
+			if (opts.artifactDir) {
+				const stray = findStrayWriteTarget(command, opts.artifactDir);
+				if (stray !== undefined) {
+					return {
+						block: true,
+						reason:
+							`产物落点越界拦截：命令里的写盘目标「${stray}」不在本 run 的产物目录内（${opts.artifactDir}）。` +
+							`融合报告必须由 harness 落盘——把报告正文写进你的**回复正文**即可，不要用 shell 写文件。`,
+					};
+				}
+			}
 			const verdict = judgeLaneBashCommand(command);
-			return verdict.block ? { block: true, reason: verdict.reason } : undefined;
+			if (verdict.block) return { block: true, reason: verdict.reason };
 		}
-		if (NATIVE_SCAN_TOOLS.has(name)) {
+		if (NATIVE_SCAN_TOOLS.has(name) && !isShell) {
 			const hit = collectPathCandidates(event.input ?? {}).find(isRootishTarget);
 			if (hit !== undefined) {
 				return {

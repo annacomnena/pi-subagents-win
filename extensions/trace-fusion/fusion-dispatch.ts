@@ -27,7 +27,7 @@
 
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildPiArgv } from "../runner-argv.ts";
 import { recordLink } from "../links.ts";
 import type { LaneId } from "./types.ts";
@@ -49,6 +49,16 @@ export const FUSION_EXCLUDE_TOOLS = [
 ];
 
 export const FUSION_DEFAULT_WALL_MS = 30 * 60_000;
+
+/** 融合报告的固定六节标题（缺任一 ⇒ 不落盘）。 */
+export const FUSION_REPORT_SECTIONS = [
+	"## 1. 采纳结论",
+	"## 2. 分歧与裁决",
+	"## 3. 证据核验",
+	"## 4. 不可采信项",
+	"## 5. 后续行动",
+	"## 6. 可复跑附录",
+];
 
 export interface FusionDispatchInput {
 	runId: string;
@@ -142,6 +152,50 @@ export function parseFusionUsage(logPath: string, maxBytes = 8_000_000): FusionU
 }
 
 /** 融合提示词（纯函数）。 */
+/**
+ * 从融合子进程的 `--mode json` stdout 里取出「最后一条 assistant 正文」并校验六节结构，
+ * 合格才落盘（2026-11-03 首跑实测）：融合者的 write/edit 被运行时排除，旧提示词却让它
+ * 「写 fusion.md」⇒ 它用 bash 重定向自己写，路径还写丢了个点（`.pi` → `pi`），
+ * 在主仓外造出野文件。现形状：报告正文经 stdout 交回，由 harness 落到指定路径。
+ * 不合格 ⇒ 不落盘，返回形状描述（供失败理由，R-2 不得静默）。
+ */
+export function captureFusionReport(
+	logPath: string,
+	outPath: string,
+): { ok: true; bytes: number; shape: string } | { ok: false; shape: string } {
+	try {
+		const text = readFileSync(logPath, "utf8");
+		let last: string | null = null;
+		for (const line of text.split("\n")) {
+			const t = line.trim();
+			if (!t.startsWith("{")) continue;
+			let ev: unknown;
+			try {
+				ev = JSON.parse(t);
+			} catch {
+				continue; // 尾部截断
+			}
+			const e = ev as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+			if (e?.type !== "message_end" || e?.message?.role !== "assistant") continue;
+			const body = (e.message.content ?? [])
+				.filter((c) => c?.type === "text" && typeof c.text === "string")
+				.map((c) => c.text as string)
+				.join("\n");
+			if (body) last = body;
+		}
+		if (last === null) return { ok: false, shape: "无 assistant 正文" };
+		const missing = FUSION_REPORT_SECTIONS.filter((h) => !last!.includes(h));
+		if (missing.length > 0) {
+			return { ok: false, shape: `回复 ${last.length} 字符，缺 ${missing.length} 节（${missing.slice(0, 3).join(" / ")}）；首 120 字符：${last.slice(0, 120)}` };
+		}
+		mkdirSync(dirname(outPath), { recursive: true });
+		writeFileSync(outPath, last + "\n", "utf8");
+		return { ok: true, bytes: Buffer.byteLength(last, "utf8"), shape: `六节齐全 ${last.length} 字符` };
+	} catch (err) {
+		return { ok: false, shape: `读 stdout 失败：${(err as Error).message}` };
+	}
+}
+
 export function buildFusionPrompt(i: {
 	runId: string;
 	reportPath: string;
@@ -167,11 +221,14 @@ export function buildFusionPrompt(i: {
 		`- **引用越界即不可引用原文**：报告「行号引用越界校验」段列出的越界引用，**不得原样引用其结论**；需要该证据就自己重新定位并给出你在基点上核过的行。`,
 		`- 结论必须给出：采纳什么 / 拒绝什么 / 为什么（按证据强度，不按票数）；分歧的裁决方式（可复核的判据，不是「两票对一票」）。`,
 		`- **只读**：禁止修改任何代码文件、禁止 git 写操作、禁止装包、禁止 push、禁止派发 subagent 或开标签页。`,
-		`  唯一允许产物是下面这一个输出文件。命令只用于只读核验（read / git show / grep / 只读脚本）。`,
+		`  命令只用于只读核验（read / git show / grep / 只读脚本）。`,
+		`- **不要自己写文件**：你没有 write/edit 工具，也不要用 shell 重定向写盘`,
+		`  （实测有融合者用 printf 重定向写报告，把路径写丢了个点，在主仓外造出野文件）。`,
+		`  报告由调用方（harness）从你的**回复正文**落盘到 \`${i.outputPath}\`。`,
 		``,
-		`## 输出（必须落盘）`,
+		`## 输出（写在回复正文里）`,
 		``,
-		`写 \`${i.outputPath}\`，六节固定标题：`,
+		`把你的融合报告**全文写进最后一条回复正文**（调用方会原样落盘到 \`${i.outputPath}\`）。六节固定标题：`,
 		`1. \`## 1. 采纳结论\`（含每条的证据出处与复跑/越界读数）`,
 		`2. \`## 2. 分歧与裁决\``,
 		`3. \`## 3. 证据核验\`（你实际跑过的核验命令与结果）`,
@@ -179,7 +236,7 @@ export function buildFusionPrompt(i: {
 		`5. \`## 5. 后续行动\`（有序、可验收，标明涉及的文件）`,
 		`6. \`## 6. 可复跑附录\`（逐条命令 + 期望读数，任何人都能重跑）`,
 		``,
-		`回复只要文件路径 + ≤10 行摘要，不要贴正文。工作目录 \`${i.repoRoot}\`。`,
+		`不要只给文件路径或摘要——正文本身就是交付物，摘要会被当成不完整结果。工作目录 \`${i.repoRoot}\`。`,
 	].join("\n");
 }
 
@@ -228,6 +285,11 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		task: prompt,
 		excludeTools: FUSION_EXCLUDE_TOOLS,
 	});
+	// 融合者标记（2026-11-03 首跑实测）：它被排除了 write/edit，于是用 bash 自己写报告，
+	// 并把路径写丢了个点（`.pi` → `pi`），在主仓外造出野文件。
+	// env 随 spawn 透传 ⇒ 子会话里的 lane-bash-guard 据此接管（见 index.ts 注册处）。
+	const fusionDirEnv = "PI_TRACE_FUSION_FUSION_DIR";
+	const fusionRunEnv = "PI_TRACE_FUSION_FUSION_RUN";
 	const startedMs = input.spawnNow?.() ?? Date.now();
 	const startedAt = new Date(startedMs).toISOString();
 	writeRunRecord(runsDir, fusionRunId, {
@@ -259,8 +321,13 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		// argv 由 buildPiArgv 生成，argv[0] 就是脚本路径，**不加任何 node 旗标**。
 		child = spawnFn(process.execPath, argv, {
 			cwd: input.repoRoot,
+			shell: false,
 			windowsHide: true,
 			stdio: ["ignore", outFd, outFd],
+			// 融合者交报告的真实通道（2026-11-03 首跑实测）：它的 write/edit 工具被运行时排除，
+			// 旧提示词却要求它「写 fusion.md」⇒ 它用 bash 重定向自己写，并把路径写丢了个点
+			// （`.pi` → `pi`），在主仓外造出野文件。改为：报告正文从 stdout 交回，harness 落盘。
+			env: { ...process.env, FUSION_CAPTURE_REPORT: "1", PI_TRACE_FUSION_FUSION_RUN: input.runId, PI_TRACE_FUSION_FUSION_DIR: dirname(outputPath) },
 		});
 	} catch (err) {
 		if (outFd !== undefined) closeSync(outFd);
@@ -274,6 +341,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	// 读成 completed，而旧产物存在时更是把**上一次融合的文件**当成本次结果。
 	let exitCode: number | null = null;
 	let exitSignal: string | null = null;
+	let fusionCaptured: number | null = null;
 	const done = new Promise<"exit" | "timeout" | "error">((resolve) => {
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -298,9 +366,16 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	if (outFd !== undefined) closeSync(outFd);
 	const finishedAt = new Date().toISOString();
 	const usage = parseFusionUsage(outPath);
+	// harness 落盘：exit=0 且回复正文含六节标题 ⇒ 由调用方写 fusion.md（融合者无写工具）
+	// 融合者交报告的唯一通道 = 回复正文（它没有 write/edit 工具）：exit=0 就**必定**跑一次
+	// 六节校验。旧版写成 `!existsSync(outputPath)` 才校验 ⇒ 盘上有旧 fusion.md 时直接跳过，
+	// 半截旧文件会被当成本次结果判 completed（夹具实测踩到）。
+	const captured = exitCode === 0 ? captureFusionReport(outPath, outputPath) : null;
+	if (captured?.ok) fusionCaptured = captured.bytes;
 	const produced = existsSync(outputPath);
-	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）
-	const fresh = produced && statSync(outputPath).mtimeMs >= startedMs - 2_000;
+	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）。
+	// 由 harness 落盘的那条当然新鲜；旧版模型自写的文件仍由本判据兜住。
+	const fresh = produced && (fusionCaptured !== null || statSync(outputPath).mtimeMs >= startedMs - 2_000);
 	let status: FusionStatus;
 	let reason: string;
 	if (outcome === "timeout") {
@@ -314,12 +389,16 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	} else if (exitCode !== 0) {
 		status = "failed";
 		reason = `子进程非零退出（exit=${exitCode ?? `signal ${exitSignal ?? "?"}`}），不得计为融合成功`;
+	} else if (!captured?.ok) {
+		// 正文不合格（首跑真实形状 = 自称写了文件）。陈旧产物单独立案，理由必须写明两件事。
+		status = "failed";
+		reason = `回复正文不合格（${captured?.shape ?? "无 assistant 正文"}），不落盘不判成功；详见 ${outPath}`
+			+ (produced && !fresh
+				? `；盘上另有早于本次启动的旧产物 mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()}（陈旧产物，不得计为本次结果）`
+				: "");
 	} else if (!produced) {
 		status = "failed";
-		reason = "子进程 exit=0 但未产出融合文件（详见 fusion.stdout.log）";
-	} else if (!fresh) {
-		status = "failed";
-		reason = `融合产物早于本次启动（mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()} < startedAt），属陈旧产物，不得计为本次结果`;
+		reason = "子进程 exit=0 且正文合格，但产物未落盘（异常形状，必须查）";
 	} else {
 		status = "completed";
 		reason = `融合产物已生成：${outputPath}`;

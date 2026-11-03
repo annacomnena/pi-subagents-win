@@ -21,26 +21,62 @@ import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS } from "./trace
 const root = mkdtempSync(join(tmpdir(), "tf-fuse-"));
 
 type FakeChild = EventEmitter & { kill: (sig?: string) => void };
+const allCalls: { argv: string[]; opts: object }[] = [];
 const calls: { argv: string[]; opts: object }[] = [];
 const fakeSpawn = (cmd: string, argv: string[], opts: object) => {
 	const child = new EventEmitter() as FakeChild;
 	child.kill = () => {};
 	void cmd;
+	allCalls.push({ argv, opts });
 	calls.push({ argv, opts });
 	return child;
 };
-/** 在下一 tick 让子进程"退出"，并可先写融合产物。 */
+const SECTIONS = [
+	"## 1. 采纳结论",
+	"## 2. 分歧与裁决",
+	"## 3. 证据核验",
+	"## 4. 不可采信项",
+	"## 5. 后续行动",
+	"## 6. 可复跑附录",
+];
+const SECTION_TEXT = SECTIONS.map((h) => `${h}\n内容`).join("\n\n");
+/** 首跑真实形状：「File written: …」是包在 message_end 的 assistant 正文里的（不是裸文本）。 */
+const fakeWriteClaimEvent = (): string => JSON.stringify({
+	type: "message_end",
+	message: { role: "assistant", content: [{ type: "text", text: 'File written: "C:/Users/Annacomnena/pi/agent/trace-fusion-runs/t1/fusion/fusion.md" (80 lines, 19KB).' }] },
+}) + "\n";
+const sectionEvent = (marker: string): string => JSON.stringify({
+	type: "message_end",
+	message: { role: "assistant", content: [{ type: "text", text: `${marker}\n${SECTION_TEXT}` }] },
+}) + "\n";
+
+/**
+ * 融合者交报告的真实形状（2026-11-03 首跑实测）：write/edit 被运行时排除 ⇒
+ * 报告正文从 stdout 的 assistant 消息里交回，由 harness 落盘。
+ * 首跑形状 = 回复只有「File written: …」（123 字符，路径还写丢了个点）⇒ 必须判 failed。
+ */
 const fakeSpawnThatFinishes = (produce: boolean, targetDir?: string) => (cmd: string, argv: string[], opts: object) => {
 	const child = fakeSpawn(cmd, argv, opts);
 	setImmediate(() => {
 		const runDir = targetDir ?? join(root, "run");
-		const out = join(runDir, "fusion", "fusion.md");
 		if (produce) {
-			mkdirSync(join(runDir, "fusion"), { recursive: true });
-			writeFileSync(out, "# 融合\n", "utf8");
+			// 2026-11-03 形状改造：融合者没有 write/edit 工具，报告正文从 stdout 交回、
+			// 由 harness 落盘 ⇒ 夹具不得再伪造「模型自己写了 fusion.md」。
+			void runDir;
+			const fd = (opts as { stdio: [unknown, number, number] }).stdio[1] as number;
+			writeFileSync(fd, sectionEvent("融合完成"), { fd });
 		}
 		child.emit("exit", 0);
 	});
+	return child;
+};
+/** exit=0，stdout 带 usage + 六节报告正文 ⇒ harness 应落盘。 */
+const fakeSpawnSections = (dir: string, withSections = true) => (cmd: string, argv: string[], opts: object) => {
+	const child = fakeSpawn(cmd, argv, opts);
+	const fd = (opts as { stdio: [unknown, number, number] }).stdio[1] as number;
+	writeFileSync(fd, JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }) + "\n", { fd });
+	writeFileSync(fd, withSections ? sectionEvent("融合完成") : fakeWriteClaimEvent(), { fd });
+	setImmediate(() => child.emit("exit", 0));
 	return child;
 };
 
@@ -63,6 +99,54 @@ try {
 	};
 	writeFileSync(join(root, "cli.js"), "", "utf8");
 
+	// ── 2026-11-03 首跑实测：完成判据 = exit 0 + 回复正文含六节（harness 落盘） ──
+	{
+		// 本块用独立 runsDir：后面的「未配置 ⇒ 零 spawn」断言数的是全局 calls，
+		// 夹具不能往共享账本里加 spawn 记录。
+		const dirCap = join(root, "runCapture");
+		const capRunsDir = join(root, "runs-capture");
+		const capCalls: Array<{ argv: string[]; opts: object }> = [];
+		const capSpawn = (inner: (c: string, a: string[], o: object) => FakeChild) => (c: string, a: string[], o: object) => {
+			const child = inner(c, a, o);
+			// 局部记账：本块额外记录，同时把写进全局 calls 的条目撤掉
+			//（后面的「未配置 ⇒ 零 spawn」断言数的是全局 calls）。
+			capCalls.push({ argv: a, opts: o });
+			calls.length = 0;
+			return child;
+		};
+		const r = await dispatchFusion({ ...base, runDir: dirCap, runsDir: capRunsDir, fusionModel: "m", spawnFn: capSpawn(fakeSpawnSections(dirCap, true)) as never });
+		assert.equal(r.status, "completed", `六节齐全必须 completed，实得 ${r.status} / ${r.reason}`);
+		const out = join(dirCap, "fusion", "fusion.md");
+		assert.ok(existsSync(out), "fusion.md 必须由 harness 落盘（融合者没有写工具）");
+		const body = readFileSync(out, "utf8");
+		for (const h of SECTIONS) assert.ok(body.includes(h), `落盘正文必须含「${h}」`);
+		const spawnedEnv = (capCalls[capCalls.length - 1] as { opts?: { env?: Record<string, string> } }).opts?.env ?? {};
+		assert.equal(spawnedEnv.PI_TRACE_FUSION_FUSION_DIR, join(dirCap, "fusion"), "spawn 必须把合法产物目录透传给融合子会话（守卫的合法落点）");
+	}
+	// 首跑真实失败形状：exit=0，回复只有「File written: …」（路径还写丢了个点）⇒ failed
+	{
+		const dirFake = join(root, "runClaimOnly");
+		const capRunsDir2 = join(root, "runs-claim-only");
+		const capCalls2: Array<{ argv: string[]; opts: object }> = [];
+		const capSpawn2 = (inner: (c: string, a: string[], o: object) => FakeChild) => (c: string, a: string[], o: object) => {
+			const child = inner(c, a, o);
+			capCalls2.push({ argv: a, opts: o });
+			calls.length = 0;
+			return child;
+		};
+		// 夹具：模型自称「File written: …」并补写了一节标题 ⇒ 缺 5 节，仍不得落盘/判成功
+		mkdirSync(join(dirFake, "fusion"), { recursive: true });
+		writeFileSync(join(dirFake, "fusion", "fusion.md"), "## 1. 采纳结论" + "\n" + "半截内容" + "\n", "utf8");
+		const r = await dispatchFusion({ ...base, runDir: dirFake, runsDir: capRunsDir2, fusionModel: "m", spawnFn: capSpawn2(fakeSpawnSections(dirFake, false)) as never });
+		assert.equal(r.status, "failed", `自称写了文件但没有报告正文，不得判成功，实得 ${r.status}`);
+		assert.equal(readFileSync(join(dirFake, "fusion", "fusion.md"), "utf8"), "## 1. 采纳结论" + "\n" + "半截内容" + "\n", "不合格正文不得覆盖已有文件（capture 必须整体拒写）");
+		assert.ok(/回复|正文|结构/.test(r.reason), `失败理由必须带回复形状（R-2 不得静默），实得 ${r.reason}`);
+		const before = capCalls2.length;
+		const again = await dispatchFusion({ ...base, runDir: dirFake, runsDir: capRunsDir2, fusionModel: "m", spawnFn: capSpawn2(fakeSpawnSections(dirFake, false)) as never });
+		assert.equal(again.status, "skipped", "失败后认领必须留在盘上（不得一失败就自动重烧模型）");
+		assert.equal(capCalls2.length, before, "跳过 ⇒ 零 spawn");
+	}
+
 	// ── ① 未设置 fusionModel ⇒ 零动作 ──
 	{
 		const r = await dispatchFusion({ ...base, fusionModel: undefined });
@@ -83,7 +167,11 @@ try {
 		assert.ok(p.includes("禁止派发 subagent"), "必须禁止递归派发");
 		assert.ok(p.includes("禁止 push"), "必须禁止 push");
 		assert.ok(p.includes("## 6. 可复跑附录"), "输出必须含可复跑附录");
-		assert.ok(p.includes("回复只要文件路径"), "必须要求路径优先");
+		// 2026-11-03 首跑实测后改形状：旧版要求「回复只要文件路径」，而融合者没有写工具
+		// ⇒ 它自称写了文件（123 字符，路径还写丢了个点）。现在正文本身就是交付物。
+		assert.ok(p.includes("全文写进最后一条回复正文"), "必须要求报告正文写在回复里（harness 据此落盘）");
+		assert.ok(p.includes("不要自己写文件"), "必须明令禁止自己写盘（首跑：它用 bash 重定向写到主仓外）");
+		assert.ok(!p.includes("回复只要文件路径"), "不得再要求路径优先（旧形状会诱导它谎称已写文件）");
 	}
 
 	// ── ②③ 派发形状 + 终态账本 + links 归属 ──
@@ -198,10 +286,9 @@ try {
 			const fd = o.stdio[1] as number;
 			writeFileSync(fd, JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 1000, output: 20, cacheRead: 500, cacheWrite: 0, cost: { total: 0.125 } } } }) + "\n", { fd });
 			writeFileSync(fd, JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 900, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.075 } } } }) + "\n", { fd });
-			setImmediate(() => {
-				writeFileSync(join(dirU, "fusion", "fusion.md"), "# fused", "utf8");
-				child.emit("exit", 0);
-			});
+			// usage 夹具也必须带六节正文：完成判据 = exit 0 + 正文结构（由 harness 落盘）
+			writeFileSync(fd, sectionEvent("融合完成"), { fd });
+			setImmediate(() => child.emit("exit", 0));
 			return child;
 		};
 		const r = await dispatchFusion({ ...base, runDir: dirU, fusionModel: "m", spawnFn: spawnWithLog as never });

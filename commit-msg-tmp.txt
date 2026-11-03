@@ -1,0 +1,50 @@
+trace-fusion: 融合交付形状改造（首跑实测：模型谎称已写文件 + 野路径写盘）
+
+根因（首跑 tfl-20261103-192444-c7e2 实测，三次融合尝试）：
+融合者被运行时排除 write/edit（只读强制），但提示词要求它「把 fusion.md 写出来」
+⇒ 它用 bash 重定向/tee 自己写盘，并把路径写丢了个点（`.pi` 写成 `pi`），落到主仓外；
+最后一条回复只有 123 字符的「File written: …」。判据当时只看「文件是否存在于期望路径」
+⇒ 正确地判 failed，但**没有任何机制阻止它写盘**，也没有机制把「正文不合格」与
+「盘上有旧产物」区分开。
+
+改了什么：
+1. **交付形状改为「回复正文 = 交付物，harness 落盘」**（fusion-dispatch.ts）
+   - `captureFusionReport()`：从 stdout json 流取最后一条 assistant 正文，校验六节
+     （`FUSION_REPORT_SECTIONS`：采纳结论/分歧与裁决/证据核验/不可采信项/后续行动/可复跑附录），
+     合格才 `writeFileSync(outputPath)`；不合格返回 shape（缺几节 + 首 120 字符）。
+   - 判据链：exit≠0 ⇒ failed；exit=0 且正文不合格 ⇒ failed（不落盘）；
+     合格且产物新鲜 ⇒ completed。旧版 `!existsSync(outputPath)` 才跑 capture
+     ⇒ 盘上有旧 fusion.md 时直接跳过校验，半截旧文件会被判 completed（夹具实测踩到）。
+   - spawn env 透传 `PI_TRACE_FUSION_FUSION_RUN` / `PI_TRACE_FUSION_FUSION_DIR`（守卫的合法落点）。
+2. **提示词**：删除「回复只要文件路径」（旧形状诱导谎称已写文件），改为
+   「全文写进最后一条回复正文 + 不要自己写文件」。
+3. **lane-bash-guard 写盘落点拦截**（首跑真实缺口）：
+   - `findStrayWriteTarget()` 识别 `>` / `>>` / `tee` / `dd of=` 的绝对写盘目标，
+     不在 artifactDir 内 ⇒ 拦截；只读命令（`grep /path/file`）放行（首版误拦 grep，已修）。
+   - 接线修复：这段原先写在 `if (isShell) { … return … }` **之后** ⇒ 对 bash 命令永不可达。
+     现在移到 return 之前，并给 NATIVE_SCAN 分支加 `!isShell` 防重复判定。
+   - index.ts 注册面覆盖 fusion 子会话（`isLane: isTraceWorker() || PI_TRACE_FUSION_FUSION_DIR`）。
+
+怎么验证：
+- 夹具按真实形状重做：「File written: …」包在 `message_end` 的 assistant 正文里（不是裸文本）
+  —— 旧夹具写裸文本，capture 根本不解析 ⇒ 变异全绿（假绿）。
+- 变异 6 条全部变红（plans/_mutate_fusion_capture.py，字节级还原 + sha256 核对）：
+  M28 摘掉 capture 内部落盘 / M29 摘掉六节判据 / M33 摘掉判据侧 capture 调用 /
+  M32 摘掉守卫写盘拦截（在 guard 套件测，不在 fusion 套件）/ M30 不透传合法产物目录 /
+  M31 提示词退回旧形状。
+- 全部 trace-fusion 套件 17/17 绿；全量 189 套件 177 绿 / 12 红
+  （12 条为改动前既有基线红，逐条同名：runtime-autonomy、expectations、graph-* 等）。
+
+首跑融合产物核验（真材料在野路径 `C:/Users/Annacomnena/pi/agent/…`，80 行六节齐全）：
+- 采纳结论正确：采纳 B/C 收敛的根因「collectLaneArtifacts 缺产物白名单校验」。
+- 引用核验：`citation-check.ts:198 ARTIFACT_NAMES` **真实存在且行号精确**；
+  `worker-prompt.ts:85-100` = artifact 契约（只定义 trajectory.md/validation.json）**真实**。
+- 幻觉：附录「artifacts.ts at base: ~28 行」= 假（实测 base 125b735 为 **293 行**）；
+  附录里的路径 `pi/packages/trace-fusion/citation-check.ts` 是拼出来的野路径（真路径在
+  `pi-packages/subagent-win/extensions/trace-fusion/`）。⇒ 小模型融合**结论层可用、附录数字不可信**。
+
+未闭合项：
+- 野路径产物（`C:/Users/Annacomnena/pi/agent/…`）尚未归档进 run 目录，本仓不自动删用户目录文件。
+- 六节判据只看标题存在，不校验节内内容 ⇒ 空壳六节仍可通过（下一轮加长度门）。
+- 12 条基线红测试仍未立案修复（`test:runtime-autonomy` 优先级最高）。
+- lane 模型 `lan-199/bonsai` 的采样参数已调，但发散性（三路根因多样性）仍待多次实测。
