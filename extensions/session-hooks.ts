@@ -46,7 +46,7 @@ export interface SessionHooksDeps {
 	 * ⇒ `tryResumeQueuedLane` 直接 return null ⇒ **追赶路径永远不会续发**
 	 * ⇒ run 卡在 running、待发 lane 永不派发（c2f5 的 lane C 就是这么饿死的）。
 	 */
-	traceResumePaths?: () => { wtExe?: string; piCli: string; runsDir?: string; tabRunsDir?: string };
+	traceResumePaths?: () => { wtExe?: string; piCli: string; runsDir?: string; tabRunsDir?: string; timersDir?: string };
 	/** 续发开标签页的 seam（测试注入 fake；缺省 = supervisor 内部的真实 spawnPiTab）。 */
 	traceSpawnTab?: SupervisorOptions["spawnTab"];
 }
@@ -104,6 +104,7 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			piCli: paths.piCli,
 			runsDir: paths.runsDir,
 			tabRunsDir: paths.tabRunsDir,
+			timersDir: paths.timersDir, // 测试隔离 seam（缺省走真实计时器目录）
 			spawnTab: deps.traceSpawnTab,
 		});
 		if (!catches.length) return;

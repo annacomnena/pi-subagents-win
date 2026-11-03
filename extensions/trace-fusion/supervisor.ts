@@ -25,6 +25,7 @@ import { readTabResultFile } from "../tab-runs.ts";
 import { spawnPiTab } from "../tab-launch-core.ts";
 import { readTraceFusionConfig } from "./config.ts";
 import { readLaneQueue, resumeQueuedLane, type ResumeQueuedLaneOutcome } from "./lane-queue.ts";
+import { defaultTimersDir, writeTimerAtomic } from "../timers.ts";
 import { readTraceRunMeta } from "./launch-workers.ts";
 import { isProcessAlive } from "../runtime/liveness.ts";
 import type { LaneFacts } from "./lane-facts.ts";
@@ -71,6 +72,15 @@ export interface SupervisorOptions {
 	spawnTab?: (opts: Parameters<typeof spawnPiTab>[0]) => ReturnType<typeof spawnPiTab>;
 	/** 会话身份 seam（测试注入）：不传则用真实的 sessionScopeKey()。 */
 	sessionScopeKey?: () => string | undefined;
+	/** 计时器目录 seam（测试注入）；缺省 = ~/.pi/agent/timers。 */
+	timersDir?: string;
+	/** meta 重读 seam（测试注入）；缺省 = 从盘上 readTraceRunMeta。续发的在飞数必须用重读值。 */
+	rereadMeta?: (runDir: string) => TraceRunMeta | null;
+	/**
+	 * 只供测试复现「调用方拿着取锁前的旧快照驱动续发」这一形状（2026-11-03 L4 M1）：
+	 * 生产不传。传了就用它当续发的入参 meta，验证在飞数仍取自盘上重读值。
+	 */
+	staleMetaForResume?: (hit: TraceRunMeta) => TraceRunMeta;
 }
 
 /** claim 新鲜阈值：超过视为陈进程遗留，可重新认领（覆盖 lane 墙钟上限 45min + cross-test 余量）。 */
@@ -108,16 +118,36 @@ function tryResumeQueuedLane(
 		// 跨进程互斥：抢不到 ⇒ 另一个会话正在续发这一条，本轮不重复派。
 		if (!tryClaimResume(hit.runDir, { now: opts.now })) return null;
 		const cfg = readTraceFusionConfig();
-		const resumed = resumeQueuedLane({
-			meta: hit,
+		let resumed: ResumeQueuedLaneOutcome = { resumed: false, reason: "empty" };
+		// claim 一律在 finally 释放（2026-11-03 L4 M1）：resumeQueuedLane 抛异常时旧版会把
+		// claim 占住 90s（实测 meta 形状异常就是在这里抛的），期间所有续发被锁死。
+		try {
+			resumed = resumeQueuedLane({
+			meta: opts.staleMetaForResume ? opts.staleMetaForResume(hit) : hit,
 			tabRunsDir,
 			concurrency: q.concurrency,
 			wtExe: opts.wtExe,
 			piCli: opts.piCli,
+			// 判活 seam：「unconfirmed 不得连锁续发」靠它验 tab 是否还活着
+			isAlive: opts.isAlive,
 			// 续发时**不看** per-call 覆盖（那份只属首次 launch 调用），只用 config。
 			workerModelFor: (lane) => cfg.workerModelByLane?.[lane] ?? cfg.workerModel,
+			rereadMeta: opts.rereadMeta,
 			spawnTab: opts.spawnTab ?? ((o) => spawnPiTab(o)),
 		});
+		} catch (e) {
+			return { outcome: { resumed: false, reason: "dispatch-failed", error: String((e as Error)?.message ?? e) } };
+		} finally {
+			// claim 一律在 finally 释放（成功派发、空跑、抛异常三种出口都释放，2026-11-03 L4）：
+			// · 旧版不释放 ⇒ no-capacity 空跑把 claim 占住 90s（RESUME_CLAIM_FRESH_MS），
+			//   lane 真正自报后合法续发被自己上一轮的空跑锁住；
+			// · 成功派发也不释放 ⇒ B 在 90s 内完成时，C 的续发被上一轮 claim 拦住，
+			//   而队列里的 C 不进分母 ⇒ 直接落进提前收集（run 被标 completed、C 永无机会）；
+			// · resumeQueuedLane 抛异常时旧版同样残留 claim（实测 meta 形状异常就在这里抛）。
+			// claim 的语义是「本次尝试的互斥」，派发结果已写进 lane-queue.json / meta，
+			// 无需靠残留 claim 防重复派。
+			releaseResumeClaim(hit.runDir, opts.now);
+		}
 		return resumed.resumed ? { outcome: resumed } : null;
 	} catch {
 		return null; // best-effort：续发失败不得阻断收集
@@ -151,6 +181,57 @@ function tryClaimResume(runDir: string, opts: { now?: () => number } = {}): bool
 		}
 	}
 	return false;
+}
+
+/**
+ * 释放自己持有的续发 claim（2026-11-03）：只删**本 pid 写的**那份，不得掠别人的 claim。
+ * 未派发成行时调用（no-capacity / empty / dispatch-failed）。
+ */
+function releaseResumeClaim(runDir: string, now?: () => number): void {
+	const claimPath = join(runDir, "resume.claim");
+	try {
+		const prev = JSON.parse(readFileSync(claimPath, "utf8")) as { pid?: number };
+		if (prev?.pid !== process.pid) return; // 不是自己的 ⇒ 不掠
+		rmSync(claimPath, { force: true });
+	} catch {
+		/* 尽力而为：删不掉就交给 90s 陈旧接管 */
+	}
+}
+
+
+/**
+ * 到期重评估计时器（2026-11-03 L4 M2）：把「墙钟期限已过、lane 仍未自报」这件事在到期后
+ * 再叫起来一次，而不是等下一次 lane 事件（不再产生文件的 lane 不会再来）。
+ * 幂等：同一 run 只排一条（文件存在即跳过）；写失败静默（不阻断本轮决策）。
+ */
+function scheduleDeadlineRecheck(meta: TraceRunMeta, visible: LaneFacts[], opts: SupervisorOptions): void {
+	try {
+		const waiting = visible.filter((f) => f.status === "unconfirmed" || f.status === "queued" || f.status === "dispatch-failed");
+		if (waiting.length === 0) return;
+		const own = (["A", "B", "C"] as const)
+			.map((l) => (meta.lanes[l] as { deadlineAt?: string } | undefined)?.deadlineAt)
+			.filter((x): x is string => !!x)
+			.map((x) => Date.parse(x))
+			.filter(Number.isFinite);
+		const runLevel = Date.parse(meta.laneDeadlineAt ?? "");
+		const candidates = [...own, ...(Number.isFinite(runLevel) ? [runLevel] : [])];
+		if (candidates.length === 0) return;
+		const dueAt = new Date(Math.min(...candidates) + 60_000); // 期限后 1 分钟复查
+		const dir = opts.timersDir ?? defaultTimersDir();
+		const id = `trace-recheck-${meta.runId}`;
+		if (existsSync(join(dir, `${id}.json`))) return;
+		writeTimerAtomic(dir, {
+			id,
+			version: 1,
+			dueAt: dueAt.toISOString(),
+			message: `trace-fusion run ${meta.runId} 到期复查：lane ${waiting.map((f) => f.lane).join("/")} 仍未自报（原因：${waiting[0].reason}）。请 tab-status 核实并按需用 /trace-fusion-clean 处置（注意：clean 只取消 run，不终止 lane 进程）。`,
+			target: "self",
+			source: "trace-fusion:deadline-recheck",
+			label: `trace-fusion ${meta.runId} deadline recheck`,
+		});
+	} catch {
+		/* best-effort */
+	}
 }
 
 /** collect-worker 入口脚本路径（与本模块同目录）。 */
@@ -234,10 +315,13 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 	// 旧 meta（无 laneStatus 且无队列）⇒ 三路全参与，零回归。
 	const participating = TRACE_LANES.filter((lane) => {
 		const f = facts.find((x) => x.lane === lane);
-		return f?.status === "done" || f?.status === "running";
+		return f?.status === "done" || f?.status === "running" || f?.status === "unconfirmed";
 	});
 	const expectedIds = participating.map((lane) => hit.lanes[lane].tabRunId).filter((id) => id !== "");
-	const done = expectedIds.filter((id) => existsSync(join(tabRunsDir, `${id}.result.json`))).length;
+	// `done` 与续发名额**必须同一源**（2026-11-03）：旧版这里自己数 `existsSync(result.json)`，
+	// 于是兜底生成的 unconfirmed 结果也算 done ⇒ 中止一条 lane 就连锁起下一条。
+	// 现只认 lane 自报终态（facts 里的 "done"，见 lane-facts.ts 的 isSelfReportedResult）。
+	const done = facts.filter((f) => f.status === "done" && expectedIds.includes(f.tabRunId)).length;
 
 	// ── laneConcurrency 续发（2026-10-30）：未全终态时才可能要派下一条 ──
 	// 队列文件不存在 ⇒ 历史全并发行为，本段零作用（不碰存量路径）。
@@ -259,8 +343,53 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 	}
 
 	const factsSummary = degradedFacts(facts);
+	// 活着的 unconfirmed lane 必须**出现在 progress 输出里**（2026-11-03 L4：旧版只带降级原因，
+	// 「A 回合结束未自报且 tab 活着 ⇒ 队列在等它」这件事对用户完全不可见，R-2 静默失效）。
+	const waitingFacts = facts.filter((f) => f.status === "unconfirmed").map((f) => ({
+		lane: f.lane,
+		tabRunId: f.tabRunId,
+		status: "unconfirmed" as const,
+		hasResult: f.hasResult,
+		reason: `回合已结束但 lane 未自报（tab 进程仍存活）：并发名额由它占用，队列在等它自报；可用 /trace-fusion-clean 处置`,
+	}));
 
-	if (done < expectedIds.length) return { isTrace: true, phase: "progress", runId: hit.runId, done, laneFacts: factsSummary };
+	// **仍有 lane 在队未派发 ⇒ 绝不收集**（2026-11-03 L4 实验验实）：旧版只看 participating，于是
+	// 「A 自报完 + B 自报完 + C 仍在待发队列」= participating 全 done ⇒ 直接起 collect，
+	// collect-cli 把 run 标 completed，C 永远没有派发机会（静默丢一路）。
+	// 判据取 facts 里真 `queued` 的 lane（meta 无 tabRunId 且在队列），**不是队列文件条数**：
+	// 队列里已派发/已跳过的条目不算待发，否则 2026-11-02 修好的「2/3 降级收集」会被重新锁死。
+	const stillQueued = facts.filter((f) => f.status === "queued");
+	if (stillQueued.length > 0) {
+		// 队列里还有未派发 lane ⇒ 同样要排到期重评估（时间流逝不会叫 supervisor）
+		scheduleDeadlineRecheck(hit, [...factsSummary, ...waitingFacts, ...stillQueued], opts);
+		return {
+			isTrace: true,
+			phase: "progress",
+			runId: hit.runId,
+			done,
+			laneFacts: [
+				...factsSummary,
+				...waitingFacts,
+				...stillQueued.map((f) => ({
+					lane: f.lane,
+					tabRunId: "",
+					status: "queued" as const,
+					hasResult: false,
+					reason: `仍在待发队列（未派发）：不得提前收集`,
+				})),
+			],
+		};
+	}
+
+	if (done < expectedIds.length) {
+		const visible = [...factsSummary, ...waitingFacts];
+		// 到期重评估必须自己排（2026-11-03 L4 M2 验实）：生产入口只有「结果事件」与
+		// session_start，时间流逝不会叫 supervisor ⇒ deadline 判据永远不会被重算，
+		// 队列会一直等一条不再产生文件的 lane。这里按最近的本 lane 期限写一条 self timer
+		// （同一 run 同一期限只排一次，写失败不阻断本轮决策）。
+		scheduleDeadlineRecheck(hit, visible, opts);
+		return { isTrace: true, phase: "progress", runId: hit.runId, done, laneFacts: visible };
+	}
 
 	// 参与 lane 已全部终态 ⇒ 可收集。有 lane 不可用（skipped/dispatch-failed/进程死）时
 	// 降级收集，并把降级原因写进 meta（不得静默，AGENTS.md R-2）。

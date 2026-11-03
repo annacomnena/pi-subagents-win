@@ -16,8 +16,11 @@ import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { readTabResultFile } from "../tab-runs.ts";
 import { recordLink } from "../links.ts";
+import { isProcessAlive } from "../runtime/liveness.ts";
+import { laneFacts, SLOT_FREE_STATUSES } from "./lane-facts.ts";
 import type { LaneId, TraceRunMeta } from "./types.ts";
 import { dispatchDiagnoseLane, readTraceRunMeta, writeLaneTimers, type TabSpawner } from "./launch-workers.ts";
+import { metaPath } from "./meta-path.ts";
 
 export interface LaneQueueFile {
 	/** 尚未派发的 lane（顺序即派发顺序）。 */
@@ -63,10 +66,25 @@ export function markLaneQueueDrained(runDir: string, concurrency: number): void 
 	writeFileSync(laneQueuePath(runDir), JSON.stringify({ lanes: [], concurrency }, null, 2) + "\n", "utf8");
 }
 
-/** 某 lane 是否已有终态 result（与 supervisor 的 done 判据同源）。 */
-function laneTerminal(tabRunsDir: string, tabRunId: string): boolean {
-	if (!tabRunId) return false;
-	return existsSync(join(tabRunsDir, `${tabRunId}.result.json`));
+/**
+ * 某 lane 是否已**释放并发名额**（2026-11-03 修复）。
+ *
+ * 旧版此处目分 = `existsSync(<tabRunId>.result.json)`，与 `supervisor.ts` 的 `done`
+ * 是**两份重复定义的判据**（正是任务书 ③ 要统一的那类重复）。
+ * 现统一取自 `lane-facts.ts` 的 `SLOT_FREE_STATUSES`（单一来源）：
+ * 自报终态才释放；**兜底生成的 unconfirmed 结果 + tab 还活着 ⇒ 不释放**（用户中止
+ * 一条不得连锁起下一条）；进程已死（pid 探活 ∨ 心跳超阈）才兜底释放。
+ */
+function laneTerminal(
+	meta: TraceRunMeta,
+	tabRunsDir: string,
+	lane: LaneId,
+	isAlive: (pid: number) => boolean,
+	now: () => number,
+): boolean {
+	const facts = laneFacts(meta, tabRunsDir, { now, isAlive });
+	const f = facts.find((x) => x.lane === lane);
+	return !!f && SLOT_FREE_STATUSES.has(f.status);
 }
 
 export interface ResumeQueuedLaneInput {
@@ -83,6 +101,8 @@ export interface ResumeQueuedLaneInput {
 	rereadMeta?: (runDir: string) => TraceRunMeta | null;
 	/** 溯源链接落盘路径（测试注入；缺省走 links.ts 默认）。 */
 	linksPath?: string;
+	/** 判活 seam（测试注入）；缺省 = 真实 pid 探活。用于「unconfirmed 不得连锁续发」的判据。 */
+	isAlive?: (pid: number) => boolean;
 }
 
 export type ResumeQueuedLaneOutcome =
@@ -100,24 +120,34 @@ export function resumeQueuedLane(input: ResumeQueuedLaneInput): ResumeQueuedLane
 	if (!q) return { resumed: false, reason: "no-queue" };
 	if (q.lanes.length === 0) return { resumed: false, reason: "empty" };
 
-	const inFlight = (Object.values(input.meta.lanes) as { tabRunId: string }[])
-		.filter((l) => l.tabRunId && !laneTerminal(input.tabRunsDir, l.tabRunId)).length;
+	const nowMs = input.now ? () => input.now!.getTime() : () => Date.now();
+	const isAlive = input.isAlive ?? isProcessAlive;
+	// 在飞数必须用**持锁后从盘上重读的 meta**（2026-11-03 L4 M1）：调用方传进来的 meta 是
+	// 取锁之前的快照。两个驱动者先后取锁时，第二个若用旧快照，会把「刚被第一个派出去的
+	// lane」当成未派发 ⇒ 在飞数算少 ⇒ 突破 laneConcurrency（串行实况变并行）。
+	const meta = (input.rereadMeta ?? readTraceRunMeta)(input.meta.runDir) ?? input.meta;
+	const inFlight = (Object.keys(meta.lanes) as LaneId[]).filter(
+		(lane) => !!meta.lanes[lane].tabRunId && !laneTerminal(meta, input.tabRunsDir, lane, isAlive, nowMs),
+	).length;
 	if (inFlight >= input.concurrency) return { resumed: false, reason: "no-capacity" };
 
 	const lane = q.lanes[0];
 	const now = input.now ?? new Date();
 	const wallMin = input.meta.laneWallClockMin;
-	const deadline = new Date(Date.parse(input.meta.laneDeadlineAt));
+	// **续发 lane 用自己的起跑期限**（2026-11-03 L4 M3 验实）：旧版直接复用 meta.laneDeadlineAt
+	// = 首发时刻 + wallMin。串行下 B 在 A 之后才起跑，继承的是 A 的期限 ⇒ B 的两个墙钟提醒
+	// 因已过期被跳过，B 第一次产生兜底结果就立刻被 deadline 判据释放名额（等于没给预算）。
+	const deadline = new Date(nowMs() + wallMin * 60_000);
 
 	const r = dispatchDiagnoseLane({
-		task: input.meta.task,
-		runId: input.meta.runId,
-		baseCommit: input.meta.baseCommit,
-		repoRoot: input.meta.repoRoot,
-		runDir: input.meta.runDir,
+		task: meta.task,
+		runId: meta.runId,
+		baseCommit: meta.baseCommit,
+		repoRoot: meta.repoRoot,
+		runDir: meta.runDir,
 		wallClockMin: wallMin,
 		lane,
-		shortId: input.meta.shortId,
+		shortId: meta.shortId,
 		repoName: input.meta.repoRoot.split(/[\\/]/).filter(Boolean).pop() ?? "repo",
 		workerModel: input.workerModelFor(lane),
 		now,
@@ -125,11 +155,36 @@ export function resumeQueuedLane(input: ResumeQueuedLaneInput): ResumeQueuedLane
 		piCli: input.piCli,
 		spawnTab: input.spawnTab,
 	});
-	if (!r.ok) return { resumed: false, reason: "dispatch-failed", error: r.error };
+	if (!r.ok) {
+		// 派发失败必须有出口（2026-11-03 L4 M4）：旧版直接返回 ⇒ 队首 lane 永久占位、
+		// meta 无终态、原因不可见，run 卡在 running（队列门又禁止收集）。
+		// 处置：把该 lane 记为 dispatch-failed 终态（进降级、不进分母）并移出队列，
+		// 让后面的 lane 有机会；失败原因由 degradedFacts 带到用户面前。
+		try {
+			const fresh = (input.rereadMeta ?? readTraceRunMeta)(input.meta.runDir);
+			if (fresh) {
+				const slot = fresh.lanes[lane] as Record<string, unknown>;
+				slot.laneStatus = "dispatch-failed";
+				slot.laneStatusReason = `续发派发失败：${r.error ?? "未知原因"}`;
+				writeFileSync(metaPath(input.meta.runDir), JSON.stringify(fresh, null, 2) + "\n", "utf8");
+				writeLaneQueue(input.meta.runDir, { lanes: q.lanes.slice(1), concurrency: q.concurrency });
+			}
+		} catch { /* 尽力：写不动就保持原状，下一次事件再试 */ }
+		return { resumed: false, reason: "dispatch-failed", error: r.error };
+	}
 
 	// 成功：移出队列 + 回写 meta 的 lane.tabRunId（供 collect 收集）+ 写计时器
 	const remaining = q.lanes.slice(1);
 	writeLaneQueue(input.meta.runDir, { lanes: remaining, concurrency: input.concurrency });
+	// 本 lane 的期限落盘到 lane 自己的槽位（F3/M3）：判定与提醒都读它，不再继承 run 级期限
+	try {
+		const freshForDeadline = (input.rereadMeta ?? readTraceRunMeta)(input.meta.runDir);
+		if (freshForDeadline) {
+			const lane2 = freshForDeadline.lanes[lane] as Record<string, unknown> & { deadlineAt?: string };
+			lane2.deadlineAt = deadline.toISOString();
+			writeFileSync(metaPath(input.meta.runDir), JSON.stringify(freshForDeadline, null, 2) + "\n", "utf8");
+		}
+	} catch { /* 尽力：缺 deadlineAt 时判定回退 run 级期限 */ }
 	writeLaneTimers(r.tabRunId, lane, deadline, now);
 
 	// 溯源必须写在**拿到真实 tabRunId 的这一刻**。2026-11-02 实测：旧做法在派发时给三路

@@ -30,6 +30,7 @@ import { checkDispatchTier, loadCostTiers, normalizeRoleTier, registerTiersComma
 import { litePromptLines, registerLiteCommand, type LiteMode } from "./lite-mode.ts";
 import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.ts";
 import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
+import { registerLaneBashGuard } from "./trace-fusion/lane-bash-guard.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import {
 	readTfBlock,
@@ -2580,6 +2581,11 @@ export default function (pi: ExtensionAPI) {
 	// 与 registerIdentityFlag 同时序约束：工厂内只注册不读值，消费点惰性读取。
 	registerCapabilityFlags(pi);
 
+	// lane（trace-worker）的 R-13 机械门（2026-11-03）：盘根递归扫描在提示词里已被禁，
+	// 实测 lane 仍跑了三次 `find /`（句柄 699,972）⇒ 禁令不够，落成 tool_call 拦截。
+	// 只影响 lane 会话（isLane=isTraceWorker）；主会话/普通 tab 零作用。
+	registerLaneBashGuard(pi, { isLane: () => isTraceWorker() });
+
 	// 子 agent 进程（嵌套 pi 会话）由 PI_SUBAGENT=1 标记：
 	// Fast-Path 彻底早退：跳过所有编排器组件、后台定时器、文件监听器与重型钩子，
 	// 消除子 agent 进程重复加载全量设施的冷启动与系统开销。
@@ -2619,6 +2625,9 @@ export default function (pi: ExtensionAPI) {
 	// async subagent 完成注入（0922）：监听 subagent-runs/，终态时向归属会话 followUp 唤醒
 	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
+	// trace-fusion progress 去重集（2026-11-03 L4 M2）：同一「run + lane 状态签名」只报一次
+	const TRACE_PROGRESS_SEEN = new Set<string>();
+
 	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）；
 	// trace-fusion lane tab 则由 supervisor 自动后台收集（不注入 reclaim 提示）
 	collect(registerEventBus(pi, {
@@ -2637,7 +2646,7 @@ export default function (pi: ExtensionAPI) {
 				const rest = outcome.remaining.length ? `，待发 ${outcome.remaining.join("/")}` : "，队列已空";
 				notifyFollowUpQuietly(
 					pi.sendUserMessage,
-					`🧬 trace-fusion run ${outcome.runId} 串行续发 lane ${outcome.lane} [${outcome.tabRunId}]${rest}。\n进度：/trace-fusion-status`,
+					`🧬 trace-fusion run ${outcome.runId} 串行续发 lane ${outcome.lane} [${outcome.tabRunId}]${rest}。\n产物：runDir/lanes/<lane>/trajectory.md`,
 					{ source: "index:trace-fusion", runId: outcome.runId },
 				);
 			} else if (outcome.phase === "started") {
@@ -2646,11 +2655,30 @@ export default function (pi: ExtensionAPI) {
 				// **不声称已送达**（无独立交付账本），但未确认/失败必留痕（`notifyFollowUpQuietly`）。
 				notifyFollowUpQuietly(
 					pi.sendUserMessage,
-					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。\n进度：/trace-fusion-status；报告：runDir/cross-test-report.md`,
+					`🧬 trace-fusion run ${outcome.runId} 三路终态，已后台启动 deterministic cross-test（零模型调用）。\n报告：runDir/cross-test-report.md`,
 					{ source: "index:trace-fusion", runId: outcome.runId },
 				);
+			} else if (outcome.phase === "progress") {
+				// progress 不能全静默（2026-11-03 L4 M2 验实）：旧版把「队列在等一条不再自报的
+				// 活 lane」「某条续发派发失败」「某条已越过墙钟期限」全部吞掉，用户只看到
+				// 迟迟没有后续通知。现在把原因报一次（按内容签名去重 ⇒ 同一事实不刷屏）。
+				const facts = outcome.laneFacts ?? [];
+				const notable = facts.filter((f) => f.status === "unconfirmed" || f.status === "queued" || f.status === "dispatch-failed" || f.status === "deadline" || f.status === "dead" || f.status === "terminal-no-result");
+				if (notable.length > 0) {
+					const sig = `${outcome.runId}|${notable.map((f) => `${f.lane}:${f.status}`).join(",")}`;
+					if (!TRACE_PROGRESS_SEEN.has(sig)) {
+						TRACE_PROGRESS_SEEN.add(sig);
+						notifyFollowUpQuietly(
+							pi.sendUserMessage,
+							`🧬 trace-fusion run ${outcome.runId} 进度：完成 ${outcome.done}/3。${notable.map((f) => `${f.lane}=${f.status}`).join(" ")}。
+${notable[0].reason}
+（人工处置：/trace-fusion-clean <runId>，注意它只取消 run、不终止 lane 进程）`,
+							{ source: "index:trace-fusion-progress", runId: outcome.runId },
+						);
+					}
+				}
 			}
-			// progress / busy / already-done：静默（无新事可报，重复注入只消耗 turn）
+			// busy / already-done：静默（无新事可报，重复注入只消耗 turn）
 			return true; // trace lane 消费（不注入 reclaim-tabs 提示）
 		},
 	}));

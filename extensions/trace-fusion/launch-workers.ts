@@ -203,7 +203,11 @@ function metaPath(runDir: string): string {
 export function readTraceRunMeta(runDir: string): TraceRunMeta | null {
 	if (!existsSync(metaPath(runDir))) return null;
 	try {
-		return JSON.parse(readFileSync(metaPath(runDir), "utf8")) as TraceRunMeta;
+		const meta = JSON.parse(readFileSync(metaPath(runDir), "utf8")) as TraceRunMeta;
+		// 兜底 runDir（2026-11-03 实验：meta 缺 runDir 时 supervisor 的 laneQueuePath 直接抛
+		// ERR_INVALID_ARG_TYPE，整条收集/续发链断掉）。目录就是现成的权威值，缺了就补。
+		if (meta && typeof meta === "object" && !meta.runDir) meta.runDir = runDir;
+		return meta;
 	} catch {
 		return null;
 	}

@@ -206,6 +206,9 @@ assert.deepEqual(commandNames, [
 //   · `message_update` x1 ← `runtime/streaming-snapshot-register.ts:41`（GUI 「正在思考」流式快照，Item 59）
 //   · `turn_start` x1 ← `runtime/streaming-snapshot-register.ts:96`（与 agent_start 同处循环）
 // 三者均未同步本快照 ⇒ eventNames 断言恒红。
+// 2026-11-03：`tool_call` x1 ← `trace-fusion/lane-bash-guard.ts`（经 index.ts 注册）。
+// 它是 lane 的 R-13 机械门（盘根递归扫描拦截），只在 trace-worker profile 生效。
+// 本快照是**追平事实**，不是放权：新增挂点必须在这里显式登记（同命令词表守卫的处置）。
 assert.deepEqual(eventNames, [
 	"agent_end",
 	"agent_settled",
@@ -220,6 +223,7 @@ assert.deepEqual(eventNames, [
 	"resources_discover",
 	"session_shutdown",
 	"session_start",
+	"tool_call",
 	"tool_execution_end",
 	"tool_execution_start",
 	"turn_start",

@@ -223,7 +223,9 @@
     "test:wechat-input": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_wechat_input.ts",
     "test:wechat-input-set": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_wechat_input_set.ts",
     "test:wechat-receive": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_wechat_receive.ts",
-    "test:ws-client": "node --experimental-strip-types ./extensions/_test_ws_client.ts"
+    "test:ws-client": "node --experimental-strip-types ./extensions/_test_ws_client.ts",
+    "test:trace-fusion-lane-bash-guard": "node --experimental-strip-types extensions/_test_trace_fusion_lane_bash_guard.ts",
+    "test:trace-fusion-wake-path": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_wake_path.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
