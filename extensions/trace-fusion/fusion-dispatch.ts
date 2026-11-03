@@ -183,9 +183,13 @@ export function fusionFileSections(
 export function captureFusionReport(
 	logPath: string,
 	outPath: string,
+	fromOffset = 0,
 ): { ok: true; bytes: number; shape: string } | { ok: false; shape: string } {
 	try {
-		const text = readFileSync(logPath, "utf8");
+		const text =
+			fromOffset > 0
+				? readFileSync(logPath).subarray(fromOffset).toString("utf8")
+				: readFileSync(logPath, "utf8");
 		let last: string | null = null;
 		for (const line of text.split("\n")) {
 			const t = line.trim();
@@ -330,6 +334,10 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 
 	const spawnFn = input.spawnFn ?? ((c, a, o) => spawn(c, a, o));
 	const outPath = join(input.runDir, "fusion", "fusion.stdout.log");
+	// 日志是 append（多次补跑共用一份，保留取证）⇒ 必须记下本次启动的字节偏移，
+	// 否则 capture 会把**上一次尝试**的正文当成本次结果（实测：attempt 5 刚跑 85s，
+	// 日志尾部仍是 attempt 4 的 591 字符谎报正文）。
+	const logStartOffset = existsSync(outPath) ? statSync(outPath).size : 0;
 	let child: ChildProcess;
 	let outFd: number | undefined;
 	try {
@@ -398,7 +406,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）。
 	const fresh = produced && statSync(outputPath).mtimeMs >= startedMs - 2_000;
 	const fileSections = fresh ? fusionFileSections(outputPath) : null;
-	const captured = exitCode === 0 && !fresh ? captureFusionReport(outPath, outputPath) : null;
+	const captured = exitCode === 0 && !fresh ? captureFusionReport(outPath, outputPath, logStartOffset) : null;
 	if (captured?.ok) fusionCaptured = captured.bytes;
 	let status: FusionStatus;
 	let reason: string;

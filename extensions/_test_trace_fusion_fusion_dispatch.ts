@@ -161,6 +161,27 @@ try {
 		assert.ok(r.reason.includes("回复 25 字符") || /缺 \d 节/.test(r.reason), `理由要带回复形状（R-2），实得 ${r.reason}`);
 		assert.ok(!existsSync(join(dirLie, "fusion", "fusion.md")), "不得凭空落盘");
 	}
+	// 跨尝试污染（append 日志）：上一次尝试的合格正文不得被当成本次结果
+	{
+		const dirX = join(root, "runCrossAttempt");
+		const runsX = join(root, "runs-cross-attempt");
+		mkdirSync(join(dirX, "fusion"), { recursive: true });
+		// 上一轮留下的日志：内含一份**六节齐全**的正文
+		writeFileSync(
+			join(dirX, "fusion", "fusion.stdout.log"),
+			JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: SECTION_TEXT }] } }) + String.fromCharCode(10),
+			"utf8",
+		);
+		const spawnNoBody = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			setImmediate(() => child.emit("exit", 0)); // 本次零正文
+			return child;
+		};
+		const r = await dispatchFusion({ ...base, runDir: dirX, runsDir: runsX, fusionModel: "m", spawnFn: spawnNoBody as never });
+		assert.equal(r.status, "failed", `本次没有正文，不得继承上一轮的正文判成功，实得 ${r.status}`);
+		assert.ok(!existsSync(join(dirX, "fusion", "fusion.md")), "不得把上一轮正文落盘成本轮产物");
+		assert.ok(/无 assistant 正文/.test(r.reason), `理由要写明本次无正文，实得 ${r.reason}`);
+	}
 	// 首跑真实失败形状：exit=0，回复只有「File written: …」（路径还写丢了个点）⇒ failed
 	{
 		const dirFake = join(root, "runClaimOnly");
