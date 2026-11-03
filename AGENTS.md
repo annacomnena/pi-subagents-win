@@ -266,3 +266,46 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
    **不得**直接下「越权」判断，更不得建议强制终止。
 2. 「任务内容触碰不可逆面」是**提示风险**的理由，不是**推定违规**的理由。
 3. 同理：用户与 tab 直连对话期间，该 tab 的产出**不归主会话账**，不要拿它去反推「谁绕过了约束」。
+
+---
+
+## R-16（2026-11-03）：junction 目录**禁止递归删除**；基线 worktree 用 `PI_NODE_MODULES_DIR`，不要 mklink
+
+### 事故（我造成的一次真实损坏，全过程与读数见 `plans/20261103_incident_junction_recursive_delete.md`）
+
+为做基线对照我跑了：
+
+```bash
+git worktree add -q ../wt-base 6f86b3b
+cmd //c "mklink /J ..\wt-base\node_modules  <主仓>\node_modules"
+git worktree remove ../wt-base        # ← 报 "failed to delete … Invalid argument"
+```
+
+`git worktree remove` 的递归删除**会穿过 junction 走进目标目录**。沿链删掉了主仓 `node_modules`
+里 junction 的**目标内容** = **全局 pi 安装**（本仓 `node_modules/@earendil-works/pi-coding-agent`
+与 `pi-tui` 实测 `LinkType=Junction`，指向 `C:\nvm4w\nodejs\node_modules\@earendil-works\...`）。
+
+后果实测：全局 `pi-coding-agent/dist/` 文件数 **0**（应 28）、嵌套包只剩 `pi-tui=5`、
+**`pi --version` 直接 module loader 报错**（CLI 起不来）、`health.mjs` 判 `UNHEALTHY`。
+
+### 规则
+
+1. **禁止对含 junction 的目录做递归删除**：`git worktree remove` / `rmdir /s /q` /
+   `fs.rmSync(..., {recursive:true})` / robocopy `/MIR`，都会穿 junction 删目标。
+   删目录前用 PowerShell 查 reparse 点（`Get-ChildItem -Force | Where Attributes -match ReparsePoint`），
+   有则先**只删链接**（`(Get-Item x).Delete()`），并认识到删链接也改变消费方视角。
+2. **基线/对照 worktree 复用依赖的正规做法 = 环境变量，不是 junction**：
+   `PI_NODE_MODULES_DIR=<主仓>\node_modules`（`scripts/ensure-pi-test-deps.mjs` 认它），
+   基线目录里**不建 junction**。这样递归删除最多删掉基线目录自己。
+3. **数 junction 里的文件不能用 MSYS `find`**——`find` 不穿 junction，会得到假的 0。
+   用 PowerShell `Get-ChildItem -Recurse -File` 或直接查 junction 目标路径。
+4. **`@earendil-works` 的布局事实（纠正 §14 环境事实里那句"已是真实副本"）**：
+   本仓 `node_modules/@earendil-works/{pi-coding-agent,pi-tui}` 是**由
+   `scripts/ensure-pi-test-deps.mjs` 创建的 junction**（指向 pi 安装树）。
+   **不要**用实体副本替换它们——脚本会判 `CONFLICT … refusing to replace an existing path`
+   ⇒ `smoke:wiki-nav` / `smoke:wiki-semantic` / `test:register-graph` 三条直接红（实测 3/3 稳定）。
+   依赖坏了的正确顺序：修**目标**（pi 安装树）→ 跑 `node scripts/ensure-pi-test-deps.mjs` 重建 junction
+   → 用 `plans/pi-corruption-diagnostics/health.mjs` 验收（R-14）。
+5. **从 `C:/pi-standalone` 复制实体修全局时：禁 `/MIR`**（运行中的 pi 持有旧文件）。
+   实测 `/E` 的 robocopy 会以 exit=9 结束，且唯一失败项是**在用的**
+   `pi-tui/native/win32/prebuilds/win32-x64/win32-platform.node`（EBUSY，该文件本就存在 ⇒ 无损失）。
