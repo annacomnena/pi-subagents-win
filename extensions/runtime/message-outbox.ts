@@ -132,6 +132,122 @@ export function outboxDir(stateDir: string): string {
 	return join(stateDir, "message-outbox");
 }
 
+// ── 目标会话死亡检测（B：静默卡死根治）───────────────────────
+//
+// 真机事故（2026-11-03）：3 条 GUI 消息卡在 pending 10 小时，界面只显示
+// 「已提交等待注入」。目标会话（01a18af1）00:22 后进程就没了，但 outbox 没有任何
+// 机制知道这件事—— `OUTBOX_PENDING_TTL_MS` 是 **24 小时**，而消费者
+// （`registerOutboxBridge` 挂在 session_start）只在目标会话**启动时**注册。
+//
+// 两层失效叠加：目标死了 ⇒ 没人取；TTL 24h ⇒ 很久才扫。中间的 10 小时里，
+// 用户看到的是「等待注入」，看不出任何异常。
+//
+// 修法：增加一条**快速路径**——目标会话确定已死 + 消息已等待超过宽限期
+// （缺省 10 分钟，避开正常重启窗口）⇒ 直接标 failed，并带上可读原因。
+// 界面上就能看到「目标会话已结束」而不是无限「等待中」。
+
+/**
+ * 目标会话死亡后，消息要等多久才判死（缺省 10 分钟）。
+ *
+ * 不能是 0：正常情况下用户重启会话需要时间（加载上下文、开新窗口），
+ * 消息应该在重启后由新进程取走。10 分钟足够盖住一次正常重启，又远短于 24h TTL。
+ */
+export const OUTBOX_TARGET_DEAD_GRACE_MS = 10 * 60 * 1000;
+
+/** 目标会话存活探针的抽象（便于测试注入；生产用 scope-liveness + 进程表）。 */
+export interface TargetLivenessProbe {
+	/** 三态：alive（确定活着）/ dead（确定死了）/ unknown（查不到，不判）。 */
+	state: "alive" | "dead" | "unknown";
+	/** 判定依据（可观测，便于排查）。 */
+	basis: string;
+}
+
+/**
+ * 扫描「目标会话已死」的 pending 项 → failed。
+ *
+ * 与 `sweepExpiredOutboxItems` 的分工：
+ * - expired = 时间维度（24h 到了，无论目标死活）
+ * - failed   = 因果维度（目标确实没了，消息永远送不到）
+ *
+ * 三条红线：
+ * 1. **只动 pending**（终态不可迁移，幂等）。
+ * 2. **不确定就不判**（`unknown` 一律跳过，绝不因探针失败冤枉活会话）。
+ * 3. **有宽限期**（`graceMs`，缺省 10min），避开正常重启窗口。
+ *
+ * never-throw：探针异常 / 写盘失败均静默跳过，不阻断消费循环。
+ */
+export function sweepTargetDeadOutboxItems(
+	dir: string,
+	opts: {
+		probe: (sessionId: string) => TargetLivenessProbe;
+		graceMs?: number;
+		now?: Date;
+		by?: string;
+		journalPath?: string;
+	} = {} as never,
+): OutboxItem[] {
+	const graceMs = opts.graceMs ?? OUTBOX_TARGET_DEAD_GRACE_MS;
+	const now = opts.now ?? new Date();
+	const by = opts.by ?? "runtime-host";
+	const failed: OutboxItem[] = [];
+	if (typeof opts.probe !== "function") return failed;
+
+	// 同一目标会话只探一次（多个 pending 项常指向同一会话；探针含进程表查询，不便宜）
+	const probeCache = new Map<string, TargetLivenessProbe>();
+
+	for (const it of listOutboxItems(dir)) {
+		if (it.status !== "pending") continue;
+		const age = now.getTime() - Date.parse(it.createdAt);
+		if (!Number.isFinite(age) || age <= graceMs) continue; // 宽限期内不动（可能是正常重启）
+
+		let p = probeCache.get(it.sessionId);
+		if (p === undefined) {
+			try {
+				p = opts.probe(it.sessionId);
+			} catch {
+				p = { state: "unknown", basis: "probe-threw" };
+			}
+			probeCache.set(it.sessionId, p);
+		}
+		// 只认「确定死了」；alive / unknown 一律跳过（不冤枉活会话）
+		if (p.state !== "dead") continue;
+
+		const reason = `目标会话已结束（${p.basis}），消息无法送达`;
+		const marked = markOutboxItem(dir, it.id, {
+			status: "failed",
+			at: now.toISOString(),
+			by,
+			error: reason.slice(0, 512),
+		});
+		if (marked === null) continue; // 竞态：恰被并发迁移 → 让位
+		failed.push(marked);
+		try {
+			const at = now.toISOString();
+			appendRuntimeEnvelopeSafe(
+				newEventEnvelope({
+					type: "message.failed",
+					source: piSessionAddress(it.sessionId),
+					subject: it.to,
+					at,
+					recordedAt: at,
+					payload: {
+						commandKey: it.commandKey,
+						outboxId: it.id,
+						sessionId: it.sessionId,
+						reason: "target-session-dead",
+						basis: p.basis,
+					},
+					dedupeKey: `message.failed:${it.id}`,
+				}),
+				opts.journalPath ?? defaultJournalPath(),
+			);
+		} catch {
+			/* safe wrapper 自吞，双保险 */
+		}
+	}
+	return failed;
+}
+
 /** item id = dedupeKey 的 SHA-256 hex（64 定长，跨平台文件名安全；同 commands/ 纪律）。 */
 export function outboxItemId(dedupeKey: string): string {
 	return createHash("sha256").update(dedupeKey, "utf8").digest("hex");

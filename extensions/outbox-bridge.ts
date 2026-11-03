@@ -55,9 +55,11 @@ import {
 	markOutboxItem,
 	outboxDir,
 	sweepExpiredOutboxItems,
+	sweepTargetDeadOutboxItems,
 	OUTBOX_PENDING_TTL_MS,
 	type OutboxItem,
 } from "./runtime/message-outbox.ts";
+import { probeTargetSessionLiveness } from "./runtime/outbox-target-liveness.ts";
 import { piSessionAddress } from "./runtime/address.ts";
 import { claimInjection, confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
 import { injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
@@ -78,6 +80,13 @@ export interface ConsumeOutboxOptions {
 	sourceLabel?: string;
 	/** pending TTL（缺省 24h；测试注入更短触发 expired 扫描）。 */
 	pendingTtlMs?: number;
+	/**
+	 * 【B】目标会话已死的宽限期（缺省 10min）。
+	 *
+	 * 消息等超过这个时长，且目标会话确定已死 ⇒ 直接标 failed(reason=target-session-dead)，
+	 * 不再干等 24h TTL。宽限期是为了不冤枉「正在重启」的正常场景。
+	 */
+	targetDeadGraceMs?: number;
 	/** 交付账本目录（C-3；缺省 defaultDeliveryDir()，测试注入隔离目录）。 */
 	deliveryDir?: string;
 	now?: Date;
@@ -282,6 +291,35 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 		}
 	} catch {
 		/* 扫描失败不阻塞投递 */
+	}
+	// 【B】目标会话已死的快速路径。
+	//
+	// 24h TTL 太慢：真机上 3 条消息卡了 10 小时，界面只显示「已提交等待注入」。
+	// 这里每 tick 扫一遍 pending，对**已过宽限期**的项探一下目标是否还活；确定死了就标 failed。
+	//
+	// 三个关键的“不”：
+	// - 不探宽限期内的（<10min，避开正常重启窗口）
+	// - 不确定不判（probe 返 unknown ⇒ 跳过，绝不巩枉活会话）
+	// - 只标非本会话的（自己的 pending 项走正常投递逻辑，不在这被杀）
+	try {
+		const failed = sweepTargetDeadOutboxItems(dir, {
+			probe: (sid: string) => {
+				if (sid === opts.sessionId) return { state: "alive", basis: "self" }; // 自己肯定活着
+				return probeTargetSessionLiveness(sid, {
+					...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
+					...(opts.now !== undefined ? { now: opts.now } : {}),
+				});
+			},
+			...(opts.now !== undefined ? { now: opts.now } : {}),
+			...(opts.targetDeadGraceMs !== undefined ? { graceMs: opts.targetDeadGraceMs } : {}),
+			journalPath: opts.journalPath,
+			by: holderOf(opts.sessionId),
+		});
+		for (const f of failed) {
+			report.consumed.push({ outboxId: f.id, action: "failed", reason: `目标会话已结束：${f.error ?? "unknown"}` });
+		}
+	} catch {
+		/* 探测失败不阻塞投递（宁漏不枉） */
 	}
 	const items = listOutboxItems(dir).filter((it) => it.to === myAddress && it.status === "pending");
 	const now = (): string => (opts.now ?? new Date()).toISOString();
