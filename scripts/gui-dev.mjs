@@ -23,7 +23,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import process from "node:process";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -113,7 +113,16 @@ function spawnHost() {
 	return new Promise((resolvePromise) => {
 		let child;
 		try {
-			child = spawn(process.execPath, ["--experimental-strip-types", SERVER_TS], {
+			// 【必须带 --import pi-deps-loader.mjs】
+			//
+			// server.ts 依赖 pi-deps-loader 才能解析宿主的裸导入（`@earendil-works/pi-coding-agent`
+			// 等）。不带 loader ⇒ 进程启动即静默死（stdio:"ignore" 把错误吞了），
+			// 表现就是“代启失败：timeout 8000ms：host.json 未就绪”，而 GUI 永远起不来。
+			//
+			// 真机事故（2026-11-03）：本脚本一直缺这个参数 ⇒ `npm run gui:dev` 100% 启动失败。
+			// 其他入口（package.json 的 test:* 脚本、本地调试命令）都带了 loader，只有这里漏了。
+			const DEPS_LOADER = pathToFileURL(join(REPO_ROOT, "extensions", "runtime-host", "pi-deps-loader.mjs")).href;
+			child = spawn(process.execPath, ["--experimental-strip-types", "--import", DEPS_LOADER, SERVER_TS], {
 				detached: true,
 				stdio: "ignore",
 				cwd: dirname(SERVER_TS),

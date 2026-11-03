@@ -99,6 +99,19 @@ export function acquireRuntimeLock(
 	entry: RuntimeLock,
 ): { acquired: boolean; existing: RuntimeLock | null } {
 	const body = `${JSON.stringify(entry, null, 2)}\n`;
+	// 【必须保证父目录存在】
+	//
+	// `openSync(path, "wx")` 在父目录不存在时抛 **ENOENT**，而不是 EEXIST。
+	// 旧实现把「非 EEXIST」一律当成「没拿到锁」，于是调用方（acquireDaemonLockOrThrow）
+	// 会一直重试到 waitMs 超时，报出一句完全误导的「单实例锁竞争超时」。
+	//
+	// 真机事故（2026-11-03）：`npm run gui:dev` 用全新的 runtime-dev 目录 ⇒ 目录不存在
+	// ⇒ 100% 启动失败，错误信息指向「锁竞争」而不是「目录缺失」，排查了很久。
+	try {
+		mkdirSync(dirname(lockPath), { recursive: true });
+	} catch {
+		/* 建不了目录也会在下面 openSync 里暴露真实错误 */
+	}
 	try {
 		const fd = openSync(lockPath, "wx", 0o600);
 		try {
