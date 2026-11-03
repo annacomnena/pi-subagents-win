@@ -47,7 +47,7 @@
  */
 
 import { join } from "node:path";
-import { existsSync, mkdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./runtime/journal.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import {
@@ -128,6 +128,50 @@ export interface OutboxConsumeReport {
 /** 注入互斥键（receipts 命名空间内 outbox: 前缀，与 run-/msg:/cmd: 键形不重叠）。 */
 function claimKeyFor(item: OutboxItem): string {
 	return `outbox:${item.id}`;
+}
+
+/**
+ * 历史 eventId 的 consumed ACK 兼容查找（C-4）。
+ *
+ * 背景：`terminalRevision` 曾经把 `item.text` 算进哈希 ⇒ 正文一变 eventId 就变 ⇒
+ * 旧 eventId 上的 `.ack.consumed` 再也匹配不上 ⇒ outbox 永远 pending。
+ * 真机：msg `c945db9f` 空转 5153 条 / 12 小时。
+ *
+ * 本次已把 `text` 从哈希里拿掉（新 eventId 稳定），但磁盘上**存量** event 仍是旧算法算的。
+ * 这里枚举同 `runId` 的所有历史 event，只要任一个带 consumed ACK 就算交付成立。
+ *
+ * 安全边界：
+ * - 只认 `runId === outbox_<itemId>` 的 event ⇒ 不可能跨消息误认。
+ * - 只认 `stage === "consumed"` ⇒ 仍然不把「收据/sent」当交付（C-3 不变）。
+ * - 失败一律 false（never-throw）⇒ 查不到就走正常投递路径。
+ */
+function legacyConsumedAckFor(dDir: string, itemId: string, currentEventId: string): boolean {
+	const runId = `outbox_${itemId}`;
+	const prefix = `async:${runId}:`;
+	let files: string[];
+	try {
+		files = readdirSync(dDir);
+	} catch {
+		return false;
+	}
+	for (const f of files) {
+		if (!f.endsWith(".json") || f.includes(".ack.") || f.includes(".attempt.")) continue;
+		let ev: { eventId?: string; runId?: string };
+		try {
+			ev = JSON.parse(readFileSync(join(dDir, f), "utf8")) as { eventId?: string; runId?: string };
+		} catch {
+			continue;
+		}
+		if (ev.runId !== runId) continue;
+		const eid = ev.eventId;
+		if (!eid || eid === currentEventId || !eid.startsWith(prefix)) continue;
+		try {
+			if (listAcks(dDir, eid).some((a) => a.stage === "consumed")) return true;
+		} catch {
+			/* 单个 event 的 ACK 读失败不阻断其它候选 */
+		}
+	}
+	return false;
 }
 
 /**
@@ -260,9 +304,19 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 			try {
 				const { event } = ensureEvent(dDir, {
 					runId: `outbox_${item.id}`,
+					// 【C-4 修 eventId 不稳定】terminalRevision 曾把 `text` 算进去 ⇒ 正文一改
+					// （重试时重写、截断、前缀拼接等）哈希就变 ⇒ eventId 变 ⇒ 旧 eventId 上的
+					// `.ack.consumed` 再也匹配不上 ⇒ outbox 永远 pending ⇒ 每 10s 空转一条
+					// `message.received(replayed)` journal。真机铁证：msg c945db9f 在 12 小时内
+					// 空转 5153 条（events.jsonl 涨到 4.6MB），而它的 ACK 一直躺在
+					// `...d0bd209ba7621a7b.ack.consumed...` 里没人看。
+					//
+					// 修法：outbox 项的**身份**是 outboxId，不是正文。terminalRevision 只取
+					// 「终态不变的东西」——runId 已含 item.id，这里再锁定 status + outboxId 即可。
+					// 正文改动不应让「同一条消息」变成另一个事件（事件语义 = 这条消息到达）。
 					terminalRevision: terminalRevisionOf({
-						status: "pending", endedAt: terminalAt,
-						result: { status: "pending", text: item.text, outboxId: item.id },
+						status: "pending",
+						result: { status: "pending", outboxId: item.id },
 					}),
 					terminalSnapshotPath: join(dir, `${item.id}.json`),
 					dispatcherSessionId: opts.sessionId,
@@ -274,9 +328,17 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 
 			// **ACK 驱动闭环（C-3 核心）**：既有 `consumed` ACK ⇒ 交付成立，补写 delivered。
 			// 这是唯一**不**依赖 send 返回值的成功路径，也是「unconfirmed 之后崩溃」的收敛点。
+			//
+			// 【C-4】上面修了 terminalRevision 之后，新 eventId 才是稳定的；但磁盘上已有
+			// 大量**旧算法算出的 eventId**（含 text 哈希）挂着真 ACK。只看新 eventId 会让
+			// 这些历史 ACK 永远匹配不上（就是本次 12 小时空转的直接机制）。
+			// 因此：先查新 eventId，未命中再扫同 runId 的所有历史 event 取 ACK。
+			// runId = `outbox_<id>` 是固定的，可枚举；命中即收敛，只需一次。
 			if (eventId) {
 				try {
-					if (listAcks(dDir, eventId).some((a) => a.stage === "consumed")) {
+					const seen = listAcks(dDir, eventId).some((a) => a.stage === "consumed")
+						|| legacyConsumedAckFor(dDir, item.id, eventId);
+					if (seen) {
 						const marked = markOutboxItem(dir, item.id, { status: "delivered", at: now(), by: holderOf(opts.sessionId) });
 						if (marked !== null) appendBridgeJournalEvent("message.delivered", item, opts, { replayed: true });
 						report.consumed.push({ outboxId: item.id, action: "delivered", reason: "ack-consumed" });
