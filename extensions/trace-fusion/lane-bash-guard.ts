@@ -198,6 +198,27 @@ export function findStrayWriteTarget(command: string, artifactDir: string): stri
 	return undefined;
 }
 
+/**
+ * 原生写工具（write/edit）的落点越界判据（2026-11-03 第四次实测后新增）。
+ * 形状：融合者现在**有** write 工具（禁写实测拦不住交付：第 3 次用 bash 野写，
+ * 第 4 次直接谎报「报告已完成，185 行六节齐全」），因此落点必须由机械门锁到本 run 产物目录。
+ * 只识别绝对路径（相对路径落在 cwd，本层无法可靠归一 ⇒ 放行）。
+ */
+export function findStrayWriteToolTarget(
+	toolName: string,
+	input: Record<string, unknown> | undefined,
+	artifactDir: string,
+): string | undefined {
+	if (toolName !== "write" && toolName !== "edit") return undefined;
+	const raw = input?.path ?? input?.filePath ?? input?.file_path;
+	if (typeof raw !== "string" || !raw.trim()) return undefined;
+	if (!/^([a-z]:[\\/]|\/)/i.test(raw.trim())) return undefined;
+	const norm = (p: string): string => p.split("\\").join("/").replace(/\/+$/, "").toLowerCase();
+	const dir = norm(artifactDir);
+	const n = norm(raw.trim());
+	return n === dir || n.startsWith(dir + "/") ? undefined : raw.trim();
+}
+
 export interface LaneBashGuardOptions {
 	/** 当前会话是不是 trace lane（缺省 = 永不拦，防止注册到主会话时误杀）。 */
 	isLane?: () => boolean;
@@ -224,6 +245,18 @@ export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unkn
 		const event = eventRaw as { toolName?: string; input?: Record<string, unknown> };
 		if (!isLane()) return undefined;
 		const name = String(event?.toolName ?? "");
+		// 原生写工具落点锁（融合者有 write，但只能写本 run 产物目录）
+		if (opts.artifactDir && (name === "write" || name === "edit")) {
+			const strayTool = findStrayWriteToolTarget(name, event.input, opts.artifactDir);
+			if (strayTool !== undefined) {
+				return {
+					block: true,
+					reason:
+						`写盘落点越界拦截：${name} 工具目标「${strayTool}」不在本 run 的产物目录内（${opts.artifactDir}）。` +
+						`融合报告只能写进该目录（主仓与用户目录均不可写）。`,
+				};
+			}
+		}
 		const isShell = name === "bash" || name === "powershell";
 		if (isShell) {
 			const command = String((event.input as { command?: string } | undefined)?.command ?? "");

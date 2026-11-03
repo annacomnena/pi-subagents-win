@@ -42,9 +42,12 @@ export const FUSION_EXCLUDE_TOOLS = [
 	"trace-fusion",
 	"tab-finish",
 	"tab-report",
-	// 2026-11-02 #1 安全边界：**运行时**只读强制。旧版只有提示词里写「只读」，
-	// write/edit 仍然可用 ⇒ 提示词被无视时无兼平。工具直接不存，才是硬约束。
-	"write",
+	// 2026-11-02 #1 安全边界：**运行时**只读强制（旧版只有提示词里写「只读」，无兼平）。
+	// 2026-11-03 首跑四次实测后的修正：完全禁写 ⇒ 小模型交不出报告。
+	//   第 3 次：它用 bash 重定向写盘（写到主仓外）；第 4 次：它回复「报告已完成，185 行，六节齐全」
+	//   ——而它根本没有写工具 ⇒ 谎报。禁写没有消除写盘行为，只是把交付变成幻觉。
+	// ⇒ 形状改为：**给 write，但落点由 lane-bash-guard 锁到本 run 的产物目录**（仓内一律不可写）；
+	//   edit 仍禁止（edit 能改仓内已有文件，write 只能造新文件且落点受控）。
 	"edit",
 ];
 
@@ -159,6 +162,24 @@ export function parseFusionUsage(logPath: string, maxBytes = 8_000_000): FusionU
  * 在主仓外造出野文件。现形状：报告正文经 stdout 交回，由 harness 落到指定路径。
  * 不合格 ⇒ 不落盘，返回形状描述（供失败理由，R-2 不得静默）。
  */
+/**
+ * 产物文件的六节齐全度（交付主通道的验收判据）。
+ * 只数标题存在：空壳六节仍可通过（已知未闭合，下一轮加每节长度门）。
+ */
+export function fusionFileSections(
+	path: string,
+): { ok: true; bytes: number } | { ok: false; missing: string[] } {
+	try {
+		const body = readFileSync(path, "utf8");
+		const missing = FUSION_REPORT_SECTIONS.filter((h) => !body.includes(h));
+		return missing.length === 0
+			? { ok: true, bytes: Buffer.byteLength(body, "utf8") }
+			: { ok: false, missing };
+	} catch {
+		return { ok: false, missing: ["产物不可读"] };
+	}
+}
+
 export function captureFusionReport(
 	logPath: string,
 	outPath: string,
@@ -220,15 +241,15 @@ export function buildFusionPrompt(i: {
 		`- **可执行证据压过自报置信度**：报告「Validation 复跑」段里 \`声称pass实测失败\` 计数高的 lane，其自报结论必须显式降级并写明降级理由；复跑通过项可作为事实引用。`,
 		`- **引用越界即不可引用原文**：报告「行号引用越界校验」段列出的越界引用，**不得原样引用其结论**；需要该证据就自己重新定位并给出你在基点上核过的行。`,
 		`- 结论必须给出：采纳什么 / 拒绝什么 / 为什么（按证据强度，不按票数）；分歧的裁决方式（可复核的判据，不是「两票对一票」）。`,
-		`- **只读**：禁止修改任何代码文件、禁止 git 写操作、禁止装包、禁止 push、禁止派发 subagent 或开标签页。`,
+		`- **只读仓库**：禁止修改任何代码文件、禁止 git 写操作、禁止装包、禁止 push、禁止派发 subagent 或开标签页。`,
 		`  命令只用于只读核验（read / git show / grep / 只读脚本）。`,
-		`- **不要自己写文件**：你没有 write/edit 工具，也不要用 shell 重定向写盘`,
-		`  （实测有融合者用 printf 重定向写报告，把路径写丢了个点，在主仓外造出野文件）。`,
-		`  报告由调用方（harness）从你的**回复正文**落盘到 \`${i.outputPath}\`。`,
+		`- **写盘只允许一个路径**：你唯一可写的文件是 \`${i.outputPath}\`（本 run 的产物目录）。`,
+		`  任何其他路径（仓内、用户目录、把 \`.pi\` 写成 \`pi\` 这种拼错的野路径）都会被机械门当场拦下——`,
+		`  实测有融合者用 printf 重定向写报告，把路径写丢了个点，在主仓外造出野文件。`,
 		``,
-		`## 输出（写在回复正文里）`,
+		`## 输出`,
 		``,
-		`把你的融合报告**全文写进最后一条回复正文**（调用方会原样落盘到 \`${i.outputPath}\`）。六节固定标题：`,
+		`把融合报告**用 write 工具写入 \`${i.outputPath}\`**（这是交付物，不落盘就判失败）。六节固定标题：`,
 		`1. \`## 1. 采纳结论\`（含每条的证据出处与复跑/越界读数）`,
 		`2. \`## 2. 分歧与裁决\``,
 		`3. \`## 3. 证据核验\`（你实际跑过的核验命令与结果）`,
@@ -236,7 +257,8 @@ export function buildFusionPrompt(i: {
 		`5. \`## 5. 后续行动\`（有序、可验收，标明涉及的文件）`,
 		`6. \`## 6. 可复跑附录\`（逐条命令 + 期望读数，任何人都能重跑）`,
 		``,
-		`不要只给文件路径或摘要——正文本身就是交付物，摘要会被当成不完整结果。工作目录 \`${i.repoRoot}\`。`,
+		`写完后回复只要：文件路径 + ≤10 行摘要。**不得声称「报告已完成/已写入」而没有真的调用 write 工具**`,
+		`（实测有融合者回复「报告已完成，185 行六节齐全」而盘上零产物 ⇒ 判失败并白烧一次模型）。工作目录 \`${i.repoRoot}\`。`,
 	].join("\n");
 }
 
@@ -370,12 +392,14 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	// 融合者交报告的唯一通道 = 回复正文（它没有 write/edit 工具）：exit=0 就**必定**跑一次
 	// 六节校验。旧版写成 `!existsSync(outputPath)` 才校验 ⇒ 盘上有旧 fusion.md 时直接跳过，
 	// 半截旧文件会被当成本次结果判 completed（夹具实测踩到）。
-	const captured = exitCode === 0 ? captureFusionReport(outPath, outputPath) : null;
-	if (captured?.ok) fusionCaptured = captured.bytes;
+	// 交付主通道 = 融合者自己用 write 写 outputPath（落点由机械门锁死）；
+	// stdout 正文作为兼平通道（它写不了盘时至少能报出正文）。
 	const produced = existsSync(outputPath);
 	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）。
-	// 由 harness 落盘的那条当然新鲜；旧版模型自写的文件仍由本判据兜住。
-	const fresh = produced && (fusionCaptured !== null || statSync(outputPath).mtimeMs >= startedMs - 2_000);
+	const fresh = produced && statSync(outputPath).mtimeMs >= startedMs - 2_000;
+	const fileSections = fresh ? fusionFileSections(outputPath) : null;
+	const captured = exitCode === 0 && !fresh ? captureFusionReport(outPath, outputPath) : null;
+	if (captured?.ok) fusionCaptured = captured.bytes;
 	let status: FusionStatus;
 	let reason: string;
 	if (outcome === "timeout") {
@@ -389,19 +413,25 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	} else if (exitCode !== 0) {
 		status = "failed";
 		reason = `子进程非零退出（exit=${exitCode ?? `signal ${exitSignal ?? "?"}`}），不得计为融合成功`;
-	} else if (!captured?.ok) {
-		// 正文不合格（首跑真实形状 = 自称写了文件）。陈旧产物单独立案，理由必须写明两件事。
-		status = "failed";
-		reason = `回复正文不合格（${captured?.shape ?? "无 assistant 正文"}），不落盘不判成功；详见 ${outPath}`
-			+ (produced && !fresh
-				? `；盘上另有早于本次启动的旧产物 mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()}（陈旧产物，不得计为本次结果）`
-				: "");
-	} else if (!produced) {
-		status = "failed";
-		reason = "子进程 exit=0 且正文合格，但产物未落盘（异常形状，必须查）";
-	} else {
+	} else if (fileSections?.ok) {
 		status = "completed";
-		reason = `融合产物已生成：${outputPath}`;
+		reason = `融合产物已由融合者写入：${outputPath}（${fileSections.bytes} 字节，六节齐全）`;
+	} else if (captured?.ok) {
+		status = "completed";
+		reason = `融合者未写盘，已由 harness 从回复正文落盘：${outputPath}（${fusionCaptured} 字节）`;
+	} else if (fresh) {
+		// 写了盘但六节不齐 ⇒ 不得拿半截报告当结果
+		status = "failed";
+		reason = `产物已写但六节不齐（缺 ${fileSections?.missing.join(" / ")}），不得计为融合结果`;
+	} else {
+		// 第四次实测的真实形状：exit=0 + 回复「报告已完成，185 行六节齐全」+ 盘上零产物 ⇒ 谎报
+		status = "failed";
+		reason =
+			`融合者未产出产物（盘上无本次新鲜 fusion.md），回复正文也不合格（${captured?.shape ?? "无 assistant 正文"}）。` +
+			`不得拿口头报告当结果；详见 ${outPath}` +
+			(produced && !fresh
+				? `；盘上另有早于本次启动的旧产物 mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()}（陈旧产物，同样不得计为本次结果）`
+				: "");
 	}
 	writeRunRecord(runsDir, fusionRunId, {
 		id: fusionRunId,

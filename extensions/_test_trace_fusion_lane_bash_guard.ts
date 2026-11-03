@@ -15,6 +15,7 @@ import {
 	isRootishTarget,
 	judgeLaneBashCommand,
 	registerLaneBashGuard,
+	findStrayWriteToolTarget,
 } from "./trace-fusion/lane-bash-guard.ts";
 
 const repoRoot = process.cwd();
@@ -138,6 +139,16 @@ const stray = callToolCall({ command: 'cat x | tee "C:/Users/Annacomnena/pi/agen
 assert.equal(stray?.block, true, "写到 artifactDir 之外的绝对路径必须拦");
 const inPlace = callToolCall({ command: 'echo hi > "/repo/run/fusion/notes.md"' });
 assert.equal(inPlace, undefined, "写进合法产物目录必须放行");
+
+// 原生 write 工具的落点锁（2026-11-03 第四次实测后：禁 write 拦不住交付 ⇒ 给 write 但锁落点）
+assert.equal(findStrayWriteToolTarget("write", { path: "C:/Users/x/.pi/agent/trace-fusion-runs/r/fusion/fusion.md" }, "C:/Users/x/.pi/agent/trace-fusion-runs/r/fusion"), undefined);
+assert.equal(findStrayWriteToolTarget("write", { path: "C:/Users/x/pi/agent/trace-fusion-runs/r/fusion/fusion.md" }, "C:/Users/x/.pi/agent/trace-fusion-runs/r/fusion"), "C:/Users/x/pi/agent/trace-fusion-runs/r/fusion/fusion.md", "把 .pi 写成 pi 的野路径必须识别");
+assert.equal(findStrayWriteToolTarget("write", { path: "plans/x.md" }, "C:/run/fusion"), undefined, "相对路径交给 cwd 约束，不在本层拦");
+assert.equal(findStrayWriteToolTarget("read", { path: "C:/Windows/x" }, "C:/run/fusion"), undefined, "只读工具不在本层拦");
+const wBlock = callToolCall({ path: "C:/Users/Annacomnena/evil.md" }, "write");
+assert.equal(wBlock?.block, true, "注册线必须真的 block 越界 write");
+const wAllow = callToolCall({ path: "/repo/run/fusion/fusion.md" }, "write");
+assert.equal(wAllow, undefined, "写进合法产物目录的 write 必须放行");
 
 // 原生 find 工具：目标为盘根也拦；仓库内路径放行
 assert.equal(callToolCall({ path: "/", query: "cli.js" }, "find")?.block, true, "原生 find 工具盘根目标必须拦");

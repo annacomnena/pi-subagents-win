@@ -123,6 +123,44 @@ try {
 		const spawnedEnv = (capCalls[capCalls.length - 1] as { opts?: { env?: Record<string, string> } }).opts?.env ?? {};
 		assert.equal(spawnedEnv.PI_TRACE_FUSION_FUSION_DIR, join(dirCap, "fusion"), "spawn 必须把合法产物目录透传给融合子会话（守卫的合法落点）");
 	}
+	// 2026-11-03 第四次实测后的交付主通道：融合者自己用 write 写产物（落点由机械门锁死）
+	{
+		const dirW = join(root, "runWriteOwn");
+		const runsW = join(root, "runs-write-own");
+		const spawnWrite = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			setImmediate(() => {
+				// 融合者真的调用了 write ⇒ 产物出现在盘上（正文也从 stdout 给出）
+				mkdirSync(join(dirW, "fusion"), { recursive: true });
+				writeFileSync(join(dirW, "fusion", "fusion.md"), SECTION_TEXT + "\n", "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		const r = await dispatchFusion({ ...base, runDir: dirW, runsDir: runsW, fusionModel: "m", spawnFn: spawnWrite as never });
+		assert.equal(r.status, "completed", `融合者自己写盘且六节齐全必须 completed，实得 ${r.status} / ${r.reason}`);
+		assert.ok(/融合者写入/.test(r.reason), `理由要写明是谁写的，实得 ${r.reason}`);
+	}
+	// 第四次实测真实形状：exit=0 + 回复「报告已完成」+ 盘上零产物 ⇒ 谎报，必须 failed
+	{
+		const dirLie = join(root, "runLie");
+		const runsLie = join(root, "runs-lie");
+		const spawnLie = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			const fd = (opts as { stdio: [unknown, number, number] }).stdio[1] as number;
+			writeFileSync(fd, JSON.stringify({
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: "融合报告已完成。六节结构完全符合规格（185 行）。" }] },
+			}) + "\n", { fd });
+			setImmediate(() => child.emit("exit", 0));
+			return child;
+		};
+		const r = await dispatchFusion({ ...base, runDir: dirLie, runsDir: runsLie, fusionModel: "m", spawnFn: spawnLie as never });
+		assert.equal(r.status, "failed", `口头报告不得计为结果，实得 ${r.status}`);
+		assert.ok(r.reason.includes("未产出产物"), `理由要写明盘上无产物，实得 ${r.reason}`);
+		assert.ok(r.reason.includes("回复 25 字符") || /缺 \d 节/.test(r.reason), `理由要带回复形状（R-2），实得 ${r.reason}`);
+		assert.ok(!existsSync(join(dirLie, "fusion", "fusion.md")), "不得凭空落盘");
+	}
 	// 首跑真实失败形状：exit=0，回复只有「File written: …」（路径还写丢了个点）⇒ failed
 	{
 		const dirFake = join(root, "runClaimOnly");
@@ -140,7 +178,7 @@ try {
 		const r = await dispatchFusion({ ...base, runDir: dirFake, runsDir: capRunsDir2, fusionModel: "m", spawnFn: capSpawn2(fakeSpawnSections(dirFake, false)) as never });
 		assert.equal(r.status, "failed", `自称写了文件但没有报告正文，不得判成功，实得 ${r.status}`);
 		assert.equal(readFileSync(join(dirFake, "fusion", "fusion.md"), "utf8"), "## 1. 采纳结论" + "\n" + "半截内容" + "\n", "不合格正文不得覆盖已有文件（capture 必须整体拒写）");
-		assert.ok(/回复|正文|结构/.test(r.reason), `失败理由必须带回复形状（R-2 不得静默），实得 ${r.reason}`);
+		assert.ok(/六节不齐/.test(r.reason) && /## 2\./.test(r.reason), `失败理由必须写明缺哪几节（R-2 不得静默），实得 ${r.reason}`);
 		const before = capCalls2.length;
 		const again = await dispatchFusion({ ...base, runDir: dirFake, runsDir: capRunsDir2, fusionModel: "m", spawnFn: capSpawn2(fakeSpawnSections(dirFake, false)) as never });
 		assert.equal(again.status, "skipped", "失败后认领必须留在盘上（不得一失败就自动重烧模型）");
@@ -167,11 +205,12 @@ try {
 		assert.ok(p.includes("禁止派发 subagent"), "必须禁止递归派发");
 		assert.ok(p.includes("禁止 push"), "必须禁止 push");
 		assert.ok(p.includes("## 6. 可复跑附录"), "输出必须含可复跑附录");
-		// 2026-11-03 首跑实测后改形状：旧版要求「回复只要文件路径」，而融合者没有写工具
-		// ⇒ 它自称写了文件（123 字符，路径还写丢了个点）。现在正文本身就是交付物。
-		assert.ok(p.includes("全文写进最后一条回复正文"), "必须要求报告正文写在回复里（harness 据此落盘）");
-		assert.ok(p.includes("不要自己写文件"), "必须明令禁止自己写盘（首跑：它用 bash 重定向写到主仓外）");
-		assert.ok(!p.includes("回复只要文件路径"), "不得再要求路径优先（旧形状会诱导它谎称已写文件）");
+		// 2026-11-03 四次实测后的交付形状（第四次是口头谎报：「报告已完成，185 行六节齐全」而盘上零产物）：
+		// 禁写拦不住交付 ⇒ 给 write，并把落点锁到本 run 产物目录（机械门）。
+		assert.ok(p.includes("用 write 工具写入"), "必须明令用 write 写产物（口头报告不算交付）");
+		assert.ok(p.includes("写盘只允许一个路径"), "必须把可写路径收敛到一个");
+		assert.ok(p.includes("报告已完成"), "必须点名『不得声称已完成而没真的写盘』（第四次实测形状）");
+		assert.ok(!p.includes("不要自己写文件"), "不得再要求它不写文件（旧形状拦不住交付，只造成幻觉）");
 	}
 
 	// ── ②③ 派发形状 + 终态账本 + links 归属 ──
@@ -190,14 +229,19 @@ try {
 		assert.ok(!calls[0].argv.some((a: string) => a.startsWith("--experimental-")),
 			`spawn argv 不得掺 node 旗标（cli.js 是已编译 JS），实得 ${calls[0].argv.slice(0, 3).join(" ")}`);
 		assert.ok(argv.includes("--mode json"), "pi 的 --mode json 必须保留在 argv 里");
+		// argv 里的工具集是 `--exclude-tools` 后的**单个逗号串**，所以下面均从该串取。
+		const exclTok = calls[0].argv[calls[0].argv.indexOf("--exclude-tools") + 1] ?? "";
+		const excl = new Set(exclTok.split(","));
 		for (const t of FUSION_EXCLUDE_TOOLS) {
-			assert.ok(argv.includes(t), `argv 必须排除 ${t}（融合者不得拥有该能力）`);
+			assert.ok(excl.has(t), `argv 的 --exclude-tools 必须含 ${t}（融合者不得拥有该能力）`);
 		}
-		// 2026-11-02 #1 安全边界：**运行时**只读强制 = write/edit 工具直接不存在，
-		// 不能只靠提示词里那句「只读」（提示词被无视时无兼平）。
-		for (const t of ["write", "edit"]) {
-			assert.ok(FUSION_EXCLUDE_TOOLS.includes(t), `融合者必须被排除 ${t} 工具（只读靠运行时强制，不靠提示词）`);
-		}
+		// 2026-11-02 #1 安全边界：**运行时**强制，不靠提示词。
+		// 2026-11-03 四次实测后的边界重划：edit 仍禁（能改仓内已有文件）；
+		// write 放行但落点由 lane-bash-guard 锁到本 run 产物目录（禁 write 实测拦不住交付：
+		// 第 3 次用 bash 野写，第 4 次直接谎报「报告已完成」）。
+		assert.ok(FUSION_EXCLUDE_TOOLS.includes("edit"), "edit 必须排除（可改仓内已有文件）");
+		assert.ok(!FUSION_EXCLUDE_TOOLS.includes("write"), "write 必须放行（交付物要落盘），安全靠落点机械门");
+		assert.ok(excl.has("edit") && !excl.has("write"), `argv 必须排 edit 不排 write，实得 edit=${excl.has("edit")} write=${excl.has("write")}`);
 		assert.ok(argv.includes("local-qwen38/medium"), "argv 必须用用户设置的融合模型");
 		assert.ok((calls[0].opts as { cwd?: string }).cwd === root, "cwd 必须是仓根");
 
