@@ -16,6 +16,7 @@ import {
 	judgeLaneBashCommand,
 	registerLaneBashGuard,
 	findStrayWriteToolTarget,
+	findDestructiveCommand,
 } from "./trace-fusion/lane-bash-guard.ts";
 
 const repoRoot = process.cwd();
@@ -149,6 +150,16 @@ const wBlock = callToolCall({ path: "C:/Users/Annacomnena/evil.md" }, "write");
 assert.equal(wBlock?.block, true, "注册线必须真的 block 越界 write");
 const wAllow = callToolCall({ path: "/repo/run/fusion/fusion.md" }, "write");
 assert.equal(wAllow, undefined, "写进合法产物目录的 write 必须放行");
+
+// 破坏性命令（第 5 次实测：融合者写完 fusion.md 又 `rm` 掉它 ⇒ 交付物自毁）
+assert.equal(findDestructiveCommand('rm /c/Users/x/.pi/agent/trace-fusion-runs/r/fusion/fusion.md'), "rm/rmdir/unlink ×1");
+assert.equal(findDestructiveCommand('cat a.md'), undefined, "普通读取不得误判");
+assert.equal(findDestructiveCommand('cat >> x.md << EOF'), undefined, "追加重定向不是删除");
+assert.equal(findDestructiveCommand('powershell -Command "Remove-Item C:/x/y.md"') !== undefined, true);
+const rmBlock = callToolCall({ command: 'rm /c/Users/x/.pi/agent/trace-fusion-runs/r/fusion/fusion.md && echo done' });
+assert.equal(rmBlock?.block, true, "注册线必须真的 block 删除产物");
+const readKeep = callToolCall({ command: 'ls -la /c/Users/x/.pi/agent/trace-fusion-runs/r/fusion/ && head -5 notes.md' });
+assert.equal(readKeep, undefined, "只读命令必须放行（不得误杀核验）");
 
 // 原生 find 工具：目标为盘根也拦；仓库内路径放行
 assert.equal(callToolCall({ path: "/", query: "cli.js" }, "find")?.block, true, "原生 find 工具盘根目标必须拦");

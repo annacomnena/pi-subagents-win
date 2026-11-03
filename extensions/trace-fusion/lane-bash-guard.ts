@@ -219,6 +219,28 @@ export function findStrayWriteToolTarget(
 	return n === dir || n.startsWith(dir + "/") ? undefined : raw.trim();
 }
 
+/**
+ * 破坏性 shell 命令判据（2026-11-03 第 5 次实测）：融合者写了产物又自己 `rm` 掉它。
+ * 实测读数（tfl-20261103-192444-c7e2 第 5 次）：
+ *   WRITE fusion.md (3240 字符) → WRITE fusion.md → cat >> fusion.md << EOF …
+ *   → `rm …/fusion.md && write …` ×2  ⇒ 交付物被它自己删了。
+ * 融合者的职责 = 只读核验 + 写一份报告；**删除不在其职责内** ⇒ 机械门拦截。
+ * 只在传了 artifactDir 的会话（= 融合子会话）生效，主会话/lane 零影响。
+ */
+export function findDestructiveCommand(command: string): string | undefined {
+	const PATTERNS: Array<[RegExp, string]> = [
+		[/\b(rm|rmdir|unlink|shred|truncate)\b/g, "rm/rmdir/unlink"],
+		[/\bdel\b[ ^\S|]+["']?[A-Za-z]:[\\/]/gi, "del"],
+		[/\bRemove-Item\b/gi, "Remove-Item"],
+		[/\brd\b[ ^\S|]+["']?[A-Za-z]:[\\/]/gi, "rd"],
+	];
+	for (const [re, label] of PATTERNS) {
+		const m = command.match(re);
+		if (m) return `${label} ×${m.length}`;
+	}
+	return undefined;
+}
+
 export interface LaneBashGuardOptions {
 	/** 当前会话是不是 trace lane（缺省 = 永不拦，防止注册到主会话时误杀）。 */
 	isLane?: () => boolean;
@@ -264,12 +286,21 @@ export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unkn
 			// 必须在下面 return 之前查——旧版把它写在本分支之后 ⇒ 对 bash 命令永不可达。
 			if (opts.artifactDir) {
 				const stray = findStrayWriteTarget(command, opts.artifactDir);
-				if (stray !== undefined) {
-					return {
+				if (stray !== undefined) {					return {
 						block: true,
 						reason:
 							`产物落点越界拦截：命令里的写盘目标「${stray}」不在本 run 的产物目录内（${opts.artifactDir}）。` +
 							`融合报告必须由 harness 落盘——把报告正文写进你的**回复正文**即可，不要用 shell 写文件。`,
+					};
+				}
+				// 破坏性命令（第 5 次实测：融合者写完报告又 `rm` 掉自己产物）
+				const wreck = findDestructiveCommand(command);
+				if (wreck !== undefined) {
+					return {
+						block: true,
+						reason:
+							`破坏性命令拦截（融合会话只允许读核验 + 写报告）：检测到 ${wreck}。` +
+							`产物只能越写越完整，不得删除/截断它；要重写就直接用 write 工具写同一路径。`,
 					};
 				}
 			}
