@@ -113,7 +113,9 @@ import { getMasterStatus } from "../runtime/master-control.ts";
 import {
 	outboxDir,
 	sweepExpiredOutboxItems,
+	sweepTargetDeadOutboxItems,
 } from "../runtime/message-outbox.ts";
+import { probeTargetSessionLiveness } from "../runtime/outbox-target-liveness.ts";
 import {
 	defaultSessionsDir,
 	findSessionFile,
@@ -396,6 +398,20 @@ function iso(d: Date | null | undefined): string {
  * （例如读入了不该读的巨型文件）。阈值故意给宽：宁可少报，也不要天天喊狼来了。
  */
 const MEMORY_WARN_RSS_MB = 1536;
+
+/**
+ * 【B-2】目标会话已死周期扫描间隔。
+ *
+ * 为什么是 60s：
+ * - 比 outbox 桥的 10s tick 慢（那个只能扫自己会话的）；host 这个扫全部，不宜太频。
+ * - 比 24h TTL 快得多（真机事故里用户等了 10 小时）。
+ * - 配合 `OUTBOX_TARGET_DEAD_GRACE_MS`(10min) 宽限期，最坏情况是「会话死后 10~11 分钟」
+ *   就能看到明确的 failed 而不是无限「等待注入」。
+ *
+ * 成本：一次 readdir + 每个待测会话一次 scope-liveness 读 + 一次进程探针；
+ * 且同会话有缓存（一轮只探一次）。空 outbox 时几乎零开销。
+ */
+const DEAD_TARGET_SWEEP_MS = 60_000;
 
 /**
  * 单个会话文件的告警阈值（MB）。本机实测最大 152MB（1273 条 message 占 151MB）。
@@ -2911,6 +2927,38 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			} catch {
 				/* 启动扫描失败不炸 host */
 			}
+
+			// 【B-2】目标会话已死的快速路径 —— **必须由 host 做，不能只靠桥**。
+			//
+			// 上面的桥侧 sweep 有一个根本盲区：桥跑在**目标会话自己的进程**里
+			// （`registerOutboxBridge` 挂在 session_start），而"目标会话已死"恰恰意味着
+			// 那个进程不在了 ⇒ 没人给它扫。这是自指困境：失效方无法执行失效检测。
+			//
+			// 真机事故（2026-11-03）：msg 5ead2c2e72 发给已死的 01a18af1，卡 17 分钟不动。
+			// 探针能正确判 dead，但那个会话的 bridge 不存在，于是没人调它。
+			//
+			// host 是**唯一**对全部 outbox 项（不分目标会话）有视野的执行体，所以补在这里。
+			// 启动扫一次 + 60s 周期扫（比 24h TTL 快得多，也比等下次 host 重启快）。
+			const sweepDeadTargets = (): void => {
+				try {
+					const stateDir = outboxStateDirFor(opts);
+					sweepTargetDeadOutboxItems(outboxDir(stateDir), {
+						probe: (sid: string) => probeTargetSessionLiveness(sid, { stateDir }),
+						...(opts.journalPath !== undefined ? { journalPath: opts.journalPath } : {}),
+						by: "runtime-host",
+					});
+				} catch {
+					/* never-throw：目标死亡检测不得影响 host 存活 */
+				}
+			};
+			sweepDeadTargets();
+			let deadTargetTimer: NodeJS.Timeout | null = null;
+			try {
+				deadTargetTimer = setInterval(sweepDeadTargets, DEAD_TARGET_SWEEP_MS);
+				(deadTargetTimer as { unref?: () => void }).unref?.();
+			} catch {
+				/* 定时器建不起来也不炸 host（启动那次已做过） */
+			}
 			// 0924 W1：接收 worker 监督启动（初始 sync + 周期对账；receive.enabled 缺省 false → 零行为）
 			try {
 				channelSupervisor.start();
@@ -2934,6 +2982,11 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				server,
 				info,
 				close: async () => {
+					// B-2：停目标死亡周期扫描（先停：不再产生新的 outbox 终态副作用）
+					if (deadTargetTimer !== null) {
+						clearInterval(deadTargetTimer);
+						deadTargetTimer = null;
+					}
 					// B 对账循环随 host 生命周期停止（先停：不再产生新的对账副作用）
 					try {
 						deliveryReconciler?.stop();
