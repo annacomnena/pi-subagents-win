@@ -5,7 +5,7 @@
  *   - MessageFrame 工厂 + 校验（7 种 kind、msg_ id namespace、512B summary 预算）
  *   - CommandFrame 工厂 + 校验（白名单 type、commandKey 必填）
  *   - ACK 不再要求 ack（requiresAck=false，防自指循环）
- *   - Letter 投递状态词表（pending/claimed/delivered/acked/expired）
+ *   - Letter 投递状态词表（pending/claimed/delivered/acked/expired/target-gone）
  *   - 协议寻址一律 ObjectAddress（物理 session 字符串拒绝）
  *
  * 运行：npm run test:runtime-protocol
@@ -115,7 +115,9 @@ try {
 			status: "pending",
 		};
 		assert.ok(DELIVERY_STATUSES.includes(letter.status));
-		assert.deepEqual([...DELIVERY_STATUSES], ["pending", "claimed", "delivered", "acked", "expired"]);
+		// **追平事实（2026-11-03 P-2）**：词表新增 `target-gone`（目标确定不在的终态，见 protocol.ts:220）。
+		// 本断言是**钉住词表形状**的守卫：新状态必须显式登记，不能默默混进协议。
+		assert.deepEqual([...DELIVERY_STATUSES], ["pending", "claimed", "delivered", "acked", "expired", "target-gone"]);
 	}
 } finally {
 	rmSync(process.env.PI_RUNTIME_DIR!, { recursive: true, force: true });

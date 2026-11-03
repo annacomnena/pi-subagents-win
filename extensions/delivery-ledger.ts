@@ -122,6 +122,19 @@ function ensureDir(dir: string): void {
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
+/**
+ * `ensureDir` 的 never-throw 包装（2026-11-03 L4 第 2 轮实测驱动）：目标路径不可用时
+ * 返回 false 交给调用方如实上报，不让 gauge 写入打断调用方（reconcile tick）。
+ */
+function ensureDirSafe(dir: string): boolean {
+	try {
+		ensureDir(dir);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** 原子发布（temp + rename，同分区原子）。单写者语义由调用方保证（创建者/对账者）。 */
 function atomicWrite(path: string, content: string): void {
 	const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -261,7 +274,10 @@ export interface DeliveryAttempt {
 export type AttemptWriteOutcome = "written" | "exists" | "failed";
 
 export function recordAttempt(dir: string, eventId: string, a: DeliveryAttempt): AttemptWriteOutcome {
-	ensureDir(dir);
+	// **never-throw（2026-11-03 L4 第 2 轮实测驱动）**：`ensureDir` 原先在 try 外 ⇒
+	// 目录不可用（父级是文件 ⇒ ENOTDIR）会**抛穿调用方**，把整个 reconcile tick 带崩。
+	// gauge 写不上只能是「记不上」（返回 failed），不能打断主流程。
+	if (!ensureDirSafe(dir)) return "failed";
 	const key = eventFileKey(eventId);
 	const path = join(dir, `${key}.attempt.${encodeURIComponent(a.attemptId)}.json`);
 	// append-only + 幂等：同 attemptId 重复写不覆盖（`wx`）
@@ -392,6 +408,7 @@ export function finalizeExpiredLease(
 ): boolean {
 	const at = new Date(now).toISOString();
 	const attemptId = `${attempt.attemptId}@${EXPIRED_DEAD_OWNER}`;
+	if (!ensureDirSafe(dir)) return false; // 目录不可用 ⇒ 如实报「没写成」，不抛
 	const path = join(dir, `${eventFileKey(eventId)}.attempt.${encodeURIComponent(attemptId)}.json`);
 	if (existsSync(path)) return false;
 	const outcome = recordAttempt(dir, eventId, {
@@ -635,12 +652,14 @@ export function reconcileDecision(
 	// 到首投阈值才补投
 	if (!last && now - observed < firstRetryMs) return { action: "none", reason: "before-first-retry" };
 
-	// P-3：B 补投次数上限（只数 channel==="B" 且真正投递过的 attempt；终态记录不算）。
-	// **口径登记（2026-11-03 L4）**：限的是**尝试次数**，不是「已确认重复次数」——
-	// `failed/busy/no-injector` 都占额度（它们是真实发生过的播发）。
+	// P-3：B 补投次数上限（只数 channel==="B" 且**真的产生过可见播发**的 attempt）。
+	// **口径修正（2026-11-03 L4 第 2 轮实测驱动）**：旧版把 `failed` / `no-injector` 也计入额度
+	// ⇒ 两次「没投出去」就耗尽额度，事件在期限内**再无重投机会**，只能等 deadline 升级。
+	// 本仓取舍（AGENTS.md R-5）=「宁可重发，不可漏发」：P-3 限的是**重复播发的噪声**，
+	// 而「明确未投递」不产生噪声 ⇒ 不占额度。终态记录（EXPIRED_DEAD_OWNER）也不占。
 	// **作用面登记**：本门**不受 `staleLeaseFinalize` 开关控制**（无条件生效）⇒ 「P-1 默认关」
 	// 不等于「行为与改动前逐字节等价」，见 `_test_delivery_stale.ts` S3 的措辞。
-	const bRetries = attempts.filter((a) => a.channel === "B" && a.status !== EXPIRED_DEAD_OWNER).length;
+	const bRetries = attempts.filter((a) => a.channel === "B" && a.status !== EXPIRED_DEAD_OWNER && a.status !== "failed" && a.status !== "no-injector").length;
 	const maxB = opts.maxBRetries ?? MAX_B_RETRIES_PER_EVENT;
 	if (bRetries >= maxB) {
 		return { action: "none", reason: `b-retry-cap-reached(${bRetries}/${maxB})` };
@@ -793,15 +812,23 @@ export async function reconcileEvent(
 
 	if (action.action === "finalize_expired_lease") {
 		const target = attempts.find((a) => a.attemptId === action.attemptId);
-		if (target) {
-			const written = finalizeExpiredLease(dir, event.eventId, target, now);
-			if (written) {
-				// R-2：不静默 —— 落终态后必须写一条审计（不可抛：审计失败不得回滚终态）。
-				try {
-					opts.onExpiredLease?.({ eventId: event.eventId, attemptId: target.attemptId, reason: action.reason, leaseOwner: target.leaseOwner });
-				} catch { /* best-effort */ }
-			}
+		// **盘上事实驱动（2026-11-03 L4 第 2 轮实测驱动）**：旧版无视写入结果 ⇒ 写失败时仍然
+		// 「写审计 + 报 stage=expired_dead_lease」= 把零终态文件报成已落终态（R-2）。
+		let written = false;
+		if (target) written = finalizeExpiredLease(dir, event.eventId, target, now);
+		appendTrace(dir, {
+			kind: "B-finalize-expired-lease", eventId: event.eventId, attemptId: action.attemptId,
+			reason: action.reason, leaseOwner: target?.leaseOwner, written,
+		});
+		if (!written) {
+			// 没写进去 ⇒ **不写审计、不报终态**（审计只记真实发生的终态），stage 按盘上重算
+			const view2 = effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
+			return { eventId: event.eventId, stage: view2.stage, action: { ...action, reason: `${action.reason}(write-failed)` } };
 		}
+		// R-2：不静默 —— 落终态后必须写一条审计（不可抛：审计失败不得回滚终态）。
+		try {
+			opts.onExpiredLease?.({ eventId: event.eventId, attemptId: target!.attemptId, reason: action.reason, leaseOwner: target!.leaseOwner });
+		} catch { /* best-effort */ }
 		return { eventId: event.eventId, stage: "expired_dead_lease", action };
 	}
 

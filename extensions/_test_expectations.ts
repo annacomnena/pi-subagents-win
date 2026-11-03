@@ -812,8 +812,11 @@ check("G16.1 protocol.ts 冻结词表逐字 + 无事件词表 / 无新帧字段�
 	assert.deepEqual([...MESSAGE_KINDS], ["REPORT", "ESCALATION", "QUESTION", "DELEGATION", "RESULT", "ACK", "CONTROL"], "MESSAGE_KINDS 冻结");
 	assert.deepEqual(
 		[...COMMAND_TYPES],
-		["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare", "session.message"],
-		"COMMAND_TYPES 冻结",
+		// **词表变更登记（2026-11-03，与 #5 的 `test:runtime-commands` 同事实）**：
+		// 新登记 `session.abort` / `session.slash` 两条命令型（用户授权的控制面，非默认扩权）。
+		// 本守卫的用法是「改词表必须在此显式登记」，不是禁止新增。
+		["agent.wake", "task.cancel", "workstream.pause", "workstream.resume", "master.handoff.accept", "master.auto-handoff.set", "master.handoff.prepare", "session.message", "session.abort", "session.slash"],
+		"COMMAND_TYPES 冻结（11 项，含 2026-11-03 登记的两条 session.*）",
 	);
 	assert.equal(proto.includes("expected_event"), false, "protocol.ts 不含事件类型词表（boundary 3 约束的是本文件改动）");
 	assert.equal(proto.includes("requestId"), false, "MessageFrame 不加字段（requestId 即既有 messageId）");

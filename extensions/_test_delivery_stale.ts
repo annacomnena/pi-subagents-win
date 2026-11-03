@@ -36,7 +36,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// ── 隔离在 import 之前（同 _test_delivery_reconciler_loop.ts:44 纪律）──────────
+// ── 隔离必须在 import 之前（2026-11-03 L4 第 2 轮实测驱动）────────────
+// 本文件此前用**顶层静态 import** 装载 delivery-ledger / reconciler / loop / outbox / mailbox，
+// 而 ESM 静态 import **先于任何顶层语句执行** ⇒ `PI_RUNTIME_DIR` 晚赋，`DEFAULT_RUNS_DIR`
+// （subagent-kill.ts:43 模块级缓存）在生产环境下求值 ⇒ 隔离只靠“测试自己全部显式传目录”兼顾。
+// 现改为**环境变量先设 → 动态 import**，隔离不再依赖调用点纪律。
 const ROOT = mkdtempSync(join(tmpdir(), "delivery-stale-env-"));
 process.env.PI_RUNTIME_DIR = join(ROOT, "runtime");
 process.env.PI_SUBAGENT_RUNS_DIR = join(ROOT, "subagent-runs");
@@ -47,7 +51,7 @@ delete process.env.PI_TAB_RUN_ID;
 delete process.env.PI_DELIVERY_RECONCILER;
 delete process.env.PI_DELIVERY_STALE_FINALIZE;
 
-import {
+const {
 	EXPIRED_DEAD_OWNER,
 	LEASE_MS,
 	MAX_B_RETRIES_PER_EVENT,
@@ -67,22 +71,24 @@ import {
 	staleLeaseReason,
 	staleLeaseVerdict,
 	terminalRevisionOf,
-	type DeliveryAttempt,
-} from "./delivery-ledger.ts";
-import { reconcileOnce } from "./delivery-reconciler.ts";
-import { startDeliveryReconcilerLoop, staleFinalizeEnabled, buildReconcileWakeBody } from "./runtime-host/delivery-reconciler-loop.ts";
-import { listOutboxItems, outboxDir } from "./runtime/message-outbox.ts";
-import {
+	reconcileEvent,
+	listAcks,
+} = await import("./delivery-ledger.ts");
+type DeliveryAttempt = import("./delivery-ledger.ts").DeliveryAttempt;
+const { reconcileOnce } = await import("./delivery-reconciler.ts");
+const { startDeliveryReconcilerLoop, staleFinalizeEnabled, buildReconcileWakeBody } = await import("./runtime-host/delivery-reconciler-loop.ts");
+const { listOutboxItems, outboxDir } = await import("./runtime/message-outbox.ts");
+const {
 	DEAD_LETTER_MIN_AGE_MS,
 	DEAD_CLAIM_AGE_MS,
 	deliverLetter,
 	finalizeDeadLetters,
 	findDeadLetters,
 	listLetters,
-} from "./runtime/mailbox.ts";
-import { newMessageFrame } from "./runtime/protocol.ts";
-import { newEnvelopeId } from "./runtime/ids.ts";
-import { masterAddress, piSessionAddress } from "./runtime/address.ts";
+} = await import("./runtime/mailbox.ts");
+const { newMessageFrame } = await import("./runtime/protocol.ts");
+const { newEnvelopeId } = await import("./runtime/ids.ts");
+const { masterAddress, piSessionAddress } = await import("./runtime/address.ts");
 import type { MasterId } from "./runtime/ids.ts";
 
 /** 与本文件其余夹具同型的小封装：`agent://<master>`（测试里原写 agentAddressFor，本仓真实导出是 masterAddress）。 */
@@ -631,7 +637,11 @@ try {
 		ok("S9 租约终态不取消期限升级（期限前停投 / 期限后升级 + 发 incident）");
 	}
 
-	// ── S10：落盘失败不得报成成功（2026-11-03 L4 审查实测驱动）────────────
+	// ── S10：写失败必须被如实上报（2026-11-03 L4 第 2 轮实测驱动）────────────
+	// 注入面实测（不是猜）：
+	//   plans/_probe_rodir.mjs ⇒ Windows 只读目录**不**阻止建文件（CREATE_OK）
+	//   plans/_probe_notdir.mjs ⇒ 父级是文件时 openSync(`${file}/sub/x.json`) = **ENOENT**
+	// ⇒ 真写失败用「父级是文件」；目录占位在 Windows 得到的是 EEXIST（幂等命中，不是失败）。
 	{
 		const dir = join(ROOT, "delivery-s10");
 		mkdirSync(dir, { recursive: true });
@@ -644,15 +654,87 @@ try {
 			attemptId: "a10", channel: "A", at: iso(NOW), status: "unconfirmed",
 			leaseOwner: "MB:10248", leaseUntil: iso(NOW + 15_000),
 		};
-		assert.equal(recordAttempt(dir, event.eventId, attempt), "written", "S10 正常写入 ⇒ written");
-		assert.equal(recordAttempt(dir, event.eventId, attempt), "exists", "S10 重复写 ⇒ exists（幂等命中，不是失败）");
-		// 造不可写：把终态目标路径造成**目录** ⇒ openSync(wx) 必失败（非 EEXIST）
-		const blocked = join(dir, `${eventFileKey(event.eventId)}.attempt.${encodeURIComponent(`a10@${EXPIRED_DEAD_OWNER}`)}.json`);
+		assert.equal(recordAttempt(dir, event.eventId, attempt), "written", "S10① 正常写入 ⇒ written");
+		assert.equal(recordAttempt(dir, event.eventId, attempt), "exists", "S10② 重复写 ⇒ exists（幂等命中，不是失败）");
+		const asFile = join(ROOT, "s10-not-a-dir");
+		writeFileSync(asFile, "x", "utf8");
+		const nested = join(asFile, "delivery");
+		assert.equal(recordAttempt(nested, event.eventId, { ...attempt, attemptId: "a10-fail" }), "failed", "S10③ 真写失败（ENOENT 形状）⇒ failed");
+		assert.equal(finalizeExpiredLease(nested, event.eventId, attempt, NOW + 60_000), false, "S10④ 写失败 ⇒ finalizeExpiredLease 不得报成功");
+
+		// **接线层反例（L4 第 2 轮给的真实入口形状）**：终态写入被占 ⇒ 必须零审计、不报终态。
+		const g = group("s10w");
+		writeRun(g.runsDir, "run_s10w", NOW);
+		const { eventId: evId, attemptId: mbAttempt } = seedLeaseAttempt(g.deliverDir, "run_s10w", {
+			leaseOwner: "MB:10248", leaseUntil: NOW + 5_000, at: NOW + 1_000,
+		});
+		// 先把终态目标路径造成目录 ⇒ openSync(wx) 命中 EEXIST ⇒ 写入不落盘
+		const blocked = join(g.deliverDir, `${eventFileKey(evId)}.attempt.${encodeURIComponent(`${mbAttempt}@${EXPIRED_DEAD_OWNER}`)}.json`);
 		mkdirSync(blocked, { recursive: true });
-		assert.equal(recordAttempt(dir, event.eventId, { ...attempt, attemptId: "a10-blocked" }), "written", "S10 旁路 attempt 仍可写（证明不是整个目录不可写）");
-		const wrote = finalizeExpiredLease(dir, event.eventId, attempt, NOW + 60_000);
-		assert.equal(wrote, false, "S10① 落盘失败 ⇒ finalizeExpiredLease 必须返回 false（旧版恒返 true = 把失败报成成功）");
-		ok("S10 recordAttempt 三态口径（written/exists/failed）+ 落盘失败不得报成终态成功");
+		let audits = 0;
+		const res10 = await reconcileOnce({
+			runsDir: g.runsDir, deliverDir: g.deliverDir, now: NOW + 40_000,
+			resolveDispatcher: () => "sess_s10w", deliver: () => "sent",
+			staleLeaseFinalize: true, isPidAlive: () => false,
+			onExpiredLease: () => { audits += 1; },
+		});
+		assert.ok(audits === 0, `S10⑤ 写入未落盘 ⇒ 审计必须零调用（实得 ${audits}）`);
+		assert.ok(!res10.results.some((x) => x.stage === "expired_dead_lease"), "S10⑥ 未落盘 ⇒ 不得报 stage=expired_dead_lease");
+		assert.ok(!listAttempts(g.deliverDir, evId).some((a) => a.status === EXPIRED_DEAD_OWNER), "S10⑦ 盘上确实没有终态记录（与报告一致）");
+		ok("S10 三态口径（written/exists/failed）+ 写失败零审计零虚假终态（函数层与接线层各自反例）");
+	}
+
+	// ── S11：P-3 不得被「明确未投递」耗尽（2026-11-03 L4 第 2 轮实测驱动）──
+	{
+		const g = group("s11");
+		writeRun(g.runsDir, "run_s11", NOW);
+		seedLeaseAttempt(g.deliverDir, "run_s11", { leaseOwner: "A:1111", leaseUntil: NOW + 5_000, at: NOW + 1_000, status: "unconfirmed", channel: "A" });
+		// 两次 B 投递均**失败**（没投出去 ⇒ 不应占额度），然后期限内必须还能重试
+		let delivered = 0;
+		const call = async (now: number, fail: boolean): Promise<string> => {
+			const rr = await reconcileOnce({
+				runsDir: g.runsDir, deliverDir: g.deliverDir, now,
+				resolveDispatcher: () => "sess_s11",
+				deliver: () => { delivered += 1; if (fail) throw new Error("inject-fail"); return "sent"; },
+				isPidAlive: () => true, // P-1 不介入（租约持有者活）
+			});
+			return rr.results[0]?.action ?? "none";
+		};
+		assert.equal(await call(NOW + 21_000, true), "retry", "S11① 首投（A 未确认）⇒ retry");
+		assert.equal(await call(NOW + 37_000, true), "retry", "S11② 第 1 次 B 失败后，期限内**必须还能重试**（旧版在此已耗尽额度 ⇒ 静默等 deadline）");
+		assert.equal(await call(NOW + 53_000, false), "retry", "S11③ 第 2 次 B 失败后，期限内仍还能重试");
+		const act4 = await call(NOW + 59_000, false);
+		assert.ok(act4 === "retry" || act4 === "none", `S11④ 已产生 2 次可见播发后不再无限重投（实得 ${act4}）`);
+		const capAttempts = listAttempts(g.deliverDir, listEvents(g.deliverDir, 100).find((e) => e.runId === "run_s11")!.eventId);
+		const visible = capAttempts.filter((a) => a.channel === "B" && a.status === "sent").length;
+		assert.ok(visible <= MAX_B_RETRIES_PER_EVENT, `S11⑤ 可见播发（sent）不超上限（实得 ${visible}/${MAX_B_RETRIES_PER_EVENT}）`);
+		void delivered;
+		ok("S11 P-3 只计可见播发：failed/no-injector 不占额度，期限内可恢复重投");
+	}
+
+	// ── S12：`reconcileEvent`（ledger 自己的对账入口）写失败同样不得报终态 ───
+	// 覆盖理由（AGENTS.md §4）：生产有两处消费 finalize（`delivery-reconciler.ts` 与
+	// `delivery-ledger.ts::reconcileEvent`），S10 只拓到前者 ⇒ 变异后者会存活。
+	{
+		const g = group("s12");
+		writeRun(g.runsDir, "run_s12", NOW);
+		const { eventId: evId, attemptId: mbAttempt } = seedLeaseAttempt(g.deliverDir, "run_s12", {
+			leaseOwner: "MB:20480", leaseUntil: NOW + 5_000, at: NOW + 1_000,
+		});
+		const blocked = join(g.deliverDir, `${eventFileKey(evId)}.attempt.${encodeURIComponent(`${mbAttempt}@${EXPIRED_DEAD_OWNER}`)}.json`);
+		mkdirSync(blocked, { recursive: true }); // 终态写入必失败（Windows: openSync(wx) → EEXIST）
+		const ev = listEvents(g.deliverDir, 100).find((e) => e.runId === "run_s12")!;
+		let audits = 0;
+		const out = await reconcileEvent(g.deliverDir, ev, NOW + 40_000, {
+			deliver: () => "sent",
+			staleLease: (a: DeliveryAttempt) => staleLeaseVerdict(a, { now: NOW + 40_000, isPidAlive: () => false }),
+			onExpiredLease: () => { audits += 1; },
+		});
+		assert.ok(audits === 0, `S12① 写入未落盘 ⇒ 审计零调用（实得 ${audits}）`);
+		assert.notEqual(out.stage, "expired_dead_lease", `S12② 未落盘 ⇒ 不得报终态 stage（实得 ${out.stage}）`);
+		assert.ok(out.action.reason.includes("write-failed"), `S12③ reason 必须带 write-failed（实得 ${out.action.reason}）`);
+		assert.ok(!listAttempts(g.deliverDir, evId).some((a) => a.status === EXPIRED_DEAD_OWNER), "S12④ 盘上无终态记录（与报告一致）");
+		ok("S12 reconcileEvent 路径同样盘上事实驱动（零审计零虚假终态 + reason 带 write-failed）");
 	}
 
 	console.log(`\n_test_delivery_stale: all ${n} groups passed`);

@@ -190,6 +190,31 @@ try {
 		ok("S9 写入原子（tmp+rename，零残留）");
 	}
 
+	// ── S11 生命周期接线自证（2026-11-03 L4 第 2 轮实测驱动）──────────
+	// 背景：L4 实测 `writeSessionOwner` 的**生产调用点 = 0 个**⇒ 本文件头写的
+	// 「session_start 写、session_shutdown 删」当时只是声明（AGENTS.md §4：判定必须走真实入口）。
+	// 本检查走**真实注册线**：registerSessionHooks(fakePi) → 触发 session_start / session_shutdown。
+	{
+		process.env.PI_RUNTIME_DIR = join(ROOT, "runtime"); // 必须早于 import（本检查内动态 import ⇒ 隔离真的成立）
+		// 生产侧推导是 `join(defaultRuntimeDir(), "state")` ⇒ 测试读同一个推导，不能自造目录
+		const OWNER_STATE = join(process.env.PI_RUNTIME_DIR, "state");
+		const { registerSessionHooks } = await import("./session-hooks.ts");
+		const handlers: Record<string, Array<(e: unknown, c: unknown) => void>> = {};
+		const fakePi = { on: (ev: string, cb: (e: unknown, c: unknown) => void) => { (handlers[ev] ??= []).push(cb); } };
+		registerSessionHooks(fakePi as never, { cleanups: [], isNotifyEnabled: () => false, pkgDir: ROOT });
+		const fire = (ev: string): void => { for (const cb of handlers[ev] ?? []) cb({}, { sessionManager: { sessionId: "sess-life-1" } }); };
+		assert.ok((handlers["session_start"] ?? []).length > 0, "S11 前置：session_start handler 已注册");
+		assert.equal(readSessionOwner("sess-life-1", OWNER_STATE), null, "S11 前置：本会话尚无 owner 记录");
+		fire("session_start");
+		assert.notEqual(readSessionOwner("sess-life-1", OWNER_STATE), null, "S11① 真实 session_start ⇒ owner 记录真的创建（接线在）");
+		const probe = probeSessionOwner("sess-life-1", { stateDir: OWNER_STATE });
+		assert.equal(probe.state, "alive", `S11② 本进程活着 ⇒ 探针应 alive（实得 ${probe.state}/${probe.basis}）`);
+		fire("session_shutdown");
+		assert.equal(deleteSessionOwner("sess-life-1", OWNER_STATE), false, "S11③ 真实 session_shutdown 已删（再删应 false）");
+		assert.equal(readSessionOwner("sess-life-1", OWNER_STATE), null, "S11④ 生命周期成对：shutdown 后无残留");
+		ok("S11 生命周期接线（registerSessionHooks ⇒ session_start 写 / session_shutdown 删）");
+	}
+
 	console.log(`\n_test_session_owner: ${n} checks passed`);
 } finally {
 	rmSync(ROOT, { recursive: true, force: true });

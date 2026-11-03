@@ -226,15 +226,23 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 		if (decision.action === "finalize_expired_lease") {
 			const target = attempts.find((a) => a.attemptId === decision.attemptId);
 			let reason = decision.reason;
+			// **盘上事实驱动（2026-11-03 L4 第 2 轮实测驱动）**：旧版忽略 `finalizeExpiredLease` 返回值
+			// ⇒ 写失败时照写审计、照报 stage=expired_dead_lease（实测：终态文件 0 / 审计回调 1）。
+			let written = false;
 			if (target) {
 				reason = staleLeaseReason(target, now);
-				finalizeExpiredLease(opts.deliverDir, event.eventId, target, now);
+				written = finalizeExpiredLease(opts.deliverDir, event.eventId, target, now);
 			}
-			// trace 总是写（账本内诊断）；审计行走注入面（生产 = appendAuditLine）
+			// trace 总是写（账本内诊断，带 written 事实）；审计行走注入面（生产 = appendAuditLine）
 			appendTrace(opts.deliverDir, {
 				kind: "B-finalize-expired-lease", eventId: event.eventId, runId: run.runId,
-				attemptId: decision.attemptId, reason, leaseOwner: target?.leaseOwner,
+				attemptId: decision.attemptId, reason, leaseOwner: target?.leaseOwner, written,
 			});
+			if (!written) {
+				// 没落盘 ⇒ 不写审计、不报终态；stage 按盘上既有事实（view.stage）给出
+				results.push({ eventId: event.eventId, runId: run.runId, stage: view.stage, action: "finalize_expired_lease", dispatched: false, reason: `${reason}(write-failed)` });
+				continue;
+			}
 			try {
 				opts.onExpiredLease?.({ eventId: event.eventId, runId: run.runId, attemptId: decision.attemptId, reason, leaseOwner: target?.leaseOwner });
 			} catch { /* 审计失败不回滚终态 */ }

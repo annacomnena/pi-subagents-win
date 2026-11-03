@@ -16,7 +16,9 @@ import { catchUpAutoCollect } from "./trace-fusion/supervisor.ts";
 import type { SupervisorOptions } from "./trace-fusion/supervisor.ts";
 import { masterAddress } from "./runtime/address.ts";
 import { clearSessionStartCwd, recordSessionStartCwd } from "./runtime/master-session-cwd.ts";
-import { writeLiveness, writeScopeLiveness } from "./runtime/liveness.ts";
+import { writeLiveness, writeScopeLiveness, processStartedAt } from "./runtime/liveness.ts";
+import { deleteSessionOwner, writeSessionOwner } from "./runtime/session-owner.ts";
+import { defaultRuntimeDir } from "./runtime/journal.ts";
 import { readPressure } from "./runtime/master-pressure.ts";
 import { maybePropose } from "./runtime/master-succession.ts";
 import { readAttachment } from "./runtime/registry.ts";
@@ -80,6 +82,10 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 			if (!sid || sid === "unknown") return;
 			const cwd = (ctx as unknown as { cwd?: unknown }).cwd;
 			recordSessionStartCwd(sid, typeof cwd === "string" && cwd ? cwd : process.cwd());
+			// session-owner 生命周期接线（2026-11-03 L4 第 2 轮实测驱动）：本模块此前**生产调用点 0 个**
+			// ⇒ 「普通 TUI 会话可被归属探活」只是能力，不是事实。现在 session_start 写、session_shutdown 删。
+			// 状态目录跟探针同源：`<runtime>/state/session-owner/<sid>.json`。
+			writeSessionOwner({ sessionId: sid, pid: process.pid, startedAt: processStartedAt(), stateDir: join(defaultRuntimeDir(), "state") });
 		} catch { /* gauge 永不打断主流程 */ }
 	});
 
@@ -127,6 +133,7 @@ export function registerSessionHooks(pi: ExtensionAPI, deps: SessionHooksDeps): 
 		try {
 			const sid = durableSessionIdentity(ctx as never);
 			if (sid && sid !== "unknown") clearSessionStartCwd(sid);
+			if (sid && sid !== "unknown") deleteSessionOwner(sid, join(defaultRuntimeDir(), "state")); // 生命周期成对（探活不得看到已退会话的僵尸记录）
 		} catch { /* ignore */ }
 		for (const cleanup of deps.cleanups) {
 			try { cleanup(); } catch { /* ignore */ }

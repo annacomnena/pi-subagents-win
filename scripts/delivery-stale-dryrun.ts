@@ -28,8 +28,11 @@ import { join } from "node:path";
 import {
 	EXPIRED_DEAD_OWNER,
 	deliveryDir,
+	effectiveStageOf,
+	listAcks,
 	listAttempts,
 	listEvents,
+	reconcileDecision,
 	staleLeaseReason,
 	staleLeaseVerdict,
 	type DeliveryAttempt,
@@ -81,6 +84,9 @@ interface StaleLeaseRow {
 	status: string;
 	ageHours: number;
 	reason: string;
+	/** 走**完整判定链**（stage + reconcileDecision）后是否真的会落终态（2026-11-03 L4 第 2 轮） */
+	realAction: string;
+	wouldFinalizeReal: boolean;
 }
 
 function scanStaleLeases(now: number): StaleLeaseRow[] {
@@ -95,6 +101,13 @@ function scanStaleLeases(now: number): StaleLeaseRow[] {
 		if (last.status === EXPIRED_DEAD_OWNER) continue; // 已终态化过
 		const verdict = staleLeaseVerdict(last, { now, isPidAlive: isProcessAlive });
 		if (verdict === null) continue;
+		// **完整链对照（2026-11-03 L4 第 2 轮实测驱动）**：光用租约判据报「wouldFinalize」会高估
+		// （实测 1/1 候选走完整 reconcileDecision 后 = none，因 deadline/stage 门先命中）。
+		// 现在同时报：租约判据候选 + 完整链实际动作，不再把候选当结论。
+		const view = effectiveStageOf({ event: ev, attempts, acks: listAcks(dir, ev.eventId) }, { incidentId: ev.incidentId, incidentAt: ev.incidentAt }, now);
+		const dec = reconcileDecision(ev, view, attempts, now, {
+			staleLease: (a: DeliveryAttempt) => staleLeaseVerdict(a, { now, isPidAlive: isProcessAlive }),
+		});
 		rows.push({
 			eventId: ev.eventId,
 			runId: ev.runId,
@@ -104,6 +117,8 @@ function scanStaleLeases(now: number): StaleLeaseRow[] {
 			status: last.status,
 			ageHours: Math.round(((now - Date.parse(last.at)) / 3_600_000) * 10) / 10,
 			reason: staleLeaseReason(last, now),
+			realAction: dec.action,
+			wouldFinalizeReal: dec.action === "finalize_expired_lease",
 		});
 	}
 	rows.sort((a, b) => b.ageHours - a.ageHours);
@@ -271,7 +286,8 @@ const report = {
 		mailboxFilesAfter: mailboxStatsAfter.files,
 		events: leaseSummary.events,
 		eventsUnclosed: leaseSummary.deliverableNow,
-		p1WouldFinalize: staleLeases.length,
+		p1LeaseCandidates: staleLeases.length,
+		p1WouldFinalize: staleLeases.filter((r) => r.wouldFinalizeReal).length,
 		p1DistinctDeadPids: leaseSummary.deadPidsInPlay,
 		p2WouldFinalize: deadLetters.length,
 		p2CandidatesNotJudged: deadLetterCandidates.length,
@@ -297,7 +313,7 @@ if (asJson) {
 	line(`  files: ${report.counts.mailboxFilesBefore} → ${report.counts.mailboxFilesAfter}（扫描前后，应相等）`);
 	line("");
 	line(`事件总数：${report.counts.events}   未关闭（无 incident ⇒ 仍可能被补投）：${report.counts.eventsUnclosed}`);
-	line(`P-1 会被判 expired-dead-owner 的 event：${report.counts.p1WouldFinalize}（涉及 ${report.counts.p1DistinctDeadPids} 个已死 pid）`);
+	line(`P-1 租约判据候选（**不等于会落终态**）：${report.counts.p1LeaseCandidates}；走完整判定链后真会落终态：${report.counts.p1WouldFinalize}`);
 	line(`P-2 会被判 target-gone 的信件：${report.counts.p2WouldFinalize}（另有 ${report.counts.p2CandidatesNotJudged} 条超龄但探针 unknown ⇒ **不判死**）`);
 	line("");
 	line("── 信箱家底（按状态）──");
