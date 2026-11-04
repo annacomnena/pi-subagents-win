@@ -63,6 +63,38 @@ export const FUSION_REPORT_SECTIONS = [
 	"## 6. 可复跑附录",
 ];
 
+/**
+ * 每节最小正文长度（2026-11-03 第 5 次实测驱动）：只数标题存在时，
+ * 「## 4. 不可采信项」写两行套话也算齐全 ⇒ 小模型很容易交出一份结构完整、内容为空的报告。
+ * 低于此门 ⇒ 计为缺口（与缺节同等对待）。
+ */
+export const FUSION_SECTION_MIN_CHARS = 40;
+
+/**
+ * 六节齐全度 + 每节长度门（文件侧与 stdout 侧共用一份判据，不得两处各自硬写）。
+ * 返回缺口列表：缺标题，或该节正文 < FUSION_SECTION_MIN_CHARS 字符（含长度读数）。
+ */
+export function fusionSectionGaps(body: string): string[] {
+	const gaps: string[] = [];
+	for (let i = 0; i < FUSION_REPORT_SECTIONS.length; i++) {
+		const h = FUSION_REPORT_SECTIONS[i];
+		const at = body.indexOf(h);
+		if (at < 0) {
+			gaps.push(h);
+			continue;
+		}
+		const starts = FUSION_REPORT_SECTIONS.slice(i + 1)
+			.map((n) => body.indexOf(n, at + h.length))
+			.filter((p) => p >= 0);
+		const end = starts.length > 0 ? Math.min(...starts) : body.length;
+		const seg = body.slice(at + h.length, end).trim();
+		if (seg.length < FUSION_SECTION_MIN_CHARS) {
+			gaps.push(`${h}（正文仅 ${seg.length} 字符 < ${FUSION_SECTION_MIN_CHARS}）`);
+		}
+	}
+	return gaps;
+}
+
 export interface FusionDispatchInput {
 	runId: string;
 	runDir: string;
@@ -85,6 +117,12 @@ export interface FusionDispatchInput {
 	now?: () => number;
 	/** 子进程启动时刻的参考值（测试可注入；缺省 = 真实 Date.now()）。 */
 	spawnNow?: () => number;
+	/**
+	 * 有界补写一轮（2026-11-03 第 5 次实测驱动）：盘上已有产物但六节不齐/正文空壳 ⇒
+	 * 同认领内**只补派一次**（提示词只列缺口 + 现有文件路径），不直接判死重烧整轮。
+	 * 带 repair 时跳过 fusion.claim 幂等门（认领已存在），全链最多一轮由调用方结构性保证。
+	 */
+	repair?: { gaps: string[] };
 }
 
 export type FusionStatus = "skipped" | "launched" | "completed" | "failed" | "timeout" | "spawn-error";
@@ -111,6 +149,11 @@ export interface FusionDispatchResult {
 	exitCode?: number | null;
 	/** 从 json 流解析出的真实用量；解析不出 = null（不得写 0 冒充「花了 0 元」）。 */
 	usage?: FusionUsage | null;
+	/**
+	 * 产物新鲜但六节不齐时的缺口清单（缺标题 / 正文过短）；供调用方决定有界补写一轮。
+	 * 只在「盘上已有本次新鲜产物」时非空（无产物的失败没有补写基础）。
+	 */
+	gaps?: string[];
 }
 
 /**
@@ -171,7 +214,7 @@ export function fusionFileSections(
 ): { ok: true; bytes: number } | { ok: false; missing: string[] } {
 	try {
 		const body = readFileSync(path, "utf8");
-		const missing = FUSION_REPORT_SECTIONS.filter((h) => !body.includes(h));
+		const missing = fusionSectionGaps(body);
 		return missing.length === 0
 			? { ok: true, bytes: Buffer.byteLength(body, "utf8") }
 			: { ok: false, missing };
@@ -209,7 +252,7 @@ export function captureFusionReport(
 			if (body) last = body;
 		}
 		if (last === null) return { ok: false, shape: "无 assistant 正文" };
-		const missing = FUSION_REPORT_SECTIONS.filter((h) => !last!.includes(h));
+		const missing = fusionSectionGaps(last);
 		if (missing.length > 0) {
 			return { ok: false, shape: `回复 ${last.length} 字符，缺 ${missing.length} 节（${missing.slice(0, 3).join(" / ")}）；首 120 字符：${last.slice(0, 120)}` };
 		}
@@ -227,8 +270,22 @@ export function buildFusionPrompt(i: {
 	laneModel?: string;
 	outputPath: string;
 	repoRoot: string;
+	repair?: { gaps: string[] };
 }): string {
 	const lanes = (["A", "B", "C"] as LaneId[]).map((l) => `- TRACE ${l}：\`lanes/${l}/trajectory.md\``).join("\n");
+	const repairBlock = i.repair
+		? [
+				``,
+				`## 本轮是补写轮（已有报告，不得重做）`,
+				``,
+				`盘上已有 \`${i.outputPath}\`，但它缺下列节（标题缺失或正文过短 < ${FUSION_SECTION_MIN_CHARS} 字符）：`,
+				...i.repair.gaps.map((g) => `- \`${g}\``),
+				``,
+				`要求：先 \`read\` 现有文件，**保留已有内容不删不改**；只补齐上面缺的几节（每节必须给出实质内容：`
+				+ `证据出处 / 核验命令 / 具体行动，不得写「暂无」「待补充」凑数），然后用 write 将**全文**写回同一路径。`,
+				`补写轮同样受机械门约束：写盘只允许这一个路径，禁止删除/截断（rm、truncate 会被拦）。`,
+			].join("\n")
+		: "";
 	return [
 		`你是 trace-fusion 的**融合者**（run ${i.runId}）。任务：把三路独立诊断**拼装**成一份可执行的推进方案。`,
 		``,
@@ -263,6 +320,7 @@ export function buildFusionPrompt(i: {
 		``,
 		`写完后回复只要：文件路径 + ≤10 行摘要。**不得声称「报告已完成/已写入」而没有真的调用 write 工具**`,
 		`（实测有融合者回复「报告已完成，185 行六节齐全」而盘上零产物 ⇒ 判失败并白烧一次模型）。工作目录 \`${i.repoRoot}\`。`,
+		repairBlock,
 	].join("\n");
 }
 
@@ -285,12 +343,14 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	if (!existsSync(input.reportPath)) {
 		return { status: "skipped", reason: `主材料缺失：${input.reportPath}`, zeroModelCall: true };
 	}
-	// 幂等认领：同一 run 只融合一次
-	try {
-		mkdirSync(join(input.runDir, "fusion"), { recursive: true });
-		writeFileSync(join(input.runDir, "fusion", "fusion.claim"), `${new Date().toISOString()}\n`, { encoding: "utf8", flag: "wx" });
-	} catch {
-		return { status: "skipped", reason: "本 run 已有融合认领（fusion.claim 存在）", zeroModelCall: true };
+	// 幂等认领：同一 run 只融合一次（补写轮不得重抢认领——它就是在同一次融合内）
+	if (!input.repair) {
+		try {
+			mkdirSync(join(input.runDir, "fusion"), { recursive: true });
+			writeFileSync(join(input.runDir, "fusion", "fusion.claim"), `${new Date().toISOString()}\n`, { encoding: "utf8", flag: "wx" });
+		} catch {
+			return { status: "skipped", reason: "本 run 已有融合认领（fusion.claim 存在）", zeroModelCall: true };
+		}
 	}
 	if (!input.piCli || !existsSync(input.piCli)) {
 		return { status: "spawn-error", reason: "pi CLI 未找到（fusion 未启动）", zeroModelCall: false, reportPath: outputPath };
@@ -304,6 +364,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		laneModel: input.laneModel,
 		outputPath,
 		repoRoot: input.repoRoot,
+		repair: input.repair,
 	});
 	const argv = buildPiArgv({
 		cliPath: input.piCli,
@@ -457,7 +518,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		cost: usage ? { total: usage.cost, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite } : null,
 		turns: usage?.turns ?? null,
 	});
-	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false, exitCode, usage };
+	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false, exitCode, usage, gaps: fileSections && !fileSections.ok ? fileSections.missing : undefined };
 }
 
 /**
@@ -497,6 +558,37 @@ export async function runFusionStep(opts: {
 		res = { status: "spawn-error", reason: `融合步骤异常：${(err as Error).message}`, zeroModelCall: false };
 	}
 	opts.log(`fusion: ${res.status} — ${res.reason}${res.usage ? ` [成本 $${res.usage.cost.toFixed(4)} / ${res.usage.turns} turns / cacheRead ${res.usage.cacheRead}]` : " [成本读数缺失：json 流未解析出 usage]"}`);
+
+	// 有界补写一轮（2026-11-03 第 5 次实测：产物写进了产物目录但六节不齐）。
+	// 只在「盘上已有本次新鲜产物 + 缺口清单非空」时补派；无产物的失败不补（没有补写基础，
+	// 重烧整轮是编排层/人的决定，不在自动链里）。**结构性只派一次**（本函数内单层，无循环）。
+	let repair: FusionDispatchResult | null = null;
+	let gapsRequested: string[] | null = null;
+	if (res.status === "failed" && (res.gaps?.length ?? 0) > 0) {
+		gapsRequested = res.gaps!.slice();
+		opts.log(`fusion-repair: 产物已写但缺 ${res.gaps!.length} 节 ⇒ 同认领内补派一轮（只补不重做）`);
+		try {
+			repair = await dispatch({
+				runId: opts.meta.runId,
+				runDir: opts.meta.runDir,
+				repoRoot: opts.meta.repoRoot,
+				reportPath: opts.reportPath,
+				fusionModel: opts.fusionModel,
+				laneModel: opts.meta.laneModels?.A ?? opts.meta.workerModel,
+				dispatcherSessionId: opts.meta.dispatcherSessionId,
+				piCli: opts.piCli,
+				runsDir: opts.runsDir,
+				linksPath: opts.linksPath,
+				spawnFn: opts.spawnFn,
+				repair: { gaps: res.gaps! },
+			});
+		} catch (err) {
+			repair = { status: "spawn-error", reason: `补写轮异常：${(err as Error).message}`, zeroModelCall: false };
+		}
+		opts.log(`fusion-repair: ${repair.status} — ${repair.reason}`);
+		if (repair.status === "completed") res = repair;
+		else res = { ...repair, gaps: repair.gaps ?? res.gaps };
+	}
 	try {
 		const metaPath = join(opts.meta.runDir, "meta.json");
 		const raw = existsSync(metaPath) ? JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown> : {};
@@ -526,6 +618,9 @@ export async function runFusionStep(opts: {
 					exitCode: res.exitCode ?? null,
 					usage: res.usage ?? null,
 					at: new Date().toISOString(),
+					repair: repair
+						? { status: repair.status, reason: repair.reason, gapsRequested, usage: repair.usage ?? null, at: new Date().toISOString() }
+						: null,
 				},
 			}, null, 2) + "\n",
 			"utf8",

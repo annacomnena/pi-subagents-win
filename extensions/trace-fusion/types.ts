@@ -97,5 +97,34 @@ export function defaultWorktreeRoot(): string {
 	return join(homedir(), ".pi", "tfl-wt");
 }
 
+/**
+ * lane 产物白名单（2026-11-03 tfl-20261103-192444-c7e2 首跑驱动）。
+ *
+ * 事故：lane 目录里的**非契约文件**（如 lane 自己写的分析笔记/测试产物）在收集侧
+ * 逐字沉默——collect 只查 trajectory.md / validation.json 的存在性，从不枚举 laneDir，
+ * 而 diagnose 模式的 `diagnoseDirtyViolations` 只对比**主仓** porcelain 基线，覆盖不到
+ * `lanes/<lane>/` ⇒ stray 文件既不进 cross-test 报告也不进 issues（首跑 lanes/A 实测：
+ * 只有 supervisor 自产的 patch.diff/status.txt/result.json；上一轮 c2f5 的 lane A 曾有
+ * 402B 的 triangle.md 混在产物里无人识别）。
+ *
+ * 白名单必须含 **supervisor 自产文件**（patch.diff / status.txt / result.json）与
+ * `archiveUntracked` 产出的 `untracked.md` / `untracked/`，否则收集器会把自己写的文件
+ * 判成 lane 违规（假阳）。
+ *
+ * 两个消费方：`artifacts.ts`（收集侧 stray 检查）与 `citation-check.ts`（行号越界判定）
+ * ⇒ 共享常量放 types.ts，禁止两处各自硬写名单。
+ */
+export const LANE_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
+	"trajectory.md",
+	"validation.json",
+	"patch.diff",
+	"status.txt",
+	"result.json",
+	"untracked.md",
+]);
+
+/** lane 目录内允许存在的**目录**（supervisor 归档产物）；目录名的白名单单独维护。 */
+export const LANE_ARTIFACT_DIRS: ReadonlySet<string> = new Set(["untracked"]);
+
 import { join } from "node:path";
 import { homedir } from "node:os";

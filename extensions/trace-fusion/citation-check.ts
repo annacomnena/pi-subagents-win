@@ -31,6 +31,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import type { LaneId } from "./types.ts";
+import { LANE_ARTIFACT_NAMES } from "./types.ts";
 
 export interface CitationFacts {
 	lane: LaneId;
@@ -195,7 +196,8 @@ export function checkLaneCitations(opts: CitationCheckOptions): CitationFacts {
 
 		const lineCache = new Map<string, { ok: boolean; lines: number }>();
 		// lane 自产文件（自己写的 patch / trajectory / validation 等）的行号，对**产物自身行数**判。
-		const ARTIFACT_NAMES = new Set(["trajectory.md", "validation.json", "patch.diff", "status.txt", "result.json", "untracked.md"]);
+		// 名单共享自 types.ts（2026-11-03）：收集侧 stray 检查与本处必须用同一份名单。
+		const ARTIFACT_NAMES = LANE_ARTIFACT_NAMES;
 		const localLines = new Map<string, number | null>();
 		const localCount = (base: string): number | null => {
 			if (localLines.has(base)) return localLines.get(base)!;

@@ -1,32 +1,40 @@
-trace-fusion: 融合会话破坏性命令机械门（第 5 次实测：融合者写完报告又 rm 掉自己产物）
+trace-fusion: lane 产物白名单校验 + 融合六节长度门 + 缺节有界补写一轮（首跑五次实测收口）
 
-根因（第 5 次补跑实测，14:54:10Z 派发，读 fusion.stdout.log 本轮区间的 tool_execution_start）：
-新交付形状**打通了**——融合者确实两次调用 `write` 把 fusion.md 写进产物目录（3240 字符），
-并用 bash heredoc 追加附录；随后它自己跑了两次：
-```
-rm /c/Users/…/tfl-20261103-192444-c7e2/fusion/fusion.md && write '…/fusion.md'
-```
-⇒ 14:57Z 盘上出现 9239 字节产物，14:58Z **消失**。落点锁只约束「写盘目标」，
-没有约束「删除」⇒ 交付物自毁，判据只能判无产物。
-（同时暴露：它写的 9239 字节版六节不齐——有 1/2/6 节，缺 3/4/5 节。）
+三项都来自 tfl-20261103-192444-c7e2 首跑与融合五次实测（核验报告 plans/20261103_fusion_attempt5_review.md）。
 
-改了什么（lane-bash-guard.ts）：
-- 新增 `findDestructiveCommand()`：识别 `rm` / `rmdir` / `unlink` / `shred` / `truncate` /
-  `del X:\…` / `rd X:\…` / `Remove-Item`；注册线在 artifactDir 分支内拦截，
-  理由写明「产物只能越写越完整，要重写就直接用 write 写同一路径」。
-- 生效面：只在传了 `artifactDir` 的会话（= 融合子会话）生效；主会话与 lane 零影响。
-- 不误杀核验：`cat a.md`、`cat >> x.md << EOF`、`ls -la … && head -5 notes.md` 全部放行（夹具断言）。
+1) lane 产物白名单校验（本 run 诊断出的缺陷本体）
+- 根因：`collectLaneArtifacts` 只查 trajectory.md/validation.json 存在性，从不枚举 laneDir；
+  diagnose 模式的 `diagnoseDirtyViolations` 只比主仓 porcelain 基线，覆盖不到 `lanes/<lane>/`
+  ⇒ lane 自写的契约外文件逐字沉默（c2f5 的 lane A 混过 402B triangle.md，首跑 lanes/A 只有 supervisor 自产文件）。
+- 改法：types.ts 新增共享常量 `LANE_ARTIFACT_NAMES`（6 名）+ `LANE_ARTIFACT_DIRS`（untracked）；
+  artifacts.ts 新增 `findLaneStrayFiles(laneDir)` 并在 collect 内产出 `<file>：非白名单 lane 产物` issue；
+  citation-check.ts 的 `ARTIFACT_NAMES` 改为引用同一常量（禁止两处各自硬写名单）。
+- 假阳防护（写进夹具）：白名单必须含 supervisor 自产文件（patch.diff/status.txt/result.json/untracked.md/untracked/），
+  否则收集器会把自己写的文件判成 lane 违规。
 
-怎么验证：
-- 夹具新增 6 条：`rm` 形状命中并注册线 block；`del/Remove-Item` 命中；
-  普通读取/追加重定向放行（防误杀）。
-- 变异 **M39**（摘掉破坏性命令调用）在 guard 套件**变红**，命中「注册线必须真的 block 删除产物」。
-- 变异集 12/12 全部变红（M28–M39），trace-fusion 16/16 绿。
+2) 融合六节「每节最小长度门」
+- 根因：第 5 次实测 §4/§5 各只写 297/281 字符表格壳；只数标题存在 ⇒ 套话可凑数通过。
+- 改法：新增 `fusionSectionGaps(body)`（缺标题 **或** 正文 < `FUSION_SECTION_MIN_CHARS`=40），
+  文件侧 `fusionFileSections` 与 stdout 侧 `captureFusionReport` 共用一份判据；缺口带实测长度读数。
 
-未闭合项：
-- 融合者用 `cat >>` 追加绕过 write 工具写附录 ⇒ 落点在 artifactDir 内所以合法；
-  是否要求「报告只能由 write 工具产出」待决（现判据只看最终文件形状）。
-- 六节不齐 ⇒ 直接判 failed，尚无「缺节有界补写一轮」的收敛环（小模型模板服从度：
-  三次实测分别全齐 / 全缺 / 缺 3 节）。
-- 第 5 次补跑终态读数待取（进程在飞，14:54:10Z 起）。
-- 12 条基线红测试仍未立案修复。
+3) 缺节有界补写一轮（不重烧整轮）
+- 改法：`FusionDispatchResult.gaps` 暴露缺口清单（只在盘上有本次新鲜产物时非空）；
+  `runFusionStep` 在 failed ∧ gaps 非空时**同认领内补派一次**（单层无循环 ⇒ 结构性只一次），
+  补写轮提示词只列缺口 + 现有文件路径，要求「read 现有文件、保留已有内容、只补缺节、write 全文回同一路径」；
+  `repair` 时跳过 fusion.claim 幂等门（第二轮不得被自己 skip——真实接线测试钉住）；
+  meta.fusion.repair 记录补写轮状态/缺口/用量（R-2：不得静默）。
+- 无缺口（盘上无产物）⇒ **不自动补派**：重烧整轮是编排层/人的决定，禁止连环重发。
+
+验证
+- 夹具新增：collect 侧 stray 命中 + 目录命中 + 假阳防护（laneDir 全白名单 ⇒ 空）；
+  fusion 侧空壳六节判不齐、真实派发链跑两轮、补写失败终态仍 failed、无缺口不补派。
+- 变异 19/19 全红（M28–M47），含 M40 stray 摘除、M41 白名单去 status.txt（假阳）、
+  M42 长度门摘除、M43 补写摘除、M44 无缺口也补派、M45 补写不覆盖终态、M46 补写抢 claim、M47 提示词不列缺口；
+  文件字节级还原 + sha256 核对。M44 的红是 TypeError 崩溃（证明 gaps 门是承重的）。
+- trace-fusion 全套 16/16 绿。
+
+未闭合项
+- 六节长度门阈值 40 是经验值，未做分布标定（首跑五次实测样本：297/281 字符通过，套话形状 <40）。
+- 融合者用 `cat >>` 追加写附录仍合法（落点在 artifactDir 内）；「报告只能由 write 工具产出」未收口。
+- 收口门禁与判据口径差：写进 artifactDir 内**其他文件名**目前判 failed，门禁允许目录内任意文件。
+- 12 条基线红测试仍未立案修复（plans/20261103_fusion_attempt5_review.md §5 待办 5）。

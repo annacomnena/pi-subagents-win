@@ -12,11 +12,12 @@
  *   part3: git status --porcelain → untracked 单独归档 lanes/X/untracked/
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, statSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { execGit } from "./git.ts";
 import { defaultTabRunsDir, readTabResultFile } from "../tab-runs.ts";
 import type { LaneId, TraceRunMeta } from "./types.ts";
+import { LANE_ARTIFACT_DIRS, LANE_ARTIFACT_NAMES } from "./types.ts";
 
 /** validation.json 允许的字段（宽松解析：弱模型会写错/缺字段）。 */
 export interface TraceValidationJson {
@@ -153,6 +154,23 @@ export function diagnoseDirtyViolations(meta: TraceRunMeta): string[] {
 	return nowSt.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !base.has(l));
 }
 
+/**
+ * lane 目录 stray 文件枚举（白名单见 types.ts `LANE_ARTIFACT_NAMES`）。
+ * 目录只允许 `LANE_ARTIFACT_DIRS`。导出供测试直接调用（真实接线在 collectLaneArtifacts 内部）。
+ */
+export function findLaneStrayFiles(laneDir: string): string[] {
+	if (!existsSync(laneDir)) return [];
+	const out: string[] = [];
+	for (const ent of readdirSync(laneDir, { withFileTypes: true })) {
+		if (ent.isDirectory()) {
+			if (!LANE_ARTIFACT_DIRS.has(ent.name)) out.push(`${ent.name}/`);
+			continue;
+		}
+		if (!LANE_ARTIFACT_NAMES.has(ent.name)) out.push(ent.name);
+	}
+	return out;
+}
+
 export interface CollectOptions {
 	now?: Date;
 	/** tab-runs 目录（测试注入；缺省 defaultTabRunsDir）。 */
@@ -184,6 +202,14 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 	const validation = parseValidationFile(validationPath);
 	if (!validation) {
 		issues.push("validation.json 缺失或非法");
+	}
+
+	// lane 产物白名单校验（2026-11-03 首跑驱动：stray 文件此前逐字沉默）。
+	// 必须在 supervisor 自产文件（patch.diff/status.txt）写入**之后**枚举，
+	// 否则会把收集器自己写的文件判成 lane 违规。
+	const strays = findLaneStrayFiles(laneDir);
+	for (const s of strays) {
+		issues.push(`${s}：非白名单 lane 产物（契约外文件，来源需人工核实；白名单见 types.ts LANE_ARTIFACT_NAMES）`);
 	}
 
 	// 三段式 patch（§21.0 P4 修订；worker 有无 commit 都覆盖）。

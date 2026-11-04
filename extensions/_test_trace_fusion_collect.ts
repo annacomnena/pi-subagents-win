@@ -26,7 +26,7 @@ if (gitVer.status !== 0) {
 	process.exit(0);
 }
 
-import { collectLaneArtifacts, collectRunArtifacts, parseValidationFile, trustedCommands } from "./trace-fusion/artifacts.ts";
+import { collectLaneArtifacts, collectRunArtifacts, findLaneStrayFiles, parseValidationFile, trustedCommands } from "./trace-fusion/artifacts.ts";
 import type { TraceRunMeta } from "./trace-fusion/types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tfl-c7-test-"));
@@ -172,6 +172,22 @@ try {
 			{ command: "drop-me", portable: false },
 		]), "utf8");
 		assert.deepEqual(trustedCommands(parseValidationFile(arrPath)), ["keep-me"], "portable:false 仍排除");
+	}
+
+	// ── lane 产物白名单校验（2026-11-03 首跑驱动：stray 文件此前逐字沉默）──
+	{
+		const laneDirS = join(run2.meta.runDir, "lanes", "B");
+		mkdirSync(laneDirS, { recursive: true });
+		writeFileSync(join(laneDirS, "trajectory.md"), "## Root cause / hypotheses\nx\n", "utf8");
+		writeFileSync(join(laneDirS, "validation.json"), "{}", "utf8");
+		writeFileSync(join(laneDirS, "triangle.md"), "lane 自写的分析笔记\n", "utf8");
+		mkdirSync(join(laneDirS, "scratch"), { recursive: true });
+		const repS = collectLaneArtifacts(run2.meta, "B");
+		assert.ok(repS.issues.some((i) => i.includes("triangle.md") && i.includes("非白名单")), "stray 文件必须进 issues");
+		assert.ok(repS.issues.some((i) => i.includes("scratch/") && i.includes("非白名单")), "契约外目录必须进 issues");
+		// 假阳防护：收集器自产文件（patch.diff/status.txt/untracked/）不得被判 stray
+		assert.deepEqual(findLaneStrayFiles(laneDirA), [], "情形 1 的 laneDir 应全在白名单内");
+		assert.ok(!repA2.issues.some((i) => i.includes("非白名单")), "收集器自产文件不得判成 lane 违规");
 	}
 
 	// ── collectRunArtifacts 汇总 + 落盘 ─────────────────────────

@@ -39,7 +39,18 @@ const SECTIONS = [
 	"## 5. 后续行动",
 	"## 6. 可复跑附录",
 ];
-const SECTION_TEXT = SECTIONS.map((h) => `${h}\n内容`).join("\n\n");
+// 每节正文必须 ≥ FUSION_SECTION_MIN_CHARS（40）：小模型交「标题齐全、内容为空」的报告
+// 是实测过的形状（2026-11-03 第 5 次：§4/§5 各只写了 280/281 字符表格壳），判据已加长度门。
+const SECTION_TEXT = [
+	"## 1. 采纳结论\n采纳 B/C 收敛根因：collect 侧缺 lane 产物白名单校验；证据 artifacts.ts:163 与 worker-prompt.ts:85-100。",
+	"## 2. 分歧与裁决\n不投票：B 主张结构、C 主张白名单，取 C（更具体且可立即核验），裁决理由写入本节。",
+	"## 3. 证据核验\n实跑：git show 125b735:extensions/trace-fusion/artifacts.ts | sed -n '175,205p' ⇒ 只有 2 项存在性检查，无枚举。",
+	"## 4. 不可采信项\nA 路无 trajectory.md（cross-test-report 行 16：A✗）⇒ 其全部主张不可采信；越界引用 3 条不得原样引用。",
+	"## 5. 后续行动\n1) artifacts.ts 的 collectLaneArtifacts 内引入 readdirSync(laneDir) + 白名单比对；2) 补 stray 夹具测试。",
+	"## 6. 可复跑附录\n命令：git show 125b735:extensions/trace-fusion/artifacts.ts | grep -n readdirSync ⇒ 期望 0 命中（修法前提）。",
+].join("\n\n");
+/** 空壳六节（实测形状）：标题齐全、正文只有套话 ⇒ 必须判不齐（长度门）。 */
+const SHELL_TEXT = SECTIONS.map((h) => `${h}\n暂无，待补充。`).join("\n\n");
 /** 首跑真实形状：「File written: …」是包在 message_end 的 assistant 正文里的（不是裸文本）。 */
 const fakeWriteClaimEvent = (): string => JSON.stringify({
 	type: "message_end",
@@ -442,6 +453,137 @@ try {
 			logs5.some((l) => l.includes("meta 写入失败")),
 			"meta 写失败必须在日志里说出来（AGENTS.md R-2：静默失效不可接受）",
 		);
+	}
+
+	// ── 2026-11-03 第 5 次实测：空壳六节不得通过 + 缺节有界补写一轮 ──
+	{
+		const { fusionFileSections, fusionSectionGaps, FUSION_SECTION_MIN_CHARS, runFusionStep } = await import("./trace-fusion/fusion-dispatch.ts");
+		// 单元：齐全且每节达标
+		const goodPath = join(root, "sec-good.md");
+		writeFileSync(goodPath, "# 融合报告\n\n" + SECTION_TEXT, "utf8");
+		assert.equal(fusionFileSections(goodPath).ok, true, "六节齐全且正文达标 ⇒ ok");
+		// 单元：空壳六节（标题齐全、正文套话）⇒ 必须判不齐，缺口带长度读数
+		const shellPath = join(root, "sec-shell.md");
+		writeFileSync(shellPath, "# 融合报告\n\n" + SHELL_TEXT, "utf8");
+		const shellRes = fusionFileSections(shellPath);
+		assert.equal(shellRes.ok, false, "空壳六节不得通过（只数标题会被套话凑数）");
+		assert.ok(
+			!shellRes.ok && shellRes.missing.some((m) => m.includes("正文仅") && m.includes(String(FUSION_SECTION_MIN_CHARS))),
+			"缺口必须写明是哪节空壳与实测长度",
+		);
+		assert.equal(fusionSectionGaps(SECTION_TEXT).length, 0);
+		assert.equal(fusionSectionGaps(SHELL_TEXT).length, 6, "六节全空壳 ⇒ 六个缺口");
+
+		// 接线：融合者写了盘但写的是空壳 ⇒ dispatchFusion 判 failed 并给出 gaps
+		const dirShell = join(root, "runShell");
+		const runsShell = join(root, "runs-shell");
+		const spawnShell = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			setImmediate(() => {
+				mkdirSync(join(dirShell, "fusion"), { recursive: true });
+				writeFileSync(join(dirShell, "fusion", "fusion.md"), "# 融合报告\n\n" + SHELL_TEXT, "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		const rShell = await dispatchFusion({ ...base, runDir: dirShell, runsDir: runsShell, fusionModel: "m", spawnFn: spawnShell as never });
+		assert.equal(rShell.status, "failed", "空壳产物不得计为融合成功");
+		assert.ok((rShell.gaps?.length ?? 0) === 6, "failed 结果必须带 gaps 清单供补写轮使用");
+
+		// 接线：runFusionStep 必须在同认领内**只补派一轮**，补写成功则终态 completed
+		const dirRep = join(root, "runRepair");
+		mkdirSync(dirRep, { recursive: true });
+		writeFileSync(join(dirRep, "meta.json"), JSON.stringify({ runId: "tfl-rep", status: "completed" }), "utf8");
+		const repInputs: Array<Record<string, unknown>> = [];
+		const repLogs: string[] = [];
+		const resRep = await runFusionStep({
+			meta: { runId: "tfl-rep", runDir: dirRep, repoRoot: root },
+			reportPath,
+			fusionModel: "m",
+			log: (m) => repLogs.push(m),
+			dispatch: async (i) => {
+				repInputs.push(i as unknown as Record<string, unknown>);
+				if (!i.repair) return { status: "failed", reason: "产物已写但六节不齐", zeroModelCall: false, gaps: ["## 4. 不可采信项"] };
+				return { status: "completed", reason: "补写后六节齐全", zeroModelCall: false };
+			},
+		});
+		assert.equal(repInputs.length, 2, "缺口 ⇒ 必须补派且只补派一次");
+		assert.deepEqual(repInputs[1].repair, { gaps: ["## 4. 不可采信项"] }, "补写轮必须把缺口清单交给提示词");
+		assert.equal(resRep.status, "completed", "补写成功 ⇒ 终态取补写结果");
+		assert.ok(repLogs.some((l) => l.startsWith("fusion-repair:")), "补写轮必须日志可见");
+		const metaRep = JSON.parse(readFileSync(join(dirRep, "meta.json"), "utf8")) as {
+			fusion?: { status: string; repair?: { status: string; gapsRequested?: string[] | null } };
+		};
+		assert.equal(metaRep.fusion?.status, "completed", "meta 记终态");
+		assert.equal(metaRep.fusion?.repair?.status, "completed", "meta 必须记录补写轮（不得静默）");
+		assert.deepEqual(metaRep.fusion?.repair?.gapsRequested, ["## 4. 不可采信项"], "补写请求的缺口要落盘可审计");
+
+		// 无产物的失败（gaps 为空）⇒ 不得自动补派（没有补写基础，重烧整轮是编排层的决定）
+		const dirNoGap = join(root, "runNoGap");
+		mkdirSync(dirNoGap, { recursive: true });
+		const gapInputs: Array<Record<string, unknown>> = [];
+		const resNoGap = await runFusionStep({
+			meta: { runId: "tfl-ng", runDir: dirNoGap, repoRoot: root },
+			reportPath,
+			fusionModel: "m",
+			log: () => {},
+			dispatch: async (i) => {
+				gapInputs.push(i as unknown as Record<string, unknown>);
+				return { status: "failed", reason: "盘上无产物且回复不合格", zeroModelCall: false };
+			},
+		});
+		assert.equal(gapInputs.length, 1, "无缺口清单 ⇒ 不得自动补派（禁止连环重发）");
+		assert.equal(resNoGap.status, "failed");
+
+		// 补写轮自己失败 ⇒ 终态仍是 failed（不得拿首轮半截结果当成功）
+		const resRep2 = await runFusionStep({
+			meta: { runId: "tfl-rep2", runDir: dirNoGap, repoRoot: root },
+			reportPath,
+			fusionModel: "m",
+			log: () => {},
+			dispatch: async (i) =>
+				i.repair
+					? { status: "failed", reason: "补写后仍缺 ## 5. 后续行动", zeroModelCall: false, gaps: ["## 5. 后续行动"] }
+					: { status: "failed", reason: "六节不齐", zeroModelCall: false, gaps: ["## 5. 后续行动"] },
+		});
+		assert.equal(resRep2.status, "failed", "补写失败 ⇒ 终态 failed");
+		assert.deepEqual(resRep2.gaps, ["## 5. 后续行动"], "残余缺口要留在结果里（给人看的下一步依据）");
+
+		// 真实接线（不走 seam）：走完整 dispatchFusion 两轮 ⇒ 补写轮**必须能跑起来**。
+		// 首轮写空壳 ⇒ failed(gaps)；第二轮提示词带「补写轮」标记 ⇒ 写齐全 ⇒ 终态 completed。
+		// 本夹具同时钉住一个坑：补写轮不得去重抢 fusion.claim（claim 已存在 ⇒ 会被幂等门 skip）。
+		const dirR2 = join(root, "runRepairReal");
+		const runsR2 = join(root, "runs-repair-real");
+		mkdirSync(join(dirR2, "fusion"), { recursive: true });
+		writeFileSync(join(dirR2, "meta.json"), JSON.stringify({ runId: "tfl-r2", status: "completed" }), "utf8");
+		const r2Prompts: string[] = [];
+		const spawnR2 = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			const prompt = argv.join(" ");
+			r2Prompts.push(prompt);
+			setImmediate(() => {
+				const body = prompt.includes("本轮是补写轮") ? SECTION_TEXT : SHELL_TEXT;
+				writeFileSync(join(dirR2, "fusion", "fusion.md"), "# 融合报告\n\n" + body + "\n", "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		const resR2 = await runFusionStep({
+			meta: { runId: "tfl-r2", runDir: dirR2, repoRoot: root },
+			reportPath,
+			fusionModel: "m",
+			runsDir: runsR2,
+			piCli: join(root, "cli.js"),
+			spawnFn: spawnR2 as never,
+			log: () => {},
+		});
+		assert.equal(r2Prompts.length, 2, "真实派发链必须真的跑两轮");
+		assert.ok(r2Prompts[1].includes("本轮是补写轮"), "补写轮提示词必须带补写模式说明");
+		assert.ok(r2Prompts[1].includes("正文仅"), "补写轮提示词必须列出具体缺口与实测长度（基座提示词本身含六节标题，不得拿它当断言）");
+		assert.ok(!r2Prompts[0].includes("本轮是补写轮"), "首轮不得带补写模式");
+		assert.equal(resR2.status, "completed", "补写轮写齐 ⇒ 终态 completed（claim 已存在时补写轮不得被幂等门 skip）");
+		const metaR2 = JSON.parse(readFileSync(join(dirR2, "meta.json"), "utf8")) as { fusion?: { status: string; repair?: { status: string } } };
+		assert.equal(metaR2.fusion?.repair?.status, "completed", "meta 记录真实补写轮结果");
 	}
 
 	console.log("trace-fusion fusion-dispatch tests passed");
