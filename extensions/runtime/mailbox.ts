@@ -18,7 +18,7 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
+import { appendRuntimeEnvelopeOnceSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
 import { newEventEnvelope } from "./envelope.ts";
 import { isObjectAddress, type ObjectAddress } from "./address.ts";
 import {
@@ -802,7 +802,7 @@ export function finalizeDeadLetters(
 			continue; // never-throw：单封写失败不影响其他封
 		}
 		try {
-			appendRuntimeEnvelopeSafe(
+			appendRuntimeEnvelopeOnceSafe(
 				newEventEnvelope({
 					type: "message.target-gone",
 					source: `pi://${row.recipient}`,

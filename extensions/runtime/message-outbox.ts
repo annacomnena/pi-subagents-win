@@ -31,7 +31,7 @@ import { readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from
 import { join } from "node:path";
 import { piSessionAddress, type ObjectAddress } from "./address.ts";
 import { newEventEnvelope } from "./envelope.ts";
-import { appendRuntimeEnvelopeSafe, defaultJournalPath } from "./journal.ts";
+import { appendRuntimeEnvelopeOnceSafe, defaultJournalPath } from "./journal.ts";
 
 // ── 词表 ───────────────────────────────────────────────────────────
 
@@ -123,7 +123,7 @@ export function sweepExpiredOutboxItems(dir: string, opts: SweepExpiredOutboxOpt
 		expired.push(marked);
 		try {
 			const at = now.toISOString();
-			appendRuntimeEnvelopeSafe(
+			appendRuntimeEnvelopeOnceSafe(
 				newEventEnvelope({
 					type: "message.expired",
 					source: piSessionAddress(it.sessionId),
@@ -289,7 +289,7 @@ export function sweepTargetDeadOutboxItems(
 		failed.push(marked);
 		try {
 			const at = now.toISOString();
-			appendRuntimeEnvelopeSafe(
+			appendRuntimeEnvelopeOnceSafe(
 				newEventEnvelope({
 					type: "message.failed",
 					source: piSessionAddress(it.sessionId),

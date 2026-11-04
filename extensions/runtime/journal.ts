@@ -12,6 +12,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, openSync, closeSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { validateEnvelope, type RuntimeEnvelope } from "./envelope.ts";
@@ -39,24 +40,55 @@ function defaultClaimsDir(): string {
  * 其余实例/后续重放看到标记直接跳过。与 legacy .notified 唤醒幂等完全解耦——
  * journal 的完备性不依赖 recipient 路由，rollover 后新 master session 仍能补写终态。
  *
- * dedupeKey 含 scheme 字符（`run.completed:run://tab/x`），claim 文件名做受限替换；
- * tab runId 为 base36 无 `/` `:`，受控格式下无碰撞面。
+ * dedupeKey 含 scheme 字符（`run.completed:run://tab/x`）⇒ 文件名用 sha256 定长映射（见 claimFileName）。
  */
-export function claimRuntimeEmission(dedupeKey: string, claimsDir: string = defaultClaimsDir()): boolean {
-	if (!dedupeKey || /\s/.test(dedupeKey)) return false;
+/**
+ * claim 标记文件名（定长 sha256）。
+ *
+ * 【为何不用 sanitize（L4 M2，2026-11-05）】旧版 `key.replace(/[^A-Za-z0-9._-]/g,"_")` 有两个可达缺陷：
+ * ① 碰撞：`keyA/v1` 与 `keyA_v1` 映射到同一个文件名 ⇒ 后者的 journal 行被当成「已写过」而**静默吞掉**
+ *   （旧注释「受控格式下无碰撞面」只对 tab runId 成立，对 commandKey 不成立——它是自由文本）。
+ * ② 超长：文件名 256 字符时 open(wx) 报 ENOENT ⇒ claim 永远 false ⇒ 静默丢行（commandKey ≥ 232 字符即触发）。
+ * 定长 sha256（与 command-executor.ts:897 `commandArtifactName` 同一范式）同时消灭两个缺陷。
+ */
+function claimFileName(dedupeKey: string): string {
+	return createHash("sha256").update(dedupeKey, "utf8").digest("hex") + ".claimed";
+}
+
+/** claim 结果三态（L4 M1）：必须把「已写过」与「claim 机制坏了」区分开。 */
+export type ClaimOutcome =
+	| { state: "claimed" }
+	| { state: "duplicate" }
+	| { state: "unavailable"; error: string };
+
+/**
+ * 原子领取一个 dedupeKey 的「已写入 journal」权：第一个 open('wx') 成功者获得写权，
+ * 其余实例/后续重放看到标记直接跳过。与 legacy .notified 唤醒幂等完全解耦——
+ * journal 的完备性不依赖 recipient 路由，rollover 后新 master session 仍能补写终态。
+ */
+export function claimRuntimeEmissionDetailed(dedupeKey: string, claimsDir: string = defaultClaimsDir()): ClaimOutcome {
+	if (!dedupeKey || /\s/.test(dedupeKey)) return { state: "unavailable", error: "empty-or-whitespace-key" };
 	try {
 		mkdirSync(claimsDir, { recursive: true });
-	} catch {
-		return false;
+	} catch (e) {
+		// 目录建不出来（同名文件占位 / 权限 / 磁盘满）⇒ 机制坏，不是「已写过」
+		return { state: "unavailable", error: `claims-dir-unusable: ${e instanceof Error ? e.message : String(e)}` };
 	}
-	const fileName = `${dedupeKey.replace(/[^A-Za-z0-9._-]/g, "_")}.claimed`;
 	try {
-		const fd = openSync(join(claimsDir, fileName), "wx");
+		const fd = openSync(join(claimsDir, claimFileName(dedupeKey)), "wx");
 		try { closeSync(fd); } catch { /* ignore */ }
-		return true;
-	} catch {
-		return false;
+		return { state: "claimed" };
+	} catch (e) {
+		// EEXIST = 已有赢家（正常幂等路径）；其余（ENOENT/权限/磁盘）都是机制坏
+		const code = (e as NodeJS.ErrnoException)?.code;
+		if (code === "EEXIST") return { state: "duplicate" };
+		return { state: "unavailable", error: `claim-open-failed(${code ?? "?"}): ${e instanceof Error ? e.message : String(e)}` };
 	}
+}
+
+/** 向后兼容的布尔入口（既有测试与调用方用它）。语义：claimed=true，其余 false。 */
+export function claimRuntimeEmission(dedupeKey: string, claimsDir: string = defaultClaimsDir()): boolean {
+	return claimRuntimeEmissionDetailed(dedupeKey, claimsDir).state === "claimed";
 }
 
 // ── 写 ─────────────────────────────────────────────────────────────
@@ -78,6 +110,48 @@ export interface SafeAppendResult {
 /** Safe wrapper：吞掉一切异常（含 envelope 非法），失败只体现在返回值。接线点一律走这里。 */
 export function appendRuntimeEnvelopeSafe(envelope: RuntimeEnvelope, path: string = defaultJournalPath()): SafeAppendResult {
 	try {
+		appendRuntimeEnvelope(envelope, path);
+		return { ok: true };
+	} catch (e) {
+		return { ok: false, error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+/**
+ * 幂等 Safe wrapper（2026-11-05，plans/20261104_delivery_defects_L2_item1.md；L4 返修后）。
+ * 带 dedupeKey ⇒ 先跨进程 claim 再写（同一 key 只落盘一次）；无 key ⇒ 退化为普通 safe 写。
+ *
+ * 为何新增本函数而不是改 `appendRuntimeEnvelopeSafe`（首版尝试的错误）：
+ * `emitRuntimeEventOnce` 已在内部先 claim 再调 `emitRuntimeEvent` ⇒ 后者再调 safe ⇒
+ * 若 safe 也 claim，**同一 key 会被 claim 两次**，第二次必然失败 ⇒ 真正那一行再也写不进去
+ * （实测：原「emitRuntimeEventOnce 同键双调用只落盘一次」用例直接红成 0 条）。
+ *
+ * 【claim 三态（L4 M1 必修）】旧版把 `claimRuntimeEmission` 的**全部** false 原因当成
+ * 「同 key 已写过」⇒ claims 目录建不出来 / 文件名非法 / 权限 / 磁盘满 时，
+ * 8 个写点全部静默停写且返回 ok:true（AGENTS R-2 的教科书形状）。现改为：
+ *   · claimed      ⇒ 写盘，ok:true
+ *   · duplicate    ⇒ 不写盘，ok:true（幂等成功）
+ *   · unavailable  ⇒ 不写盘，**ok:false + error**（可诊断；不能再慌报成功）
+ *
+ * 【at-most-once 取舍（L4 M3，必须显式登记）】本入口把 8 个写点从**可能重发**变为
+ * **可能漏发**（claim 一旦成功、后续 append 失败就永远不再补）。这与 AGENTS R-5
+ * 「宁可重发，不可漏发」方向相反，所以这里显式记下理由：
+ *   · journal 是 **shadow / 派生审计面**，不是交付真相；交付真相在 outbox 盘面与会话转写；
+ *   · 重复行已实测造成 10 分钟空转与 4.6MB 日志（`message.received` 单键 62 次），
+ *     而漏行可由消费面（list / 面板 / 通知）补齐；
+ *   · **如果将来发现 journal 行被当作交付判据使用，本取舍必须重审**。
+ * 且 `unavailable` 现在返回 ok:false，调用方若需要区分「漏行」可以自行记一行 trace
+ * （当前 8 个调用方均忽略返回值，属已知且已登记的状态）。
+ */
+export function appendRuntimeEnvelopeOnceSafe(envelope: RuntimeEnvelope, path: string = defaultJournalPath()): SafeAppendResult {
+	try {
+		const key = envelope.dedupeKey;
+		// 无 key ⇒ 不参与幂等（旧行为不变）
+		if (key) {
+			const claim = claimRuntimeEmissionDetailed(key);
+			if (claim.state === "duplicate") return { ok: true };
+			if (claim.state === "unavailable") return { ok: false, error: claim.error };
+		}
 		appendRuntimeEnvelope(envelope, path);
 		return { ok: true };
 	} catch (e) {

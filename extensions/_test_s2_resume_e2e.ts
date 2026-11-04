@@ -36,6 +36,12 @@ import { createRuntimeHostServer } from "./runtime-host/server.ts";
 import { writeSessionOwner } from "./runtime/session-owner.ts";
 import { processStartedAt } from "./runtime/liveness.ts";
 
+// 【2026-11-05 L4 S2】隔离 PI_RUNTIME_DIR：本套件会走 appendRuntimeEnvelopeOnceSafe，
+// 而该函数的 claims 目录取自 defaultRuntimeDir() ⇒ 不隔离就会往**真实**
+// ~/.pi/agent/runtime/claims 里写（实测 _test_gui_continue_resume 每次 +22 个 .claimed，
+// 造成 40 个 orphan claim）。同 _test_runtime_journal.ts:19 的既有范式。
+process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-iso-"));
+
 let n = 0;
 const ok = (msg: string): void => {
 	n += 1;

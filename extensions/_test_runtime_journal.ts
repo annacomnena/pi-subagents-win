@@ -21,6 +21,7 @@ import { newEventEnvelope, validateEnvelope, type RuntimeEnvelope } from "./runt
 import {
 	appendRuntimeEnvelope,
 	appendRuntimeEnvelopeSafe,
+	appendRuntimeEnvelopeOnceSafe,
 	claimRuntimeEmission,
 	defaultJournalPath,
 	emitRuntimeEvent,
@@ -240,6 +241,68 @@ try {
 		assert.equal(emitRuntimeEventOnce(mk(), path), false, "同键第二次不发");
 		const { envelopes } = listRuntimeEnvelopes({ path });
 		assert.equal(envelopes.length, 1, "journal 只有一条");
+	}
+
+	// ── 9.6 appendRuntimeEnvelopeOnceSafe 幂等入口（窄改）（2026-11-05，item1）──────
+	// 根因：9 个写点全部带 dedupeKey 但全部走 safe 入口，而该入口历史上不看 key
+	// ⇒ events.jsonl 实测 2850 条带键信封里 310 条重复（最严重单键 62 次）。
+	{
+		const path = jp("safe-dedupe");
+		const mk = (text: string) => newEventEnvelope({
+			type: "run.completed",
+			source: masterAddress(),
+			subject: tabRunAddress("tab_safe_dedupe"),
+			dedupeKey: "run.completed:run://tab/tab_safe_dedupe",
+			payload: { text },
+		});
+
+		// ① 同 key 写两次 ⇒ 只落 1 行，且**两次都 ok:true**（幂等成功不是失败）
+		assert.equal(appendRuntimeEnvelopeOnceSafe(mk("first"), path).ok, true, "首次写 ok");
+		const second = appendRuntimeEnvelopeOnceSafe(mk("second"), path);
+		assert.equal(second.ok, true, "同键第二次仍返回 ok（幂等成功，不是失败）");
+		assert.equal(listRuntimeEnvelopes({ path }).envelopes.length, 1, "journal 只有一条");
+
+		// ② 不带 key ⇒ 逐条写入（旧行为逐字节不变）
+		const path2 = jp("safe-nokey");
+		const noKey = () => newEventEnvelope({ type: "run.completed", source: masterAddress(), subject: tabRunAddress("tab_nokey") });
+		assert.equal(appendRuntimeEnvelopeSafe(noKey(), path2).ok, true);
+		assert.equal(appendRuntimeEnvelopeSafe(noKey(), path2).ok, true);
+		assert.equal(listRuntimeEnvelopes({ path: path2 }).envelopes.length, 2, "无 key 不拦截");
+
+		// ③ 无 key 分支必须**真的走 append**（L4 E 变异漏网点：旧用例调的是 Safe 而非 OnceSafe
+		//    ⇒ 把无 key 分支改成 return {ok:false} 仍全绿）。这里断言行数，不再只看返回值。
+		const path3 = jp("once-nokey");
+		const noKey2 = () => newEventEnvelope({ type: "run.completed", source: masterAddress(), subject: tabRunAddress("tab_once_nokey") });
+		assert.equal(appendRuntimeEnvelopeOnceSafe(noKey2(), path3).ok, true);
+		assert.equal(appendRuntimeEnvelopeOnceSafe(noKey2(), path3).ok, true);
+		assert.equal(listRuntimeEnvelopes({ path: path3 }).envelopes.length, 2, "OnceSafe 无 key ⇒ 逐条写（不参与幂等）");
+
+		// ④ claims 目录里的标记文件**真的被创建**（L4 漏项 2）。定长 sha256 命名（L4 M2）。
+		const claimFiles = (await import("node:fs")).readdirSync(join(process.env.PI_RUNTIME_DIR!, "claims"));
+		const target = claimFiles.filter((f) => f.endsWith(".claimed"));
+		assert.ok(target.length > 0, "claims 目录里必须有 .claimed 标记文件");
+		assert.ok(target.every((f) => /^[0-9a-f]{64}\.claimed$/.test(f)), "claim 文件名必须是定长 sha256（L4 M2 修 sanitize 碰撞/超长）");
+
+		// ⑤ claim 机制**坏了**必须返回 ok:false（L4 M1 必修：旧版静默丢行 + 假 ok:true）
+		//    做法：把 claims 位置放成同名普通文件 ⇒ mkdirSync 必失败
+		const brokenRoot = join(tmp, "broken-runtime");
+		mkdirSync(brokenRoot, { recursive: true });
+		const claimsAsFile = join(brokenRoot, "claims");
+		writeFileSync(claimsAsFile, "occupied", "utf8");
+		const realRuntime = process.env.PI_RUNTIME_DIR;
+		process.env.PI_RUNTIME_DIR = brokenRoot;
+		try {
+			const path4 = jp("once-broken");
+			const r = appendRuntimeEnvelopeOnceSafe(newEventEnvelope({
+				type: "run.completed", source: masterAddress(), subject: tabRunAddress("tab_broken"),
+				dedupeKey: "run.completed:run://tab/tab_broken",
+			}), path4);
+			assert.equal(r.ok, false, "claims 机制坏 ⇒ 必须 ok:false（不得谎报成功）");
+			assert.ok(String(r.error ?? "").includes("claims"), `错误须可诊断，实际：${r.error}`);
+			assert.equal(listRuntimeEnvelopes({ path: path4 }).envelopes.length, 0, "机制坏时不写盘");
+		} finally {
+			process.env.PI_RUNTIME_DIR = realRuntime;
+		}
 	}
 
 	// ── 10. 默认路径：env override 生效（PI_RUNTIME_DIR 隔离契约）────

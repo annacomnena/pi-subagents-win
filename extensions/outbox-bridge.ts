@@ -48,7 +48,7 @@
 
 import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch, type FSWatcher } from "node:fs";
-import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./runtime/journal.ts";
+import { appendRuntimeEnvelopeOnceSafe, defaultJournalPath, defaultRuntimeDir } from "./runtime/journal.ts";
 import { newEventEnvelope } from "./runtime/envelope.ts";
 import {
 	listOutboxItems,
@@ -533,7 +533,7 @@ function appendBridgeJournalEvent(
 ): void {
 	try {
 		const at = (opts.now ?? new Date()).toISOString();
-		appendRuntimeEnvelopeSafe(
+		appendRuntimeEnvelopeOnceSafe(
 			newEventEnvelope({
 				type,
 				source: piSessionAddress(item.sessionId),

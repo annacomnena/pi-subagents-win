@@ -827,7 +827,7 @@ check("G16.2 autonomy 只读面：collect/gate 无 journal 写与投递调用（
 	const dir = join(repoRoot, "extensions", "runtime", "autonomy");
 	for (const f of ["collect.ts", "gate.ts"]) {
 		const src = readFileSync(join(dir, f), "utf8");
-		for (const banned of ["emitRuntimeEventOnce(", "appendRuntimeEnvelope(", "appendRuntimeEnvelopeSafe(", "deliverLetter(", "claimLetters("]) {
+		for (const banned of ["emitRuntimeEventOnce(", "appendRuntimeEnvelope(", "appendRuntimeEnvelopeSafe(", "appendRuntimeEnvelopeOnceSafe(", "deliverLetter(", "claimLetters("]) {
 			assert.equal(src.includes(banned), false, `${f} 不得出现 ${banned}`);
 		}
 	}

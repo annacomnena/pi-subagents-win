@@ -259,6 +259,8 @@ function emitOnce(env: RuntimeEnvelope, root: string): boolean {
 	} catch {
 		return false;
 	}
+	// 本函数已自行 claim（emitOnce 的 claim-then-append）⇒ 这里必须用**无幂等**的 Safe，
+	// 否则同一 key 被 claim 两次、第二次必败 ⇒ 一行都写不进去（实测 5 个用例红）。
 	return appendRuntimeEnvelopeSafe(env, journalPath).ok;
 }
 

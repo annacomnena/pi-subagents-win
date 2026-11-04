@@ -21,7 +21,7 @@
  *     auto 仅 {auto:boolean, reason?:string}；多余/非法字段 → invalid-payload（结构级，
  *     claim 之前拒绝，不占幂等键不写盘面）；
  *   - journal 入账：command.accepted|rejected|failed 各一事件（kind=event，subject=frame.to，
- *     dedupeKey=<type>:<commandKey>），经 appendRuntimeEnvelopeSafe（写失败仅吞掉，不影响回执）。
+ *     dedupeKey=<type>:<commandKey>），经 appendRuntimeEnvelopeOnceSafe（写失败仅吞掉；带 dedupeKey ⇒ 幂等，不影响回执）。
  *
  * 首批四命令（拍板见 plans/0920_G4_cmdexec_plan.md §0-2）：
  *   - workstream.pause/resume：目标放 to（workstream://<id>）；executor 层最小迁移校验
@@ -47,7 +47,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { masterAddress, parseObjectAddress, type ObjectAddress } from "./address.ts";
 import { newEventEnvelope } from "./envelope.ts";
-import { appendRuntimeEnvelopeSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
+import { appendRuntimeEnvelopeOnceSafe, defaultJournalPath, defaultRuntimeDir } from "./journal.ts";
 import { readLiveness } from "./liveness.ts";
 import { DEFAULT_MASTER_SUCCESSION, normalizeMasterSuccession } from "./master-auto.ts";
 import { uploadIdOk, UPLOAD_MAX_PER_MESSAGE } from "../runtime-host/uploads.ts";
@@ -684,7 +684,7 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 	// journal message.queued（safe wrapper：写失败不影响回执；正文不进 journal，§15 大内容不进信封）
 	try {
 		const at = (opts.now ?? new Date()).toISOString();
-		appendRuntimeEnvelopeSafe(
+		appendRuntimeEnvelopeOnceSafe(
 			newEventEnvelope({
 				type: "message.queued",
 				source: frame.issuedBy,
@@ -748,7 +748,7 @@ function runSessionAbort(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 	// journal（safe wrapper：写失败不影响回执；不含任何会话内容）
 	try {
 		const at = (opts.now ?? new Date()).toISOString();
-		appendRuntimeEnvelopeSafe(
+		appendRuntimeEnvelopeOnceSafe(
 			newEventEnvelope({
 				type: "session.abort.requested",
 				source: frame.issuedBy,
@@ -838,7 +838,7 @@ function runSessionSlash(frame: CommandFrame, opts: ExecuteCommandOptions): Comm
 
 	try {
 		const at = (opts.now ?? new Date()).toISOString();
-		appendRuntimeEnvelopeSafe(
+		appendRuntimeEnvelopeOnceSafe(
 			newEventEnvelope({
 				type: "session.slash.requested",
 				source: frame.issuedBy,
@@ -984,7 +984,7 @@ function appendCommandJournalEvent(frame: CommandFrame, outcome: CommandOutcome,
 		},
 		dedupeKey: `${frame.type}:${frame.commandKey}`,
 	});
-	appendRuntimeEnvelopeSafe(envelope, opts.journalPath ?? defaultJournalPath());
+	appendRuntimeEnvelopeOnceSafe(envelope, opts.journalPath ?? defaultJournalPath());
 }
 
 // ── 原子写（index.ts writeConfig 同款模式）────────────────────────
