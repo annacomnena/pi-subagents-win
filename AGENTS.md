@@ -249,6 +249,7 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
 | 广播：进程在 `agent_settled` 前被杀 ⇒ 该条可能漏推 | 未闭合 |
 | 广播：反序列化克隆 ⇒ 同一条可能重发 | 已知取舍（见 R-5） |
 | `config.json` 整文件重写的**机制性防护**（自动校验顶层键） | 未实现（目前靠本文件 R-1 人工遵守） |
+| trace-fusion **融合者**在所有 UI 面不可见（不是 tab、曾被写进孤岛账本目录） | **2026-11-04 已修账本落点**（见 R-17）；融合者仍是无头子进程，只经 `subagent-runs/run_fuse*.json` + 完成通知呈现，**不会**作为 tab 出现（设计约束） |
 
 ## R-15（2026-10-19）：不要把「用户本人的操作」误判成 agent 越权
 
@@ -309,3 +310,42 @@ git worktree remove ../wt-base        # ← 报 "failed to delete … Invalid ar
 5. **从 `C:/pi-standalone` 复制实体修全局时：禁 `/MIR`**（运行中的 pi 持有旧文件）。
    实测 `/E` 的 robocopy 会以 exit=9 结束，且唯一失败项是**在用的**
    `pi-tui/native/win32/prebuilds/win32-x64/win32-platform.node`（EBUSY，该文件本就存在 ⇒ 无损失）。
+
+## R-17（2026-11-04）：账本落点必须与消费端同源；「写进去了」≠「看得见」
+
+### 事故（用户原话：「融合者也不会作为一个 subagent 去呈现，任何地方都找不到它」）
+
+`extensions/trace-fusion/fusion-dispatch.ts:394` 用 `process.env.APPDATA` 拼账本目录：
+
+```ts
+const runsDir = input.runsDir ?? join(process.env.APPDATA ?? "", "pi", "agent", "subagent-runs");
+```
+
+本机实测这两个是**两个互不相关的目录**（PowerShell 查 `LinkType` 均为空，不是 junction）：
+
+```
+C:\Users\<u>\AppData\Roaming\pi\agent\subagent-runs   ← 融合者写这里（孤岛）
+C:\Users\<u>\.pi\agent\subagent-runs                  ← 真实账本目录（index.ts:208 RUNS_DIR）
+```
+
+而消费端 `extensions/index.ts:2649` 盯的是**另一个**：
+
+```ts
+collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));   // RUNS_DIR = DEFAULT_RUNS_DIR
+```
+
+⇒ 融合者写了账本，但 `registerAsyncResultWatcher` 永远监听不到它 ⇒ `subagent-win list` / async 面板 / 完成通知 / kill **全部空白**。
+实测存量 9 份孤岛账本（从 `run_fusemw0mh6mm_eeyu` 11-03 19:46 到 `run_fusemw1utt8t_yc1w` 11-04 16:31）—— **从功能落地那天起每一次融合都是「看不见」的**，无人发现。
+
+### 规则
+
+1. **账本/派生目录不得自行拼路径**。仓内已有单一常量（`subagent-kill.ts:43` `DEFAULT_RUNS_DIR`，注释就写着「避免两处硬编码漂移」），必须复用它。
+2. **写账本前先找消费端**：`grep -rn "registerAsyncResultWatcher\|listTabDispatches\|defaultTabRunsDir"`，确认自己写的目录与消费端读的是同一个。
+3. **「写进去了」不等于「看得见」**：验证可观测性不能只看文件存在，要看**消费面**（list / 面板 / 通知）真的有那一行。
+4. **存量迁移必须带去重标记**：迁 `run_*.json` 到真实目录时，**每份同时写 `.notified`**，否则 watcher 的 tick 会把全部陈旧完成通知一次注入当前会话（本次 9 份，实测会刷屏）。
+5. **不自动迁移存量**：迁移会让旧完成事件重新进入投递链，属人的决定。
+
+### 为什么它是 R-2 的姊妹条
+
+R-2 说的是「开关关掉就彻底不工作，必须有独立存活信号」；
+R-17 说的是「在工作，但产物写到了没人读的地方」—— **同样是静默失效，同样只能靠消费面读数发现**。

@@ -181,6 +181,7 @@ assert.deepEqual(commandNames, [
 	"today-usage",
 	"trace-fusion",
 	"trace-fusion-clean",
+	"trace-fusion-fuse",
 	"wechat",
 	"wechat-remote-run",
 	"workstream",
@@ -241,7 +242,7 @@ assert.deepEqual(
 for (const t of ["subagent-win", "launch-tabs"]) {
 	assert.ok(toolNames.includes(t), `工具 ${t} 必须注册`);
 }
-for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion", "trace-fusion-clean", "hotspot"]) {
+for (const c of ["agents", "runs", "links", "today-usage", "sub-models", "notify", "searcher-mode", "launch", "trace-fusion", "trace-fusion-clean", "trace-fusion-fuse", "hotspot"]) {
 	assert.ok(commandNames.includes(c), `命令 ${c} 必须注册`);
 }
 for (const e of ["session_start", "session_shutdown", "before_agent_start"]) {

@@ -17,6 +17,8 @@ import { collectRunArtifacts } from "./artifacts.ts";
 import { runCrossTest, finishDiagnoseRun } from "./cross-test.ts";
 import { readTraceFusionConfig } from "./config.ts";
 import { runFusionStep } from "./fusion-dispatch.ts";
+import { registerRunProcess, clearRunProcess } from "../subagent-kill.ts";
+import { notifyAsyncCompletion } from "../async-panel.ts";
 import { defaultRunsDir } from "./types.ts";
 
 async function main(): Promise<void> {
@@ -76,6 +78,11 @@ async function main(): Promise<void> {
 			fusionModel: config.fusionModel,
 			piCli,
 			log,
+			// S1（2026-11-04）：让 headless 融合者成为一等 async run —— 有 pid（可 kill）、
+			// 有正规完成通知（不再只靠对账补投这条降级路径）。
+			registerRunProcess,
+			clearRunProcess,
+			notifyCompletion: notifyAsyncCompletion,
 		});
 		releaseClaim();
 	} catch (err) {

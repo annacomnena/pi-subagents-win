@@ -45,6 +45,8 @@ import { registerHotspot } from "./hotspot/index.ts";
 import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { resolveWorkerModel as resolveTraceWorkerModel, type AvailableModelRef } from "./trace-fusion/models.ts";
+import { dispatchFusion, buildFusionPrompt } from "./trace-fusion/fusion-dispatch.ts";
+import { makeSubagentFusionRunner } from "./trace-fusion/fusion-agent.ts";
 import { registerWikiNav } from "./wiki-nav.ts";
 // codegraph：外部 codegraph CLI 的工具包装（2026-10-31）。
 // 之前只有提示文字提到 codegraph，从未注册成工具 ⇒ 实测 8492 次调用里
@@ -5641,6 +5643,57 @@ ${notable[0].reason}
 					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。\n` +
 					`完成时会自动通知；报告在 ${result.meta.runDir}/cross-test-report.md`,
 					"info",
+				);
+			},
+		});
+
+		// ── /trace-fusion-fuse <runId>（2026-11-04，S2/S3）────────────────────
+		// 把「融合」显式拉成一次**同步 subagent 调用**：融合者以 agent="fusion" 出现在本次
+		// tool/命令调用里，结果直接回显（不再是「盘上一个没人读的 json」）。
+		// 自动链（lane 全部终态后由 collect worker 触发）仍是 headless 异步——那是结构约束：
+		// 它发生在事件回调里，同步阻塞会冻住 TUI。本命令是给人手动跑/重跑融合用的。
+		pi.registerCommand("trace-fusion-fuse", {
+			description: "同步跑一次融合（把 trace-fusion run 的三路诊断拼装成推进方案）：/trace-fusion-fuse <runId>",
+			handler: async (args, ctx) => {
+				const runId = (args ?? "").trim();
+				if (!runId) {
+					ctx.ui.notify("用法：/trace-fusion-fuse <runId>；runId 见 ~/.pi/agent/trace-fusion-runs/ 目录名", "error");
+					return;
+				}
+				const meta = readTraceRunMeta(join(defaultTraceFusionRunsDir(), runId));
+				if (!meta) {
+					ctx.ui.notify(`run meta 不可读：${runId}`, "error");
+					return;
+				}
+				const reportPath = join(meta.runDir, "cross-test-report.md");
+				const cfg = readTraceFusionConfig(join(PKG_DIR, "config.json"));
+				if (!cfg.fusionModel) {
+					ctx.ui.notify("未配置 traceFusionLoop.fusionModel ⇒ 融合不启动（不自动挑模型）", "error");
+					return;
+				}
+				ctx.ui.notify(`🧬 融合开始（同步，模型 ${cfg.fusionModel}）…`, "info");
+				const runner = makeSubagentFusionRunner({
+					runWithFallback: (agent, task, systemPrompt, model, timeoutMs, signal, onUpdate, opts2) =>
+						runWithFallback(agent as AgentDef | null, task, systemPrompt, model, timeoutMs, signal, onUpdate as never, opts2 as never) as never,
+					findAgent: (name) => agents.find((a) => a.name === name) ?? null,
+				});
+				const res = await dispatchFusion({
+					runId: meta.runId,
+					runDir: meta.runDir,
+					repoRoot: meta.repoRoot,
+					reportPath,
+					fusionModel: cfg.fusionModel,
+					laneModel: meta.lanes?.A ? undefined : undefined,
+					dispatcherSessionId: meta.dispatcherSessionId,
+					piCli: findPiCli() ?? undefined,
+					runFusionAgent: runner,
+					via: "subagent-runWithFallback(manual)",
+				});
+				ctx.ui.notify(
+					res.status === "completed"
+						? `✅ 融合完成：${res.reportPath}`
+						: `❌ 融合未完成（${res.status}）：${res.reason}`,
+					res.status === "completed" ? "info" : "error",
 				);
 			},
 		});

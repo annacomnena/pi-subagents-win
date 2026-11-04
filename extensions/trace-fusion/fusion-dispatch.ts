@@ -30,6 +30,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import { buildPiArgv } from "../runner-argv.ts";
 import { recordLink } from "../links.ts";
+// 账本落点必须与 async subagent 同源（2026-11-04 实测缺陷：此前用 APPDATA 拼路径，
+// 在本机是 C:\Users\<u>\AppData\Roaming\pi\agent\subagent-runs，与真实的 ~/.pi/agent/subagent-runs
+// 是两个互不相关的目录 ⇒ run_fuse*.json 成孤岛，registerAsyncResultWatcher 永远监听不到，
+// 导致融合进程在所有 UI 面（subagent list / async panel / 完成通知）都不可见。
+// 复用 subagent-kill.ts 的单一常量，避免「两处硬编码漂移」（该文件 :43 注释即为此而写）。
+import { DEFAULT_RUNS_DIR, registerRunProcess } from "../subagent-kill.ts";
+import type { FusionAgentRequest, FusionAgentResult, FusionAgentRunner } from "./fusion-agent.ts";
 import type { LaneId } from "./types.ts";
 
 /** 融合者不得拥有的能力（防递归派发/开标签页/自设计时器）。 */
@@ -135,6 +142,20 @@ export interface FusionDispatchInput {
 	outputPath?: string;
 	/** seams（测试注入）。 */
 	spawnFn?: (cmd: string, argv: string[], opts: object) => ChildProcess;
+	/**
+	 * 融合者跑法 seam（2026-11-04，S2/S3）。缺省 = 模块内 headless spawn（原行为）。
+	 * index.ts 注入 `runFusionAgentViaSubagent` 后，手动命令 `/trace-fusion-fuse` 走**同步**真 subagent。
+	 */
+	runFusionAgent?: FusionAgentRunner;
+	/** 手动/同步通道：把融合者作为一次真 subagent 呈现（写进账本的 agent 名不变，仅影响 via 标签与日志）。 */
+	via?: string;
+	/**
+	 * S1（2026-11-04）：视觉/控制面补齐 seam。缺省（不注入）保持旧行为（裸 spawn、不登记 pid、不发通知）。
+	 * index.ts 注入后，headless 融合者也是「一等 async run」：list 有 pid、可 kill、有正规完成通知。
+	 */
+	registerRunProcess?: (runsDir: string, runId: string, info: { pid: number; marker: string }) => void;
+	clearRunProcess?: (runId: string) => void;
+	notifyCompletion?: (rec: { id: string; agent?: string; task?: string; status: "completed" | "failed"; startedAt: string; result?: { error?: string } }) => void;
 	runsDir?: string;
 	linksPath?: string;
 	now?: () => number;
@@ -391,7 +412,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	}
 
 	const fusionRunId = `run_fuse${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-	const runsDir = input.runsDir ?? join(process.env.APPDATA ?? "", "pi", "agent", "subagent-runs");
+	const runsDir = input.runsDir ?? DEFAULT_RUNS_DIR;
 	const prompt = buildFusionPrompt({
 		runId: input.runId,
 		reportPath: input.reportPath,
@@ -427,12 +448,53 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		} catch { /* 尽力 */ }
 	}
 
-	const spawnFn = input.spawnFn ?? ((c, a, o) => spawn(c, a, o));
 	const outPath = join(input.runDir, "fusion", "fusion.stdout.log");
 	// 日志是 append（多次补跑共用一份，保留取证）⇒ 必须记下本次启动的字节偏移，
 	// 否则 capture 会把**上一次尝试**的正文当成本次结果（实测：attempt 5 刚跑 85s，
 	// 日志尾部仍是 attempt 4 的 591 字符谎报正文）。
 	const logStartOffset = existsSync(outPath) ? statSync(outPath).size : 0;
+	const budget = Math.max(60_000, Math.trunc(input.wallBudgetMs ?? FUSION_DEFAULT_WALL_MS));
+	// #3（2026-11-02）：必须拿退出码。「只要文件存在就算成功」会把非零退出（崩了/预算耗尽/模型报错）
+	// 读成 completed，而旧产物存在时更是把**上一次融合的文件**当成本次结果。
+	let timedOut = false;
+	let exitCode: number | null = null;
+	let exitSignal: string | null = null;
+	let fusionCaptured: number | null = null;
+	let fusionUsage: FusionUsage | null = null;
+	let agentVia = "headless-spawn";
+	let outcome: "exit" | "timeout" | "error" = "exit";
+
+	if (input.runFusionAgent) {
+		// ── subagent 通道（S2/S3，2026-11-04）：调用方注入 runFusionAgentViaSubagent ──
+		// 融合者在主会话里表现为一次普通 subagent 调用（同步可等、结果直接回显）。
+		agentVia = input.via ?? "subagent-runWithFallback";
+		try {
+			const res = await input.runFusionAgent({
+				fusionRunId,
+				traceRunId: input.runId,
+				prompt,
+				model: input.fusionModel,
+				repoRoot: input.repoRoot,
+				logPath: outPath,
+				outputPath,
+				wallBudgetMs: budget,
+				runsDir,
+				cmdMarker: input.piCli ?? process.execPath,
+				spawnFn: input.spawnFn,
+			});
+			exitCode = res.exitCode;
+			exitSignal = res.exitSignal;
+			timedOut = res.timedOut;
+			fusionUsage = res.usage;
+			agentVia = res.via || agentVia;
+			// subagent 通道没有 spawn 事件：用「超时 / 正常结束」两态映射，错误由 exitCode!==0 表达
+			outcome = res.timedOut ? "timeout" : "exit";
+		} catch (err) {
+			writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", startedAt, finishedAt: new Date().toISOString(), error: `subagent 通道异常：${(err as Error).message}` });
+			return { status: "spawn-error", reason: `subagent 通道异常：${(err as Error).message}`, fusionRunId, zeroModelCall: false };
+		}
+	} else {
+	const spawnFn = input.spawnFn ?? ((c, a, o) => spawn(c, a, o));
 	let child: ChildProcess;
 	let outFd: number | undefined;
 	try {
@@ -459,14 +521,13 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", startedAt, finishedAt: new Date().toISOString(), error: String((err as Error).message) });
 		return { status: "spawn-error", reason: `spawn 失败：${(err as Error).message}`, fusionRunId, zeroModelCall: false };
 	}
+	// S1：登记 pid（kill/身份校验需要）。marker 用 pi CLI 路径（命令行稳定子串）。
+	if (child.pid && input.registerRunProcess) {
+		try {
+			input.registerRunProcess(runsDir, fusionRunId, { pid: child.pid, marker: input.piCli ?? process.execPath });
+		} catch { /* 登记失败不阻塞派发 */ }
+	}
 
-	const budget = Math.max(60_000, Math.trunc(input.wallBudgetMs ?? FUSION_DEFAULT_WALL_MS));
-	let timedOut = false;
-	// #3（2026-11-02）：必须拿退出码。「只要文件存在就算成功」会把非零退出（崩了/预算耗尽/模型报错）
-	// 读成 completed，而旧产物存在时更是把**上一次融合的文件**当成本次结果。
-	let exitCode: number | null = null;
-	let exitSignal: string | null = null;
-	let fusionCaptured: number | null = null;
 	const done = new Promise<"exit" | "timeout" | "error">((resolve) => {
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -487,10 +548,12 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 			if (!timedOut) resolve("exit");
 		});
 	});
-	const outcome = await done;
+	outcome = await done;
 	if (outFd !== undefined) closeSync(outFd);
+	if (input.clearRunProcess) { try { input.clearRunProcess(fusionRunId); } catch { /* 尽力 */ } }
+	}
 	const finishedAt = new Date().toISOString();
-	const usage = parseFusionUsage(outPath);
+	const usage = fusionUsage ?? parseFusionUsage(outPath);
 	// harness 落盘：exit=0 且回复正文含六节标题 ⇒ 由调用方写 fusion.md（融合者无写工具）
 	// 融合者交报告的唯一通道 = 回复正文（它没有 write/edit 工具）：exit=0 就**必定**跑一次
 	// 六节校验。旧版写成 `!existsSync(outputPath)` 才校验 ⇒ 盘上有旧 fusion.md 时直接跳过，
@@ -515,7 +578,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		reason = "子进程 error 事件（未能正常启动/执行）";
 	} else if (exitCode !== 0) {
 		status = "failed";
-		reason = `子进程非零退出（exit=${exitCode ?? `signal ${exitSignal ?? "?"}`}），不得计为融合成功`;
+		reason = `融合者非零退出（exit=${exitCode ?? `signal ${exitSignal ?? "?"}`}），不得计为融合成功`;
 	} else if (fileSections?.ok) {
 		status = "completed";
 		reason = `融合产物已由融合者写入：${outputPath}（${fileSections.bytes} 字节，六节齐全）`;
@@ -541,6 +604,8 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		status, // 必须终态：停在 running 的账本 watcher 永不通知 ⇒ 静默失效
 		agent: "fusion",
 		model: input.fusionModel,
+		// via（2026-11-04）：区分「headless 子进程」与「真 subagent（runWithFallback）」两条通道
+		via: agentVia,
 		startedAt,
 		finishedAt,
 		exitCode,
@@ -552,6 +617,19 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		cost: usage ? { total: usage.cost, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite } : null,
 		turns: usage?.turns ?? null,
 	});
+	// S1：正规完成通知（旧版只有对账兜底「B 对账补投」，属降级路径）
+	if (input.notifyCompletion) {
+		try {
+			input.notifyCompletion({
+				id: fusionRunId,
+				agent: "fusion",
+				task: `trace-fusion ${input.runId} fusion`,
+				status: status === "completed" ? "completed" : "failed",
+				startedAt,
+				...(status === "completed" ? {} : { result: { error: reason } }),
+			});
+		} catch { /* 通知尽力 */ }
+	}
 	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false, exitCode, usage, gaps: fileSections && !fileSections.ok ? fileSections.missing : undefined };
 }
 
@@ -570,6 +648,10 @@ export async function runFusionStep(opts: {
 	runsDir?: string;
 	linksPath?: string;
 	spawnFn?: FusionDispatchInput["spawnFn"];
+	/** S1 seams：透传给 dispatchFusion（collect-cli 注入后，自动链的融合者也有一等账本）。 */
+	registerRunProcess?: FusionDispatchInput["registerRunProcess"];
+	clearRunProcess?: FusionDispatchInput["clearRunProcess"];
+	notifyCompletion?: FusionDispatchInput["notifyCompletion"];
 }): Promise<FusionDispatchResult> {
 	const dispatch = opts.dispatch ?? dispatchFusion;
 	let res: FusionDispatchResult;
@@ -587,6 +669,9 @@ export async function runFusionStep(opts: {
 			runsDir: opts.runsDir,
 			linksPath: opts.linksPath,
 			spawnFn: opts.spawnFn,
+			registerRunProcess: opts.registerRunProcess,
+			clearRunProcess: opts.clearRunProcess,
+			notifyCompletion: opts.notifyCompletion,
 		});
 	} catch (err) {
 		res = { status: "spawn-error", reason: `融合步骤异常：${(err as Error).message}`, zeroModelCall: false };
