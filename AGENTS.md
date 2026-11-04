@@ -349,3 +349,67 @@ collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));   // RUNS_DIR = 
 
 R-2 说的是「开关关掉就彻底不工作，必须有独立存活信号」；
 R-17 说的是「在工作，但产物写到了没人读的地方」—— **同样是静默失效，同样只能靠消费面读数发现**。
+
+---
+
+## R-18（2026-11-05）：**改了不等于生效**——会话内常驻路径必须用新进程验收
+
+### 事故（我自己踩的，gen14 复现确认）
+
+`#8` 修了 diagnose 模式把 `repoRoot` 当 lane worktree 的缺陷（`fd12c6d`，04:07 提交）。
+之后我在**同一个主会话进程**里跑了一次 trace-fusion，reclaim 仍然报 6 条
+`fatal: '<repo>' is a main working tree`，仓外 `.stale.json` 野文件又出现。
+
+**不是修复无效，是修复没被加载**：
+- 主会话进程 pid 5420 **启动于 11-04 16:00:33**
+- `fd12c6d` 提交于 **11-05 04:07:21**
+⇒ 那个进程跑的是**旧码**。而写 `.stale.json` 的调用链
+`index.ts:2661 onTabFinished → maybeAutoCollectTraceRun → reclaimTerminalLaneWorktrees`
+**跑在主会话进程里**，不是 lane 进程。
+
+### 规则
+
+1. **凡修改「会话进程内常驻代码路径」，验收必须用新进程。**
+   这类路径包括（不限于）：`supervisor` / `worktree-reclaim` / `async-result-watcher` /
+   `sweepDeadTargets` / `autonomy tick` / `event-bus` —— 全部由 session 事件驱动，
+   只在长驻进程里跑。
+2. **验收方式（按成本从低到高）**：
+   · 起一个独立 node 进程 `import` 该模块直接验（最快，本次 gen14 就是这么验的）
+   · `/reload`（同进程重读扩展，覆盖大部分场景）
+   · 重启会话 / 重启 host（最彻底，但会影响当前所有会话 ⇒ **必须用户批**）
+3. **禁止的验收方式**：`git log` 有 commit + 单测绿 ⇒ 就宣布「已修」。长驻进程不会热更新，
+   这正是「改了但没生效」的形状。
+4. **一批改动要登记「需重启才生效」清单**，并在下一次重启时一次性核对。
+   2026-11-05 本批有 4 项属于这一类：
+   `fd12c6d`（#8 worktree）、`654aeed`（journal R-2 信号）、
+   `cc3a1f2`（项 6 死信终结）、`47bf3cb`（项 0 判活判据）。
+5. **区分「改了但没生效」与「改错了」**：前者重跑即好，后者要返修。
+   判据是「进程启动时刻 vs commit 时刻」，不是「现象有没有」。
+
+---
+
+## R-19（2026-11-05）：提交前自检——改含转义字面量的 `.ts` 后必须 import 加载验证
+
+### 事故（同一天两次，都是我自己）
+
+1. **第一次**：用 `node -e` / heredoc 写含 `\n` 的 TS 字面量 ⇒ 三层转义（shell → node → JS 引擎）
+   各吃一层反斜杠 ⇒ 写进文件的是真实换行。改用 `String.fromCharCode(10,10)` 后正常。
+2. **第二次**（`7e8e3ac`）：用 **python 的 `s.replace()`** 写入含 `\r?\n` 的 TS 正则 ⇒
+   `md.split(/` + 真实换行 + `?` + 换行 + `/)` ⇒ `SyntaxError: Unterminated regexp literal`。
+   后果真机实测：run `tfl-20261105-050830-7ccc` 三路终态后 collect worker **起不来**，
+   claim 被领走、worker 一启动就崩、cross-test/fusion 全没生成、run 卡在 `running`。
+
+### 规则
+
+1. **改 `.ts` 里含转义字面量（`\n` / `\r?\n` / 正则 `/.../`）的代码后，提交前必须做一次加载验证**：
+   ```bash
+   node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs \
+     -e "import('./path/to/file.ts').then(()=>console.log('load ok'))"
+   ```
+2. **不要用字符串替换（python `s.replace()` / `sed` / heredoc）写带反斜杠的字面量**。
+   改用：`edit` 工具、或按行号整体替换函数体、或用 `chr(92)` 显式拼接。
+3. **进程入口文件（`*-cli.ts` / `main` 入口）必须有加载 smoke 测试**。
+   它们只在被 spawn 时才执行 ⇒ 语法错能完整逃过整套测试网
+   （本次已补 `test:trace-fusion-collect-cli-import`，~50ms）。
+4. **测试不覆盖 = 不等于没问题**。看一个改动的验证是否充分，要看
+   「这类错误有没有任何测试会红」，而不是「我跑的那几个套件绿了」。
