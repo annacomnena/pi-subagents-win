@@ -538,6 +538,9 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		task: prompt.slice(0, 200),
 		model: input.fusionModel,
 		startedAt,
+		// 显示层（2026-11-05 第 3 项）：面板据此实时读 progress（turn 数 + 最后活动时刻），
+		// 让「自动链的融合者此刻在干什么」可见，而不需要新进程形态（不用 tab）。
+		progressSource: { logPath: join(input.runDir, "fusion", "fusion.stdout.log"), runDir: input.runDir },
 	});
 	if (input.dispatcherSessionId) {
 		try {

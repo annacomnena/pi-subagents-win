@@ -15,6 +15,7 @@
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { fusionProgressLine, readFusionProgress } from "./runtime/fusion-progress.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +36,12 @@ export interface AsyncPanelRecord {
 	startedAt: string;
 	/** 文件 mtime（终态 TTL 用；run 文件无 finishedAt 字段，以最后写入时刻为准）。 */
 	mtimeMs?: number;
+	/**
+	 * 实时进度来源（2026-11-05 第 3 项显示层）：融合者把自己 `--mode json` 的事件流写进
+	 * `fusion.stdout.log`，这里只读解析成「第 N turn · Xs 前 · stopReason」。
+	 * 仅 `agent="fusion"` 的记录会带它；其它 subagent 没有这个字段 ⇒ 行为不变。
+	 */
+	progressSource?: { logPath: string; runDir?: string };
 }
 
 const DEFAULT_RUNS_DIR = join(homedir(), ".pi", "agent", "subagent-runs");
@@ -123,7 +130,16 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 			for (const r of running) {
 				const agent = r.agent ?? "subagent";
 				const age = formatAge(r.startedAt);
-				lines.push(`  ${agent}: ${shortTaskLabel(r.task)} (${r.id} · ${age})`);
+				// 融合者带实时进度（第 N turn + 年龄），其它 subagent 行为不变（无 progressSource）。
+				let prog: string | null = null;
+				if (r.progressSource?.logPath) {
+					try {
+						prog = fusionProgressLine(readFusionProgress(r.progressSource.logPath));
+					} catch {
+						prog = null; // 进度读不到不得让面板崩
+					}
+				}
+				lines.push(`  ${agent}: ${shortTaskLabel(r.task)} (${r.id} · ${age})${prog ? `\n     ↳ ${prog}` : ""}`);
 			}
 		}
 		// 终态区压缩：失败/取消逐条（需要人看），成功只记条数。
