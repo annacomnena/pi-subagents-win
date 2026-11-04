@@ -11,7 +11,7 @@
  *   - legacy 文件（tab-runs/*.json 等）仍是 source of truth；本 journal 只观察。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, openSync, closeSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, openSync, closeSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -107,6 +107,91 @@ export interface SafeAppendResult {
 	error?: string;
 }
 
+/**
+ * journal 不可用状态文件（R-2：降级不得静默）。
+ *
+ * 【为何需要】`claimRuntimeEmissionDetailed` 的 `unavailable`（claims 目录建不出 / 权限 /
+ * 磁盘满 / 文件名非法）会让 8 个写点**全部**停写，而它们都忽略返回值 ⇒
+ * 「机制坏掉但没人知道」——比原来「重复写 199 次」更难发现（重复至少看得见）。
+ *
+ * 【为何不用 journal 自己记】自己坏了写不了 —— 必须用独立于 journal 的通道。
+ *
+ * 形状：`<runtimeDir>/state/journal-unavailable.json`，**只写不删**（供运维观察；
+ * 无 GC 是故意的——这个文件的成长本身就是一个信号）。
+ */
+const JOURNAL_UNAVAILABLE_REL = join("state", "journal-unavailable.json");
+
+/** 进程内计数器（避免每一条失败都写盘；仅首次 + 每 N 次或错误变化时落盘）。 */
+const journalUnavailable = { count: 0, firstAt: "" as string, lastAt: "" as string, lastError: "" as string, persisted: 0 };
+
+/** 可观测的状态快照（含 "degraded" 判定；供 `/autonomy status` 一类的诊断面消费）。 */
+export function journalUnavailableSnapshot(): {
+	count: number;
+	firstAt: string | null;
+	lastAt: string | null;
+	lastError: string | null;
+	degraded: boolean;
+} {
+	return {
+		count: journalUnavailable.count,
+		firstAt: journalUnavailable.firstAt || null,
+		lastAt: journalUnavailable.lastAt || null,
+		lastError: journalUnavailable.lastError || null,
+		degraded: journalUnavailable.count > 0,
+	};
+}
+
+/** 测试用：重置进程内计数器（不影响盘上状态文件）。 */
+export function _resetJournalUnavailableForTests(): void {
+	journalUnavailable.count = 0;
+	journalUnavailable.firstAt = "";
+	journalUnavailable.lastAt = "";
+	journalUnavailable.lastError = "";
+	journalUnavailable.persisted = 0;
+}
+
+/**
+ * 留下一次**可见信号**（R-2）。
+ *
+ * 频率限制：首次必写；之后每 100 次或错误内容变化时再写（避免一条坏磁盘把日志写爆）。
+ * never-throw：连状态文件都写不了时只能放弃（但 stderr 至少会有一行）。
+ */
+function signalJournalUnavailable(error: string, path: string): void {
+	const at = new Date().toISOString();
+	journalUnavailable.count += 1;
+	if (!journalUnavailable.firstAt) journalUnavailable.firstAt = at;
+	journalUnavailable.lastAt = at;
+	const errorChanged = journalUnavailable.lastError !== error;
+	journalUnavailable.lastError = error;
+	const shouldPersist = journalUnavailable.count === 1 || errorChanged || journalUnavailable.count - journalUnavailable.persisted >= 100;
+	// ⚠ stderr **每次**都写（最弱但最快可见；daemon 日志可直接 grep `journal-unavailable`）
+	try {
+		process.stderr.write(`[journal-unavailable] ${at} count=${journalUnavailable.count} path=${path} error=${error}\n`);
+	} catch { /* stderr 都不可用就只能算了 */ }
+	if (!shouldPersist) return;
+	journalUnavailable.persisted = journalUnavailable.count;
+	try {
+		const statePath = join(defaultRuntimeDir(), JOURNAL_UNAVAILABLE_REL);
+		mkdirSync(dirname(statePath), { recursive: true });
+		writeFileSync(
+			statePath,
+			JSON.stringify(
+				{
+					count: journalUnavailable.count,
+					firstAt: journalUnavailable.firstAt,
+					lastAt: journalUnavailable.lastAt,
+					lastError: error,
+					lastJournalPath: path,
+					pid: process.pid,
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+	} catch { /* 状态文件也写不了：stderr 那行是最后的信号 */ }
+}
+
 /** Safe wrapper：吞掉一切异常（含 envelope 非法），失败只体现在返回值。接线点一律走这里。 */
 export function appendRuntimeEnvelopeSafe(envelope: RuntimeEnvelope, path: string = defaultJournalPath()): SafeAppendResult {
 	try {
@@ -150,7 +235,13 @@ export function appendRuntimeEnvelopeOnceSafe(envelope: RuntimeEnvelope, path: s
 		if (key) {
 			const claim = claimRuntimeEmissionDetailed(key);
 			if (claim.state === "duplicate") return { ok: true };
-			if (claim.state === "unavailable") return { ok: false, error: claim.error };
+			if (claim.state === "unavailable") {
+				// R-2（2026-11-05 必修）：claim 机制坏掉时 8 个写点会**全部**停写，
+				// 而它们都忽略返回值 ⇒ 必须在这里留下独立于 journal 的可见信号
+				// （stderr 每次 + <runtimeDir>/state/journal-unavailable.json 限频落盘）。
+				signalJournalUnavailable(claim.error, path);
+				return { ok: false, error: claim.error };
+			}
 		}
 		appendRuntimeEnvelope(envelope, path);
 		return { ok: true };

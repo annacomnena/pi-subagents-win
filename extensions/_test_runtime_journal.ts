@@ -11,7 +11,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -303,6 +303,56 @@ try {
 		} finally {
 			process.env.PI_RUNTIME_DIR = realRuntime;
 		}
+	}
+
+	// ── 9.7 R-2：claim 机制坏掉时必须留下**可见信号**（2026-11-05 必修）──────
+	// 背景：8 个写点全部忽略 appendRuntimeEnvelopeOnceSafe 的返回值 ⇒ claims 目录
+	// 建不出来 / 权限 / 磁盘满时，整个 journal 静默停写，无人知道。
+	// 这是「机制坏掉但没人知道」，比原来「重复写 199 次」更难发现（重复至少看得见）。
+	{
+		const { journalUnavailableSnapshot, _resetJournalUnavailableForTests } = await import("./runtime/journal.ts");
+		_resetJournalUnavailableForTests();
+		const before = journalUnavailableSnapshot();
+		assert.equal(before.degraded, false, "初始未降级");
+
+		// 造 claims 不可用：把 <runtimeDir>/claims 位置放成同名普通文件
+		const rt = process.env.PI_RUNTIME_DIR!;
+		const claimsPath = join(rt, "claims");
+		// 先清掉可能存在的目录（前面用例已用过 claims）
+		try { rmSync(claimsPath, { recursive: true, force: true }); } catch { /* ignore */ }
+		writeFileSync(claimsPath, "occupied", "utf8");
+
+		const env = newEventEnvelope({
+			type: "run.completed", source: masterAddress(), subject: tabRunAddress("tab_signal"),
+			dedupeKey: "run.completed:run://tab/tab_signal",
+		});
+		const r = appendRuntimeEnvelopeOnceSafe(env, jp("signal"));
+		assert.equal(r.ok, false, "claims 不可用 ⇒ ok:false（不谎报）");
+
+		// ① 进程内计数器（诊断面可读）
+		const snap = journalUnavailableSnapshot();
+		assert.equal(snap.count, 1, `计数器应记录 1 次，实得 ${snap.count}`);
+		assert.equal(snap.degraded, true, "degraded 标记必须翻转（R-2 存活信号）");
+		assert.ok((snap.lastError ?? "").length > 0, "必须记录错误原文");
+
+		// ② 盘上状态文件（跨进程/重启后可查）
+		const statePath = join(rt, "state", "journal-unavailable.json");
+		assert.ok(existsSync(statePath), "必须落盘 state/journal-unavailable.json");
+		const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { count: number; lastError: string; lastJournalPath: string };
+		assert.equal(persisted.count, 1, "落盘计数");
+		assert.ok(persisted.lastError.includes("claims"), `落盘错误可诊断，实得 ${persisted.lastError}`);
+		assert.ok(persisted.lastJournalPath.length > 0, "落盘记录被影响的 journal 路径");
+
+		// ③ 第二次也计数（限频落盘，但内存计数递增）
+		appendRuntimeEnvelopeOnceSafe(env, jp("signal2"));
+		assert.equal(journalUnavailableSnapshot().count, 2, "第二次仍计数");
+		// 落盘限频：第 2 次不重写（persisted 停在 1）
+		assert.equal(JSON.parse(readFileSync(statePath, "utf8")).count, 1, "限频：第 2 次不重写状态文件");
+
+		// 清理：把 claims 恢复成目录，让后续用例不受影响
+		rmSync(claimsPath, { force: true });
+		mkdirSync(claimsPath, { recursive: true });
+		_resetJournalUnavailableForTests();
 	}
 
 	// ── 10. 默认路径：env override 生效（PI_RUNTIME_DIR 隔离契约）────

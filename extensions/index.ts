@@ -32,6 +32,7 @@ import { launchTraceRun, readTraceRunMeta } from "./trace-fusion/launch-workers.
 import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { registerLaneBashGuard } from "./trace-fusion/lane-bash-guard.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
+import { journalUnavailableSnapshot } from "./runtime/journal.ts";
 import {
 	readTfBlock,
 	normalizeUserSettings,
@@ -2957,6 +2958,13 @@ ${notable[0].reason}
 					`${hbTxt}`,
 					`${diagLine}`,
 					`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
+					// journal 写入口存活信号（R-2，2026-11-05）：claim 机制坏掉 / 磁盘满 / 权限时
+					// 8 个 journal 写点会**全部静默停写**。这里把它变成可见读数。
+					`journal-unavailable: ${(() => {
+						const j = journalUnavailableSnapshot();
+						if (!j.degraded) return "none（全部写点正常）";
+						return `⚠️ ${j.count} 次（首 ${j.firstAt?.slice(0, 19)} / 末 ${j.lastAt?.slice(0, 19)}）lastError=${j.lastError}`;
+					})()}`,
 					// ⑨ 监管账本（2026-10-17 P0）：每个 active 账本的状态（state + idle）——只读显示，零动作。
 					...supervisionLines(frontier),
 					`audit (最近 ${tail.length} 行):`,
