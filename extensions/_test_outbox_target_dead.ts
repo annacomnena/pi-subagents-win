@@ -154,14 +154,19 @@ check("A3 【改写】pid 活 + 心跳超龄 ⇒ unknown（心跳是弱信号，
 	assert.match(p.basis, /heartbeat-stale-weak-signal/, `basis 应指明「心跳超龄是弱信号」，实际 ${p.basis}`);
 });
 
-check("A4 pid unknown + 心跳超龄 ⇒ dead（查不到进程 + 久无心跳）", () => {
+check("A4 【2026-11-05 项 0 改写】pid 探针不可用 + 心跳超龄 ⇒ unknown（两个弱信号不叠加成 dead）", () => {
+	// 旧判据判 dead，理由「两个独立源都指向没了」——但两者**并不独立**：
+	//   pidState=unknown 的语义是「探针查不出来」（EPERM + enumerate 不可用，
+	//   liveness.ts:174-188），不是「进程没了」；心跳在空闲会话上必然超龄。
+	// dead 会驱动有副作用的动作（标 failed / 开新窗口），弱信号不得支撑它。
 	const staleAt = new Date(Date.now() - TARGET_HEARTBEAT_STALE_MS - 60_000).toISOString();
 	seedLiveness("sc-a4", "sess-a4", 4321, staleAt);
 	const p = probeTargetSessionLiveness("sess-a4", {
 		stateDir: STATE,
 		probePid: () => ({ state: "unknown", basis: "test" }),
 	});
-	assert.equal(p.state, "dead", `应为 dead，实际 ${p.state}（${p.basis}）`);
+	assert.equal(p.state, "unknown", `应为 unknown，实际 ${p.state}（${p.basis}）`);
+	assert.match(p.basis, /pid-probe-unavailable/, `basis 应说明探针不可用，实际 ${p.basis}`);
 });
 
 check("A5 没有心跳记录 ⇒ unknown（不猜）", () => {

@@ -227,10 +227,23 @@ export function probeTargetSessionLiveness(
 		const ageMin = Math.round((heartbeatAge / 60_000) * 10) / 10;
 		return { state: "unknown", basis: `heartbeat-stale-weak-signal(pid=${rec.pid},heartbeat-age=${ageMin}min)` };
 	}
-	// pid unknown + 心跳超龄       ⇒ dead（进程查不到 + 久无心跳）
+	// pid unknown + 心跳超龄 ⇒ **unknown**（2026-11-05 项 0 改判）
+	//
+	// 旧判据在这里判 dead，理由是「两个独立源都指向没了」。但两者**并不独立**：
+	//   ① `pidState: "unknown"` 恰恰是**探针查不出来**（EPERM + enumerate 不可用；
+	//      见 liveness.ts:174-188 的 `present === undefined ⇒ unknown`），
+	//      它的语义是「我不知道」，不是「进程没了」；
+	//   ② 「心跳超龄」在**空闲会话上必然成立**（scope-liveness 只在 agent_start/agent_end 写，
+	//      本文件头 :23-27 已实测证伪过同源推理）。
+	// ⇒ 「不知道 + 弱信号」= 更弱，绝不能支撑 **dead**（dead 会驱动有副作用的动作：
+	//    标 failed、开新窗口）。与 A3（pid 活 + 心跳超龄）取同一方向：弱信号只到 unknown。
+	//
+	// 死亡只由两条支撑（文件头既有纪律，本次把最后一条违例补齐）：
+	//   · pid 探活为 **dead**（最硬）；或
+	//   · session-owner 进程启动时间不匹配（PID 复用强证据）。
 	if (pidState === "unknown" && !heartbeatFresh) {
 		const ageMin = Math.round((heartbeatAge / 60_000) * 10) / 10;
-		return { state: "dead", basis: `pid-unknown-heartbeat-stale(${ageMin}min)` };
+		return { state: "unknown", basis: `pid-probe-unavailable-heartbeat-stale(heartbeat-age=${ageMin}min)` };
 	}
 	// 其余（pid unknown + 心跳新鲜 / 心跳时间戳坏）⇒ unknown，不判
 	return { state: "unknown", basis: `pid-${pidState}-heartbeat-${heartbeatFresh ? "fresh" : "unparsable"}` };
