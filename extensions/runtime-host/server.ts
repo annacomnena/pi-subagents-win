@@ -108,7 +108,7 @@ import {
 	type HostState,
 } from "./discovery.ts";
 import { defaultJournalPath, defaultRuntimeDir, listRuntimeEnvelopes } from "../runtime/journal.ts";
-import { defaultMailboxDir, mailboxBacklog } from "../runtime/mailbox.ts";
+import { defaultMailboxDir, mailboxBacklog, findDeadLetters, finalizeDeadLetters } from "../runtime/mailbox.ts";
 import { getMasterStatus } from "../runtime/master-control.ts";
 import {
 	outboxDir,
@@ -3076,6 +3076,25 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					// 【2026-11-04，L4 审查 B1/M2】owner 记录超龄 GC。
 					// 懒删已改为缺省不删（证据是 S2 与 B 共同依赖的）⇒ 目录有界靠这个显式 GC。
 					gcSessionOwners(stateDir);
+					// 【2026-11-05 投递缺陷项 6】mailbox 的 pending/claimed 死信扫成终态。
+					//
+					// 根因：`findDeadLetters` / `finalizeDeadLetters` 此前**生产零调用**
+					// （`grep -rn findDeadLetters extensions/ | grep -v _test` 只命中定义与 docstring）。
+					// 而 `claimLetters` 的 stale 重领只在**拉取路径**触发（3 个调用点都是「有信要取」时），
+					// 且它只把信重新标 `claimed`、**不判终态** ⇒ 前任 owner 领了信就死时，
+					// 那封信永远停在 claimed，无人判 target-gone。
+					//
+					// 修法：host 是唯一对全部 outbox 项有视野的执行体（同 sweepTargetDeadOutboxItems 的理由），
+					// 把死信终结挂进同一个 60s sweep。`finalizeDeadLetters` 缺省 dryRun=true，
+					// 这里必须显式 dryRun:false 才会真的落终态。
+					// never-throw：死信终结失败不得影响 host 存活。
+					const deadRows = findDeadLetters({
+						mailboxDir: defaultMailboxDir(),
+						probe: (addr) => probeTargetSessionLiveness(addr, { stateDir }),
+					});
+					if (deadRows.length > 0) {
+						finalizeDeadLetters(deadRows, { dryRun: false, ...(opts.journalPath !== undefined ? { journalPath: opts.journalPath } : {}) });
+					}
 				} catch {
 					/* never-throw：目标死亡检测不得影响 host 存活 */
 				}

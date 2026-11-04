@@ -137,6 +137,67 @@ check("D2 关闭后消息状态不再变化", () => {
 	assert.equal(readOutboxItem(DIR, idC)?.status, "pending", "C 应稳定在 pending");
 });
 
+
+// E（2026-11-05 项 6）：host 还必须把 mailbox 的 pending/claimed 死信扫成终态。
+// 根因：findDeadLetters / finalizeDeadLetters 此前**生产零调用**（grep 只命中定义），
+// 而 claimLetters 的 stale 重领只在拉取路径触发、且只重标 claimed 不判终态
+// ⇒ 前任 owner 领了信就死时，那封信永远停在 claimed。
+{
+	const { deliverLetter, listLetters, defaultMailboxDir } = await import("./runtime/mailbox.ts");
+	const { masterAddress } = await import("./runtime/address.ts");
+	const { readdirSync, readFileSync, writeFileSync } = await import("node:fs");
+	const { join: j2 } = await import("node:path");
+	const mb = defaultMailboxDir();
+	const old = new Date(Date.now() - 100 * 3_600_000).toISOString();
+	const { newMessageFrame } = await import("./runtime/protocol.ts");
+	const { newEnvelopeId } = await import("./runtime/ids.ts");
+	const frame = newMessageFrame({
+		id: newEnvelopeId("msg"),
+		kind: "REPORT",
+		from: masterAddress(),
+		to: masterAddress(),
+		sentAt: old,
+		summary: "dead claim",
+		details: {},
+	});
+	deliverLetter(frame, { mailboxDir: mb });
+	const frameId = frame.id;
+	const dir = j2(mb, "agent___master_default");
+	const file = readdirSync(dir).find((f) => f === `${frameId}.json`);
+	assert.ok(file, "信件已落盘");
+	const p2 = j2(dir, file!);
+	const raw = JSON.parse(readFileSync(p2, "utf8")) as Record<string, unknown>;
+	writeFileSync(p2, JSON.stringify({ ...raw, status: "claimed", claimedBy: "dead-owner", claimedAt: old }), "utf8");
+
+	const host4 = await createRuntimeHostServer({
+		port: 0,
+		stateDir: RT,
+		mailboxDir: mb,
+		sessionsDir: SESS,
+		hostPath: j2(RT, "host4.json"),
+	});
+	await host4.close();
+	const after = listLetters(masterAddress(), undefined, mb).find((l) => (l.frame as { id?: string }).id === frameId);
+	assert.ok(after, "信仍在（不应被删）");
+	assert.ok(["claimed", "target-gone"].includes(after!.status), `状态合法，实得 ${after!.status}`);
+	console.log("  ✓ E1 host sweep 构造成功且不改活信（链路不抛）");
+
+	// E2：**接线钉**（AGENTS §4.2「变异真实接线」）。
+	// 为什么需要它：E1 只证明「host 能起来、不抛、不改活信」，它**对接线被删零判别力**
+	// （实测：把 findDeadLetters/finalizeDeadLetters 调用整段删掉，E1 仍然绿）。
+	// 要让探针真的判 dead 需要造 attachment + session-owner + 无 transcript 的完整夹具，
+	// 成本高且属 _test_delivery_stale S5 已覆盖的行为面。故这里直接钉源码接线：
+	// 删掉调用、删掉 dryRun:false、或改回干跑，这条立刻红。
+	{
+		const { readFileSync: rf } = await import("node:fs");
+		const src = rf(new URL("./runtime-host/server.ts", import.meta.url), "utf8");
+		assert.ok(src.includes("findDeadLetters("), "server.ts 必须调用 findDeadLetters（项 6 接线）");
+		assert.ok(src.includes("finalizeDeadLetters("), "server.ts 必须调用 finalizeDeadLetters（项 6 接线）");
+		assert.ok(/finalizeDeadLetters\([^)]*dryRun:\s*false/.test(src), "必须显式 dryRun:false（缺省是干跑，零写入）");
+		console.log("  ✓ E2 接线钉：server.ts 同时含 findDeadLetters / finalizeDeadLetters / dryRun:false");
+		passed += 1;
+	}
+}
 console.log(`\n_test_host_dead_target_sweep: ${passed} checks passed`);
 rmSync(RT, { recursive: true, force: true });
 rmSync(SESS, { recursive: true, force: true });
