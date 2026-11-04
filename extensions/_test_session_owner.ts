@@ -26,6 +26,7 @@ import { join } from "node:path";
 
 import {
 	deleteSessionOwner,
+	gcSessionOwners,
 	probeSessionOwner,
 	readSessionOwner,
 	sessionOwnerDir,
@@ -97,7 +98,12 @@ try {
 		ok("S3 容忍读：坏 JSON / 坏版本 / 缺 pid / 缺 updatedAt / 缺失 全 → null");
 	}
 
-	// ── S4 pid 已死 ⇒ dead，且记录被**懒删** ──
+	// ── S4 pid 已死 ⇒ dead；**默认不删**（2026-11-04 语义变更，L4 审查 B1）──
+	//
+	// 旧语义：探针判 dead 时顺手懒删记录。
+	// 新语义：**默认不删** —— owner 记录是 S2（拉起）与 B（死信）**共同**的判死证据，
+	// 「谁先读到谁拿走证据」会让另一个消费者失效（实测：B 先扫过 ⇒ S2 永不拉起）。
+	// 目录卫生改由 `gcSessionOwners`（超龄 GC）承担 ⇒ 见 S12。
 	{
 		writeSessionOwner({ sessionId: "sess-s4", pid: 999999, startedAt: "2026-11-03T09:00:00.000Z", stateDir: STATE, now: T0 });
 		const p = probeSessionOwner("sess-s4", {
@@ -107,8 +113,30 @@ try {
 		});
 		assert.equal(p.state, "dead", `pid 死应判 dead，实际 ${p.state}（${p.basis}）`);
 		assert.equal(p.record?.pid, 999999, "结论应带上原记录（诊断可读）");
-		assert.equal(existsSync(sessionOwnerPath("sess-s4", STATE)), false, "僵尸记录应被懒删（否则目录无限增长）");
-		ok("S4 pid 已死 ⇒ dead + 僵尸记录懒删");
+		assert.equal(
+			existsSync(sessionOwnerPath("sess-s4", STATE)),
+			true,
+			"判死后记录**不得**被删（证据是 S2 与 B 共同依赖的；谁先删谁就让另一个失效）",
+		);
+		ok("S4 pid 已死 ⇒ dead + 记录保留（默认不删，GC 负责目录卫生）");
+	}
+
+	// ── S4b 显式 deleteZombie: true ⇒ 仍然懒删（向后兼容旧调用方）──
+	{
+		writeSessionOwner({ sessionId: "sess-s4b", pid: 999998, startedAt: "2026-11-03T09:00:00.000Z", stateDir: STATE, now: T0 });
+		const p = probeSessionOwner("sess-s4b", {
+			stateDir: STATE,
+			now: T0,
+			deleteZombie: true, // 显式要求删
+			probePid: () => ({ state: "dead", basis: "test" }),
+		});
+		assert.equal(p.state, "dead", "pid 死应判 dead");
+		assert.equal(
+			existsSync(sessionOwnerPath("sess-s4b", STATE)),
+			false,
+			"显式 deleteZombie:true ⇒ 仍应懒删（老调用方语义保留）",
+		);
+		ok("S4b 显式 deleteZombie:true ⇒ 懒删仍生效（向后兼容）");
 	}
 
 	// ── S5 pid 活 + 启动时间匹配 ⇒ alive ──
@@ -213,6 +241,31 @@ try {
 		assert.equal(deleteSessionOwner("sess-life-1", OWNER_STATE), false, "S11③ 真实 session_shutdown 已删（再删应 false）");
 		assert.equal(readSessionOwner("sess-life-1", OWNER_STATE), null, "S11④ 生命周期成对：shutdown 后无残留");
 		ok("S11 生命周期接线（registerSessionHooks ⇒ session_start 写 / session_shutdown 删）");
+	}
+
+	// ── S12 超龄 GC（2026-11-04，L4 审查 M2）──────────────────────────
+	//
+	// 懒删改为缺省不删后，目录有界**只**靠这个 GC。判据：pid 已死 **且** 超龄。
+	{
+		const DAY = 24 * 60 * 60 * 1000;
+		const now = new Date("2026-11-10T00:00:00.000Z");
+
+		// ① pid 已死 + 超龄 ⇒ 删
+		writeSessionOwner({ sessionId: "sess-gc-old", pid: 999001, startedAt: new Date(now.getTime() - 30 * DAY).toISOString(), stateDir: STATE, now: new Date(now.getTime() - 30 * DAY) });
+		// ② pid 已死但**未超龄** ⇒ 不删（给 S2 留复活窗口）
+		writeSessionOwner({ sessionId: "sess-gc-fresh", pid: 999002, startedAt: new Date(now.getTime() - 1 * DAY).toISOString(), stateDir: STATE, now: new Date(now.getTime() - 1 * DAY) });
+		// ③ pid **还活着** + 超龄 ⇒ 不删（活着的记录绝不能删）
+		writeSessionOwner({ sessionId: "sess-gc-alive", pid: 999003, startedAt: new Date(now.getTime() - 30 * DAY).toISOString(), stateDir: STATE, now: new Date(now.getTime() - 30 * DAY) });
+
+		const removed = gcSessionOwners(STATE, {
+			now,
+			probePid: (pid) => (pid === 999003 ? { state: "alive", basis: "test" } : { state: "dead", basis: "test" }),
+		});
+		assert.equal(removed, 1, `应只删 1 条（超龄且已死），实得 ${removed}`);
+		assert.equal(existsSync(sessionOwnerPath("sess-gc-old", STATE)), false, "超龄 + 已死 ⇒ 应删");
+		assert.equal(existsSync(sessionOwnerPath("sess-gc-fresh", STATE)), true, "未超龄 ⇒ 不删（留复活窗口）");
+		assert.equal(existsSync(sessionOwnerPath("sess-gc-alive", STATE)), true, "pid 还活着 ⇒ 绝不删");
+		ok("S12 超龄 GC：pid 已死且超龄 ⇒ 删；未超龄 / pid 活着 ⇒ 保留");
 	}
 
 	console.log(`\n_test_session_owner: ${n} checks passed`);

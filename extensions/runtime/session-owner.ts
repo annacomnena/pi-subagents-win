@@ -27,7 +27,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { probePidState } from "./liveness.ts";
@@ -136,6 +136,80 @@ export function deleteSessionOwner(sessionId: string, stateDir: string): boolean
 	}
 }
 
+/** owner 记录 GC 的超龄阈值（缺省 7 天）。 */
+export const SESSION_OWNER_GC_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 超龄 GC：删除「pid 已死且记录超龄」的僵尸 owner 记录。
+ *
+ * ## 为什么需要它（2026-11-04，L4 审查 B1/M2）
+ *
+ * owner 记录有两个消费者：S2（拉起判定）与 B（死信判定）——
+ * **两者都需要证据**。懒删改为缺省不删后 ⇒ 若没有别的路径删 ⇒
+ * 崩溃/被杀且无 outbox 项指向的会话 ⇒ 记录永久残留。
+ *
+ * （正常退出的会话由 `session_shutdown` 删 —— 那是生命周期成对，不是 GC。）
+ *
+ * ## 判据（两个条件都满足才删）
+ *
+ * 1. **pid 已死**（`probePidState` 判 dead）：活着的记录绝不能删
+ * 2. **updatedAt 超龄**（缺省 7 天）：给 S2 留足「用户想复活」的窗口
+ *    —— 用户在一周内回来点「拉起」应当仍然有效。
+ *
+ * never-throw：任何失败静默跳过（GC 失败不影响主流程）。
+ *
+ * @returns 删除的记录数
+ */
+export function gcSessionOwners(
+	stateDir: string,
+	opts: {
+		/** 超龄阈值 ms（缺省 7 天）。 */
+		maxAgeMs?: number;
+		now?: Date;
+		/** pid 探针（缺省 probePidState；测试可注入）。 */
+		probePid?: (pid: number) => { state: "alive" | "dead" | "unknown"; basis: string };
+	} = {},
+): number {
+	const maxAgeMs = opts.maxAgeMs ?? SESSION_OWNER_GC_MAX_AGE_MS;
+	const now = opts.now ?? new Date();
+	let files: string[] = [];
+	try {
+		files = readdirSync(sessionOwnerDir(stateDir));
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	for (const f of files) {
+		if (!f.endsWith(".json")) continue;
+		const sid = f.slice(0, -".json".length);
+		let rec: SessionOwnerRecord | null;
+		try {
+			rec = readSessionOwner(sid, stateDir);
+		} catch {
+			continue;
+		}
+		if (rec === null) continue;
+		// ① pid 还活着 ⇒ 绝不删
+		let alive: boolean;
+		try {
+			const p = (opts.probePid ?? ((pid: number) => probePidState(pid)))(rec.pid);
+			alive = p.state !== "dead";
+		} catch {
+			continue; // 探不到 ⇒ 不删（判不了 = 不动）
+		}
+		if (alive) continue;
+		// ② 未超龄 ⇒ 不删（给 S2 留复活窗口）
+		const age = now.getTime() - Date.parse(rec.updatedAt);
+		if (!Number.isFinite(age) || age < maxAgeMs) continue;
+		try {
+			if (deleteSessionOwner(sid, stateDir)) removed += 1;
+		} catch {
+			/* never-throw */
+		}
+	}
+	return removed;
+}
+
 /** Windows：OS 报告的进程启动时间（ISO）。查询不可用 → undefined（不猜）。 */
 function winProcessStartedAt(pid: number): string | undefined {
 	// Get-Process -Id 需要的权限与 process.kill 同级（不需要 admin）；
@@ -161,6 +235,17 @@ export interface SessionOwnerProbeOptions {
 	probeProcessStartedAt?: (pid: number) => string | undefined;
 	/** 容差覆盖（测试注入）。 */
 	startToleranceMs?: number;
+	/**
+	 * 僵尸记录是否**懒删**（缺省 false = **不删**）。
+	 *
+	 * 2026-11-04：原缺省 true，经 L4 审查 B1 改为 false ——
+	 * owner 记录是 S2（拉起）与 B（死信）**共同**的判死证据，
+	 * 「谁先读到谁拿走证据」会让另一个消费者失效（实测：B 先扫过 ⇒ S2 永不拉起）。
+	 * 目录卫生改由 `gcSessionOwners`（显式超龄 GC）承担。
+	 *
+	 * 需要删除语义的老调用方请显式传 `deleteZombie: true`。
+	 */
+	deleteZombie?: boolean;
 }
 
 export interface SessionOwnerProbeResult {
@@ -186,6 +271,8 @@ export function probeSessionOwner(sessionId: string, opts: SessionOwnerProbeOpti
 	const record = readSessionOwner(sessionId, opts.stateDir);
 	if (record === null) return { state: "unknown", basis: "no-record" };
 
+	const deleteZombie = opts.deleteZombie === true;
+
 	let pidState: "alive" | "dead" | "unknown";
 	let pidBasis: string;
 	try {
@@ -198,7 +285,7 @@ export function probeSessionOwner(sessionId: string, opts: SessionOwnerProbeOpti
 	}
 
 	if (pidState === "dead") {
-		deleteSessionOwner(sessionId, opts.stateDir); // 僵尸懒删（不变量 3）
+		if (deleteZombie) deleteSessionOwner(sessionId, opts.stateDir); // 僵尸懒删（不变量 3）
 		return { state: "dead", basis: `pid-dead(pid=${record.pid},${pidBasis})`, record };
 	}
 	if (pidState === "unknown") {
@@ -222,7 +309,7 @@ export function probeSessionOwner(sessionId: string, opts: SessionOwnerProbeOpti
 	const rec = Date.parse(record.startedAt);
 	const tol = opts.startToleranceMs ?? SESSION_OWNER_START_TOLERANCE_MS;
 	if (Number.isFinite(os) && Number.isFinite(rec) && os > rec + tol) {
-		deleteSessionOwner(sessionId, opts.stateDir); // 复用的号 ⇒ 记录已无意义
+		if (deleteZombie) deleteSessionOwner(sessionId, opts.stateDir); // 复用的号 ⇒ 记录已无意义
 		return { state: "dead", basis: `pid-reused(pid=${record.pid},os-start=${osStart},recorded=${record.startedAt})`, record };
 	}
 	return { state: "alive", basis: `pid-alive(pid=${record.pid},${pidBasis}) start-time-match`, record };

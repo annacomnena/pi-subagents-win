@@ -175,6 +175,16 @@ export function probeTargetSessionLiveness(
 		// 按这个字符串识别「零证据」，不能改）。
 		const owner = probeSessionOwner(sessionId, {
 			stateDir,
+			// 【2026-11-04 修，L4 审查 B1】deleteZombie: false —— **本调用点原来会删记录**。
+			//
+			// 事故链（L4 审查实测确认）：
+			//   ① S2 探针（server.ts）传 deleteZombie:false ⇒ 不删，保留证据
+			//   ② **本调用点没传** ⇒ 默认 true ⇒ B 判 dead 时**删掉 owner 记录**
+			//   ③ S2 下次探针只看到 no-record ⇒ unknown ⇒ 永不拉起
+			// ⇒ 能力断链原样重现（且只在「B 先扫过同一会话」时发生 ⇒ 难复现）。
+			//
+			// 目录卫生改由 `gcSessionOwners`（超龄 GC）承担 ⇒ 谁需要证据谁就不删。
+			deleteZombie: false,
 			...(opts.now !== undefined ? { now: opts.now } : {}),
 			...(opts.probePid !== undefined ? { probePid: opts.probePid } : {}),
 			...(opts.probeProcessStartedAt !== undefined ? { probeProcessStartedAt: opts.probeProcessStartedAt } : {}),
