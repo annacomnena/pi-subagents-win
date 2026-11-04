@@ -94,6 +94,12 @@ export interface AsyncResultWatcherOptions {
 let watcher: FSWatcher | null = null;
 let watcherGen = 0;
 let seenRunIds = new Set<string>();
+/**
+ * 僵尸扫描游标（2026-11-05 项 3）：`reapZombiesInDir` 单轮只处理 limit 个，
+ * 而 `readdirSync` 顺序稳定 ⇒ 不轮转的话排在 limit 之后的结果永远扫不到。
+ * 模块级 = 跨会话保留（目录不会因为我们重开 watcher 而变短）。
+ */
+let zombieCursor = 0;
 let selfDisabled = false;
 let tickInterval: ReturnType<typeof setInterval> | null = null;
 let sessionGen = 0;
@@ -469,7 +475,8 @@ export function registerAsyncResultWatcher(
 			// 此处复用**既有** 10s tick（不新增定时器）；skipInspect=true 避免在事件循环里跑
 			// PowerShell（审查 M8）；只扫 *.json（实测 654 文件中仅 54 个 JSON）。
 			try {
-				reapZombiesInDir(runsDir, { deps: { skipInspect: true }, limit: 50 });
+				const r = reapZombiesInDir(runsDir, { deps: { skipInspect: true }, limit: 50, cursor: zombieCursor });
+				zombieCursor = r.nextCursor;
 			} catch { /* 看门狗失败不影响投递 */ }
 		}, TICK_MS);
 		tickInterval.unref?.();

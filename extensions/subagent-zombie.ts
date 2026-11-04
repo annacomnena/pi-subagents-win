@@ -448,14 +448,22 @@ function reapClaimed(
  *
  * 审查 M8：调大列表时不做无界扫描——`limit` 限制单轮处理量（默认 50）。
  * 仅处理 `*.json`（实测 runs 目录 654 文件中只有 54 个 JSON）。
+ *
+ * 【限流后必须轮转（2026-11-05 项 3 修）】旧版每次都从 `readdirSync` 的第 0 项开始取前 `limit`
+ * 个 —— 而 NTFS 实测 `readdirSync` 顺序**稳定**（同一目录两次调用逐字相同）。
+ * ⇒ 目录超过 `limit` 后，**排在后面的文件永远不在窗口里**，“真僵尸扫不到”
+ * （本机当前 31 个 < 50 所以未显现，但这是必然的规模问题，不是偶发）。
+ *
+ * 现改为**游标轮转**：调用方传 `cursor` 进来，本轮从上次停下的位置继续（绕回 0），
+ * 返回 `nextCursor` 供下次传入。默认 `cursor=0` ⇒ 单次调用行为与旧版逐字节一致（向后兼容）。
  */
 export function reapZombiesInDir(
 	runsDir: string = DEFAULT_RUNS_DIR,
-	opts: { deps?: ZombieDeps; now?: () => number; limit?: number; runIds?: string[] } = {},
-): { scanned: number; reaped: string[]; observed: string[] } {
+	opts: { deps?: ZombieDeps; now?: () => number; limit?: number; runIds?: string[]; cursor?: number } = {},
+): { scanned: number; reaped: string[]; observed: string[]; nextCursor: number } {
 	const reaped: string[] = [];
 	const observed: string[] = [];
-	if (!existsSync(runsDir)) return { scanned: 0, reaped, observed };
+	if (!existsSync(runsDir)) return { scanned: 0, reaped, observed, nextCursor: 0 };
 
 	const limit = opts.limit ?? 50;
 	let ids = opts.runIds;
@@ -463,13 +471,19 @@ export function reapZombiesInDir(
 		try {
 			ids = readdirJson(runsDir);
 		} catch {
-			return { scanned: 0, reaped, observed };
+			return { scanned: 0, reaped, observed, nextCursor: 0 };
 		}
 	}
 
+	// 游标归一化：越界或负数 ⇒ 从 0 开始（目录可能被清理过，旧游标无意义）
+	const total = ids.length;
+	let cursor = Number.isFinite(opts.cursor) && (opts.cursor as number) > 0 ? Math.trunc(opts.cursor as number) : 0;
+	if (cursor >= total) cursor = 0;
+
 	let scanned = 0;
-	for (const id of ids) {
-		if (scanned >= limit) break;
+	for (let i = 0; i < total && scanned < limit; i++) {
+		const idx = (cursor + i) % total;
+		const id = ids[idx]!;
 		scanned += 1;
 		try {
 			const r = reapZombie(runsDir, id, opts);
@@ -477,7 +491,9 @@ export function reapZombiesInDir(
 			else if (r.suspect) observed.push(id);
 		} catch { /* 单条失败不影响其余 */ }
 	}
-	return { scanned, reaped, observed };
+	// 扫完一整圈 ⇒ 回到 0（下一圈从头开始）；否则停在下一个未扫项
+	const nextCursor = scanned >= total ? 0 : (cursor + scanned) % total;
+	return { scanned, reaped, observed, nextCursor };
 }
 
 function readdirJson(dir: string): string[] {

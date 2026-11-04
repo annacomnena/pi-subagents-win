@@ -213,6 +213,60 @@ try {
 		ok("Z11 批量扫描遵守 limit（不在 UI 读路径无界扫）");
 	}
 
+	// ── Z11b（2026-11-05 项 3）：limit 之后必须**轮转**，否则真僵尸永远扫不到 ──
+	// 旧实现每轮都从 readdirSync 的第 0 项取前 N 个，而 readdirSync 顺序稳定（NTFS 实测）
+	// ⇒ 目录超过 limit 后，排在后面的文件永远不在窗口里。
+	{
+		const dir2 = mkdtempSync(join(tmpdir(), "zombie-cursor-"));
+		try {
+			const total = 10;
+			for (let i = 0; i < total; i++) {
+				const id = `run_cur_${String(i).padStart(2, "0")}`;
+				writeFileSync(join(dir2, `${id}.json`), JSON.stringify({
+					id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999,
+				}), "utf8");
+			}
+			const seenIds = new Set<string>();
+			let cursor = 0;
+			// limit=3、10 个文件 ⇒ 第 1 轮扫 3 个、第 2 轮扫**接下来** 3 个（而不是重复前 3 个）
+			for (let round = 0; round < 4; round++) {
+				const rr = reapZombiesInDir(dir2, { now: () => NOW, deps: { isPidAlive: () => false }, limit: 3, cursor });
+				assert.equal(rr.scanned, 3, `第 ${round + 1} 轮限流生效`);
+				for (const id of [...rr.reaped, ...rr.observed]) seenIds.add(id);
+				cursor = rr.nextCursor;
+				assert.ok(Number.isInteger(cursor) && cursor >= 0 && cursor < total, `nextCursor 合法（${cursor}）`);
+			}
+			assert.equal(seenIds.size, total, `4 轮 × 3 = 12 ≥ 10，全部文件都被扫到过（实得 ${seenIds.size}/${total}）`);
+
+			// 反向对照（另一份全新目录，避免上面已被 reap 成终态）：不传 cursor（旧行为）
+			// ⇒ 每轮都扫同一批前 3 个，第 4 个及以后**永远扫不到**。
+			const dir3 = mkdtempSync(join(tmpdir(), "zombie-nocursor-"));
+			try {
+				for (let i = 0; i < total; i++) {
+					const id = `run_nc_${String(i).padStart(2, "0")}`;
+					writeFileSync(join(dir3, `${id}.json`), JSON.stringify({
+						id, status: "running", startedAt: longAgo, pidRecordedAt: longAgo, lastActivity: longAgo, pid: 999_999_999,
+					}), "utf8");
+				}
+				const firstOnly = new Set<string>();
+				for (let round = 0; round < 4; round++) {
+					const rr = reapZombiesInDir(dir3, { now: () => NOW, deps: { isPidAlive: () => false }, limit: 3 });
+					for (const id of [...rr.reaped, ...rr.observed]) firstOnly.add(id);
+				}
+				assert.ok(firstOnly.size <= 3, `无游标时 4 轮只碰到 ≤3 个不同文件（实得 ${firstOnly.size}）——这正是本缺陷的形状`);
+			} finally {
+				rmSync(dir3, { recursive: true, force: true });
+			}
+
+			// 游标越界 ⇒ 绕回 0（目录被清理后旧游标无意义）
+			const beyond = reapZombiesInDir(dir2, { now: () => NOW, deps: { isPidAlive: () => false }, limit: 2, cursor: 999 });
+			assert.equal(beyond.scanned, 2, "游标越界自动归零后仍能扫");
+		} finally {
+			rmSync(dir2, { recursive: true, force: true });
+		}
+		ok("Z11b limit 后轮转：4 轮覆盖全部 10 个（无游标只有 3 个）");
+	}
+
 	// ── Z12：**持久 claim**（第5代）：非 force 永不自动接管（杜绝双赢家）────────
 	{
 		const id = "run_z12";
