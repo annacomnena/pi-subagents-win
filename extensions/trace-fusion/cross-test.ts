@@ -279,6 +279,15 @@ export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport)
 				B: meta.lanes.B.tabRunId,
 				C: meta.lanes.C.tabRunId,
 			},
+			// 2026-11-04（首跑融合结论驱动）：收集侧检测到的 lane 契约外文件必须以**结构化清单**
+			// 进 packet。此前检测结果只以文案进 `issues`，而 packet 无对应字段 ⇒ 逐环传不到融合者。
+			// 注：**空集过滤由 packet 单点负责**（fusion-packet.ts 内部 filter files.length>0）。
+			// 旧版这里带一个同样的 filter ⇒ 判据重复（L4 S-1：摘掉本处 filter 测试仍全绿，
+			// 即本处不是单点⇒ 删掉它，避免两处同逻辑只能同时摘才能测出）。
+			laneStrayIssues: (Object.keys(collect.lanes) as LaneId[]).map((l) => ({
+				lane: l,
+				files: collect.lanes[l]?.strayFiles ?? [],
+			})),
 		});
 		lines.push(packet.markdown);
 	} catch (e) {

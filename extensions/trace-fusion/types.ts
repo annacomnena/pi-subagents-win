@@ -51,6 +51,13 @@ export interface TraceFusionConfig {
 	 * 缺省 3 = **与今天逐字节一致**（不改变存量用户行为）。
 	 */
 	laneConcurrency?: 1 | 2 | 3;
+	/**
+	 * 盘根递归扫描（R-13）机械门是否**也作于主会话/普通会话**（2026-11-04）。
+	 * 背景：R-13 事故的发起者就是主会话自己（一条无超时的 `find /` 挂 2.7h、699 万句柄）。
+	 * 本门只拦「递归命令 + 盘根/家目录目标」单一形状，仓库内搜索零影响。
+	 * 缺省 true；显式设 false 可关（关掉后仅 lane/融合会话受约束）。
+	 */
+	guardMainRootScan?: boolean;
 	provisioning: TraceFusionProvisioning;
 }
 
@@ -65,6 +72,8 @@ export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
 	maxActiveRuns: 1,
 	// 缺省 3 = 保持历史全并发行为；本机共享 KV 池场景应显式设为 1 或 2。
 	laneConcurrency: 3,
+	// 盘根递归扫描门默认也管主会话（R-13 事故发起者就是主会话）
+	guardMainRootScan: true,
 	provisioning: {
 		junction: ["node_modules"],
 		copy: [".env", ".env.local"],
@@ -121,6 +130,12 @@ export const LANE_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
 	"status.txt",
 	"result.json",
 	"untracked.md",
+	// 2026-11-04 L4 必修（B-1）：**supervisor 自产文件全部要进名单**，否则收集器把自产文件
+	// 判成 lane 违规（假阳）。实测分母：34 个 lane 目录里 6 个已被误判（全是 `provision*`），
+	// 真 stray 只有 1 个。写盘点：`worktrees.ts:40` 写 `provision.json`（launch 阶段）、
+	// `cross-test.ts:329` 写 `provision-eval.json`（implement 分支）。
+	"provision.json",
+	"provision-eval.json",
 ]);
 
 /** lane 目录内允许存在的**目录**（supervisor 归档产物）；目录名的白名单单独维护。 */
@@ -128,3 +143,60 @@ export const LANE_ARTIFACT_DIRS: ReadonlySet<string> = new Set(["untracked"]);
 
 import { join } from "node:path";
 import { homedir } from "node:os";
+
+// 2026-11-04 L4 类型收口：lane/run 元数据的**规范定义在本文件**（此前定义在 launch-workers.ts，
+// 而 6 个模块从本文件 import 这两个类型 ⇒ TS2305）。
+import type { ProvisionReport } from "./worktrees.ts";
+
+export interface TraceLaneMeta {
+	lane: LaneId;
+	worktree: string;
+	tabRunId: string;
+	provision: ProvisionReport;
+	/**
+	 * lane 参与状态（2026-11-02，状态机修复）。
+	 *
+	 * 起因：supervisor 原来**固定等 A/B/C 三份 result.json**，而被 skip 的 lane /
+	 * spawn 失败的 lane 根本没有 tabRunId ⇒ `done` 永远 < 3 ⇒ **永不自动收集**，
+	 * run 停在 `running` 占住 `active-run-mutex` ⇒ 一次 wt.exe 启动失败就能锁死 trace-fusion。
+	 * 宣称的「2/3 降级」在代码里根本不可达。
+	 *
+	 * 收集判据改为「**预期参与的 lane 集合**」：`skipped` / `dispatch-failed` 是一等终态，
+	 * 不进分母。缺省（字段缺失的旧 meta）= `active` ⇒ 零回归。
+	 */
+	laneStatus?: "active" | "skipped" | "dispatch-failed";
+	laneStatusReason?: string;
+}
+
+export interface TraceRunMeta {
+	runId: string;
+	shortId: string;
+	status: "running";
+	/** run 模式（2026-09-17）：diagnose 只读诊断（默认）| implement worktree 读写实现。 */
+	mode: "diagnose" | "implement";
+	task: string;
+	repoRoot: string;
+	createdAt: string;
+	baseCommit: string;
+	headBefore: string;
+	runDir: string;
+	/** worktree 根目录；diagnose 模式为空串（不开 worktree）。 */
+	wtDir: string;
+	laneWallClockMin: number;
+	laneDeadlineAt: string;
+	lanes: Record<LaneId, TraceLaneMeta>;
+	/** diagnose 模式：启动时主仓库 porcelain 基线文件路径（collect 时对比检违规写入）。 */
+	dirtyBaselineFile?: string;
+	/**
+	 * 派发者会话指纹（2026-11-02）：`sessionScopeKey()` 的返回值（tab runId 优先，否则持久 UUID）。
+	 *
+	 * 修缺陷：`isMainSession()` 让**所有**非 tab 会话都 watch 同一个全局 `tab-runs/`，
+	 * 而 meta 里没有任何字段能判定「这个 run 是谁派的」，且 lane tab 不进 `links.jsonl`
+	 * ⇒ event-bus 的 `recipient` 恒 undefined ⇒ `isDispatcher` 恒 false ⇒ fencing 全部走
+	 * legacy 无归属兜底 ⇒ 跨会话重复通知（实测 a726 两路会话各收一份、单会话内重复 3 次）。
+	 * 写入后由 `isDispatcherSession(meta)` 用于过滤，不新造机制。
+	 * 旧的 meta（字段缺失）一律当作「无归属」→ 保持 legacy 行为（零回归）。
+	 */
+	dispatcherSessionId?: string;
+}
+

@@ -34,6 +34,10 @@
  * 漏掉的面由墙钟时限与主会话巡检兜底，不假装已闭合。
  */
 
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+import { defaultRunsDir } from "./types.ts";
+
 /** 递归扫描命令的首词（剥路径前缀与 .exe 后比较）。 */
 const SCAN_HEADS = new Set(["find", "du", "grep", "rg", "ag", "ls", "get-childitem", "gci", "dir", "ls.exe"]);
 
@@ -245,6 +249,13 @@ export interface LaneBashGuardOptions {
 	/** 当前会话是不是 trace lane（缺省 = 永不拦，防止注册到主会话时误杀）。 */
 	isLane?: () => boolean;
 	/**
+	 * 盘根递归扫描门的生效判据（2026-11-04 新增）。
+	 * 缺省沿用 `isLane`（与历史逐行为一致）；传入时**只放宽盘根扫描那一条**，
+	 * 写盘落点锁与破坏性命令拦截仍只对 lane/融合会话生效（主会话不得被锁住写文件）。
+	 * 背景：R-13 事故的发起者就是主会话自己（无超时的 `find /`），而旧版门只管 lane。
+	 */
+	scanGate?: () => boolean;
+	/**
 	 * 产物落点目录（2026-11-03 首跑实测缺口）：融合者被排除 write/edit 后，
 	 * 用 bash 自己写 fusion.md，并把路径写丢了个点（`.pi` 写成 `pi`），
 	 * 落到主仓外的野路径 ⇒ 判据正确地判 failed，但文件已经落在用户目录里。
@@ -252,6 +263,11 @@ export interface LaneBashGuardOptions {
 	 * 否则拦截（只读诊断/融合的写盘只允许发生在指定产物目录）。
 	 */
 	artifactDir?: string;
+	/**
+	 * 拦截留痕文件（AGENTS.md R-2：拦了要可见）。缺省写 trace-fusion runs 目录下的
+	 * `rootscan-blocks.jsonl`；传空串 ⇒ 不落盘。
+	 */
+	blockAuditPath?: string;
 }
 
 const NATIVE_SCAN_TOOLS = new Set(["find", "grep", "ls", "directory_tree"]);
@@ -263,12 +279,23 @@ const NATIVE_SCAN_TOOLS = new Set(["find", "grep", "ls", "directory_tree"]);
  */
 export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unknown) => unknown) => void }, opts: LaneBashGuardOptions = {}): void {
 	const isLane = opts.isLane ?? (() => false);
+	// 盘根扫描门单独一条判据（缺省 = isLane ⇒ 旧行为逐字节不变）
+	const scanOn = opts.scanGate ?? isLane;
+	const auditPath = opts.blockAuditPath !== undefined ? opts.blockAuditPath : join(defaultRunsDir(), "rootscan-blocks.jsonl");
+	const audit = (rec: Record<string, unknown>): void => {
+		if (!auditPath) return;
+		try {
+			appendFileSync(auditPath, JSON.stringify({ at: new Date().toISOString(), pid: process.pid, ...rec }) + "\n", "utf8");
+		} catch { /* 留痕尽力而为，不得影响拦截本身 */ }
+	};
 	pi.on("tool_call", (eventRaw) => {
 		const event = eventRaw as { toolName?: string; input?: Record<string, unknown> };
-		if (!isLane()) return undefined;
 		const name = String(event?.toolName ?? "");
 		// 原生写工具落点锁（融合者有 write，但只能写本 run 产物目录）
-		if (opts.artifactDir && (name === "write" || name === "edit")) {
+		// 产物落点锁（写工具）：**lane/融合专属**（2026-11-04 收口）。
+		// 旧版只看 `opts.artifactDir` 存不存在 ⇒ 只要调用方把目录传给了一个非 lane 会话，
+		// 主会话连自己仓里的文件都写不了。锁必须跟 `isLane()` 取与。
+		if (isLane() && opts.artifactDir && (name === "write" || name === "edit")) {
 			const strayTool = findStrayWriteToolTarget(name, event.input, opts.artifactDir);
 			if (strayTool !== undefined) {
 				return {
@@ -282,9 +309,8 @@ export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unkn
 		const isShell = name === "bash" || name === "powershell";
 		if (isShell) {
 			const command = String((event.input as { command?: string } | undefined)?.command ?? "");
-			// 写盘落点越界（首跑实测：融合者无 write 工具，用 bash 重定向把 fusion.md 写到主仓外）。
-			// 必须在下面 return 之前查——旧版把它写在本分支之后 ⇒ 对 bash 命令永不可达。
-			if (opts.artifactDir) {
+			// 产物落点越界与破坏性命令：**只对 lane/融合会话生效**（主会话零影响）
+			if (isLane() && opts.artifactDir) {
 				const stray = findStrayWriteTarget(command, opts.artifactDir);
 				if (stray !== undefined) {					return {
 						block: true,
@@ -305,11 +331,15 @@ export function registerLaneBashGuard(pi: { on: (event: string, fn: (event: unkn
 				}
 			}
 			const verdict = judgeLaneBashCommand(command);
-			if (verdict.block) return { block: true, reason: verdict.reason };
+			if (verdict.block && scanOn()) {
+				audit({ tool: name, head: verdict.head, target: verdict.target, segment: verdict.segment.slice(0, 200), gate: isLane() ? "lane" : "scan" });
+				return { block: true, reason: verdict.reason };
+			}
 		}
-		if (NATIVE_SCAN_TOOLS.has(name) && !isShell) {
+		if (NATIVE_SCAN_TOOLS.has(name) && !isShell && scanOn()) {
 			const hit = collectPathCandidates(event.input ?? {}).find(isRootishTarget);
 			if (hit !== undefined) {
+				audit({ tool: name, head: name, target: hit, segment: "", gate: isLane() ? "lane" : "scan" });
 				return {
 					block: true,
 					reason:

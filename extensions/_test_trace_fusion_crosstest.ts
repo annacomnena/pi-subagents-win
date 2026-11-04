@@ -183,11 +183,37 @@ try {
 		assert.ok(mdD.includes("KV 池不足"), "缺席理由要进报告");
 		// 3) 无降级时也要明说（不得沉默）
 		const metaN = makeRun();
-		for (const lane of ["A", "B", "C"] as const) simulateLane(metaD, lane, { fix: lane, validation: { validationCommands: ["ls -1"], testFiles: [] } });
+		// 2026-11-04 L4 S-2：旧版这里写的是 metaD ⇒ metaN 的 lane 目录里只有 patch.diff/status.txt，
+		// “无 stray”断言站在**空 lane** 上，不证明「三路都有正规产物时白名单不误报」。
+		// 改成 metaN ⇒ 本断言真的站在 trajectory/validation/patch.diff/status.txt 齐全的形状上。
+		for (const lane of ["A", "B", "C"] as const) simulateLane(metaN, lane, { fix: lane, validation: { validationCommands: ["ls -1"], testFiles: [] } });
 		const diagN = { ...metaN, mode: "diagnose" } as TraceRunMeta;
 		finishDiagnoseRun(diagN, collectRunArtifacts(diagN));
 		const mdN = readFileSync(join(diagN.runDir, "cross-test-report.md"), "utf8");
 		assert.ok(mdN.includes("不可用 lane：无"), "无降级时也要写出（可分辨，不是默认静默）");
+		assert.ok(mdN.includes("lane 契约外文件：无"), "无 stray 时也要明说（不得沉默）");
+	}
+
+	// ── 接线（2026-11-04 首跑融合结论）：lane 契约外文件必须从收集侧一路传到报告 ──
+	{
+		const metaS = makeRun();
+		for (const lane of ["A", "B", "C"] as const) simulateLane(metaS, lane, { fix: lane, validation: { validationCommands: ["ls -1"], testFiles: [] } });
+		// 收集前造两个契约外文件（一个文件、一个目录）
+		const la = join(metaS.runDir, "lanes", "A");
+		mkdirSync(join(la, "scratch"), { recursive: true });
+		writeFileSync(join(la, "triangle.md"), "lane 自写分析\n", "utf8");
+		const diagS = { ...metaS, mode: "diagnose" } as TraceRunMeta;
+		const collectS = collectRunArtifacts(diagS);
+		assert.deepEqual(collectS.lanes.A.strayFiles, ["scratch/", "triangle.md"], "收集侧必须给出结构化 stray 清单（不止文案）");
+		assert.deepEqual(collectS.lanes.B.strayFiles, [], "无 stray 的路必须为空集（假阳防护）");
+		finishDiagnoseRun(diagS, collectS);
+		const mdS = readFileSync(join(diagS.runDir, "cross-test-report.md"), "utf8");
+		assert.ok(mdS.includes("lane 契约外文件（2 个，分布于 1 路）"), `报告必须给出 stray 计数，片段：${mdS.slice(Math.max(0, mdS.indexOf("契约外") - 120), mdS.indexOf("契约外") + 200)}`);
+		assert.ok(mdS.includes("triangle.md") && mdS.includes("scratch/"), "stray 文件名必须进报告（融合者看得懂）");
+		assert.ok(mdS.includes("必须逐条判定"), "报告必须写清要求逐条判定（不得当噪声丢弃）");
+		// 收集报告本身也带结构化字段（供主会话/人工直接取用）
+		const collectJson = JSON.parse(readFileSync(join(diagS.runDir, "collect.json"), "utf8")) as { lanes: Record<string, { strayFiles?: string[] }> };
+		assert.deepEqual(collectJson.lanes.A.strayFiles, ["scratch/", "triangle.md"], "collect.json 必须落盘 strayFiles");
 	}
 
 

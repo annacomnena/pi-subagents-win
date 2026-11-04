@@ -2583,13 +2583,29 @@ export default function (pi: ExtensionAPI) {
 
 	// lane（trace-worker）的 R-13 机械门（2026-11-03）：盘根递归扫描在提示词里已被禁，
 	// 实测 lane 仍跑了三次 `find /`（句柄 699,972）⇒ 禁令不够，落成 tool_call 拦截。
-	// 只影响 lane 会话（isLane=isTraceWorker）；主会话/普通 tab 零作用。
 	// 2026-11-03 首跑补面：融合者（无头 subagent，write/edit 已被排除）用 bash 写报告，
 	// 把路径写丢了个点（`.pi`→`pi`）在主仓外造出野文件 ⇒ 融合子会话一并纳入，
-	// 并给出合法产物目录：env 随 spawn 透传（与 PI_SUBAGENT 同一机制），
-	// 主会话/普通 tab 两个变量都不存在 ⇒ 零拦截。
+	// 并给出合法产物目录：env 随 spawn 透传（与 PI_SUBAGENT 同一机制）。
+	// 2026-11-04 补面（用户问「find 这类禁用命令能不能直接不接受」）：盘根递归扫描**这一条**
+	// 也管主会话/普通会话 —— R-13 事故的发起者就是主会话自己（无超时的 `find /` 挂 2.7h、699 万句柄）。
+	// 写盘落点锁与破坏性命令拦截仍只对 lane/融合生效（主会话不得被锁住写自己的文件）。
+	// 开关 = config.json 的 traceFusionLoop.guardMainRootScan（缺省 true）；惰性读 + 30s 缓存（工厂内零 IO）。
+	let mainScanGate: { at: number; val: boolean } | null = null;
+	const mainRootScanGuarded = (): boolean => {
+		const now = Date.now();
+		if (mainScanGate && now - mainScanGate.at < 30_000) return mainScanGate.val;
+		let val = true;
+		try {
+			val = readTraceFusionConfig().guardMainRootScan !== false;
+		} catch {
+			val = true; // 配置读不动 ⇒ 保持拦截（宁严，不得静默放行）
+		}
+		mainScanGate = { at: now, val };
+		return val;
+	};
 	registerLaneBashGuard(pi, {
 		isLane: () => isTraceWorker() || Boolean(process.env.PI_TRACE_FUSION_FUSION_DIR),
+		scanGate: () => isTraceWorker() || Boolean(process.env.PI_TRACE_FUSION_FUSION_DIR) || mainRootScanGuarded(),
 		artifactDir: process.env.PI_TRACE_FUSION_FUSION_DIR,
 	});
 

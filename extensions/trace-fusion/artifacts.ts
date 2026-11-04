@@ -77,6 +77,13 @@ export interface LaneArtifactReport {
 	/** 命令本身（可信子集，交 cross-test 复跑）。 */
 	trustedCommands: string[];
 	testFiles: string[];
+	/**
+	 * lane 目录里的**契约外文件**（白名单见 types.ts `LANE_ARTIFACT_NAMES`）。
+	 * 2026-11-04 tfl-20261104-111728-8618 融合结论驱动：光有 `issues` 里的文案不够——
+	 * 下游（cross-test → Fusion Packet → 融合者）需要**结构化清单**才能逐条判定，
+	 * 字符串只能靠文本拼接，管道里没人解析它。
+	 */
+	strayFiles: string[];
 	issues: string[];
 	collectedAt: string;
 }
@@ -284,6 +291,7 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 		testFiles: validation && Array.isArray(validation.testFiles)
 			? validation.testFiles.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
 			: [],
+		strayFiles: strays,
 		issues,
 		collectedAt: now.toISOString(),
 	};

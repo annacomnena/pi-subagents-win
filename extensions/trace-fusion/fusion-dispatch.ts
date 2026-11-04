@@ -49,6 +49,29 @@ export const FUSION_EXCLUDE_TOOLS = [
 	// ⇒ 形状改为：**给 write，但落点由 lane-bash-guard 锁到本 run 的产物目录**（仓内一律不可写）；
 	//   edit 仍禁止（edit 能改仓内已有文件，write 只能造新文件且落点受控）。
 	"edit",
+	// 2026-11-04（用户：harness 相关功能不需要）：融合子会话是**无头只读核验 + 写一份报告**，
+	// 主会话的编排/治理面全部排除（与 lane 同步收口，降低常驻 token 与攻击面）。
+	// 保留：read / bash / write（落点由 lane-bash-guard 锁在产物目录）/ codegraph / wiki-nav / hotspot。
+	"master-status",
+	"master-dispatch",
+	"master-attach",
+	"master-detach",
+	"master-cutover",
+	"master-transfer",
+	"master-transfer-confirm",
+	"master-handoff",
+	"master-pressure",
+	"local-master-ensure",
+	"global-view",
+	"supervise-push",
+	"tab-steer",
+	"steer-status",
+	"tab-status",
+	"reclaim-tabs",
+	"get_goal",
+	"create_goal",
+	"update_goal",
+	"ds_websearch",
 ];
 
 export const FUSION_DEFAULT_WALL_MS = 30 * 60_000;
@@ -294,14 +317,25 @@ export function buildFusionPrompt(i: {
 		`1. 主材料：\`${i.reportPath}\` —— 内含 Hard Facts、Validation 复跑、行号引用越界校验、Fusion Packet（Hard Facts / Conflicts / Instruction 三段）与三路 trajectory 摘录。`,
 		`2. 需要细节时按下列路径 read 原文（不要全仓巡查）：`,
 		lanes,
-		`3. 三路诊断的基点 commit 已写在报告里；核验历史版本用 \`git show <base>:<path>\`，不要用当前工作树代替。`,
+		`3. 三路诊断的基点 commit 已写在报告的 Hard Facts 段（一个真实 sha）；核验历史版本用 ` +
+			`\`git show <那个 sha>:<path>\`，不要用当前工作树代替。`,
 		``,
 		`## 硬纪律`,
 		``,
 		`- **拼装，不是投票**（设计稿 §25 明令禁止多数投票）：三路不是三张票。共识只说明「值得优先核验」，不说明成立。`,
 		`- **可执行证据压过自报置信度**：报告「Validation 复跑」段里 \`声称pass实测失败\` 计数高的 lane，其自报结论必须显式降级并写明降级理由；复跑通过项可作为事实引用。`,
 		`- **引用越界即不可引用原文**：报告「行号引用越界校验」段列出的越界引用，**不得原样引用其结论**；需要该证据就自己重新定位并给出你在基点上核过的行。`,
-		`- 结论必须给出：采纳什么 / 拒绝什么 / 为什么（按证据强度，不按票数）；分歧的裁决方式（可复核的判据，不是「两票对一票」）。`,
+		`- **lane 契约外文件必须逐条判定**：Hard Facts 段给出「lane 契约外文件」清单（收集器按白名单枚举 lane 目录得出，`
+		+ `supervisor 自产文件已在白名单内）。对每一条写清：谁写的、内容是否构成证据、是否进 §4 不可采信项。`
+		+ `清单为「无」时可以不管；**不得当噪声丢弃，也不得直接当权威**。`,
+		`- **引用必须可复跑**：报告里出现的每个 commit 引用都必须写 Hard Facts 段里那个**真实 sha**；` +
+			"禁止写 `<base>`、「`<runId>-base-commit`」这种占位符或**上一次 run 的 runId**（两次实测都出现过：" +
+			"照字面执行必失败，附录变成废纸）。同理，你引用的行号必须来自你**实跑过的** `" +
+			"`git show <sha>:<path>` / `grep -n` 输出；没跑过就别给行号。",
+		`- 三路 trajectory 里的行号与引用**不得直接转抄**（越界校验段就是为它设的）；` +
+			`你自己采信的每一条都要带自己的出处，不拿别人的行号当自己的证据。`,
+		`- 结论必须给出：采纳什么 / 拒绝什么 / 为什么（按证据强度，不按票数）；分歧的裁决方式（可复核的判据，不是「两票对一票」。` +
+			`**「三路都这么说」不是判据**：它只说明值得优先核验，不说明成立。`,
 		`- **只读仓库**：禁止修改任何代码文件、禁止 git 写操作、禁止装包、禁止 push、禁止派发 subagent 或开标签页。`,
 		`  命令只用于只读核验（read / git show / grep / 只读脚本）。`,
 		`- **写盘只允许一个路径**：你唯一可写的文件是 \`${i.outputPath}\`（本 run 的产物目录）。`,

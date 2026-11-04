@@ -234,6 +234,11 @@ try {
 		assert.ok(p.includes("拼装，不是投票"), "必须写死「拼装非投票」（设计稿 §25）");
 		assert.ok(p.includes("声称pass实测失败"), "必须要求按复跑读数降级自报");
 		assert.ok(p.includes("越界"), "必须要求越界引用不得原样引用");
+		assert.ok(p.includes("lane 契约外文件必须逐条判定"), "必须把 lane 契约外文件写成硬纪律（2026-11-04：检测结果传达到融合者）");
+		assert.ok(p.includes("引用必须可复跑"), "必须有「引用可复跑」硬纪律标题（M52 变异特异性断言）");
+		assert.ok(p.includes("真实 sha"), "必须要求引用写真实 sha（两次实测均写占位符/上一跑 runId）");
+		assert.ok(p.includes("实跑过的"), "必须要求行号来自实跑输出");
+		assert.ok(p.includes("「三路都这么说」不是判据"), "必须封掉「共识即成立」的口径（实测融合写过 Consensus: all correct）");
 		assert.ok(p.includes("禁止派发 subagent"), "必须禁止递归派发");
 		assert.ok(p.includes("禁止 push"), "必须禁止 push");
 		assert.ok(p.includes("## 6. 可复跑附录"), "输出必须含可复跑附录");

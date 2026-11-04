@@ -63,6 +63,8 @@ export function readTraceFusionConfig(path: string = traceFusionConfigPath()): T
 			laneConcurrency: u.laneConcurrency === 1 || u.laneConcurrency === 2 || u.laneConcurrency === 3
 				? u.laneConcurrency
 				: DEFAULT_TRACE_FUSION_CONFIG.laneConcurrency,
+			// 只认显式 false（关掉主会话盘根扫描门）；undefined/非法值一律回默认 true
+			guardMainRootScan: u.guardMainRootScan === false ? false : true,
 			provisioning: mergeProvisioning(u.provisioning),
 		};
 	} catch {

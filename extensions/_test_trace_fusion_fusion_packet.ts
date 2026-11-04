@@ -143,6 +143,43 @@ try {
 			}),
 		);
 
+		// ---- 2026-11-04：lane 契约外文件清单进 Hard Facts（结构化透传链的最后一环）----
+		{
+			const mdStray = buildFusionPacket({
+				runDir,
+				task: "诊断 X",
+				baseCommit: "abcdef1234567",
+				laneStrayIssues: [{ lane: "A", files: ["triangle.md", "scratch/"] }],
+			}).markdown;
+			assert.ok(mdStray.includes("lane 契约外文件（2 个，分布于 1 路）"), "必须给计数");
+			assert.ok(mdStray.includes("triangle.md") && mdStray.includes("scratch/"), "文件名必须进 Hard Facts");
+			// S-4（2026-11-04 L4）：必须**结构化精确**匹配——实测「把逐 lane 行的 lane 名写死」与
+			// 「去掉反引号」两种变异当时全绿 ⇒ includes(文件名) 不承重。
+			assert.ok(mdStray.includes("  - A：`triangle.md` `scratch/`"), "逐 lane 行必须给出正确的 lane 归属与结构（不是只包含文件名）");
+			// S-3：与 dirtyViolations 同一口径的截断（Hard Facts 不得被文件名挤占）
+			const many = buildFusionPacket({
+				runDir,
+				task: "诊断 X",
+				baseCommit: "abcdef1234567",
+				laneStrayIssues: [{ lane: "B", files: Array.from({ length: 12 }, (_, i) => `f${i}.md`) }],
+			}).markdown;
+			assert.ok(many.includes("lane 契约外文件（12 个，分布于 1 路）"), "计数要数文件总数而非路数");
+			assert.ok(many.includes("…另 2 个（全量见 collect.json）"), "超出 10 个必须截断并指向 collect.json");
+			assert.ok(!many.includes("f11.md"), "被截断的文件名不得展开到 prompt");
+			assert.ok(mdStray.includes("必须逐条判定"), "必须写明逐条判定要求");
+			const mdNoStray = buildFusionPacket({ runDir, task: "诊断 X", baseCommit: "abcdef1234567", laneStrayIssues: [] }).markdown;
+			assert.ok(mdNoStray.includes("lane 契约外文件：无"), "无 stray 也要明说（不得沉默）");
+			// 空集 lane 不得被计为一路（packet 单点过滤，cross-test 不再重复过滤）
+			const mdEmptyLane = buildFusionPacket({
+				runDir,
+				task: "诊断 X",
+				baseCommit: "abcdef1234567",
+				laneStrayIssues: [{ lane: "A", files: [] }, { lane: "B", files: ["x.md"] }],
+			}).markdown;
+			assert.ok(mdEmptyLane.includes("lane 契约外文件（1 个，分布于 1 路）"), `空集 lane 不得计入路数：${mdEmptyLane.slice(mdEmptyLane.indexOf("契约外") - 40, mdEmptyLane.indexOf("契约外") + 160)}`);
+			assert.ok(!/^  - A：$/m.test(mdEmptyLane), "空集 lane 不得占一行「A：」空头");
+		}
+
 		const p = buildFusionPacket({ runDir, task: "诊断 X", baseCommit: "abcdef1234567" });
 		assert.ok(p.divergentSections.includes(shortNames[0]), "第 1 节三路有两说 ⇒ 必须标分歧");
 		assert.ok(!p.divergentSections.includes(shortNames[5]), "第 6 节是粗细关系 ⇒ 不标分歧");

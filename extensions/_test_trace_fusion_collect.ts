@@ -182,9 +182,15 @@ try {
 		writeFileSync(join(laneDirS, "validation.json"), "{}", "utf8");
 		writeFileSync(join(laneDirS, "triangle.md"), "lane 自写的分析笔记\n", "utf8");
 		mkdirSync(join(laneDirS, "scratch"), { recursive: true });
+		// 2026-11-04 L4 必修 B-1：supervisor 自产的 provision* 也必须在名单内。
+		// 实测分母：34 个 lane 目录里 6 个曾因缺这两个名字被误判 stray（真 stray 只 1 个）。
+		writeFileSync(join(laneDirS, "provision.json"), "{}", "utf8");
+		writeFileSync(join(laneDirS, "provision-eval.json"), "{}", "utf8");
 		const repS = collectLaneArtifacts(run2.meta, "B");
 		assert.ok(repS.issues.some((i) => i.includes("triangle.md") && i.includes("非白名单")), "stray 文件必须进 issues");
 		assert.ok(repS.issues.some((i) => i.includes("scratch/") && i.includes("非白名单")), "契约外目录必须进 issues");
+		assert.ok(!repS.issues.some((i) => i.includes("provision")), "supervisor 自产 provision.json / provision-eval.json 不得判成 lane 违规（B-1）");
+		assert.deepEqual(repS.strayFiles.filter((f) => f.startsWith("provision")), [], "strayFiles 结构化清单同样不得含 provision*");
 		// 假阳防护：收集器自产文件（patch.diff/status.txt/untracked/）不得被判 stray
 		assert.deepEqual(findLaneStrayFiles(laneDirA), [], "情形 1 的 laneDir 应全在白名单内");
 		assert.ok(!repA2.issues.some((i) => i.includes("非白名单")), "收集器自产文件不得判成 lane 违规");

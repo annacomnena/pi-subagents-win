@@ -22,7 +22,7 @@ import { runPreflight } from "./preflight.ts";
 import { execGit } from "./git.ts";
 import { createSyntheticSnapshot } from "./snapshot.ts";
 import { createLaneWorktrees, removeWorktreeRetry, writeProvisionReport, type ProvisionReport } from "./worktrees.ts";
-import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type TraceFusionConfig } from "./types.ts";
+import { defaultRunsDir, defaultWorktreeRoot, TRACE_LANES, type LaneId, type TraceFusionConfig, type TraceLaneMeta, type TraceRunMeta } from "./types.ts";
 import { buildTraceWorkerPrompt, buildDiagnoseWorkerPrompt } from "./worker-prompt.ts";
 import { ensureDirTrusted } from "./trust.ts";
 import { sessionScopeKey } from "../identity.ts";
@@ -53,8 +53,48 @@ const spawnFailedLanes = new Set<string>();
  * 而是查询面。写入类动作（`rebuild` / `semantic-rebuild`）**改为在 worker prompt 里
  * 禁止**：本仓的既定纪律是先例（trace-fusion 对 bash 的只读纪律就是这么做的，
  * 并有 `diagnoseDirtyViolations` 做确定性检出兑底）。
- * 同批清理：`wiki-semantic` 不是工具名（是内部模块）⇒ 从 exclude 里移除死项。 */
-export const TRACE_WORKER_EXCLUDE_TOOLS = ["launch-tabs", "set-timer", "cancel-timer", "list-timers", "trace-fusion"];
+ * 同批清理：`wiki-semantic` 不是工具名（是内部模块）⇒ 从 exclude 里移除死项。
+ *
+ * 2026-11-04（用户：“主 agent 的 harness 相关功能，lane 不太需要”）：把**编排/治理面**工具
+ * 从 lane 会话整排拿掉。两面理由：
+ * - 成本：小模型（bonsai-9b）上下文本来就紧，这些工具的 schema 每轮都在 prompt 里常驻。
+ * - 风险：lane 只需「读代码 + 跑只读命令 + 写自己两份产物 + tab-finish 交工」；
+ *   Master/监管/steer/回收/goal 类工具对它是纯多余攻击面（历史上只靠提示词禁止）。
+ * 保留面（有实测用途，不得排除）：`read` / `bash` / `write`（写产物）/ `codegraph`（符号定位）/
+ * `wiki-nav`（查既有知识）/ `hotspot`（只读）/ `tab-finish` + `tab-report`（交工与回报）/
+ * `subagent-win`（§17 设计保留的角色委派）。 */
+export const TRACE_WORKER_EXCLUDE_TOOLS = [
+	// 编排面（§17 原有）
+	"launch-tabs",
+	"set-timer",
+	"cancel-timer",
+	"list-timers",
+	"trace-fusion",
+	// Master / 监管 / 交接（2026-11-04）
+	"master-status",
+	"master-dispatch",
+	"master-attach",
+	"master-detach",
+	"master-cutover",
+	"master-transfer",
+	"master-transfer-confirm",
+	"master-handoff",
+	"master-pressure",
+	"local-master-ensure",
+	"global-view",
+	"supervise-push",
+	// 主会话专用的 tab 监管/steer（lane 只留 tab-finish / tab-report 交工）
+	"tab-steer",
+	"steer-status",
+	"tab-status",
+	"reclaim-tabs",
+	// 主会话工作视野与 goal 语义（小模型上的干扰项）
+	"get_goal",
+	"create_goal",
+	"update_goal",
+	// 外部配额：诊断对象是本仓代码，不需要联网（lane 烧的是用户套餐额度）
+	"ds_websearch",
+];
 
 /**
  * §24.2：向 lane tab 邮箱写两个墙钟计时器——
@@ -132,57 +172,12 @@ export interface LaunchTraceRunInput {
 	spawnTab?: TabSpawner;
 }
 
-export interface TraceLaneMeta {
-	lane: LaneId;
-	worktree: string;
-	tabRunId: string;
-	provision: ProvisionReport;
-	/**
-	 * lane 参与状态（2026-11-02，状态机修复）。
-	 *
-	 * 起因：supervisor 原来**固定等 A/B/C 三份 result.json**，而被 skip 的 lane /
-	 * spawn 失败的 lane 根本没有 tabRunId ⇒ `done` 永远 < 3 ⇒ **永不自动收集**，
-	 * run 停在 `running` 占住 `active-run-mutex` ⇒ 一次 wt.exe 启动失败就能锁死 trace-fusion。
-	 * 宣称的「2/3 降级」在代码里根本不可达。
-	 *
-	 * 收集判据改为「**预期参与的 lane 集合**」：`skipped` / `dispatch-failed` 是一等终态，
-	 * 不进分母。缺省（字段缺失的旧 meta）= `active` ⇒ 零回归。
-	 */
-	laneStatus?: "active" | "skipped" | "dispatch-failed";
-	laneStatusReason?: string;
-}
-
-export interface TraceRunMeta {
-	runId: string;
-	shortId: string;
-	status: "running";
-	/** run 模式（2026-09-17）：diagnose 只读诊断（默认）| implement worktree 读写实现。 */
-	mode: "diagnose" | "implement";
-	task: string;
-	repoRoot: string;
-	createdAt: string;
-	baseCommit: string;
-	headBefore: string;
-	runDir: string;
-	/** worktree 根目录；diagnose 模式为空串（不开 worktree）。 */
-	wtDir: string;
-	laneWallClockMin: number;
-	laneDeadlineAt: string;
-	lanes: Record<LaneId, TraceLaneMeta>;
-	/** diagnose 模式：启动时主仓库 porcelain 基线文件路径（collect 时对比检违规写入）。 */
-	dirtyBaselineFile?: string;
-	/**
-	 * 派发者会话指纹（2026-11-02）：`sessionScopeKey()` 的返回值（tab runId 优先，否则持久 UUID）。
-	 *
-	 * 修缺陷：`isMainSession()` 让**所有**非 tab 会话都 watch 同一个全局 `tab-runs/`，
-	 * 而 meta 里没有任何字段能判定「这个 run 是谁派的」，且 lane tab 不进 `links.jsonl`
-	 * ⇒ event-bus 的 `recipient` 恒 undefined ⇒ `isDispatcher` 恒 false ⇒ fencing 全部走
-	 * legacy 无归属兜底 ⇒ 跨会话重复通知（实测 a726 两路会话各收一份、单会话内重复 3 次）。
-	 * 写入后由 `isDispatcherSession(meta)` 用于过滤，不新造机制。
-	 * 旧的 meta（字段缺失）一律当作「无归属」→ 保持 legacy 行为（零回归）。
-	 */
-	dispatcherSessionId?: string;
-}
+// 2026-11-04 L4 类型收口：`TraceLaneMeta` / `TraceRunMeta` 的**规范定义已搬到 types.ts**。
+// 旧版定义在本文件，而 artifacts/cross-test/lane-facts/lane-queue/supervisor/index 全都
+// `import type { TraceRunMeta } from "./types.ts"` ⇒ tsc 报 TS2305（types.ts 没有该导出）；
+// 运行时因 strip-types 剥掉类型导入而全绿 ⇒ 本仓的「类型安全」声明此前没有验证手段。
+// 本文件继续 re-export ⇒ 按旧路径 import 的调用方（clean.ts 等）零回归。
+export type { TraceLaneMeta, TraceRunMeta } from "./types.ts";
 
 export type LaunchTraceRunResult =
 	| { ok: true; meta: TraceRunMeta; lines: string[] }

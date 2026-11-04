@@ -196,6 +196,15 @@ export interface FusionPacketInput {
 	validationCommandCount?: number;
 	/** 选填：collect 阶段发现的违规写入（硬事实）。 */
 	dirtyViolations?: string[];
+	/**
+	 * 选填（2026-11-04 tfl-20261104-111728-8618 融合结论驱动）：**lane 契约外文件清单**。
+	 *
+	 * 为什么需要：收集侧 `findLaneStrayFiles` 已能检测 stray，但此前只以文案进 `issues`，
+	 * 而 `FusionPacketInput` 没有任何 issues/stray 字段 ⇒ 检测结果**逐环传不到融合者**
+	 * （首跑实测：cross-test-report 里的 stray 信总只能靠 lane 自己把代码文案拄进 trajectory）。
+	 * 本字段把检测结果变成硬事实交给融合者，并要求逐条判定来源。
+	 */
+	laneStrayIssues?: Array<{ lane: string; files: string[] }>;
 	/** 选填：tab-runs 目录（读 result.json 用）。未给则跳过 result 事实。 */
 	tabRunsDir?: string;
 	/** 返填：lane → tabRunId（读 result.json 用）。 */
@@ -499,6 +508,26 @@ export function buildFusionPacket(input: FusionPacketInput): FusionPacket {
 		lines.push(`- ⚠ **主仓库基线外改动（${input.dirtyViolations.length}）**：${input.dirtyViolations.slice(0, 5).join("; ")}`);
 	} else {
 		lines.push("- 主仓库违规写入：无（基线对比通过）");
+	}
+	// lane 契约外文件（2026-11-04 新增硬事实）：必须逐条判定来源，不得当噪声丢弃。
+	// 白名单以 `types.ts LANE_ARTIFACT_NAMES` 为准（diagnose：trajectory/validation/patch.diff/status.txt/
+	// result.json/untracked.md；implement 额外含 provision.json / provision-eval.json，2026-11-04 L4 B-1）
+	// 与 `LANE_ARTIFACT_DIRS`（untracked/）。出现在本清单里的文件不得是收集器/supervisor 自产；
+	// 若出现自产文件名 ⇒ 是白名单漏项，不是 lane 越权（先查白名单再定性）。
+	const strayLanes = (input.laneStrayIssues ?? []).filter((s) => s.files.length > 0);
+	const STRAY_FILES_PER_LANE = 10; // 与 dirtyViolations 的 slice(0,5) 同一口径：Hard Facts 不得被文件名挤占
+	if (strayLanes.length > 0) {
+		const total = strayLanes.reduce((n, s) => n + s.files.length, 0);
+		lines.push(`- ⚠ **lane 契约外文件（${total} 个，分布于 ${strayLanes.length} 路）**：`);
+		for (const s of strayLanes) {
+			const shown = s.files.slice(0, STRAY_FILES_PER_LANE).map((f) => `\`${f}\``).join(" ");
+			const more = s.files.length > STRAY_FILES_PER_LANE ? ` …另 ${s.files.length - STRAY_FILES_PER_LANE} 个（全量见 collect.json）` : "";
+			lines.push(`  - ${s.lane}：${shown}${more}`);
+		}
+		lines.push("  ⇒ **必须逐条判定**：该文件是谁写的（lane 自写 / 工具产物 / 越权写入）、内容是否构成证据、"
+			+ "是否应进 §4 不可采信项；**不得当噪声丢弃，也不得直接当权威**。");
+	} else {
+		lines.push("- lane 契约外文件：无（各 lane 目录只含白名单产物）");
 	}
 	// 2026-11-02 #2：**不可用 lane 必须进硬事实**。旧版 packet 不告诉你哪一路根本不存在
 	// （被 skip / 派发失败 / tab 进程死）：融合者只看见该 lane 的 trajectory 缺失，
