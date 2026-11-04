@@ -167,6 +167,19 @@ export interface FusionDispatchInput {
 	 * 带 repair 时跳过 fusion.claim 幂等门（认领已存在），全链最多一轮由调用方结构性保证。
 	 */
 	repair?: { gaps: string[] };
+	/**
+	 * 融合者的系统提示（2026-11-05 第 3 项修：headless 通道一直**没挂** `agents/fusion.md` 的 body）。
+	 *
+	 * 实测缺陷：`makeSubagentFusionRunner` 走 `runWithFallback(agent=agents/fusion.md)` ⇒
+	 * `finalPrompt = systemPrompt ?? agent?.body ?? ""`（index.ts:1172）⇒ 有 body；
+	 * 而 headless 分支只把 `buildFusionPrompt()` 的产物当 task 传，`buildPiArgv` 的
+	 * `systemPrompt` 参数**从未传**（fusion-dispatch.ts:424-429）⇒ 两条通道的系统提示不一致。
+	 *
+	 * 由调用方（collect-cli / index.ts）读 `agents/fusion.md` 的 body 注入，
+	 * 不让 trace-fusion 反向依赖 agents/ 的加载逻辑（保持 DAG）。
+	 * 未传 ⇒ 行为与旧版逐字节一致（向后兼容）。
+	 */
+	systemPrompt?: string;
 }
 
 export type FusionStatus = "skipped" | "launched" | "completed" | "failed" | "timeout" | "spawn-error";
@@ -424,6 +437,9 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	const argv = buildPiArgv({
 		cliPath: input.piCli,
 		model: input.fusionModel,
+		// 2026-11-05 第 3 项：挂上 agents/fusion.md 的 body（此前 headless 通道从未传，
+		// 导致它与 makeSubagentFusionRunner 的系统提示不一致）。未传 ⇒ 旧行为不变。
+		...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
 		task: prompt,
 		excludeTools: FUSION_EXCLUDE_TOOLS,
 	});
@@ -648,6 +664,8 @@ export async function runFusionStep(opts: {
 	runsDir?: string;
 	linksPath?: string;
 	spawnFn?: FusionDispatchInput["spawnFn"];
+	/** 融合者系统提示（agents/fusion.md 的 body）；未传 ⇒ 旧行为。 */
+	systemPrompt?: string;
 	/** S1 seams：透传给 dispatchFusion（collect-cli 注入后，自动链的融合者也有一等账本）。 */
 	registerRunProcess?: FusionDispatchInput["registerRunProcess"];
 	clearRunProcess?: FusionDispatchInput["clearRunProcess"];
@@ -669,6 +687,7 @@ export async function runFusionStep(opts: {
 			runsDir: opts.runsDir,
 			linksPath: opts.linksPath,
 			spawnFn: opts.spawnFn,
+			systemPrompt: opts.systemPrompt,
 			registerRunProcess: opts.registerRunProcess,
 			clearRunProcess: opts.clearRunProcess,
 			notifyCompletion: opts.notifyCompletion,
@@ -699,6 +718,7 @@ export async function runFusionStep(opts: {
 				runsDir: opts.runsDir,
 				linksPath: opts.linksPath,
 				spawnFn: opts.spawnFn,
+				systemPrompt: opts.systemPrompt,
 				repair: { gaps: res.gaps! },
 			});
 		} catch (err) {

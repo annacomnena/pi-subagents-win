@@ -591,6 +591,58 @@ try {
 		assert.equal(metaR2.fusion?.repair?.status, "completed", "meta 记录真实补写轮结果");
 	}
 
+	// ── 第 3 项（2026-11-05）：headless 通道必须挂 agents/fusion.md 的 body ──
+	// 缺陷：buildPiArgv 的 systemPrompt 参数在 headless 分支**从未传**
+	// ⇒ 与 makeSubagentFusionRunner（runWithFallback 自动取 agent.body）系统提示不一致。
+	{
+		const dirS = join(root, "runSysPrompt");
+		const runsS = join(root, "runs-sys");
+		mkdirSync(join(dirS, "fusion"), { recursive: true });
+		writeFileSync(join(dirS, "meta.json"), JSON.stringify({ runId: "tfl-sp", status: "completed" }), "utf8");
+		const spyArgv: string[][] = [];
+		const spawnS = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			spyArgv.push(argv.slice());
+			setImmediate(() => {
+				writeFileSync(join(dirS, "fusion", "fusion.md"), "# 融合报告" + String.fromCharCode(10,10) + SECTION_TEXT + String.fromCharCode(10), "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		// ① 传 systemPrompt ⇒ 必须出现在 argv 的 --append-system-prompt 之后
+		await dispatchFusion({
+			runId: "tfl-sp", runDir: dirS, repoRoot: root, reportPath,
+			fusionModel: "m", runsDir: runsS, piCli: join(root, "cli.js"),
+			spawnFn: spawnS as never,
+			systemPrompt: "FUSION_AGENT_BODY_MARKER",
+		});
+		const argvWith = spyArgv[0];
+		const iFlag = argvWith.indexOf("--append-system-prompt");
+		assert.ok(iFlag >= 0, "传了 systemPrompt ⇒ argv 必须含 --append-system-prompt");
+		assert.equal(argvWith[iFlag + 1], "FUSION_AGENT_BODY_MARKER", "body 必须原样进值位");
+
+		// ② 不传 ⇒ 行为与旧版一致（argv 里**不得**出现该旗标）
+		const dirS2 = join(root, "runSysPrompt2");
+		mkdirSync(join(dirS2, "fusion"), { recursive: true });
+		writeFileSync(join(dirS2, "meta.json"), JSON.stringify({ runId: "tfl-sp2", status: "completed" }), "utf8");
+		const spyArgv2: string[][] = [];
+		const spawnS2 = (cmd: string, argv: string[], opts: object) => {
+			const child = fakeSpawn(cmd, argv, opts);
+			spyArgv2.push(argv.slice());
+			setImmediate(() => {
+				writeFileSync(join(dirS, "fusion", "fusion.md"), "# 融合报告" + String.fromCharCode(10,10) + SECTION_TEXT + String.fromCharCode(10), "utf8");
+				child.emit("exit", 0);
+			});
+			return child;
+		};
+		await dispatchFusion({
+			runId: "tfl-sp2", runDir: dirS2, repoRoot: root, reportPath,
+			fusionModel: "m", runsDir: runsS, piCli: join(root, "cli.js"),
+			spawnFn: spawnS2 as never,
+		});
+		assert.equal(spyArgv2[0].includes("--append-system-prompt"), false, "未传 systemPrompt ⇒ 旧行为逐字节不变（无该旗标）");
+	}
+
 	console.log("trace-fusion fusion-dispatch tests passed");
 } finally {
 	try {

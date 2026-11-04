@@ -8,7 +8,7 @@
  * 设计稿 §24.1：磁盘是唯一真相源——本 worker 只与磁盘交互，不依赖主会话存活。
  */
 
-import { appendFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -20,6 +20,32 @@ import { runFusionStep } from "./fusion-dispatch.ts";
 import { registerRunProcess, clearRunProcess } from "../subagent-kill.ts";
 import { notifyAsyncCompletion } from "../async-panel.ts";
 import { defaultRunsDir } from "./types.ts";
+
+/**
+ * 读 `agents/fusion.md` 的 body（frontmatter 之后的部分）作为融合者系统提示。
+ *
+ * 为什么在这里读、而不是让 fusion-dispatch 自己读：`discoverAgents()` 在 index.ts，
+ * trace-fusion 反向 import 它会成环。collect-cli 是进程入口（非库），自己读一次最干净。
+ * never-throw：读不到返回 undefined ⇒ 退回旧行为（不挂 systemPrompt），不阻断融合。
+ */
+function readFusionAgentBody(): string | undefined {
+	try {
+		const here = dirname(fileURLToPath(import.meta.url));
+		const mdPath = join(here, "..", "..", "agents", "fusion.md");
+		if (!existsSync(mdPath)) return undefined;
+		const md = readFileSync(mdPath, "utf8");
+		if (!md.startsWith("---")) return md.trim() || undefined;
+		const lines = md.split(/?
+/);
+		const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+		if (end === -1) return md.trim() || undefined;
+		const body = lines.slice(end + 1).join("
+").trim();
+		return body.length > 0 ? body : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 async function main(): Promise<void> {
 	const runId = process.argv[2] ?? "";
@@ -78,6 +104,10 @@ async function main(): Promise<void> {
 			fusionModel: config.fusionModel,
 			piCli,
 			log,
+			// 2026-11-05 第 3 项：headless 通道此前**不挂** agents/fusion.md 的 body
+			// ⇒ 与 makeSubagentFusionRunner（runWithFallback 自动取 agent.body）系统提示不一致。
+			// 在这里读并注入（不让 trace-fusion 反向依赖 agents/ 加载逻辑，保持 DAG）。
+			systemPrompt: readFusionAgentBody(),
 			// S1（2026-11-04）：让 headless 融合者成为一等 async run —— 有 pid（可 kill）、
 			// 有正规完成通知（不再只靠对账补投这条降级路径）。
 			registerRunProcess,
