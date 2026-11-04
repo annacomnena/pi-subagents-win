@@ -7,7 +7,13 @@
  * RuntimeEnvelope=runtime/envelope.ts）。**不跨 package import server 类型**（bundler
  * resolution + 独立 package，research 风险 5）；version:1 已冻结，server 只做加法时此处
  * 手工同步（加法字段对新客户端可选）。
+ *
+ * 2026-11-04 P1 例外：transcript 行模型 / 操作类型已改为从 `shared/transcript/model.ts`
+ * 重导出（见下方「5 种自包含行」段）。这是本文件**唯一**的跨目录来源；
+ * 其余类型仍是手抄，属 P2 逐域迁移范围。
  */
+
+import type { TranscriptOp, TranscriptRow } from "../../../shared/transcript/model.ts";
 
 // ── host 自信息（discovery.ts HostInfo）────────────────────────────
 
@@ -357,7 +363,23 @@ export interface UploadResult {
 }
 
 export type CommandOutcomeBody =
-	| { status: "accepted"; summary: string; replayed: boolean }
+	| {
+			status: "accepted";
+			summary: string;
+			replayed: boolean;
+			/**
+			 * 【2026-11-04 新增】S2 拉起结果（服务端 additive 透传；只在 action !== "send" 时出现）。
+				 *   action: "spawn-then-send"（已请求开窗，尚不证明 ready）/ "spawn-pending" / "spawn-failed" / "reject"
+			 *   reason: "session-dead" / "liveness-unknown" / "cwd-missing" / "spawn-not-permitted" …
+			 *   liveness: "alive" | "dead" | "unknown"
+			 */
+			resume?: {
+				action: string;
+				reason: string;
+				liveness?: string;
+				evidence?: unknown;
+			};
+	  }
 	| { status: "rejected"; reason: string; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: string; error?: string; replayed: boolean };
 
@@ -383,6 +405,14 @@ export interface SessionSummary {
 	title?: string;
 	/** 标题来源：ledger 台账 | first-user 首条用户消息剥前缀 | id 会话 id 兜底（GUI 灰显 shortId）。 */
 	titleSource?: "ledger" | "first-user" | "id";
+	/**
+	 * 【2026-11-04 补声明】服务端权威的存活态（`activityOf` 派生）。
+	 *   active=有活进程 / inactive=确证已死 / unknown=缺证据（**不得**显示成 inactive）。
+	 *
+	 * 用途：会话行的「拉起」按钮只在 `activity !== "active"` 时显示
+	 * （L4 审查 M3：活会话上误点会白发一条消息 + 反馈与副作用矛盾）。
+	 */
+	activity?: "active" | "inactive" | "unknown";
 }
 
 export interface SessionsBody {
@@ -393,33 +423,17 @@ export interface SessionsBody {
 	masterProtectedSessionId: string | null;
 }
 
-/** 5 种自包含行（turn = 行上标签非容器；渲染任一行不需读别的行）。 */
-export type TranscriptRow =
-	| { kind: "turnHeader"; rowId: string; turnIndex: number; startedAt: string; durationMs?: number }
-	| { kind: "userInput"; rowId: string; turnIndex: number; at: string; text: string }
-	| { kind: "assistantText"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
-	| { kind: "reasoning"; rowId: string; turnIndex: number; at: string; text: string; model?: string; provider?: string }
-	| {
-			kind: "toolCall";
-			rowId: string;
-			turnIndex: number;
-			at: string;
-			callId: string;
-			name: string;
-			arguments: unknown;
-			status: "running" | "done" | "error";
-			output?: string;
-			model?: string;
-			provider?: string;
-	  };
-
-/** 5 操作封闭集（P1 发射面 = appended/upserted/state.updated；delta/removed 定义留后续）。 */
-export type TranscriptOp =
-	| { kind: "row.appended"; row: TranscriptRow }
-	| { kind: "row.delta"; rowId: string; path: string; append: string }
-	| { kind: "row.upserted"; row: TranscriptRow }
-	| { kind: "row.removed"; rowId: string }
-	| { kind: "state.updated"; patch: Record<string, unknown> };
+/**
+ * 5 种自包含行 / 5 操作封闭集：**唯一来源是 `shared/transcript/model.ts`**（2026-11-04 P1）。
+ *
+ * 此前这里是第三份手抄（inline object 字面量形式），与 `extensions/runtime/transcript.ts`
+ * 的 interface 形式字段一致，但靠人眼同步、无任何机制校验。现在改为重导出，
+ * 既有 `import type { TranscriptRow } from "../api/types"` 全部继续可用（P2 会逐域清理）。
+ *
+ * 注意：本文件其余类型（HealthView / TimelineItem / RuntimeSnapshot…）仍是手抄，
+ * 属 P2 范围，不在 P1 内一并处理。
+ */
+export type { TranscriptOp, TranscriptRow } from "../../../shared/transcript/model.ts";
 
 export interface TranscriptHead {
 	seq: number;

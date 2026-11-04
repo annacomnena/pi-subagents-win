@@ -249,7 +249,7 @@ const REAL_WITH_ATTACHMENT =
 	const client = readFileSync(new URL("./api/client.ts", import.meta.url), "utf8");
 	const smStart = client.indexOf("sessionMessage:");
 	assert.ok(smStart >= 0, "client 有 sessionMessage");
-	const smBody = client.slice(smStart, smStart + 900);
+		const smBody = client.slice(smStart, client.indexOf("uploadImage:", smStart));
 	assert.ok(smBody.includes('type: "session.message"'), "sessionMessage 的 type 恒为 session.message");
 	ok("⑥ 作用域不变量：chatOutbox 唯一写入点 = session.message（口径可证）");
 }
@@ -284,7 +284,7 @@ const REAL_WITH_ATTACHMENT =
 	const fnEnd = store.indexOf("pollChatSessions:", fnStart);
 	const fnBody = store.slice(fnStart, fnEnd);
 	assert.ok(
-		/api\.sessionMessage\(sessionId, text, attachments, commandKey\)/.test(fnBody),
+			/api\.sessionMessage\(sessionId, text, attachments, commandKey, true\)/.test(fnBody),
 		"store 把本地 commandKey 传给 api.sessionMessage（同源）",
 	);
 	assert.ok(

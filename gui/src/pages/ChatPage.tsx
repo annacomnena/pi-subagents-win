@@ -1570,7 +1570,7 @@ function OutboxStatusLine({ e }: { e: ChatOutboxEntry }) {
 			title={e.detail ?? s.label}
 			aria-live="polite"
 		>
-			{s.label}
+			{e.detail ?? s.label}
 		</div>
 	);
 }

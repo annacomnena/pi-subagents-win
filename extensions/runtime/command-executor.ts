@@ -105,7 +105,26 @@ export type CommandRejectReason =
 	| "replay-unknown-outcome";
 
 export type CommandOutcome =
-	| { status: "accepted"; summary: string; replayed: boolean }
+	| {
+		status: "accepted";
+		summary: string;
+		replayed: boolean;
+		/**
+		 * 【2026-11-04 新增】S2 拉起结果（可观测，additive 可选）。
+		 *
+		 * 由 server 层在 S2 分支挂上（`{action, reason, liveness, evidence}`），
+		 * 经 `commandOutcomeHttpResponse` 透传到 HTTP 回执。
+		 *
+		 * 之前注释说「并入回执（可观测）」但命令层**静默丢弃**该字段
+		 * ⇒ GUI 端完全看不到拉起结果，无法区分「没拉起」与「拉起失败」。
+		 */
+		resume?: {
+			action: string;
+			reason: string;
+			liveness?: string;
+			evidence?: unknown;
+		};
+	}
 	/** detail（G5.2 additive，可选）：拒绝的面向用户的补充说明（如 prepare 无心跳提示），HTTP 面原样透传。 */
 	| { status: "rejected"; reason: CommandRejectReason; detail?: string; replayed: boolean }
 	| { status: "failed"; reason: "io-error" | "failed"; error?: string; replayed: boolean };
@@ -287,8 +306,26 @@ function sessionMessagePayloadOk(payload: unknown): boolean {
 	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
 	const rec = payload as Record<string, unknown>;
 	for (const key of Object.keys(rec)) {
-		if (key !== "text" && key !== "reason" && key !== "attachments") return false; // 封闭字段集
+		if (key !== "text" && key !== "reason" && key !== "attachments" && key !== "forceResume") return false; // 封闭字段集
 	}
+	// 【2026-11-04 新增】forceResume：用户**显式意图**的强制拉起标记。
+	//
+	// 为什么需要它（S2 自动路径覆盖不到的场景）：
+	//   S2 自动拉起要求「确证死亡」（liveness === "dead"）。而确证死亡需要证据：
+	//     - tab 会话 ⇒ tab state 的 pid（覆盖 tab 会话）
+	//     - 普通 TUI 会话 ⇒ session-owner 记录（**2026-11-03 之后**才有）
+	//   ⇒ ① 2026-11-03 之前的历史会话（无 owner 记录）
+	//     ② **正常退出**的会话（`session_shutdown` 删除了 owner 记录！）
+	//   这两类永远判 unknown ⇒ 自动路径永远不拉起。
+	//   而「我刚才关掉的会话，帮我继续」是**高频真实需求**。
+	//
+	// 为什么用标记而不是新命令类型：复用 S2 的现成路径（判据/门控/回执全同源），
+	// 不新增协议词表条目 ⇒ 前后端改动面最小、语义最清晰。
+	//
+	// 口径：**只放宽 liveness 门槛，不放宽其它门**——
+	//   权限门（trustedLocal + guiEnabled）、cwd 存在门、会话文件存在门全部照旧。
+	//   ⇒ 微信端够不到（它不发 session.message）；cwd 没了照样拒绝。
+	if (rec.forceResume !== undefined && typeof rec.forceResume !== "boolean") return false;
 	// GUI 图片输入 S2：attachments = 上传 id 列表（≤4，形状校验；存在性在 executor 解析时判）。
 	let attachments: unknown[] = [];
 	if (rec.attachments !== undefined) {
@@ -622,6 +659,9 @@ function runSessionMessage(frame: CommandFrame, opts: ExecuteCommandOptions): Co
 		text: payload.text,
 		...(attachmentPaths.length > 0 ? { attachments: attachmentPaths } : {}),
 		...(payload.reason !== undefined ? { reason: payload.reason } : {}),
+		// 【2026-11-04 新增】forceResume 透传进 outbox 项 ⇒ B 通道看到「用户显式要求拉起」
+		// ⇒ 不把这条消息标 failed（等 S2 拉起后送达）。
+		...(payload.forceResume === true ? { forceResume: true } : {}),
 		now: opts.now ?? new Date(),
 	});
 	try {
@@ -884,6 +924,42 @@ function readCommandOutcome(dedupeKey: string, commandsDir: string): StoredOutco
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * 该 commandKey 是否**已经执行过**（只读查询；2026-11-04 为 S2 幂等保护新增）。
+ *
+ * ## 为什么需要
+ *
+ * S2（拉起死会话）在 server 层发生，而幂等 claim 在 `executeCommand` **内部**：
+ *
+ * ```
+ * server.ts:  [S2 分支 → spawnSessionTab]  →  executeCommand → [claim → 执行]
+ * ```
+ *
+ * ⇒ 同 commandKey 重放时，S2 会**再次**调 `spawnSessionTab` ⇒ **重复开窗**。
+ * 这是 2026-10-30「每发一句拉起一个 tab」事故的同型问题（幂等维度）。
+ *
+ * ## 为什么不用 claim 文件做判断
+ *
+ * `claimCommandExecution` 是 `openSync(..., "wx")` 排他创建——**有副作用**
+ * （会占键）。S2 若复用它做「检查」，就等于在 executor 之前抢占了键，
+ * 破坏 executor 自己的 claim 语义。⇒ 必须用**只读**方式判断。
+ *
+ * 判据取 **outcome 文件存在**（而非 claim 文件）：outcome 存在 ⇒ 该键**已完整执行过**
+ * ⇒ 重放必然走 executor 的 replay 分支（零二次副作用）⇒ S2 不该再拉起。
+ * 只有 claim 存在但 outcome 不存在 = 「claim 后崩溃」的极窄窗口 ⇒ 按未知处理，
+ * **仍允许拉起**（宁可多开一个窗口，不可漏拉起 —— R-5 的取舍方向）。
+ *
+ * @param frame     帧（取 type + commandKey 拼 dedupeKey，与 executor 同口径）
+ * @param commandsDir 幂等盘面目录（与 executor 同源）
+ */
+export function isCommandAlreadyExecuted(
+	frame: { type: string; commandKey: string },
+	commandsDir: string,
+): boolean {
+	const dedupeKey = `${frame.type}:${frame.commandKey}`;
+	return readCommandOutcome(dedupeKey, commandsDir) !== null;
 }
 
 function writeCommandOutcome(dedupeKey: string, commandsDir: string, outcome: CommandOutcome, now: Date): void {

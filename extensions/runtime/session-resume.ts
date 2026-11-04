@@ -1,7 +1,6 @@
 /**
  * runtime/session-resume.ts — 「向任意 session 发消息时，会话**确认已死**才把它拉起来」
- *
- * owner 裁决（2026-10-30）：
+ * * owner 裁决（2026-10-30）：
  *   > 既然我们有了 gui，那么应当允许用户发送消息给任意 session 就拉起这个 session
  *   > 2. 能不能是让 runtime-deamon 操作？然后应当只能由 gui 操作
  *   > 3. 新开一个可见 wt tab。
@@ -24,6 +23,11 @@
  * 这与本仓既有纪律同源：**判不了 = 不动**（`judgeScopeOwnerStale` 的 `skip:no-liveness`
  * 是同一条原则）。
  */
+
+import { readFileSync, statSync } from "node:fs";
+
+import { probeSessionOwner } from "./session-owner.ts";
+import { findSessionFile } from "./transcript.ts";
 
 /**
  * 会话存活三态。**三态而不是两态**是本次修正的核心：
@@ -131,4 +135,139 @@ export interface SpawnSessionTabArgs {
 export function resumeTabTitle(sessionId: string): string {
 	const short = String(sessionId ?? "").trim().slice(0, 8);
 	return short ? `resume ${short}` : "resume session";
+}
+
+/**
+ * 【2026-11-04 新增】该会话**是否仍有可能被 S2 拉起**（B 通道协调用）。
+ *
+ * ## 为什么需要这个函数（B/S2 语义冲突）
+ *
+ * B 通道（`sweepTargetDeadOutboxItems`）判「目标已死 ⇒ 标 failed（消息永远送不到）」；
+ * S2 判「目标已死 ⇒ **拉起它**（消息送得到）」。同一事实，相反处置。
+ * 不协调的后果（真实场景）：
+ * ```
+ * t=0    用户发消息给死会话 → S2 拉起它 → 消息等新实例起来消费
+ * t=10m  B 扫到这条 pending（过宽限期）→ 判目标死 → 标 failed ❌ 消息在送达前被判死
+ * ```
+ *
+ * ## 判据口径（与 S2 的 decideSendAction **同源**，避免两处各写一份）
+ *
+ * 「能拉起」= **S2 的裁决链条会走 spawn**：
+ *   ① 有会话文件（否则无从拉起）
+ *   ② 会话的工作目录存在（否则 pi 拒启）
+ *   ③ 存活判定**是 dead**（与 decideSendAction 的「只有 dead 才拉起」完全一致）
+ *
+ * ## 为什么 ③ 必须要求 `dead` 而不是「不是 alive」（L4 审查 B3）
+ *
+ * 旧口径（unknown 也算「能拉起」）会让 **B 通道整体失效**：
+ * 真机 1046 个会话里 1038 个（99.24%）**没有 owner 记录** ⇒ 判 unknown
+ * ⇒ 全被算成「能拉起」⇒ B **永不**标 failed ⇒ 消息悬挂到 24h TTL
+ * ⇒ 正是 2026-11-03 事故「3 条消息卡 10 小时」的形态。
+ *
+ * ⇒ 口径必须与 `decideSendAction` 一致（要求 dead）。
+ *
+ * ## 那「历史会话靠 GUI 显式拉起」怎么办？
+ *
+ * 由**另一条通道**解决，不靠放宽本判据：
+ * 用户点「拉起」时消息带 `forceResume` 标记 ⇒ outbox 项携带该标记
+ * ⇒ B 看到「这条消息用户明确要求拉起」⇒ **不标 failed**（等 S2 拉起后送达）。
+ * 见 `message-outbox.ts` 的 `forceResume` 字段与 sweep 里的对应分支。
+ *
+ * ## 取舍方向
+ *
+ * 宁可让消息多等一会儿（B 不标 failed），**不可**把还能送的消息判死
+ * （本仓 R-5：异步交付宁可重发不可漏发）。
+ */
+export function decideRescuable(input: {
+	/** 会话文件是否存在（S2 的必要条件之一）。 */
+	sessionFileExists: boolean;
+	/** 会话记录里的 cwd；null = 读不出。 */
+	sessionCwd: string | null;
+	/** cwd 是否仍存在。 */
+	cwdExists: boolean;
+	/** 存活三态。 */
+	liveness: SessionLiveness;
+}): boolean {
+	if (!input.sessionFileExists) return false;
+	if (input.sessionCwd === null || !input.cwdExists) return false;
+	// **必须与 decideSendAction 同源**：只有 dead 才算「会被拉起」。
+	// alive ⇒ 不需要拉起；unknown ⇒ 自动路径不会拉起（缺证据 = 不动）。
+	return input.liveness === "dead";
+}
+
+/**
+ * 【2026-11-04 新增】生产实现：某会话**是否仍有可能被 S2 拉起**。
+ *
+ * ## 为什么放在这里（而不是 host 侧）
+ *
+ * B 通道有**两个**执行体，都会标 failed：
+ *   - host 侧：每 60s 扫一次（`runtime-host/server.ts`）—— 对**全部** outbox 项有视野
+ *   - 桥侧：每 10s 扫一次（`outbox-bridge.ts`）—— 跑在某个会话的进程里
+ *
+ * 桥**比 host 频繁**（10s < 60s）⇒ 只在 host 侧协调是**不够的**
+ * （桥会先把消息标死，host 的协调来不及）。
+ *
+ * 而桥侧**没有**拉起能力（无 wt.exe / spawnPiTab）⇒ 它只能「问判据」，
+ * 不能「执行拉起」。⇒ 判据必须是**共享的纯逻辑**，两个执行体都能调用。
+ *
+ * ## 判据来源（与 S2 同源）
+ *
+ * 复用 `session-owner` 记录（方案 A）+ 会话文件存在性 + cwd 存在性，
+ * 与 `decideSendAction` 的必要条件一致。
+ *
+ * never-throw：任何异常 ⇒ false（按「不能拉起」处理）。
+ */
+export function canSessionBeRescued(input: {
+	sessionId: string;
+	/** sessions 根目录（找会话文件）。 */
+	sessionsDir: string;
+	/** runtime state 根（读 session-owner 记录）。 */
+	stateDir: string;
+	/** pid 探针（测试可注入；缺省走 liveness.ts::probePidState）。 */
+	probePid?: (pid: number) => { state: "alive" | "dead" | "unknown"; basis: string };
+}): boolean {
+	try {
+		const file = findSessionFile(input.sessionsDir, input.sessionId);
+		if (file === null) return false;
+		const cwd = readSessionCwdFromFile(file);
+		if (cwd === null) return false;
+		let cwdExists = false;
+		try {
+			cwdExists = statSync(cwd).isDirectory();
+		} catch {
+			cwdExists = false;
+		}
+		if (!cwdExists) return false;
+		// 存活判定：owner 记录（方案 A）。**不删僵尸记录**（证据要留给 S2）。
+		const owner = probeSessionOwner(input.sessionId, {
+			stateDir: input.stateDir,
+			deleteZombie: false,
+			...(input.probePid !== undefined ? { probePid: input.probePid } : {}),
+		});
+		// alive ⇒ 不需要拉起；dead / unknown ⇒ 仍可能（unknown 含历史会话无记录的情形）
+		return decideRescuable({
+			sessionFileExists: true,
+			sessionCwd: cwd,
+			cwdExists: true,
+			liveness: owner.state,
+		});
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * 读会话文件首行的 cwd（会话记录形状：`{type:"session", cwd}`）。
+ * never-throw（读不出 → null）。
+ *
+ * 只读**首行**（不整文件解析）：大会话文件可能几十 MB，而 cwd 只在首行。
+ */
+export function readSessionCwdFromFile(file: string): string | null {
+	try {
+		const head = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
+		const rec = JSON.parse(head) as { type?: unknown; cwd?: unknown };
+		return rec.type === "session" && typeof rec.cwd === "string" ? rec.cwd : null;
+	} catch {
+		return null;
+	}
 }

@@ -249,6 +249,29 @@ interface GuiState {
 	chatOutboxHead: TranscriptHead | null;
 	/** 会话页输入框发送（POST /v1/commands session.message；never-throw，拒绝/失败落 failed/rejected）。 */
 	sendChatMessage: (sessionId: string, text: string, attachments?: string[]) => Promise<void>;
+	/**
+	 * 【2026-11-04 新增】强制拉起一个已结束的会话（列表行「拉起」按钮）。
+	 *
+	 * S2 自动路径要求「确证死亡」；历史会话与**正常退出**的会话都缺证据 ⇒ 永不自动拉起。
+	 * 本动作带 `forceResume: true` 显式表达用户意图（只放宽 liveness 门槛，
+	 * 权限/cwd/会话文件/幂等门全部照旧）。
+	 */
+	resumeSession: (sessionId: string) => Promise<void>;
+	/**
+	 * 【2026-11-04 新增】强制拉起的结果（**按 sessionId 存**，不是单槽）。
+	 *
+	 * 为什么按 sessionId 存（L4 审查 M4）：单槽时并发点两个会话的「拉起」，
+	 * 后返回的结果会覆盖先返回的 ⇒ 前一个会话的提示消失。
+	 * 按 sessionId 存 ⇒ 各行互不干扰。
+	 *
+	 * status：pending=进行中 / resumed=已开新窗口 / failed=失败 / skipped=无需或无法恢复。
+	 */
+	resumeSessionResult: Record<string, {
+		sessionId: string;
+		status: "pending" | "resumed" | "failed" | "skipped";
+		detail?: string;
+		at: string;
+	}>;
 	pollChatSessions: () => Promise<void>;
 	openChatSession: (id: string) => Promise<void>;
 	/** 首屏/全量重拉：缺省只取最新 TAIL_FIRST 行（`?tail=`）；传 tail 显式放大（「加载更早」）。 */
@@ -542,6 +565,8 @@ export const useGui = create<GuiState>((set, get) => ({
 	chatResyncKey: 0,
 	chatOutbox: {},
 	chatOutboxHead: null,
+	// 【2026-11-04 新增】强制拉起反馈（按 sessionId 存；初始空）
+	resumeSessionResult: {},
 
 	sendChatMessage: async (sessionId, text, attachments) => {
 		// 2026-10-19：commandKey **只生成一次**，既作本地 chatOutbox 的 key，也传给 api.sessionMessage
@@ -552,9 +577,13 @@ export const useGui = create<GuiState>((set, get) => ({
 		// GUI 图片输入 S2：附件只带 id（图已落盘；正文由服务端拼路径）；两段回执行仍展示正文
 		const entry: ChatOutboxEntry = { commandKey, sessionId, text, status: "sending", at: new Date().toISOString() };
 		set({ chatOutbox: { ...get().chatOutbox, [commandKey]: entry } });
-		const r = await api.sessionMessage(sessionId, text, attachments, commandKey);
+			// 用户在 GUI 发送即表达「继续此会话，必要时恢复」；API 的缺省行为仍保守。
+			// 宁可在身份证据不足时显式尝试恢复，也不让原消息静默无人消费（R-5）。
+			const r = await api.sessionMessage(sessionId, text, attachments, commandKey, true);
 		const cur = get().chatOutbox[commandKey];
 		if (cur === undefined) return; // 已被裁剪（理论不发生）
+			// 入队后恢复探测可能较慢；WS 的送达/失败可能先于 HTTP 回来，终态不能倒退。
+			if (cur.status === "delivered" || cur.status === "failed" || cur.status === "expired" || cur.status === "rejected") return;
 		if (!r.ok) {
 			// 真实 403 回执驱动（G6-P2 L4 必修 4）：executor 护栏拒绝即权威终态，不靠 health 猜测
 			const rej = (typeof r.body === "object" && r.body !== null ? (r.body as { status?: unknown; reason?: unknown }) : null);
@@ -586,17 +615,93 @@ export const useGui = create<GuiState>((set, get) => ({
 			return;
 		}
 		const body = r.data as CommandOutcomeBody;
+			let detail: string | undefined;
+			if (body.status === "accepted") {
+				const resume = body.resume;
+				if (resume?.action === "spawn-then-send" || resume?.action === "spawn-pending") {
+					detail = "正在恢复原会话，消息已排队；等待会话就绪后送达";
+				} else if (resume?.action === "spawn-failed" || resume?.action === "reject") {
+					const reasons: Record<string, string> = {
+						"cwd-missing": "原工作目录已不存在",
+						"spawn-not-permitted": "当前通道不允许恢复会话",
+						"no-session": "原会话文件不存在",
+					};
+					detail = `无法恢复会话：${reasons[resume.reason] ?? resume.reason}。消息仍已排队，尚未送达`;
+				}
+			} else {
+				detail = body.reason;
+			}
 		set({
 			chatOutbox: {
 				...get().chatOutbox,
 				[commandKey]: {
 					...cur,
 					status: body.status === "accepted" ? "pending" : "rejected",
-					detail: body.status === "accepted" ? undefined : body.reason,
+						detail,
 					at: new Date().toISOString(),
 				},
 			},
 		});
+	},
+
+	/**
+	 * 强制拉起一个已结束的会话（列表行「拉起」按钮；2026-11-04 新增）。
+	 *
+	 * ## 为什么需要独立动作（而不是复用 sendChatMessage）
+	 *
+	 * 拉起**不是发消息**：
+	 *   - 它不该在聊天区留下一条用户气泡（「已提交·等待注入」对用户是误导——
+	 *     实际发生的是「开了一个新窗口」，不是「排队等注入」）
+	 *   - 它不该占用 chatOutbox 的幂等键空间
+	 *   - 它的反馈是「窗口开了 / 没开」，与消息的「已提交/已送达」是两种语义
+	 *
+	 * ## 报文形状
+	 *
+	 * 复用 `session.message` + `payload.forceResume = true`（服务端 2026-11-04 新增）。
+	 * 不新增命令类型 ⇒ 协议词表不动、微信端够不到（它不发 session.message）。
+	 *
+	 * ## 反馈
+	 *
+	 * `resumeSessionResult`：一次性反馈（状态 + 说明），供列表行渲染提示。
+	 * never-throw（失败也落状态，不抛）。
+	 */
+	resumeSession: async (sessionId) => {
+		const setResult = (status: "pending" | "resumed" | "failed" | "skipped", detail?: string): void => {
+			set({
+				resumeSessionResult: {
+					...get().resumeSessionResult,
+					[sessionId]: { sessionId, status, ...(detail !== undefined ? { detail } : {}), at: new Date().toISOString() },
+				},
+			});
+		};
+		setResult("pending");
+		// 正文用一句可读的续接语：它会真的进入新会话的上下文（用户能在新窗口看到）。
+		const r = await api.sessionMessage(sessionId, "（从 GUI 恢复此会话）", undefined, undefined, true);
+		if (!r.ok) {
+			setResult("failed", r.status === 401 ? "未授权（401）" : `请求失败（${r.status}）`);
+			return;
+		}
+		const body = r.data as CommandOutcomeBody;
+		const resume = (body as { resume?: { action?: string; reason?: string } }).resume;
+		if (body.status === "rejected") {
+			setResult("failed", body.reason);
+			return;
+		}
+		// resume 字段只在 action !== "send" 时并入回执（server.ts 的既定语义）：
+		//   action=spawn-then-send ⇒ 已开新窗口
+		//   action=send            ⇒ 会话还活着，无需拉起（本次是多余的点击）
+		if (resume?.action === "spawn-then-send") {
+			setResult("resumed", "已在新窗口打开该会话");
+			return;
+		}
+			if (resume?.action === "spawn-pending") {
+				setResult("resumed", "恢复请求已在进行，等待会话就绪");
+				return;
+			}
+		setResult(
+			"skipped",
+			resume?.reason === "liveness-unknown" ? "该会话无法自动恢复" : "该会话当前无需恢复",
+		);
 	},
 
 	/**

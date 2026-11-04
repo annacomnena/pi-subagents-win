@@ -155,12 +155,13 @@ import {
 	type SessionLivenessVerdict,
 } from "../runtime/session-liveness.ts";
 import { readSessionUsage } from "../runtime/session-usage.ts";
+import { gcSessionOwners, probeSessionOwner, readSessionOwner, sessionOwnerDir } from "../runtime/session-owner.ts";
 import { readNotify } from "../runtime/notify-bridge.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
 import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 // 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
-import { decideSendAction, isSpawnPermitted } from "../runtime/session-resume.ts";
+import { canSessionBeRescued, decideSendAction, isSpawnPermitted, readSessionCwdFromFile } from "../runtime/session-resume.ts";
 import { parseObjectAddress } from "../runtime/address.ts";
 import { spawnPiTab } from "../tab-launch-core.ts";
 import { piSessionAddress } from "../runtime/address.ts";
@@ -586,6 +587,26 @@ export function buildLivenessIndex(sessionsDir: string): Map<string, SessionLive
 		const evidence: LivenessEvidence = { kind: "session-flag-alive", pid };
 		index.set(sid, { sessionId: sid, liveness: "alive", evidence, pid });
 	}
+
+	// ── 【2026-11-04 撤除】session-owner 证据并入 GUI 列表索引 ──
+	//
+	// L4 审查 I2/I3 判定：**这一段不能留在批量索引里**，三个理由：
+	//
+	// ① 【I3 fail-unsafe】`scanAlivePids()` 枚举失败时返回空集 ⇒ 全部 owner 记录被判
+	//    `owner-pid-dead` ⇒ 而它的 rank 高于 tab 证据 ⇒ **大面积误标「已死」**。
+	//    「枚举失败」的正确语义是「查不到」，不是「都没活」（AGENTS §0）。
+	//
+	// ② 【I2 PID 复用】批量版跳过 `session-owner.ts` 的进程启动时间交叉验证（不变量 2）
+	//    ⇒ PID 被复用时误判 alive（该会话在列表里显示「活跃中」，实际那个 pid 已是别的进程）。
+	//
+	// ③ 【I2 性能】`scanAlivePids()` 是**新增**的一次 PowerShell 全进程枚举（实测 1393ms），
+	//    叠加既有的 `scanSessionCommandLines()`（实测 1353ms）⇒ `/v1/sessions` 从 ~1.4s 变 ~2.8s。
+	//    该接口有 5s 缓存 TTL + 6s 轮询周期（注释原文：「含一次 PowerShell 进程枚举（~2.4s）
+	//    ⇒ 必须缓存」）⇒ 逼近超时事故阈值。
+	//
+	// ⇒ **owner 证据只在 S2 决策路径（`probeSessionLiveness`）使用**，那里是逐条精确判定
+	//    （含启动时间交叉验证）。GUI 列表的 activity 字段用 tab + 命令行证据即可
+	//    —— 列表是**展示面**，判不准的后果只是标签不准；决策面判错的后果是误开窗口。
 	return index;
 }
 
@@ -683,7 +704,7 @@ function scanSessionCommandLines(): Map<string, number> {
 	return out;
 }
 
-function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLivenessVerdict {
+function probeSessionLiveness(sessionId: string, sessionsDir: string, stateDir?: string): SessionLivenessVerdict {
 	if (!sessionId) {
 		return { sessionId, liveness: "unknown", evidence: { kind: "probe-unavailable", reason: "empty-session-id" } };
 	}
@@ -713,6 +734,49 @@ function probeSessionLiveness(sessionId: string, sessionsDir: string): SessionLi
 		}
 	} catch {
 		evidenceListPush(evidences, { kind: "probe-unavailable", reason: "tab-state-read-failed" });
+	}
+
+	// ①' 【2026-11-04 新增】session-owner 全生命周期 pid 记录 —— **普通 TUI 会话的唯一判据**。
+	//
+	// 为什么必须在这里（而不是 ② legacy 之后）：
+	//   - ② legacy 只在 `evidences.length === 0` 时启用 ⇒ 若 owner 先产出证据，
+	//     legacy 的「时间就近配对」就整个跳过（而它正是 4b7e7d1 认定的不可靠路径）。
+	//   - owner 证据是**身份绑定**（sessionId ↔ pid + 进程启动时间交叉验证），
+	//     比 legacy 的「同 cwd + 时间接近」可靠得多 ⇒ 应当优先。
+	//
+	// 为什么必须接（2026-11-03 诊断 + 2026-11-04 实测）：
+	//   方案 A（session-owner）已于 2026-11-03 实现，但**只被 B 通道使用**，
+	//   S2 探针完全没接 ⇒ 能力断链。实测：1043 个会话里 S2 只判出 3 个
+	//   （覆盖率 0.29%），1039 个判 unknown ⇒ 只入队不拉起。
+	//   典型症状会话 `01a1a137`（owner 判 dead / S2 判 unknown）永远拉不起来。
+	//
+	// deleteZombie: false —— 证据必须留住：
+	//   owner 记录是 S2 唯一的判死证据，而 B 通道每 60s 扫一次 outbox 并对
+	//   「过宽限期」的 pending 项调 probeSessionOwner。
+	//   若任一方删 ⇒ 谁先读到谁拿走证据，另一方只看到 no-record ⇒ 永不拉起。
+	//   （2026-11-04：懒删已改为**缺省不删**，本处显式传 false 是双保险；
+	//    目录卫生由 `gcSessionOwners`（超龄 GC）承担。）
+	try {
+		const owner = probeSessionOwner(sessionId, {
+			stateDir: stateDir ?? runtimeStateDir({}),
+			deleteZombie: false,
+		});
+		if (owner.state === "alive") {
+			const p = owner.record?.pid;
+			if (typeof p === "number" && p > 0) {
+				evidenceListPush(evidences, { kind: "owner-pid-alive", pid: p });
+			}
+		} else if (owner.state === "dead") {
+			const p = owner.record?.pid;
+			if (typeof p === "number" && p > 0) {
+				evidenceListPush(evidences, { kind: "owner-pid-dead", pid: p });
+			}
+		}
+		// owner.state === "unknown"（无记录 / pid 查不到 / 探针失败）⇒ 不产出证据
+		//   （缺证据 = 不动）。**不产出 probe-unavailable**：那是「探针失败」的语义，
+		//   而「无记录」是常态（历史会话无 owner 记录），混同会掩盖真实故障。
+	} catch {
+		evidenceListPush(evidences, { kind: "probe-unavailable", reason: "owner-probe-failed" });
 	}
 
 	// ② 旧 state 兜底（本修复之前写的 state **没有 sessionPath**）：
@@ -910,14 +974,45 @@ function probeCommandLineForSessionFlag(sessionFile: string): CommandLineProbe {
  * 只读**首行**（`{type:"session", cwd}`），不整文件解析：
  * 大会话文件可能几十 MB，而 cwd 只在首行。never-throw（读不出 → null）。
  */
-function readSessionCwdFromFile(file: string): string | null {
+/**
+ * 读会话文件首行的 cwd。
+ *
+ * 【2026-11-04，L4 审查 S1】本函数原先在 server.ts 有**逐字相同的私有副本**，
+ * 而 session-resume.ts 也有一个导出版 ⇒ 两处口径可能漂移。
+ * 现在统一用 `session-resume.ts` 的共享版（server.ts 已改为 import）。
+ */
+
+/**
+ * 【2026-11-04 新增】从原始命令体里读 `payload.forceResume`（用户显式的强制拉起意图）。
+ *
+ * 只读 `payload.forceResume === true` 这一个布尔；形状校验在 executor 层
+ * （`sessionMessagePayloadOk`）已做（封闭字段集 + 类型检查）⇒ 这里只做**提取**，
+ * 任何解析失败 ⇒ false（按「没请求强制拉起」处理 ⇒ 保守）。
+ */
+function peekForceResume(raw: Buffer): boolean {
 	try {
-		const head = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
-		const rec = JSON.parse(head) as { type?: unknown; cwd?: unknown };
-		return rec.type === "session" && typeof rec.cwd === "string" ? rec.cwd : null;
+		const parsed = JSON.parse(raw.toString("utf8")) as { payload?: { forceResume?: unknown } };
+		return parsed?.payload?.forceResume === true;
 	} catch {
-		return null;
+		return false;
 	}
+}
+
+/**
+ * 【2026-11-04 新增】该会话是否仍**有可能被 S2 拉起**（B 通道协调用）。
+ *
+ * 与 S2 的裁决链条**同源**：复用共享判据 `session-resume.ts::canSessionBeRescued`
+ * （owner 记录 + 会话文件 + cwd），避免两处各写一份口径 —— 那是 `4b7e7d1` 的教训
+ * （legacy 配对漂移就发生在两处各写一份）。
+ *
+ * never-throw：抛异常 ⇒ 返回 false（按「不能拉起」处理 ⇒ B 保持既有行为）。
+ */
+function canResumeSession(sessionId: string, opts: RuntimeHostServerOptions): boolean {
+	return canSessionBeRescued({
+		sessionId,
+		sessionsDir: opts.sessionsDir ?? defaultSessionsDir(),
+		stateDir: runtimeStateDir(opts),
+	});
 }
 
 /**
@@ -1787,6 +1882,10 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 	const stopWechatInput = startWechatInput({ runtimeDir: wechatRuntimeDir, configPath, timersDir: opts.timersDir ?? defaultTimersDir(), stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 	const stopWechatReply = startWechatReplyWatcher({ runtimeDir: wechatRuntimeDir, configPath, stateDir: opts.stateDir ?? join(defaultRuntimeDir(), "state") });
 
+		// 启动到 owner 就绪之间仍可能判 dead/unknown；按 session 合并不同消息的启动。
+		// 有界 60s 保护：启动失败可重试，不能永久锁死。daemon 重启后不跨进程幂等（R-5）。
+		const sessionStarts = new Map<string, number>();
+
 	const respondJson = (res: ServerResponse, status: number, body: unknown, etag?: string): void => {
 		try {
 			res.writeHead(status, { "content-type": "application/json", ...(etag !== undefined ? { etag } : {}) });
@@ -1912,16 +2011,27 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					trustedMasterInjection = undefined;
 				}
 				const frame = parseCommandRequest(raw);
+				const outcome = executeCommand(frame, {
+					stateDir: opts.stateDir,
+					journalPath: opts.journalPath,
+					configPath,
+					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）。
+					// GUI 图片输入 S2：附件 id → 绝对路径的解析根（与 /v1/uploads 落盘根**同源**）。
+					uploadsDir: uploadsDir(uploadsRuntimeDir),
+					// R1 注：TOCTOU（预检活→执行时死）落 post-claim 旧护栏 409 会占 key，同 key 重试重放 409，需换 key（fail-closed；claim 顺序不动）。
+					...(trustedMasterInjection !== undefined ? { trustedMasterInjection } : {}),
+				});
+				// 先校验并幂等入队，再做恢复副作用；拒绝命令绝不开窗。
 				// ── S2（2026-10-30 owner）：向**已死会话**发消息 ⇒ 先拉起它（新开可见 WT tab）──
 				// 门控：只允许 GUI（trustedLocal ∧ guiEnabled）。微信端只能与 global 通信，
 				// 不发 session.message，天然够不到。
 				// 缺省 opts.spawnSessionTab === undefined ⇒ 不拉起（零行为变化）。
-				let resumeOutcome: { action: string; reason: string } | null = null;
+				let resumeOutcome: { action: string; reason: string; liveness?: string; evidence?: unknown } | null = null;
 				try {
 					const peekForResume = JSON.parse(raw) as { type?: unknown; to?: unknown; payload?: unknown };
 					if (peekForResume?.type === "session.message" && typeof peekForResume.to === "string") {
 						const parsedTo = parseObjectAddress(peekForResume.to);
-						if (parsedTo?.scheme === "pi" && opts.spawnSessionTab) {
+						if (parsedTo?.scheme === "pi" && opts.spawnSessionTab && outcome.status === "accepted" && !outcome.replayed) {
 							const targetSid = parsedTo.value;
 							// ⚠️ 2026-10-30 两次事故修正：
 							// ① 【首次】不能用 sessionAlive() 当「进程活着」——它读的是
@@ -1933,50 +2043,64 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 							// 正确做法：用 tab state 里的 pid（`tab-runs-runtime.ts:250` 自写），
 							// 非 tab 会话才回落命令行精确匹配 `--session <文件>`。
 							const sd = opts.sessionsDir ?? defaultSessionsDir();
-							const verdict = probeSessionLiveness(targetSid, sd);
+							const forceResume = peekForceResume(raw);
+							const verdict = probeSessionLiveness(targetSid, sd, opts.stateDir);
 							const liveness = verdict.liveness;
 							const file = findSessionFile(sd, targetSid);
 							const tl = checkTrustedLocalChannel(req, hostToken, self.port);
+							// 【2026-11-04】forceResume：用户**显式意图**的强制拉起。
+							//
+							// 只放宽 liveness 门槛（unknown ⇒ 视为可拉起），**其它门全部照旧**：
+							//   - 权限门（trustedLocal + guiEnabled）：微信端照样够不到
+							//   - cwd 存在门：cwd 没了照样 reject:cwd-missing
+							//   - 会话文件存在门：找不到会话照样 reject:no-session
+							//   - 幂等门：重放**完全跳过**（见上）
+							// ⇒ 「显式意图」是唯一新增的授权来源，不会打开自动路径的口子。
+							//
+							// 覆盖的场景（S2 自动路径够不到）：
+							//   ① 2026-11-03 之前的历史会话（无 owner 记录）
+							//   ② **正常退出**的会话（session_shutdown 删了 owner 记录）
+							const effectiveLiveness = forceResume && liveness === "unknown"
+								? "dead" as const
+								: liveness;
 							const decision = decideSendAction({
 								sessionFile: file,
-								liveness,
+								liveness: effectiveLiveness,
 								sessionCwd: file !== null ? readSessionCwdFromFile(file) : null,
 								cwdExists: (c) => { try { return statSync(c).isDirectory(); } catch { return false; } },
 								permitted: isSpawnPermitted({ trustedLocal: tl.ok, guiEnabled: readGuiEnabled(configPath) }),
 							});
-							resumeOutcome = { action: decision.action, reason: decision.reason, liveness, evidence: verdict.evidence };
+							resumeOutcome = { action: decision.action, reason: decision.reason, liveness: effectiveLiveness, evidence: verdict.evidence };
+							const now = Date.now();
+							for (const [sid, until] of sessionStarts) if (until <= now) sessionStarts.delete(sid);
+							if (liveness === "alive") sessionStarts.delete(targetSid);
 							if (decision.action === "spawn-then-send") {
-								const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
-								// 标题：不再是纯 `resume 01a18b7f`（owner 2026-10-31 反馈）。
-								// 用「仓库名 · 最近一句诉求」，让用户在任务栏/标签栏里能一眼认出是哪个会话。
-								const title = deriveResumeTabTitle({
-									sessionId: targetSid,
-									cwd: sessionCwd,
-									recentUserText: readLastUserText(decision.sessionFile),
-								});
-								const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title });
-								// 注意：`probe` 变量已不存在（改用 `verdict`）——旧代码引用它会被外层 catch 吞掉，
-								// 导致“拉起失败”永远不登账。这里用 verdict.evidence 代替。
-								if (r.error) resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), evidence: verdict.evidence };
+								if (sessionStarts.has(targetSid)) {
+									resumeOutcome = { action: "spawn-pending", reason: "session-starting", liveness, evidence: verdict.evidence };
+								} else {
+									sessionStarts.set(targetSid, now + 60_000);
+									try {
+										const sessionCwd = readSessionCwdFromFile(decision.sessionFile) ?? process.cwd();
+										const title = deriveResumeTabTitle({ sessionId: targetSid, cwd: sessionCwd, recentUserText: readLastUserText(decision.sessionFile) });
+										const r = opts.spawnSessionTab({ sessionFile: decision.sessionFile, cwd: sessionCwd, title });
+										if (r.error) {
+											sessionStarts.delete(targetSid);
+											resumeOutcome = { action: "spawn-failed", reason: r.error.slice(0, 120), evidence: verdict.evidence };
+										}
+									} catch (error) {
+										sessionStarts.delete(targetSid);
+										resumeOutcome = { action: "spawn-failed", reason: String(error).slice(0, 120), evidence: verdict.evidence };
+									}
+								}
 							}
 						}
 					}
-				} catch { resumeOutcome = null; /* never-throw：拉起失败不影响发消息主路径 */ }
-				const outcome = executeCommand(frame, {
-					stateDir: opts.stateDir,
-					journalPath: opts.journalPath,
-					configPath,
-					sessionsDir: opts.sessionsDir, // L4 必修 3：session.message 存在性校验与读投影同源（非默认 sessionsDir 下不再误判 no-session）。
-					// GUI 图片输入 S2：附件 id → 绝对路径的解析根（与 /v1/uploads 落盘根**同源**）。
-					uploadsDir: uploadsDir(uploadsRuntimeDir),
-					// R1 注：TOCTOU（预检活→执行时死）落 post-claim 旧护栏 409 会占 key，同 key 重试重放 409，需换 key（fail-closed；claim 顺序不动）。
-					...(trustedMasterInjection !== undefined ? { trustedMasterInjection } : {}),
-				});
+				} catch (error) { resumeOutcome = { action: "spawn-failed", reason: String(error).slice(0, 120) }; }
+
 				// S2：拉起结果并入回执（可观测；不影响原有 outcome 语义）
 				if (resumeOutcome !== null && resumeOutcome.action !== "send") {
 					(outcome as { resume?: unknown }).resume = resumeOutcome;
-				}
-				// M3：窄路径被拒补 denied 审计行（字段同 accepted，无正文；best-effort 不影响回执）。
+				}				// M3：窄路径被拒补 denied 审计行（字段同 accepted，无正文；best-effort 不影响回执）。
 				// 唯一 denied 落盘点在 server 层：executor 预检/护栏保持零副作用（M2），
 				// 此处只记“peek 命中 master 目标且策略已计算”的两类窄路径拒绝
 				// （master-session-protected：gui-off/坏 policy；master-offline）。
@@ -2944,9 +3068,14 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					const stateDir = outboxStateDirFor(opts);
 					sweepTargetDeadOutboxItems(outboxDir(stateDir), {
 						probe: (sid: string) => probeTargetSessionLiveness(sid, { stateDir }),
+						// 【2026-11-04】S2 协调：目标虽判 dead，但仍可能被 S2 拉起 ⇒ 不标 failed。
+						canRescue: (sid: string) => canResumeSession(sid, opts),
 						...(opts.journalPath !== undefined ? { journalPath: opts.journalPath } : {}),
 						by: "runtime-host",
 					});
+					// 【2026-11-04，L4 审查 B1/M2】owner 记录超龄 GC。
+					// 懒删已改为缺省不删（证据是 S2 与 B 共同依赖的）⇒ 目录有界靠这个显式 GC。
+					gcSessionOwners(stateDir);
 				} catch {
 					/* never-throw：目标死亡检测不得影响 host 存活 */
 				}
@@ -3035,8 +3164,24 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 // ── slash 命令用的进程控制（start 已跑 → 回显现有；stop 清理僵尸文件）──
 
 /** 启动扫描用的 outbox state 根（与 executor 同款缺省；env PI_RUNTIME_DIR 隔离）。 */
-function outboxStateDirFor(opts: RuntimeHostServerOptions): string {
+/**
+ * runtime state 根目录的**单一事实源**（L4 审查 I1）。
+ *
+ * 缺省 = `<defaultRuntimeDir()>/state`；注入 `opts.stateDir` 时用注入值。
+ *
+ * 为什么必须单一：本文件里有多处要读 state 子目录
+ * （owner 记录 / 幂等账本 / outbox），若各处各写一遍
+ * `opts.stateDir ?? join(defaultRuntimeDir(), "state")`，
+ * 将来某处改成别的推导就会**读错目录**（读不到 ⇒ 判 unknown ⇒ 能力静默失效）。
+ *
+ * 与 `outboxStateDirFor` 同义（后者保留旧名以免动既有调用点）。
+ */
+function runtimeStateDir(opts: { stateDir?: string }): string {
 	return opts.stateDir ?? join(defaultRuntimeDir(), "state");
+}
+
+function outboxStateDirFor(opts: RuntimeHostServerOptions): string {
+	return runtimeStateDir(opts);
 }
 
 export interface HostStartResult {

@@ -60,6 +60,8 @@ import {
 	type OutboxItem,
 } from "./runtime/message-outbox.ts";
 import { probeTargetSessionLiveness } from "./runtime/outbox-target-liveness.ts";
+import { canSessionBeRescued } from "./runtime/session-resume.ts";
+import { defaultSessionsDir } from "./runtime/transcript.ts";
 import { piSessionAddress } from "./runtime/address.ts";
 import { claimInjection, confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
 import { injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
@@ -89,6 +91,11 @@ export interface ConsumeOutboxOptions {
 	targetDeadGraceMs?: number;
 	/** 交付账本目录（C-3；缺省 defaultDeliveryDir()，测试注入隔离目录）。 */
 	deliveryDir?: string;
+	/**
+	 * 【2026-11-04 新增】pi sessions 根目录（找会话文件用；缺省 defaultSessionsDir()）。
+	 * 用于 B/S2 协调：判断目标会话「是否仍可能被 S2 拉起」。
+	 */
+	sessionsDir?: string;
 	now?: Date;
 }
 
@@ -312,6 +319,20 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 			},
 			...(opts.now !== undefined ? { now: opts.now } : {}),
 			...(opts.targetDeadGraceMs !== undefined ? { graceMs: opts.targetDeadGraceMs } : {}),
+			// 【2026-11-04 新增】S2 协调：目标虽判 dead，但仍**可能被 S2 拉起** ⇒ 不标 failed。
+			//
+			// 为什么桥侧也要做（host 侧做了还不够）：桥每 10s 扫一次，host 每 60s
+			// ⇒ **桥会先标 failed**，host 的协调来不及。
+			// 桥没有拉起能力（无 wt.exe），但能读判据（owner 记录 + 会话文件 + cwd）。
+			//
+			// 判据与 S2 同源（session-resume.ts::canSessionBeRescued）⇒ 口径只有一处。
+			canRescue: (sid: string) => canSessionBeRescued({
+				sessionId: sid,
+				sessionsDir: opts.sessionsDir ?? defaultSessionsDir(),
+				// 与本文件其它 state 路径**同源**（defaultStateDir()；L4 审查 I1：
+				// 各处各写一遍推导，将来某处改了就会读错目录 ⇒ 能力静默失效）。
+				stateDir: opts.stateDir ?? defaultStateDir(),
+			}),
 			journalPath: opts.journalPath,
 			by: holderOf(opts.sessionId),
 		});

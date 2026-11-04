@@ -259,13 +259,23 @@ ok("⑥ 粘贴决策（files/items 并集 + Excel 文本优先 + 超长提示）
 	// 2026-10-19：契约升级为 api.sessionMessage(sessionId, text, attachments, commandKey)
 	// （commandKey 单一来源，见 _test_outbox_envelope ⑦）；attachments 仍在第 3 参。
 	assert.ok(
-		store.includes("api.sessionMessage(sessionId, text, attachments, commandKey)"),
+		store.includes("api.sessionMessage(sessionId, text, attachments, commandKey, true)"),
 		"store 透传 attachments（+ commandKey 单一来源）",
 	);
 	const client = readFileSync(new URL("./api/client.ts", import.meta.url), "utf8");
 	assert.ok(client.includes('"/v1/uploads"'), "client 打上传端点");
 	assert.ok(client.includes("body: file"), "上传发送**原始字节**（非 JSON base64）");
-	assert.ok(/payload: attachments !== undefined && attachments\.length > 0 \? \{ text, attachments \} : \{ text \}/.test(client), "命令载荷按有无附件分形");
+	// 命令载荷按有无附件分形（2026-11-04 更新：forceResume 是第三个可选分形维度）。
+	// 断言放宽为「三处关键字都存在」而不是整段正则 —— 正则锁死整个表达式写法，
+	// 任何新增可选字段都会让它假红（本次实测：加 forceResume 后原正则直接红）。
+	// 语义（按有无附件分形）改由**行为测试**覆盖（server 端 _test_s2_resume_e2e）。
+	assert.ok(
+		client.includes("attachments !== undefined && attachments.length > 0"),
+		"命令载荷按有无附件分形（attachments 条件存在）",
+	);
+	assert.ok(client.includes("{ text, attachments,"), "有附件分支带 attachments");
+	assert.ok(client.includes(": { text,"), "无附件分支只有 text");
+	assert.ok(client.includes("forceResume: true"), "forceResume 标记透传（2026-11-04 显式拉起）");
 }
 ok("⑤ 接线静态断言（ChatPage/store/client）");
 

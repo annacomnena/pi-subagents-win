@@ -390,13 +390,13 @@ check("F5 两者都有且一致（pid 死）⇒ dead（owner 路径优先但结�
 	assert.equal(p.state, "dead", `pid 死应 dead，实际 ${p.state}（${p.basis}）`);
 });
 
-check("F6 session-owner pid 已死 ⇒ 记录被懒删（不留僵尸）", () => {
+check("F6 session-owner pid 已死 ⇒ 记录**保留**（2026-11-04 语义变更，L4 审查 B1）", () => {
 	seedOwner("sess-f6", 999996, "2026-11-03T09:00:00.000Z", "2026-11-03T10:00:00.000Z");
 	probeTargetSessionLiveness("sess-f6", { stateDir: STATE, probePid: () => ({ state: "dead", basis: "test" }) });
 	assert.equal(
 		existsSync(join(OWNER_DIR, "sess-f6.json")),
-		false,
-		"判死后的 owner 记录应被懒删（否则 state 目录无限增长）",
+		true,
+		"判死后 owner 记录**不得**被删（它是 S2 拉起判定的唯一证据；B 删了 ⇒ S2 永不拉起）",
 	);
 });
 

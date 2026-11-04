@@ -59,6 +59,21 @@ export interface OutboxItem {
 	sessionId: string;
 	/** 消息正文（1..8000 UTF-8 字节；校验在 executor payload 白名单）。 */
 	text: string;
+	/**
+	 * 【2026-11-04 新增】用户**显式要求**拉起目标会话（GUI「拉起」按钮 ⇒ payload.forceResume）。
+	 *
+	 * ## 为什么 outbox 项要带这个标记
+	 *
+	 * B 通道判「目标死了 ⇒ 标 failed」，S2 判「目标死了 ⇒ 拉起它」。
+	 * 协调口径（L4 审查 B3 的修法）：**只有「确证死亡」的目标**才由 B 放弃判死；
+	 * 而「用户明确要求拉起」的消息**无论目标证据如何**都不该被判死
+	 * —— 用户已经表达了意图，消息必须有机会送达。
+	 *
+	 * ⇒ B 扫到带本标记的 pending 项 ⇒ 跳过（不标 failed）⇒ 等 S2 拉起后送达。
+	 *
+	 * 这是**显式意图**通道，不放宽自动路径：普通消息（无本标记）行为完全不变。
+	 */
+	forceResume?: boolean;
 	/** GUI 图片输入 S2：附件**绝对路径**列表（图不内联；桥在正文里给路径，agent 用 `read` 自取）。 */
 	attachments?: string[];
 	reason?: string;
@@ -184,6 +199,29 @@ export function sweepTargetDeadOutboxItems(
 		now?: Date;
 		by?: string;
 		journalPath?: string;
+		/**
+		 * 【2026-11-04 新增】该目标会话是否**还能被拉起**（S2 语义）。
+		 *
+		 * ## 为什么需要这个钩子（B/S2 语义冲突）
+		 *
+		 * B 通道的语义是「目标确实没了 ⇒ 消息永远送不到 ⇒ 标 failed」；
+		 * S2 的语义是「目标死了 ⇒ **拉起它** ⇒ 消息送得到」。
+		 *
+		 * 两者对**同一个事实**（目标已死）给出**相反**的处置。若不协调：
+		 * ```
+		 * t=0    用户发消息 → S2 拉起会话（消息将在新实例起来后被消费）
+		 * t=10m  B 扫到这条 pending（过宽限期）→ 判目标死 → 标 failed ❌
+		 * ```
+		 * ⇒ 消息在送达前被标死，用户永远收不到。
+		 *
+		 * ## 判据口径
+		 *
+		 * 返回 true ⇒ 「这个会话**有可能**被拉起」⇒ B **不得**标 failed
+		 * （宁可让消息多等，不可把还能送的消息判死 —— R-5 取舍方向）。
+		 *
+		 * 缺省 undefined ⇒ 视为「不能拉起」⇒ B 保持既有行为（零行为变化）。
+		 */
+		canRescue?: (sessionId: string) => boolean;
 	} = {} as never,
 ): OutboxItem[] {
 	const graceMs = opts.graceMs ?? OUTBOX_TARGET_DEAD_GRACE_MS;
@@ -211,6 +249,34 @@ export function sweepTargetDeadOutboxItems(
 		}
 		// 只认「确定死了」；alive / unknown 一律跳过（不冤枉活会话）
 		if (p.state !== "dead") continue;
+
+		// 【2026-11-04 新增】S2 协调：目标虽判 dead，但**仍可能被拉起** ⇒ 不得标 failed。
+		//
+		// 冲突场景（真实）：用户发消息给死会话 ⇒ S2 拉起它 ⇒ 消息等新实例消费；
+		// 过宽限期后 B 扫到这条 pending ⇒ 若标 failed ⇒ 消息在送达前被判死。
+		//
+		// 判据：`canRescue` 说「还能拉起」⇒ 跳过（宁可多等，不可误杀）。
+		// 缺省（undefined）⇒ 跳过本检查 ⇒ 既有行为零变化。
+		if (typeof opts.canRescue === "function") {
+			let rescuable = false;
+			try {
+				rescuable = opts.canRescue(it.sessionId);
+			} catch {
+				rescuable = false; // 探针抛异常 ⇒ 不救（保守：按「不能拉起」处理）
+			}
+			if (rescuable) continue;
+		}
+
+		// 【2026-11-04 新增】用户**显式要求**拉起的消息 ⇒ 绝不判死。
+		//
+		// 与上面的 canRescue 是**两条不同的通道**：
+		//   canRescue  = 「自动路径能不能救」（要求确证 dead）
+		//   forceResume= 「用户已经明确要求拉起」（不需要证据，只需要意图）
+		//
+		// 后者覆盖 2026-11-03 之前的历史会话与**正常退出**的会话
+		// （这两类没有 owner 记录 ⇒ 自动路径判 unknown ⇒ 救不了），
+		// 而用户点「拉起」时消息带了标记 ⇒ 必须有机会送达。
+		if (it.forceResume === true) continue;
 
 		const reason = `目标会话已结束（${p.basis}），消息无法送达`;
 		const marked = markOutboxItem(dir, it.id, {
@@ -278,6 +344,8 @@ export function newOutboxItem(input: {
 	text: string;
 	attachments?: string[];
 	reason?: string;
+	/** 【2026-11-04 新增】用户显式要求拉起（GUI「拉起」按钮）⇒ B 不判死这条消息。 */
+	forceResume?: boolean;
 	now: Date;
 }): OutboxItem {
 	const id = outboxItemId(input.dedupeKey);
@@ -297,6 +365,7 @@ export function newOutboxItem(input: {
 	};
 	if (input.attachments !== undefined && input.attachments.length > 0) item.attachments = input.attachments;
 	if (input.reason !== undefined) item.reason = input.reason;
+	if (input.forceResume === true) item.forceResume = true;
 	return item;
 }
 

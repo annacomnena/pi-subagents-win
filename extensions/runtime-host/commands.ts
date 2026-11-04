@@ -133,7 +133,23 @@ export interface CommandHttpResponse {
 /** CommandOutcome → HTTP 回执（accepted 200 / 拒绝 4xx / 失败 5xx）。 */
 export function commandOutcomeHttpResponse(outcome: CommandOutcome): CommandHttpResponse {
 	if (outcome.status === "accepted") {
-		return { status: 200, body: { status: "accepted", summary: outcome.summary, replayed: outcome.replayed } };
+		// 【2026-11-04 修】`resume` 字段透传。
+		//
+		// 之前 server.ts:2098 把拉起结果挂到 outcome.resume，注释写「并入回执（可观测）」，
+		// 但本函数只透传 status/summary/replayed ⇒ **resume 被静默丢弃**。
+		// 后果：S2 的拉起结果在 GUI 端完全不可见 ⇒ 拉起失败/未触发都无法诊断。
+		// （真机症状：用户只看到「已提交·等待注入」，不知道是没拉起还是拉起失败。）
+		//
+		// 口径：只在 outcome 上确有该字段时透传（additive，不改既有字段语义）。
+		return {
+			status: 200,
+			body: {
+				status: "accepted",
+				summary: outcome.summary,
+				replayed: outcome.replayed,
+				...(outcome.resume !== undefined ? { resume: outcome.resume } : {}),
+			},
+		};
 	}
 	if (outcome.status === "rejected") {
 		return {

@@ -61,6 +61,8 @@ export function SessionList() {
 	const chatSessions = useGui((s) => s.chatSessions);
 	const activeId = useGui((s) => s.chatActiveId);
 	const outboxMap = useGui((s) => s.chatOutbox);
+	// 【2026-11-04 新增】强制拉起反馈（列表行提示用；按 sessionId 存）
+	const resumeResults = useGui((s) => s.resumeSessionResult);
 	const [filter, setFilter] = useState("");
 	// 组内排序维度（默认 updated；持久化到 localStorage `saw-ws-sort`，机制同 saw-ws-expansion）
 	const [sortBy, setSortBy] = useState<SessionSortBy>(() => loadSortBy());
@@ -196,16 +198,44 @@ export function SessionList() {
 								<Shield className="size-3.5" />
 							</span>
 						)}
-						{pinnedBadge && (
-							// 组内置顶徽标（scope master 行；L3 三件套 1/3）：盾标旁，subtlest 档不抢标题
-							<span
-								className="flex shrink-0 items-center gap-0.5 text-ui-sm text-foreground-subtlest"
-								title="本仓库的本地 master（scope master）——组内置顶，不受 3 个截断影响"
-							>
-								<Pin className="size-3" />
-								置顶
-							</span>
-						)}
+					{pinnedBadge && (
+						// 组内置顶徽标（scope master 行；L3 三件套 1/3）：盾标旁，subtlest 档不抢标题
+						<span
+							className="flex shrink-0 items-center gap-0.5 text-ui-sm text-foreground-subtlest"
+							title="本仓库的本地 master（scope master）——组内置顶，不受 3 个截断影响"
+						>
+							<Pin className="size-3" />
+							置顶
+						</span>
+					)}
+					{/* 【2026-11-04 新增】「拉起」按钮：把已结束的会话在新窗口续接。
+					    S2 自动路径要求「确证死亡」；历史会话与**正常退出**的会话都缺证据
+					    ⇒ 永不自动拉起。本按钮是**用户显式意图**的入口（forceResume 标记），
+					    只放宽 liveness 门槛，权限/cwd/幂等门在服务端照旧生效。
+
+					    显示条件（L4 审查 M3）：`activity !== "active"`。
+					    原来用 `!isActive`（=「不是当前打开的会话」）⇒ **活会话也显示按钮**，
+					    误点会**往那个会话真发一条消息**（内容是「（从 GUI 恢复此会话）」），
+				    而回执 action=send 不并入 resume ⇒ GUI 显示「无需恢复」——
+				    ⇒ 反馈与实际副作用矛盾。
+
+				    `activity` 缺省（undefined）时**不显示**：判不准就别给入口
+				    （「缺证据 = 不动」的 GUI 侧同款纪律）。*/}
+					{s.activity !== undefined && s.activity !== "active" && (
+						<button
+							type="button"
+							data-session-resume-button="true"
+							title="在新窗口续接该会话（已结束的会话无法自动恢复时用这个）"
+							aria-label="拉起会话"
+							onClick={(e) => {
+								e.stopPropagation(); // 不触发行跳转（行 onClick 会 openChatSession）
+								void useGui.getState().resumeSession(s.sessionId);
+							}}
+							className="hidden shrink-0 rounded border border-border px-1 text-ui-sm text-foreground-subtle transition-colors hover:bg-hover hover:text-foreground group-hover/task-item:inline-flex"
+						>
+							拉起
+						</button>
+					)}
 					</div>
 					{/* 元信息行（#L745-770 同款刻度）：basename(cwd) · mtime 相对时间 */}
 					<div className="flex min-w-0 items-center gap-1 text-ui-sm text-foreground-subtle">
@@ -213,6 +243,31 @@ export function SessionList() {
 						<span className="shrink-0 text-foreground-subtlest">·</span>
 						<Clock className="size-3.5 shrink-0" />
 						<RelTime at={mtimeIso(s)} className="shrink-0" />
+						{/* 【2026-11-04 新增】拉起结果提示（仅本行、仅该会话最近一次的结果） */}
+						{resumeResults[s.sessionId] !== undefined && (() => {
+							const rr = resumeResults[s.sessionId];
+							return (
+								<span
+									data-session-resume-result={rr.status}
+									className={`shrink-0 truncate ${
+										rr.status === "failed"
+											? "text-destructive"
+											: rr.status === "resumed"
+												? "text-success"
+												: "text-foreground-subtlest"
+									}`}
+									title={rr.detail ?? ""}
+								>
+									{rr.status === "pending"
+										? "拉起中…"
+										: rr.status === "resumed"
+											? "已在新窗口打开"
+											: rr.status === "failed"
+												? (rr.detail ?? "拉起失败")
+												: (rr.detail ?? "无需恢复")}
+								</span>
+							);
+						})()}
 					</div>
 				</div>
 			</li>

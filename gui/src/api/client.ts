@@ -256,6 +256,18 @@ export const api = {
 		text: string,
 		attachments?: string[],
 		commandKey?: string,
+		/**
+		 * 【2026-11-04 新增】强制拉起标记（用户显式意图）。
+		 *
+		 * S2 自动路径要求「确证死亡」（liveness === "dead"），而确证死亡需要证据：
+		 * tab state 的 pid 或 session-owner 记录（**2026-11-03 之后**才有）。
+		 * ⇒ ① 更早的历史会话 ② **正常退出**的会话（session_shutdown 删了 owner 记录）
+		 * 这两类永远判 unknown ⇒ 自动路径永远不拉起。
+		 *
+		 * `forceResume: true` 只放宽 **liveness 门槛**，其它门（权限 / cwd 存在 /
+		 * 会话文件存在 / 幂等）全部照旧 ⇒ 零新增误开窗风险。
+		 */
+		forceResume?: boolean,
 	): Promise<FetchResult<CommandOutcomeBody>> =>
 		postJson<CommandOutcomeBody>("/v1/commands", {
 			frame: "command",
@@ -264,8 +276,12 @@ export const api = {
 			commandKey: commandKey ?? newCommandKey("msg"),
 			issuedAt: new Date().toISOString(),
 			// GUI 图片输入 S2：attachments = 上传 id 列表（图不内联；服务端落 outbox 时转绝对路径）
-			payload: attachments !== undefined && attachments.length > 0 ? { text, attachments } : { text },
-		} satisfies CommandFrameInput, 8000),
+			payload:
+				attachments !== undefined && attachments.length > 0
+					? { text, attachments, ...(forceResume === true ? { forceResume: true } : {}) }
+					: { text, ...(forceResume === true ? { forceResume: true } : {}) },
+			// 判活涉及有超时的 OS 进程探测；8s 会在繁忙机器上早于恢复结果超时。
+			} satisfies CommandFrameInput, 60_000),
 
 	/**
 	 * GUI 图片输入 S1：上传**原始图片字节**到 /v1/uploads（同源 cookie 鉴权同 /v1/commands）。

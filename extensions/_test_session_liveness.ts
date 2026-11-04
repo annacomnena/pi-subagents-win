@@ -32,6 +32,8 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 	const cases: Array<[LivenessEvidence, string, string]> = [
 		[{ kind: "tab-pid-alive", runId: "t1", pid: 100 }, "alive", "tab 的 pid 活着"],
 		[{ kind: "tab-pid-dead", runId: "t1", pid: 100 }, "dead", "tab 的 pid 已死（唯一可安全拉起的证据）"],
+		[{ kind: "owner-pid-alive", pid: 300 }, "alive", "session-owner 记录的 pid 活着（普通 TUI 会话的唯一活证据）"],
+		[{ kind: "owner-pid-dead", pid: 300 }, "dead", "session-owner 记录的 pid 已死（普通 TUI 会话可安全拉起）"],
 		[{ kind: "session-flag-alive", pid: 200 }, "alive", "非 tab 会话命令行精确命中"],
 		[{ kind: "session-flag-absent" }, "unknown", "命令行看不到 ⇒ **unknown 不是 dead**"],
 		[{ kind: "probe-unavailable", reason: "boom" }, "unknown", "探针失败 ⇒ unknown"],
@@ -39,7 +41,7 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 	for (const [ev, want, why] of cases) {
 		assert.equal(livenessFromEvidence(ev), want, `${ev.kind} ⇒ 应 ${want}（${why}）`);
 	}
-	ok("三态映射：只有 tab-pid-dead 判 dead；session-flag-absent / probe-unavailable 一律 unknown");
+	ok("三态映射：只有 pid 死才 dead；session-flag-absent / probe-unavailable 一律 unknown");
 }
 
 // ── ② 【事故②回归】@prompt 形态绝不判 dead ─────────────────────────
@@ -230,6 +232,103 @@ const ok = (msg: string): void => { n += 1; console.log(`ok ${n} - ${msg}`); };
 	]);
 	assert.equal(same.length, 2, "同一会话的重复候选不算争抢（按 sessionId 去重判）");
 	ok("【实测回归】同一 legacy tab 被多会话争抢 ⇒ 全部弃用降 unknown（防邻居记录误判）");
+}
+
+// ── ⑩ 【2026-11-04 新增】owner 证据：普通 TUI 会话的存活判据 ─────────
+//
+// 背景（真机实测，plans/20261103_S2_resume_capability_regression.md）：
+// S2 拉起能力对**普通 TUI 会话** 100% 失效 —— 1043 个会话里 S2 只判出 3 个
+// （覆盖率 0.29%），其余 1040 个判 unknown ⇒ `decideSendAction` 走
+// `send/liveness-unknown` ⇒ 只入队不拉起。
+//
+// 根因：S2 的两条取证路径都依赖 tab 概念，而 TUI 会话不是 tab。
+// 方案 A（session-owner 全生命周期 pid 记录）已于 2026-11-03 实现，
+// 但**只被 B 通道（outbox 死信）使用，S2 探针完全没接** ⇒ 能力断链。
+//
+// 本组测试锁住「接上 owner 之后」的三条行为：
+{
+	// ⑩-1 owner 判 dead ⇒ S2 允许拉起（这是修复的核心目的）
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "owner-pid-dead", pid: 337844 }])),
+		"dead",
+		"owner 说 pid 已死 ⇒ 判 dead（普通 TUI 会话终于能被拉起了）",
+	);
+	assert.equal(
+		decideSendActionAllowed(livenessFromEvidence(mergeEvidence([{ kind: "owner-pid-dead", pid: 337844 }]))),
+		true,
+		"owner 判 dead ⇒ 允许拉起",
+	);
+
+	// ⑩-2 【反向风险】owner 判 alive ⇒ 绝不拉起（防「活着被判死」误开窗）
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "owner-pid-alive", pid: 22064 }])),
+		"alive",
+		"owner 说 pid 活着 ⇒ 判 alive",
+	);
+	assert.equal(
+		decideSendActionAllowed(livenessFromEvidence(mergeEvidence([{ kind: "owner-pid-alive", pid: 22064 }]))),
+		false,
+		"owner 判 alive ⇒ 绝不拉起（防误开窗口）",
+	);
+
+	// ⑩-3 【核心不变量】alive 恒高于 dead —— owner 的 dead 不得压过 owner 的 alive
+	// 这条是 2026-10-30「第五次修正」锁定的：dead 只证明「某个历史实例退了」，
+	// 不能证明「这个逻辑会话现在没有活进程」。
+	assert.equal(
+		mergeEvidence([{ kind: "owner-pid-dead", pid: 1 }, { kind: "owner-pid-alive", pid: 2 }]).kind,
+		"owner-pid-alive",
+		"同会话旧实例 dead + 新实例 alive ⇒ alive（owner 证据不得打破这条不变量）",
+	);
+	assert.equal(
+		mergeEvidence([{ kind: "owner-pid-alive", pid: 2 }, { kind: "owner-pid-dead", pid: 1 }]).kind,
+		"owner-pid-alive",
+		"顺序不得影响结果",
+	);
+	// owner-alive 也要压过 tab-dead（否则旧 tab 记录又会让活会话被判死 ⇒ 重复开窗）
+	assert.equal(
+		mergeEvidence([{ kind: "tab-pid-dead", runId: "old", pid: 1 }, { kind: "owner-pid-alive", pid: 2 }]).kind,
+		"owner-pid-alive",
+		"owner-alive 必须压过 tab-dead（tab 记录是历史，owner 是当下）",
+	);
+	// 反向：owner-dead 与 tab-alive 并存时，alive 赢（当下观测优先）
+	assert.equal(
+		mergeEvidence([{ kind: "owner-pid-dead", pid: 1 }, { kind: "tab-pid-alive", runId: "t", pid: 2 }]).kind,
+		"tab-pid-alive",
+		"当下活实例（tab-alive）压过历史死记录（owner-dead）",
+	);
+
+	// ⑩-4 owner 证据不得掩盖弱证据的 unknown 语义（无记录 ⇒ 仍 unknown）
+	assert.equal(
+		livenessFromEvidence(mergeEvidence([{ kind: "probe-unavailable", reason: "no-owner-record" }])),
+		"unknown",
+		"无 owner 记录 ⇒ 仍 unknown（缺证据 = 不动，绝不判死）",
+	);
+
+	// ⑩-5 【端到端】普通 TUI 会话的完整生命周期：
+	//   活着 → 只发不拉；进程死了 → 拉起；拉起后新实例出现 → 又变回只发不拉。
+	// 这是「两次消息只开一个窗口」在 owner 证据路径上的等价锁。
+	{
+		let ownerPid: number | null = 22064; // 会话活着
+		let spawns = 0;
+		const decide = (): "send" | "spawn-then-send" => {
+			const evs: LivenessEvidence[] = [];
+			if (ownerPid !== null) {
+				evs.push({ kind: "owner-pid-alive", pid: ownerPid });
+			} else {
+				evs.push({ kind: "owner-pid-dead", pid: 22064 });
+			}
+			return decideSendActionAllowed(livenessFromEvidence(mergeEvidence(evs))) ? "spawn-then-send" : "send";
+		};
+
+		assert.equal(decide(), "send", "会话活着 ⇒ 只发不拉");
+		ownerPid = null; // 进程退出（owner 记录仍在，pid 已死）
+		assert.equal(decide(), "spawn-then-send", "进程已死 ⇒ 应拉起");
+		spawns += 1;
+		ownerPid = 99999; // 拉起产生新实例
+		assert.equal(decide(), "send", "拉起后新实例活着 ⇒ 又变回只发不拉");
+		assert.equal(spawns, 1, "整轮生命周期只应拉起 1 次");
+	}
+	ok("owner 证据：普通 TUI 会话可判 dead 可拉起；alive 恒压 dead；缺记录仍 unknown；生命周期只拉起 1 次");
 }
 
 console.log(`\nsession-liveness tests passed (${n} checks)`);

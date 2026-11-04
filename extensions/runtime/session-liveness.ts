@@ -43,6 +43,24 @@ export type LivenessEvidence =
 	| { kind: "tab-pid-alive"; runId: string; pid: number }
 	/** tab state 的 pid 已死。最强证据（可据此安全拉起）。 */
 	| { kind: "tab-pid-dead"; runId: string; pid: number }
+	/**
+	 * `session-owner` 全生命周期记录里的 pid 活着。
+	 *
+	 * 2026-11-04：这是**普通 TUI 会话**唯一的活证据来源。
+	 * `state/session-owner/<sid>.json` 由 `session-hooks.ts` 在 session_start 写、
+	 * session_shutdown 删 ⇒ **与忙闲无关、全生命周期存在**，且带进程启动时间做
+	 * PID 复用交叉验证（`session-owner.ts` 不变量 2）。
+	 */
+	| { kind: "owner-pid-alive"; pid: number }
+	/**
+	 * `session-owner` 记录里的 pid 已死 ⇒ 该会话**确定**没有活实例。
+	 *
+	 * 这是普通 TUI 会话能被安全拉起的**唯一**依据（tab state 只覆盖 tab 会话）。
+	 * 强证据等级与 `tab-pid-dead` 同级：都是「观测到某个进程已死」，
+	 * 但 owner 记录带 sessionId 身份绑定 + 启动时间防复用 ⇒ 不会像 legacy
+	 * 时间就近配对那样张冠李戴。
+	 */
+	| { kind: "owner-pid-dead"; pid: number }
 	/** 非 tab 会话，命令行精确含 `--session <file>` 且进程在。 */
 	| { kind: "session-flag-alive"; pid: number }
 	/** 非 tab 会话，未找到对应进程。 */
@@ -72,8 +90,10 @@ export function livenessFromEvidence(evidence: LivenessEvidence): SessionLivenes
 	switch (evidence.kind) {
 		case "tab-pid-alive":
 		case "session-flag-alive":
+		case "owner-pid-alive":
 			return "alive";
 		case "tab-pid-dead":
+		case "owner-pid-dead":
 			return "dead";
 		// ⚠️ `session-flag-absent` **不是** dead：
 		//    非 tab 会话可能是通过 @prompt / 别名 / 未来新形态启动的，
@@ -108,10 +128,12 @@ export function livenessFromTabState(
  * 合并多份证据，取**最强**的那份。
  *
  * 优先级（强 → 弱）：
- *   1. `tab-pid-alive`     —— 明确活（有 pid + isProcessAlive）
- *   1. `session-flag-alive`—— 明确活（命令行当下观测）
- *   3. `tab-pid-dead`      —— **历史**某实例已死
- *   4. `session-flag-absent` / `probe-unavailable` —— 无结论
+ *   1. `owner-pid-alive`    —— 全生命周期 owner 记录 + 启动时间交叉验证（身份绑定最硬）
+ *   2. `tab-pid-alive`      —— 明确活（tab state 的 pid + isProcessAlive）
+ *   3. `session-flag-alive` —— 明确活（命令行当下观测）
+ *   4. `owner-pid-dead`     —— **历史**某实例已死（生命周期受管 + 身份绑定）
+ *   5. `tab-pid-dead`       —— **历史**某实例已死
+ *   6. `session-flag-absent` / `probe-unavailable` —— 无结论
  *
  * ## 为什么 alive 必须高于 dead（2026-10-30 第五次修正）
  *
@@ -130,12 +152,35 @@ export function livenessFromTabState(
  *
  * **反向风险仍然守住**：只有**观测到** alive 才判 alive。
  * `absent` / `probe-unavailable` 仍是 unknown ⇒ 不拉起（见 `livenessFromEvidence`）。
+ *
+ * ## 2026-11-04：owner 证据的插入位置（不是随手排的）
+ *
+ * `owner-pid-alive` 排在**最前**：它是「sessionId ↔ pid」的**身份绑定**，
+ * 且经进程启动时间交叉验证（防 PID 复用）⇒ 比 tab 记录的 sessionPath 路径
+ * 匹配更硬，比命令行的文本匹配更可靠。
+ *
+ * `owner-pid-dead` 与 `tab-pid-dead` **同 rank**（L4 审查 M1 修正）：
+ * 原稿把 owner 排更高，理由是「owner 记录指向最近那个实例」——**该前提不成立**：
+ * owner 记录在 `session_shutdown` 时即被删除（`session-hooks.ts:140`）
+ * ⇒ **正常退出的会话永远没有 owner 记录** ⇒ owner 记录只覆盖「崩溃/被杀」的会话。
+ * 而 tab 记录（`tab-runs/*.state.json`）是**永久留存**的。
+ * ⇒ 两个证据源的**存活期恰好互补**（owner 短命、tab 长命），
+ *   让「短命源的陈旧记录」压过「长命源的历史记录」没有依据 ⇒ 同 rank。
+ *
+ * ## 不变量（最高优先级，不因新增证据而松动）
+ *
+ * **所有 alive 类证据的 rank 都高于所有 dead 类证据** —— 2026-10-30「第五次修正」锁定：
+ * dead 只证明「某个历史实例退了」，不能证明「这个逻辑会话现在没有活进程」。
+ * 问「要不要拉起」只能看「**现在**有没有活实例」。
  */
 export function mergeEvidence(evidences: readonly LivenessEvidence[]): LivenessEvidence {
 	const rank = (e: LivenessEvidence): number => {
 		switch (e.kind) {
-			case "tab-pid-alive": return 4;
-			case "session-flag-alive": return 3;
+			case "owner-pid-alive": return 6;
+			case "tab-pid-alive": return 5;
+			case "session-flag-alive": return 4;
+			// owner-pid-dead 与 tab-pid-dead 同 rank（L4 审查 M1）：两个证据源存活期互补
+			case "owner-pid-dead": return 2;
 			case "tab-pid-dead": return 2;
 			case "session-flag-absent": return 1;
 			case "probe-unavailable": return 0;
