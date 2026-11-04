@@ -56,6 +56,22 @@ export function reclaimLaneWorktree(
 	if (enabled === false) return { lane, action: "noop", reason: "开关关闭（reclaimLaneWorktree=false）" };
 	// 没有 worktree（diagnose run / 未派发 / 已回收）⇒ 零动作
 	if (!wt) return { lane, action: "noop", reason: laneMeta?.worktreeReclaimedAt ? "已回收" : "无 worktree" };
+	// 【2026-11-05 缺陷 #8 修】主工作树不是 lane worktree。
+	//
+	// 事故实测（三个 run 各 6 条，形状完全一致 A×3/B×2/C×1）：
+	// diagnose 模式历史上把 `worktree` 填成 `repoRoot`（launch-workers.ts:374）
+	// ⇒ 本函数对**主仓根**执行 `git worktree remove --force` ⇒ git 必拒
+	// (`fatal: '<repo>' is a main working tree`) ⇒ worktrees.ts:285 在主仓**同级**
+	// 写 `<repo>.stale.json` 野文件（实测 subagent-win.stale.json 196B、GreenCAD.stale.json 138B），
+	// 并落 6 条假告警 `action:deferred`。
+	//
+	// 双保险：除修生产者的填值外，这里也必须拦 —— 主工作树永远不是 lane worktree，
+	// 无论上游怎么填。守卫比对用归一化（\ ↔ /、大小写），与 fusion-packet 的
+	// replayMainRoot 判据同口径。
+	const normPath = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+	if (meta.repoRoot && normPath(wt) === normPath(meta.repoRoot)) {
+		return { lane, action: "noop", reason: "主工作树不是 lane worktree（诊断模式无隔离树），零动作" };
+	}
 	if (!existsSync(wt)) {
 		markReclaimed(meta, lane, now);
 		return { lane, action: "noop", reason: "目录已不在（补记回收时间）" };

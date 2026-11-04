@@ -172,6 +172,29 @@ async function main() {
 		rmSync(s.root, { recursive: true, force: true, maxRetries: 2 });
 	}
 
+	// ── 6b) 缺陷 #8（2026-11-05）：worktree 被填成 repoRoot 时**不得**去删主工作树，
+	//        且**不得**在主仓同级写 `<repo>.stale.json` 野文件 ──
+	// 实测事故：三个 run 各 6 条 `fatal: '<repo>' is a main working tree` + 仓外野文件。
+	{
+		const s = sandbox();
+		const { meta } = fakeMeta(s);
+		for (const lane of ["A", "B", "C"] as const) {
+			(meta.lanes[lane] as { worktree: string }).worktree = s.repoRoot;
+			(meta.lanes[lane] as { tabRunId?: string }).tabRunId = "";
+		}
+		const stalePath = `${s.repoRoot}.stale.json`;
+		const before = existsSync(stalePath) ? readFileSync(stalePath, "utf8") : null;
+		for (const lane of ["A", "B", "C"] as const) {
+			const r = reclaimLaneWorktree(meta, lane, { enabled: true });
+			assert(r.action === "noop", `lane ${lane}：主工作树必须 noop（实得 ${r.action}）`);
+			assert(String(r.reason).includes("主工作树"), `lane ${lane}：理由须点名主工作树，实得「${r.reason}」`);
+		}
+		const after = existsSync(stalePath) ? readFileSync(stalePath, "utf8") : null;
+		assert(after === before, "不得在主仓同级写 .stale.json 野文件");
+		assert(existsSync(s.repoRoot), "主仓目录必须仍在");
+		rmSync(s.root, { recursive: true, force: true, maxRetries: 2 });
+	}
+
 	// ── 7) 批量入口只处理传入的 done lane（supervisor 传的就是 facts 里 done 的 lane） ──
 	{
 		const s = sandbox();

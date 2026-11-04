@@ -371,7 +371,20 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 		const deadline = new Date(now.getTime() + wallMin * 60_000);
 		const lanes = {} as Record<LaneId, TraceLaneMeta>;
 		for (const lane of TRACE_LANES) {
-			lanes[lane] = { lane, worktree: repoRoot, tabRunId: "", provision: noopProvision() };
+			// 【2026-11-05 缺陷 #8 修】diagnose 模式**没有 worktree**（零磁盘代价、零主仓写入），
+			// 因此这里必须是空串而不是 repoRoot。
+			//
+			// 旧值 `repoRoot` 让下游 `reclaimLaneWorktree` 对主工作树执行
+			// `git worktree remove --force` ⇒ git 必拒（`is a main working tree`）
+			// ⇒ worktrees.ts:285 在主仓**同级**写 `<repo>.stale.json` 野文件 + 6 条假告警。
+			// 实测三个 run 形状完全一致（A×3/B×2/C×1），野文件仍在
+			// （subagent-win.stale.json 196B、GreenCAD.stale.json 138B）。
+			//
+			// 与 `wtDir: ""` 对齐（diagnose 不建短路径目录）。下游所有使用点都已做 truthy 守卫：
+			// cross-test.ts:91 `if (wt) strip(wt)`、pooled 段只在 implement 路径、
+			// fusion-packet 的 replayCwdByLane 会回落 `?? replayRepoRoot`（且与 mainRoot 相等即拒），
+			// artifacts.ts:192 只拿它做归一化。
+			lanes[lane] = { lane, worktree: "", tabRunId: "", provision: noopProvision() };
 		}
 		const meta: TraceRunMeta = {
 			runId,

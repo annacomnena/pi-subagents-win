@@ -323,7 +323,10 @@ try {
 			assert.ok(!existsSync(join(wtRoot, res.meta.shortId)), "不创建任何 worktree");
 			assert.equal(Object.keys(res.meta.lanes).length, 3);
 			for (const lane of ["A", "B", "C"] as const) {
-				assert.equal(res.meta.lanes[lane].worktree.replace(/\\/g, "/"), repo2.replace(/\\/g, "/"), "lane 工作区=主仓库");
+				// 【2026-11-05 缺陷 #8 修】diagnose **没有** worktree ⇒ 必须空串，不是 repoRoot。
+				// 旧断言「lane 工作区=主仓库」把这个缺陷**钉成了期望行为** —— 生产每轮据此
+				// 假报 6 条 `is a main working tree` 并在仓外写 .stale.json。
+				assert.equal(res.meta.lanes[lane].worktree, "", "diagnose 的 lane worktree 必须为空串（缺陷 #8）");
 			}
 			assert.equal(calls.length, 3, "三 tab 已派发");
 			for (const c of calls) {
