@@ -149,16 +149,60 @@ function archiveUntracked(worktree: string, destDir: string): { files: string[];
 	return { files, issues };
 }
 
+/** 一条基线外改动的归因（2026-11-05 缺陷 #9）。 */
+export interface DirtyViolation {
+	/** porcelain 行（如 `M src/a.ts`）。 */
+	line: string;
+	/**
+	 * 归因：
+	 *  - `lane`      = 有 lane 专属目录线索（`lanes/<lane>/`）⇒ 疑似 lane 写入
+	 *  - `dispatcher` = 有派发者仍在写的证据（保留位，当前不产生）
+	 *  - `unknown`   = **默认**：不知道是谁写的（不得默认有罪）
+	 */
+	attribution: "lane" | "dispatcher" | "unknown";
+	/** 归因依据（人可读）。 */
+	evidence: string;
+}
+
 /**
- * diagnose 模式确定性违规检查：主仓库当前 porcelain 对比启动基线，
- * 返回新增条目（lane 违规写入的证据）。只增不改——基线内既有脏项不算违规。
+ * diagnose 模式确定性违规检查：主仓库当前 porcelain 对比启动基线，返回新增条目**带归因**。
+ *
+ * 【2026-11-05 缺陷 #9 修】旧版返回 `string[]` 且只有两个时刻（基线 / 现在），
+ * 没有任何「谁写的」维度 ⇒ diagnose 模式下主会话并发改代码时，任何改动都会被判成
+ * 「疑似 lane 违规」。实测：run tfl-20261105-020514-f7ed 的 cross-test 报 7 条
+ * 「⚠ 疑似 lane 违规」，而那 7 个文件是**主会话**在修项 1 时改的
+ * （基线 02:05:15 → 评估 02:09:16 → 7 文件 mtime 02:09:43）。
+ *
+ * diagnose 模式的定位恰恰是「正式开工前的探查」，此时主会话通常正在读/改代码
+ * ⇒ **误报是常态而非例外**。故改为结构化归因，默认 `unknown`（不得默认有罪）。
+ */
+export function diagnoseDirtyViolationsDetailed(meta: TraceRunMeta): DirtyViolation[] {
+	if (!meta.dirtyBaselineFile || !existsSync(meta.dirtyBaselineFile)) return [];
+	// `-uall`：展开未跟踪目录。默认 porcelain 把整个 `lanes/` 折叠成一行 `?? lanes/`
+	// ⇒ 归因粒度不足（实测：lane 内新增文件被报成「主仓路径，无 lane 线索」）。
+	const nowSt = execGit(["status", "--porcelain=v1", "--untracked-files=all"], { cwd: meta.repoRoot });
+	if (nowSt.status !== 0) return [];
+	const base = new Set(readFileSync(meta.dirtyBaselineFile, "utf8").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0));
+	const fresh = nowSt.stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0 && !base.has(l));
+	const out: DirtyViolation[] = [];
+	for (const line of fresh) {
+		const path = line.slice(3).trim().replace(/\\/g, "/");
+		const laneHit = /(^|\/)lanes\/([ABC])\//.exec(path);
+		if (laneHit) {
+			out.push({ line, attribution: "lane", evidence: `路径在 lanes/${laneHit[2]}/ 内` });
+			continue;
+		}
+		out.push({ line, attribution: "unknown", evidence: "主仓路径，无 lane 目录线索；派发者可能并发编辑" });
+	}
+	return out;
+}
+
+/**
+ * 旧的字符串入口（向后兼容：cross-test 报告、fusion packet、既有测试都用它）。
+ * 仅保留路径部分，**不带归因**；新代码请用 `diagnoseDirtyViolationsDetailed`。
  */
 export function diagnoseDirtyViolations(meta: TraceRunMeta): string[] {
-	if (!meta.dirtyBaselineFile || !existsSync(meta.dirtyBaselineFile)) return [];
-	const nowSt = execGit(["status", "--porcelain=v1"], { cwd: meta.repoRoot });
-	if (nowSt.status !== 0) return [];
-	const base = new Set(readFileSync(meta.dirtyBaselineFile, "utf8").split("\n").map((l) => l.trim()).filter((l) => l.length > 0));
-	return nowSt.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !base.has(l));
+	return diagnoseDirtyViolationsDetailed(meta).map((v) => v.line);
 }
 
 /**

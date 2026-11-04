@@ -18,7 +18,7 @@ import { execGit } from "./git.ts";
 import { createSingleWorktree, provisionWorktree, removeWorktreeRetry, writeProvisionReport } from "./worktrees.ts";
 import type { LaneId, TraceRunMeta, TraceFusionProvisioning } from "./types.ts";
 import type { RunCollectReport } from "./artifacts.ts";
-import { diagnoseDirtyViolations } from "./artifacts.ts";
+import { diagnoseDirtyViolations, diagnoseDirtyViolationsDetailed } from "./artifacts.ts";
 import { buildFusionPacket } from "./fusion-packet.ts";
 import { defaultTabRunsDir } from "../tab-runs.ts";
 
@@ -219,7 +219,12 @@ function renderReport(matrix: CrossTestMatrix): string {
  * + 报告说明 + 违规写入检查结论。
  */
 export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport): CrossTestMatrix {
-	const violations = diagnoseDirtyViolations(meta);
+	// 2026-11-05 缺陷 #9：带归因的版本（lane / unknown）。报告文案按归因分级，
+	// 默认 unknown「不知道是谁写的」——不得默认有罪。
+	const attributed = diagnoseDirtyViolationsDetailed(meta);
+	const laneAttributed = attributed.filter((v) => v.attribution === "lane");
+	const unknownAttributed = attributed.filter((v) => v.attribution === "unknown");
+	const violations = attributed.map((v) => v.line);
 	const matrix: CrossTestMatrix = {
 		runId: meta.runId,
 		baseCommit: meta.baseCommit,
@@ -240,8 +245,17 @@ export function finishDiagnoseRun(meta: TraceRunMeta, collect: RunCollectReport)
 		"- 模式：**diagnose（只读诊断）**——lane 未实现代码，无 patch 可验证；",
 		"  本模式不在用户主仓库执行任何 pooled command（无 worktree 隔离），",
 		`  ${poolSize} 条证据主张仅供 fusion/人工复核。`,
-		`- 主仓库违规写入检查：${violations.length === 0 ? "✅ 无基线外改动" : `⚠ 发现 ${violations.length} 条基线外改动（疑似 lane 违规）：`}`,
-		...(violations.length > 0 ? violations.slice(0, 10).map((v) => `  - ${v}`) : []),
+		// 归因分级（缺陷 #9）：只有落在 lanes/<lane>/ 内的才能叫「疑似 lane 违规」；
+		// 主仓路径上的改动一律标「无法归因」——diagnose 模式下主会话并发改代码是常态。
+		`- 主仓库违规写入检查：${attributed.length === 0
+			? "✅ 无基线外改动"
+			: laneAttributed.length > 0
+				? `⚠ 发现 ${laneAttributed.length} 条**可归因到 lane** 的基线外改动：`
+				: `ℹ 评估窗口内出现 ${attributed.length} 条基线外改动，**无法归因到 lane**（主会话可能并发编辑）`}`,
+		...(laneAttributed.length > 0 ? laneAttributed.slice(0, 10).map((v) => `  - ${v.line}（${v.evidence}）`) : []),
+		...(unknownAttributed.length > 0
+			? [`  - 另 ${unknownAttributed.length} 条无 lane 线索：${unknownAttributed.slice(0, 5).map((v) => v.line).join("; ")}${unknownAttributed.length > 5 ? " …" : ""}`]
+			: []),
 		"",
 		"## 交付物",
 		"",

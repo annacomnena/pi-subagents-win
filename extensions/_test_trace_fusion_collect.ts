@@ -203,6 +203,46 @@ try {
 	const collectJson = JSON.parse(readFileSync(join(run2.meta.runDir, "collect.json"), "utf8")) as { lanes: Record<string, unknown> };
 	assert.ok(collectJson.lanes.A && collectJson.lanes.B && collectJson.lanes.C);
 
+
+// ── 缺陷 #9（2026-11-05）：dirty 归因默认 unknown，不默认有罪 ──
+{
+	const { diagnoseDirtyViolationsDetailed } = await import("./trace-fusion/artifacts.ts");
+	const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { execFileSync } = await import("node:child_process");
+	const root = mkdtempSync(join(tmpdir(), "tfl-attr-"));
+	try {
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: root });
+		writeFileSync(join(root, "seed.txt"), "x", "utf8");
+		execFileSync("git", ["add", "."], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "seed"], { cwd: root });
+		// 基线：干净
+		const baselineFile = join(root, "baseline.txt");
+		writeFileSync(baselineFile, "", "utf8");
+		const meta = { repoRoot: root, dirtyBaselineFile: baselineFile } as never;
+		// ① 主仓路径改动 ⇒ unknown（不得判成 lane 违规）
+		writeFileSync(join(root, "extensions_file.ts"), "changed", "utf8");
+		const v1 = diagnoseDirtyViolationsDetailed(meta);
+		const f1 = v1.find((v) => v.line.includes("extensions_file.ts"));
+		assert.ok(f1, "主仓改动必须被记录");
+		assert.equal(f1!.attribution, "unknown", "主仓路径改动 ⇒ unknown（不默认有罪）");
+		// ② lanes/A/ 内改动 ⇒ lane
+		mkdirSync(join(root, "lanes", "A"), { recursive: true });
+		writeFileSync(join(root, "lanes", "A", "trajectory.md"), "y", "utf8");
+		const v2 = diagnoseDirtyViolationsDetailed(meta);
+		const f2 = v2.find((v) => v.line.includes("lanes/A/"));
+		assert.ok(f2, "lane 目录改动必须被记录");
+		assert.equal(f2!.attribution, "lane", "lanes/A/ 内的改动 ⇒ lane");
+		// ③ 旧字符串入口仍工作（向后兼容）
+		const { diagnoseDirtyViolations } = await import("./trace-fusion/artifacts.ts");
+		assert.equal(diagnoseDirtyViolations(meta).length, v2.length, "旧入口映射行数一致");
+		console.log("ok - #9 dirty 归因：主仓=unknown / lanes/A/=lane / 旧入口兼容");
+	} finally {
+		rmSync(root, { recursive: true, force: true, maxRetries: 2 });
+	}
+}
 	console.log("trace-fusion collect tests passed");
 } finally {
 	try {
