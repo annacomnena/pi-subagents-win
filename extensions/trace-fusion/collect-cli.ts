@@ -35,12 +35,10 @@ function readFusionAgentBody(): string | undefined {
 		if (!existsSync(mdPath)) return undefined;
 		const md = readFileSync(mdPath, "utf8");
 		if (!md.startsWith("---")) return md.trim() || undefined;
-		const lines = md.split(/?
-/);
+		const lines = md.split(/\r?\n/);
 		const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
 		if (end === -1) return md.trim() || undefined;
-		const body = lines.slice(end + 1).join("
-").trim();
+		const body = lines.slice(end + 1).join("\n").trim();
 		return body.length > 0 ? body : undefined;
 	} catch {
 		return undefined;
