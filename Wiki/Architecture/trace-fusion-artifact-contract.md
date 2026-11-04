@@ -1,6 +1,6 @@
 # trace-fusion lane 产出的判定基准
 
-> 校准状态：**current（2026-11-02 源码级核实 + 五个 run 实测对照）**
+> 校准状态：**current（2026-11-02 源码级核实 + 五个 run 实测对照；2026-11-04 行号重校 + 补上 `collect-manifest.json` 与自产文件全集）**
 > 关联：`trace-fusion-architecture.md`、`autonomy-consumer-gap.md`
 >
 > 本文解决一个**判定陷阱**：判「lane 该产出哪些 artifact」时，很容易拿错标准答案，
@@ -29,16 +29,21 @@ edit 工具对你禁用（不改代码）；write 只能写上述两个 artifact
 
 ## 陷阱：拿 `artifacts.ts` 当标准答案会得到 6 个
 
-`artifacts.ts:163-264` 的 `collectLaneArtifacts` 里有 6 处 `writeFileSync(join(laneDir, ...))`：
+`artifacts.ts` 的 `collectLaneArtifacts` 里的写入点（行号按 2026-11-04 工作区重新核过）：
 
 | 文件 | 行 | **谁写的** | 是不是 lane 的义务 |
 |---|---|---|---|
-| `trajectory.md` | `:179` | worker | ✅ 是 |
-| `validation.json` | `:180` | worker | ✅ 是 |
-| `patch.diff` | `:194` | **supervisor** | ❌ 否（prompt 明说不用生成） |
-| `untracked` | `:197` | **supervisor** | ❌ 否 |
-| `status.txt` | `:222/:227` | **supervisor**（`git status --porcelain`） | ❌ 否 |
-| `result.json` | `:238` | **supervisor**（归档 tab result） | ❌ 否 |
+| `trajectory.md` | `:211`（只检查存在，不写） | worker | ✅ 是 |
+| `validation.json` | `:212`（只检查存在，不写） | worker | ✅ 是 |
+| `patch.diff` | `:239`（diagnose 写空）/ `:251`（implement 写真实 diff） | **supervisor** | ❌ 否（prompt 明说不用生成） |
+| `untracked/` | `:255` | **supervisor** | ❌ 否 |
+| `status.txt` | `:262` / `:267`（implement 分支内外各一处） | **supervisor**（`git status --porcelain`） | ❌ 否 |
+| `result.json` | `:278` | **supervisor**（归档 tab result） | ❌ 否 |
+| `collect-manifest.json` | `:284` | **supervisor**（2026-11-04新增：记 changedFiles/testFiles，供 worktree 回收后沿用） | ❌ 否 |
+
+补充：`provision.json` 由 `worktrees.ts` 写（launch 阶段）、`provision-eval.json` 由 `cross-test.ts` 写。
+以上 supervisor 自产文件全部在 `types.ts` 的 `LANE_ARTIFACT_NAMES` 白名单里；
+判「什么算 lane 契约外文件」时必须连这些一起排除（漏项会造出假阳，见本页《其它已知失效模式》）。
 
 **`collectLaneArtifacts` 是采集器，不是契约。** 它需要收集 supervisor 自己派生出来的文件，
 这不代表 worker 要写它们。
