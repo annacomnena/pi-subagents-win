@@ -45,6 +45,24 @@ function readFusionAgentBody(): string | undefined {
 	}
 }
 
+/**
+ * 读 `config.json` 的 `fallbackModels.fusion`（只取**第一个**，2026-11-05 第 3 项）。
+ *
+ * gen14 明确要求「不要做多级 fallback 链」⇒ 这里只取一条。
+ * 未配置 / 读到空 ⇒ undefined ⇒ 不启用 fallback（行为与旧版逐字节一致）。
+ */
+function readFusionFallbackModel(config: { fallbackModels?: unknown }): string | undefined {
+	try {
+		const fb = (config.fallbackModels ?? {}) as Record<string, unknown>;
+		const list = fb["fusion"];
+		if (!Array.isArray(list)) return undefined;
+		const first = list.find((v): v is string => typeof v === "string" && v.trim().length > 0);
+		return first?.trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function main(): Promise<void> {
 	const runId = process.argv[2] ?? "";
 	// 第三参 = supervisor 传入的 pi CLI 路径（fusion 消费链用）；其次退 PI_CLI_PATH
@@ -106,6 +124,9 @@ async function main(): Promise<void> {
 			// ⇒ 与 makeSubagentFusionRunner（runWithFallback 自动取 agent.body）系统提示不一致。
 			// 在这里读并注入（不让 trace-fusion 反向依赖 agents/ 加载逻辑，保持 DAG）。
 			systemPrompt: readFusionAgentBody(),
+			// 2026-11-05 第 3 项缺陷 2：单轮 fallback（provider 层失败才触发，不级联）。
+			// 用户未配 fallbackModels.fusion ⇒ undefined ⇒ 行为与旧版一致。
+			fusionFallbackModel: readFusionFallbackModel(config),
 			// S1（2026-11-04）：让 headless 融合者成为一等 async run —— 有 pid（可 kill）、
 			// 有正规完成通知（不再只靠对账补投这条降级路径）。
 			registerRunProcess,

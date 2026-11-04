@@ -180,6 +180,19 @@ export interface FusionDispatchInput {
 	 * 未传 ⇒ 行为与旧版逐字节一致（向后兼容）。
 	 */
 	systemPrompt?: string;
+	/**
+	 * 单轮 fallback 模型（2026-11-05 第 3 项缺陷 2）。
+	 *
+	 * R-7b 教训：headless 通道钉死单一 fusionModel，provider 抖一次整轮融合报废。
+	 * **只允许一条**（gen14 明确要求「不要做多级 fallback 链」）：
+	 * 「主模型失败 ⇒ 换这一条重试一轮」为止。
+	 *
+	 * 触发条件（二者之一）：
+	 *   · 子进程非零退出 / spawn error / timeout
+	 *   · 产物守卫命中（stopReason=length，预算烧在思考上）
+	 * 不触发：六节不齐（那是补写轮的职责，不是 provider 问题）。
+	 */
+	fusionFallbackModel?: string;
 }
 
 export type FusionStatus = "skipped" | "launched" | "completed" | "failed" | "timeout" | "spawn-error";
@@ -211,6 +224,13 @@ export interface FusionDispatchResult {
 	 * 只在「盘上已有本次新鲜产物」时非空（无产物的失败没有补写基础）。
 	 */
 	gaps?: string[];
+	/**
+	 * 产物守卫读数（2026-11-05 第 3 项）：模型怎么停的 + 最后一轮正文长度。
+	 * 有它才能区分「预算烧在思考上」与「报告写得不好」。
+	 */
+	termination?: { stopReason: string | null; textChars: number; truncated: boolean } | null;
+	/** 本轮实际用了 fallback 模型（2026-11-05 缺陷 2）：R-2 要求换模型必须可见。 */
+	usedFallbackModel?: string;
 }
 
 /**
@@ -723,7 +743,19 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 			});
 		} catch { /* 通知尽力 */ }
 	}
-	return { status, reason, fusionRunId, reportPath: outputPath, zeroModelCall: false, exitCode, usage, gaps: fileSections && !fileSections.ok ? fileSections.missing : undefined };
+	return {
+		status,
+		reason,
+		fusionRunId,
+		reportPath: outputPath,
+		zeroModelCall: false,
+		exitCode,
+		usage,
+		gaps: fileSections && !fileSections.ok ? fileSections.missing : undefined,
+		// 产物守卫读数必须回传给调用方：runFusionStep 的 fallback 判据要用它，
+		// 且账本/meta 里要能看出「模型是怎么停的」（R-2）。
+		termination: term ? { stopReason: term.stopReason, textChars: term.textChars, truncated: term.truncated } : null,
+	};
 }
 
 /**
@@ -743,6 +775,8 @@ export async function runFusionStep(opts: {
 	spawnFn?: FusionDispatchInput["spawnFn"];
 	/** 融合者系统提示（agents/fusion.md 的 body）；未传 ⇒ 旧行为。 */
 	systemPrompt?: string;
+	/** 单轮 fallback 模型（2026-11-05 缺陷 2）：provider 层失败时换它重试一轮，不级联。 */
+	fusionFallbackModel?: string;
 	/** S1 seams：透传给 dispatchFusion（collect-cli 注入后，自动链的融合者也有一等账本）。 */
 	registerRunProcess?: FusionDispatchInput["registerRunProcess"];
 	clearRunProcess?: FusionDispatchInput["clearRunProcess"];
@@ -773,6 +807,73 @@ export async function runFusionStep(opts: {
 		res = { status: "spawn-error", reason: `融合步骤异常：${(err as Error).message}`, zeroModelCall: false };
 	}
 	opts.log(`fusion: ${res.status} — ${res.reason}${res.usage ? ` [成本 $${res.usage.cost.toFixed(4)} / ${res.usage.turns} turns / cacheRead ${res.usage.cacheRead}]` : " [成本读数缺失：json 流未解析出 usage]"}`);
+
+	// ── 单轮 fallback（2026-11-05 第 3 项缺陷 2）────────────────────────
+	//
+	// R-7b：headless 通道钉死单一 fusionModel ⇒ provider 抖一次整轮报废。
+	// gen14 定形：**只允许一条 fallback、只重试一轮**，不做多级链。
+	// 触发条件严格限定为「provider 层失败」：
+	//   · spawn-error / failed（非零退出）/ timeout
+	//   · 产物守卫命中（stopReason=length ⇒ 预算烧在思考上，换端点可能就好）
+	// **不**触发：六节不齐（那是补写轮的职责，不是 provider 问题，重试只会重烧）。
+	const fallbackModel = opts.fusionFallbackModel && opts.fusionFallbackModel !== opts.fusionModel
+		? opts.fusionFallbackModel
+		: undefined;
+	const providerFailed = res.status === "spawn-error" || res.status === "failed" || res.status === "timeout";
+	const guardTripped = res.termination?.truncated === true;
+	if (fallbackModel && (providerFailed || guardTripped)) {
+		opts.log(
+			`fusion-fallback: 主模型 ${opts.fusionModel ?? "(unknown)"} 失败` +
+			`（${providerFailed ? `status=${res.status}` : `产物守卫: stopReason=${res.termination?.stopReason} 正文 ${res.termination?.textChars} 字符`}）` +
+			` ⇒ 换 ${fallbackModel} 重试一轮（单轮，不级联）`,
+		);
+		let fb: FusionDispatchResult | null = null;
+		const primary = res;
+		try {
+			fb = await dispatch({
+				runId: opts.meta.runId,
+				runDir: opts.meta.runDir,
+				repoRoot: opts.meta.repoRoot,
+				reportPath: opts.reportPath,
+				fusionModel: fallbackModel,
+				laneModel: opts.meta.laneModels?.A ?? opts.meta.workerModel,
+				dispatcherSessionId: opts.meta.dispatcherSessionId,
+				piCli: opts.piCli,
+				runsDir: opts.runsDir,
+				linksPath: opts.linksPath,
+				spawnFn: opts.spawnFn,
+				systemPrompt: opts.systemPrompt,
+				registerRunProcess: opts.registerRunProcess,
+				clearRunProcess: opts.clearRunProcess,
+				notifyCompletion: opts.notifyCompletion,
+				// 幂等门：主模型那次**已经写过 fusion.claim**（在任何 spawn 之前就写了），
+				// 所以 fallback 这一轮必然撞 claim 门 ⇒ 必须带 `repair` 才能绕过
+				// （`repair` 在 dispatchFusion 里是「跳过 claim 检查」的既有语义）。
+				//
+				// **这里必须无条件带 repair，不能只在 gaps 非空时带** —— 实测踩到：
+				// provider 层失败（spawn-error / 非零退出）时 `primary.gaps` 是 undefined
+				// （没有产物就没有"缺哪些节"），若按 gaps 条件传 ⇒ fallback 直接 skip、
+				// 一次都不真跑（测试里 `models` 只有 primary-m）。
+				// gaps 为空 ⇒ 传空数组，语义是「没有已知缺口，按完整报告重写」。
+				repair: { gaps: primary.gaps ?? [] },
+			});
+		} catch (err) {
+			fb = { status: "spawn-error", reason: `fallback 轮异常：${(err as Error).message}`, zeroModelCall: false };
+		}
+		const fbOk = fb.status === "completed";
+		opts.log(
+			`fusion-fallback: ${fbOk ? "成功" : "仍失败"}（${fb.status}）` +
+			`${fbOk ? ` ⇒ 采信 fallback 结果 ${fb.reportPath ?? ""}` : ` ⇒ 保留主模型失败读数（${primary.reason.slice(0, 80)}）`}`,
+		);
+		res = {
+			...fb,
+			// 归因留痕（R-2：用了 fallback 必须可见，不许静默换模型）
+			reason: fbOk
+				? `[fallback ${fallbackModel} 成功] ${fb.reason}`
+				: `[主模型 ${opts.fusionModel ?? "?"} ${primary.status}；fallback ${fallbackModel} 也失败] ${fb.reason}`,
+			usedFallbackModel: fallbackModel,
+		};
+	}
 
 	// 有界补写一轮（2026-11-03 第 5 次实测：产物写进了产物目录但六节不齐）。
 	// 只在「盘上已有本次新鲜产物 + 缺口清单非空」时补派；无产物的失败不补（没有补写基础，

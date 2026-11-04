@@ -16,7 +16,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS, parseFusionTermination } from "./trace-fusion/fusion-dispatch.ts";
+import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS, parseFusionTermination, runFusionStep } from "./trace-fusion/fusion-dispatch.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tf-fuse-"));
 
@@ -703,6 +703,123 @@ try {
 		]);
 		const t5 = parseFusionTermination(p5);
 		assert.equal(t5!.truncated, false, "必须只看最后一轮（前面的 length 不算）");
+	}
+
+	// ── 第 3 项缺陷 2（2026-11-05）：单轮 fallback（不级联）──
+	{
+		const NL = String.fromCharCode(10);
+		const mkDir = (name: string) => {
+			const d = join(root, name);
+			mkdirSync(join(d, "fusion"), { recursive: true });
+			writeFileSync(join(d, "meta.json"), JSON.stringify({ runId: name, status: "completed" }), "utf8");
+			return d;
+		};
+		const mkLog = (dir: string, rows: Array<{ stop: string; text: string }>) => {
+			const p = join(dir, "fusion", "fusion.stdout.log");
+			writeFileSync(p, rows.map((r) => JSON.stringify({
+				type: "message_end",
+				message: { role: "assistant", stopReason: r.stop, content: r.text ? [{ type: "text", text: r.text }] : [] },
+			})).join(NL) + NL, "utf8");
+			return p;
+		};
+
+		// ① provider 层失败（非零退出）⇒ 换 fallback 重试一轮，且账本/理由里可见「用了 fallback」
+		{
+			const d = mkDir("fb-nonzero");
+			const runs = join(root, "runs-fb1");
+			const models: string[] = [];
+			let call = 0;
+			const spawnFn = (cmd: string, argv: string[], opts: object) => {
+				const child = fakeSpawn(cmd, argv, opts);
+				const mi = argv.indexOf("--model");
+				models.push(argv[mi + 1] ?? "?");
+				const isFirst = call++ === 0;
+				setImmediate(() => {
+					if (isFirst) { mkLog(d, [{ stop: "stop", text: "空的" }]); child.emit("exit", 1); return; }
+					writeFileSync(join(d, "fusion", "fusion.md"), "# 融合报告" + NL + NL + SECTION_TEXT, "utf8");
+					mkLog(d, [{ stop: "stop", text: "ok" }]);
+					child.emit("exit", 0);
+				});
+				return child;
+			};
+			const r = await runFusionStep({
+				meta: { runId: "fb-nonzero", runDir: d, repoRoot: root },
+				reportPath, fusionModel: "primary-m", fusionFallbackModel: "fb-m",
+				runsDir: runs, piCli: join(root, "cli.js"), spawnFn: spawnFn as never, log: () => {},
+			});
+			assert.deepEqual(models, ["primary-m", "fb-m"], "provider 失败 ⇒ 恰好换一次 fallback（不级联）");
+			assert.equal(r.status, "completed", "fallback 成功 ⇒ 整体 completed");
+			assert.equal(r.usedFallbackModel, "fb-m", "账本必须记录用了 fallback（R-2 可见）");
+			assert.ok(r.reason.includes("fallback"), "理由必须点名 fallback");
+		}
+
+		// ② 产物守卫命中（length + 空正文）⇒ 也触发 fallback
+		{
+			const d = mkDir("fb-guard");
+			const runs = join(root, "runs-fb2");
+			let call = 0;
+			const spawnFn = (cmd: string, argv: string[], opts: object) => {
+				const child = fakeSpawn(cmd, argv, opts);
+				const isFirst = call++ === 0;
+				setImmediate(() => {
+					if (isFirst) {
+						// 预算烧在思考上：exit=0 但 stopReason=length 且无正文、无产物
+						mkLog(d, [{ stop: "length", text: "" }]);
+						child.emit("exit", 0);
+						return;
+					}
+					writeFileSync(join(d, "fusion", "fusion.md"), "# 融合报告" + NL + NL + SECTION_TEXT, "utf8");
+					mkLog(d, [{ stop: "stop", text: "ok" }]);
+					child.emit("exit", 0);
+				});
+				return child;
+			};
+			const r = await runFusionStep({
+				meta: { runId: "fb-guard", runDir: d, repoRoot: root },
+				reportPath, fusionModel: "primary-m", fusionFallbackModel: "fb-m",
+				runsDir: runs, piCli: join(root, "cli.js"), spawnFn: spawnFn as never, log: () => {},
+			});
+			assert.equal(call, 2, "产物守卫命中 ⇒ 必须重试一次");
+			assert.equal(r.usedFallbackModel, "fb-m", "守卫触发的 fallback 也必须记录");
+		}
+
+		// ③ 未配 fallback ⇒ 只跑一次（零行为变化）
+		{
+			const d = mkDir("fb-none");
+			const runs = join(root, "runs-fb3");
+			let call = 0;
+			const spawnFn = (cmd: string, argv: string[], opts: object) => {
+				const child = fakeSpawn(cmd, argv, opts);
+				call++;
+				setImmediate(() => { child.emit("exit", 1); });
+				return child;
+			};
+			await runFusionStep({
+				meta: { runId: "fb-none", runDir: d, repoRoot: root },
+				reportPath, fusionModel: "primary-m",
+				runsDir: runs, piCli: join(root, "cli.js"), spawnFn: spawnFn as never, log: () => {},
+			});
+			assert.equal(call, 1, "未配 fallback ⇒ 只跑一次（旧行为）");
+		}
+
+		// ④ fallback === 主模型 ⇒ 不重试（防自己重试自己白烧一轮）
+		{
+			const d = mkDir("fb-same");
+			const runs = join(root, "runs-fb4");
+			let call = 0;
+			const spawnFn = (cmd: string, argv: string[], opts: object) => {
+				const child = fakeSpawn(cmd, argv, opts);
+				call++;
+				setImmediate(() => { child.emit("exit", 1); });
+				return child;
+			};
+			await runFusionStep({
+				meta: { runId: "fb-same", runDir: d, repoRoot: root },
+				reportPath, fusionModel: "same-m", fusionFallbackModel: "same-m",
+				runsDir: runs, piCli: join(root, "cli.js"), spawnFn: spawnFn as never, log: () => {},
+			});
+			assert.equal(call, 1, "fallback 与主模型相同 ⇒ 不重试");
+		}
 	}
 
 	console.log("trace-fusion fusion-dispatch tests passed");
