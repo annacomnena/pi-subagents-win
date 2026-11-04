@@ -58,6 +58,12 @@ export interface TraceFusionConfig {
 	 * 缺省 true；显式设 false 可关（关掉后仅 lane/融合会话受约束）。
 	 */
 	guardMainRootScan?: boolean;
+	/**
+	 * 「跑完一个删一个」（2026-11-04 用户批准）：lane 自报终态 ⇒ 先收该 lane 产物
+	 * （patch.diff / status.txt 都来自 worktree）⇒ 收集成功才回收该树。
+	 * 缺省 true；false 回到旧的「run 终态后手动 /trace-fusion-clean」行为。
+	 */
+	reclaimLaneWorktree?: boolean;
 	provisioning: TraceFusionProvisioning;
 }
 
@@ -74,6 +80,8 @@ export const DEFAULT_TRACE_FUSION_CONFIG: TraceFusionConfig = {
 	laneConcurrency: 3,
 	// 盘根递归扫描门默认也管主会话（R-13 事故发起者就是主会话）
 	guardMainRootScan: true,
+	// 跑完一个删一个（缺省开）：lane 终态即回收其 worktree，不必等 run 结束手动 clean
+	reclaimLaneWorktree: true,
 	provisioning: {
 		junction: ["node_modules"],
 		copy: [".env", ".env.local"],
@@ -136,6 +144,9 @@ export const LANE_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
 	// `cross-test.ts:329` 写 `provision-eval.json`（implement 分支）。
 	"provision.json",
 	"provision-eval.json",
+	// 2026-11-04「跑完一个删一个」：收集器自产，记首次收集的 changedFiles/testFiles
+	// （worktree 回收后的二次收集靠它沿用，不得被当成 lane 契约外文件）
+	"collect-manifest.json",
 ]);
 
 /** lane 目录内允许存在的**目录**（supervisor 归档产物）；目录名的白名单单独维护。 */
@@ -166,6 +177,10 @@ export interface TraceLaneMeta {
 	 */
 	laneStatus?: "active" | "skipped" | "dispatch-failed";
 	laneStatusReason?: string;
+	/** §29.6 供给失败时的降级原因（与 provision.issues 同源；进 meta 让下游可见）。 */
+	degradedReason?: string;
+	/** 跑完一个删一个：本 lane worktree 已回收的时刻（产物已先收，见 worktree-reclaim.ts）。 */
+	worktreeReclaimedAt?: string;
 }
 
 export interface TraceRunMeta {

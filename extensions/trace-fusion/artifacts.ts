@@ -197,6 +197,13 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 	const runsDir = opts.tabRunsDir ?? defaultTabRunsDir();
 	const workerResult = laneMeta.tabRunId ? readTabResultFile(runsDir, laneMeta.tabRunId) : null;
 
+	// 跑完一个删一个（2026-11-04）：worktree 已被回收 ⇒ **不得重算**。
+	// 在已删掉的树上 git 全数失败，会把首次收集好的 patch/status **覆盖成空文件**（证据被清空）。
+	// ⇒ 沿用首次落盘的产物 + collect-manifest.json（changedFiles/testFiles 是 cross-test 冲突检测的输入）。
+	if (!existsSync(worktree) && existsSync(join(laneDir, "patch.diff")) && existsSync(join(laneDir, "status.txt"))) {
+		return reuseHarvestedReport(meta, lane, laneDir, worktree, workerResult, now);
+	}
+
 	// §24.2 墙钟超时（恰达 deadline 也算超时）
 	const timedOut = now.getTime() >= new Date(meta.laneDeadlineAt).getTime();
 
@@ -272,6 +279,21 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 		} catch { /* 归档尽力而为 */ }
 	}
 
+	// 落一份 manifest：worktree 被回收后，后续 collect 只能靠它还原 changedFiles/testFiles
+	try {
+		writeFileSync(join(laneDir, "collect-manifest.json"), JSON.stringify({
+			changedFiles,
+			untrackedFiles,
+			testFiles: validation && Array.isArray(validation.testFiles)
+				? validation.testFiles.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
+				: [],
+			patchBytes: statSync(patchPath).size,
+			strayFiles: strays,
+			trustedCommands: trustedCommands(validation),
+			collectedAt: now.toISOString(),
+		}, null, 2) + "\n", "utf8");
+	} catch { /* manifest 尽力而为（缺失时 reuse 会明说降级） */ }
+
 	return {
 		lane,
 		laneDir,
@@ -293,6 +315,60 @@ export function collectLaneArtifacts(meta: TraceRunMeta, lane: LaneId, opts: Col
 			: [],
 		strayFiles: strays,
 		issues,
+		collectedAt: now.toISOString(),
+	};
+}
+
+/**
+ * worktree 已被回收时的沿用报告（跑完一个删一个的下游保护）。
+ * 绝不在已删除的树上重跑 git——那会把首次收集好的证据写成空文件。
+ */
+function reuseHarvestedReport(
+	meta: TraceRunMeta,
+	lane: LaneId,
+	laneDir: string,
+	worktree: string,
+	workerResult: { status?: string } | null,
+	now: Date,
+): LaneArtifactReport {
+	const patchPath = join(laneDir, "patch.diff");
+	const untrackedDir = join(laneDir, "untracked");
+	const validationPath = join(laneDir, "validation.json");
+	const trajectoryPath = join(laneDir, "trajectory.md");
+	const validation = parseValidationFile(validationPath);
+	let manifest: { changedFiles?: string[]; untrackedFiles?: string[]; testFiles?: string[] } = {};
+	try {
+		manifest = JSON.parse(readFileSync(join(laneDir, "collect-manifest.json"), "utf8"));
+	} catch { /* 旧 run 没有 manifest */ }
+	let patchBytes = 0;
+	try {
+		patchBytes = statSync(patchPath).size;
+	} catch { /* 缺失即 0 */ }
+	const deadlineMs = new Date(meta.laneDeadlineAt as string).getTime();
+	return {
+		lane,
+		laneDir,
+		worktree,
+		workerFinished: workerResult !== null,
+		workerStatus: workerResult?.status,
+		timedOut: Number.isFinite(deadlineMs) ? now.getTime() >= deadlineMs : false,
+		trajectoryPath: existsSync(trajectoryPath) ? trajectoryPath : null,
+		validationPath: existsSync(validationPath) ? validationPath : null,
+		validation,
+		patchPath,
+		patchBytes,
+		changedFiles: Array.isArray(manifest.changedFiles) ? manifest.changedFiles : [],
+		untrackedFiles: Array.isArray(manifest.untrackedFiles)
+			? manifest.untrackedFiles
+			: (existsSync(untrackedDir) ? readdirSync(untrackedDir) : []),
+		untrackedDir,
+		trustedCommands: trustedCommands(validation),
+		testFiles: Array.isArray(manifest.testFiles) ? manifest.testFiles : [],
+		strayFiles: findLaneStrayFiles(laneDir),
+		issues: [
+			"worktree 已回收（跑完一个删一个）：沿用首次收集产物，未在已删除的树上重算",
+			...(Array.isArray(manifest.changedFiles) ? [] : ["首次 manifest 缺失：changedFiles 以空集降级（cross-test 冲突检测会变宽）"]),
+		],
 		collectedAt: now.toISOString(),
 	};
 }

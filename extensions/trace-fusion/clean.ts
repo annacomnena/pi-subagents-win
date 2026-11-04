@@ -12,7 +12,7 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execGit } from "./git.ts";
-import { removeWorktreeRetry } from "./worktrees.ts";
+import { removeWorktreeRetry, removeLinksOnly } from "./worktrees.ts";
 import { readTraceRunMeta, type TraceRunMeta } from "./launch-workers.ts";
 import { defaultRunsDir, TRACE_LANES, type LaneId } from "./types.ts";
 
@@ -56,10 +56,19 @@ export function cleanTraceRun(runId: string, opts: CleanOptions = {}): CleanResu
 			else lines.push(`⚠ lane ${lane} worktree 移除失败（可能被进程占用）：${wt}`);
 		}
 		execGit(["worktree", "prune"], { cwd: meta.repoRoot });
-		try {
-			rmSync(meta.wtDir, { recursive: true, force: true, maxRetries: 2, retryDelay: 300 });
-		} catch (err) {
-			lines.push(`⚠ wt 目录删除失败：${(err as Error).message}`);
+		// R-16：wt 目录里可能还挂着未移除干净的 worktree（其内有 junction 指向主仓）
+		// ⇒ 先解链接；解不干净就拒绝递归删除（宁可留目录，不能删穿目标）
+		const links = removeLinksOnly(meta.wtDir);
+		if (links.removed.length > 0) lines.push(`已解除残留链接：${links.removed.join(",")}`);
+		if (links.failed.length > 0) {
+			lines.push(`⚠ 拒绝删除 ${meta.wtDir}：链接无法解除（R-16）：${links.failed.join(",")}`);
+		} else {
+			try {
+				rmSync(meta.wtDir, { recursive: true, force: true, maxRetries: 2, retryDelay: 300 });
+				lines.push(`短路径目录已删：${meta.wtDir}`);
+			} catch (err) {
+				lines.push(`⚠ wt 目录删除失败：${(err as Error).message}`);
+			}
 		}
 		lines.push(`已移除 worktrees：${removed.join("/") || "（无）"}；短路径目录 ${meta.wtDir}`);
 	} else {

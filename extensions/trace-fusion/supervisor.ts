@@ -27,6 +27,7 @@ import { readTraceFusionConfig } from "./config.ts";
 import { readLaneQueue, resumeQueuedLane, type ResumeQueuedLaneOutcome } from "./lane-queue.ts";
 import { defaultTimersDir, writeTimerAtomic } from "../timers.ts";
 import { readTraceRunMeta } from "./launch-workers.ts";
+import { reclaimTerminalLaneWorktrees } from "./worktree-reclaim.ts";
 import { isProcessAlive } from "../runtime/liveness.ts";
 import type { LaneFacts } from "./lane-facts.ts";
 import { laneFacts, degradedFacts, seedDispatchState, TERMINAL_LANE_STATUSES, writeDegradedLanes } from "./lane-facts.ts";
@@ -76,6 +77,13 @@ export interface SupervisorOptions {
 	timersDir?: string;
 	/** meta 重读 seam（测试注入）；缺省 = 从盘上 readTraceRunMeta。续发的在飞数必须用重读值。 */
 	rereadMeta?: (runDir: string) => TraceRunMeta | null;
+	/**
+	 * 「跑完一个删一个」 seam（测试注入 fake）；缺省 = 真实 reclaimTerminalLaneWorktrees。
+	 * 语义：先收该 lane 产物，收齐才回收其 worktree（见 worktree-reclaim.ts）。
+	 */
+	reclaimLaneWorktrees?: (meta: TraceRunMeta, lanes: readonly LaneId[], opts?: { tabRunsDir?: string; log?: (m: string) => void }) => unknown;
+	/** 日志 seam（回收留痕进主会话日志）。 */
+	log?: (msg: string) => void;
 	/**
 	 * 只供测试复现「调用方拿着取锁前的旧快照驱动续发」这一形状（2026-11-03 L4 M1）：
 	 * 生产不传。传了就用它当续发的入参 meta，验证在飞数仍取自盘上重读值。
@@ -322,6 +330,21 @@ function outcomeForMeta(hit: TraceRunMeta, opts: SupervisorOptions, runsDir: str
 	// 于是兜底生成的 unconfirmed 结果也算 done ⇒ 中止一条 lane 就连锁起下一条。
 	// 现只认 lane 自报终态（facts 里的 "done"，见 lane-facts.ts 的 isSelfReportedResult）。
 	const done = facts.filter((f) => f.status === "done" && expectedIds.includes(f.tabRunId)).length;
+	const doneLaneIds = facts.filter((f) => f.status === "done" && expectedIds.includes(f.tabRunId)).map((f) => f.lane);
+
+	// ── 跑完一个删一个（2026-11-04 用户批准）──────────────────────────────────
+	// lane 自报终态 ⇒ 先收该 lane 产物（patch.diff / status.txt 都来自 worktree，删早了就没证据）
+	// ⇒ 收齐才回收该树；收不齐保留树并写 deferred 审计行。
+	// 位置必须在续发之前：laneConcurrency=1 时这让「下一个 lane 派发前，上一棵已落盘并释放」。
+	// 只认 facts 里 done（自报终态），running/queued/unconfirmed/skipped 一律不碰。
+	if (doneLaneIds.length > 0) {
+		const reclaim = opts.reclaimLaneWorktrees ?? reclaimTerminalLaneWorktrees;
+		try {
+			reclaim(hit, doneLaneIds, { tabRunsDir, log: opts.log });
+		} catch {
+			/* 回收失败不得影响收集决策（worktree-reclaim 自带 deferred 审计） */
+		}
+	}
 
 	// ── laneConcurrency 续发（2026-10-30）：未全终态时才可能要派下一条 ──
 	// 队列文件不存在 ⇒ 历史全并发行为，本段零作用（不碰存量路径）。

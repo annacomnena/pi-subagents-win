@@ -226,7 +226,8 @@
     "test:ws-client": "node --experimental-strip-types ./extensions/_test_ws_client.ts",
     "test:trace-fusion-lane-bash-guard": "node --experimental-strip-types extensions/_test_trace_fusion_lane_bash_guard.ts",
     "test:trace-fusion-wake-path": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_wake_path.ts",
-    "test:trace-fusion-tool-scope": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_tool_scope.ts"
+    "test:trace-fusion-tool-scope": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_tool_scope.ts",
+    "test:trace-fusion-wt-reclaim": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_wt_reclaim.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

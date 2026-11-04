@@ -468,7 +468,14 @@ export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult
 	const deadline = new Date(now.getTime() + wallMin * 60_000);
 	const lanes = {} as Record<LaneId, TraceLaneMeta>;
 	for (const l of created.lanes) {
-		lanes[l.lane] = { lane: l.lane, worktree: l.worktree, tabRunId: "", provision: l.provision };
+		lanes[l.lane] = {
+			lane: l.lane,
+			worktree: l.worktree,
+			tabRunId: "",
+			provision: l.provision,
+			// §29.6：降级原因要随 meta 走（下游 cross-test / 融合 Hard Facts 可见）
+			degradedReason: l.provision.degraded ? l.provision.issues.join("; ").slice(0, 240) : undefined,
+		};
 		writeProvisionReport(join(runDir, "lanes", l.lane), l.provision);
 	}
 	const meta: TraceRunMeta = {

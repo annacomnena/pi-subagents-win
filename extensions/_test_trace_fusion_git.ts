@@ -132,10 +132,12 @@ assert.equal(norm(pf.toplevel ?? ""), norm(repo));
 	assert.equal(dp.degraded, true, "供给缺失必须标 degraded");
 	assert.ok(dp.issues.length > 0);
 
-	// ── §40.3 removal 成功路径 ───────────────────────────────────
+	// ── §40.3 removal 成功路径（R-16 加固 2026-11-04：必须先解 junction 再交给 git）──
 	const removed = removeWorktreeRetry(created.lanes[0].worktree, repo, { attempts: 2, baseDelayMs: 10 });
-	assert.deepEqual(removed, { removed: true, stale: false });
-	assert.equal(existsSync(created.lanes[0].worktree), false);
+	assert.deepEqual(removed, { removed: true, stale: false, linksRemoved: ["nm"], linksFailed: [] });
+	assert.equal(existsSync(created.lanes[0].worktree), false, "worktree 目录已移除");
+	// 承重断言：junction 目标（主仓 nm/）内容必须完好——旧写法会被 git 递归删除穿过去清空
+	assert.equal(readFileSync(join(mainNm, "pkg.txt"), "utf8"), "dep-marker\n", "junction 目标未被删穿（R-16）");
 
 	// ── §24.1 resume 侧：resolveBaseCommit ───────────────────────
 	assert.equal(resolveBaseCommit(repo, baseDir), snap.baseCommit, "base 仍可解析");

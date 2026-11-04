@@ -16,8 +16,10 @@ import {
 	copyFileSync,
 	writeFileSync,
 	rmSync,
+	readdirSync,
+	lstatSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { execGit } from "./git.ts";
 import type { LaneId, TraceFusionProvisioning } from "./types.ts";
@@ -33,6 +35,61 @@ export interface ProvisionReport {
 }
 
 const EMPTY_PROVISION: ProvisionReport = { junction: [], copied: [], commandOk: true, degraded: false, issues: [] };
+
+/**
+ * 枚举目录树内的 reparse 链接（junction / symlink），**绝不进入链接内部**。
+ * R-16：junction 指向的是别处（主仓 node_modules、pi 安装）的活数据。
+ */
+export function listReparseLinks(root: string, depthLimit = 8): string[] {
+	const out: string[] = [];
+	try {
+		if (lstatSync(root).isSymbolicLink()) return [root];
+	} catch {
+		return out;
+	}
+	const walk = (dir: string, depth: number) => {
+		if (depth > depthLimit) return;
+		let entries: Array<{ name: string; isSymbolicLink(): boolean; isDirectory(): boolean }>;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true }) as never;
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const p = join(dir, e.name);
+			try {
+				if (e.isSymbolicLink()) {
+					out.push(p); // 链接只记录，不进入
+					continue;
+				}
+				if (e.isDirectory()) walk(p, depth + 1);
+			} catch {
+				/* 条目消失（并发写）：跳过 */
+			}
+		}
+	};
+	walk(root, 0);
+	return out;
+}
+
+/**
+ * 只解除链接本身（rmSync 不带 recursive ⇒ 删的是链接，不是目标内容）。
+ * 沙盒实测：先解链接再 git worktree remove ⇒ 目标完好；不解链接直接 remove ⇒ 目标内容被清空。
+ */
+export function removeLinksOnly(root: string): { removed: string[]; failed: string[] } {
+	const removed: string[] = [];
+	const failed: string[] = [];
+	for (const p of listReparseLinks(root)) {
+		try {
+			rmSync(p);
+			if (existsSync(p)) failed.push(basename(p));
+			else removed.push(basename(p));
+		} catch {
+			failed.push(basename(p));
+		}
+	}
+	return { removed, failed };
+}
 
 /** 在 run 目录内记录单 lane 供给结果（磁盘契约，C7 artifacts 复用）。 */
 export function writeProvisionReport(runLaneDir: string, report: ProvisionReport): void {
@@ -115,6 +172,14 @@ export function createSingleWorktree(
 		// 而不是永久占用目录名导致后续 run 全部被拒。
 		const staleMarker = `${wtPath}.stale.json`;
 		if (existsSync(staleMarker)) {
+			// R-16：stale 目录里可能还挂着供给出来的 junction ⇒ 先解链接；解不干净就拒绝递归删除
+			const staleLinks = removeLinksOnly(wtPath);
+			if (staleLinks.failed.length > 0) {
+				return {
+					ok: false,
+					error: `stale 目录内的链接无法解除，拒绝递归删除（R-16）：${staleLinks.failed.join(",")} ⇒ ${wtPath}`,
+				};
+			}
 			try {
 				rmSync(wtPath, { recursive: true, force: true, maxRetries: 2, retryDelay: 200 });
 				execGit(["worktree", "prune"], { cwd: repoRoot });
@@ -166,6 +231,10 @@ export interface RemovalResult {
 	removed: boolean;
 	/** true = 重试后仍失败，已写 stale 标记；下次启动由 prune 兜底，不算 run 失败。 */
 	stale: boolean;
+	/** 本次解除的 reparse 链接名（R-16：git worktree remove 前必须先把链接解掉）。 */
+	linksRemoved?: string[];
+	/** 解不掉的链接名（非空 ⇒ 绝不递归删除该目录）。 */
+	linksFailed?: string[];
 	error?: string;
 }
 
@@ -175,7 +244,14 @@ function sleepSync(ms: number): void {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** 删除单个 worktree（§40.3：指数退避重试；失败 → stale 标记）。 */
+/**
+ * 删除单个 worktree（§40.3：指数退避重试；失败 → stale 标记）。
+ *
+ * ★ R-16 地雷修复（2026-11-04 沙盒实测）：git worktree remove --force 的递归删除**会穿过 junction
+ * 删掉目标内容**（实测目标目录文件 [keep,extra] ⇒ 空，而目标就是主仓 node_modules / pi 安装）。
+ * ⇒ 每次尝试前先把目录树里的 reparse 链接逐个解除（只删链接本身），再交给 git；
+ *   解不掉的链接 ⇒ 只写 stale 标记，**绝不**递归删除该目录。
+ */
 export function removeWorktreeRetry(
 	wtPath: string,
 	repoRoot: string,
@@ -184,10 +260,25 @@ export function removeWorktreeRetry(
 	const attempts = opts.attempts ?? 3;
 	const baseDelayMs = opts.baseDelayMs ?? 300;
 	let lastError = "";
+	const linksRemoved: string[] = [];
+	let linksFailed: string[] = [];
 	for (let i = 0; i < attempts; i++) {
 		if (i > 0) sleepSync(baseDelayMs * 2 ** (i - 1));
+		if (existsSync(wtPath)) {
+			const links = removeLinksOnly(wtPath);
+			for (const n of links.removed) if (!linksRemoved.includes(n)) linksRemoved.push(n);
+			linksFailed = links.failed;
+		}
 		const rm = execGit(["worktree", "remove", "--force", wtPath], { cwd: repoRoot });
-		if (rm.status === 0) return { removed: true, stale: false };
+		if (rm.status === 0) {
+			return {
+				removed: true,
+				stale: false,
+				linksRemoved,
+				linksFailed,
+				...(linksFailed.length > 0 ? { error: `链接未能解除：${linksFailed.join(",")}` } : {}),
+			};
+		}
 		lastError = rm.stderr;
 	}
 	// stale 标记：与 wt 目录同级的旁文件，自描述；下次启动 prune + 手动清理
