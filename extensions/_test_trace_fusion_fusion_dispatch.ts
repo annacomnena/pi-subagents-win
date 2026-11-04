@@ -16,7 +16,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS } from "./trace-fusion/fusion-dispatch.ts";
+import { buildFusionPrompt, dispatchFusion, FUSION_EXCLUDE_TOOLS, parseFusionTermination } from "./trace-fusion/fusion-dispatch.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tf-fuse-"));
 
@@ -641,6 +641,68 @@ try {
 			spawnFn: spawnS2 as never,
 		});
 		assert.equal(spyArgv2[0].includes("--append-system-prompt"), false, "未传 systemPrompt ⇒ 旧行为逐字节不变（无该旗标）");
+	}
+
+	// ── 第 3 项（2026-11-05）：产物守卫 —— 分清「预算烧在思考上」与「报告写得不好」──
+	// gen14 实测：local-bonsai 在 prompt 3028 tok / max_tokens 512 时
+	// finish=length、content 完全为空、reasoning_content 2119 字符 ⇒ 空产物但 exit=0。
+	// 旧代码只说「六节不齐」，把归因错成「报告写得不好」。
+	{
+		const NL = String.fromCharCode(10);
+		const mkLog = (name: string, rows: Array<{ stop: string; text: string; thinking?: string }>): string => {
+			const p = join(root, `${name}.jsonl`);
+			const lines = rows.map((r) => JSON.stringify({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: r.stop,
+					content: [
+						...(r.thinking ? [{ type: "thinking", thinking: r.thinking }] : []),
+						...(r.text ? [{ type: "text", text: r.text }] : []),
+					],
+				},
+			}));
+			writeFileSync(p, lines.join(NL) + NL, "utf8");
+			return p;
+		};
+
+		// ① 预算耗尽（length + 正文空）⇒ truncated=true（这是「空产物」的代表）
+		const p1 = mkLog("term-length-empty", [
+			{ stop: "toolUse", text: "" },
+			{ stop: "length", text: "", thinking: "思考吃满了全部预算" },
+		]);
+		const t1 = parseFusionTermination(p1);
+		assert.ok(t1, "必须解析出 termination");
+		assert.equal(t1!.stopReason, "length", "stopReason=length");
+		assert.equal(t1!.textChars, 0, "正文 0 字符");
+		assert.equal(t1!.truncated, true, "预算耗尽必须标 truncated（这就是空产物的判据）");
+
+		// ② 正常收尾（stop + 有正文）⇒ truncated=false
+		const p2 = mkLog("term-stop", [{ stop: "toolUse", text: "" }, { stop: "stop", text: "六节齐全的报告" }]);
+		const t2 = parseFusionTermination(p2);
+		assert.equal(t2!.truncated, false, "stop ⇒ 不算截断");
+		assert.equal(t2!.textChars, 7, "只数 text block（不含 thinking）");
+
+		// ③ thinking 不计入 textChars（否则空产物会被误判成有内容）
+		const p3 = mkLog("term-thinking-only", [{ stop: "length", text: "", thinking: "很长的思考".repeat(200) }]);
+		const t3 = parseFusionTermination(p3);
+		assert.equal(t3!.textChars, 0, "thinking 不得计入正文长度");
+
+		// ④ 空流 / 无 assistant ⇒ null（不猜，交给六节门）
+		const p4 = join(root, "term-empty.jsonl");
+		writeFileSync(p4, "", "utf8");
+		assert.equal(parseFusionTermination(p4), null, "空流 ⇒ null");
+
+		// ⑤ 只看**最后一轮**：前面 toolUse、最后一轮 stop ⇒ 不截断
+		//    （融合是多轮工具调用后出正文，拿第一轮判会全员误报）
+		const p5 = mkLog("term-nulti", [
+			{ stop: "toolUse", text: "" },
+			{ stop: "toolUse", text: "" },
+			{ stop: "length", text: "" },
+			{ stop: "stop", text: "最终正文" },
+		]);
+		const t5 = parseFusionTermination(p5);
+		assert.equal(t5!.truncated, false, "必须只看最后一轮（前面的 length 不算）");
 	}
 
 	console.log("trace-fusion fusion-dispatch tests passed");

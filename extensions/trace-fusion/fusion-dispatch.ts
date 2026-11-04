@@ -254,6 +254,67 @@ export function parseFusionUsage(logPath: string, maxBytes = 8_000_000): FusionU
 	}
 }
 
+/**
+ * 产物守卫（2026-11-05 第 3 项）：从 json 流里取「最后一轮模型为什么停」。
+ *
+ * ## 为什么需要它（gen14 实测 + 我自己的实测）
+ *
+ * `local-bonsai` 在 max_tokens 偏小或思考开启时，会把**全部预算烧在 reasoning 上**：
+ *   prompt 3028 tok / max_tokens 512 ⇒ `finish=length`, `content` **完全为空**,
+ *   `reasoning_content` 2119 字符 ⇒ **产物是空的**，但 exit=0。
+ * 旧代码只看 exitCode + 文件六节，**从不看模型是怎么停的** ⇒ 这种空产物会被
+ * 六节门前拦住（产物空 ⇒ 缺节 ⇒ failed），但 reason 只说「六节不齐」，
+ * 归因错成「报告写得不好」，掩盖了「预算烧在思考上」这个真因。
+ *
+ * ## 判据（不依赖具体端点行为）
+ *
+ * 只在**最后一轮**（模型真正收尾的那一轮）判：
+ *   · `stopReason === "length"` 且该轮 text 正文为空 ⇒ 空产物（预算耗尽）
+ *   · `stopReason === "length"` 且有正文 ⇒ 截断（也不合格：六节可能少）
+ * `toolUse` / `stop` 视为正常收尾。
+ *
+ * 返回 null = 流里找不到 assistant message（不猜，交给既有六节门判）。
+ */
+export function parseFusionTermination(logPath: string, maxBytes = 8_000_000): {
+	stopReason: string | null;
+	/** 最后一轮 assistant 的 text 正文字符数（不含 thinking / toolCall）。 */
+	textChars: number;
+	/** 是否命中「预算耗尽 / 截断」这类不该计为成功的停止原因。 */
+	truncated: boolean;
+} | null {
+	try {
+		const size = statSync(logPath).size;
+		let text = readFileSync(logPath, "utf8");
+		if (size > maxBytes) text = text.slice(-maxBytes);
+		const rows: { stopReason: string | null; textChars: number }[] = [];
+		for (const line of text.split("\n")) {
+			const t = line.trim();
+			if (!t.startsWith("{")) continue;
+			let ev: unknown;
+			try {
+				ev = JSON.parse(t);
+			} catch {
+				continue;
+			}
+			const e = ev as {
+				type?: string;
+				message?: { role?: string; stopReason?: string; rawStopReason?: string; content?: Array<{ type?: string; text?: string }> };
+			};
+			if (e?.type !== "message_end" || e?.message?.role !== "assistant") continue;
+			const blocks = e.message.content ?? [];
+			const textChars = blocks.reduce((n, b) => n + (b?.type === "text" && typeof b.text === "string" ? b.text.length : 0), 0);
+			rows.push({ stopReason: e.message.stopReason ?? e.message.rawStopReason ?? null, textChars });
+		}
+		if (rows.length === 0) return null;
+		// 只看最后一轮：融合是「多轮工具调用 → 最后一轮出正文」。
+		const last = rows[rows.length - 1]!;
+		const truncated = last.stopReason === "length";
+		return { stopReason: last.stopReason, textChars: last.textChars, truncated };
+	} catch {
+		return null;
+	}
+}
+
 /** 融合提示词（纯函数）。 */
 /**
  * 从融合子进程的 `--mode json` stdout 里取出「最后一条 assistant 正文」并校验六节结构，
@@ -576,6 +637,11 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 	// 半截旧文件会被当成本次结果判 completed（夹具实测踩到）。
 	// 交付主通道 = 融合者自己用 write 写 outputPath（落点由机械门锁死）；
 	// stdout 正文作为兼平通道（它写不了盘时至少能报出正文）。
+	// 产物守卫（2026-11-05 第 3 项）：模型是怎么停的。
+	// gen14 实测 + 我复现：local-bonsai 在 max_tokens 偏小时会把预算全烧在 reasoning 上
+	// ⇒ finish=length + content 空 + exit=0 ⇒ 旧代码只说「六节不齐」，归因错成「报告写得不好」。
+	// 判据不依赖具体端点行为，只看 json 流里最后一轮的 stopReason 与 text 字符数。
+	const term = parseFusionTermination(outPath);
 	const produced = existsSync(outputPath);
 	// 「本次新写的」：产物 mtime 不得早于启动时刻（留 2s 容差防文件系统时间粒度/钟差）。
 	const fresh = produced && statSync(outputPath).mtimeMs >= startedMs - 2_000;
@@ -602,14 +668,22 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		status = "completed";
 		reason = `融合者未写盘，已由 harness 从回复正文落盘：${outputPath}（${fusionCaptured} 字节）`;
 	} else if (fresh) {
-		// 写了盘但六节不齐 ⇒ 不得拿半截报告当结果
+		// 写了盘但六节不齐 ⇒ 不得拿半截报告当结果。
+		// 归因分级（R-2：不许把真因藏在一句笼统的话里）：
+		//   · 模型因预算耗尽/思考吃掉预算而停 ⇒ 明确说「预算烧在思考上」，而不是「写得不好」
+		//   · 否则才是真的「六节候选内容不足」
 		status = "failed";
-		reason = `产物已写但六节不齐（缺 ${fileSections?.missing.join(" / ")}），不得计为融合结果`;
+		reason = term?.truncated
+			? `产物已写但六节不齐（缺 ${fileSections?.missing.join(" / ")}）；` +
+				`**根因是模型预算耗尽**（stopReason=length, 最后一轮正文仅 ${term.textChars} 字符）` +
+				`——思考吃掉了 output 预算，不是「报告写得不好」。可将 fusionModel 换到不会把预算烧在 reasoning 上的端点。`
+			: `产物已写但六节不齐（缺 ${fileSections?.missing.join(" / ")}），不得计为融合结果`;
 	} else {
 		// 第四次实测的真实形状：exit=0 + 回复「报告已完成，185 行六节齐全」+ 盘上零产物 ⇒ 谎报
 		status = "failed";
 		reason =
-			`融合者未产出产物（盘上无本次新鲜 fusion.md），回复正文也不合格（${captured?.shape ?? "无 assistant 正文"}）。` +
+			`融合者未产出产物（盘上无本次新鲜 fusion.md），回复正文也不合格（${captured?.shape ?? "无 assistant 正文"}）` +
+			(term?.truncated ? `；**模型预算耗尽**（stopReason=length, 正文 ${term.textChars} 字符）` : "") + "。" +
 			`不得拿口头报告当结果；详见 ${outPath}` +
 			(produced && !fresh
 				? `；盘上另有早于本次启动的旧产物 mtime=${new Date(statSync(outputPath).mtimeMs).toISOString()}（陈旧产物，同样不得计为本次结果）`
@@ -628,6 +702,9 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		exitSignal,
 		produced,
 		productFresh: fresh,
+		// 产物守卫读数（2026-11-05 第 3 项）：模型怎么停的 + 最后一轮正文长度。
+		// 有它才能区分「预算烧在思考上」与「报告写得不好」——这两者的修法完全不同。
+		termination: term ? { stopReason: term.stopReason, textChars: term.textChars, truncated: term.truncated } : null,
 		text: produced ? `融合产物：${outputPath}` : timedOut ? "墙钟预算耗尽，未见融合产物" : "子进程退出但未产出融合文件",
 		// 成本读数：从 json 流解析；解析不出记 null（不得写 0 冒充「本次未花钱」）
 		cost: usage ? { total: usage.cost, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite } : null,
