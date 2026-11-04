@@ -6,8 +6,11 @@
  * mailbox 消费端接入后，"同一 tab 终态已唤醒过"必须三路可查，否则漏注入或重复注入。
  *
  * 解：runtime/receipts/<receipt-key>.json（wx 原子创建，first-wins）。
- * 收据键约定：`run-<tabRunId>-<terminalStatus>`（与 mailbox dedupeId 同形，
- * 三处天然对齐）。加法门：各通道原 .notified/ack 机制不动（失败模式 E），
+ * 收据键约定：`run-<tabRunId>-<terminalStatus>`。
+ * （2026-11-05 更正：mailbox dedupeId 自 832967f 起改为 `-final` / `-fallback` 分桶，
+ *  两者**不再是同形**。收据键的输入来自 subject + details.status，与 dedupeId 无字符串耦合，
+ *  形状分家不影响功能 —— 旧注释「与 mailbox dedupeId 同形，三处天然对齐」已过时。）
+ * 加法门：各通道原 .notified/ack 机制不动（失败模式 E），
  * 注入前先查收据（有 → 跳过），注入后补写收据（best-effort，不阻塞）。
  *
  * 纯库、无接线。
