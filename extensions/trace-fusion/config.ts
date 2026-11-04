@@ -66,6 +66,9 @@ export function readTraceFusionConfig(path: string = traceFusionConfigPath()): T
 			// 只认显式 false（关掉主会话盘根扫描门）；undefined/非法值一律回默认 true
 			guardMainRootScan: u.guardMainRootScan === false ? false : true,
 			reclaimLaneWorktree: u.reclaimLaneWorktree === false ? false : true,
+			// 用户 2026-11-04 定边界：trace-fusion 只用于正式开工前的探查与诊断。
+			// 只认**显式 true** 才允许 implement（默认锁死）；合法值写法："allowImplementMode": true
+			allowImplementMode: u.allowImplementMode === true,
 			provisioning: mergeProvisioning(u.provisioning),
 		};
 	} catch {

@@ -33,7 +33,9 @@ import { DEFAULT_TRACE_FUSION_CONFIG, type TraceFusionConfig } from "./trace-fus
 const cfg = (over: Partial<TraceFusionConfig> = {}): TraceFusionConfig => ({
 	...structuredClone(DEFAULT_TRACE_FUSION_CONFIG),
 	// 本文件锁的是 implement 模式（worktree 管线）——diagnose 分支另有专项用例
+	// 2026-11-04：implement 现在有机械门（缺省拒绝），测试走**显式授权**形状
 	mode: "implement",
+	allowImplementMode: true,
 	maxWallClockPerLaneMin: 45,
 	...over,
 });
@@ -476,6 +478,59 @@ try {
 		assert.ok(isolated > 0, `隔离账本里确实落了记录（证明写入发生过、只是落了隔离目录，实得 ${isolated}）`);
 		console.log(`ok isolation - 生产 tab-runs ${prodCountBefore}→${prodCountAfter}（零写）；隔离目录 ${isolated} 条`);
 	}
+	// ── implement 机械门（2026-11-04：trace-fusion 定位为开工前探查/诊断）──
+	// 走生产入口 launchTraceRun：mode=implement 且无显式授权 ⇒ 必须降级 diagnose、
+	// 不得开 worktree，且降级理由必须出现在返回行里（AGENTS.md R-2：不得静默）。
+	{
+		const repoGate = join(root, "repo-gate");
+		ensureDirTrusted(repoGate);
+		mkdirSync(repoGate, { recursive: true });
+		assert.equal(g(["init", "-b", "main"], repoGate), 0);
+		writeFileSync(join(repoGate, "a.txt"), "a\n");
+		g(["add", "."], repoGate);
+		g(["commit", "-m", "init"], repoGate);
+		const { spawner: spGate } = makeFakeSpawner();
+		const resGate = launchTraceRun({
+			task: "门测试：请求 implement",
+			repoRoot: repoGate,
+			wtExe: "wt.exe",
+			piCli: "pi.cmd",
+			// cfg() 默认写了 allowImplementMode:true，这里**刻意拿掉**它模拟缺省
+			config: { ...cfg(), mode: "implement", allowImplementMode: undefined },
+			runsDir: join(root, "runs-gate"),
+			wtRoot,
+			now: new Date("2026-11-04T09:00:00"),
+			spawnTab: spGate,
+		});
+		assert.equal(resGate.ok, true, `降级后派发仍应成功：${!resGate.ok ? resGate.error : ""}`);
+		if (resGate.ok) {
+			assert.equal(resGate.meta.mode, "diagnose", "implement 被门拒绝 ⇒ 实际跑 diagnose");
+			assert.equal(resGate.meta.wtDir, "", "被拒的 implement 不得开 worktree");
+			assert.ok(
+				resGate.lines.some((l) => l.includes("机械门拒绝") && l.includes("allowImplementMode")),
+				"返回行必须写明拒绝原因与开启方法",
+			);
+		}
+		const { spawner: spAllow } = makeFakeSpawner();
+		const resAllow = launchTraceRun({
+			task: "门测试：显式授权 implement",
+			repoRoot: repoGate,
+			wtExe: "wt.exe",
+			piCli: "pi.cmd",
+			config: { ...cfg(), mode: "implement", allowImplementMode: true },
+			runsDir: join(root, "runs-gate-allow"),
+			wtRoot,
+			now: new Date("2026-11-04T09:10:00"),
+			spawnTab: spAllow,
+		});
+		assert.equal(resAllow.ok, true, `授权后 implement 应可跑：${!resAllow.ok ? resAllow.error : ""}`);
+		if (resAllow.ok) {
+			assert.equal(resAllow.meta.mode, "implement", "allowImplementMode=true ⇒ 放行");
+			assert.ok(resAllow.meta.wtDir !== "", "授权后真的开了 worktree（证明门是真门，不是装饰）");
+		}
+		console.log("ok gate - implement 机械门：缺省拒绝+留痕+不开树；显式 true 才放行");
+	}
+
 } finally {
 	try {
 		rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });

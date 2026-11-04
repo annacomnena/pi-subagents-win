@@ -18,7 +18,7 @@ source_paths:
 
 # trace-fusion lane worktree 生命周期与磁盘成本
 
-> 校准状态：**current（2026-11-04 源码级核实 + 沙盒对照实验 + 磁盘实测分母）**
+> 校准状态：**current（2026-11-04 源码级核实 + 沙盒对照实验 + 磁盘实测分母；同日补记 implement 机械门 = 已定边界）**
 > 关联：`trace-fusion-architecture.md`、`trace-fusion-artifact-contract.md`、`tab-run-ledger.md`
 >
 > 本文回答三个问题：**一轮要花多少磁盘**、**什么时候可以安全删**、**删的时候什么会杀死你的依赖**。
@@ -124,10 +124,28 @@ run 终态 collect → cross-test → fusion（产物在长路径 runDir，永�
 
 ---
 
-## 6. 已知未闭合（勿当成已完成）
+## 6. mode 边界（已定）：只做开工前的探查与诊断
+
+用户 2026-11-04 定边界：**trace-fusion 仅用于正式开工前的探查与诊断**，不拿它真去改代码。
+已机械执行（不靠自觉）：
+
+- 门在 `launch-workers.ts` 的 `gateImplementMode`（由 `launchTraceRun` 调用）：`mode=implement` 且无显式授权
+  ⇒ **降级 `diagnose`**，并把拒绝理由写进返回行（R-2：不得静默）；`meta.mode` 就是 `diagnose`，
+  事后从产物能看出被降过级。
+- 开启方法（唯一）：`config.json → traceFusionLoop.allowImplementMode: true`（只认显式 `true`，
+  `false`/字符串/缺省都是锁死；读侧 `config.ts`）。
+- 可见性：`/trace-fusion config` 会多一行「implement 门：锁死 / 已显式放开（+ 磁盘代价）」。
+- 为什么要有门：此前 `config.ts` 不读 `mode` 使 implement 在生产上不可达 —— **那是意外，不是保障**：
+  任何人把 `mode` 传进来就会打开构建链（12GB/轮级）。现在变成显式授权才放行。
+- 测试钉法：缺省 ⇒ `meta.mode==="diagnose"` + `wtDir===""` + 返回行含拒绝原因；
+  显式 `true` ⇒ `meta.mode==="implement"` **且 `wtDir != ""`**（证明门是真门，不是装饰）。
+
+---
+
+## 7. 已知未闭合（勿当成已完成）
 
 | 项 | 状态 |
 |---|---|
-| `config.ts` 不读 `mode` ⇒ **implement 分支生产不可达**（现存 run 全 diagnose） | 未修；本功能在 implement 开闸后才真正生效，diagnose 零影响 |
+| `mode` 边界：**已定边界 + 已上机械门**（用户 2026-11-04）——trace-fusion 仅用于正式开工前的**探查与诊断**；`implement` 缺省被 `gateImplementMode` 拒绝并降级 `diagnose`（拒绝行写进返回行），要开需显式 `config.json → traceFusionLoop.allowImplementMode: true` | 已实现（`launch-workers.ts` 的 `gateImplementMode`，门状态在 `/trace-fusion config` 展示）；开闸属生产行为变更，**需用户点头** |
 | `linksFailed`（占用中的 junction）只写审计，不重试解链接 | 未闭合；需等持有进程退出后由下轮回收处理 |
 | 六节长度门保持 40（分节阈值未做） | 未做；门只保证「写了」，不保证「写够」 |

@@ -300,13 +300,37 @@ export function dispatchDiagnoseLane(input: DispatchDiagnoseLaneInput): Dispatch
 	return { ok: true, lane, tabRunId: laneRunId, title };
 }
 
+/**
+ * implement 机械门（用户 2026-11-04 定边界：trace-fusion 仅用于正式开工前的探查与诊断）。
+ *
+ * 背景：implement = 每 lane 真开 worktree + 各自构建，实测 12GB/轮级
+ * （见 Wiki/Architecture/trace-fusion-worktree-lifecycle.md）。此前 config.ts 不读 mode
+ * 使 implement 在生产上不可达——那是**意外**，不能当安全保障：任何人把 mode 传进来
+ * 就会打开构建链。现在改成**显式授权才放行**：默认拒绝并降级 diagnose，
+ * 降级必须写进返回行（AGENTS.md R-2：不得静默）。
+ */
+export function gateImplementMode(
+	requested: "diagnose" | "implement",
+	allowImplementMode: boolean | undefined,
+	lines: string[],
+): "diagnose" | "implement" {
+	if (requested === "implement" && allowImplementMode !== true) {
+		lines.push(
+			"⛔ mode=implement 被机械门拒绝 ⇒ 降级 diagnose（trace-fusion 当前定位为开工前探查/诊断）；"
+			+ "要开：config.json → traceFusionLoop.allowImplementMode = true",
+		);
+		return "diagnose";
+	}
+	return requested;
+}
+
 export function launchTraceRun(input: LaunchTraceRunInput): LaunchTraceRunResult {
 	const lines: string[] = [];
 	const runsDir = input.runsDir ?? defaultRunsDir();
 	const wtRoot = input.wtRoot ?? defaultWorktreeRoot();
 	const now = input.now ?? new Date();
 	const spawnTab = input.spawnTab ?? ((opts) => spawnPiTab(opts));
-	const mode = input.config.mode ?? "diagnose";
+	const mode = gateImplementMode(input.config.mode ?? "diagnose", input.config.allowImplementMode, lines);
 	// 参数化 ①（2026-10-21）：per-call model > config.workerModel > 不传（lane 默认模型）。
 	// 这是模型优先级的**唯一实现点**；config 旧路径不校验（向后兼容，见计划 D8）。
 	const workerModel = input.workerModel ?? input.config.workerModel;

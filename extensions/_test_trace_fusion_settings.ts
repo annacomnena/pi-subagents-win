@@ -23,6 +23,7 @@ import {
 	renderSettingsSummary,
 	DEFAULT_USER_SETTINGS,
 } from "./trace-fusion/tf-settings.ts";
+import { gateImplementMode } from "./trace-fusion/launch-workers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "tf-settings-"));
 const CFG = join(root, "config.json");
@@ -127,6 +128,29 @@ try {
 		assert.equal(normalizeUserSettings({ mode: "garbage" }).mode, "diagnose");
 		assert.equal(normalizeUserSettings({ mode: "implement" }).mode, "implement");
 		console.log("  ✓ ⑤ 归一化：非法 laneConcurrency/数值/mode 一律回默认");
+	}
+
+	// ── ⑤b implement 机械门（2026-11-04：trace-fusion 定位为开工前探查/诊断）──
+	{
+		const lines: string[] = [];
+		// 缺省（allowImplementMode 未写）⇒ implement 被拒并降级，且必须留下可见的拒绝行
+		assert.equal(gateImplementMode("implement", undefined, lines), "diagnose", "缺省：implement 被机械门拒绝");
+		assert(lines.some((l) => l.includes("机械门拒绝") && l.includes("allowImplementMode")), "拒绝行必须写明原因与开启方法（R-2）");
+		// 显式 true ⇒ 放行
+		assert.equal(gateImplementMode("implement", true, []), "implement", "allowImplementMode=true ⇒ 放行");
+		// 非 true 的一切写法（false/字符串/1）都算锁死
+		assert.equal(gateImplementMode("implement", false, []), "diagnose", "显式 false ⇒ 锁死");
+		// diagnose 永不受门影响
+		assert.equal(gateImplementMode("diagnose", undefined, []), "diagnose", "diagnose 零影响");
+		// 展示面必须把门状态告知用户
+		// 展示面必须把门状态告知用户（走真实入口：写临时 config.json 再读展示）
+		const gateCfgA = join(mkdtempSync(join(tmpdir(), "tfl-gate-")), "config.json");
+		writeFileSync(gateCfgA, JSON.stringify({ traceFusionLoop: { mode: "implement" } }), "utf8");
+		assert(renderSettingsSummary(gateCfgA).some((l) => l.includes("implement 门：**锁死**")), "展示：缺省显示锁死");
+		const gateCfgB = join(mkdtempSync(join(tmpdir(), "tfl-gate-")), "config.json");
+		writeFileSync(gateCfgB, JSON.stringify({ traceFusionLoop: { mode: "implement", allowImplementMode: true } }), "utf8");
+		assert(renderSettingsSummary(gateCfgB).some((l) => l.includes("已显式放开")), "展示：显式放开要说明磁盘代价");
+		console.log("  ✓ ⑤b implement 机械门：缺省拒绝 + 显式 true 才放行 + 展示可见");
 	}
 
 	// ── ⑥ per-lane / 融合模型读取：只收非空字符串，丢垃圾 ──

@@ -193,6 +193,12 @@ export function renderSettingsSummary(configPath: string): string[] {
 
 	const lines: string[] = [];
 	lines.push(`模式：${s.mode}　并发度：${s.laneConcurrency}${s.laneConcurrency === 1 ? "（严格串行）" : ""}`);
+	// implement 机械门状态必须可见（R-2）：只看 mode 值会误以为设了 implement 就能跑
+	lines.push(
+		block["allowImplementMode"] === true
+			? "implement 门：**已显式放开**（traceFusionLoop.allowImplementMode=true）⇒ 会真开 worktree + 构建（实测 12GB/轮级）"
+			: "implement 门：**锁死**（缺省）⇒ mode=implement 会被拒绝并降级 diagnose；要开写 `\"allowImplementMode\": true`",
+	);
 	lines.push(`lane 时限：${s.maxWallClockPerLaneMin}min　最大轮数：${s.maxRounds}`);
 	lines.push(`lane 模型：A=${lanes.A ?? globalWorker ?? "(lane 默认)"} | B=${lanes.B ?? globalWorker ?? "(lane 默认)"} | C=${lanes.C ?? globalWorker ?? "(lane 默认)"}`);
 	lines.push(`融合模型：${fusion.fusionModel ?? "(未设)"} —— 未设则 collect 完成后**零动作**（跳过理由会写进 meta.fusion）`);

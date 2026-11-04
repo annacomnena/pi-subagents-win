@@ -64,6 +64,12 @@ export interface TraceFusionConfig {
 	 * 缺省 true；false 回到旧的「run 终态后手动 /trace-fusion-clean」行为。
 	 */
 	reclaimLaneWorktree?: boolean;
+	/**
+	 * 用户 2026-11-04 定边界：trace-fusion **仅用于正式开工前的探查与诊断**。
+	 * 缺省 false ⇒ implement（lane 真开 worktree 实现 + 构建，12GB/轮级）被**机械门硬拒**并降级 diagnose。
+	 * 要开：在 `config.json → traceFusionLoop` 里显式写 `"allowImplementMode": true`。
+	 */
+	allowImplementMode?: boolean;
 	provisioning: TraceFusionProvisioning;
 }
 
