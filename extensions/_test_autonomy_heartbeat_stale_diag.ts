@@ -103,4 +103,49 @@ const snap = (asofMsAgo: number) => ({ asof: NOW - asofMsAgo });
 	ok("F3 非法读数值（Infinity）被 reader 拒绝");
 }
 
+// ── ⑨ F3/N1（2026-11-05 L4 复验）：未来时间**不得算 fresh**，也不得让它进 suspectedDisabled ──
+// L4 实测反例：`at=now+24h` + 旧快照 ⇒ 旧实现报「tick 活着但 frontier 不新鲜 ⇒ 很可能被关」
+// 根因：`now - at <= threshold` 对负 age 恒真，而 clockSkew 只排除 heartbeatStale，不排除 hbFresh。
+{
+	const future = { at: NOW + 24 * 3600_000, iso: "future", pid: 1, sessionId: "s", tickIntervalMs: 30_000 };
+	const f = frontierFreshness(snap(12 * 3600_000), future, NOW);
+	assert.equal(f.suspectedDisabled, false, "F3：未来心跳不得触发「tick 活着但被关」（旧实现对负 age 恒 fresh）");
+	assert.equal(f.heartbeatStale, false, "F3：未来心跳是「无法判定」，不得归入 stale");
+	// 无快照路径同样不得误报
+	const f2 = frontierFreshness(null, future, NOW);
+	assert.equal(f2.suspectedDisabled, false, "F3：无快照 + 未来心跳也不得报「被关」");
+	ok("F3 未来时间：不误判 fresh、不进 suspectedDisabled（L4 反例回归）");
+}
+
+// ── ⑩ F3：tickIntervalMs 非有限/超大值不得让 threshold 溢出 ──
+// L4 实测：`tickIntervalMs=1e400`（parse 成 Infinity）与 `1e308`（×3 溢出）⇒ threshold=Infinity
+// ⇒ 一天前的心跳与快照都被当「正常」。
+{
+	for (const badTick of [Infinity, 1e308, Number.NaN]) {
+		const bad = { at: NOW - 24 * 3600_000, iso: "", pid: 1, sessionId: "s", tickIntervalMs: badTick as number };
+		const f = frontierFreshness(snap(24 * 3600_000), bad, NOW);
+		assert.ok(Number.isFinite(f.threshold), `F3：tick=${badTick} 时 threshold 必须有限（实际 ${f.threshold}）`);
+		assert.equal(f.stale, true, `F3：tick=${badTick} + 24h 前读数 ⇒ 必须判 stale，不得报正常`);
+		assert.equal(f.suspectedDisabled, false, `F3：tick=${badTick} 不得误报「被关」`);
+	}
+	// 合法小周期仍生效（不得把 normal 路径改坏）
+	const normal = { at: NOW - 10_000, iso: "", pid: 1, sessionId: "s", tickIntervalMs: 30_000 };
+	assert.equal(frontierFreshness(snap(10_000), normal, NOW).suspectedDisabled, false);
+	ok("F3 非法 tick 周期不得让 threshold 溢出（Infinity/1e308/NaN）");
+}
+
+// ── ⑪ N1（L4 新增发现）：上一任 owner 的心跳不得被当成当前 owner 的 tick 证据 ──
+// L4 实测：交接后共享槽位留着上一任的陈旧心跳（自然可达状态）
+// ⇒ 旧实现报「owner wake 心跳已 60min 未更新」，把上一任的陈旧当成当前 owner 死。
+// 注意：这层归因在 `index.ts` 的 diagLine（用 hbIsOwner），本用例锁的是**前置算子的边界**：
+// 未来/陈旧读数不得互相污染——具体归因由 index.ts 的 hbAttributable 门完成（已改）。
+{
+	const prevOwner = { at: NOW - 60 * 60_000, iso: "", pid: 1, sessionId: "previous-owner", tickIntervalMs: 30_000 };
+	const f = frontierFreshness(snap(12 * 3600_000), prevOwner, NOW);
+	// 算子层只能表达「陈旧」——不能自己声称「当前 owner 死了」（它不知道 owner 是谁）
+	assert.equal(f.heartbeatStale, true, "N1：陈旧心跳在算子层仍应标 heartbeatStale=true（供上层比对 owner）");
+	assert.equal(f.suspectedDisabled, false, "N1：陈旧心跳不得触发「被关」（那是新鲜+旧快照的形状）");
+	ok("N1 算子边界：陈旧心跳不被误当「tick 活着」（owner 比对在 index.ts 层）");
+}
+
 console.log(`\n_test_autonomy_heartbeat_stale_diag: ${pass} checks passed`);

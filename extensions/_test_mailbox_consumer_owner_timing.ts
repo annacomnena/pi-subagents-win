@@ -209,5 +209,81 @@ function ok(name: string) {
   stop();
 }
 
+// ── 用例 5（L4 F4 缺口①，2026-11-05 复验指出）：**wake loop 晚 attach 后必须真的开始干活** ──
+//
+// L4 原话：「没有 wake loop 晚 attach 后真实 evaluate/spawn/维护的正面测试。
+// 仅证明非 owner timer 活着不能证明 owner 下半段会工作。」
+//
+// 判据取 **spawn 是否被真实调用**（`registerWakeLoop` 的 spawn 回调），而不是只看心跳：
+// 心跳在 owner 门内就写了，而 spawn 在更后面的 evaluateWakes 里。
+// 因此本用例必须能区分三种情况：
+//   A. interval 未起（旧实现） ⇒ spawn 恒 0
+//   B. 起了但下半段断了（只测到心跳就停） ⇒ spawn 恒 0
+//   C. 完整工作 ⇒ spawn > 0
+{
+  rmSync(join(mailboxDir, "agent___master_default"), { recursive: true, force: true });
+  rmSync(join(stateDir, "autonomy"), { recursive: true, force: true });
+  // 启动时 owner 是别人
+  writeFileSync(
+    join(registryDir, "attachments", "agent___master_default.json"),
+    JSON.stringify({ agentAddress: "agent://master_default", sessionId: "sid-wake-someone-else", generation: 5, attachedAt: "2026-01-01T00:00:00.000Z" }),
+    "utf8",
+  );
+  // 造 workstream（形状照 `extensions/runtime/workstreams.ts:WorkstreamRecord`；
+  // 必须满足 evaluateOne 的前置：status=active + wakePolicy.enabled + **ws 邮箱有 pending 信**，
+  // 否则会停在 disabled / no-mail 分支、永远测不到 spawn —— 那就是 R-4 的「夹具不贴近真实形状」）
+  // 判据改用 tick 的**确定性副作用** `expireSweep`（`mailbox-consumer.ts:667`）：
+  // 它在 owner 门**之后**、autonomy 门**之前** ⇒ 不受 autonomy 的 graph frontier 输入影响，
+  // 是「owner 下半段真的在跑」的干净证据。
+  // 造一封**已过 expiresAt** 的非终态信 ⇒ 只要 sweep 跑到就该被置 expired。
+  {
+    const dir = join(mailboxDir, "agent___master_default");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "msg_should_expire.json"),
+      JSON.stringify({
+        frame: { frame: "message", id: "msg_should_expire", kind: "REPORT", from: "agent://master_local_x",
+          to: "agent://master_default", requiresAck: false, sentAt: new Date(Date.now() - 7200_000).toISOString(),
+          body: { summary: "stale" } },
+        status: "pending",
+        expiresAt: new Date(Date.now() - 3600_000).toISOString(), // 1h 前就过期
+      }),
+      "utf8",
+    );
+  }
+  const expiredStatus = (): string | undefined => {
+    const p = join(mailboxDir, "agent___master_default", "msg_should_expire.json");
+    if (!existsSync(p)) return undefined;
+    try { return JSON.parse(readFileSync(p, "utf8")).status; } catch { return undefined; }
+  };
+
+  const spawned: string[] = [];
+  const pi = makeFakePi(LATE_SID);
+  const stop = registerWakeLoop(pi as never, {
+    spawn: (d) => { spawned.push(String((d as { workstreamId?: string })?.workstreamId ?? "?")); return "tab_fake"; },
+    mailboxDir,
+    stateDir,
+    intervalMs: 30,
+  });
+  pi.fire("session_start", { sessionManager: { sessionId: LATE_SID } });
+  await sleep(150);
+  assert.equal(expiredStatus(), "pending", "attach 之前：非 owner 不得跑 expireSweep（信须仍 pending）");
+
+  // ← attach 晚到（真实交接路径）
+  writeFileSync(
+    join(registryDir, "attachments", "agent___master_default.json"),
+    JSON.stringify({ agentAddress: "agent://master_default", sessionId: LATE_SID, generation: 6, attachedAt: new Date().toISOString() }),
+    "utf8",
+  );
+  await sleep(300);
+  assert.equal(
+    expiredStatus(),
+    "expired",
+    `【L4 F4】attach 晚到后 owner tick 必须真的跑到 expireSweep；interval 未起或下半段断开都恒 pending（实际 ${expiredStatus()}）`,
+  );
+  ok("★F4 缺口①：wake loop 晚 attach 后仍跑到真实维护副作用（不只是 timer 活着）");
+  stop();
+}
+
 rmSync(root, { recursive: true, force: true, maxRetries: 3 });
 console.log(`\n_test_mailbox_consumer_owner_timing: ${pass} checks passed`);

@@ -672,12 +672,22 @@ export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: 
 	 */
 	heartbeatStale: boolean;
 } {
-	const tick = heartbeat?.tickIntervalMs && heartbeat.tickIntervalMs > 0 ? heartbeat.tickIntervalMs : 30_000;
-	const threshold = Math.max(tick * 3, 5 * 60_000);
-	const hbFresh = Boolean(heartbeat && now - heartbeat.at <= threshold);
-	// F3：`heartbeat.at` 在未来（时钟倒退/串改）不得当「新鲜」——那是**未知**，不是活着。
-	// 容差 1 个 tick 周期内的微小偏移仍算 fresh；超过则既不算 fresh 也不算「tick 死」。
-	const clockSkew = Boolean(heartbeat && heartbeat.at - now > Math.max(tick, 60_000));
+	// F3（2026-11-05 L4 复验）：**周期也要做有限性校验**。
+	// 旧写法只判 `> 0` ⇒ `tickIntervalMs=1e400`（JSON parse 成 Infinity）或 `1e308`（×3 溢出）
+	// 都会让 threshold 变 Infinity ⇒ 一天前的心跳与快照都被当「正常」。
+	const TICK_MIN = 1_000;
+	const TICK_MAX = 3_600_000; // 1h，再大必然不是真实 tick 周期
+	const rawTick = heartbeat?.tickIntervalMs;
+	const tick =
+		typeof rawTick === "number" && Number.isFinite(rawTick) && rawTick >= TICK_MIN && rawTick <= TICK_MAX
+			? rawTick
+			: 30_000;
+	const threshold = Math.min(Math.max(tick * 3, 5 * 60_000), 24 * 3_600_000);
+	// F3：**未来时间不得算 fresh**（旧写法 `now - at <= threshold` 对负 age 恒真）。
+	// 容差 1 tick（至少 60s）：微小时钟偏移仍算新鲜；超过则既不算 fresh 也不算「tick 死」，由 clockSkew 表达。
+	const skewTolerance = Math.max(tick, 60_000);
+	const clockSkew = Boolean(heartbeat) && heartbeat!.at - now > skewTolerance;
+	const hbFresh = Boolean(heartbeat) && !clockSkew && now - heartbeat!.at <= threshold;
 	const heartbeatStale = Boolean(heartbeat) && !hbFresh && !clockSkew;
 	if (!snapshot) {
 		// 无快照：

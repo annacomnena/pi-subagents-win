@@ -2991,24 +2991,35 @@ ${notable[0].reason}
 				})();
 				const hbIsOwner = Boolean(hb && ownerSid && hb.sessionId === ownerSid);
 				// F3：心跳时间在未来（时钟倒退/串改）⇒ 既不算新鲜也不算死，显式报「无法判定」
-				const clockSkewLine = hb && hb.at - Date.now() > Math.max(hb.tickIntervalMs || 30_000, 60_000)
-					? `⚠️ 诊断：心跳时间在**未来** ${Math.round((hb.at - Date.now()) / 60_000)}min（时钟倒退或文件被串改）⇒ 既不能判新鲜也不能判死，**无法判定**`
+				// N1（2026-11-05 L4 复验）：**先做有效性/身份校验，再判新鲜/陈旧/疑似关闭**。
+				// 旧写法把 suspectedDisabled / heartbeatStale 排在最前 ⇒ 上一任 owner 留下的陈旧心跳
+				// （交接后完全自然的状态）会被当成「当前 owner tick 活着但被关」或「当前 owner tick 停了」，
+				// 也就是说 hbIsOwner 算了却没接入前两个分支（L4 N1 实测复现）。
+				const clockSkewMs = hb ? hb.at - Date.now() : 0;
+				const hasClockSkew = Boolean(hb) && clockSkewMs > Math.max(hb!.tickIntervalMs || 30_000, 60_000);
+				// 心跳读数是否**可用于归因当前 owner**：存在 + 非未来 + 属于当前 owner
+				const hbAttributable = Boolean(hb) && !hasClockSkew && hbIsOwner;
+				const clockSkewLine = hasClockSkew
+					? `⚠️ 诊断：心跳时间在**未来** ${Math.round(clockSkewMs / 60_000)}min（时钟倒退或文件被串改）⇒ 既不能判新鲜也不能判死，**无法判定**`
 					: "";
 				const otherTicks = listNonOwnerTicks();
+				// N2（L4）：区分「总记录」与「活跃记录」——旧文案把全部文件数叫「活跃记录」
+				const otherActive = otherTicks.filter((t) => Date.now() - t.at <= 5 * 60_000);
 				const otherTickLine = otherTicks.length
-					? `非 owner tick：${otherTicks.length} 个活跃记录（最近 ${Math.round(Math.max(0, Date.now() - otherTicks[0].at) / 1000)}s 前，session=${otherTicks[0].sessionId?.slice(0, 13) ?? "?"}）；它们**不在** owner 槽位，不参与「被关」判定`
+					? `非 owner tick：共 ${otherTicks.length} 条记录，其中 ${otherActive.length} 条活跃（≤5min）；最近一条 ${Math.round(Math.max(0, Date.now() - otherTicks[0].at) / 1000)}s 前（session=${otherTicks[0].sessionId?.slice(0, 13) ?? "?"}）；它们**不在** owner 槽位，不参与「被关」判定`
 					: "非 owner tick：(none)";
-				const diagLine = fresh.suspectedDisabled
-					? "⚠️ 诊断：tick 活着但 frontier 不新鲜 ⇒ **autonomy 很可能被关**（查 enabled 键是否还在 config）"
-					: fresh.heartbeatStale
-						? `⚠️ 诊断：**owner wake 心跳已 ${Math.round(Math.max(0, Date.now() - (hb?.at ?? 0)) / 60_000)}min 未更新**（pid=${hb?.pid} tick=${Math.round((hb?.tickIntervalMs ?? 0) / 1000)}s）⇒ owner 的 wake 链未在跳（tick 未注册/停摆/写盘失败，或宿主死了）；**注意这不能证明 mailbox 消费链也停了**（独立 10s interval，需单独用消费证据判）`
-						: clockSkewLine
+				const diagLine = hb && !hbIsOwner
+						? `⚠️ 诊断：心跳的 sessionId 与当前 global owner 不一致（心跳=${hb.sessionId?.slice(0, 13) ?? "null"} / owner=${ownerSid?.slice(0, 13) ?? "null"}）⇒ **无法归因**（交接刚发生或共享槽位被旧写者遗留）；心跳年龄 ${Math.round(Math.max(0, Date.now() - hb.at) / 1000)}s`
+						: hasClockSkew
 							? clockSkewLine
-							: hb && !hbIsOwner
-								? `⚠️ 诊断：心跳的 sessionId 与当前 global owner 不一致（心跳=${hb.sessionId?.slice(0, 13) ?? "null"} / owner=${ownerSid?.slice(0, 13) ?? "null"}）⇒ **无法归因**（可能是共享槽位被覆盖或交接刚发生）；心跳年龄 ${Math.round(Math.max(0, Date.now() - hb.at) / 1000)}s`
-								: hb && !fresh.stale ? "诊断：正常（tick 活着且快照新鲜）"
-								: !hb && frontier ? "⚠️ 诊断：无心跳但快照旧 ⇒ tick 未在跑（旧代码重启前不会自愈）"
-								: "诊断：未知";
+							: !hbAttributable
+								? (!hb && frontier ? `⚠️ 诊断：无心跳（读数不存在或无法解析）但 frontier 快照 ${Math.round(Math.max(0, Date.now() - (frontier.asof ?? 0)) / 60_000)}min 前 ⇒ 无法确定 tick 状态（可能是 tick 未跑，也可能是读盘失败）` : "诊断：未知")
+								: fresh.suspectedDisabled
+									? "⚠️ 诊断：owner tick 活着且��份有效，但 frontier 不新鲜 ⇒ **autonomy 很可能被关**（查 enabled 键是否还在 config）"
+									: fresh.heartbeatStale
+										? `⚠️ 诊断：**owner wake 心跳已 ${Math.round(Math.max(0, Date.now() - hb!.at) / 60_000)}min 未更新**（pid=${hb!.pid} tick=${Math.round(hb!.tickIntervalMs / 1000)}s）⇒ owner wake **心跳未更新**（疑 tick 未注册/停摆，或写盘失败——写心跳是 never-throw，失败不会阻止 tick 后续的维护/唤醒）；**注意这不能证明 mailbox 消费链也停了**（独立 10s interval，需单独用消费证据判）`
+										: hb && !fresh.stale ? "诊断：正常（owner tick 活着且快照新鲜）"
+										: "诊断：未知";
 				body = [
 					`autonomy: enabled=${cfg.enabled === true ? "on" : "off"}（切换：/autonomy on|off，或 GUI 设置区的「主动性套件」开关）`,
 					`kill-switch: ${kill ? `on (reason=${kill.reason} @${kill.at.slice(0, 19)} by=${kill.by})` : "off"}`,
