@@ -249,6 +249,11 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
 | 广播：进程在 `agent_settled` 前被杀 ⇒ 该条可能漏推 | 未闭合 |
 | 广播：反序列化克隆 ⇒ 同一条可能重发 | 已知取舍（见 R-5） |
 | `config.json` 整文件重写的**机制性防护**（自动校验顶层键） | 未实现（目前靠本文件 R-1 人工遵守） |
+| **`tab-status` 从不读 `heartbeatAt` 判死**（注释声明「>90s 即死」但读侧零实现） | **2026-11-05 实测**：565 个 state 里 8 个「读侧报非终态」且心跳 >7 天，**逐个 pid 探活 8/8 全部 dead**。未修（修法见 `plans/20261105_break3_tabstatus_heartbeat_closure.md`；注意直接判 `terminal:true` 会让归档逻辑移走派发账本 ⇒ `steer` 静默丢消息） |
+| **tab 身份在会话 resume 后丢失**（`PI_TAB_RUN_ID` 不重放） | 未修（需建 `sessionPath → runId` 索引，结构性改动）。后果：workflow-tab 形态的 local master 被 resume 后 `tab-report` 自助回报通道对该进程永久失效，而账本仍显示 `phase=working` |
+| **C-3 strict 重试只看 ACK，不看「是否已排进目标会话队列」** | **2026-11-05 实测**：`msg_mw30uzu6` / `msg_mw39jjiv` 各 5 条 attempt，全在 89 秒内且均早于 consumed ACK ⇒ 目标端合并成巨型消息。修法方向：去重对象从 acked 扩到 queued，或消费者侧加短 TTL 已注入标记 |
+| `state/autonomy/non-owner-ticks/` 无 GC（每 sessionId 一文件） | 未修（R-21 修复的副作用，量小但无界） |
+| trace-fusion 融入 adaptive 的**门槛口径未定义** | 未落地。「连续无返修 run」按连续口径现为 0（最新两个 run 是 cancelled/abandoned，且与他仓），按累计口径为 5。建议改用「最近 N 次 qualified 成功率」并把 cancelled/abandoned 排除出分母（见 `plans/20261105_tracefusion_adaptive_gate_metric.md`），**待 gen14 裁定** |
 | trace-fusion **融合者**在所有 UI 面不可见（不是 tab、曾被写进孤岛账本目录） | **2026-11-04 已修账本落点**（见 R-17）；融合者仍是无头子进程，只经 `subagent-runs/run_fuse*.json` + 完成通知呈现，**不会**作为 tab 出现（设计约束） |
 
 ## R-15（2026-10-19）：不要把「用户本人的操作」误判成 agent 越权
