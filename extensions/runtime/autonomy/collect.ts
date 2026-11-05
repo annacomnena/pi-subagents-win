@@ -17,8 +17,8 @@
  * - v1 无任何调用方注册它（无循环、无注册——计划工程约束 2）；仅测试（temp 目录）与后续 L2 接线使用。
  *   本层不产生任何 wake/注入：Wake Gate 判定由调用层用 evaluateWakeGate（纯）消费返回的 diff。
  */
-import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "../journal.ts";
 import { collectGlobalView, defaultAgentDir } from "../global-view.ts";
@@ -558,6 +558,8 @@ export function readAutonomyHeartbeat(opts?: { stateDir?: string }): AutonomyHea
 	try {
 		const raw: any = JSON.parse(readFileSync(join(autonomyDir(opts?.stateDir), "heartbeat.json"), "utf8"));
 		if (typeof raw?.at !== "number") return null;
+		// L4 F3：`JSON.parse` 接受 `1e400` ⇒ Infinity；非有限值不得当有效读数（会永远判 fresh）
+		if (!Number.isFinite(raw.at)) return null;
 		return {
 			at: raw.at,
 			iso: typeof raw.iso === "string" ? raw.iso : new Date(raw.at).toISOString(),
@@ -570,6 +572,87 @@ export function readAutonomyHeartbeat(opts?: { stateDir?: string }): AutonomyHea
 	}
 }
 
+/**
+ * 非 owner 会话的 tick 存活心跳（R-21 修复 / L4 F1）。
+ *
+ * **为什么不能直接复用 `heartbeat.json`**：那一个槽位语义是「owner 的 wake 链活着」，
+ * 而 `frontierFreshness` / `/autonomy status` 的「②被关」判据就是拿它比时间。
+ * 若非 owner 也写同一文件，共享槽位会被最后写者覆盖 ⇒ 「owner tick 已停」会被误报成
+ * 「tick 活着，autonomy 很可能被关」（L4 reviewer 已用真实注册链隔离复现，P1）。
+ *
+ * 所以：**per-session 分文件**，键为 sessionId 哈希，只回答「这个会话的 timer 活着」。
+ * 它不被 `frontierFreshness` 读（不参与「被关」判定），用于区分：
+ *   ① owner 心跳陈旧 + 某非 owner 心跳新鲜 ⇒ owner 停了，但机器上不是全死
+ *   ② 两都陈旧/缺失               ⇒ 进程/宿主层面就没 tick
+ * never-throw。
+ */
+export function writeNonOwnerTick(opts: {
+	stateDir?: string;
+	sessionId?: string | null;
+	reason?: string;
+	tickIntervalMs: number;
+}): boolean {
+	try {
+		const sid = opts?.sessionId;
+		if (!sid) return false; // 无 sessionId 无法分文件，宁可不写也不污染 owner 槽位
+		const dir = join(autonomyDir(opts?.stateDir), "non-owner-ticks");
+		mkdirSync(dir, { recursive: true });
+		const now = Date.now();
+		// 用 sha256 前缀作文件名：sessionId 含非文件名安全字符时也稳定，且不泄露原值到目录列表
+		const key = createHash("sha256").update(sid).digest("hex").slice(0, 16);
+		const body = {
+			version: 1,
+			at: now,
+			iso: new Date(now).toISOString(),
+			pid: process.pid,
+			sessionId: sid,
+			tickIntervalMs: opts.tickIntervalMs,
+			reason: opts.reason ?? "not-owner",
+		};
+		const target = join(dir, `${key}.json`);
+		const tmp = join(dir, `${key}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+		writeFileSync(tmp, JSON.stringify(body), { encoding: "utf8", mode: 0o600 });
+		renameSync(tmp, target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** 读全部非 owner tick 心跳（最近一次在前的顺序由调用方定；只用于观测，不参与「被关」判定）。 */
+export function listNonOwnerTicks(opts?: { stateDir?: string }): Array<{
+	at: number;
+	sessionId: string | null;
+	pid: number;
+	tickIntervalMs: number;
+	reason: string;
+}> {
+	try {
+		const dir = join(autonomyDir(opts?.stateDir), "non-owner-ticks");
+		return readdirSync(dir)
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				try {
+					const j: any = JSON.parse(readFileSync(join(dir, f), "utf8"));
+					if (typeof j?.at !== "number" || !Number.isFinite(j.at)) return null;
+					return {
+						at: j.at,
+						sessionId: typeof j.sessionId === "string" ? j.sessionId : null,
+						pid: typeof j.pid === "number" ? j.pid : -1,
+						tickIntervalMs: typeof j.tickIntervalMs === "number" ? j.tickIntervalMs : 0,
+						reason: typeof j.reason === "string" ? j.reason : "",
+					};
+				} catch {
+					return null;
+				}
+			})
+			.filter((x): x is NonNullable<typeof x> => x !== null)
+			.sort((a, b) => b.at - a.at);
+	} catch {
+		return [];
+	}
+}
+
 /** frontier 快照新鲜度判定。STALE 阈值 = 3 个 tick 周期（下限 5min），避免单次抖动误报。 */
 export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: AutonomyHeartbeat | null, now = Date.now()): {
 	ageMs: number | null;
@@ -577,11 +660,32 @@ export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: 
 	stale: boolean;
 	/** tick 活着但 frontier 不新鲜 ⇒ 最可能是 autonomy 被关（而非进程死）。 */
 	suspectedDisabled: boolean;
+	/**
+	 * 心跳**存在但已陈旧** ⇒ tick/进程死了（R-2 规则 3 的第 ① 态）。
+	 *
+	 * 2026-11-05 事故：本函数原先只表达 ②被关 / ③正常，缺 ①tick 死。
+	 * 真实故障（mailbox 消费链死亡）时心跳文件**还在**（只是停了 46min，周期 30s），
+	 * 于是 `suspectedDisabled = stale && hbFresh = false`、`hb && !stale = false`、
+	 * `!hb && frontier = false`（心跳存在）⇒ 三分支全 false ⇒ 调用方报「诊断：未知」。
+	 * 唯一走得到的「tick 未在跑」分支要求 `!hb`（心跳**完全不存在**），而故障时它还在。
+	 * 详见 AGENTS.md R-20。
+	 */
+	heartbeatStale: boolean;
 } {
 	const tick = heartbeat?.tickIntervalMs && heartbeat.tickIntervalMs > 0 ? heartbeat.tickIntervalMs : 30_000;
 	const threshold = Math.max(tick * 3, 5 * 60_000);
-	if (!snapshot) return { ageMs: null, threshold, stale: true, suspectedDisabled: Boolean(heartbeat) };
-	const ageMs = Math.max(0, now - snapshot.asof);
 	const hbFresh = Boolean(heartbeat && now - heartbeat.at <= threshold);
-	return { ageMs, threshold, stale: ageMs > threshold, suspectedDisabled: ageMs > threshold && hbFresh };
+	// F3：`heartbeat.at` 在未来（时钟倒退/串改）不得当「新鲜」——那是**未知**，不是活着。
+	// 容差 1 个 tick 周期内的微小偏移仍算 fresh；超过则既不算 fresh 也不算「tick 死」。
+	const clockSkew = Boolean(heartbeat && heartbeat.at - now > Math.max(tick, 60_000));
+	const heartbeatStale = Boolean(heartbeat) && !hbFresh && !clockSkew;
+	if (!snapshot) {
+		// 无快照：
+		//   有心跳且新鲜 ── tick 在跑但从未产出快照 ⇒ 仍然「很可能被关」（旧语义不变）
+		//   有心跳但陈旧 ── tick 死了（①态），不得报「被关」
+		//   无心跳       ── 从未跑过，两标志都 false，由调用方的 `!hb && frontier` 分支处理
+		return { ageMs: null, threshold, stale: true, suspectedDisabled: hbFresh, heartbeatStale };
+	}
+	const ageMs = Math.max(0, now - snapshot.asof);
+	return { ageMs, threshold, stale: ageMs > threshold, suspectedDisabled: ageMs > threshold && hbFresh, heartbeatStale };
 }

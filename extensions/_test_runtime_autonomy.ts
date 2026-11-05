@@ -878,6 +878,14 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				if (p === join(EXT_ROOT, "_test_audit_rotation.ts")) continue;
 				// 同上：性能探针（稳态基准取证），只读调用 readAuditTail → 排除
 				if (p === join(EXT_ROOT, "_probe_perf.ts")) continue;
+				// R-20（2026-11-05）：heartbeatStale 回归网直接验证 `frontierFreshness`
+				// （runtime/autonomy/collect.ts）→ 需要 import 字面量 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧未新增 autonomy 引用）
+				if (p === join(EXT_ROOT, "_test_autonomy_heartbeat_stale_diag.ts")) continue;
+				// R-21（2026-11-05）：mailbox 消费端 owner 门时序回归网需要
+				// `readAutonomyHeartbeat`（runtime/autonomy/collect.ts）验证心跳 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点）
+				if (p === join(EXT_ROOT, "_test_mailbox_consumer_owner_timing.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}

@@ -212,6 +212,74 @@ setCurrentSessionId(undefined);
 	}
 }
 
+// ── R-21 / L4 F5（2026-11-05）：`registerReportListener` 的 owner 门**不得阻塞注册** ──
+//
+// 事故同 mailbox：session_start 与 attach 是时序竞争（实测 gen14 晚 26s）⇒ 旧写法
+// `if (!eligible) return` 让 watcher/interval 永不启动 ⇒ 晚到的 attach 永远没机会。
+// 本条必须经过**真实注册入口**（pi.on 回调 → interval → poll），不能只调 pollNewReports。
+{
+	const isoDir = mkdtempSync(join(tmpdir(), "report-late-attach-"));
+	const prev = process.env.PI_RUNTIME_DIR;
+	process.env.PI_RUNTIME_DIR = isoDir;
+	try {
+		const { setCutover, attachMaster } = await import("./runtime/registry.ts");
+		setCutover(true, "test");
+		attachMaster({ sessionId: "sid-someone-else" }); // 启动时 owner 是别人
+
+		_resetReportListener();
+		const injected: string[] = [];
+		const reportsDirX = join(dir, "reports-late");
+		const linksX = makeLinks({ from: "tab_late", sessionId: "sid-late" });
+		const handlers: Array<(e: unknown, ctx?: unknown) => void> = [];
+		const fakePi = {
+			on(ev: string, cb: (e: unknown, ctx?: unknown) => void) {
+				if (ev === "session_start") handlers.push(cb);
+			},
+			sendUserMessage: (content: string) => { injected.push(content); return true; },
+		};
+		const stop = registerReportListener(fakePi as never, {
+			reportsDir: reportsDirX, linksPath: linksX, toast: false,
+			pollIntervalMs: 50, // 生产 5000；测试调到 50ms 才能验证「注册→tick→poll」真实接线
+		});
+		for (const h of handlers) h({}, { sessionManager: { sessionId: "sid-late" } });
+		// ⚠ 夹具要点：`registerReportListener` 在 session_start 时调 `snapshotExisting()`，
+		// 把目录里**已有**的报告全部标记为已见。所以所有发送必须在 session_start 之后。
+		// 夹具自检：session_start 必须真的把 currentSessionId 设成 sid-late
+		//（前一个用例末尾 setCurrentSessionId(undefined)，不显式断言就会在 preInject 那道
+		//  独立 owner 门被 suppressed-not-owner 静默抑掉，表现为「注入 0」而非报错）
+		assert.equal(
+			(await import("./identity.ts")).getCurrentSessionId(),
+			"sid-late",
+			"夹具自检：currentSessionId 必须已设为 sid-late",
+		);
+
+		// attach 之前：非 owner，不应注入
+		sendReportToMain({ from: "tab_late", message: "attach 前的回报", taskId: "1010" }, reportsDirX);
+		await new Promise((r) => setTimeout(r, 120));
+		assert.equal(injected.length, 0, "attach 之前不得注入（此时还归别人）");
+
+		// ← 模拟」attach 在 session_start 之后才完成」（用 forceStale 真走交接路径：
+		// attachMaster 不会无条件抢占已有 owner，这是它的不变量）
+		attachMaster({ sessionId: "sid-late", forceStale: true, staleAfterMs: -1 });
+		assert.equal(
+			(await import("./runtime/registry.ts")).readAttachment("agent://master_default" as never)?.sessionId,
+			"sid-late",
+			"夹具自检：owner 必须已切到 sid-late",
+		);
+		sendReportToMain({ from: "tab_late", message: "attach 后的回报", taskId: "1011" }, reportsDirX);
+		await new Promise((r) => setTimeout(r, 300));
+		assert.ok(
+			injected.length > 0,
+			`【L4 F5】attach 晚到后 tick 必须开始消费；旧实现 interval 根本没起 ⇒ 恒 0（实际 ${injected.length}）`,
+		);
+		stop();
+	} finally {
+		if (prev === undefined) delete process.env.PI_RUNTIME_DIR;
+		else process.env.PI_RUNTIME_DIR = prev;
+		rmSync(isoDir, { recursive: true, force: true });
+	}
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log("report tests passed");

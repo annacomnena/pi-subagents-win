@@ -54,7 +54,7 @@ import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
-import { writeAutonomyHeartbeat } from "./runtime/autonomy/collect.ts";
+import { writeAutonomyHeartbeat, writeNonOwnerTick } from "./runtime/autonomy/collect.ts";
 import {
 	auditScopeWakeSpawnFailed,
 	confirmScopeWakeSpawn,
@@ -509,8 +509,37 @@ function buildInjectBody(letter: Letter): string {
 }
 
 /**
+ * owner 门（R-21，2026-11-05）：**只决定 tick 是否做真活，不决定 interval 是否启动**。
+ *
+ * 事故：旧代码在 `session_start` 里判 `eligible`，false 就 `return` ⇒ interval 永不启动，
+ * 而 **session_start 与 attach 是时序竞争**：gen14 实测 session_start 15:57:35、
+ * global attach 写入 15:58:01（晚 26s）⇒ 那一刻 `sid !== att.sessionId` ⇒ eligible=false ⇒
+ * 整个 mailbox 自动消费链一死就是 25 小时（26 封信只剩人手 ack）。
+ *
+ * 修法分两层，各自独立可验：
+ *   ① **注册层不看 owner**：非子 agent 就起 interval（否则晚到的 attach 永远没机会）。
+ *   ② **tick 层精判**：真正的 owner 判据在 tick 内读一次（与旧语义完全一致）。
+ * ⇒ 非 owner 会话仍每秒只做几次 readFileSync（亚毫秒，均自限），早退位置从「不注册」
+ *   推到「注册但不干活」，可观测性上从 0 变为可见。
+ */
+function mailboxOwnerEligible(sessionId: string | undefined): { eligible: boolean; reason: string } {
+	try {
+		const cut = readCutover();
+		const att = readAttachment(masterAddress());
+		// 未切换/无 registry → legacy 回退 isMainSession（零变化）
+		if (!(cut?.enabled && att)) return { eligible: isMainSession(), reason: "legacy-main-session" };
+		if (!sessionId) return { eligible: false, reason: "no-session-id" };
+		return sessionId === att.sessionId
+			? { eligible: true, reason: "owner" }
+			: { eligible: false, reason: `not-owner (owner=${att.sessionId.slice(0, 13)})` };
+	} catch {
+		return { eligible: false, reason: "gate-threw" };
+	}
+}
+
+/**
  * 注册主会话消费循环（形态同 report 监听器：session_start + interval tick）。
- * flag 关/非 owner 时 tick 为空转（零行为变化）。
+ * 非 owner 时 tick 空转（零行为变化）。
  */
 export function registerMailboxConsumer(
 	pi: {
@@ -522,17 +551,10 @@ export function registerMailboxConsumer(
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
+			// R-21：注册层**只排除子 agent**（子 agent 恒不消费），不看 owner。
+			// owner 判定下沉到 tick 内（mailboxOwnerEligible）——否则 session_start 早于
+			// attach 的时序竞争会让 interval 永不启动（2026-11-05 事故）。
 			if (isSubagent()) return;
-			// 消费注册 ownership-gated（M1，与 event-bus watcher 同不变量）：cutover 启用时
-			// 「owner 是谁谁消费」（UUID 域，与 attach 写入侧同域——tab 形态 owner 重启前也可消费）；
-			// 未启用/无 registry → legacy 回退 isMainSession（零变化）；子 agent 恒不消费。
-			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
-			const cut = readCutover();
-			const att = readAttachment(masterAddress());
-			const eligible = cut?.enabled && att
-				? Boolean(sid && sid === att.sessionId)
-				: isMainSession();
-			if (!eligible) return;
 		} catch {
 			return;
 		}
@@ -543,6 +565,9 @@ export function registerMailboxConsumer(
 		const send = pi.sendUserMessage?.bind(pi);
 		interval = setInterval(() => {
 			if (closed()) return;
+			// tick 层精判（与旧语义逐字一致，只是从注册层搬下来）
+			const gate = mailboxOwnerEligible(sid);
+			if (!gate.eligible) return;
 			try {
 				consumeMailboxOnce({ sessionId: sid, mailboxDir: opts.mailboxDir, sendUserMessage: send });
 			} catch {
@@ -580,17 +605,10 @@ export function registerWakeLoop(
 	let sessionGen = 0;
 	pi.on("session_start", (_event, ctx) => {
 		try {
+			// R-21：注册层**只排除子 agent**（同 registerMailboxConsumer）。
+			// 旧代码在此判 owner，而 session_start 与 attach 有时序竞争（实测晚 26s）
+			// ⇒ interval 永不启动 ⇒ 心跳也不写 ⇒ 整链静默死亡且**零存活信号**。
 			if (isSubagent()) return;
-			// 消费注册 ownership-gated（M1，与 event-bus watcher 同不变量）：cutover 启用时
-			// 「owner 是谁谁消费」（UUID 域，与 attach 写入侧同域——tab 形态 owner 重启前也可消费）；
-			// 未启用/无 registry → legacy 回退 isMainSession（零变化）；子 agent 恒不消费。
-			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
-			const cut = readCutover();
-			const att = readAttachment(masterAddress());
-			const eligible = cut?.enabled && att
-				? Boolean(sid && sid === att.sessionId)
-				: isMainSession();
-			if (!eligible) return;
 		} catch {
 			return;
 		}
@@ -600,17 +618,39 @@ export function registerWakeLoop(
 		const sid = ctx?.sessionManager?.sessionId;
 		interval = setInterval(() => {
 			if (closed()) return;
-			// 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）：每次 tick 无论后续是否
-			// 被 autonomy 门旁路，都写一份 heartbeat。为什么需要：`gate.ts:73` `enabled !== true`
-			// 是「零 IO / 零审计 / 零写盘」的完全旁路 ⇒ 一旦 enabled 被误关（如整文件重写 config
-			// 丢键），整链静默死亡且**无任何痕迹**，只能靠人偶然发现 frontier 陈旧。
-			// 本心跳把「tick 活着」与「autonomy 是否工作」解耦：心跳停 = 进程/tick 死；
-			// 心跳新但 frontier 旧 = autonomy 被关（可判别，不再与「从未开启」混淆）。
-			// never-throw：写失败不影响唤醒循环。
-			try {
-				writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
-			} catch {
-				/* 心跳永不破坏会话 */
+			// ⚠ R-21 修复（2026-11-05，L4 F1 P1）：心跳**不能**在 owner 门之前无条件写。
+			//
+			// 实测反例（L4 reviewer 用真实 registerWakeLoop→session_start→interval 隔离复现）：
+			//   先写 owner 的 1h 前心跳，再只启动 nonowner 的 wake loop（owner loop 不跑）：
+			//     before: { stale:true, suspectedDisabled:false, heartbeatStale:true }  ← 正确：tick 死
+			//     after : { stale:true, suspectedDisabled:true,  heartbeatStale:false } ← 错误：报「被关」
+			// ⇒ 「owner tick 已停」被显示成「tick 活着，autonomy 很可能被关」。
+			//
+			// `heartbeat.json` 只有**一个槽位**，tmp+rename 只保证单次写入完整，不解决多写者最后覆盖。
+			// 所以：**共享心跳只由 owner 写**（owner 门之后），语义仍是「owner 的 wake 链活着」。
+			// 这不妨碍晚 attach：interval 一直在，下一次 owner 门通过就开始写 + 消费。
+			// 非 owner 会话的存活另有 per-session 心跳（writeNonOwnerTick），不与 owner 槽位混用。
+			// tick 层精判（与旧语义逐字一致，只是从注册层搬下来）
+			const gate = mailboxOwnerEligible(sid);
+			if (gate.eligible) {
+				// 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）：每次 tick 无论后续是否
+				// 被 autonomy 门旁路，都写一份 heartbeat。为什么需要：`gate.ts:73` `enabled !== true`
+				// 是「零 IO / 零审计 / 零写盘」的完全旁路 ⇒ 一旦 enabled 被误关（如整文件重写 config
+				// 丢键），整链静默死亡且**无任何痕迹**，只能靠人偶然发现 frontier 陈旧。
+				// never-throw：写失败不影响唤醒循环。
+				try {
+					writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
+				} catch {
+					/* 心跳永不破坏会话 */
+				}
+			} else {
+				// 非 owner：写 per-session 心跳，只回答「本会话的 timer 活着」，绝不占 owner 槽位
+				try {
+					writeNonOwnerTick({ stateDir: opts.stateDir, sessionId: sid, reason: gate.reason, tickIntervalMs: opts.intervalMs ?? 30_000 });
+				} catch {
+					/* 同上 */
+				}
+				return;
 			}
 			// 2026-10-31 邮箱维护（接上两个一直“写了但没人调”的函数）：
 			//   `expireSweep`  —— 非终态且过 TTL → expired（此前**零调用**，TTL 形同虚设）

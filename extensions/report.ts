@@ -139,6 +139,13 @@ export interface ReportListenerOptions {
 	onReport?: (record: ReportRecord, id: string) => void;
 	/** 完成时 toast（默认 true）。 */
 	toast?: boolean;
+	/**
+	 * tick 兜底周期（ms，缺省 5000）。**只给测试用**：生产下 fs.watch 能即时唤醒，
+	 * 5s tick 只是兼容 Windows 偶发丢事件。测试要验证 tick 链路时不能等 5s（会拖慢套件），
+	 * 但**必须**能调到看得到——否则只能证明「onNewReport 直接调用可用」，
+	 * 不能证明「注册→tick→poll」这条真实接线通（R-21 的缺陷恰恰在注册层）。
+	 */
+	pollIntervalMs?: number;
 }
 
 /** 原子领取「已消费」标记（跨进程/跨实例幂等，根治双 watcher 双注入）。 */
@@ -228,20 +235,30 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 	let interval: ReturnType<typeof setInterval> | null = null;
 	let sessionGen = 0; // gen token：过期周期的排队回调 no-op，绝不用旧 pi
 	pi.on("session_start", (_event, ctx) => {
+		// R-21（2026-11-05）：注册层**只排除子 agent**，不看 owner。
+		// 旧写法在此判 `eligible` 然后 `return` —— 而 session_start 与 attach 是**时序竞争**
+		//（实测 gen14：session_start 15:57:35 / global attach 15:58:01，晚 26s）⇒ watcher/tick
+		// 永不启动 ⇒ 晚到的 attach 永远没机会。owner 判据下沉到 watcher 回调与 tick 内。
+		// L4 F5 指出的既存同类遗漏（`extensions/report.ts:230-239`）。
 		try {
 			if (isSubagent()) return;
-			const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
-			const cut = readCutover();
-			const att = readAttachment(masterAddress());
-			const eligible = cut?.enabled && att
-				? Boolean(sid && sid === att.sessionId)
-				: isMainSession();
-			if (!eligible) return;
 		} catch { /* ctx 不可用 → 不消费（宁可静默） */ }
 		// 捕获当前会话 UUID（回报会话定位的依据）
 		try {
 			setCurrentSessionId((ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId);
-		} catch { /* ctx 不可用则保持 undefined（不消费任何回报，宁可静默） */ }
+		} catch { /* ctx 不可用则保持 undefined */ }
+		const sid = (ctx as { sessionManager?: { sessionId?: string } } | undefined)?.sessionManager?.sessionId;
+		/** tick/watcher 内部用的 owner 精判（与 mailbox-consumer 同一语义，不共享实现以免耦合） */
+		const ownerEligible = (): boolean => {
+			try {
+				const cut = readCutover();
+				const att = readAttachment(masterAddress());
+				if (!(cut?.enabled && att)) return isMainSession();
+				return Boolean(sid && sid === att.sessionId);
+			} catch {
+				return false;
+			}
+		};
 
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen;
@@ -258,8 +275,9 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 			try {
 				watcher = watch(reportsDir, (_event, fileName) => {
 					if (closed()) return;
+					if (!ownerEligible()) return; // R-21：owner 门下沉到回调内
 					if (typeof fileName === "string") {
-						const id = fileName.endsWith(".json") ? fileName.slice(0, -".json".length) : fileName;
+						const id = fileName.endsWith(".json") ? fileName.slice(0, - ".json".length) : fileName;
 						onNewReport(reportsDir, id, fullOpts);
 					}
 				});
@@ -271,8 +289,9 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 		// tick 兜底（Windows fs.watch 偶发丢事件）
 		interval = setInterval(() => {
 			if (closed()) return;
+			if (!ownerEligible()) return; // R-21：owner 门下沉到 tick 内
 			pollNewReports(reportsDir, fullOpts);
-		}, 5000);
+		}, opts.pollIntervalMs ?? 5000);
 		interval.unref?.();
 	});
 
