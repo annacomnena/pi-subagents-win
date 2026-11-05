@@ -660,17 +660,18 @@ export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: 
 	stale: boolean;
 	/** tick 活着但 frontier 不新鲜 ⇒ 最可能是 autonomy 被关（而非进程死）。 */
 	suspectedDisabled: boolean;
-	/**
-	 * 心跳**存在但已陈旧** ⇒ tick/进程死了（R-2 规则 3 的第 ① 态）。
-	 *
-	 * 2026-11-05 事故：本函数原先只表达 ②被关 / ③正常，缺 ①tick 死。
-	 * 真实故障（mailbox 消费链死亡）时心跳文件**还在**（只是停了 46min，周期 30s），
-	 * 于是 `suspectedDisabled = stale && hbFresh = false`、`hb && !stale = false`、
-	 * `!hb && frontier = false`（心跳存在）⇒ 三分支全 false ⇒ 调用方报「诊断：未知」。
-	 * 唯一走得到的「tick 未在跑」分支要求 `!hb`（心跳**完全不存在**），而故障时它还在。
-	 * 详见 AGENTS.md R-20。
-	 */
 	heartbeatStale: boolean;
+	/**
+	 * F3（L4 第二轮）：**心跳时间是否在未来超容差**。
+	 *
+	 * 必须由本函数返回，**不得由调用方重算**：调用方若用原始 `tickIntervalMs`
+	 * （可能是 1e400/1e308/非法值）算容差，就会与这里的归一化 tick 分裂，
+	 * 导致「算子算出 clockSkew=true」而「上层算出 false」⇒ 处于容差外的未来读数被报「正常」。
+	 * L4 实测：`at=now+120s` + `tickIntervalMs=3600001` + 新快照 ⇒ 旧写法报「正常」。
+	 */
+	clockSkew: boolean;
+	/** 归一化后的 tick 周期（ms）；调用方展示请用它，不要用 heartbeat.tickIntervalMs。 */
+	tickMs: number;
 } {
 	// F3（2026-11-05 L4 复验）：**周期也要做有限性校验**。
 	// 旧写法只判 `> 0` ⇒ `tickIntervalMs=1e400`（JSON parse 成 Infinity）或 `1e308`（×3 溢出）
@@ -694,8 +695,8 @@ export function frontierFreshness(snapshot: { asof: number } | null, heartbeat: 
 		//   有心跳且新鲜 ── tick 在跑但从未产出快照 ⇒ 仍然「很可能被关」（旧语义不变）
 		//   有心跳但陈旧 ── tick 死了（①态），不得报「被关」
 		//   无心跳       ── 从未跑过，两标志都 false，由调用方的 `!hb && frontier` 分支处理
-		return { ageMs: null, threshold, stale: true, suspectedDisabled: hbFresh, heartbeatStale };
+		return { ageMs: null, threshold, stale: true, suspectedDisabled: hbFresh, heartbeatStale, clockSkew, tickMs: tick };
 	}
 	const ageMs = Math.max(0, now - snapshot.asof);
-	return { ageMs, threshold, stale: ageMs > threshold, suspectedDisabled: ageMs > threshold && hbFresh, heartbeatStale };
+	return { ageMs, threshold, stale: ageMs > threshold, suspectedDisabled: ageMs > threshold && hbFresh, heartbeatStale, clockSkew, tickMs: tick };
 }

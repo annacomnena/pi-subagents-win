@@ -148,4 +148,30 @@ const snap = (asofMsAgo: number) => ({ asof: NOW - asofMsAgo });
 	ok("N1 算子边界：陈旧心跳不被误当「tick 活着」（owner 比对在 index.ts 层）");
 }
 
+// ── ⑫ F3 第二轮（L4 实反例）：**上层不得自己重算 clockSkew** ──
+// L4 原文：「collect 归一化 tick，index 仍用未校验 tick 判 clockSkew ⇒ 超过容差的未来读数显示正常」。
+// 修法：`frontierFreshness` 直接返回 `clockSkew` / `tickMs`，调用方不得再算。
+// 本用例锁三个字段的一致性 —— 若有人把定时/容差逻辑搬回调用方，这些断言会先红。
+{
+	const cases = [
+		{ skew: 120_000, tick: 3_600_001 },   // 非法大周期 + 超容差未来
+		{ skew: 120_000, tick: Number.POSITIVE_INFINITY }, // Infinity 周期
+		{ skew: 120_000, tick: 1e308 },       // 溢出周期
+		{ skew: 120_000, tick: 30_000 },      // 正常周期 + 超容差未来
+	];
+	for (const c of cases) {
+		const hb = { at: NOW + c.skew, iso: "", pid: 1, sessionId: "s", tickIntervalMs: c.tick };
+		const f = frontierFreshness(snap(10_000), hb, NOW);
+		assert.equal(f.clockSkew, true, `F3②：at=+${c.skew}ms 且 tick=${c.tick} ⇒ clockSkew 必须 true（实际 ${f.clockSkew}）`);
+		assert.equal(f.heartbeatStale, false, "F3②：未来读数不得归入 heartbeatStale");
+		assert.equal(f.suspectedDisabled, false, "F3②：未来读数不得报「被关」");
+		assert.ok(Number.isFinite(f.tickMs) && f.tickMs >= 1_000 && f.tickMs <= 3_600_000, `F3②：tickMs 必须是归一化后的合法值（实际 ${f.tickMs}）`);
+	}
+	// 反例：容差内的微小时钟偏移仍算正常（不得把正常态打成「无法判定」）
+	const inside = frontierFreshness(snap(10_000), { at: NOW + 30_000, iso: "", pid: 1, sessionId: "s", tickIntervalMs: 30_000 }, NOW);
+	assert.equal(inside.clockSkew, false, "F3②：+30s 在 1 tick 容差内，不得判为 clockSkew");
+	assert.equal(inside.heartbeatStale, false);
+	ok("F3② 上层不得重算 clockSkew（算子归一化的 tick/skew 必须一致生效）");
+}
+
 console.log(`\n_test_autonomy_heartbeat_stale_diag: ${pass} checks passed`);

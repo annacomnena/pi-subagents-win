@@ -2995,8 +2995,12 @@ ${notable[0].reason}
 				// 旧写法把 suspectedDisabled / heartbeatStale 排在最前 ⇒ 上一任 owner 留下的陈旧心跳
 				// （交接后完全自然的状态）会被当成「当前 owner tick 活着但被关」或「当前 owner tick 停了」，
 				// 也就是说 hbIsOwner 算了却没接入前两个分支（L4 N1 实测复现）。
+				// F3（L4 第二轮）：clockSkew **必须用算子归一化后的结论**，不得在此重算。
+				// 旧写法用原始 `hb.tickIntervalMs`（可能是 1e400/1e308/非法值）算容差 ⇒
+				// 与 collect 的归一化 tick（回落 30000）分裂 ⇒ `at=now+120s` + `tick=3600001` + 新快照
+				// 会被判 `hasClockSkew=false` 然后走「诊断：正常」（L4 实测复现）。
 				const clockSkewMs = hb ? hb.at - Date.now() : 0;
-				const hasClockSkew = Boolean(hb) && clockSkewMs > Math.max(hb!.tickIntervalMs || 30_000, 60_000);
+				const hasClockSkew = Boolean(hb) && fresh.clockSkew;
 				// 心跳读数是否**可用于归因当前 owner**：存在 + 非未来 + 属于当前 owner
 				const hbAttributable = Boolean(hb) && !hasClockSkew && hbIsOwner;
 				const clockSkewLine = hasClockSkew
@@ -3015,9 +3019,9 @@ ${notable[0].reason}
 							: !hbAttributable
 								? (!hb && frontier ? `⚠️ 诊断：无心跳（读数不存在或无法解析）但 frontier 快照 ${Math.round(Math.max(0, Date.now() - (frontier.asof ?? 0)) / 60_000)}min 前 ⇒ 无法确定 tick 状态（可能是 tick 未跑，也可能是读盘失败）` : "诊断：未知")
 								: fresh.suspectedDisabled
-									? "⚠️ 诊断：owner tick 活着且��份有效，但 frontier 不新鲜 ⇒ **autonomy 很可能被关**（查 enabled 键是否还在 config）"
+									? "⚠️ 诊断：owner tick 活着且心跳读数有效，但 frontier 不新鲜 ⇒ **autonomy 很可能被关**（查 enabled 键是否还在 config）"
 									: fresh.heartbeatStale
-										? `⚠️ 诊断：**owner wake 心跳已 ${Math.round(Math.max(0, Date.now() - hb!.at) / 60_000)}min 未更新**（pid=${hb!.pid} tick=${Math.round(hb!.tickIntervalMs / 1000)}s）⇒ owner wake **心跳未更新**（疑 tick 未注册/停摆，或写盘失败——写心跳是 never-throw，失败不会阻止 tick 后续的维护/唤醒）；**注意这不能证明 mailbox 消费链也停了**（独立 10s interval，需单独用消费证据判）`
+										? `⚠️ 诊断：**owner wake 心跳已 ${Math.round(Math.max(0, Date.now() - hb!.at) / 60_000)}min 未更新**（pid=${hb!.pid} tick=${Math.round(fresh.tickMs / 1000)}s）⇒ owner wake **心跳未更新**（疑 tick 未注册/停摆，或写盘失败——写心跳是 never-throw，失败不会阻止 tick 后续的维护/唤醒）；**注意这不能证明 mailbox 消费链也停了**（独立 10s interval，需单独用消费证据判）`
 										: hb && !fresh.stale ? "诊断：正常（owner tick 活着且快照新鲜）"
 										: "诊断：未知";
 				body = [
