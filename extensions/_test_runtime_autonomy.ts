@@ -886,6 +886,9 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// `readAutonomyHeartbeat`（runtime/autonomy/collect.ts）验证心跳 → 排除
 				//（ALLOW 不动：仍是测试文件、非生产接线点）
 				if (p === join(EXT_ROOT, "_test_mailbox_consumer_owner_timing.ts")) continue;
+				// F4② 回归网（2026-11-05）：直接测 `runtime/autonomy/status-body.ts` 的真实分支 → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点）
+				if (p === join(EXT_ROOT, "_test_autonomy_status_body.ts")) continue;
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}
