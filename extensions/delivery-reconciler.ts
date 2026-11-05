@@ -252,6 +252,12 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 
 		if (decision.action === "fail_delivery") {
 			const inc = publishIncident(opts.deliverDir, event, decision.reason, now);
+			// 2026-11-05（裁定二·第2 条）：写入前复查发现已有 consumed ACK ⇒ 实际送到了。
+			if (inc.suppressed) {
+				appendTrace(opts.deliverDir, { kind: "B-fail-suppressed-by-ack", eventId: event.eventId, runId: run.runId, reason: inc.reason });
+				results.push({ eventId: event.eventId, runId: run.runId, stage: "consumed", action: "none", incidentId: inc.incidentId, dispatched: false });
+				continue;
+			}
 			try { opts.onIncident?.(inc); } catch { /* 出口失败不抹 incident */ }
 			appendTrace(opts.deliverDir, { kind: "B-fail-delivery", eventId: event.eventId, runId: run.runId, reason: decision.reason });
 			results.push({ eventId: event.eventId, runId: run.runId, stage: "failed_delivery", action: "fail_delivery", incidentId: inc.incidentId, dispatched: false });

@@ -511,11 +511,35 @@ export interface IncidentState {
  */
 export function effectiveStageOf(ledger: LedgerState, incident: IncidentState, now: number): StageView {
 	const { event, attempts, acks } = ledger;
+	// ── 2026-11-05 修复（gen14 裁定二·第2 条）：incident **不再无条件压过 ACK** ──
+	//
+	// 旧行为：只要 incident 写过就立即返回 `failed_delivery`，**完全不看 acks**。
+	// 代价（实测分母 442 个交付事件）：
+	//   - 328 个发过 incident（74%）
+	//   - 其中 **14 个在 incident 之后仍收到 consumed ACK** ⇒ 同一事件同时存在
+	//     `fail_delivery` 与 `consumed` 两个矛盾终态
+	//   - 单例：`run_mw3flr49_7d1z` deadline 19:04:49 判死，ACK 19:11:25（晚 6'36"）
+	//
+	// 根因不是「只看 ACK 不看队列」（`stage==="consumed"` 早已短路），而是
+	// `DELIVERY_DEADLINE_MS=60s` 短于真实 ACK 时延 ⇒ incident 在 ACK 到达前就写了。
+	//
+	// 修法（两条独立生效，各自可单测）：
+	//   ① 此处：incident 之后**又来了 consumed ACK** ⇒ ACK 是更强的终态证据（目标真的收到了），
+	//      返回 consumed，让上层不再补投、不再报死。
+	//   ② 调用方：写 incident 之前先复查一次 ACK（堵「复查到写入」之间那个窗口）。
+	const consumedAck = acks.filter((a) => a.stage === "consumed").at(-1);
 	if (incident.incidentId) {
+		// 只有「ACK 晚于 incident」才算翻案 —— ACK 早于 incident 属旧数据矛盾（不该发生，
+		// 但不能把更早的 ACK 当成本次复活证据），保守地仍判 failed_delivery。
+		const incidentAtMs = Date.parse(String(incident.incidentAt ?? ""));
+		const ackAtMs = Date.parse(String(consumedAck?.at ?? ""));
+		const ackAfterIncident = consumedAck && Number.isFinite(ackAtMs) && Number.isFinite(incidentAtMs) && ackAtMs > incidentAtMs;
+		if (ackAfterIncident) {
+			return { stage: "consumed", evidence: `consumed-after-incident:${consumedAck!.evidence}`, lastAt: consumedAck!.at, consumedBy: consumedAck };
+		}
 		return { stage: "failed_delivery", evidence: `incident:${incident.incidentId}`, lastAt: incident.incidentAt };
 	}
-	const consumed = acks.filter((a) => a.stage === "consumed").at(-1);
-	if (consumed) return { stage: "consumed", evidence: `consumed:${consumed.evidence}`, lastAt: consumed.at, consumedBy: consumed };
+	if (consumedAck) return { stage: "consumed", evidence: `consumed:${consumedAck.evidence}`, lastAt: consumedAck.at, consumedBy: consumedAck };
 	const received = acks.filter((a) => a.stage === "received").at(-1);
 	if (received) return { stage: "received", evidence: `received:${received.evidence}`, lastAt: received.at };
 	const last = attempts.at(-1);
@@ -683,11 +707,23 @@ export interface Incident {
 	/** 通知出口重试（5s 起、最长 60s）。 */
 	nextAttemptAt?: string;
 	notifyAttempts?: number;
+	/**
+	 * 2026-11-05（裁定二）：**被抑制的 incident** —— 写入前复查发现已有 consumed ACK，
+	 * 说明这封其实送到了。`true` 表示本对象只是返回值占位，**未写盘**，调用方不得通知。
+	 */
+	suppressed?: boolean;
 }
 
 /**
  * 发布 incident（幂等：同 eventId 已有 incident 则复用，不重复制造）。
  * incident 是**不调用模型的失败出口**（咨询 §6.2）：与 provider 额度无关，必然写盘。
+ *
+ * 2026-11-05（gen14 裁定二·第2 条）：**写之前先复查一次 ACK**。
+ * 原因：`DELIVERY_DEADLINE_MS=60s` 短于真实 ACK 时延（实测单例 6'36"，是 deadline 的 6.6 倍）
+ * ⇒ incident 会在 ACK 到达前就写 ⇒ 同一事件后续又收到 consumed ⇒ **两个矛盾终态**
+ * （实测 442 个事件里 14 个属此形）。
+ * 本复查只能缩小窗口（读→写之间仍有间隙，无锁），**不能消除**；
+ * 消除靠 `effectiveStageOf` 的「ACK 晚于 incident ⇒ 翻案为 consumed」那一半。
  */
 export function publishIncident(dir: string, event: DeliveryEvent, reason: string, now: number): Incident {
 	ensureDir(dir);
@@ -695,6 +731,23 @@ export function publishIncident(dir: string, event: DeliveryEvent, reason: strin
 	if (existing?.incidentId) {
 		const inc = loadIncident(dir, existing.incidentId);
 		if (inc) return inc;
+	}
+	// ── 写前复查 ACK（裁定二·第2 条）──
+	// 已经有了 consumed ACK ⇒ 这封其实送到了，**不该发 incident**。
+	// 注：本函数返回类型是 Incident，无法表达「不发」⇒ 用一个带标记的 incident，
+	// 由调用方（reconcileOnce）在拿到返回值后识别并跳过通知。见返回值的 suppressed 字段。
+	const acksNow = existing ? listAcks(dir, event.eventId) : [];
+	const consumedNow = acksNow.filter((a) => a.stage === "consumed").at(-1);
+	if (consumedNow) {
+		return {
+			incidentId: `inc_suppressed_${event.runId}_${terminalRevisionOrRandom(event)}`,
+			eventId: event.eventId,
+			runId: event.runId,
+			reason: `suppressed:consumed-ack-arrived(reason-was=${reason},ack=${consumedNow.at})`,
+			createdAt: new Date(now).toISOString(),
+			notifyAttempts: 0,
+			suppressed: true,
+		} as Incident;
 	}
 	const incidentId = `inc_${event.runId}_${terminalRevisionOrRandom(event)}`;
 	const incident: Incident = {
@@ -834,6 +887,11 @@ export async function reconcileEvent(
 
 	if (action.action === "fail_delivery") {
 		const inc = publishIncident(dir, event, action.reason, now);
+		// 2026-11-05（裁定二·第2 条）：写入前复查发现已有 consumed ACK ⇒ 实际上送到了。
+		// 不发通知、**也不当 failed_delivery**（否则仍造出矛盾终态）。
+		if (inc.suppressed) {
+			return { eventId: event.eventId, stage: "consumed", action: { action: "none", reason: `suppressed-incident:${inc.reason}` } };
+		}
 		try { opts.onIncident?.(inc); } catch { /* best-effort：出口失败不抹 incident */ }
 		return { eventId: event.eventId, stage: "failed_delivery", action };
 	}

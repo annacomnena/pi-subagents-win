@@ -235,7 +235,8 @@
     "test:trace-fusion-wt-reclaim": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_wt_reclaim.ts",
     "test:mailbox-consumer-owner-timing": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_consumer_owner_timing.ts",
     "test:autonomy-heartbeat-stale-diag": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_heartbeat_stale_diag.ts",
-    "test:autonomy-status-body": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_status_body.ts"
+    "test:autonomy-status-body": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_status_body.ts",
+    "test:delivery-incident-ack-invariant": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_incident_ack_invariant.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
