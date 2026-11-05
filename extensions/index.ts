@@ -463,12 +463,42 @@ export function classifyModelFailure(
 		/(zhipu|glm|智谱|bigmodel)/i.test(message);
 
 	// Explicit package / billing wording (CN + EN + common Zhipu codes)
-	const usageWording =
-		/(用量|额度|套餐|资源包|余量|余额不足|欠费|over.?quota|quota.?exceed|exceeded.{0,40}quota|usage.?limit|limit.?exceed|token.?limit|out of credit|insufficient.?credit|insufficient.?balance|billing|package.?limit|plan.?limit|subscription.?limit|free.?tier|capacity.?exceed|resource.?exhausted|tokens?.{0,20}(用尽|耗尽|上限)|已达上限|到达上限|超出限额|\b1302\b|\b1113\b)/i.test(
+	//
+	// ⚠ 2026-11-05 事故（R-22）：opendesign-go 返回
+	//   `503 {"code":"database_unavailable","message":"resolve Billing Scope: status 503"}`
+	// 其中 `Billing` 被本正则命中 ⇒ 归类 `usage_cap` ⇒ 主 agent 被要求**换模型**
+	// （而换模型救不了后端 DB 不可用，只是换个 endpoint 继续撞），且重试退避被乘
+	// `usageCapMultiplier`（60s/120s）—— 把一个「几秒就自愈」的瞬时故障当成额度耗尽。
+	//
+	// 修法（两层，各自可独立验）：
+	// ① `billing` 不再单独作为额度证据：要求同时有额度词（quota/credit/额度/套餐…），
+	//    或本身就是 429。/ 光一个 `billing` 出现在路径名/服务名里（`resolve Billing Scope`）
+	//    不算额度耗尽。
+	// ② HTTP 5xx **且带 billing/scope 类字样**时优先于额度判定（见下方护栏）。
+	const usageKeyword =
+		/(用量|额度|套餐|资源包|余量|余额不足|欠费|over.?quota|quota.?exceed|exceeded.{0,40}quota|usage.?limit|limit.?exceed|token.?limit|out of credit|insufficient.?credit|insufficient.?balance|package.?limit|plan.?limit|subscription.?limit|free.?tier|capacity.?exceed|resource.?exhausted|tokens?.{0,20}(用尽|耗尽|上限)|已达上限|到达上限|超出限额|\b1302\b|\b1113\b)/i.test(
 			error,
-		) || /\b(quota|credit)\b/i.test(message);
+		);
+	const bareQuotaCredit = /\b(quota|credit)\b/i.test(message);
+	const usageWording = usageKeyword || bareQuotaCredit;
 
 	const is429 = /\b429\b|too many requests|rate.?limit|throttl/i.test(message);
+
+	// ② 5xx **且带额度类字样**（如 `resolve Billing Scope: status 503`）⇒ 额度词不得抢走 5xx。
+	//  这条只在「两者同时出现」时才介入，**不改变任何其它 5xx 的既有归类**
+	//  （如 `504 gateway timeout` 仍走下方 timeout 规则、`502 bad gateway` 仍走 connectionish）。
+	//  额度耗尽的正常表述是 4xx，不会用 5xx 报；带 5xx 的 billing 字样几乎都是服务内部路径/服务名。
+	const http5xx = /\b50[0-4]\b|service unavailable|bad gateway|internal server error/i.test(message);
+	// ② 唯一生效路径：**`billing` 已不算额度证据**（见上方①）。5xx 里出现 `billing`/`resolve scope`
+	//  这类字样是**服务侧路径名/服务名**，不是额度耗尽。保留下面的显式护栏**只为可读性**：
+	//  它不改变结果（`billing` 已不在 usageKeyword 里），但如果有人以后把 `billing` 加回去，
+	//  这条护栏能先挡住 503 一类的最危险形状。
+	//  注：因为它是冗余的，单独回退它**不会**让测试变红——已实测确认；
+	//  完整的旧行为回退（billing 加回 + 删护栏）才会红。这是有意的冗余。
+	const billingish = /billing|resolve.{0,20}scope/i.test(message);
+	if (http5xx && billingish && !is429) {
+		return { retryable: true, kind: "provider_network", label: "PROVIDER_NETWORK" };
+	}
 
 	// Zhipu: exhausted package almost always returns 429 → USAGE_CAP (switch model).
 	if (usageWording || (is429 && isZhipuFamily)) {

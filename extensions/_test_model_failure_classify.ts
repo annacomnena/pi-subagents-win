@@ -65,4 +65,43 @@ function expectClass(error: string, kind: string, retryable: boolean, modelHint?
 	ok("C3 反例自检：未知文本仍为 other/非 retryable（防止「全都可重试」式回归）");
 }
 
+// ── C4（R-22，2026-11-05 真机事故）：opendesign-go 的 503 不得被 billing 字样抢成 USAGE_CAP ──
+//
+// 原报告：
+//   Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable]
+//   resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}
+//
+// 旧行为：`billing` 在 usageWording 正则里 ⇒ 归类 usage_cap ⇒
+//   ① 主 agent 被要求**换模型**（换模型救不了后端 DB 不可用，只是换个 endpoint 继续撞）
+//   ② 重试退避被乘 usageCapMultiplier ⇒ 60s/120s，把一个「几秒自愈」的瞬时故障当成额度耗尽
+{
+	const real = 'Error: 503: {"code":"database_unavailable","message":"[code=database_unavailable] resolve Billing Scope: status 503: database_unavailable","type":"database_unavailable"}';
+	expectClass(real, "provider_network", true);
+	// 同形状变体（不同 code 拼写）
+	expectClass("503 database_unavailable: resolve Billing Scope", "provider_network", true);
+	// 护栏：明确额度词 + 5xx（供应商用 5xx 包额度纸条）**仍按额度**，不被 5xx 护栏抢走
+	expectClass("503 service unavailable: quota exceeded", "usage_cap", true);
+	expectClass("500 internal server error: insufficient credit", "usage_cap", true);
+	// 护栏：未带 billing/scope 字样的 5xx **既有归类零变化**
+	expectClass("504 gateway timeout", "timeout", true);
+	expectClass("502 bad gateway", "provider_network", true);
+	expectClass("503 status code (no body)", "provider_network", true);
+	ok("C4 503 database_unavailable ⇒ provider_network（不是 USAGE_CAP）；其余 5xx 零回归");
+}
+
+// ── C5（R-22 判别力补强）：`billing` 单独出现**不得**算额度凭证 ──
+//
+// 为什么要单独一组：C4 的 503 有**两条**路径能救它（①`billing` 不在额度词表 ② 5xx+billing 护栏），
+// 所以单独回退任何一条，C4 仍会绿 —— 那就测不出“每条护栏各自都在起作用”。
+// 本组用**不带 5xx**的 billing 文本把①单独钉死（护栏管不到它，因为 http5xx=false）。
+{
+	// 不带 5xx 的 billing 文本：只能靠“billing 不算额度词”这条
+	expectClass("failed to resolve Billing Scope for tenant", "other", false);
+	expectClass("billing service unreachable", "other", false);
+	// 反例：真额度词 + billing 同现 ⇒ 仍按额度
+	expectClass("billing: quota exceeded", "usage_cap", true);
+	expectClass("billing: insufficient credit", "usage_cap", true);
+	ok("C5 `billing` 不单独作为额度凭证（真额度词同现时仍按额度）");
+}
+
 console.log(`\n_test_model_failure_classify: all ${n} groups passed`);
