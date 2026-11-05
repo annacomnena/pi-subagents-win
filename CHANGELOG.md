@@ -433,3 +433,14 @@
 - `/sub-models` command: interactive model/fallback/thinking config
 - `workflow-orchestrator` skill: multi-step workflow orchestration (search → plan → review → implement → review → Wiki wrap-up)
 - Windows Toast notifications via `/notify` command
+## 2026-11-06 · searcher 模型路由切到本机 bonsai（委托方指令）
+- 指令原文：「searcher 一直做不完，不妨改成 30001 的 bonsai」。
+- 变更（**read-modify-write 单键**，守 R-1；改前备份 `config.json.bak-searcher-bonsai-*`）：
+  `models.searcher` `opendesigngo/deepseek-v4.1-flash` → **`local-bonsai/bonsai`**（127.0.0.1:30001）；
+  `fallbackModels.searcher` `[opendesigngo/mimo-v4.1-flash]` 旧值 `[opendesigngo/mimo-v2.6-flash]` → **`[lan-199/bonsai]`**（192.168.66.199:6001）。
+- R-1 §4 核对实测：改前 11 顶层键 / 改后 11 顶层键，`json.load` 通过（机制性防护仍未实现，本条为人工遵守记录）。
+- 依据（本仓既有实测，非新猜测）：`plans/20261104_handoff_gen14.md` 记本机 30001 吞吐 189/121/364 tok/s、命中 4,125 tok/s；
+  `plans/20261105_item3_L1.md` 已把 local-bonsai 列为 L1 首选（8315 tok、命中 0、3178/3404）。
+- **未验证/当前限制（如实登记）**：本次改动时实测 `curl http://127.0.0.1:30001/v1/models` **返回空** ⇒ 重启后 30001 的 llama-server 未运行，
+  主选端点暂不可用，searcher 实际将走 fallback `lan-199/bonsai`（实测 `curl http://192.168.66.199:6001/v1/models` 正常返回 `bonsai`）。
+  恢复本机 30001 主选路需**委托方启动该 llama-server**；本仓 agent 未做全盘扫描去找启动命令（R-13 盘根递归扫描守卫拦截）。
