@@ -413,3 +413,80 @@ R-17 说的是「在工作，但产物写到了没人读的地方」—— **同
    （本次已补 `test:trace-fusion-collect-cli-import`，~50ms）。
 4. **测试不覆盖 = 不等于没问题**。看一个改动的验证是否充分，要看
    「这类错误有没有任何测试会红」，而不是「我跑的那几个套件绿了」。
+
+---
+
+## R-20（2026-11-05）：**三态机的注释不算实现**——写进规则的那一态必须真的可达
+
+### 事故
+
+R-2 规则 3 早在 2026-10-17 就写明要区分三态：**①进程/tick 死 ②功能被关 ③正常工作**。
+`frontierFreshness`（`runtime/autonomy/collect.ts`）只实现了 ② 和 ③。缺的 ① 恰恰是本次
+真实故障的形态：
+
+```
+心跳 age = 46min（周期 30s）→ hbFresh=false
+frontier age = 12h          → stale=true
+suspectedDisabled = stale && hbFresh = false
+hb && !stale = false
+!hb && frontier = false     ← 心跳**存在**，只是旧
+⇒ 三分支全 false ⇒ /autonomy status 只报「诊断：未知」
+```
+
+唯一能走到「tick 未在跑」的分支要求 `!hb`（心跳**完全不存在**）。而故障时心跳文件还在，
+只是停了 ⇒ 那条分支永远走不到。
+
+### 规则
+
+1. **每加一条「三态/多态」规则，必须逐态写出一个能演示它的输入。** 缺一态 = 规则没落地。
+2. **「删除类」与「陈旧类」必须分开表达**：`!hb`（从未有过/被删）和 `hb 但旧`（停了）
+   是两种故障，不能让后者被前者遮蔽。
+3. **写了 sessionId 不等于用了它**。同 R-17：产物带身份字段但读方不比对 = 白写。
+4. **诊断文案不得超出证据作用域**（L4 F2 教训）：wake 心跳陈旧只证明「wake tick 没在跳」，
+   不能证明 mailbox 消费链（独立 10s interval）也停了。措辞必须收窄到「这份证据能说明什么」。
+
+---
+
+## R-21（2026-11-05）：**owner 门不得阻塞 interval 注册**——session_start 与 attach 是时序竞争
+
+### 事故（local↔global 通信实际断了 25 小时，无人发现）
+
+```
+主会话（gen14）session_start   11-04 15:57:35
+global attach 写入             11-04 15:58:01   ← 晚 26 秒
+```
+
+`registerMailboxConsumer` / `registerWakeLoop` 在 `session_start` 回调里判：
+
+```ts
+const eligible = cut?.enabled && att ? sid === att.sessionId : isMainSession();
+if (!eligible) return;          // ← interval 永不启动
+interval = setInterval(...);    // ← 唯一启动点，在 return 之后
+```
+
+那一刻 `att` 还是旧值 ⇒ `eligible=false` ⇒ **interval 从没起过**。
+而 attach 之后**没有任何事件重跑这段判定** ⇒ 接管方拿到的是「owner 名义 + 零消费者」。
+
+实测后果（分母 26 封信）：自动 17 / **人工 8** / 无 1。
+自动链最后一次 11-04 10:49，此后全靠人手 ack；一封 RESULT 5.7 小时无人认领。
+
+`extensions/report.ts` 有**同一形状**的既存遗漏（L4 F5 指出），一并修了。
+
+### 规则
+
+1. **注册层只判「身份类型」（子 agent / 非子 agent），不判「当前是不是 owner」。**
+   owner 判定必须在 **tick 内**每次重读——因为 owner 会在会话生命周期中途变化
+   （attach / handoff / cutover 翻转 / 撤销）。
+2. **任何「只在 session_start 判一次」的门都要问：如果条件在第 2 秒才成立，
+   它还会不会被重新求值？** 不会 ⇒ 这就是一个必然的静默死锁。
+3. **interval 必须 unref，但 `fs.watch` 不能 unref** ⇒ 用 `fs.watch` 的模块必须有
+   可靠 `stop()`，且**临时验证脚本必须显式调它**，否则进程永不退出。
+   （本次我因此让一条命令挂了一个多小时——脚本调了 `registerReportListener` 却没 `stop()`。）
+4. **共享槽位只能由「语义上的主体」写。** `heartbeat.json` 是「owner 的 wake 链活着」的
+   唯一槽位；非 owner 写它会覆盖真 owner 的存活信号，把「owner 停了」变成
+   「tick 活着，autonomy 很可能被关」（L4 用真实注册链隔离复现，P1）。
+   非 owner 的存活必须写 **per-session 分文件**，且不被「被关」判据读取。
+5. **测试要过真实注册入口**（`pi.on` 回调 → interval → poll），不能只调内部函数。
+   本次 `report.ts` 的 tick 是 5000ms，测试等 300ms ⇒ **测不到 tick 链路**。
+   故把 `pollIntervalMs` 做成可注入（生产仍 5000ms）。同 R-4：夹具必须贴近真实形状，
+   但也要把「等不到的时间」变成可注入的参数，否则等于没测。
