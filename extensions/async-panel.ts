@@ -26,6 +26,16 @@ export const ASYNC_STATUS_KEY = "subagent-async";
 export interface AsyncPanelRecord {
 	id: string;
 	agent?: string;
+	/**
+	 * 派发时解析的模型（`provider/id` 全名）。由 `index.ts:4650` 写入。
+	 *
+	 * ⚠️ 语义边界（已实测）：`if (!record.model)` 守卫 ⇒ **只写一次**，在派发时。
+	 * `runWithFallback` 换成第二个模型时**不回写** ⇒ 这里看到的是「**最初解析**的模型」，
+	 * 不是 fallback 后的实际值。（`usageEvents` 也补救不了：落盘前被
+	 * `slimRunRecordForDisk()` 清空，实测 53 个 run json 里带 model 的 usageEvent 为 0 个。）
+	 * 要让这里变成「实际模型」必须先补记录，属于派发链改动，不在本次显示层范围。
+	 */
+	model?: string;
 	task: string;
 	status: "running" | "completed" | "failed" | "cancelled";
 	result?: {
@@ -94,6 +104,30 @@ export function shortTaskLabel(task: string): string {
 	return base.length > 36 ? `${base.slice(0, 35)}…` : base;
 }
 
+/**
+ * 模型短名（面板行内展示用）：取 `provider/id` 的最后一段，超长截断。
+ *
+ * 为何取最后一段：完整名最长 32 字符（`opendesigngo/deepseek-v4.1-flash`），
+ * 而 running 行已经有 agent + 36 字任务标签 + runId + age，直接追加全名会爆行。
+ *
+ * ⚠️ 已知代价（显式登记，不是不知道）：只取末段会丢失同源信息 ——
+ * `lan-199/bonsai`、`local-bonsai/bonsai` 都变成 `bonsai`。
+ * 需要区分源时看 `subagent-win({action:"status"})` 的 `Model:` 行（那里是全名）。
+ * 取舍：面板是「扫一眼谁在跑」的概览，不是审计面。
+ */
+export const MODEL_LABEL_MAX_CHARS = 14;
+
+export function shortModelLabel(model: string | undefined | null): string | undefined {
+	if (typeof model !== "string") return undefined;
+	const trimmed = model.trim();
+	if (!trimmed) return undefined;
+	const slash = trimmed.lastIndexOf("/");
+	// 「provider/」 这种尾斜杠形态：末段为空 ⇒ 保留���串（不能返回空字符串）
+	const seg = slash >= 0 && slash < trimmed.length - 1 ? trimmed.slice(slash + 1) : trimmed;
+	if (!seg) return undefined;
+	return seg.length > MODEL_LABEL_MAX_CHARS ? `${seg.slice(0, MODEL_LABEL_MAX_CHARS - 1)}…` : seg;
+}
+
 /** 刷新面板：running 任务列表（widget）+ 摘要（status）。无 UI 时静默。 */
 export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: ExtensionUIContext | null = lastUi): void {
 	if (!ui) return;
@@ -130,6 +164,11 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 			for (const r of running) {
 				const agent = r.agent ?? "subagent";
 				const age = formatAge(r.startedAt);
+				// 模型绑在 agent 上（`searcher[bonsai]: …`）—— 语义是「谁用什么模型」。
+				// 无 model（如 provider 在 resolveCallModel 之前就挂）⇒ 不加方括号，
+				// 不显示「(未知)」：既有行本来就不带模型，空 bracket 只会是噪声。
+				const m = shortModelLabel(r.model);
+				const agentLabel = m ? `${agent}[${m}]` : agent;
 				// 融合者带实时进度（第 N turn + 年龄），其它 subagent 行为不变（无 progressSource）。
 				let prog: string | null = null;
 				if (r.progressSource?.logPath) {
@@ -139,7 +178,7 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 						prog = null; // 进度读不到不得让面板崩
 					}
 				}
-				lines.push(`  ${agent}: ${shortTaskLabel(r.task)} (${r.id} · ${age})${prog ? `\n     ↳ ${prog}` : ""}`);
+				lines.push(`  ${agentLabel}: ${shortTaskLabel(r.task)} (${r.id} · ${age})${prog ? `\n     ↳ ${prog}` : ""}`);
 			}
 		}
 		// 终态区压缩：失败/取消逐条（需要人看），成功只记条数。
@@ -148,8 +187,10 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 		const doneCount = recentlyDone.length - failed.length;
 		for (const r of failed) {
 			const agent = r.agent ?? "subagent";
+			const m = shortModelLabel(r.model);
+			const agentLabel = m ? `${agent}[${m}]` : agent;
 			const err = r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
-			lines.push(`  ✗ ${agent}: ${shortTaskLabel(r.task)} (${r.id})${err}`);
+			lines.push(`  ✗ ${agentLabel}: ${shortTaskLabel(r.task)} (${r.id})${err}`);
 		}
 		if (doneCount > 0) {
 			lines.push(`  ✓ ${doneCount} completed`);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { refreshAsyncPanel, bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, shortTaskLabel, type AsyncPanelRecord } from "./async-panel.ts";
+import { refreshAsyncPanel, bindAsyncPanelUi, clearAsyncPanelUi, notifyAsyncCompletion, shortTaskLabel, shortModelLabel, type AsyncPanelRecord } from "./async-panel.ts";
 
 // P0-1 同款：隔离进程环境（本模块不读 PI_*，但保持测试可移植）
 delete process.env.PI_SUBAGENT;
@@ -109,6 +109,45 @@ const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json
 	// 清空后刷新静默（无 UI 引用），不抛错
 	refreshAsyncPanel();
 	assert.equal(typeof clearAsyncPanelUi, "function");
+}
+
+// ── 模型显示（2026-11-06）：绑在 agent 上 `searcher[bonsai]: …` ──────
+{
+	const ui = makeFakeUi();
+	const d2 = mkdtempSync(join(tmpdir(), "async-panel-model-"));
+	const w2 = (rec: AsyncPanelRecord) => writeFileSync(join(d2, `${rec.id}.json`), JSON.stringify(rec), "utf8");
+	w2({ id: "run_m1", agent: "searcher", model: "local-bonsai/bonsai", task: "调研 X", status: "running", startedAt: new Date(Date.now() - 10_000).toISOString() });
+	w2({ id: "run_m2", agent: "general", model: "opendesigngo/deepseek-v4.1-flash", task: "长任务", status: "running", startedAt: new Date(Date.now() - 5_000).toISOString() });
+	w2({ id: "run_m3", agent: "general", task: "无模型的失败", status: "failed", result: { error: "503" }, startedAt: new Date().toISOString() });
+	refreshAsyncPanel(d2, ui);
+	const lines = ui.widgets.get("subagent-async") ?? [];
+	const joined = lines.join(" | ");
+	assert.ok(joined.includes("searcher[bonsai]"), `模型须绑在 agent 上：searcher[bonsai]（实际：${joined}）`);
+	assert.ok(!joined.includes("local-bonsai/"), "面板只显示短名，不显示 provider 前缀");
+	// 32 字符全名须被截断成 ≤14 字符（含省略号）
+	assert.ok(joined.includes("general[deepseek-v4.1…]"), `超长模型名须截断（实际：${joined}）`);
+	// 无 model 不得出现空方括号
+	assert.ok(!joined.includes("general[]"), "无 model 时不得出现空方括号");
+	assert.ok(joined.includes("✗ general:"), "失败行在无 model 时保持原样（无 bracket）");
+	rmSync(d2, { recursive: true, force: true });
+}
+
+// ── shortModelLabel 纯函数：边界 ──────────────────────────────────
+{
+	assert.equal(shortModelLabel("local-bonsai/bonsai"), "bonsai");
+	assert.equal(shortModelLabel("Zhipu/glm-5.3"), "glm-5.3");
+	assert.equal(shortModelLabel("no-slash-model"), "no-slash-model");
+	assert.equal(shortModelLabel("a/" ), "a/", "尾斜杠不丢成空串");
+	assert.equal(shortModelLabel(""), undefined);
+	assert.equal(shortModelLabel(undefined), undefined);
+	assert.equal(shortModelLabel(null), undefined);
+	assert.equal(shortModelLabel("   "), undefined, "纯空白视为无模型");
+	// 截断：32 字符 → 14 字符（13 + 省略号）
+	const long = shortModelLabel("opendesigngo/deepseek-v4.1-flash");
+	assert.equal(long!.length, 14, `截断后长度须为 14（实际 ${long}）`);
+	assert.ok(long!.endsWith("…"), "截断须带省略号（可见地告知被截）");
+	// provider 前缀同名不同源：这是已知代价，显式断言当前行为（不是「测意外」）
+	assert.equal(shortModelLabel("lan-199/bonsai"), shortModelLabel("local-bonsai/bonsai"), "已知代价：末段相同会失去源信息（面板概览面，非审计面）");
 }
 
 rmSync(dir, { recursive: true, force: true });
