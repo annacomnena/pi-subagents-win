@@ -77,7 +77,6 @@ interface RunMetaLite {
 	runId: string;
 	createdAt: string;
 	status?: string;
-	mode?: string;
 	fusionStatus?: string;
 	/** `true` = fusion 子对象里**确实有** `repair` 字段（值是 null 也算有） */
 	hasRepairField: boolean;
@@ -100,7 +99,6 @@ function readRunMetaLite(runDir: string, runId: string): RunMetaLite | null {
 			runId,
 			createdAt,
 			status: typeof raw.status === "string" ? raw.status : undefined,
-			mode: typeof raw.mode === "string" ? raw.mode : undefined,
 			fusionStatus: typeof fusion?.status === "string" ? (fusion.status as string) : undefined,
 			hasRepairField,
 			repairIsNull: hasRepairField ? (fusion as Record<string, unknown>).repair === null : false,
@@ -116,10 +114,17 @@ function readRunMetaLite(runDir: string, runId: string): RunMetaLite | null {
  *   2. `fusion.status === "completed"`
  *   3. 有 `repair` 字段（缺字段 ⇒ 剔除；**不得**当作 clean）
  *
- * 为什么不要求 `mode === "diagnose"` 作为第 4 条：
- * 实测当前全部 qualified 都是 diagnose，加这条不改变结果；但它会把「将来
- * fusion 在别的 mode 下也产出六节报告」当作不合格 —— 那是**格式门**而非 mode 门。
- * 因此只在 detail 里记录 mode 分布，不用它做筛选。**这是有意放宽，已在测试里登记。**
+ * 为什么刻意**不读** `mode`（连字段都不保留）：
+ * fusion 报告的合格性由**六节格式**决定，与 run 的 `mode` 正交 —— 那是格式门，不是 mode 门。
+ * 实测当前全部 qualified 恰好都是 diagnose，加 mode 门不改变结果，只会把
+ * 「将来别的 mode 也产出合格报告」误判为不合格。
+ *
+ * 若将来要收紧成「只算 diagnose」，必须先给出「别 mode 也产合格报告」的**反例证明**，
+ * 否则属过度收紧（会把合格样本剔出分母 ⇒ 门槛虚高）。
+ *
+ * 注：本条曾写「只在 detail 里记录 mode 分布 / 已在测试里登记」，**两句都没兑现**
+ * （detail 无 mode 字样、测试零 mode 断言），已按 gen14 裁定删除字段与那两句，
+ * 只保留这条口径说明。
  */
 function isQualified(m: RunMetaLite): boolean {
 	if (m.status !== "completed") return false;
