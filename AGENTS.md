@@ -104,6 +104,29 @@
 - **agent 不得自行 push**，除非用户在当次会话明确授权。
 - 提交信息必须含：根因、改了什么、怎么验证、**未闭合项**。
 
+### 7a. 生产 GUI 跑 `gui/dist`（**不入库**）—— 改源码不 build = 没生效（2026-11-10）
+
+**事故**：排查 GUI 的 400 时，一直以为改 `gui/src/**` 就会生效；实测 `gui/dist/assets/*.js`
+的 mtime 停在 **11-05 01:03**，而 host（pid 25588）自签发那刻起读的就是它 ⇒ 改了一个多月前的代码。
+
+**事实**：
+- 生产路径 = daemon 自托管 `gui/dist`（`gui-autostart.ts` 头注释：生产禁 vite）
+- `gui/dist/` 被 `.gitignore:15` 忽略 ⇒ **`git add gui/dist` 会报 "paths are ignored"，那不是错误，是设计**
+- 只有 `npm run gui:dev`（独立 dev profile）走 vite 实时编译
+
+**规则**：
+1. 改 `gui/src/**` 后**必须** `npm run gui:build`，否则 host 仍取旧 bundle。
+2. **验证拿新 bundle（三件事都要）**：
+   ```bash
+   ls -la gui/dist/assets/*.js                 # mtime 必须是本次构建
+   curl -s 127.0.0.1:<hostPort>/ | grep -o 'index-[A-Za-z0-9_-]*\.js'   # index.html 指向的名字
+   curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:<hostPort>/assets/<该名字>.js   # 期望 200
+   ```
+   `hostPort` 从 `~/.pi/agent/runtime/host.json` 的 `port` 读，**不要写死**。
+3. 新 bundle 里必须能 grep 到新逻辑（如 `grep -c "<新文案关键词>" gui/dist/assets/<新名字>.js`）
+   —— 否则「文件重建了但内容没进去」也会骗人。
+4. **不要**把 `dist` 产物入库（已忽略，强加会污染仓库）；重新 clone / 换机器**必须自行 build**。
+
 ### R-7b 同一 provider 连续失败必须冷却 ≥30s（2026-10-17 实测）
 
 **事故**：主会话在 14:56→14:58→14:59→15:00 连续重派 4 个 subagent，四个全 `Connection error`；
