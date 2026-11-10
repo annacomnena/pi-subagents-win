@@ -240,7 +240,8 @@
     "test:non-owner-ticks-gc": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_non_owner_ticks_gc.ts",
     "test:tab-liveness": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness.ts",
     "test:tab-liveness-archive": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_archive.ts",
-    "test:tab-liveness-nospawn": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_nospawn.ts"
+    "test:tab-liveness-nospawn": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_nospawn.ts",
+    "test:trace-fusion-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_gate.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
