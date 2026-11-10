@@ -135,7 +135,7 @@ try {
 		const loop = startDeliveryReconcilerLoop({
 			runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir,
 			intervalMs: 60_000, limit: 50, now: () => clock,
-			resolveDispatcher: (r: string) => (r === runId ? "sess_b_dispatch" : undefined),
+			resolveDispatcher: (r: string) => (r === runId ? "01a1bbbb-0000-0000-0000-000000000002" : undefined),
 		});
 		try {
 			await loop.ready;
@@ -143,7 +143,7 @@ try {
 			// ① 终态 run 被 ensureEvent（B 独立建事件）
 			const ev = listEvents(g.deliverDir, 100).find((e) => e.runId === runId);
 			assert.ok(ev, "E1① 只跑 loop（不加载 watcher）⇒ 终态 run 仍被 ensureEvent");
-			assert.equal(ev!.dispatcherSessionId, "sess_b_dispatch", "派发者来自 links 解析口径（注入点）");
+			assert.equal(ev!.dispatcherSessionId, "01a1bbbb-0000-0000-0000-000000000002", "派发者来自 links 解析口径（注入点）");
 
 			// ② 补投：B 通道 attempt 已记（channel=B），且**没有** A 通道痕迹
 			const attempts = listAttempts(g.deliverDir, ev!.eventId);
@@ -157,7 +157,7 @@ try {
 			// ③ outbox 定向持久唤醒（生产缺省投递路径）确实落盘到派发者
 			const items = outboxItems(g.stateDir);
 			assert.equal(items.length, 1, "E1③ 生产投递 = 向派发者 outbox 写 1 条定向持久唤醒");
-			assert.equal(items[0]!.sessionId, "sess_b_dispatch", "唤醒寻址 = 派发者会话（不是别的会话）");
+			assert.equal(items[0]!.sessionId, "01a1bbbb-0000-0000-0000-000000000002", "唤醒寻址 = 派发者会话（不是别的会话）");
 			assert.ok(items[0]!.text.includes(ev!.eventId), "唤醒正文**必带 eventId 标记**（receiver context 才能 ACK）");
 
 			// ④ 升级：过 deliveryDeadline ⇒ fail_delivery + 持久 incident（不调用模型）
@@ -191,7 +191,7 @@ try {
 		const loop = startDeliveryReconcilerLoop({
 			runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir,
 			intervalMs: 60_000, limit: 50, now: () => NOW + 25_000,
-			resolveDispatcher: (r: string) => (ids.includes(r) ? "sess_e2" : undefined),
+			resolveDispatcher: (r: string) => (ids.includes(r) ? "01a1eeee-0000-0000-0000-00000000ee02" : undefined),
 		});
 		try {
 			await loop.ready;
@@ -233,7 +233,7 @@ try {
 		for (const id of ids) {
 			writeRun(g.runsDir, id, NOW);
 			// 真实 links 账本行（与 A 派发时 `recordLink` 落盘形状一致；env PI_LINKS_PATH 已隔离）
-			writeFileSync(process.env.PI_LINKS_PATH!, `${JSON.stringify({ sessionId: "sess_prod_links", kind: "async", targetId: id, detail: "prod-defaults", at: iso(NOW), pid: process.pid })}\n`, { flag: "a" });
+			writeFileSync(process.env.PI_LINKS_PATH!, `${JSON.stringify({ sessionId: "01a1dddd-0000-0000-0000-0000000dd001", kind: "async", targetId: id, detail: "prod-defaults", at: iso(NOW), pid: process.pid })}\n`, { flag: "a" });
 		}
 		const loop = startDeliveryReconcilerLoop({
 			runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir,
@@ -251,11 +251,11 @@ try {
 		const undiscovered = [...terminals].filter((id) => !discovered.has(id));
 		assert.equal(undiscovered.length, 0, `E2b 生产缺省派发者解析（links）无一漏发现（实得 ${undiscovered.join(",")}）`);
 		assert.equal(evs.length, 2, "E2b 两条终态各建一事件");
-		assert.ok(evs.every((e) => e.dispatcherSessionId === "sess_prod_links"), "E2b 派发者 = links 账本里的 async sessionId（生产口径）");
+		assert.ok(evs.every((e) => e.dispatcherSessionId === "01a1dddd-0000-0000-0000-0000000dd001"), "E2b 派发者 = links 账本里的 async sessionId（生产口径；UUID 形态）");
 		// 生产投递（outbox spool）确实产出定向唤醒，且寻址派发者
 		const items = outboxItems(g.stateDir);
 		assert.equal(items.length, 2, "E2b 生产缺省投递 = outbox 定向唤醒 ×2");
-		assert.ok(items.every((it) => it.sessionId === "sess_prod_links" && it.to === "pi://sess_prod_links"), "E2b outbox 寻址 = 派发者会话地址");
+		assert.ok(items.every((it) => it.sessionId === "01a1dddd-0000-0000-0000-0000000dd001" && it.to === "pi://01a1dddd-0000-0000-0000-0000000dd001"), "E2b outbox 寻址 = 派发者会话地址");
 		// 幂等：再跑一轮不得重复投（dedupeKey 绑 eventId ⇒ item id 稳定）
 		const loop2 = startDeliveryReconcilerLoop({ runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir, intervalMs: 60_000, limit: 50, now: () => NOW + 45_000 });
 		try { await loop2.ready; } finally { loop2.stop(); }
@@ -353,7 +353,7 @@ try {
 			const loop = startDeliveryReconcilerLoop({
 				runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir,
 				intervalMs: 60_000, limit: LIMIT, now: () => NOW + 25_000,
-				resolveDispatcher: (r: string) => (ids.includes(r) ? "sess_e5" : undefined),
+				resolveDispatcher: (r: string) => (ids.includes(r) ? "01a1eeee-0000-0000-0000-00000000ee05" : undefined),
 			});
 			try { await loop.ready; } finally { loop.stop(); }
 			const afterIds = new Set(listEvents(g.deliverDir, 10_000).map((e) => e.runId));
@@ -389,7 +389,7 @@ try {
 				const loop = startDeliveryReconcilerLoop({
 					runsDir: gNeg.runsDir, deliverDir: gNeg.deliverDir, stateDir: gNeg.stateDir,
 					intervalMs: 60_000, limit: LIMIT, now: () => NOW + 25_000,
-					resolveDispatcher: (r: string) => (ids.includes(r) ? "sess_e5_neg" : undefined),
+					resolveDispatcher: (r: string) => (ids.includes(r) ? "01a1eeee-0000-0000-0000-00000000ee99" : undefined),
 				});
 				// 用独立 stateDir 的「首次」语义模拟：读得到的 cursor 恒为 null 时页面恒相同
 				try { await loop.ready; } finally { loop.stop(); }

@@ -98,7 +98,7 @@ try {
 		await reconcileOnce({ runsDir, deliverDir: d2, now: NOW + 1000, resolveDispatcher: () => undefined });
 		assert.equal(listEvents(d2, 100).length, before, "无派发者 ⇒ 不建事件（fail closed）");
 		// 有派发者 ⇒ 建事件
-		await reconcileOnce({ runsDir, deliverDir: d2, now: NOW + 2000, resolveDispatcher: (r) => (r === "run_b3" ? "sess_a" : undefined) });
+		await reconcileOnce({ runsDir, deliverDir: d2, now: NOW + 2000, resolveDispatcher: (r) => (r === "run_b3" ? "01a1aaaa-0000-0000-0000-000000000001" : undefined) });
 		const evs = listEvents(d2, 100).filter((e) => e.runId === "run_b3");
 		assert.equal(evs.length, 1, "有派发者 ⇒ 建事件");
 		ok("B3 fail closed：无派发者不建事件；有派发者才建");
@@ -110,7 +110,7 @@ try {
 		const rd = mkRunsDir("b4");
 		mkRunIn(rd, "run_b4");
 		const deliveries: string[] = [];
-		const common = { runsDir: rd, deliverDir: d, resolveDispatcher: () => "sess_a", deliver: (e: { eventId: string }, a: string) => { deliveries.push(a); return "sent" as const; } };
+		const common = { runsDir: rd, deliverDir: d, resolveDispatcher: () => "01a1aaaa-0000-0000-0000-000000000001", deliver: (e: { eventId: string }, a: string) => { deliveries.push(a); return "sent" as const; } };
 		// ① 终态后 5s（< 20s 首投阈值）⇒ 不投
 		await reconcileOnce({ ...common, now: NOW + 5_000 });
 		assert.equal(deliveries.length, 0, "未到 20s ⇒ B 不补投（让 A 快通道先做）");
@@ -133,7 +133,7 @@ try {
 		mkRunIn(rd, "run_b5");
 		let deliveries = 0;
 		let incidents = 0;
-		const opts = { runsDir: rd, deliverDir: d, resolveDispatcher: () => "sess_a", deliver: () => { deliveries += 1; return "sent" as const; }, onIncident: () => { incidents += 1; } };
+		const opts = { runsDir: rd, deliverDir: d, resolveDispatcher: () => "01a1aaaa-0000-0000-0000-000000000001", deliver: () => { deliveries += 1; return "sent" as const; }, onIncident: () => { incidents += 1; } };
 		await reconcileOnce({ ...opts, now: NOW + 25_000 });
 		const ev = listEvents(d, 100).find((e) => e.runId === "run_b5")!;
 		const lastAttempt = listAttempts(d, ev.eventId).at(-1)!;
@@ -155,7 +155,7 @@ try {
 		const seen: string[] = [];
 		const seenIds = new Set<string>();
 		const opts = {
-			runsDir: rd, deliverDir: d, resolveDispatcher: (r: string) => (r === "run_b6" ? "sess_a" : undefined),
+			runsDir: rd, deliverDir: d, resolveDispatcher: (r: string) => (r === "run_b6" ? "01a1aaaa-0000-0000-0000-000000000001" : undefined),
 			deliver: () => "sent" as const,
 			onIncident: (inc: { eventId: string; reason: string; incidentId?: string }) => { seen.push(inc.reason); if (inc.incidentId) seenIds.add(inc.incidentId); },
 		};
@@ -185,7 +185,7 @@ try {
 		let delivered = 0;
 		await reconcileOnce({
 			runsDir: rd, deliverDir: d, now: NOW + 25_000,
-			resolveDispatcher: () => "sess_a",
+			resolveDispatcher: () => "01a1aaaa-0000-0000-0000-000000000001",
 			deliver: () => { delivered += 1; return "sent" as const; },
 		});
 		const ev = listEvents(d, 100).find((e) => e.runId === "run_b7")!;
@@ -209,7 +209,7 @@ try {
 			const { reconcileOnce } = m;
 			const r = await reconcileOnce({
 				runsDir: ${JSON.stringify(rd)}, deliverDir: ${JSON.stringify(d)}, now: ${NOW + 25_000},
-				resolveDispatcher: () => "sess_a",
+				resolveDispatcher: () => "01a1aaaa-0000-0000-0000-000000000001",
 				deliver: () => "sent",
 			});
 			console.log(JSON.stringify({ pid: process.pid, results: r.results.length, scanned: r.scanned }));

@@ -200,6 +200,7 @@
     "test:mailbox-retry-budget": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_retry_budget.ts",
     "test:mailbox-claimed-sweep": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_claimed_sweep.ts",
     "test:reconciler-owner-session": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_reconciler_owner_session.ts",
+    "test:reconciler-dispatcher-shape": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_reconciler_dispatcher_shape.ts",
     "test:model-failure-classify": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_failure_classify.ts",
     "test:model-retry": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_model_retry.ts",
     "test:gui-composer": "npm run test:gui-composer --prefix gui",

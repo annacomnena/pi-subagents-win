@@ -201,6 +201,9 @@ function writeDeliveryReconcilerState(stateDir: string, state: DeliveryReconcile
  * 与 A 侧 `async-result-watcher.ts::asyncDispatcherFor` **同口径但独立实现**（不 import 该模块
  * ⇒ 结构上不共享 A 的模块级状态；这是咨询 §6.2 的硬要求，不是重复代码的疏忽）。
  */
+/** 会话 id 的 UUID 形态（可达地址的唯一判据）。2026-11-10 与 `makeOutboxDeliver` 共用。 */
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export function resolveDispatcherFromLinks(runId: string, linksPath?: string): string | undefined {
 	try {
 		for (const link of listLinks(linksPath ?? defaultLinksPath())) {
@@ -222,10 +225,30 @@ export function resolveDispatcherFromLinks(runId: string, linksPath?: string): s
 			// 拿不到 `ownerSessionId` ⇒ **返回 undefined**（fail closed）：
 			// 宁可不补投（`reconcileOnce` 会记 incident），也不发一条注定到不了的。
 			// 「不猜」的依据同 `links.ts:22-33` 注释：存量记录没有该字段时「不得事后回填」。
-			if (link.sessionId && link.sessionId.startsWith("tab_")) {
-				return link.ownerSessionId && link.ownerSessionId !== "unknown" ? link.ownerSessionId : undefined;
+			// 【P0 形状校验（2026-11-10 gen14 裁定）】只有 UUID 形态才是**可达**的会话地址。
+			//
+			// `links.jsonl` 的 kind=async `sessionId` 本机实测三种形态（分母 1201）：
+			//   uuid 532 | tab_ 567（96 带 ownerSessionId、471 无）| other 102（如 `test-parallel-async`）
+			//
+			// 旧实现「先匹配先返回」会把 `tab_xxx` / `test-parallel-async` 直接当会话地址 ⇒
+			// 补投写 `to = pi://<脏值>` ⇒ outbox-bridge 的 `it.to === myAddress` 永不成立
+			// ⇒ **静默永停 pending**（delivery 账本完全空白：无 attempt、无 incident）。
+			//
+			// 三条规则，顺序固定：
+			//   1. `tab_` 前缀 ⇒ 有 owner 用 owner（**96 条已靠这条恢复，加校验不能把它回退**），
+			//      无 owner ⇒ **continue**（不 return undefined，后面可能还有正确记录）
+			//   2. 非 UUID 且非 tab_ ⇒ **continue**（`test-parallel-async` 这类假 id）
+			//   3. UUID ⇒ return
+			// 全程不 return undefined 提前退出 —— 「脏在前、正确在后」的列表必须能被跳过
+			// （本测试 ② 就是造这个形状）。
+			const sid = link.sessionId;
+			if (!sid || sid === "unknown") continue;
+			if (sid.startsWith("tab_")) {
+				if (link.ownerSessionId && SESSION_ID_RE.test(link.ownerSessionId)) return link.ownerSessionId;
+				continue;
 			}
-			if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
+			if (!SESSION_ID_RE.test(sid)) continue;
+			return sid;
 		}
 		return undefined;
 	} catch {
@@ -275,7 +298,9 @@ export function makeOutboxDeliver(opts: { stateDir: string }): NonNullable<Recon
 		// （它只认 `pi://<自己的真 sessionId>`）⇒ 静默悬挂。
 		// ⇒ **不写**，返回 `"unreachable"` 让 reconcileOnce 记 incident（不静默）。
 		const targetSid = event.dispatcherSessionId;
-		if (!targetSid || targetSid === "unknown" || targetSid.startsWith("tab_")) {
+		// P0-b 防御（与 resolver 的 SESSION_ID_RE **同一个常量**，防两处漂移）：
+		// 任何非 UUID 形态（`tab_xxx` / `test-parallel-async` / 空 / unknown）都不是可达地址。
+		if (!SESSION_ID_RE.test(targetSid)) {
 			// 不写 outbox（写了也是永停 pending 的僵尸）。
 			// 返回现有词表里的 `failed`：B 补投有上限（`MAX_B_RETRIES_PER_EVENT=2`）⇒ 最多再试 2 次
 			// 就 `exhausted` + incident ⇒ **不静默、也不无限重试**。
