@@ -420,6 +420,48 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 - **手段**：`codegraph explore <符号>` / `read` 目标文件关键行 / `bash` 跑一次复现命令。禁止 searcher 全量搜索。
 - **通过**：假设成立 → 按档位继续（A0 → tab 自执行；A → implementer）。**失效**：升级档位（→B 或 C）并在回复声明升级原因。
 
+### trace-fusion 门槛闸（**校验性核对之前**，2026-11-09 裁定）
+
+**位置**：台在校验性核对**之前**（不是 L2 之前）。
+理由：fusion 产物是三路独立诊断，它替代的是「检索与假设验证」，不是「计划」。
+放 L2 之前会让 A0/A 档（本就跳过检索）白等一个 45min × 3 lane 的 rollout。
+
+**判定入口**：`extensions/trace-fusion/gate.ts::evaluateFusionGate()`——纯函数、
+只读 `meta.json`、不跑 fusion、零副作用。门槛口径：
+> 最近 5 个 qualified run 中 ≥4 个 `repair: null`（= **首轮六节齐全**，**不是**「融合质量」）
+> qualified = 排除 cancelled / abandoned / 未进融合阶段的 run；分母不足 5 不阻断
+
+**三态行为（**不是两类**——「不阻断」≠「允许用」）**
+
+| verdict | 是否用 fusion 作输入 | 是否阻断链条 | 计划里必须写 |
+|---|---|---|---|
+| `pass` | **用**（三路诊断作校验性核对的输入） | 不阻断 | 原样记录 `detail`（含 examined/clean） |
+| `not-yet` | **不用**（回落常规检索） | **不阻断** | 「fusion 门槛未达（clean M/5），本轮不启用」 |
+| `insufficient-sample` | **不用**（回落常规检索） | **不阻断** | 「fusion 样本不足（examined N/5），不启用」 |
+
+**三条硬约束**
+
+1. **只有 `pass` 才真的把 fusion 产物喂进去**。`not-yet` / `insufficient-sample` 一律
+   降级为常规检索，并**在计划里具名记录**。静默降级违反 R-2。
+2. **A0 / A 档绝不白等**：若本档自评为 A0 或 A，且不确定是否值得跑 fusion，
+   默认 **不跑**（fusion 成本 45min × 3 lane，远高于自执行/快链的检索成本）。
+   只有档位自评为 C，或 B 且缺验收标准时，才允许因「检索与假设验证成本高」而跑。
+3. **假设可验证则不跑**：若 `codegraph` / `read` 能直接确认关键事实，
+   不需要三路独立诊断 ⇒ 不启用 fusion（即使门槛 `pass`）。
+
+**具名未闭合（必须随本闸一直带着）**
+
+- ⚠️ **本闸当前是「文档约束」，零代码强制**：`evaluateFusionGate()` 在生产代码里
+  **无任何调用方**（`grep -rn evaluateFusionGate extensions/ | grep -v gate.ts` 只命中定义与测试）。
+  也就是说：这条闸靠的是 tab 启动时**读本文件并自觉执行**，而不是代码拦截。
+  这与 R-17「写进去了 ≠ 看得见」同族 —— 一个没接消费端的产出等于不存在。
+  **接线（真正的调用点）未做**，登记为未闭合；下次改 adaptive 编排方时必须补。
+- `not-yet` 分支**线上覆盖率为 0**（穷举 19 个 run：`repair` 非 null 只有 1 个，且它
+  `fusion.status=failed` ⇒ 不 qualified）。该分支仅由测试夹具覆盖（`test:trace-fusion-gate` 用例③）。
+  真机复现路径存在（`fusion-dispatch.ts` 的 repair 分支：primary failed 且 gaps 非空 ⇒
+  补写一轮且成功），但尚未观测到。**接线验收必须含 `not-yet` / `insufficient-sample` 的实测降级读数**，
+  不许只验 `pass`。
+
 ### 档位 A0：自执行快链（tab 自己干活 + 事件驱动咨询）
 
 **定位**：把 A 档的「项目经理纯委派」放宽为「松执行、死审查」——小任务下交接税（重写交接材料、subagent 重新读文件）比实现本身更贵，且主会话上下文里的细粒度信息在 handoff 中会衰减。A0 让 tab 直接实现，但**独立审查与审计链不省**。
