@@ -10,6 +10,8 @@
 import { create } from "zustand";
 import { api, newCommandKey, type ConnState, type FetchErr } from "./api/client";
 import { applyTranscriptOp } from "./api/transcript";
+// 【P2 2026-11-10】`describeHttpFailure` 是**值**（函数），不能放进 `import type` 块
+import { describeHttpFailure } from "./api/types";
 import type {
 	AttentionItem,
 	ChatOutboxEntry,
@@ -609,7 +611,10 @@ export const useGui = create<GuiState>((set, get) => ({
 			set({
 				chatOutbox: {
 					...get().chatOutbox,
-					[commandKey]: { ...cur, status: "failed", detail: r.status === 401 ? "未授权（401）" : `网络/服务错误（${r.status}）`, at: new Date().toISOString() },
+					// 【P2 2026-11-10】原实现只印状态码（`网络/服务错误（${r.status}）`），把服务端
+					// **已经返回**的 `reason` / `hint` / `error` 全丢了 —— 这正是用户看到 400
+					// 却无法定位的第三层原因。`r.body` 由 `fetchJson` 原样带回（`api/client.ts:100`）。
+					[commandKey]: { ...cur, status: "failed", detail: describeHttpFailure(r.status, r.body), at: new Date().toISOString() },
 				},
 			});
 			return;

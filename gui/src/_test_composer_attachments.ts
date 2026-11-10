@@ -23,6 +23,8 @@ import {
 	attachmentIds,
 	canSendMessage,
 	candidatesFrom,
+	SERVER_TEXT_MAX_BYTES,
+	utf8ByteLength,
 	applyOversizePaste,
 	formatBytes,
 	isAcceptedImage,
@@ -96,6 +98,51 @@ ok("② pickAttachments：接收/逐条理由/先到先得");
 	assert.equal(canSendMessage("", [done("up_a"), done(null)]), false, "一张未完成即不发");
 }
 ok("③ canSendMessage：空文本+图可发 / 未传完不发");
+
+// ③b 【P2 2026-11-10】UTF-8 字节闸门（事故：前端按字符 8000、服务端按字节 8000，纯中文差 3 倍）
+{
+	assert.equal(utf8ByteLength("abc"), 3, "ASCII 1 字节/字");
+	assert.equal(utf8ByteLength("中文"), 6, "中文 3 字节/字");
+	assert.equal(utf8ByteLength("😀"), 4, "emoji 4 字节");
+
+	const c2666 = "测".repeat(2666); // 7998 字节
+	const c2667 = "测".repeat(2667); // 8001 字节
+	assert.equal(utf8ByteLength(c2666), 7998, "2666 汉字 = 7998 字节");
+	assert.equal(utf8ByteLength(c2667), 8001, "2667 汉字 = 8001 字节");
+	assert.equal(canSendMessage(c2666, []), true, "7998 字节 ≤ 8000 ⇒ 可发");
+	assert.equal(canSendMessage(c2667, []), false, "8001 字节 > 8000 ⇒ 不发（原实现会静默拿 400）");
+
+	const a8000 = "a".repeat(8000);
+	const a8001 = "a".repeat(8001);
+	assert.equal(canSendMessage(a8000, []), true, "ASCII 8000 字节 ⇒ 可发");
+	assert.equal(canSendMessage(a8001, []), false, "ASCII 8001 字节 ⇒ 不发");
+	assert.equal(SERVER_TEXT_MAX_BYTES, 8000, "常量与服务端同值");
+	assert.equal(DRAFT_MAX_CHARS, 8000, "字符常量保留（仅粘贴截断提示用）");
+}
+ok("③b UTF-8 字节闸门：中文 2666/2667、ASCII 8000/8001 边界");
+
+// ③c 【P2 2026-11-10】store 展示服务端 error（原实现只印状态码）
+{
+	const types = readFileSync(new URL("./api/types.ts", import.meta.url), "utf8");
+	assert.ok(types.includes("export function describeHttpFailure"), "describeHttpFailure 已导出（值，不是 type）");
+	const store = readFileSync(new URL("./store.ts", import.meta.url), "utf8");
+	assert.ok(store.includes("describeHttpFailure(r.status, r.body)"), "store 用它构造 detail");
+	assert.ok(!store.includes('detail: r.status === 401 ? "未授权（401）" : `网络/服务错误'), "旧的 detail 表达式已移除（注释里的原文不算）");
+	const chat = readFileSync(new URL("./pages/ChatPage.tsx", import.meta.url), "utf8");
+	// 判别力关键（R-22 第 5 条）：不能只断言「符号存在」——变异把 `if (textBytes > …)` 改成 `if (false)`
+	// 时符号仍在。必须断言**比较表达式本体**存在，且 `setAttachHint` 真在该分支内被调用。
+	assert.ok(
+		/if \(textBytes > SERVER_TEXT_MAX_BYTES\)/.test(chat),
+		"ChatPage 的字节闸门比较式存在（不是恒假桩）",
+	);
+	{
+		const i = chat.indexOf("if (textBytes > SERVER_TEXT_MAX_BYTES)");
+		const seg = chat.slice(i, i + 400);
+		assert.ok(seg.includes("setAttachHint"), "该分支内必须给显式提示（不静默）");
+		assert.ok(seg.includes("未发出任何内容"), "提示文案要说清「没发出去」");
+	}
+}
+ok("③c store 展示服务端 error（接线断言）");
 
 // ④ attachmentIds 过滤 + 文案
 {

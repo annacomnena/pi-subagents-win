@@ -630,6 +630,31 @@ export type StreamServerFrame =
 // ── G6-P2：session.message 两段回执（runtime/message-outbox.ts + journal 事件 payload 手抄）──
 
 /** 会话页发送状态（POST accepted → pending；WS outbox 事件推进终态；expired = TTL 过期）。 */
+/**
+ * 【P2 2026-11-10】把 HTTP 失败翻成**带服务端原因**的人话。
+ *
+ * 背景（事故）：原实现 `网络/服务错误（${status}）` 只印状态码，而服务端早已在响应体里
+ * 回了 `{"status":"rejected","reason":"invalid-payload","hint":"..."}`（或 transport 层的
+ * `{"error":"invalid-json","hint":"..."}`）—— 三个字段全被丢。用户因此只能拿到一句
+ * 无法定位的“网络/服务错误（400）”。
+ *
+ * 字段优先级：`reason`（executor 词表）→ `error`（commands.ts 解析层词表）→ `hint` → 无语。
+ * 401 保留旧文案（鉴权失败不该把服务端原句抛给用户）。
+ */
+export function describeHttpFailure(status: number, body: unknown): string {
+	if (status === 401) return "未授权（401）";
+	const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : null;
+	const reason = typeof rec?.reason === "string" ? rec.reason : undefined;
+	const error = typeof rec?.error === "string" ? rec.error : undefined;
+	const hint = typeof rec?.hint === "string" ? rec.hint : undefined;
+	const why = reason ?? error;
+	if (why !== undefined) {
+		return `发送被拒（${status}）：${why}${hint !== undefined ? ` — ${hint}` : ""}`;
+	}
+	if (hint !== undefined) return `发送被拒（${status}）：${hint}`;
+	return `网络/服务错误（${status}）`;
+}
+
 export interface ChatOutboxEntry {
 	commandKey: string;
 	sessionId: string;

@@ -102,6 +102,9 @@ export function candidatesFrom(files: FileListLike): FileLike[] {
 /** 发送闸门：有文字或有（已上传完成的）附件即可发；附件未传完 ⇒ 不可发。 */
 export function canSendMessage(text: string, attachments: AttachmentItem[]): boolean {
 	if (attachments.some((a) => a.uploadId === null)) return false;
+	// 【P2 2026-11-10】超字节上限也**不可发**（否则必得 400）。显式提示由调用方给（`send` 里）。
+	// 无附件时正文必须有内容；有附件时允许空正文（粘图直接回车是正常用法）。
+	if (utf8ByteLength(text) > SERVER_TEXT_MAX_BYTES) return false;
 	return text.trim().length > 0 || attachments.length > 0;
 }
 
@@ -120,8 +123,31 @@ export function attachmentIds(attachments: AttachmentItem[]): string[] {
 // （微信/QQ 截图、跨应用复制图片）只把图放在 `clipboardData.items` 里 ⇒ files 为空
 // ⇒ 不 preventDefault、不接收、**也不提示** = 完全静默（AGENTS R-2 同形状）。
 
-/** 输入框正文上限（与服务端 `session.message` 的 8000 一致；超限必须显式提示，不静默截断）。 */
+/** 输入框正文上限（**字符**；仅用于粘贴截断提示，**不是发送闸门**）。 */
 export const DRAFT_MAX_CHARS = 8000;
+
+/**
+ * 【P2 2026-11-10】服务端 `session.message` 的正文上限（**UTF-8 字节**，与
+ * `extensions/runtime/command-executor.ts:295` `SESSION_MESSAGE_TEXT_MAX_BYTES` 同值）。
+ *
+ * 为什么必须分开两个常量（事故）：`DRAFT_MAX_CHARS=8000` 按 JS `.length`（UTF-16 码元）算，
+ * 而服务端按 **UTF-8 字节**算 —— 纯中文时 **差 3 倍**（8000 字 = 24000 字节）。
+ * 实测边界：中文 2666 字（7998 字节）通过、2667 字（8001 字节）400；
+ * ASCII 8000 字节通过、8001 字节 400 ⇒ **严格按字节**，与字符数无关。
+ * 后果：用户能打进 8000 字，服务端只收 2666 字，中间 5334 字**无任何提示**就拿到 400。
+ */
+export const SERVER_TEXT_MAX_BYTES = 8000;
+
+/** UTF-8 字节数（与服务端同口径；`TextEncoder` 不可用时按 code point 估算）。 */
+export function utf8ByteLength(s: string): number {
+	if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(s).length;
+	let n = 0;
+	for (const ch of s) {
+		const cp = ch.codePointAt(0) ?? 0;
+		n += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+	}
+	return n;
+}
 
 /** `DataTransferItem` 的最小可用形状（只取我们需要的两个成员，便于 Node 侧造假对象测试）。 */
 export interface ClipboardItemLike {

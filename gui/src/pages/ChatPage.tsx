@@ -45,6 +45,9 @@ import {
 	canSendMessage,
 	candidatesFrom,
 	applyOversizePaste,
+	// 【P2 2026-11-10】按 UTF-8 字节的发送闸门（与服务端同口径）
+	SERVER_TEXT_MAX_BYTES,
+	utf8ByteLength,
 	formatBytes,
 	pickAttachments,
 	pickPastePlan,
@@ -1160,6 +1163,17 @@ export function ChatPage() {
 
 	const send = async (): Promise<void> => {
 		const text = draft.trim();
+		// 【P2 2026-11-10】超字节上限时给 **显式人话提示**，不静默失败、也不让用户拿到「网络/服务错误（400）」。
+		// 必须在 `canSendMessage` 之前判：后者只回答「能不能发」，不回答「为什么不能」。
+		const textBytes = utf8ByteLength(text);
+		if (textBytes > SERVER_TEXT_MAX_BYTES) {
+			setAttachHint(
+				`正文 ${textBytes.toLocaleString()} 字节超出上限 ${SERVER_TEXT_MAX_BYTES.toLocaleString()}（中文约 3 字节/字，约 ${Math.floor(
+					SERVER_TEXT_MAX_BYTES / 3,
+				)} 个汉字），请删减后再发；未发出任何内容`,
+			);
+			return;
+		}
 		if (activeId === null || !canSendMessage(draft, attachments)) return;
 		// 斜杠命令（2026-10-20）：`/name args` 走 session.slash 通道（正文原样交给 pi）。
 		// 为什么不让它当普通消息发：pi 的 prompt() 对 `/` 开头文本会先试命令
