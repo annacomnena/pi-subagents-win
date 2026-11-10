@@ -205,6 +205,26 @@ export function resolveDispatcherFromLinks(runId: string, linksPath?: string): s
 	try {
 		for (const link of listLinks(linksPath ?? defaultLinksPath())) {
 			if (link.kind !== "async" || link.targetId !== runId) continue;
+			// 【2026-11-10 B 类修复，gen14 实测 7 条 pending + 47.2% async link 是 tab 形态】
+			//
+			// tab 会话的 `sessionId` 记的是 **tabRunId**（`tab_xxx`，历史口径不动），真实 pi 会话 UUID
+			// 另记在 `ownerSessionId`（`index.ts:4534-4536` 双身份，additive）。
+			//
+			// 旧实现只读 `sessionId` ⇒ `dispatcherSessionId = "tab_xxx"` ⇒ B 补投写
+			// `to = pi://tab_xxx`，而 outbox-bridge 的 filter 是
+			// `it.to === piSessionAddress(自己的**真** sessionId)`（`outbox-bridge.ts:288/350`，
+			// 那里读的是 `ctx.sessionManager.sessionId`，**不看 PI_TAB_RUN_ID**）
+			// ⇒ **永不匹配 ⇒ 永停 pending**，且 `events=0 / receipt=0`（桥连 claimInjection 都没走到）。
+			// 症状是「静默悬挂」，日志零痕迹 —— 只能靠 outbox 项数发现。
+			//
+			// 修法：**仅当 `sessionId` 是 `tab_` 形态**时优先用 `ownerSessionId`。
+			// 非 tab 场景行为**逐字节不变**（避免动既有口径，见 `_test_reconciler_owner_session` ②）。
+			// 拿不到 `ownerSessionId` ⇒ **返回 undefined**（fail closed）：
+			// 宁可不补投（`reconcileOnce` 会记 incident），也不发一条注定到不了的。
+			// 「不猜」的依据同 `links.ts:22-33` 注释：存量记录没有该字段时「不得事后回填」。
+			if (link.sessionId && link.sessionId.startsWith("tab_")) {
+				return link.ownerSessionId && link.ownerSessionId !== "unknown" ? link.ownerSessionId : undefined;
+			}
 			if (link.sessionId && link.sessionId !== "unknown") return link.sessionId;
 		}
 		return undefined;
@@ -248,8 +268,36 @@ export function makeOutboxDeliver(opts: { stateDir: string }): NonNullable<Recon
 		const dedupeKey = `delivery-reconciler:${event.eventId}`;
 		const id = outboxItemId(dedupeKey);
 		const dir = outboxDir(opts.stateDir);
+		// 【2026-11-10 B 类修复】补投地址必须可被接收端识别 —— 否则写进去也是永停 pending。
+		//
+		// 目标地址 = `piSessionAddress(event.dispatcherSessionId)`。若 dispatcher 仍是
+		// `tab_xxx`（解析失败/存量事件），outbox-bridge 的 filter 永不匹配
+		// （它只认 `pi://<自己的真 sessionId>`）⇒ 静默悬挂。
+		// ⇒ **不写**，返回 `"unreachable"` 让 reconcileOnce 记 incident（不静默）。
+		const targetSid = event.dispatcherSessionId;
+		if (!targetSid || targetSid === "unknown" || targetSid.startsWith("tab_")) {
+			// 不写 outbox（写了也是永停 pending 的僵尸）。
+			// 返回现有词表里的 `failed`：B 补投有上限（`MAX_B_RETRIES_PER_EVENT=2`）⇒ 最多再试 2 次
+			// 就 `exhausted` + incident ⇒ **不静默、也不无限重试**。
+			// 为什么不新增 `unreachable` 状态：`AttemptStatus` 的消费方横跨
+			// `delivery-ledger` / `delivery-reconciler` / `interactions` 三处，扩词表的扩散面不需要。
+			return "failed";
+		}
+		const targetTo = piSessionAddress(targetSid);
 		const existing = readOutboxItem(dir, id);
 		if (existing !== null) {
+			// 【2026-11-10 存量迁移】幂等命中时，若该项仍 `pending` 且地址是旧的（`pi://tab_xxx`
+			// 或与当前算出的一致），**就地修正 `to`/`sessionId`** —— id 与 dedupeKey 由
+			// `eventId` 派生、**不参与修正** ⇒ 身份不变、不新增 item、不会造成第二次注入。
+			// 这是已写进盘子的 7 条悬挂项的唯一无痛恢复路径（删建会丢幂等键）。
+			// 已终态项一律不碰（防回滚成 pending ⇒ 重复注入）。
+			if (existing.status === "pending" && (existing.to !== targetTo || existing.sessionId !== targetSid)) {
+				const repaired = { ...existing, to: targetTo, sessionId: targetSid, updatedAt: new Date().toISOString() };
+				try {
+					const fresh = readOutboxItem(dir, id);
+					if (fresh !== null && fresh.status === "pending") writeOutboxItem(dir, repaired);
+				} catch { /* best-effort */ }
+			}
 			// 已存在 ⇒ 幂等命中：**不重写（不重复注入）**。
 			// P-3 例外：若该项仍 `pending`（小会话侧还没被桥消费）且这是第 ≥2 次补投，
 			// 把正文换成带「第 N 次补投（第 N-1 次未确认）」的版本 —— 不新增 item（项数不变）、
@@ -273,8 +321,8 @@ export function makeOutboxDeliver(opts: { stateDir: string }): NonNullable<Recon
 		writeOutboxItem(dir, newOutboxItem({
 			dedupeKey,
 			commandKey: id,
-			to: piSessionAddress(event.dispatcherSessionId),
-			sessionId: event.dispatcherSessionId,
+			to: targetTo,
+			sessionId: targetSid,
 			text: buildReconcileWakeBody(event, retryOrdinal),
 			now: new Date(),
 		}));
