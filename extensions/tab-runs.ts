@@ -111,6 +111,9 @@ export interface TabStatus {
 		| "completed"
 		| "failed"
 		| "cancelled"
+		/** 曾活着但现在死了（pid 探活失败 + 心跳超龄，或 pid 被复用）。
+		 *  **不进任何归档终态集合** —— 见 `TERMINAL_PHASES` 处的注释。 */
+		| "stale"
 		| "orphaned"
 		| "unconfirmed";
 	/** 当前回合：working / idle / error / unknown。 */
@@ -525,7 +528,8 @@ export function listTabResults(runsDir: string): string[] {
 /** 标签页生命周期状态（由标签页进程遥测写入）。 */
 export interface TabState {
 	id: string;
-	phase: "attached" | "working" | "waiting" | "completed" | "failed" | "cancelled" | "orphaned";
+	/** `stale`：曾活着但已被读侧判死（见 `tabLivenessVerdict`）。不影响归档集合。 */
+	phase: "attached" | "working" | "waiting" | "completed" | "failed" | "cancelled" | "stale" | "orphaned";
 	turn: "working" | "idle" | "error" | "unknown";
 	/** 只有显式终态信号才为 true。 */
 	terminal: boolean;
@@ -791,7 +795,7 @@ export function validateTabState(raw: unknown): { ok: boolean; errors: string[];
 	const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
 	if (!str(record.id)) errors.push("id required");
 	const phase = str(record.phase);
-	if (!phase || !["attached", "working", "waiting", "completed", "failed", "cancelled", "orphaned"].includes(phase)) {
+	if (!phase || !["attached", "working", "waiting", "completed", "failed", "cancelled", "stale", "orphaned"].includes(phase)) {
 		errors.push(`phase invalid: ${String(phase)}`);
 	}
 	const turn = str(record.turn);
@@ -898,13 +902,18 @@ export function buildTabStatusView(
 	runsDir: string,
 	runId: string,
 	sessionsRoot: string = defaultSessionsRoot(),
+	opts: { probeLiveness?: boolean } = {},
 ): TabStatusView {
 	const dispatch = readTabDispatch(runsDir, runId);
 	const state = readTabState(runsDir, runId);
 	const result = readTabResultFile(runsDir, runId);
 	const probe = dispatch ? (probeSessionsForDispatch(dispatch, sessionsRoot)[0] ?? null) : null;
 	// P1-1：透传 dispatchedAt 供 orphaned grace 判定
-	return composeTabStatus({ runId, dispatch, state, result, probe, dispatchedAt: dispatch?.dispatchedAt });
+	// probeLiveness 影响第 2 段（state-file）的存活判定；缺省 true（精确查询路径）。
+	return composeTabStatus({
+		runId, dispatch, state, result, probe, dispatchedAt: dispatch?.dispatchedAt,
+		...(opts.probeLiveness !== undefined ? { probeLiveness: opts.probeLiveness } : {}),
+	});
 }
 
 // ── 组合判态：dispatch + state + result + probe 汇总 ────────────────
@@ -938,6 +947,11 @@ export function composeTabStatus(opts: {
 	probe: SessionProbe | null;
 	/** P1-1：orphaned grace 判定所需（由 buildTabStatusView 透传 dispatch.dispatchedAt）。 */
 	dispatchedAt?: string;
+	/**
+	 * 是否在本次 compose 里做存活判定（含 pid 复用检查，会 spawn PowerShell ~1-2s）。
+	 * 缺省 true（精确查询路径）。**列表视图必须传 false**（557 个会卡死，见 V5）。
+	 */
+	probeLiveness?: boolean;
 	graceMs?: number;
 	now?: number;
 }): TabStatusView {
@@ -982,21 +996,33 @@ export function composeTabStatus(opts: {
 	}
 
 	// 2) 标签页遥测状态
+	//
+	// 2026-11-09（断点 3）：此前**直接返回 state.phase 字面值**，完全不探活 ⇒
+	// 340 个死账本（心跳超龄数天~数月、pid 探活全失败）在 tab-status 里仍报 working/waiting。
+	// 现在叠加存活判定：stale 时 phase 改报 `stale`（**不是** completed/failed/cancelled/
+	// orphaned 中的任何一个 —— 那四个会触发 archiveStaleTabRuns 搬走账本 ⇒ steer 丢消息）。
+	//
+	// `unknown` 时保持原 phase（保守：拿不到证据不改变报告）。
 	if (state) {
+		// 精确查询路径 ⇒ 允许查 OS 启动时间（tab-status 单个 runId 调用，成本可忽略）
+		const v = tabLivenessVerdict(state, { probePidStart: opts.probeLiveness !== false });
+		const staleNow = v.verdict === "stale" && state.terminal !== true;
 		return {
 			runId,
 			dispatch,
 			state,
 			probe,
 			result: undefined,
-			phase: state.phase,
-			turn: state.turn,
+			phase: staleNow ? "stale" : state.phase,
+			turn: staleNow ? "idle" : state.turn,
 			terminal: state.terminal,
 			resultMissing: true,
 			lastAssistantText: state.lastAssistantText,
 			usage: state.usage,
 			source: "state-file",
-			note: state.terminal ? undefined : "no explicit result yet",
+			note: staleNow
+				? `STALE（判死依据：${v.reason}）；账本原地保留，可 steer 但会被拒绝`
+				: state.terminal ? undefined : "no explicit result yet",
 		};
 	}
 
@@ -1070,10 +1096,241 @@ function readArchivedTabDispatch(runsDir: string, runId: string): TabDispatchRec
 	}
 }
 
-/** state 是否「活着」：存在且 phase 非终态（attached/working/waiting）。 */
-function stateAlivePhase(state: TabState | null): boolean {
+/**
+ * 心跳周期（ms）。与 `tab-runs-runtime.ts:258` 的写入端**必须同值**。
+ * 为什么放这里：判活阈值 = `3 * 这个值`，写死 90000 会让「周期改成 60s 后判据静默变严」。
+ * 两端同为 30s 时有测试锁（`_test_tab_liveness.ts` 比对写入端默认值）。
+ */
+export const TAB_HEARTBEAT_MS = 30_000;
+
+/** 判死阈值：3 个心跳周期（与 `heartbeatAt` 字段注释里的「>90s」逐字一致）。 */
+export const TAB_STALE_AFTER_MS = 3 * TAB_HEARTBEAT_MS;
+
+/** 判活结论。`reason` 直接作为 `tab-steer` 的拒绝理由，因此必须可读、可区分。 */
+export type TabLivenessVerdict =
+	| { verdict: "alive"; reason: string; evidence: { pidAlive: boolean; heartbeatAgeMs: number } }
+	| { verdict: "stale"; reason: string; evidence: { pidAlive: boolean; heartbeatAgeMs: number } }
+	| { verdict: "unknown"; reason: string; evidence: { pidAlive: boolean | null; heartbeatAgeMs: number | null } };
+
+/**
+ * tab 存活判定（读侧，**只读不写、零副作用**）。
+ *
+ * ## 判据（三层，两个独立证据同向才算死）
+ *
+ * ```
+ * stale ⇔ (pid 探活失败 ∧ 心跳超龄)
+ *       ∨ (pid 探活成功 ∧ OS 启动时间晚于最后一次心跳)   ← pid 复用
+ * ```
+ *
+ * 为什么不只用「心跳超龄」：机器休眠/长同步阻塞时心跳也停，但进程可能还活着
+ * ⇒ 单靠超龄会误杀。为什么不只用 pid 探活：**实测 pid 会被复用**
+ * （2026-11-09：27 个超龄账本里 25 个 pid 探活失败、2 个「探活成功」但 OS 启动时间
+ * 比最后心跳晚 10 天 ⇒ 那 2 个是复用，不是真活）。
+ *
+ * 与 `heartbeatAt` 字段注释里那句 `pid 探活 ∨ 心跳 > 90s` 的关系：
+ * 注释的 `∨` 写在「长工具调用期间 lastActivityAt 冻结」那个事故现场，目标是**别误杀**；
+ * 本函数用 `∧` 是它的**收紧版**（更保守）：代价是「休眠中仍活但心跳停」会判未死 —— 正是想要的。
+ *
+ * ## 为什么「读不到 OS 启动时间」要返回 unknown 而不是 stale
+ *
+ * `inspectLiveProcess` 每次 spawn 一个 PowerShell（单次 ~1-2s）。调用方在
+ * **列表视图**里必须传 `probePidStart: false` 来避免 557 次 spawn（见 V5）；
+ * 此时若 pid 探活成功却无法验证复用，诚实结论是「无法判定」，不是「死」。
+ *
+ * @param opts.now 可注入时钟（测试用）
+ * @param opts.probePidStart `false` = 跳过 OS 启动时间查询（列表视图用；省 PowerShell）
+ */
+export function tabLivenessVerdict(
+	state: Pick<TabState, "phase" | "pid" | "heartbeatAt" | "terminal"> | null,
+	opts: {
+		now?: number;
+		probePidStart?: boolean;
+		/** 注入探活（测试用）；缺省用 `subagent-kill.ts` 的 `isPidAlive` / `inspectLiveProcess` */
+		probe?: {
+			isPidAlive?: (pid: number) => boolean;
+			startedAtMs?: (pid: number) => number | undefined;
+		};
+	} = {},
+): TabLivenessVerdict {
+	if (!state) {
+		return { verdict: "unknown", reason: "no state file (无遥测账本)", evidence: { pidAlive: null, heartbeatAgeMs: null } };
+	}
+	// 显式终态 / 终态 phase ⇒ 不是「活着的死账本」，交给终态路径处理
+	const TERMINAL_PHASES = ["completed", "failed", "cancelled", "orphaned"];
+	if (state.terminal === true || TERMINAL_PHASES.includes(String(state.phase))) {
+		return { verdict: "alive", reason: `terminal state (phase=${state.phase}) ⇒ 由终态路径处理`, evidence: { pidAlive: false, heartbeatAgeMs: 0 } };
+	}
+
+	const now = opts.now ?? Date.now();
+	const hbMs = state.heartbeatAt ? Date.parse(String(state.heartbeatAt)) : Number.NaN;
+	const heartbeatAgeMs = Number.isFinite(hbMs) ? Math.max(0, now - hbMs) : null;
+	const pid = typeof state.pid === "number" && Number.isInteger(state.pid) && state.pid > 0 ? state.pid : null;
+
+	// ── ① pid 探活 ──
+	let pidAlive: boolean | null = null;
+	if (pid !== null) {
+		try {
+			const probe = opts.probe?.isPidAlive ?? defaultIsPidAlive;
+			pidAlive = probe(pid);
+		} catch {
+			pidAlive = null; // 探活本身失败 ⇒ 无法判定（不当死）
+		}
+	}
+
+	const heartbeatStale = heartbeatAgeMs === null || heartbeatAgeMs > TAB_STALE_AFTER_MS;
+
+	// 无 pid 时的判据。
+	if (pid === null) {
+		// **零证据 ⇒ unknown**（不是 stale）：既无 pid 可探活、又无 heartbeatAt 可算年龄时，
+		// 我们对这个账本一无所知。判 stale 会误拒「刚派发还没写遥测」「老格式账本」等真实活 tab。
+		// 实测回归：`_test_resident_lms_needsuser` 的常驻 lms 夹具就是这种形状（no pid + no heartbeatAt）。
+		if (heartbeatAgeMs === null) {
+			return { verdict: "unknown", reason: "no pid and no heartbeatAt in state ⇒ 零证据，无法判定", evidence: { pidAlive: null, heartbeatAgeMs: null } };
+		}
+		// 有 heartbeatAt 但没 pid：心跳是唯一证据 ⇒ 停了就是 stale（reason 写明依据只有心跳）
+		return heartbeatStale
+			? { verdict: "stale", reason: `no pid in state + heartbeat ${fmtAge(heartbeatAgeMs)} > ${TAB_STALE_AFTER_MS / 1000}s`, evidence: { pidAlive: null, heartbeatAgeMs } }
+			: { verdict: "alive", reason: `no pid in state but heartbeat ${fmtAge(heartbeatAgeMs)} within ${TAB_STALE_AFTER_MS / 1000}s`, evidence: { pidAlive: null, heartbeatAgeMs } };
+	}
+
+	if (pidAlive === false) {
+		// ① pid 探活失败 ∧ ② 心跳超龄 ⇒ stale（两独立证据同向）
+		return heartbeatStale
+			? { verdict: "stale", reason: `pid ${pid} not alive + heartbeat ${fmtAge(heartbeatAgeMs)} > ${TAB_STALE_AFTER_MS / 1000}s`, evidence: { pidAlive, heartbeatAgeMs } }
+			// 只一个证据 ⇒ 不确定（可能是探活权限问题 / 心跳写失败）
+			: { verdict: "unknown", reason: `pid ${pid} not alive but heartbeat ${fmtAge(heartbeatAgeMs)} fresh ⇒ 证据矛盾，无法判定`, evidence: { pidAlive, heartbeatAgeMs } };
+	}
+	if (pidAlive === null) {
+		return { verdict: "unknown", reason: `pid ${pid} probe threw ⇒ 无法判定`, evidence: { pidAlive, heartbeatAgeMs } };
+	}
+
+	// ── pid 探活成功 ⇒ 必须排除 pid 复用，否则「死账本 + 被复用的 pid」会被判活 ──
+	// 这是本方案最重要的发现（2026-11-09 实测 2/27 属此形）。
+	if (opts.probePidStart === false) {
+		return {
+			verdict: "unknown",
+			reason: `pid ${pid} alive but reuse check skipped (列表视图不查 OS 启动时间) ⇒ 精确查询可判`,
+			evidence: { pidAlive, heartbeatAgeMs },
+		};
+	}
+	let startedAtMs: number | undefined;
+	try {
+		const probeStart = opts.probe?.startedAtMs ?? defaultStartedAtMs;
+		startedAtMs = probeStart(pid);
+	} catch {
+		startedAtMs = undefined;
+	}
+	if (startedAtMs === undefined || !Number.isFinite(startedAtMs)) {
+		return { verdict: "unknown", reason: `pid ${pid} alive but OS start time unavailable ⇒ 无法排除 pid 复用`, evidence: { pidAlive, heartbeatAgeMs } };
+	}
+	if (Number.isFinite(hbMs) && startedAtMs > hbMs) {
+		// OS 进程比最后一次心跳更晚启动 ⇒ 这个 pid 不是原进程（被复用了）
+		return {
+			verdict: "stale",
+			reason: `pid ${pid} reused: OS start ${new Date(startedAtMs).toISOString()} is later than last heartbeat ${new Date(hbMs).toISOString()}`,
+			evidence: { pidAlive, heartbeatAgeMs },
+		};
+	}
+	if (heartbeatStale) {
+		// pid 是真活的但心跳停了很久 ⇒ 进程活着但事件循环卡住 —— 不是「死」，也不是「正常」
+		return { verdict: "unknown", reason: `pid ${pid} alive (start ${new Date(startedAtMs).toISOString()}) but heartbeat ${fmtAge(heartbeatAgeMs)} stale ⇒ 进程在但 tick 停了`, evidence: { pidAlive, heartbeatAgeMs } };
+	}
+	return { verdict: "alive", reason: `pid ${pid} alive + heartbeat ${fmtAge(heartbeatAgeMs)} fresh`, evidence: { pidAlive, heartbeatAgeMs } };
+}
+
+function fmtAge(ms: number | null): string {
+	if (ms === null) return "(无 heartbeatAt)";
+	const s = Math.round(ms / 1000);
+	if (s < 120) return `${s}s`;
+	const m = Math.round(s / 60);
+	if (m < 120) return `${m}min`;
+	const h = Math.round(m / 60);
+	if (h < 48) return `${h}h`;
+	return `${Math.round(h / 24)}d`;
+}
+
+// 延迟绑定：避免把 subagent-kill 的 PowerShell 依赖拖进纯读路径的模块图（reload 时也更安全）
+function defaultIsPidAlive(pid: number): boolean {
+	return isPidAliveImpl(pid);
+}
+function defaultStartedAtMs(pid: number): number | undefined {
+	return inspectLiveProcessImpl(pid)?.startedAtMs;
+}
+// ⚠ 未注入时的默认值必须**保守**（`isPidAlive → true`）：
+// 若默认返回 false，任何没走 `bindTabLivenessProbes` 的调用方（测试、独立进程、
+// 注入失败的生产路径）都会把**所有账本判成 pid 已死** ⇒ 叠加心跳缺失就成 stale ⇒ 大面积误拒。
+// 真实探活由 `index.ts` 启动时注入；未注入时宁可「当作活着」并给出 unknown，也不误杀。
+let isPidAliveImpl: (pid: number) => boolean = () => true;
+let inspectLiveProcessImpl: (pid: number) => { startedAtMs?: number } | null = () => null;
+/** 由 `index.ts` 启动时注入真实实现（避免 tab-runs.ts ↔ subagent-kill.ts 循环 import）。 */
+export function bindTabLivenessProbes(impl: {
+	isPidAlive: (pid: number) => boolean;
+	inspectLiveProcess: (pid: number) => { startedAtMs?: number; cmd?: string } | null;
+}): void {
+	isPidAliveImpl = impl.isPidAlive;
+	inspectLiveProcessImpl = impl.inspectLiveProcess;
+}
+
+/**
+ * 供 `steer-runtime.ts::tabNeedsIdleWake` 用的**廉价** stale 判定（`probePidStart:false`，零 PowerShell）。
+ *
+ * 为什么不直接用 `stateAlivePhase`：它是模块私有函数，而 `steer-runtime` 只该拿到
+ * 「这个账本是不是死的」这一个布尔，不需要暴露整套 ledger 解析。
+ */
+export function isTabStateStale(
+	state: Pick<TabState, "phase" | "pid" | "heartbeatAt" | "terminal"> | null,
+	opts: { now?: number; probe?: { isPidAlive?: (pid: number) => boolean } } = {},
+): boolean {
+	return tabLivenessVerdict(state, { ...opts, probePidStart: false }).verdict === "stale";
+}
+
+/**
+ * 列表视图的僵尸计数（**零进程开销**：只用已落盘的 `heartbeatAt` 算年龄，不探活）。
+ *
+ * 为什么要它：按 gen14 裁定，列表不能逐个判死（557 个会 spawn 557 次 PowerShell）；
+ * 但「列表看不出哪些是死的」会让人误以为一切正常 ⇒ 给聚合计数。
+ * 阈值与判死判据**同源**（`TAB_STALE_AFTER_MS`），不另立口径。
+ */
+export function countStaleByHeartbeat(
+	records: ReadonlyArray<{ state?: { heartbeatAt?: string } | null; phase?: string; terminal?: boolean }>,
+	now = Date.now(),
+): { total: number; over3Ticks: number; over1d: number; over7d: number } {
+	const TERMINAL_PHASES = ["completed", "failed", "cancelled", "orphaned"];
+	const out = { total: 0, over3Ticks: 0, over1d: 0, over7d: 0 };
+	for (const r of records) {
+		const phase = String(r.phase ?? "");
+		if (r.terminal === true || TERMINAL_PHASES.includes(phase)) continue;
+		const hbMs = r.state?.heartbeatAt ? Date.parse(String(r.state.heartbeatAt)) : Number.NaN;
+		const ageMs = Number.isFinite(hbMs) ? now - hbMs : Number.POSITIVE_INFINITY;
+		if (ageMs <= TAB_STALE_AFTER_MS) continue;
+		out.total += 1;
+		out.over3Ticks += 1;
+		if (ageMs > 86_400_000) out.over1d += 1;
+		if (ageMs > 7 * 86_400_000) out.over7d += 1;
+	}
+	return out;
+}
+
+/**
+ * state 是否「活着」：phase 非终态 **且** 存活判定不为 stale。
+ *
+ * 2026-11-09 修（断点 3）：此前只认 phase 字面值 ⇒ 27/553 个死账本（pid 探活全失败、
+ * 心跳超龄数天到数月）被判 alive ⇒ `tab-steer` 接受并落盘，但目标进程早没了 ⇒
+ * 记录永久 pending、零报错（实测：resolveTabLedger.deliverable 对 340 个全 true）。
+ *
+ * 现在接 `tabLivenessVerdict`：
+ *   - `verdict === "stale"` ⇒ **不活**（deliverable 随之变 false，steer 给出明确理由）
+ *   - `verdict === "unknown"` ⇒ **仍算活**（保守：拿不到证据时宁可放行，
+ *     因为误拒会静默丢消息，而误放行只是留下一条 pending —— 与本仓 R-5「宁可重发不可漏发」同向）
+ *   - 本函数**不做 pid 复用检查**（`probePidStart: false`）⇒ 列表/账本解析路径零 PowerShell spawn。
+ *     精确判死（含复用检查）由 `composeTabStatus` 的 runId 精确查询路径做。
+ */
+function stateAlivePhase(state: TabState | null, opts: { probePidStart?: boolean } = {}): boolean {
 	if (!state) return false;
-	return state.phase === "attached" || state.phase === "working" || state.phase === "waiting";
+	if (!(state.phase === "attached" || state.phase === "working" || state.phase === "waiting")) return false;
+	// 已知相位「活」的语义再叠加一次存活判定（stale 直接否掉；unknown 保守放行）
+	const v = tabLivenessVerdict(state, { probePidStart: opts.probePidStart ?? false });
+	return v.verdict !== "stale";
 }
 
 /**
@@ -1083,14 +1340,34 @@ function stateAlivePhase(state: TabState | null): boolean {
  */
 export function resolveTabLedger(runsDir: string, runId: string): LedgerResolutionResult {
 	const state = readTabState(runsDir, runId);
-	const alive = stateAlivePhase(state);
+	// 这里**单个 runId 精确查询** ⇒ 允许查 OS 启动时间（pid 复用检查）。
+	// 为什么这里可以而列表视图不行：实测 `inspectLiveProcess` 单次 spawn PowerShell ~1-2s，
+	// 557 个全量列表会卡死；而 tab-steer 一次只解析一个 runId，成本可忽略。
+	// 这也是「列表只给心跳年龄、精确查询才判死」这条分工的落点。
+	const alive = stateAlivePhase(state, { probePidStart: true });
 	const statePhase = state?.phase;
 
 	const active = readTabDispatch(runsDir, runId);
 	if (active) {
+		// 2026-11-09（要求 A）：`deliverable` 此前**硬编码 true**，`alive` 只赋给 stateAlive 字段、
+		// 不参与投递判定 ⇒ 死账本照样可投递（实测 340/340 = true）。
+		// 现在按存活判定给出三种可读理由（各自可被 tab-steer 原样回显给用户）。
+		// ⚠ 关键：**没有 state 文件 ≠ 死**。刚派发、还没来得及写遥测的 tab 就没有 state；
+		// 历史语义把「有 dispatch 记录」当作活着的证据（见 `no-ledger-alive` 分支）。
+		// 实测回归（`_test_steer_consumer` happy path）：若把 state===null 判死，
+		// 只带 dispatch 记录的 tab 会被拒绝投递 ⇒ 误拒。
+		const v = state ? tabLivenessVerdict(state, { probePidStart: true }) : null;
+		if (alive || state === null) {
+			return {
+				resolution: "active", dispatch: active, archivedDispatch: null,
+				stateAlive: true, statePhase, deliverable: true,
+				reason: `ledger present in active dir (${v ? `alive: ${v.reason}` : "no telemetry yet (只有 dispatch 记录)"})`,
+			};
+		}
 		return {
 			resolution: "active", dispatch: active, archivedDispatch: null,
-			stateAlive: alive, statePhase, deliverable: true, reason: "ledger present in active dir",
+			stateAlive: false, statePhase, deliverable: false,
+			reason: `ledger present but session ${v?.verdict === "stale" ? "STALE" : "NOT ALIVE"}: ${v?.reason ?? "无遥测"}`,
 		};
 	}
 

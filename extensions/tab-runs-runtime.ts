@@ -23,6 +23,7 @@ import { getTabRunId, isMainSession, isSubagent, isTabSession } from "./identity
 import { isTraceWorker } from "./capabilities.ts";
 import {
 	buildTabStatusView,
+	countStaleByHeartbeat,
 	defaultTabRunsDir,
 	defaultSessionsRoot,
 	emptyTabUsage,
@@ -675,7 +676,11 @@ export function registerTabStatusTools(
 				const dispatches = new Map(listTabDispatches(runsDir).map((d) => [d.id, d]));
 				ids = ids.filter((id) => dispatches.get(id)?.taskId === p.taskId);
 			}
-			const records = ids.map((id) => viewToBrief(buildTabStatusView(runsDir, id, sessionsRoot)));
+			// 2026-11-09（V5）：**单个 runId 精确查询才判死**（含 pid 复用检查，spawn PowerShell ~1-2s）。
+			// 多 id 列表一律不判死（557 个会 spawn 557 次 PowerShell ⇒ 面板卡死），
+			// 只靠已落盘的 heartbeatAt 给聚合计数（见下方 staleCount）。
+			const probeLiveness = p.runId !== undefined && ids.length === 1;
+			const records = ids.map((id) => viewToBrief(buildTabStatusView(runsDir, id, sessionsRoot, { probeLiveness })));
 			if (records.length === 0) {
 				return { content: [{ type: "text", text: "No tabs" }], details: { records: [] } };
 			}
@@ -684,7 +689,15 @@ export function registerTabStatusTools(
 				const resultTag = r.result ? ` → ${(r.result as { status?: string }).status}` : "";
 				return `${String(r.phase).padEnd(12)} ${r.runId}${r.taskId ? ` task=${r.taskId}` : ""}${resultMissing}${resultTag}`;
 			});
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { records } };
+			// 2026-11-09（③ 列表可观测出口）：列表不逐个判死（零 PowerShell），但必须让
+			// 「有僵尸」一眼可见 —— 用已落盘的 heartbeatAt 算年龄，零进程开销。
+			// 阈值与判死判据同源（3 * TAB_HEARTBEAT_MS），另给 1 天 / 7 天粗粒度计数。
+			const staleCount = countStaleByHeartbeat(records, Date.now());
+			const staleBanner = staleCount.total > 0
+				? `\n⚠ ${staleCount.total} 个账本心跳超龄（疑似僵尸；列表不做 pid 探活，精确查询请传 runId）：`
+					+ `>3 个心跳周期 ${staleCount.over3Ticks} / >1 天 ${staleCount.over1d} / >7 天 ${staleCount.over7d}`
+				: "";
+			return { content: [{ type: "text", text: lines.join("\n") + staleBanner }], details: { records, staleCount } };
 		},
 	});
 

@@ -19,7 +19,7 @@ import { appendFileSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { getTabRunId, isMainSession, isSubagent, setCurrentSessionId } from "./identity.ts";
-import { defaultTabRunsDir, isUnconfirmedFallback, readTabDispatch, readTabResultFile, readTabState, resolveTabLedger } from "./tab-runs.ts";
+import { defaultTabRunsDir, isTabStateStale, isUnconfirmedFallback, readTabDispatch, readTabResultFile, readTabState, resolveTabLedger } from "./tab-runs.ts";
 import {
 	defaultTimersDir,
 	dueAtFromDelay,
@@ -88,7 +88,7 @@ export const STEER_IDLE_NUDGE_MARK = "[[steer-idle-nudge]]";
 export function tabNeedsIdleWake(
 	runsDir: string,
 	tabRunId: string,
-	opts?: { readState?: typeof readTabState },
+	opts?: { readState?: typeof readTabState; probe?: { isPidAlive?: (pid: number) => boolean } },
 ): { needsWake: boolean; reason: string; turn?: string } {
 	if (!isSafeSteerComponent(tabRunId)) return { needsWake: false, reason: "unsafe-id" };
 	try {
@@ -96,6 +96,10 @@ export function tabNeedsIdleWake(
 		const state = readState(runsDir, tabRunId);
 		if (!state) return { needsWake: false, reason: "no-ledger" };
 		if (state.terminal === true) return { needsWake: false, reason: "terminal" };
+		// 2026-11-09（要求 B 第 2 条）：死账本不得被 drop idle nudge。
+		// 实测（改前）：stale 账本仍返回 needsWake:true(turn-idle) ⇒ 多一条无人消费的 timer。
+		// 这里用与 deliverable 同源的判据（stateAlivePhase），只在 stale 时短路；unknown 仍放行（保守）。
+		if (isTabStateStale(state, { probe: opts?.probe })) return { needsWake: false, reason: "ledger-stale" };
 		const turn = String(state.turn ?? "unknown");
 		// 只有 working 才有「下一个 tool 边界」；idle/unknown/error 都不保证会走到边界。
 		if (turn === "working") return { needsWake: false, reason: "turn-working", turn };
@@ -354,6 +358,9 @@ export function registerSteerTools(pi: ExtensionAPI, opts: SteerRuntimeOptions =
 			// `_archived/` ⇒ 旧实现只查活跃目录就**静默丢消息**。现改用 `resolveTabLedger`：
 			// 区分「仅被归档但仍活」与「真已终态」，前者**可投递**（备用通道）+ **可观测**。
 			const ledger = resolveTabLedger(runsDir, tabRunId);
+			// 2026-11-09（断点 3 / 要求 B 第 2 条）：死账本不仅拒绝 steer，还要**不**给它 drop idle nudge。
+			// 实测（改前）：stale 账本 tabNeedsIdleWake 仍返回 needsWake:true ⇒ 多一条无人消费的 timer。
+		 // 判据与 deliverable 同源（ledger.stateAlive），这里只在它之后短路，不另立口径。
 			if (!ledger.deliverable) {
 				// 明确理由（不得笼统 "unknown tab"）：no-ledger-dead / archived-dead
 				return text(`tab 不可投递 [${ledger.resolution}]: ${tabRunId} — ${ledger.reason}`, true);

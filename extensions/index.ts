@@ -85,6 +85,7 @@ import {
 } from "./runtime/local-master-launch.ts";
 import { appendAuditEvent, appendAuditLine, readAuditTail, readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness, listNonOwnerTicks } from "./runtime/autonomy/collect.ts";
 import { autoRegisterDispatchedTabs, handleSuperviseCommand, supervisionLedgerLines } from "./runtime/supervision.ts";
+import { bindTabLivenessProbes } from "./tab-runs.ts";
 import { registerStreamingSnapshot } from "./runtime/streaming-snapshot-register.ts";
 import { registerSessionControl } from "./runtime/session-control-register.ts";
 import { registerBuiltinCommandBridge } from "./runtime/builtin-cmd-bridge.ts";
@@ -181,6 +182,8 @@ import {
 	listAsyncRunSummaries,
 	registerRunProcess,
 	touchRunActivity,
+	inspectLiveProcess,
+	isPidAlive,
 	type ChildSpawnInfo,
 } from "./subagent-kill.ts";
 // 僵尸看门狗（失败必达终态的宿主侧兜底）：on-read 惰性回收（tick 路径在 async-result-watcher）
@@ -2601,6 +2604,15 @@ async function searchableSelect(
 // ── 扩展入口 ────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// 2026-11-09（断点 3）：把真实进程探活注入读侧判活（`tab-runs.ts::tabLivenessVerdict`）。
+	// 为什么用注入而不是直接 import：`tab-runs.ts` 是纯库层，直接 import `subagent-kill.ts`
+	// 会把 PowerShell spawn 依赖拖进所有读账本的路径（并且形成循环 import）。
+	// 注入失败不致命（此时判活会走 unknown ⇒ 保守放行，不会误拒 steer）。
+	try {
+		bindTabLivenessProbes({ isPidAlive, inspectLiveProcess });
+	} catch {
+		/* 注入失败：保持 unknown 语义，不影响 tab 账本读写 */
+	}
 	// notify 桥（2026-10-21）：**必须最先**安装——它影子化 pi.registerCommand，
 	// 之后所有 registerCommand 才会被包上 ui.notify 代理。放后面就会漏掉已注册的命令。
 	// 为何需要：ctx.ui.notify 是 TUI-only（types.d.ts:80 + interactive-mode.js:1983），

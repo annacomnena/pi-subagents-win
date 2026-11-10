@@ -237,7 +237,10 @@
     "test:autonomy-heartbeat-stale-diag": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_heartbeat_stale_diag.ts",
     "test:autonomy-status-body": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_status_body.ts",
     "test:delivery-incident-ack-invariant": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_incident_ack_invariant.ts",
-    "test:non-owner-ticks-gc": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_non_owner_ticks_gc.ts"
+    "test:non-owner-ticks-gc": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_non_owner_ticks_gc.ts",
+    "test:tab-liveness": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness.ts",
+    "test:tab-liveness-archive": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_archive.ts",
+    "test:tab-liveness-nospawn": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_nospawn.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
