@@ -363,6 +363,53 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 **设计动机（源案例 1030）**：主会话已在任务书里给出根因（file:line）+方案方向+文件域+验收标准，但 tab 仍走完整六阶段——检索/计划阶段在重复主会话已知的信息，耗时翻倍。链深应由**信息完备度**决定，不由仪式感决定。
 
+### trace-fusion 前置闸（**主会话侧，派 tab 之前**；2026-11-09 裁定）
+
+> ⚠️ **归属先定：闸在「主会话」，不在「tab」。** 原因不是分工偏好，是**能力门 + 时序**双重硬约束：
+> - **能力门**：`capabilities.ts:56` `"workflow-tab": { launchTabs: false }`，而 `index.ts:5287` 的
+>   trace-fusion 工具第一句是 `if (!capabilities().launchTabs) return error("trace-fusion 只允许主会话调用")`
+>   ⇒ **adaptive tab 根本调不到 fusion**。不是「它不愿执行」，是通道不存在。
+> - **时序**：单 lane 墙钟上限 `maxWallClockPerLaneMin = 45`（默认），三路并行 ⇒ rollout 量级是
+>   45min × 3 lane。tab 的启动自评要**秒级**出档位；让 tab 在自评阶段跑 fusion = 开局阻塞 45min，
+>   所有档位都白等（连 A0 也是）—— 与原裁定理由（“别让 A0/A 白等”）自相矛盾。
+
+**判定时机**：**主会话在派 adaptive tab 之前**自己跑 `evaluateFusionGate(runsDir)`（只读、秒级）。
+**入口**：`extensions/trace-fusion/gate.ts::evaluateFusionGate()`——纯函数、只读 `meta.json`、零副作用。
+门槛口径：最近 5 个 qualified run 中 ≥4 个 `repair: null`（= **首轮六节齐全**，**不是**「融合质量」）；
+qualified = 排除 cancelled / abandoned / 未进融合阶段的 run；分母不足 5 不阻断。
+
+| verdict | 主会话动作 | 任务书里必须写什么 |
+|---|---|---|
+| `pass` | **跑 trace-fusion**（主会话有 `launchTabs`，这是唯一有能力的位置）；45min×3 后拿到 runDir | **fusion 产物路径**（`lanes/{A,B,C}/trajectory.md` 与 `fusion.md`）+ `detail` 原文 |
+| `not-yet` | **不跑**（走常规检索） | 「fusion 门槛未达（clean M/5，达标线 N），本轮不启用」+ `detail` |
+| `insufficient-sample` | **不跑**（走常规检索） | 「fusion 样本不足（examined N/5，实际 X 个），不启用」+ `detail` |
+
+**tab 侧只做一件事**：任务书里有 fusion 产物路径 ⇒ `read` 那几份 trajectory 作校验性核对输入；
+没有 ⇒ 常规检索。**tab 不调用 `evaluateFusionGate`、不重新判定、不推翻主会话的降级理由**。
+
+**三条硬约束**
+
+1. **只有 `pass` 才真跑 fusion**。另两态走常规检索，并在计划里**具名记录未启用的理由与读数**。
+   静默降级违反 R-2（不能说「本轮没 fusion」而不说为什么）。
+2. **只在值得时跑**：fusion 成本是 45min × 3 lane，远高于常规检索。
+   预期 tab 档位是 A0/A、或 `codegraph`/`read` 能直接确认关键假设时 ⇒ **不跑**（即使门槛 `pass`）。
+   建议只在档位前置评估指向 B/C、或“三路独立诊断”本身有价值时启用。
+3. **主会话须在任务书里交接结论，不让 tab 重判**：
+   tab 拿不到 `runDir`、拿不到 `runsDir`，重判只会得出不一致结果。
+
+**具名未闭合（必须随本闸一直带着，R-23）**
+
+- **代码强制点未接**：`evaluateFusionGate()` 在生产代码里**零调用方**
+  （`grep -rn evaluateFusionGate extensions/ | grep -v gate.ts` 只命中定义、测试与文档）。
+  本闸目前是**主会话行为约束**，靠编排方读本文件执行。
+  **不得**为了“强制”而给 `workflow-tab` 开 `launchTabs` —— 那是越权扩权，比不接更糟。
+  正解是主会话侧加一个“派 tab 前的检查”入口（尚未做）。
+- **`not-yet` 分支线上覆盖率为 0**（穷举 19 个 run：`repair` 非 null 只有 1 个，且它
+  `fusion.status=failed` ⇒ 不 qualified）。该分支仅由测试夹具覆盖（`test:trace-fusion-gate` 用例③）。
+  真机复现路径存在（`fusion-dispatch.ts` 的 repair 分支），但尚未观测到。
+- **未验证主会话会真的执行这条闸**：需下一次实跑 adaptive 派发才能观测（同 R-18 形状：
+  文档改了不等于生效）。
+
 ### 启动自评（首轮回复开头必须声明档位与依据）
 
 | 档位 | 任务书条件 | 链条 |
@@ -419,48 +466,6 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 - **目的**：验证任务书假设仍成立（文件/符号存在、代码位置未漂移、验收可测），不是重新调研。
 - **手段**：`codegraph explore <符号>` / `read` 目标文件关键行 / `bash` 跑一次复现命令。禁止 searcher 全量搜索。
 - **通过**：假设成立 → 按档位继续（A0 → tab 自执行；A → implementer）。**失效**：升级档位（→B 或 C）并在回复声明升级原因。
-
-### trace-fusion 门槛闸（**校验性核对之前**，2026-11-09 裁定）
-
-**位置**：台在校验性核对**之前**（不是 L2 之前）。
-理由：fusion 产物是三路独立诊断，它替代的是「检索与假设验证」，不是「计划」。
-放 L2 之前会让 A0/A 档（本就跳过检索）白等一个 45min × 3 lane 的 rollout。
-
-**判定入口**：`extensions/trace-fusion/gate.ts::evaluateFusionGate()`——纯函数、
-只读 `meta.json`、不跑 fusion、零副作用。门槛口径：
-> 最近 5 个 qualified run 中 ≥4 个 `repair: null`（= **首轮六节齐全**，**不是**「融合质量」）
-> qualified = 排除 cancelled / abandoned / 未进融合阶段的 run；分母不足 5 不阻断
-
-**三态行为（**不是两类**——「不阻断」≠「允许用」）**
-
-| verdict | 是否用 fusion 作输入 | 是否阻断链条 | 计划里必须写 |
-|---|---|---|---|
-| `pass` | **用**（三路诊断作校验性核对的输入） | 不阻断 | 原样记录 `detail`（含 examined/clean） |
-| `not-yet` | **不用**（回落常规检索） | **不阻断** | 「fusion 门槛未达（clean M/5），本轮不启用」 |
-| `insufficient-sample` | **不用**（回落常规检索） | **不阻断** | 「fusion 样本不足（examined N/5），不启用」 |
-
-**三条硬约束**
-
-1. **只有 `pass` 才真的把 fusion 产物喂进去**。`not-yet` / `insufficient-sample` 一律
-   降级为常规检索，并**在计划里具名记录**。静默降级违反 R-2。
-2. **A0 / A 档绝不白等**：若本档自评为 A0 或 A，且不确定是否值得跑 fusion，
-   默认 **不跑**（fusion 成本 45min × 3 lane，远高于自执行/快链的检索成本）。
-   只有档位自评为 C，或 B 且缺验收标准时，才允许因「检索与假设验证成本高」而跑。
-3. **假设可验证则不跑**：若 `codegraph` / `read` 能直接确认关键事实，
-   不需要三路独立诊断 ⇒ 不启用 fusion（即使门槛 `pass`）。
-
-**具名未闭合（必须随本闸一直带着）**
-
-- ⚠️ **本闸当前是「文档约束」，零代码强制**：`evaluateFusionGate()` 在生产代码里
-  **无任何调用方**（`grep -rn evaluateFusionGate extensions/ | grep -v gate.ts` 只命中定义与测试）。
-  也就是说：这条闸靠的是 tab 启动时**读本文件并自觉执行**，而不是代码拦截。
-  这与 R-17「写进去了 ≠ 看得见」同族 —— 一个没接消费端的产出等于不存在。
-  **接线（真正的调用点）未做**，登记为未闭合；下次改 adaptive 编排方时必须补。
-- `not-yet` 分支**线上覆盖率为 0**（穷举 19 个 run：`repair` 非 null 只有 1 个，且它
-  `fusion.status=failed` ⇒ 不 qualified）。该分支仅由测试夹具覆盖（`test:trace-fusion-gate` 用例③）。
-  真机复现路径存在（`fusion-dispatch.ts` 的 repair 分支：primary failed 且 gaps 非空 ⇒
-  补写一轮且成功），但尚未观测到。**接线验收必须含 `not-yet` / `insufficient-sample` 的实测降级读数**，
-  不许只验 `pass`。
 
 ### 档位 A0：自执行快链（tab 自己干活 + 事件驱动咨询）
 
