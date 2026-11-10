@@ -43,6 +43,9 @@ Wiki/_hotspot.trash.jsonl
 
 # 临时探针/实验文件（不入库）
 .tmp_*
+# 同上，下划线变体（2026-11-09 事故：`git add -A` 把 3 个 _tmp_cost*.mjs 夹进 6cacb26，
+# 因为提交前只看了 `git diff --numstat`——它不含 untracked 文件）
+_tmp*
 
 # codegraph 符号索引（本机工具产物，可重建，不入库）
 .codegraph/
