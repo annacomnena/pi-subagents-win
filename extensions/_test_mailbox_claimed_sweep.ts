@@ -18,6 +18,7 @@
  */
 
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -185,6 +186,49 @@ try {
     assert.equal(claimedCount(midD), 0, "⑥ consumeMailboxOnce 应把有 consumed ACK 的 claimed 信 ack 掉");
     assert.equal(ackedCount(midD), 1, "⑥ 应已 acked");
     ok("⑥ 真实入口 consumeMailboxOnce 内置清扫生效");
+  }
+
+  // ── ⑦ 之前先造「大目录」夹具（否则两版都快，测不出差异 = R-22 第 5 条）──
+  //  真实生产 delivery 有 1837 个 .json（含 1104 派生）；这里造 1500 个派生 + 120 个 mailbox 事件，
+  //  让「每事件一次 listAcks（内部 readdirSync 全目录）」的退回版超 50ms，而一次 readdir 建索引的
+  //  当前版仍远低于门槛。
+  {
+    const { writeFileSync: wf } = await import("node:fs");
+    // 60 个额外的 mailbox 事件（各自没有 consumed ACK，只为撑大事件数）
+    for (let i = 0; i < 120; i++) {
+      ensureEvent(DELIVERY, {
+        runId: `mailbox_msg_bign${i}`,
+        terminalRevision: "rev1",
+        terminalSnapshotPath: join(MAILBOX, `msg_bign${i}`),
+        dispatcherSessionId: SESSION,
+        observedAt: new Date().toISOString(),
+        terminalAt: new Date().toISOString(),
+      });
+    }
+    // 600 个派生占位文件（模拟真实目录的 .ack./.attempt. 噪声）
+    for (let i = 0; i < 1500; i++) {
+      wf(join(DELIVERY, `pad-event-${i}.attempt.pad-${i}.json`), "{}");
+    }
+  }
+
+  // ── ⑦ 性能回归：本轮必须 < 50ms（gen14 门槛，2026-11-10）──
+  //  为什么要有这条：`listAcks` 每次内部 `readdirSync` 全目录，而 claimed/事件数会随使用增长。
+  //  实测对照（本机真实 delivery 1837 项 / 30 个 mailbox 事件）：
+  //    · 每事件一次 listAcks  ⇒ 95ms（readdir 55170 次）**超门槛**
+  //    · 一次 readdir 建索引  ⇒ 1.3ms median（readdir 1 次）
+  //  本测试用造出来的 20 封 claimed + 20 个事件，断言 < 50ms（真实环境更宽裕）。
+  {
+    const ROUNDS = 10;
+    const times: number[] = [];
+    for (let i = 0; i < ROUNDS; i++) {
+      const t0 = performance.now();
+      sweepClaimedLetters({ recipient: master, mailboxDir: MAILBOX, deliveryDir: DELIVERY });
+      times.push(performance.now() - t0);
+    }
+    times.sort((a, b) => a - b);
+    const median = times[Math.floor(ROUNDS / 2)]!;
+    assert.ok(median < 50, `⑦ 清扫器 median 必须 < 50ms（实测 ${median.toFixed(2)}ms）`);
+    ok(`⑦ 性能门槛 < 50ms（median ${median.toFixed(2)}ms）`);
   }
 
   console.log(`_test_mailbox_claimed_sweep: ${n} checks passed`);
