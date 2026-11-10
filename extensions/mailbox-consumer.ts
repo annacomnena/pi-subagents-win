@@ -54,7 +54,7 @@ import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
-import { writeAutonomyHeartbeat, writeNonOwnerTick } from "./runtime/autonomy/collect.ts";
+import { gcNonOwnerTicks, writeAutonomyHeartbeat, writeNonOwnerTick } from "./runtime/autonomy/collect.ts";
 import {
 	auditScopeWakeSpawnFailed,
 	confirmScopeWakeSpawn,
@@ -668,6 +668,16 @@ export function registerWakeLoop(
 				archiveTerminalLetters({ mailboxDir: opts.mailboxDir });
 			} catch {
 				/* 维护永不破坏唤醒循环 */
+			}
+			// 2026-11-09：`state/autonomy/non-owner-ticks/` 的 GC（R-21 修复的副作用，当时漏配）。
+			// 为什么不单独起一个 interval：这里本来每 30s 就有一拍，多一条独立的定时器
+			// 只增加竞态面。为什么不每次全扫：按语义规则只删「超龄」条目（见 gcNonOwnerTicks
+			// 注释），稳态下每拍只做 readdir + 逐文件 stat，实测 22 个文件 <1ms。
+			// never-throw：GC 永不破坏唤醒循环。
+			try {
+				gcNonOwnerTicks({ stateDir: opts.stateDir });
+			} catch {
+				/* GC 永不破坏唤醒循环 */
 			}
 			try {
 				const decisions = evaluateWakes({

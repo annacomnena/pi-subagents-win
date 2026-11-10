@@ -18,7 +18,7 @@
  *   本层不产生任何 wake/注入：Wake Gate 判定由调用层用 evaluateWakeGate（纯）消费返回的 diff。
  */
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "../journal.ts";
 import { collectGlobalView, defaultAgentDir } from "../global-view.ts";
@@ -651,6 +651,79 @@ export function listNonOwnerTicks(opts?: { stateDir?: string }): Array<{
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * `non-owner-ticks/` 的 GC 保留窗口（天）。**语义规则，不是写死的文件数上限**。
+ *
+ * 为什么按年龄不按数量：文件名是 `sha256(sessionId)` ⇒ 同一个会话**天然只有一份**
+ * （每次 tick 覆盖写同一路径）。所以目录里每个文件都对应一个**曾经存在过的会话**；
+ * 「只留最近 N 个」会把「N 个之前的所有会话」无差别删掉 —— 而那可能包含刚刚
+ * 挂起、还会回来继续跑的会话。按「多久没再 tick 过」淘汰才是语义正确的判据。
+ *
+ * 30 天依据：本地会话的正常寿命是小时~天级；一个月没再写 tick 的会话不会回来。
+ */
+export const NON_OWNER_TICK_RETAIN_DAYS = 30;
+
+/**
+ * 清理 `non-owner-ticks/` 里超龄的条目（每会话一个文件，已被覆盖写收敛）。
+ *
+ * 定位：R-21 修复引入的目录（`writeNonOwnerTick`），当时**没配 GC** ⇒ 无界增长。
+ * 它只是「本会话 timer 活着」的观测面，不被「autonomy 被关」判据读取，
+ * 所以删掉超龄条目**无任何功能后果**，只是止损磁盘。
+ *
+ * 安全约束（逐条对应一次真实事故的教训）：
+ *   - **绝不删 owner 心跳**（`heartbeat.json` 在上级目录，本函数不碰）
+ *   - 只删 `.json`；`.tmp` 留给写入方的 rename（删它会造成竞态）
+ *   - 只删**能解析出有限 `at`** 且确实超龄的文件；坏文件/无 at 的不删
+ *     （它们是「读方无法判断」的证据，删掉就失去了发现问题的线索）
+ *   - never-throw：GC 失败绝不破坏 tick 循环
+ *
+ * @returns `{ scanned, removed, keptOldestDays }` —— 供 `/autonomy status` 与测试读取
+ */
+export function gcNonOwnerTicks(opts?: { stateDir?: string; retainDays?: number; now?: number }): {
+	scanned: number;
+	removed: number;
+	keptOldestDays: number | null;
+} {
+	const result = { scanned: 0, removed: 0, keptOldestDays: null as number | null };
+	try {
+		const dir = join(autonomyDir(opts?.stateDir), "non-owner-ticks");
+		if (!existsSync(dir)) return result;
+		const retainMs = (opts?.retainDays ?? NON_OWNER_TICK_RETAIN_DAYS) * 86_400_000;
+		const now = opts?.now ?? Date.now();
+		let oldestRetainedMs = Infinity;
+		for (const f of readdirSync(dir)) {
+			if (!f.endsWith(".json")) continue; // 跳过 .tmp（写入方的 rename 目标）
+			result.scanned += 1;
+			const path = join(dir, f);
+			let at: number | null = null;
+			try {
+				const j: any = JSON.parse(readFileSync(path, "utf8"));
+				if (typeof j?.at === "number" && Number.isFinite(j.at)) at = j.at;
+			} catch {
+				at = null; // 坏文件：保留（它是发现问题的证据）
+			}
+			if (at === null) {
+				oldestRetainedMs = Math.min(oldestRetainedMs, now - 0); // 保守：当作最老，不影响统计口径
+				continue;
+			}
+			if (now - at > retainMs) {
+				try {
+					unlinkSync(path);
+					result.removed += 1;
+				} catch {
+					/* 单个删除失败不阻断其余（可能被另一个进程正在 rename）*/
+				}
+			} else {
+				oldestRetainedMs = Math.min(oldestRetainedMs, at);
+			}
+		}
+		result.keptOldestDays = Number.isFinite(oldestRetainedMs) ? Math.max(0, (now - oldestRetainedMs) / 86_400_000) : null;
+	} catch {
+		/* never-throw：GC 永不破坏 tick 循环 */
+	}
+	return result;
 }
 
 /** frontier 快照新鲜度判定。STALE 阈值 = 3 个 tick 周期（下限 5min），避免单次抖动误报。 */
