@@ -47,7 +47,7 @@ import { resolveRecipient } from "./runtime/resolver.ts";
 import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliveryStrictEnabled, notifyFollowUpQuietly } from "./injection-gate.ts";
 // C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
 import { eventMarker } from "./delivery-ack.ts";
-import { appendTrace, ensureEvent, listAcks, listAttempts, loadEvent, publishIncident, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
+import { appendTrace, ensureEvent, listAcks, listAttempts, listEvents, loadEvent, publishIncident, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
 import { releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
@@ -113,6 +113,93 @@ function letterTime(letter: Letter): string {
 /** 信标识（与 consumer-scan 同规则）。 */
 function describeLetter(letter: Letter): string {
 	return letter.frame.frame === "message" ? letter.frame.id : `cmd:${letter.frame.commandKey}`;
+}
+
+/**
+ * **claimed 卡死信的 collected-ACK 清扫**（2026-11-10 P0，gen14 实测 6 封事故）。
+ *
+ * 【事故】`consumeMailboxOnceInner` 的 message 循环入口是
+ * `listLetters(recipient, "pending", mailboxDir)` —— **只枚举 pending**。
+ * 于是 C-3 收尾（`if (listAcks(dDir, mbEventId).some(a => a.stage === "consumed"))
+ * ackLetter(...)`）虽然在循环体内，**claimed 的信永远走不到它**。
+ * 后果：`consumed` ACK 已经写成功了，但信 status 永停 `claimed` ⇒ 每 10min stale reclaim
+ * 重投一次 ⇒ 无限循环（实测每封 6 次 attempt，A 通道 ACK 写了两封却都不 ack）。
+ * 这是 chicken-and-egg：`claimLetters` 的 stale reclaim 只对**已经进 pending 列表**的信生效，
+ * 而卡住的正是不在列表里的。
+ *
+ * 【修法：方案 C（不改 schema、不改 claim 路径，纯增清扫器）】
+ * 枚举 `claimed`，按 `mailbox_<frameId>` 反查 delivery 事件，**只有存在
+ * `stage === "consumed"` 的 ACK 才 `ackLetter`**。
+ *
+ * 【为什么必须用 consumed ACK 作判据、而不能直接 ack 所有 claimed】
+ * 没有 consumed 证据的 claimed 信只是「已认领、还没真消费」——直接 ack 会丢消息（
+ * 违反本仓「宁可重发，不可漏发」的取舍，AGENTS R-5）。所以本函数只做「已到达的收尾」，
+ * 不做「未到达的清理」。
+ *
+ * 【为什么不需要 eventId 字段（gen14 列的方案 A）】
+ * `runId` 是 `mailbox_<frameId>`（`ensureEvent` 时写入），可枚举；本机实测 delivery 目录
+ * 的 `mailbox_` 类事件数十的量，扫描成本 <5ms（同 `expireSweep` 的每拍全扫口径）。
+ *
+ * 【幂等】已 `acked` 的信不在 `listLetters("claimed")` 结果里 ⇒ 自然跳过，重复调用零动作。
+ * 【never-throw】任何 IO/解析异常都内部吞掉：清扫失败不得破坏消费循环。
+ *
+ * @returns 本次实际 ack 的信数（可观测；`/autonomy status` 将来可挂）
+ */
+export function sweepClaimedLetters(opts: {
+	/** 收件人地址（缺省 masterAddress()） */
+	recipient?: ObjectAddress;
+	mailboxDir?: string;
+	deliveryDir?: string;
+	/** 只看本 holder 名下的信（缺省 undefined = 全部 claimed） */
+	claimedBy?: string;
+}): number {
+	try {
+		const recipient = opts.recipient ?? masterAddress();
+		const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
+		const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+		const claimed = listLetters(recipient, "claimed", mailboxDir);
+		if (claimed.length === 0) return 0;
+
+		// 先扫一遍 delivery 事件：runId=mailbox_<frameId> → 有 consumed ACK 的事件集合。
+		// 一次全扫（不按 frameId 逐个 readdir）的理由同 expireSweep：每拍 readdir 一次 <5ms。
+		const consumedRunIds = new Set<string>();
+		for (const ev of listEvents(dDir, 2000)) {
+			if (!ev.runId.startsWith("mailbox_")) continue;
+			try {
+				if (listAcks(dDir, ev.eventId).some((a) => a.stage === "consumed")) {
+					consumedRunIds.add(ev.runId);
+				}
+			} catch {
+				/* 单个事件的 ACK 读失败不影响其他 */
+			}
+		}
+		if (consumedRunIds.size === 0) return 0;
+
+		let acked = 0;
+		for (const letter of claimed) {
+			if (letter.frame.frame !== "message") continue; // command 信走专属 fileId 链
+			if (opts.claimedBy && letter.claimedBy !== opts.claimedBy) continue;
+			const frameId = letter.frame.id;
+			if (!frameId) continue;
+			if (!consumedRunIds.has(`mailbox_${frameId}`)) continue; // 无 consumed 证据 ⇒ 不碰
+			try {
+				ackLetter(recipient, frameId, { mailboxDir });
+				acked += 1;
+			} catch {
+				/* 单封 ack 失败：留给下一拍重试（幂等） */
+			}
+		}
+		if (acked > 0) {
+			try {
+				appendTrace(dDir, { kind: "claimed-sweep-acked", count: acked });
+			} catch {
+				/* trace 失败不影响主流程 */
+			}
+		}
+		return acked;
+	} catch {
+		return 0; // 顶层兜底：清扫端永不抛
+	}
 }
 
 /** 收据键（与 consumer-scan 同规则；派生不出 → msg:<id> 兜底）。 */
@@ -236,6 +323,16 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 		} catch {
 			pendingCommands = [];
 		}
+	}
+
+	// ── P0 清扫（2026-11-10）：claimed 卡死信先按 consumed ACK 收尾 ──
+	// 必须在 pending 枚举**之前**：claimed 的信不进 pending 列表，而 C-3 收尾
+	// （下方循环体里的 `listAcks(consumed) ⇒ ackLetter`）依赖它自己进列表才能跑。
+	// never-throw（本函数内部已 catch）；失败只影响本轮收尾，不影响后续注入。
+	try {
+		sweepClaimedLetters({ recipient, mailboxDir, deliveryDir: opts.deliveryDir });
+	} catch {
+		/* 清扫永不破坏消费链 */
 	}
 
 	// message 链：master 域命令信归下方专属 fileId 链，从 message 循环剔除（M2）
