@@ -249,7 +249,7 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
 | 广播：进程在 `agent_settled` 前被杀 ⇒ 该条可能漏推 | 未闭合 |
 | 广播：反序列化克隆 ⇒ 同一条可能重发 | 已知取舍（见 R-5） |
 | `config.json` 整文件重写的**机制性防护**（自动校验顶层键） | 未实现（目前靠本文件 R-1 人工遵守） |
-| **`tab-status` 从不读 `heartbeatAt` 判死**（注释声明「>90s 即死」但读侧零实现） | **2026-11-05 实测**：565 个 state 里 8 个「读侧报非终态」且心跳 >7 天，**逐个 pid 探活 8/8 全部 dead**。未修（修法见 `plans/20261105_break3_tabstatus_heartbeat_closure.md`；注意直接判 `terminal:true` 会让归档逻辑移走派发账本 ⇒ `steer` 静默丢消息） |
+| **`tab-status` 从不读 `heartbeatAt` 判死** | **2026-11-09 已修**（`b618298`）：`tabLivenessVerdict()` 三层判据（pid 探活 ∧ 心跳超龄，或 pid 复用），`phase="stale"` **刻意不进归档集合**（`archiveStaleTabRuns` 零改动）。实测 >7d 非终态账本 **340 个**，`deliverable` 从 **340/340 → 0**；列表全量 **555 项 spawn=0**；`tabNeedsIdleWake` 对死账本返回 `needsWake:false`。**`stale` 是只读侧判定，账本原地保留**（搬走会破坏 `steer` 可见性） |
 | **tab 身份在会话 resume 后丢失**（`PI_TAB_RUN_ID` 不重放） | 未修（需建 `sessionPath → runId` 索引，结构性改动）。后果：workflow-tab 形态的 local master 被 resume 后 `tab-report` 自助回报通道对该进程永久失效，而账本仍显示 `phase=working` |
 | **交付期限 `DELIVERY_DEADLINE_MS=60s` 与真实 ACK 时延量级错配** | **2026-11-05 实测**（分母 442 个交付事件）：328 个发过 incident（**74%**），其中 **14 个在 incident 之后仍收到 consumed ACK** ⇒ 同时存在 `fail_delivery` 与 `consumed` 两个矛盾终态。单例：`run_mw3flr49_7d1z` deadline 19:04:49 判死，ACK 19:11:25（晚 6'36"，是 deadline 的 6.6 倍）。**这不是「只看 ACK 不看队列」的逻辑 bug**（`stage==="consumed"` 早已短路），而是**期限参数太短**：目标会话活着的排队等待就被当成死。修法建议见 `plans/20261105_delivery_deadline_false_death.md`（推荐分级：60s 记 slow-delivery 观测，10min 才 fail） |
 | `state/autonomy/non-owner-ticks/` 无 GC（每 sessionId 一文件） | **2026-11-09 已修**（`1ff21a1`）：`gcNonOwnerTicks()` 按年龄（30 天）淘汰，挂在 wake tick 的维护块。判据是**年龄不是文件数**（文件名是 sha256(sid) ⇒ 同会话天然一份），写死数量会删掉「刚挂起还会回来的会话」。真机实测 22 文件 / removed=0 / keptOldestDays=4.7。**未接 `/autonomy status` 展示**（`keptOldestDays` 已备好） |
