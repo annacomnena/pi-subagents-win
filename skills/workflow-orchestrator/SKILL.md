@@ -366,12 +366,15 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 ### trace-fusion 前置闸（**主会话侧，派 tab 之前**；2026-11-09 裁定）
 
 > ⚠️ **归属先定：闸在「主会话」，不在「tab」。** 原因不是分工偏好，是**能力门 + 时序**双重硬约束：
-> - **能力门**：`capabilities.ts:56` `"workflow-tab": { launchTabs: false }`，而 `index.ts:5287` 的
+> - **能力门**：`capabilities.ts:57` `launchTabs: false`（在 `"workflow-tab"` 块内），而 `index.ts:5287` 的
 >   trace-fusion 工具第一句是 `if (!capabilities().launchTabs) return error("trace-fusion 只允许主会话调用")`
 >   ⇒ **adaptive tab 根本调不到 fusion**。不是「它不愿执行」，是通道不存在。
-> - **时序**：单 lane 墙钟上限 `maxWallClockPerLaneMin = 45`（默认），三路并行 ⇒ rollout 量级是
->   45min × 3 lane。tab 的启动自评要**秒级**出档位；让 tab 在自评阶段跑 fusion = 开局阻塞 45min，
->   所有档位都白等（连 A0 也是）—— 与原裁定理由（“别让 A0/A 白等”）自相矛盾。
+> - **时序**：单 lane 墙钟上限 `maxWallClockPerLaneMin = 45`（`tf-settings.ts:37` 默认），但
+>   `types.ts:86` `laneConcurrency: 3` ⇒ **三路全并发**（注释明写「缺省 3 = 保持历史全并发行为」），
+>   并行不叠加 ⇒ lane 阶段墙钟上限是 **45min，不是 135min**。要接近 45min×3 必须显式设 `laneConcurrency: 1`。
+>   实测 lane 阶段全部完成 n=15：min 4.0 / **median 9.3** / mean 21.3 / max 75.7 min。
+>   tab 的启动自评要**秒级**出档位；让 tab 在自评阶段跑 fusion = 开局阻塞十几分钟到数小时，
+>   所有档位（含 A0）都白等 —— 与原裁定理由（“别让 A0/A 白等”）自相矛盾。
 
 **判定时机**：**主会话在派 adaptive tab 之前**自己跑 `evaluateFusionGate(runsDir)`（只读、秒级）。
 **入口**：`extensions/trace-fusion/gate.ts::evaluateFusionGate()`——纯函数、只读 `meta.json`、零副作用。
@@ -380,18 +383,34 @@ qualified = 排除 cancelled / abandoned / 未进融合阶段的 run；分母不
 
 | verdict | 主会话动作 | 任务书里必须写什么 |
 |---|---|---|
-| `pass` | **跑 trace-fusion**（主会话有 `launchTabs`，这是唯一有能力的位置）；45min×3 后拿到 runDir | **fusion 产物路径**（`lanes/{A,B,C}/trajectory.md` 与 `fusion.md`）+ `detail` 原文 |
+| `pass` | **跑 trace-fusion**（主会话有 `launchTabs`，这是唯一有能力的位置）；拿到 runDir | **fusion 产物路径**（`lanes/{A,B,C}/trajectory.md` 与 `fusion.md`）+ `detail` 原文 |
 | `not-yet` | **不跑**（走常规检索） | 「fusion 门槛未达（clean M/5，达标线 N），本轮不启用」+ `detail` |
 | `insufficient-sample` | **不跑**（走常规检索） | 「fusion 样本不足（examined N/5，实际 X 个），不启用」+ `detail` |
 
 **tab 侧只做一件事**：任务书里有 fusion 产物路径 ⇒ `read` 那几份 trajectory 作校验性核对输入；
 没有 ⇒ 常规检索。**tab 不调用 `evaluateFusionGate`、不重新判定、不推翻主会话的降级理由**。
 
+### 成本口径（**实测，不是理论**；2026-11-09）
+
+| 阶段 | 样本 | min | median | mean | max |
+|---|---|---|---|---|---|
+| lane 阶段全部完成 | n=15 | 4.0 | **9.3** | 21.3 | 75.7 min |
+| 端到端到 `fusion.at` | n=7 | 5.8 | **14.1** | 44.0 | **218.7 min** |
+
+**两个方向都容易估错**：
+- 典型值**不是 135min 量级**（那是把 45min 乘了 3 的错算）；真实中位是 **14.1min**。
+- 长尾**不能低估**：实测最坏 **218.7min**。长尾**不是 lane 造成的**，是**融合重试**：
+  `tfl-20261103-192444-c7e2` 实测 lane 只用了 21.9min，端到端却 218.7min —— 多出的 196.9min
+  全是融合重试（`fusion/collect-worker.log` 时间线：exit=9 → exit=1 → exit=0 但无产物 →
+  正文不合格（591 字符缺 6 节）→ 成功，**4 次失败**后才完成；每次前还跑一遍 cross-test）。
+
+⇒ **判据**：把 fusion 当「十几分钟级」投入权衡，但**排期留小时级余量**（重试可致 3+ 小时）。
+
 **三条硬约束**
 
 1. **只有 `pass` 才真跑 fusion**。另两态走常规检索，并在计划里**具名记录未启用的理由与读数**。
    静默降级违反 R-2（不能说「本轮没 fusion」而不说为什么）。
-2. **只在值得时跑**：fusion 成本是 45min × 3 lane，远高于常规检索。
+2. **只在值得时跑**：fusion 典型 14min、长尾可达 219min（见上方成本口径），远高于常规检索。
    预期 tab 档位是 A0/A、或 `codegraph`/`read` 能直接确认关键假设时 ⇒ **不跑**（即使门槛 `pass`）。
    建议只在档位前置评估指向 B/C、或“三路独立诊断”本身有价值时启用。
 3. **主会话须在任务书里交接结论，不让 tab 重判**：

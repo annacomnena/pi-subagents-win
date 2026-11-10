@@ -258,5 +258,8 @@ export function evaluateFusionGate(runsDir: string, opts?: FusionGateOptions): F
  *    且成功）存在，但尚未观测到。
  * 2. **`mode` 不参与筛选**（见 `isQualified` 注释）：这是有意放宽，未做「只算 diagnose」
  *    的收紧；若将来 fusion 在别 mode 也产报告，本门槛会计入。
- * 3. 未接入任何调用方（本 commit 只交付纯函数；SKILL.md 的闸门接线是下一步）。
+ * 3. **文档已接线（`43f6446`），代码调用点仍零调用方**：
+ *    `grep -rn evaluateFusionGate extensions/ | grep -v gate.ts` 只命中定义、测试与文档。
+ *    本闸目前是**主会话行为约束**，靠编排方读 SKILL.md 执行。
+ *    **不得**为了“强制”而给 `workflow-tab` 开 `launchTabs`（越权扩权，比不接更糟）。
  */
