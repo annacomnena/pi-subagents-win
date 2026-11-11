@@ -3692,6 +3692,16 @@ ${notable[0].reason}
 			"durable, source-verified cross-task theme is absent. Require each returned fact to carry a code " +
 			"location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a " +
 			"'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
+		lines.push("Note: Searcher HONESTY contract (enforce it in the task text; measured violations on this repo): " +
+			"the searcher has claimed to have written files it never created (e.g. a literal unreplaced " +
+			"`plans/YYYYMMDD_*_research.md` path with no file on disk) and has self-identified as a model it is not. " +
+			"So when dispatching: (1) say 'do not say you wrote/created/updated a file unless you actually called " +
+			"write/edit this turn AND it returned success; if you did not write anything, say so explicitly'; " +
+			"(2) say 'never emit a literal placeholder path — replace YYYYMMDD/topic/NN with real values, or state " +
+			"you did not persist'; (3) say 'do not assert which model you are — identity comes from config, not from you'; " +
+			"(4) require it to say 'not found / not verified' instead of filling gaps with plausible guesses, and to " +
+			"disclose when codegraph reported 'not initialized' or a stale index, or when output was truncated. " +
+			"Verify every 'already saved to <path>' claim yourself (ls/read) before forwarding it downstream.");
 		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
 		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
