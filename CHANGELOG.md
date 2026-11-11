@@ -4,6 +4,30 @@
 
 > 主题：**监管（supervision）默认翻转 —— 从「派发后默认没人管」到「派发即登记」**；只改默认值与一个卡死判据，不改账本形状、不改只读红线、不改 `stagnation` 派生。
 
+### 2026-11-11 — trace-fusion 三路 lane + 融合模型切到本机 `local-ornith/ornith`（委托方指令）
+
+- 指令原文：「顺便把 traceFusion 的模型也改成它（ornith）」。
+- 变更（**只改 `config.json` 的 4 个键**，R-1 单键 RMW；改前备份 `config.json.bak-tf-ornith-20261111T135835`，改前 sha256 `afbfebfea3cd37b0…`）：
+  `traceFusionLoop.workerModelByLane.{A,B,C}` `lan-199/bonsai` → **`local-ornith/ornith`**；
+  `traceFusionLoop.fusionModel` `lan-199/bonsai` → **`local-ornith/ornith`**。
+  `laneConcurrency` 保持 **1**（ornith 端点 `total_slots=2`、KV 池三 slot 共享，三路并发必撞池 —— 本仓既有实测口径）；
+  `models.searcher` / `fallbackModels.searcher` 本轮**不动**（后者仍是 `lan-199/bonsai`，作为 searcher 的降级腿）。
+- **改了什么 & 为什么**：`local-ornith`（`127.0.0.1:30001/v1`，llama.cpp，`n_ctx=131072`、`total_slots=2`、9.2B IQ3_S）
+  与 `lan-199/bonsai`（`192.168.66.199:6001`，`n_ctx=262144`、`total_slots=4`）上下文同级；换过去后 trace-fusion 不再依赖 `192.168.66.199` 那台机。
+- **怎么验证（逐条读数，全部本轮实测）**：
+  1. 配置真被读到：`readTraceFusionConfig()` → `workerModelByLane={"A":"local-ornith/ornith","B":…,"C":…}`、`fusionModel=local-ornith/ornith`、`laneConcurrency=1`、`workerModel=undefined`，断言 **ASSERT OK**。
+  2. 模型名可解析（不靠猜）：`resolveWorkerModel()` 对 `local-ornith/ornith` 与短名 `ornith` 均 `{ok:true}`；`local-ornith/nope` 正确 `{ok:false}`（非法值仍 fail-closed，不静默回落）。
+  3. 端点真可用：`pi auth check --model local-ornith/ornith` → **ready**。
+  4. **ornith 单跑 `1+1`**：无 `--thinking`（默认 medium）`2` / `low` `2` / `off` `2`，wall 10.6s / 3.3s / 3.2s，`stop=stop`，无空产物。
+  5. **融合者角色真跑（关键门）**：用 `fusion-dispatch.ts` 的**真实六节标题** + `FUSION_SECTION_MIN_CHARS=40` 同一判据，喂合成三路摘要 —— **4/4 六节 PASS**
+     （`low` 2114ch/60.9s、`off` 4035ch/111.8s、`medium` 5041ch/50.6s、`medium#2` 1794ch/53.1s；四次全部 `reasoning` 块 0 字符，不存在「预算烧在思考上」）。
+  6. 回归门：`test:trace-fusion-settings`（①–⑦ 全过）/ `test:trace-fusion-param`（**20 passed, 0 failed**）/ `test:trace-fusion-launch`（passed + isolation 生产 tab-runs **1556→1556 零写**）/ `test:trace-fusion-gate`（**12 checks**）/ `test:trace-fusion-fusion-dispatch`（passed）。
+- **未做（具名）**：
+  ① **没有真跑一趟完整 trace-fusion run** —— 它会开 3 个可见 tab × 单 lane 最长 45 min；本轮只做了「同判据的融合者角色单跑」，端到端证据缺。
+  ② **trace-fusion 无 fallback 机制**（`TraceFusionConfig` 没有对应键），ornith 端点挂了就是 lane failed，不会自动切 `lan-199/bonsai`；要不要加需委托方定。
+  ③ **ornith 已知空回复缺陷（约 19% 的 assistant end 为 `content=''`）未修**：命中时产物为空 ⇒ 六节门判 `failed`（fail-closed，不会静默当成功），但融合成功率可能下降。
+  ④ `config.json` 被 `.gitignore:2` 忽略 ⇒ 本条变更**只在 CHANGELOG 里可审计**，clone 出去不带此配置。
+
 ### 2026-10-30 — 四笔此前未入账的提交（`solo` 模式 / audit 轮转 / steer 空闲唤醒）+ 陈旧事实校正
 
 - **第 5 种任务模式 `solo`（零派发）**（`56e5d0b`+`83b02d8`）：配额受限时 tab 的「必须派 subagent 做各阶段」纪律会让任务卡死；`solo` 显式声明「全工作自己做、严禁派任何 `subagent-win`」，收尾必须写自审局限的降级声明。**两条入口缺一不可**：direct `/launch --solo|-s`（`launch.ts:101-105`）+ `launch-tabs`/`master-dispatch` 的 `mode:"solo"`（`master-tools.ts:843`/`:906-907` —— 只补 launch 侧会让 master-dispatch 通道**静默降级成 workflow**）。前缀 `根据solo进行工作<id>`。验证：`test:launch` passed / `test:master-dispatch` 16 pass。**未闭合**：纪律而非机制强制（无 `assertDelegationAllowed` 硬接线）；与 adaptive 链深自评的交互未定义。README「Four task modes」已扩为五模式表。
