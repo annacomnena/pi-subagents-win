@@ -3679,7 +3679,19 @@ ${notable[0].reason}
 		// local master，诱导它们去派白名单外的 `general`（已实现过一次，见 local-master-launch 启动语的纠正段）。
 		// 与 NO_POLL_DISCIPLINE 同款处理：非主会话不注入主会话专属纪律，由各自的 onboarding 语承担。
 		if (isMainSession()) lines.push(...litePromptLines(cfg));
-		lines.push("Note: When dispatching the searcher, ask it to query `Wiki/` by keyword first, jump straight to code via each page's `source_paths` (e.g. `file#L49` / `file::Symbol`, no grep guessing), cross-check with codegraph, and PROACTIVELY maintain theme pages — update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a durable, source-verified cross-task theme is absent. Require each returned fact to carry a code location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a 'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
+		lines.push("Note: Searcher tool priority is a hard order: (1) `codegraph` for symbol-level " +
+			"lookup — whenever the task names a function/class/method/interface, tell the searcher to hit " +
+			"`codegraph action:\"query\"` / `explore` / `impact` FIRST (use `status` first; if it reports " +
+			"stale index run `sync`, if it reports 'not initialized' fall back explicitly, never pretend it " +
+			"was used); GDScript `*.gd` is NOT supported by codegraph; (2) `wiki-nav` for topic-level " +
+			"knowledge and `source_paths`; (3) `read` for actual content once you have `file:line`; " +
+			"(4) `grep`/`find`/`ls` only as a last resort (no index, no Wiki page, or non-code files). " +
+			"Also require: query `Wiki/` by keyword, jump straight to code via each page's `source_paths` " +
+			"(e.g. `file#L49` / `file::Symbol`, no grep guessing), and PROACTIVELY maintain theme pages — " +
+			"update stale ones (re-verify as `current` or mark `stale`) and CREATE a missing page when a " +
+			"durable, source-verified cross-task theme is absent. Require each returned fact to carry a code " +
+			"location AND a Wiki section reference (or `Wiki: none`) plus a calibration status, plus a " +
+			"'Wiki section list' and a 'Wiki maintenance record' to forward to downstream agents.");
 		lines.push("Note: Wiki is reused across agents — when dispatching planner/plan-reviewer/implementer/code-reviewer, forward the searcher's Wiki section list and instruct them to `read` those sections first (free knowledge, no re-exploration). Task findings still never go to Wiki.");
 		lines.push("Note: Use `wiki-nav` progressively instead of reading whole index JSON. This discovery flow is ONLY for a new/unlocated topic: split it into 1-5 short phrases → `keywords queries=[...]` exact-check → only exact misses may use `semantic-terms queries=[...]` (returns terms only) → grep a selected term to locate Wiki. Once a searcher confirms `Wiki/path.md#section`, that exact reference is the workflow handoff: forward it to planner/implementer/reviewer and have them read it directly; never rediscover a known reference. `keywords query=<fragment>` filters vocabulary only. Do NOT inspect `_navigation.json`/`_search.json`/`_keywords.json`. `tree node` requires a real page id/title/unique alias, not a directory name.");
 		lines.push("Note: Run `wiki-nav rebuild` ONLY after Wiki was created/updated/merged/deleted, or when the tool reports a missing index. It regenerates `_navigation.json` + `_search.json` + `_keywords.json` from Wiki/*.md (TS, self-contained, sub-second). Rebuilding cannot make an unchanged no-match query succeed.");
