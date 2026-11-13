@@ -125,8 +125,17 @@ interface KillMeta {
 
 /** 进程内登记表（同一 extension host 内的权威 pid 归属）。 */
 const procRegistry = new Map<string, ProcEntry>();
-/** 已被 kill 的 run（供完成回调 finalize 时保留 cancelled，不被 result 覆盖）。 */
+/** 已被 kill 的 run（供完成回调 finalize 时保留 cancelled，不被 result 覆盖；带 FIFO 上限防泄漏）。 */
+const MAX_KILLED_RUNS = 200;
 const killedRuns = new Map<string, KillMeta>();
+
+function rememberKilledRun(runId: string, meta: KillMeta): void {
+	killedRuns.set(runId, meta);
+	if (killedRuns.size > MAX_KILLED_RUNS) {
+		const first = killedRuns.keys().next().value;
+		if (first !== undefined) killedRuns.delete(first);
+	}
+}
 
 /** 登记基线容差：登记后子进程启动时间应落在此窗口内（防 pid 重用）。 */
 const START_TOLERANCE_EARLY_MS = 300_000; // 允许登记前最多 5 分钟（时钟偏差/慢启动）
@@ -386,6 +395,7 @@ export function applyKillOutcome(record: {
 }): void {
 	const meta = killedRuns.get(record.id);
 	if (!meta) return;
+	killedRuns.delete(record.id);
 	record.status = "cancelled";
 	record.killedAt = meta.killedAt;
 	record.killedBy = meta.killedBy;
@@ -849,7 +859,7 @@ function markKilled(
 	delete next.pidRecordedAt;
 	delete next.pidCmdMarker;
 	writeRecord(runsDir, next);
-	killedRuns.set(next.id, meta);
+	rememberKilledRun(next.id, meta);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -950,7 +960,7 @@ export async function killAsyncRun(opts: KillAsyncRunOptions): Promise<KillResul
 	// 先置 kill 意图：kill 会让子进程 close → index.ts 的 .then 回写 result，
 	// 可能早于下面的 markKilled；先记入 killedRuns 保证 finalize 保留 cancelled。
 	const meta = buildMeta();
-	killedRuns.set(runId, meta);
+	rememberKilledRun(runId, meta);
 	const killRes = killProcessTree(pid);
 	if (!killRes.ok) {
 		killedRuns.delete(runId);

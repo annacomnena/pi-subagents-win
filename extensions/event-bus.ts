@@ -64,6 +64,16 @@ export interface EventBusOptions {
 }
 
 const MAX_SEEN_RESULTS = 500;
+/**
+ * 单个结果文件最多记多少个内容指纹（2026-11-13 内存审计）。
+ *
+ * 为什么需要：文件级上限 500 只约束「多少个文件」，bucket 内部是 `Set.add` 无上限的 ——
+ * 一个被反复改写的结果文件（兜底→自报→人工修正）能无限累积指纹。
+ * 实测该 shape 500 文件 × 100 指纹 ≈ 5.9MB；真实每文件通常 ≤3 个（兜底/自报/终态），
+ * 这里留 8 倍余量。超过则 FIFO 丢最旧：代价是「极旧内容原样再来」会被当新事件重投一次
+ * （宁重发不漏发，见 AGENTS.md §6），而 8 个指纹的现实占用下几乎不可能触达。
+ */
+const MAX_FINGERPRINTS_PER_RESULT = 8;
 let watcher: FSWatcher | null = null;
 // 2026-11-03 L4 实验验实：按**文件名**永久去重 ⇒ 兜底生成的 unconfirmed 结果一旦消耗掉文件名，
 // 同一文件后来被 tab-finish 覆盖成正式自报，watcher 就再也不通知消费者（trace-fusion 的续发唤醒
@@ -79,6 +89,10 @@ function markResultSeen(fileName: string, fingerprint: string): void {
 		seenResults.set(fileName, bucket);
 	}
 	bucket.add(fingerprint);
+	if (bucket.size > MAX_FINGERPRINTS_PER_RESULT) {
+		const oldest = bucket.values().next().value;
+		if (oldest !== undefined) bucket.delete(oldest);
+	}
 	if (seenResults.size > MAX_SEEN_RESULTS) {
 		const first = seenResults.keys().next().value;
 		if (first !== undefined) seenResults.delete(first);

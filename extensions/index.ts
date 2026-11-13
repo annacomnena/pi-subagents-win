@@ -2694,7 +2694,8 @@ export default function (pi: ExtensionAPI) {
 	// async subagent 完成注入（0922）：监听 subagent-runs/，终态时向归属会话 followUp 唤醒
 	collect(registerAsyncResultWatcher(pi, { runsDir: RUNS_DIR }));
 
-	// trace-fusion progress 去重集（2026-11-03 L4 M2）：同一「run + lane 状态签名」只报一次
+	// trace-fusion progress 去重集（2026-11-03 L4 M2）：同一「run + lane 状态签名」只报一次（上限 200 防泄漏）
+	const MAX_TRACE_PROGRESS_SEEN = 200;
 	const TRACE_PROGRESS_SEEN = new Set<string>();
 
 	// 事件总线：tab 完成即感知（fs.watch → toast + 自动唤醒模型去 reclaim）；
@@ -2737,6 +2738,10 @@ export default function (pi: ExtensionAPI) {
 					const sig = `${outcome.runId}|${notable.map((f) => `${f.lane}:${f.status}`).join(",")}`;
 					if (!TRACE_PROGRESS_SEEN.has(sig)) {
 						TRACE_PROGRESS_SEEN.add(sig);
+						if (TRACE_PROGRESS_SEEN.size > MAX_TRACE_PROGRESS_SEEN) {
+							const first = TRACE_PROGRESS_SEEN.values().next().value;
+							if (first !== undefined) TRACE_PROGRESS_SEEN.delete(first);
+						}
 						notifyFollowUpQuietly(
 							pi.sendUserMessage,
 							`🧬 trace-fusion run ${outcome.runId} 进度：完成 ${outcome.done}/3。${notable.map((f) => `${f.lane}=${f.status}`).join(" ")}。

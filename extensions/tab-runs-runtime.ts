@@ -204,6 +204,7 @@ export function registerTabTelemetry(
 	let lastAssistantText = "";
 	let lastStopReason: string | undefined;
 	const usageAccum = emptyTabUsage();
+	const MAX_USAGE_SEEN = 500;
 	const usageSeen = new Set<string>();
 	// 本进程 pid：**每次写入都带**（旧实现只在 session_start 带一次，后续重建对象时丢掉
 	// ⇒ 实测全部 tab state 的 pid 缺失，外部无法进程探活，只能信 lastActivityAt —— 已证明不可靠）
@@ -257,20 +258,45 @@ export function registerTabTelemetry(
 	// 否则心跳会把「空闲」伪装成「有进展」，那就是另一种谎报。
 	// 判死正确口径：`pid` 探活 ∨ `heartbeatAt` 距今 > 90s。
 	const HEARTBEAT_MS = opts?.heartbeatMs ?? 30_000;
-	const heartbeatTimer = HEARTBEAT_MS > 0 ? setInterval(() => {
-		if (finished) return;
-		const runId = resolveRunId();
-		if (!runId) return;
-		lastHeartbeatAt = new Date().toISOString();
-		// 读-改-写：保留既有业务字段，只刷新 heartbeatAt（避免心跳把 currentToolStartedAt 等清掉）
-		const cur = readTabState(runsDir, runId);
-		if (!cur) return;
-		writeTabState(runsDir, runId, { ...cur, pid: ownPid, heartbeatAt: lastHeartbeatAt });
-	}, HEARTBEAT_MS) : undefined;
-	// 不因心跳钉住进程退出
-	(heartbeatTimer as unknown as { unref?: () => void } | undefined)?.unref?.();
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+	/**
+	 * 启动心跳（幂等：已在运行 / 已终态 / 关闭心跳 ⇒ no-op）。
+	 *
+	 * 为什么要能"重启"（2026-11-13）：`session_shutdown` 会在 **reload / 会话切换**时发出
+	 * （见 `index.ts` 的清理段注释），同一进程随后还会发 `session_start` 再开一个会话。
+	 * 若 shutdown 时注销心跳且不再重启，`heartbeatAt` 就**永久冻结**在那一刻 ——
+	 * `tab-status` 的列表视图（`countStaleByHeartbeat`，零进程开销、只按心跳算年龄）
+	 * 会把仍在正常工作的 tab 报成「心跳超龄，疑似僵尸」，正是心跳当初要消除的那种误判。
+	 */
+	const startHeartbeat = (): void => {
+		if (HEARTBEAT_MS <= 0 || heartbeatTimer !== undefined || finished) return;
+		heartbeatTimer = setInterval(() => {
+			if (finished) return;
+			const runId = resolveRunId();
+			if (!runId) return;
+			lastHeartbeatAt = new Date().toISOString();
+			// 读-改-写：保留既有业务字段，只刷新 heartbeatAt（避免心跳把 currentToolStartedAt 等清掉）
+			const cur = readTabState(runsDir, runId);
+			if (!cur) return;
+			writeTabState(runsDir, runId, { ...cur, pid: ownPid, heartbeatAt: lastHeartbeatAt });
+		}, HEARTBEAT_MS);
+		// 不因心跳钉住进程退出
+		(heartbeatTimer as unknown as { unref?: () => void } | undefined)?.unref?.();
+	};
+
+	const clearHeartbeat = (): void => {
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = undefined;
+		}
+	};
+
+	startHeartbeat();
 
 	pi.on("session_start", (_event, ctx) => {
+		// 会话切换/reload 后重新挂上心跳（shutdown 时注销过；finished 时 startHeartbeat 自会 no-op）
+		startHeartbeat();
 		const sessionPath = ctx.sessionManager?.getSessionFile?.() ?? undefined;
 		writeState("attached", "idle", { sessionPath, pid: process.pid });
 	});
@@ -309,6 +335,10 @@ export function registerTabTelemetry(
 				// 无法去重的消息（无任何标识）或重复消息：不累加
 			} else {
 				usageSeen.add(key);
+				if (usageSeen.size > MAX_USAGE_SEEN) {
+					const first = usageSeen.values().next().value;
+					if (first !== undefined) usageSeen.delete(first);
+				}
 				const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 				usageAccum.input += n(usage.input);
 				usageAccum.output += n(usage.output);
@@ -345,6 +375,7 @@ export function registerTabTelemetry(
 	});
 
 	pi.on("session_shutdown", () => {
+		clearHeartbeat();
 		const runId = resolveRunId();
 		if (!runId) return;
 		if (!finished) {
@@ -437,6 +468,7 @@ export function registerTabTelemetry(
 			}
 			writeJsonAtomic(tabResultPath(runsDir, runId), check.value);
 			finished = true;
+			clearHeartbeat();
 			// tab 侧也回报：本窗口用户可见（主会话侧由 event-bus 的 fs.watch 感知后再回报）
 			try {
 				sendWindowsToast({

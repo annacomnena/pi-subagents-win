@@ -456,6 +456,7 @@ export function spawnPiTab(options: TabLaunchOptions): TabSpawnResult {
 			excludeTools: options.excludeTools,
 		}), {
 			shell: false,
+			stdio: "ignore",
 			// 把回收身份传入新标签页：wt.exe 继承环境 → shell → pi 进程。
 			// review 修正（Luna critical）：session profile 同步注入 env——factory 阶段
 			// CLI flag 尚未就绪，只有 env 能保证 profile 在扩展初始化时即生效。

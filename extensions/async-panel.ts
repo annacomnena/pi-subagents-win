@@ -237,6 +237,7 @@ export function registerAsyncPanel(pi: ExtensionAPI): () => void {
 	pi.on("session_start", () => {
 		clearAsyncPanelUi(); // 新周期丢弃旧 UI 引用
 		const myGen = ++sessionGen;
+		if (interval) clearInterval(interval);
 		interval = setInterval(() => {
 			if (myGen !== sessionGen) return; // 过期周期 no-op
 			refreshAsyncPanel();

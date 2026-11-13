@@ -346,6 +346,44 @@ writeTabDispatch(runsDir, dispatch);
 	rmSync(join(runsDir, `${HB}.json`), { force: true });
 }
 
+// ── H3：session_shutdown → session_start 之后心跳必须恢复（2026-11-13 回归锁）────
+//
+// 背景：`session_shutdown` 在 **reload / 会话切换** 时会发，同一进程随后还会再发
+// `session_start`。若 shutdown 注销心跳后不再重启，`heartbeatAt` 会永久冻结；
+// `countStaleByHeartbeat`（列表视图，零进程开销）随即把仍在工作的 tab 报成
+// 「心跳超龄，疑似僵尸」—— 正是 10-20 心跳机制要消除的那种误判。
+{
+	const HB2 = "tab_hb_2";
+	writeTabDispatch(runsDir, { ...dispatch, id: HB2, taskId: "hb2" });
+	const pi = makeFakePi();
+	registerTabTelemetry(pi, { tabRunId: HB2, runsDir, heartbeatMs: 40 });
+
+	pi.emit("session_start", {}, { sessionManager: { getSessionFile: () => "/tmp/s2.jsonl" } });
+	await new Promise((r) => setTimeout(r, 120));
+	const hbBefore = readTabState(runsDir, HB2)?.heartbeatAt;
+	assert.ok(hbBefore, "H3a 基线：session_start 后心跳必须已在写 heartbeatAt");
+
+	// 会话切换/reload：shutdown 后心跳应停（不留孤儿 timer）
+	pi.emit("session_shutdown", {});
+	const hbAtShutdown = readTabState(runsDir, HB2)?.heartbeatAt;
+	await new Promise((r) => setTimeout(r, 150));
+	const hbAfterIdle = readTabState(runsDir, HB2)?.heartbeatAt;
+	assert.ok(
+		hbAfterIdle === undefined || hbAfterIdle === hbAtShutdown || String(hbAfterIdle) === String(hbBefore),
+		"H3b shutdown 之后心跳必须停（heartbeatAt 不得继续前进）",
+	);
+
+	// 同一进程内新会话：心跳必须被重新挂上（旧行为：永久冻结 ⇒ 误报僵尸）
+	pi.emit("session_start", {}, { sessionManager: { getSessionFile: () => "/tmp/s3.jsonl" } });
+	await new Promise((r) => setTimeout(r, 150));
+	const hbResumed = readTabState(runsDir, HB2)?.heartbeatAt;
+	assert.ok(hbResumed, "H3c 重新 session_start 后 heartbeatAt 必须重新出现（否则永久冻结）");
+	assert.ok(String(hbResumed) > String(hbBefore), "H3d 恢复后的 heartbeatAt 必须比 shutdown 前更新（真的在走）");
+
+	rmSync(join(runsDir, `${HB2}.state.json`), { force: true });
+	rmSync(join(runsDir, `${HB2}.json`), { force: true });
+}
+
 rmSync(runsDir, { recursive: true, force: true });
 
 console.log("tab-runs-runtime tests passed");

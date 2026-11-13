@@ -10,6 +10,7 @@
 import { create } from "zustand";
 import { api, newCommandKey, type ConnState, type FetchErr } from "./api/client";
 import { applyTranscriptOp } from "./api/transcript";
+import { sessionsToEvict, touchChatRecency } from "./chatRowCache";
 // 【P2 2026-11-10】`describeHttpFailure` 是**值**（函数），不能放进 `import type` 块
 import { describeHttpFailure } from "./api/types";
 import type {
@@ -314,6 +315,14 @@ interface GuiState {
 	sendChatSlash: (sessionId: string, name: string, args: string) => Promise<void>;
 	/** 0923 2003 C3：WS 重连强制 resync（有 head 走 after= 增量补差，否则/失败回退全量）。 */
 	resyncChatSession: (id: string) => Promise<void>;
+	/**
+	 * 会话行缓存的有界收敛（2026-11-13 内存审计）：touch 访问序 + 淘汰最久未用的会话。
+	 *
+	 * 每次写入某会话的行之后调用（`reloadChatSession` / `resyncChatSession` / `applyChatFrame`）。
+	 * 淘汰时一次性丢弃该会话的 rows/head/seq/hasOlder/tail —— **不能只丢 rows**（遗留 head 会让
+	 * 下次 resync 走 delta 分支合并进空数组，界面只剩半屏）；取舍见 `chatRowCache.ts` 头注。
+	 */
+	pruneChatCaches: (keepId: string) => void;
 	applyChatFrame: (frame: StreamServerFrame) => Promise<void>;
 	setChatConn: (s: StreamState) => void;
 	bumpChatResync: () => void;
@@ -321,6 +330,12 @@ interface GuiState {
 
 /** 首屏尾部行数（L2 perf：一屏约 200 行；「加载更早」时翻倍）。 */
 const TAIL_FIRST = 200;
+
+/**
+ * 会话行缓存的访问序（末尾 = 最近使用；模块级 —— 不进 state，改它不触发重渲染）。
+ * 只影响「淘汰谁」，不影响任何数据正确性；进程内丢失（刷新/热更）只是从空序重建。
+ */
+let chatRowRecency: readonly string[] = [];
 
 function isResync(e: FetchErr): boolean {
 	return e.resync === true;
@@ -920,6 +935,7 @@ export const useGui = create<GuiState>((set, get) => ({
 			chatHasOlderBySession: { ...get().chatHasOlderBySession, [id]: r.data.hasOlder === true },
 			chatTailBySession: { ...get().chatTailBySession, [id]: Math.max(want, rows.length) },
 		});
+		get().pruneChatCaches(id);
 		get().markUp(r.at);
 	},
 
@@ -992,7 +1008,31 @@ export const useGui = create<GuiState>((set, get) => ({
 				chatSeqBySession: { ...get().chatSeqBySession, [id]: r.data.head?.seq ?? 0 },
 			});
 		}
+		get().pruneChatCaches(id);
 		get().markUp(r.at);
+	},
+
+	pruneChatCaches: (keepId) => {
+		chatRowRecency = touchChatRecency(chatRowRecency, keepId);
+		const drop = sessionsToEvict(chatRowRecency, get().chatActiveId);
+		if (drop.length === 0) return;
+		const gone = new Set(drop);
+		const without = <T,>(m: Record<string, T>): Record<string, T> => {
+			const next: Record<string, T> = {};
+			for (const [k, v] of Object.entries(m)) if (!gone.has(k)) next[k] = v;
+			return next;
+		};
+		// 一次性丢掉整组 per-session 字段：留着 head 会让下次 resync 走 delta 分支合并进空数组
+		// ⇒ 界面只剩半屏（比多占几 MB 更糟）。notifyOffsetBySession 不动：它是去重指针，丢了会重弹 toast。
+		set({
+			chatRowsBySession: without(get().chatRowsBySession),
+			chatHeadBySession: without(get().chatHeadBySession),
+			chatSeqBySession: without(get().chatSeqBySession),
+			chatHasOlderBySession: without(get().chatHasOlderBySession),
+			chatTailBySession: without(get().chatTailBySession),
+			chatUsageBySession: without(get().chatUsageBySession),
+		});
+		chatRowRecency = chatRowRecency.filter((id) => !gone.has(id));
 	},
 
 	openChatSession: async (id) => {
@@ -1088,6 +1128,7 @@ export const useGui = create<GuiState>((set, get) => ({
 				chatRowsBySession: { ...get().chatRowsBySession, [sid]: view.rows },
 				chatSeqBySession: { ...get().chatSeqBySession, [sid]: Math.max(prevSeq, frame.seq) },
 			});
+			get().pruneChatCaches(sid);
 			return;
 		}
 		if (frame.type === "ack" && frame.mode === "snapshot" && sid !== null) {

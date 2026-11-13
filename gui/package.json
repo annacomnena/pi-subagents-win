@@ -12,7 +12,9 @@
     "test:gui-composer": "node --experimental-strip-types src/_test_composer_attachments.ts",
     "test:gui-turn-collapse": "node --experimental-strip-types src/_test_turn_collapse.ts",
     "test:outbox-envelope": "node --experimental-strip-types src/_test_outbox_envelope.ts",
-    "test:write-card": "node --experimental-strip-types src/_test_write_card.ts"
+    "test:write-card": "node --experimental-strip-types src/_test_write_card.ts",
+    "test:gui-chat-row-cache": "node --experimental-strip-types src/_test_chat_row_cache.ts",
+    "test:gui-chat-row-cache-wiring": "node --experimental-strip-types src/_test_chat_row_cache_wiring.ts"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

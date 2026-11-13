@@ -579,6 +579,7 @@ export function registerOutboxBridge(
 	let watcher: FSWatcher | null = null;
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 	let sessionGen = 0;
+	let currentSid: string | null = null;
 	pi.on("session_start", (_event, ctx) => {
 		try {
 			if (isSubagent()) return;
@@ -592,6 +593,8 @@ export function registerOutboxBridge(
 		if (interval) clearInterval(interval);
 		if (watcher) { try { watcher.close(); } catch { /* */ } watcher = null; }
 		if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+		if (currentSid) { sessionConsumers.delete(currentSid); currentSid = null; }
+		currentSid = sid;
 		const send = pi.sendUserMessage?.bind(pi);
 		const stateDir = opts.stateDir ?? join(defaultRuntimeDir(), "state");
 		const outDir = outboxDir(stateDir);
@@ -660,8 +663,10 @@ export function registerOutboxBridge(
 		interval = null;
 		if (watcher) { try { watcher.close(); } catch { /* */ } watcher = null; }
 		if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
-		// 清理同进程唤醒注册（按当前 session；sessionGen 已失配 → closed()=true → doConsume no-op）
-		// 不清 sessionConsumers（doConsume 内有 closed() 守卫，安全）；
-		// 下一次 session_start 会覆盖同 key。
+		// 清理同进程唤醒注册（解除对 sessionConsumers 强引用，防闭包内存泄漏）
+		if (currentSid) {
+			sessionConsumers.delete(currentSid);
+			currentSid = null;
+		}
 	};
 }
