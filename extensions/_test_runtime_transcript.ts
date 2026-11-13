@@ -493,6 +493,119 @@ try {
 			}
 		})();
 		assert.equal(po, 0, "缺失文件尾读 never-throw");
+
+		// 稳态早退（2026-11-13）：cursor 已在 EOF ⇒ 与旧路径逐字等价，且不得吃掉后续新增
+		//
+		// 动因：WS transcript 订阅每 250ms 一拍，旧实现每拍 readFileSync 整文件只为发现「没有新行」。
+		// 早退靠 `size === cursor.offset` 判据，**必须**保证：① cursor 原样返回（offset+nextLineNo）
+		// ② 不误报 truncated（否则前端会白白 resync）③ 之后追加的字节仍能被读到。
+		{
+			const steady = join(d, "steady.jsonl");
+			writeFileSync(steady, header("s1", "2026-09-22T09:00:00.000Z") + userMsg("u1", "2026-09-22T09:00:01.000Z", "hi"), "utf8");
+			const first = readSessionTail(steady, SESSION_TAIL_CURSOR_START);
+			assert.equal(first.lines.length, 2, "首读：header + user 两行");
+			const eof = first.cursor;
+
+			const again = readSessionTail(steady, eof);
+			assert.deepEqual(again.lines, [], "稳态（size===offset）⇒ 0 行");
+			assert.equal(again.skippedBadLines, 0);
+			assert.equal(again.truncated, false, "稳态不得误报 truncated（否则前端白 resync）");
+			assert.deepEqual(again.cursor, eof, "cursor 必须原样返回（offset + nextLineNo）");
+
+			// 早退之后仍必须能读到新字节（回归：判据写错成 `>=` ⇒ 新数据被永久吞掉，实测该变异会被本文件更早的断言杀掉）
+			appendFileSync(steady, userMsg("u2", "2026-09-22T09:00:02.000Z", "again"));
+			const nxt = readSessionTail(steady, again.cursor);
+			assert.equal(nxt.lines.length, 1, "追加 1 行必须被读到（早退不得吞新字节）");
+			assert.deepEqual(nxt.lines.map((l) => l.seq), [eof.nextLineNo], "seq 接续物理行号");
+		}
+
+		// ── 第二刀：只读增量（2026-11-13）─────────────────────────────
+		//
+		// 三条不变量：① 只消费到最后一个 `\n`（半行跨拍）② 本拍 0 行时 cursor 不动
+		// ③ 整段无换行（单行 > 软上限）绝不停滞 —— 必须倍增长到出现换行为止。
+
+		// C1 半行跨拍 + 小软上限（16B 连一行 header 都装不下 ⇒ 走倍增长，仍只吃到换行为止）
+		{
+			const span = join(d, "span.jsonl");
+			const full = '{"type":"message","id":"p1","parentId":null,"timestamp":"2026-09-22T12:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"abcdefghij"}]}}';
+			writeFileSync(span, header("h4", "2026-09-22T12:00:00.000Z") + full.slice(0, 20), "utf8");
+
+			const t1 = readSessionTail(span, SESSION_TAIL_CURSOR_START, { softCapBytes: 16 });
+			assert.equal(t1.lines.length, 1, "C1a 软上限 16B 下仍必须读到完整 header 行（倍增长）");
+			assert.equal(t1.cursor.nextLineNo, 2, "C1a 只消耗 1 行");
+			assert.equal(t1.cursor.offset, Buffer.byteLength(header("h4", "2026-09-22T12:00:00.000Z"), "utf8"), "C1a cursor 停在半行行首");
+
+			const t2 = readSessionTail(span, t1.cursor, { softCapBytes: 16 });
+			assert.equal(t2.lines.length, 0, "C1b 未终止的半行不得被消费");
+			assert.equal(t2.cursor.offset, t1.cursor.offset, "C1b 0 行时 cursor 必须不动（否则复位/重复）");
+			assert.equal(t2.cursor.nextLineNo, t1.cursor.nextLineNo, "C1b 行号不得前进");
+
+			appendFileSync(span, full.slice(20) + "\n", "utf8");
+			const t3 = readSessionTail(span, t2.cursor, { softCapBytes: 16 });
+			assert.equal(t3.lines.length, 1, "C1c 补全换行后必须读到整行");
+			assert.equal(t3.lines[0].seq, 2, "C1c seq 接续（2）");
+			assert.equal((t3.lines[0].entry as { id?: string }).id, "p1", "C1c 内容完整（未被截断破坏 JSON）");
+		}
+
+		// C2 单拍大增量：软上限小 ⇒ 多拍读完；与「一拍读完」逐行等价（差分配对）
+		{
+			const many = join(d, "chunked.jsonl");
+			const body: string[] = [header("h5", "2026-09-22T13:00:00.000Z")];
+			for (let i = 0; i < 40; i += 1) {
+				body.push(userMsg(`m${i}`, `2026-09-22T13:00:${String(i).padStart(2, "0")}.000Z`, `body-${i}-${"x".repeat(80)}`));
+			}
+			writeFileSync(many, body.join(""), "utf8");
+
+			// 参考：一拍读完（默认软上限）
+			const oneShot = readSessionTail(many, SESSION_TAIL_CURSOR_START);
+
+			// 被测：16B 软上限逐拍推进
+			const got: { seq: number; entry: Record<string, unknown> }[] = [];
+			let cursor = SESSION_TAIL_CURSOR_START;
+			let calls = 0;
+			for (;;) {
+				const r = readSessionTail(many, cursor, { softCapBytes: 16 });
+				calls += 1;
+				got.push(...(r.lines as { seq: number; entry: Record<string, unknown> }[]));
+				const progressed = r.cursor.offset !== cursor.offset || r.cursor.nextLineNo !== cursor.nextLineNo;
+				cursor = r.cursor;
+				if (!progressed) break;
+				assert.ok(calls < 500, "C2 分块读必须收敛（否则软上限判据写错）");
+			}
+
+			assert.ok(calls > 5, `C2 16B 软上限必须多拍（实际 ${calls} 拍）`);
+			assert.equal(got.length, oneShot.lines.length, "C2 多拍与一拍的行数必须一致");
+			assert.deepEqual(
+				got.map((l) => [l.seq, JSON.stringify(l.entry)]),
+				oneShot.lines.map((l) => [l.seq, JSON.stringify(l.entry)]),
+				"C2 多拍与一拍逐行等价（seq + 内容）",
+			);
+			assert.equal(cursor.offset, oneShot.cursor.offset, "C2 终态 cursor.offset 必须一致");
+			assert.equal(cursor.nextLineNo, oneShot.cursor.nextLineNo, "C2 终态行号必须一致");
+		}
+
+		// C3 巨行（单行 > 软上限）：不得在软上限处停滞
+		{
+			const giant = join(d, "giant.jsonl");
+			const bigLine = JSON.stringify({
+				type: "message", id: "g1", parentId: null, timestamp: "2026-09-22T14:00:00.000Z",
+				message: { role: "user", content: [{ type: "text", text: "y".repeat(600) }] },
+			});
+			writeFileSync(giant, header("h6", "2026-09-22T14:00:00.000Z") + bigLine, "utf8"); // 巨行未终止
+
+			const g1 = readSessionTail(giant, SESSION_TAIL_CURSOR_START, { softCapBytes: 64 });
+			assert.equal(g1.lines.length, 1, "C3a header 行可读");
+
+			const g2 = readSessionTail(giant, g1.cursor, { softCapBytes: 64 });
+			assert.equal(g2.lines.length, 0, "C3b 未终止的巨行 ⇒ 0 行");
+			assert.equal(g2.cursor.offset, g1.cursor.offset, "C3b cursor 不得前进");
+
+			appendFileSync(giant, "\n", "utf8");
+			const g3 = readSessionTail(giant, g2.cursor, { softCapBytes: 64 });
+			assert.equal(g3.lines.length, 1, "C3c 补上换行后巨行必须被读到（倍增长生效，未停滞在 64B）");
+			assert.equal((g3.lines[0].entry as { id?: string }).id, "g1", "C3c 巨行内容完整");
+			assert.equal(g3.cursor.nextLineNo, g1.cursor.nextLineNo + 1, "C3c 行号只 +1（巨行算一行）");
+		}
 	}
 
 	console.log("_test_runtime_transcript: all assertions passed");

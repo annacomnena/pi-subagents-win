@@ -26,7 +26,7 @@
  * 红线：只读纯库、never-throw（坏行/未知条目 skip+计数）、零 Pi API 依赖。
  */
 
-import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync, existsSync } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync, statSync, existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -442,6 +442,8 @@ export interface SessionTailResult {
 function splitCompleteLines(buf: Buffer, startOffset: number, startLineNo: number): {
 	lines: { lineNo: number; text: string }[];
 	cursor: SessionTailCursor;
+	/** 相对 `startOffset` 实际消费掉的字节数（到最后一个 `\n` 为止；无 `\n` 时为 0）。 */
+	end: number;
 } {
 	const slice = buf.subarray(startOffset);
 	let lastNL = -1;
@@ -464,11 +466,60 @@ function splitCompleteLines(buf: Buffer, startOffset: number, startLineNo: numbe
 		lines.push({ lineNo, text });
 		lineNo += 1;
 	}
-	return { lines, cursor: { offset: startOffset + end, nextLineNo: lineNo } };
+	return { lines, cursor: { offset: startOffset + end, nextLineNo: lineNo }, end };
 }
 
-/** 从 cursor 增量读 session JSONL 完整行（半截尾行留待下次；坏行计数并消耗行号）。 */
-export function readSessionTail(path: string, cursor: SessionTailCursor): SessionTailResult {
+/**
+ * 单拍最多读多少字节（尾读）。
+ *
+ * 实测依据：42.6MB 会话的单行最大 **4.2MB**（152MB 会话 1377 行、均 110KB），故取 8MB 留 2× 余量。
+ * 超过上限且整段无换行（巨行）时按倍增长到出现换行为止 —— 见 `readSessionTail` 的读循环。
+ * 为什么不设更大：这是**同步**读，8MB ≈ 1.7ms 事件循环阻塞；250ms 一拍，追平 8MB/拍 = 32MB/s 足够。
+ */
+const SESSION_TAIL_SOFT_CAP_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 从 cursor 增量读 session JSONL 完整行（半截尾行留待下次；坏行计数并消耗行号）。
+ *
+ * ## 一、没有新增就早退（2026-11-13 实测）
+ *
+ * 本函数唯一的**高频**调用点是 `ws.ts:894 tickTranscript`（`tailMs` 缺省 250ms，每连接一个）。
+ * 旧实现在 cursor 已在 EOF 时仍然 `readFileSync(path)` 整文件读一遍，再由 `splitCompleteLines`
+ * 用 `subarray(cursor.offset)` 把前面全部丢弃 —— 即「为了发现没有新行，先把整个文件搬一遍」。
+ *
+ * | 会话 | 旧实现 | 每秒分配 | 早退后 |
+ * |---|---|---|---|
+ * | 42.6MB | 9–12ms/次 | 170MB | 0.03ms（仅 statSync） |
+ * | 152.4MB | 36.5ms/次 | 609MB | 0.03ms |
+ *
+ * 更要紧的是**同步阻塞**：`readFileSync` 在 host 单线程里，152MB 那次每拍阻塞事件循环 36ms，
+ * 期间所有 HTTP/WS 帧排队。「没有新行」是绝大多数 tick 的真实状态 ⇒ 这一条早退吃掉几乎全部浪费。
+ *
+ * 语义等价性：`size === cursor.offset` 表示「cursor 之后的字节数为 0」，且 offset 必然落在行首
+ * （cursor 只由本函数的 `splitCompleteLines` 推进，只停完整行末）⇒ 旧路径必然返回 `lines: []`、
+ * `cursor` 原样、`truncated: false`，与新路径逐字一致。文件不存在 / 空文件（size=0 且 offset=0）同理；
+ * `size < offset`（截断/重写）仍由上面分支报 truncated。
+ *
+ * ## 二、只读增量、不读整文件（同一日第二刀）
+ *
+ * 早退只在「无新增」时生效；一旦有新行（每次模型输出），旧实现仍是 O(文件)。现在改为
+ * `openSync + readSync` 从 `cursor.offset` 起只读新增部分，单拍软上限 `SESSION_TAIL_SOFT_CAP_BYTES`，
+ * 本拍消费到**最后一个换行**为止，剩余留给下一拍（cursor 逐拍前进，不会重读已消费段）。
+ *
+ * 三条不变量（改动时不许破）：
+ *   1. **只消费到最后一个 `\n`**：半截尾行必须留给下一拍，否则半个 JSON 行会被当完整行解析，
+ *      而坏行只会让 `skippedBadLines +1` —— 静默丢一行。
+ *   2. **本拍 0 个完整行时 cursor 不得前进**（`split.end === 0`）：所以绝对偏移必须用
+ *      `cursor.offset + split.end` 换算；误用 `split.cursor.offset`（相对缓冲区）会在 end=0 时
+ *      把 offset 复位到 0 ⇒ 下一拍重读整段（重复行 + 行号错位）。
+ *   3. **绝不因软上限而停滞**：整段无换行（单行 > 上限，实测存在 4.2MB 的行）⇒ 缓冲倍增长到
+ *      出现换行或 EOF。在软上限处直接返回会让下一拍重读同一段、永远等不到那个换行。
+ */
+export function readSessionTail(
+	path: string,
+	cursor: SessionTailCursor,
+	opts: { softCapBytes?: number } = {},
+): SessionTailResult {
 	let size = 0;
 	try {
 		size = statSync(path).size;
@@ -478,16 +529,58 @@ export function readSessionTail(path: string, cursor: SessionTailCursor): Sessio
 	if (size < cursor.offset) {
 		return { lines: [], skippedBadLines: 0, cursor: { offset: 0, nextLineNo: 1 }, truncated: true };
 	}
-	let buf: Buffer;
+	// 稳态早退：无新增字节 ⇒ 零 IO、零分配（见上方实测表）
+	if (size === cursor.offset) {
+		return { lines: [], skippedBadLines: 0, cursor: { ...cursor }, truncated: false };
+	}
+
+	// 只读 [cursor.offset, size) —— 不再整文件读。单拍有软上限，剩余留给下一拍（cursor 每拍前进）。
+	const available = size - cursor.offset;
+	const cap = Math.max(1, Math.trunc(opts.softCapBytes ?? SESSION_TAIL_SOFT_CAP_BYTES));
+	let want = Math.min(available, cap);
+	let buf = Buffer.allocUnsafe(want);
+	let read = 0;
 	try {
-		buf = readFileSync(path);
+		const fd = openSync(path, "r");
+		try {
+			for (;;) {
+				while (read < want) {
+					const n = readSync(fd, buf, read, want - read, cursor.offset + read);
+					if (n <= 0) break;
+					read += n;
+				}
+				// 短读（文件被并发截断）或已读满可用长度 ⇒ 到此为止
+				if (read < want || read >= available) break;
+				// 本拍已含完整行 ⇒ 够本拍消费（后面的留给下一拍）
+				if (buf.subarray(0, read).indexOf(0x0a) >= 0) break;
+				// 巨行（整段无换行）：扩容继续读。绝不能在此返回 —— 否则下一拍会重读同一段、
+				// 永远等不到那个换行（静默停滞，比多读几 MB 糟得多）。
+				const nextWant = Math.min(available, want * 2);
+				if (nextWant <= want) break;
+				const bigger = Buffer.allocUnsafe(nextWant);
+				buf.copy(bigger, 0, 0, read);
+				buf = bigger;
+				want = nextWant;
+			}
+		} finally {
+			try { closeSync(fd); } catch { /* ignore */ }
+		}
 	} catch {
+		// 打开/读取失败：与旧实现同语义（never-throw、cursor 原样、truncated 视 offset）
 		return { lines: [], skippedBadLines: 0, cursor: { ...cursor }, truncated: cursor.offset > 0 };
 	}
-	const { lines, cursor: next } = splitCompleteLines(buf, cursor.offset, cursor.nextLineNo);
+	if (read === 0) {
+		return { lines: [], skippedBadLines: 0, cursor: { ...cursor }, truncated: false };
+	}
+
+	// ⚠️ startOffset 必须传 0：缓冲区已从 cursor.offset 起。绝对偏移要用 `split.end` 换算回来 ——
+	// 若改用 `split.cursor.offset`，在「本拍 0 个完整行」（end=0）时它会等于 0 ⇒ cursor 被复位
+	// ⇒ 下一拍重读整段（重复行 + 行号错位）。
+	const split = splitCompleteLines(buf.subarray(0, read), 0, cursor.nextLineNo);
+	const next: SessionTailCursor = { offset: cursor.offset + split.end, nextLineNo: split.cursor.nextLineNo };
 	const out: ParsedSessionLine[] = [];
 	let skippedBadLines = 0;
-	for (const l of lines) {
+	for (const l of split.lines) {
 		if (l.text.length === 0) continue;
 		try {
 			const parsed: unknown = JSON.parse(l.text);
@@ -513,7 +606,11 @@ function readAllSessionLines(path: string): { lines: ParsedSessionLine[]; skippe
 		if (r.truncated) return { lines: [], skippedBadLines: bad, cursor: SESSION_TAIL_CURSOR_START, truncated: true };
 		all.push(...r.lines);
 		bad += r.skippedBadLines;
-		const progressed = r.cursor.offset !== cursor.offset || r.cursor.nextLineNo !== cursor.nextLineNo;
+		// 判据只认「字节严格前进」：`readSessionTail` 的 cursor 语义保证「有行被消费 ⇒ offset 必增」，
+		// 反过来「行号前进但 offset 不动」只可能是 cursor 算错了。旧判据把两者并列（||），
+		// 那种情形下会**无限重读同一段**（2026-11-13 变异实测：把绝对偏移写成相对偏移 ⇒ 测试挂满 180s）。
+		// 改成 > 之后：正常路径逐字等价（无行时 offset 也不动 ⇒ break），异常路径 fail-fast。
+		const progressed = r.cursor.offset > cursor.offset;
 		cursor = r.cursor;
 		if (!progressed) break; // EOF（无新完整行可消费）
 	}
