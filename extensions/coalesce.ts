@@ -253,8 +253,10 @@ export function planFlushBatches(items: readonly CoalesceItem[], opts: PlanOptio
 // ── 5. 合成正文（硬约束 1/3）────────────────────────────────────────
 
 function renderItemBlock(item: CoalesceItem, ordinal: number): string {
+	// 注意：`kind` / `from` / `sentAt` 都是**外部可控字段**（from 是协议地址、sentAt 是信自报的
+	// 时间），必须消毒后才能拼进标题——见 `finishBody` 的整段消毒兜底（L4 F1）。
 	return [
-		`## ${ordinal}. [${item.kind}] ${item.from} · ${stamp(item.sentAt)}`,
+		`## ${ordinal}. [${sanitizeEvtMarkers(item.kind)}] ${sanitizeEvtMarkers(item.from)} · ${sanitizeEvtMarkers(stamp(item.sentAt))}`,
 		item.body,
 	].join("\n");
 }
@@ -281,12 +283,12 @@ export function composeFlushBody(batch: FlushBatch, opts: ComposeOptions = {}): 
 	if (batch.kind === "single") {
 		const it = batch.items[0]!;
 		const lines = [
-			`📬 ${batch.items[0]!.kind} · ${it.from} · ${stamp(it.sentAt)}`,
+			`📬 ${sanitizeEvtMarkers(it.kind)} · ${sanitizeEvtMarkers(it.from)} · ${sanitizeEvtMarkers(stamp(it.sentAt))}`,
 			`摘要: ${it.body.split("\n")[0]!.slice(0, 500)}`,
 			...(it.body.split("\n").length > 1 ? [it.body.split("\n").slice(1).join("\n")] : []),
 			NO_POLL_HINT,
 		];
-		return [...lines, ...markers].join("\n");
+		return finishBody(lines.join("\n"), markers);
 	}
 
 	const n = batch.items.length;
@@ -294,9 +296,27 @@ export function composeFlushBody(batch: FlushBatch, opts: ComposeOptions = {}): 
 	const blocks = batch.items.map((it, i) => renderItemBlock(it, i + 1));
 	const footer = [
 		`以上 ${n} 条均为已发生事件，请一并处理；无需逐条确认。`,
-		...(opts.holdReason !== undefined ? [`（合并原因：${opts.holdReason}）`] : []),
+		...(opts.holdReason !== undefined ? [`（合并原因：${sanitizeEvtMarkers(opts.holdReason)}）`] : []),
 	];
-	return [title, "", blocks.join("\n\n"), "", "---", footer.join("\n"), ...markers].join("\n");
+	return finishBody([title, "", blocks.join("\n\n"), "", "---", footer.join("\n")].join("\n"), markers);
+}
+
+/**
+ * **拼装咽喉点**：整段非标记区统一消毒后再追加受控标记。
+ *
+ * 为什么要在末尾再整体消毒一次（L4 F1 驱动）：`renderItemBlock` 的 `from` / `kind` / `sentAt`、
+ * 以及 `opts.title` / `opts.holdReason` 都是**外部可控文本**。`from` 是协议地址，合法值可以是
+ * `agent://evil[evt:async:mailbox_<victim>:<revision>]`（`address.ts` 接受它——无空白、无额外斜杠）
+ * ⇒ 生产提取器 `extractEventIds` 扫描整条消息，会把标题里的 victim 标记当成消费证据、
+ * **销账一封从未投递的信**（L4 已隔离复现：victim 被 ack）。
+ *
+ * 只消毒正文不够（那样每加一个插值字段就得记得再消毒一次）。这里改成**先拼、后整段消毒、
+ * 最后追加原始标记**：新增任何字段都自动被覆盖；标记由 `eventMarker()` 在消毒之后追加，
+ * 永不被削弱。
+ */
+function finishBody(withoutMarkers: string, markers: readonly string[]): string {
+	const safe = sanitizeEvtMarkers(withoutMarkers);
+	return markers.length === 0 ? safe : `${safe}\n${markers.join("\n")}`;
 }
 
 // ── 6. 超龄强冲 ────────────────────────────────────────────────────

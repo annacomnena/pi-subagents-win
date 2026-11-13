@@ -199,6 +199,7 @@
     "test:p3-provenance": "node --experimental-strip-types extensions/_test_p3_provenance.ts",
     "test:mailbox-retry-budget": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_retry_budget.ts",
     "test:delivery-coalesce": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_coalesce.ts",
+    "test:delivery-coalesce-wiring": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_coalesce_hold_flush.ts",
     "test:mailbox-claimed-sweep": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_mailbox_claimed_sweep.ts",
     "test:reconciler-owner-session": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_reconciler_owner_session.ts",
     "test:reconciler-dispatcher-shape": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_reconciler_dispatcher_shape.ts",

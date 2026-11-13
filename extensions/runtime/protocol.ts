@@ -238,4 +238,28 @@ export interface Letter<T extends FabricFrame = FabricFrame> {
 	terminalReason?: string;
 	/** P-2：落终态的时刻（与 frame.sentAt / claimedAt 区分）。 */
 	terminalAt?: string;
+	/**
+	 * **busy 期合批的压住标记**（2026-11-13，设计稿 `plans/20261112_delivery_coalesce_design.md`）。
+	 *
+	 * 为何不用新 `status`：`DELIVERY_STATUSES` 是**封闭词表**，仓内 `status===pending/claimed`
+	 * 判定有 148 处；且 `scope.ts` 的 `listScopeWakeLetters` 只看 `pending`/stale `claimed`，
+	 * 新增状态会被静默漏掉（信永远不唤醒）。⇒ 复用 `claimed` + 本字段，零状态机改动。
+	 *
+	 * 语义：`status=claimed` 表达「有人领了」；`hold` 表达「领了但**压着不投**（目标在忙）」。
+	 */
+	hold?: LetterHold;
+}
+
+/** busy 期压住元信息（见 `Letter.hold`）。 */
+export interface LetterHold {
+	/** 首次压住时刻（ISO）。超 {@link HOLD_MAX_AGE_MS} 强制冲刷（但常量定义在 coalesce.ts，此处不引）。 */
+	at: string;
+	/** 压住原因（受控枚举，目前只有 `session-busy`）。 */
+	reason: string;
+	/** 分类缓存（`urgent` 不应出现——它在压住前就被放走了）。 */
+	cls: string;
+	/** 上次尝试冲刷的时刻（ISO）。**不销账**，仅供 ack-timeout 观测。 */
+	injectedAt?: string;
+	/** 冲刷尝试次数（失败时递增；连续 3 次落 incident 由调用方负责）。 */
+	flushAttempts?: number;
 }

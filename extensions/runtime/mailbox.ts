@@ -299,6 +299,113 @@ export function releaseClaimed(
 }
 
 /**
+ * 写入 busy 合批的 hold 标记（S2，2026-11-13）：`claimed` 不变，只加 `hold` 字段。
+ *
+ * 为什么不是新 status：`DELIVERY_STATUSES` 是封闭词表，仓内 `status===pending/claimed`
+ * 判定有 148 处；`scope.ts` 的 `listScopeWakeLetters` 只看 `pending`/stale `claimed`，
+ * 新状态会被静默漏掉（信永远不唤醒）。
+ *
+ * 安全：仅当信仍是 `claimed` **且** `claimedBy` 匹配（防把已被他人 stale 接管的信改写）。
+ * `hold` 已存在则**幂等 no-op**（返回 true，保留首次 `hold.at` —— 超龄判据依赖它）。
+ *
+ * @returns 是否真的处于「已压住」状态（写盘失败/状态不匹配 ⇒ false，调用方应照常注入）。
+ */
+export function writeHold(
+	recipient: ObjectAddress,
+	messageId: string,
+	opts: { cls: string; reason: string; nowMs: number; claimedBy?: string; mailboxDir?: string },
+): boolean {
+	let ok = false;
+	// **L4 F2**：`mutateLetter` 内的 `writeJsonAtomic` 可能抛（磁盘满 / 权限 / 杀毒软件锁定）。
+	// 旧实现让异常穿出去 ⇒ 调用方 catch 只记 `skipped/error`，而这时 claim **已经落盘**：
+	// 信停在 `claimed` 且没有 `hold` ⇒ 进不了 flush（flush 只扫有 hold 的），也进不了 pending
+	// 消费循环（只枚举 pending）⇒ **既不会重投也不会被 sweep 收尾**（sweep 要求有 consumed ACK）。
+	// 现改为：任何写盘失败 ⇒ 返回 false ⇒ 调用方回落正常注入路径（宁可多投，不可卡住）。
+	try {
+		const updated = mutateLetter(recipient, messageId, { mailboxDir: opts.mailboxDir }, (l) => {
+			if (l.status !== "claimed") return null;
+			if (opts.claimedBy !== undefined && l.claimedBy !== opts.claimedBy) return null;
+			if (l.hold) { ok = true; return null; } // 已在 hold：幂等命中，不改写（保 hold.at）
+			ok = true;
+			return { ...l, hold: { at: new Date(opts.nowMs).toISOString(), reason: opts.reason, cls: opts.cls } };
+		});
+		// `mutateLetter` 在 mutate 返回 null 时不做写盘（幂等命中/状态不匹配）；ok 标志区分两者：
+		// 幂等命中 ok=true 且 updated=null；状态不匹配 ok=false。
+		return ok || updated !== null;
+	} catch {
+		return false; // 写盘失败 ⇒ 不 hold（调用方回落正常注入）
+	}
+}
+
+/** 取当前所有处于 hold 的信（`claimed` + `hold` 字段）。 */
+export function listHeldLetters(
+	recipient: ObjectAddress,
+	mailboxDir: string = defaultMailboxDir(),
+): Letter[] {
+	const dir = mailboxDirFor(recipient, mailboxDir);
+	if (!existsSync(dir)) return [];
+	const out: Letter[] = [];
+	for (const f of readdirSync(dir)) {
+		if (!f.endsWith(".json")) continue;
+		const letter = readLetterCached(join(dir, f));
+		if (letter === null) continue;
+		if (letter.status === "claimed" && letter.hold) out.push(letter);
+	}
+	return out.sort((a, b) => frameTime(a).localeCompare(frameTime(b)));
+}
+
+/**
+ * 清除 hold 标记（flush 已把信合成消息注入后调用；`claimed` 保持不变）。
+ * 只在 holder 匹配且确有 hold 时生效。
+ */
+export function clearHold(
+	recipient: ObjectAddress,
+	messageId: string,
+	opts: { claimedBy?: string; expectHoldAt?: string; mailboxDir?: string } = {},
+): Letter | null {
+	return mutateLetter(recipient, messageId, { mailboxDir: opts.mailboxDir }, (l) => {
+		if (!l.hold) return null;
+		if (opts.claimedBy !== undefined && l.claimedBy !== opts.claimedBy) return null;
+		// **代际 fencing（L4 审查驱动）**：`claimLetters` 的 10min stale reclaim 会把
+		// `claimedBy`/`claimedAt` 换成新一代，而旧 `hold` 仍在。flush 读到旧快照后若直接清，
+		// 会把新一代刚写的 hold 意图也抹掉（实测：换代后 clearHold 仍清掉新代 hold）。
+		// ⇒ 用 `hold.at`（首次压住时刻）做 CAS：不是同一代就放弃，交给新代自己的 flush。
+		if (opts.expectHoldAt !== undefined && l.hold.at !== opts.expectHoldAt) return null;
+		const next: Letter = { ...l };
+		delete next.hold;
+		return next;
+	});
+}
+
+/**
+ * 记一次 flush 注入失败（`flush.attempts++`）。返回累计失败次数。
+ * 用于「连续 3 次失败 ⇒ 落 flush-failed incident」的判据（设计稿 §2.9）。
+ */
+export function bumpHoldFlushAttempt(
+	recipient: ObjectAddress,
+	messageId: string,
+	opts: { mailboxDir?: string } = {},
+): number {
+	let attempts = 0;
+	mutateLetter(recipient, messageId, { mailboxDir: opts.mailboxDir }, (l) => {
+		if (!l.hold) return null;
+		attempts = (l.hold.flushAttempts ?? 0) + 1;
+		return { ...l, hold: { ...l.hold, flushAttempts: attempts } };
+	});
+	return attempts;
+}
+
+/** 标记「已注入时刻」（`hold.injectedAt`）；不销账，仅供 ack-timeout 观测。 */
+export function markHoldInjected(
+	recipient: ObjectAddress,
+	messageId: string,
+	opts: { injectedAt: string; mailboxDir?: string } = { injectedAt: new Date().toISOString() },
+): Letter | null {
+	return mutateLetter(recipient, messageId, { mailboxDir: opts.mailboxDir }, (l) =>
+		l.hold ? { ...l, hold: { ...l.hold, injectedAt: opts.injectedAt } } : null);
+}
+
+/**
  * 按 holder 批量 ack（wake 确认专用：claim 时 holder=`wake:<sid>:<ws>`，
  * 确认时同 holder 全收，无需逐文件名——command 信无 frame.id 也可收尾）。
  * 返回 ack 数量。

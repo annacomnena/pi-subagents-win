@@ -26,7 +26,7 @@
  * 所有异常内部吞掉，绝不破坏宿主会话。
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	ackLetter,
@@ -34,9 +34,14 @@ import {
 	claimLetters,
 	defaultMailboxDir,
 	expireSweep,
+	bumpHoldFlushAttempt,
+	clearHold,
+	listHeldLetters,
+	markHoldInjected,
 	listLetters,
 	mailboxDirFor,
 	releaseClaimed,
+	writeHold,
 	type Letter,
 } from "./runtime/mailbox.ts";
 import { executeCommand, type CommandOutcome, type ExecuteCommandOptions } from "./runtime/command-executor.ts";
@@ -53,6 +58,7 @@ import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
+import { classifyForCoalesce, composeFlushBody, letterToItem, oversizeItemIds, planFlushBatches, readBusyGate, shouldForceFlush, type ReadBusyGateOptions } from "./coalesce.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
 import { gcNonOwnerTicks, writeAutonomyHeartbeat, writeNonOwnerTick } from "./runtime/autonomy/collect.ts";
 import {
@@ -92,11 +98,29 @@ export interface ConsumeOptions {
 	nowMs?: number;
 	/** executeCommand 选项透传（stateDir/configPath/commandsDir/journalPath；测试注入隔离用） */
 	executeCommandOptions?: ExecuteCommandOptions;
+	/**
+	 * busy 门注入（S2，2026-11-13 合批）：测试传隔离目录 + 假 pid 探活；
+	 * 生产不传 ⇒ 读真实 `<runtime>/state/session-busy`。
+	 */
+	busyGateOpts?: ReadBusyGateOptions;
+	/**
+	 * 关掉 busy hold（**回滚闸门**）：`true` ⇒ 跳过 S2（不再新建 hold），行为与合批之前一致。
+	 * 缺省 `false`。
+	 *
+	 * 注意：它只关「新建 hold」，**不关 flush** —— 已有 hold 仍会被 `flushHeldLetters` 排空
+	 * （否则回滚会把已压住的信永久停住；L4 F4）。全局总闸是 `PI_DELIVERY_COALESCE=0`。
+	 */
+	disableBusyHold?: boolean;
 }
 
 export interface ConsumeEntry {
 	messageId: string;
-	action: "injected" | "skipped" | "executed";
+	/**
+	 * `held`（2026-11-13）：目标会话忙碌 ⇒ 信被压住（`status=claimed` + `hold` 字段），
+	 * **未注入**。它不是 `skipped`（那是「这轮什么也没干」）：`held` 明确表达
+	 * 「已认领、已排队，等 settled 时合批冲刷」。
+	 */
+	action: "injected" | "skipped" | "executed" | "held";
 	reason?: string;
 }
 
@@ -341,6 +365,10 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	const owner = attachment.sessionId;
 	report.owner = owner;
 	const nowMs = opts.nowMs ?? Date.now(); // D-1 退避门与 attempt 时间戳的可注入时钟
+	// S2 hold 闸门：总闸 `coalesceEnabled()`（`PI_DELIVERY_COALESCE=0` 可关）
+	// 且调用方未显式 `disableBusyHold`。S3 已落地（`agent_settled` 主触发 + tick 兜底），
+	// 所以 hold 一定有 flush 兜着，不会「压住不送」。
+	const busyHoldEnabled = coalesceEnabled() && opts.disableBusyHold !== true;
 
 	// 命令信枚举（仅 master_default 域；M2：{fileId, letter} 是唯一遍历源——同键多封
 	// 各自独立处理，重放信由 executor 幂等回放 outcome，逐封 ack 终态；枚举失败 →
@@ -475,6 +503,31 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					reportPush(report, messageId, "skipped", verdict.reason);
 				}
 				continue;
+			}
+			// ── S2（2026-11-13）：busy 期 **hold**，不注入 ─────────────────────
+			// 设计稿 `plans/20261112_delivery_coalesce_design.md` §2.5/§2.4。
+			// 判断依据：`session-busy` 标记（`runtime/session-busy.ts` 写端：agent_start/turn_start 写、
+			// agent_settled/agent_end 删、期间 15s 心跳）；陈旧阈值 45s **并联** pid 探活。
+			//
+			// 为何要 hold 而不是「直接投、让 pi 排队」：排队不合并 ⇒ N 条信吐 N 条用户消息；
+			// hold 到 settled 时再合批 ⇒ 一次只吐 1..K 条（K=ceil(N/12)）。
+			//
+			// 为何 `urgent` 不进 hold：用户在等 / 停机指令迟 20 分钟不可接受。
+			// 为何 `solo` 也进 hold：它同样会因 unconfirmed 重投，只是 flush 时逐条独立注入。
+			//
+			// 失败兜底：`writeHold` 写盘失败 ⇒ 不 hold，继续走正常注入（宁可多投，不可卡住）。
+			// 已在 hold 的信不再重复写（`letter.hold` 存在），但它也不会进 pending 循环
+			//（消费循环只枚举 pending），所以这个分支实际上只在首次 hold 时命中。
+			// 闸门：总闸 `coalesceEnabled()` && `opts.disableBusyHold !== true`（见 init）。
+			if (busyHoldEnabled && !letter.hold && readBusyGate(opts.sessionId ?? "", nowMs, opts.busyGateOpts).busy) {
+				const cls = classifyForCoalesce(letter);
+				if (cls.cls !== "urgent" && frameId) {
+					if (writeHold(recipient, frameId, { cls: cls.cls, reason: "session-busy", nowMs, claimedBy: holderOf(opts.sessionId), mailboxDir })) {
+						reportPush(report, messageId, "held", `session-busy(${cls.cls})`);
+						continue; // 不注入、不释放 claim（信停 claimed + hold）
+					}
+				}
+				// urgent 或写盘失败：落到正常注入路径
 			}
 			// 注入。L3：await send 结果再分支；**receipt 只在 "sent" 之后**（.then 衔接，不改整条消费链
 			// async，防竞态面扩大）。没有 injector 也未投递，必须释放 claim 后重试，不能伪造已消费。
@@ -611,7 +664,185 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 	return { owner, consumed: report.consumed };
 }
 
-function reportPush(report: ConsumeReport, messageId: string, action: "injected" | "skipped" | "executed", reason?: string): void {
+
+// ── S3：busy 期合批 flush（2026-11-13）──────────────────────────────
+//
+// 触发（设计稿 §2.6）：主触发 = `agent_settled`（pi 文档 `docs/extensions.md:665`：
+// 这是「Pi 不会自动继续」的终态信号）；兜底 = 消费 tick 里 busy=false 且有 hold 的信。
+//
+// **为什么不用 `agent_end` 作触发**：文档同处明说 `agent_end` 之后 pi 仍可能
+// auto-retry / auto-compact-retry / 继续消费排队消息。而 `streaming-snapshot-register.ts:111`
+// 把 `agent_end` 也接到了 busy.settle() ⇒ busy 文件可能被过早删掉（「假 idle」）。
+// 那不算 correctness 破绽（最坏退回 followUp 排队），但 flush 必须以 settled 为准。
+//
+// 竞态：进程内互斥 + 版本号。`doFlush` 注入**前**再读一次 busy 门；若又忙 ⇒ 放弃本次，
+// 信保持 hold（合成正文是纯投影，丢弃不落盘）。
+
+export interface FlushOptions {
+	sessionId: string;
+	recipient?: ObjectAddress;
+	mailboxDir?: string;
+	deliveryDir?: string;
+	/** 注入实现（生产 = `pi.sendUserMessage`）。 */
+	sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
+	nowMs?: number;
+	busyGateOpts?: ReadBusyGateOptions;
+	/** 关掉超龄强冲（测试用；缺省 false = 启用）。 */
+	disableStarvation?: boolean;
+	/** 关掉 writes（测试用 dry-run；缺省 false）。 */
+	dryRun?: boolean;
+}
+
+export interface FlushResult {
+	/** 实际注入的批次数（每批一条用户消息）。 */
+	injectedBatches: number;
+	/** 实际消掉的 hold 信数。 */
+	clearedLetters: number;
+	/** 本轮跳过原因（busy 竞态 / 无信 / 写失败 …）。 */
+	reason?: string;
+}
+
+/** flush 进程内互斥（同一进程内 settled 连发不会并发双扫）。 */
+let flushInFlight = false;
+
+/**
+ * 冲刷一轮 hold 信：切成批次 → 逐批注入 → 清除 hold。
+ *
+ * **销账仍由 consumed ACK 独享**：这里只 `clearHold`（表示「已交给会话」），
+ * `claimed` 保持不变；`sweepClaimedLetters` 拿到 consumed ACK 才 `ackLetter`。
+ */
+export function flushHeldLetters(opts: FlushOptions): FlushResult {
+	const recipient = opts.recipient ?? masterAddress();
+	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
+	const dDir = opts.deliveryDir ?? defaultDeliveryDir();
+	const nowMs = opts.nowMs ?? Date.now();
+	const spillDir = join(dDir, "spill");
+	const out: FlushResult = { injectedBatches: 0, clearedLetters: 0 };
+	if (flushInFlight) return { ...out, reason: "in-flight" };
+	flushInFlight = true;
+	try {
+		const held = listHeldLetters(recipient, mailboxDir);
+		if (held.length === 0) return { ...out, reason: "no-held" };
+		// 超龄强冲（设计稿 §2.11）：`shouldForceFlush` 为真 ⇒ 即便 busy 也送（交给 pi 的
+		// followUp 队列语义），并落 warn 级 incident，避免「长任务把信无限期压住」。
+		const starving = !opts.disableStarvation && held.some((l) => l.hold && shouldForceFlush(l.hold.at, nowMs));
+		// 注入前复检 busy（settled 后到真正注入之间可能又起了一个 turn）
+		// 例外：有信已压超 15 分钟 ⇒ 强冲（不再等 settled），否则长任务能把信压无限久。
+		if (!starving && readBusyGate(opts.sessionId, nowMs, opts.busyGateOpts).busy) return { ...out, reason: "busy-again" };
+		if (typeof opts.sendUserMessage !== "function") return { ...out, reason: "no-injector" };
+
+		// 信件 → 待渲染条目（每条都取同一个 eventId 派生点，与消费循环同源）
+		const items = held.map((l) => {
+			const rawId = l.frame.frame === "message" ? l.frame.id : undefined;
+			const spoolId = rawId ?? `cmd-${l.frame.frame === "command" ? l.frame.commandKey : "unknown"}`;
+			const ev = ensureMailboxEvent(l, spoolId, mailboxDir, dDir, opts.sessionId);
+			return {
+				letter: l,
+				item: letterToItem(l, { ...(ev ? { eventId: ev.eventId } : {}) }),
+				spoolId,
+				eventId: ev?.eventId,
+				holdAt: l.hold?.at,
+			};
+		});
+
+		// ── 单信 spill 降级（设计稿 §2.8，L4 F6）：正文超 4KiB 的不进消息体 ─────────
+		// 为什么必要：`MAX_BATCH_BYTES` 只约束**批次总预算**，一条 20KB 的合法长正文仍会让
+		// 单条合成消息突破 16KiB（L4 实测 20312/20630 字节）。合成消息过长时宿主可能截断
+		// context，而**标记区必须永远完整**（否则 ACK 丢失）。⇒ 先把超长正文落盘，
+		// 消息里只放「首 500 字 + 完整路径」，标记区不动。
+		const oversized = new Set(oversizeItemIds(items.map((x) => x.item)));
+		if (oversized.size > 0 && !opts.dryRun) {
+			for (const it of items) {
+				if (!oversized.has(it.item.id)) continue;
+				try {
+					mkdirSync(spillDir, { recursive: true });
+					const path = join(spillDir, `${it.spoolId.replace(/[^A-Za-z0-9._-]/g, "_")}.md`);
+					writeFileSync(path, it.item.body, "utf8");
+					const head = it.item.body.slice(0, 500).replace(/\s+$/, "");
+					it.item = { ...it.item, body: `${head}\n\n（正文过长已落盘，完整内容见 ${path}）` };
+				} catch {
+					// 落盘失败 ⇒ 保留原正文（宁可消息长一点，也不丢内容）
+				}
+			}
+		}
+
+		// 超龄强冲：`shouldForceFlush` 只影响「要不要现在冲」，本函数被调用即视为「该冲」。
+		const batches = planFlushBatches(items.map((x) => x.item));
+		for (const batch of batches) {
+			const body = composeFlushBody(batch, { holdReason: "session-busy" });
+			try {
+				opts.sendUserMessage(body, { deliverAs: "followUp" });
+			} catch {
+				// 注入抛错：**不清 hold**（下轮再试），并落失败计数（设计稿 §2.9）。
+				// 连续 3 次 ⇒ 落 `flush-failed` incident，避免「一直重试、一直没人知道」。
+				for (const it of batch.items) {
+					const owner = items.find((x) => x.item.id === it.id);
+					if (!owner || opts.dryRun) continue;
+					const tries = bumpHoldFlushAttempt(recipient, owner.spoolId, { mailboxDir });
+					if (tries >= 3) {
+						try {
+							const ev = owner.eventId ? loadEvent(dDir, owner.eventId) : null;
+							if (ev) publishIncident(dDir, ev, `flush-failed(attempts=${tries})`, nowMs);
+						} catch { /* incident 出口失败不阻断（best-effort） */ }
+					}
+				}
+				return { ...out, reason: "send-failed" };
+			}
+			out.injectedBatches += 1;
+			if (opts.dryRun) continue;
+			// 清 hold（`claimed` 保留，等 consumed ACK 收尾）。
+			// **代际 fencing**：带上读快照时的 `hold.at` 做 CAS —— 若这期间有 stale reclaim
+			// 换代并重写过 hold，就不清（交给新代自己的 flush，防抹掉别人的恢复意图）。
+			for (const it of batch.items) {
+				const owner = items.find((x) => x.item.id === it.id);
+				if (!owner) continue;
+				markHoldInjected(recipient, owner.spoolId, { injectedAt: new Date(nowMs).toISOString(), mailboxDir });
+				if (clearHold(recipient, owner.spoolId, { expectHoldAt: owner.holdAt, mailboxDir }) !== null) out.clearedLetters += 1;
+			}
+		}
+		// 超龄强冲观测（设计稿 §2.11 要求 warn 级可见，不静默）
+		if (starving) {
+			for (const it of items) {
+				if (!it.letter.hold || !shouldForceFlush(it.letter.hold.at, nowMs)) continue;
+				try {
+					const ev = it.eventId ? loadEvent(dDir, it.eventId) : null;
+					if (ev) publishIncident(dDir, ev, `hold-starvation(heldAt=${it.letter.hold.at})`, nowMs);
+				} catch { /* best-effort */ }
+			}
+		}
+		return out;
+	} catch (e) {
+		return { ...out, reason: e instanceof Error ? e.message : "flush-error" };
+	} finally {
+		flushInFlight = false;
+	}
+}
+
+/** 交付账本 eventId 的**唯一**派生点（消费循环与 flush 共用；两处漂移会让 ACK 对不上）。 */
+function ensureMailboxEvent(
+	letter: Letter,
+	messageId: string,
+	mailboxDir: string,
+	dDir: string,
+	sessionId: string | undefined,
+): { eventId: string; attemptId: string } | null {
+	try {
+		const stableAt = letterTime(letter);
+		const { event } = ensureEvent(dDir, {
+			runId: `mailbox_${messageId}`,
+			terminalRevision: terminalRevisionOf({ id: messageId, status: "completed", endedAt: stableAt, result: { status: "completed", text: letter.frame.frame } }),
+			terminalSnapshotPath: join(mailboxDir, messageId),
+			dispatcherSessionId: sessionId ?? "unknown",
+			observedAt: new Date().toISOString(),
+			terminalAt: stableAt,
+		});
+		return { eventId: event.eventId, attemptId: `${event.eventId}@MB@${Date.now()}` };
+	} catch {
+		return null; // 账本失败不阻断投递（best-effort；B 通道可从终态重建）
+	}
+}
+
+function reportPush(report: ConsumeReport, messageId: string, action: ConsumeEntry["action"], reason?: string): void {
 	report.consumed.push({ messageId, action, reason });
 }
 
@@ -692,9 +923,60 @@ export function registerMailboxConsumer(
 		on: (event: string, cb: (event: unknown, ctx?: { sessionManager?: { sessionId?: string } }) => void) => void;
 		sendUserMessage?: (body: string, opts?: { deliverAs?: string }) => void;
 	},
-	opts: { mailboxDir?: string; intervalMs?: number } = {},
-): () => void {	let interval: ReturnType<typeof setInterval> | null = null;
+	opts: { mailboxDir?: string; intervalMs?: number; busyGateOpts?: ReadBusyGateOptions } = {},
+): () => void {
+	let interval: ReturnType<typeof setInterval> | null = null;
 	let sessionGen = 0;
+	/** 当前会话身份（`agent_settled` 是**进程级**注册一次，靠这两个变量读最新会话 —— 见下）。 */
+	let currentSid: string | undefined;
+	let currentSend: ((body: string, opts?: { deliverAs?: string }) => void) | undefined;
+
+	/**
+	 * flush 一次（三条触发共用同一实现，防漂移）。
+	 *
+	 * **为什么 tick 不再先判 busy 再调（L4 F3 修正）**：旧实现 `if (busy===false) flush(...)`
+	 * 会把 `flushHeldLetters` 内部的**超龄强冲**（`shouldForceFlush`，设计稿 §2.11）整条
+	 * 挡在门外 —— 持续 busy 又等不到 settled 时，压在 hold 里的信会被无限期扣住
+	 *（L4 从真实注册链复现：busy + hold 16min ⇒ sent=0）。现改为无条件调用，
+	 * 让 busy 判定只发生在 `flushHeldLetters` 内部（那里才知道有没有超龄信）。
+	 */
+	const runFlush = (): void => {
+		// **注意不用 `coalesceEnabled()` 拦（L4 F4 修正）**：总闸只控制「是否**新建** hold」。
+		// 关闭总闸后仍要排空已有 hold —— 否则回滚会把已压住的信永久停住（既不 flush 也不回
+		// pending，最终可能被 TTL 改成 expired，即静默丢）。
+		try {
+			flushHeldLetters({
+				sessionId: currentSid ?? "",
+				mailboxDir: opts.mailboxDir,
+				sendUserMessage: currentSend,
+				...(opts.busyGateOpts ? { busyGateOpts: opts.busyGateOpts } : {}),
+			});
+		} catch {
+			/* flush 永不破坏会话 */
+		}
+	};
+
+	// ── S3 主触发：**进程级注册一次**（L4 F8 修正）─────────────────────
+	// 旧实现把 `pi.on("agent_settled", ...)` 写在 `session_start` 回调里 ⇒ 每次 session_start
+	// 新增一个 listener，stop() 也不解绑（实测 fake pi 连调三次 ⇒ 3 个 handler）。旧闭包被
+	// `closed()` 挡住了双 flush，但 handler/闭包持续累积是真实泄漏。现改为只注册一次、
+	// 读 `currentSid`/`currentSend`。
+	//
+	// 为何用 `agent_settled` 而非 `agent_end`：pi 文档 `docs/extensions.md:665` 明说
+	// `agent_end` 之后仍可能 auto-retry / compact-retry / 继续消费排队消息；而
+	// `streaming-snapshot-register.ts:111` 把 `agent_end` 也接到了 `busy.settle()`
+	// ⇒ busy 文件可能被过早删（假 idle）。
+	let detached = false;
+	try {
+		pi.on("agent_settled", (() => {
+			if (detached) return;
+			if (!mailboxOwnerEligible(currentSid).eligible) return;
+			runFlush();
+		}) as never);
+	} catch {
+		/* 事件注册失败不影响消费循环 */
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		try {
 			// R-21：注册层**只排除子 agent**（子 agent 恒不消费），不看 owner。
@@ -707,26 +989,44 @@ export function registerMailboxConsumer(
 		const myGen = ++sessionGen;
 		const closed = (): boolean => myGen !== sessionGen;
 		if (interval) clearInterval(interval);
-		const sid = ctx?.sessionManager?.sessionId;
-		const send = pi.sendUserMessage?.bind(pi);
+		currentSid = ctx?.sessionManager?.sessionId;
+		currentSend = pi.sendUserMessage?.bind(pi);
 		interval = setInterval(() => {
 			if (closed()) return;
 			// tick 层精判（与旧语义逐字一致，只是从注册层搬下来）
-			const gate = mailboxOwnerEligible(sid);
+			const gate = mailboxOwnerEligible(currentSid);
 			if (!gate.eligible) return;
 			try {
-				consumeMailboxOnce({ sessionId: sid, mailboxDir: opts.mailboxDir, sendUserMessage: send });
+				consumeMailboxOnce({
+					sessionId: currentSid,
+					mailboxDir: opts.mailboxDir,
+					sendUserMessage: currentSend,
+					...(opts.busyGateOpts ? { busyGateOpts: opts.busyGateOpts } : {}),
+				});
 			} catch {
 				/* 消费端永不破坏会话 */
 			}
+			// S3 兜底触发（设计稿 §2.6）：settled 事件丢了（进程重启 / 事件竞态）时靠它。
+			runFlush();
 		}, opts.intervalMs ?? 10_000);
 		interval.unref?.();
 	});
 	return () => {
+		detached = true;
 		sessionGen++;
 		if (interval) clearInterval(interval);
 		interval = null;
 	};
+}
+
+/**
+ * 合批总闸（`PI_DELIVERY_COALESCE=0` 关闭）。
+ *
+ * **缺省启用**（2026-11-13 S3 落地后）：hold 有 flush 兜着，不会再「压住不送」。
+ * 关闭 = 完全跳过 S2/S3，行为与合批之前逐字节一致（回滚档位）。
+ */
+export function coalesceEnabled(): boolean {
+	return process.env.PI_DELIVERY_COALESCE !== "0";
 }
 
 /**
