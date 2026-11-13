@@ -97,6 +97,8 @@
   - 上游：三处终态写入补 `task: fusion 融合器（<runDir>）`，并把错误同时放进 **`result.error`**（面板读的路径）与顶层 `error`（兼容既有消费者）。
 - **纪律含义**：**面板 timer 里的异常是会话级致命异常**（无 catch 冒到 `Timeout._onTimeout` ⇒ uncaughtException ⇒ pi 退出）。⇒ 凡读磁盘/外部记录的显示代码，**字段一律当"可能缺失"处理**；`async-panel.ts:192` 注释里已有「进度读不到不得让面板崩」的先例，本条把同一纪律推广到**任务文本与错误文本**。
 - **验证**：`npm run test:async-panel` PASS（新增反例块：逐字复刻 `run_fusemweer6ma_jryr.json` 形状 + `assert.doesNotThrow(refreshAsyncPanel)`）；`test:async-result-watcher`、`test:no-poll`、`test:trace-fusion-{collect,crosstest,supervisor,launch,gate}` 全 PASS（逐条实跑，非推断）。
+- **真机复测（2026-11-13 重启后）**：注入一条**故意缺 `task`** 的终态记录 `run_zombielabel_probe.json`（`status=failed`，无 `task`）到 `subagent-runs/`，跨 **4 个面板 tick（10s/tick，共 42s）** ⇒ **会话存活**（旧代码第 1 个 tick 即杀会话），随后删除探针；再扫全 `subagent-runs/*.json`：**65 条记录缺 task = 0**（含清扫竞态 `FileNotFoundError` 容错，非缺陷）；再派一条真 async run（`run_mweflc7d_lzfx`）走完整生命周期，跨 3 tick 存活。
+  ⇒ 上方「未闭合 = 重启后长跑未复测」现在**闭合**（覆盖三种形状：缺 task 记录 / running 记录 / 真 run 生命周期）。
 
 ### Item 64 - steer 空闲 tab 唤醒兜底 + `join` 未导入的静默失败（2026-10-26，`4093f61`）
 
