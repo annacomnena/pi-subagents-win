@@ -69,6 +69,40 @@ const write = (rec: AsyncPanelRecord) => writeFileSync(join(dir, `${rec.id}.json
 	assert.ok(shortTaskLabel("无句读但超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长超长").endsWith("…"), "超长应硬截");
 }
 
+// ── 反例：缺 task 的磁盘记录不得炸面板（真实事故 2026-11-13）──────
+// run_fusemweer6ma_jryr.json（agent=fusion，579 字节）**无 task 字段** ⇒
+// 面板 timer 调 shortTaskLabel(undefined).replace() ⇒ uncaughtException **杀掉整个主会话**。
+{
+	assert.equal(shortTaskLabel(undefined as unknown as string), "(无任务文本)", "undefined task 应走兜底");
+	assert.equal(shortTaskLabel(null as unknown as string), "(无任务文本)");
+	assert.equal(shortTaskLabel(""), "(空任务文本)");
+	assert.equal(shortTaskLabel("   \n  "), "(空任务文本)");
+
+	const ui = makeFakeUi();
+	const dirNoTask = join(dir, "notask");
+	mkdirSync(dirNoTask, { recursive: true });
+	// 逐字模拟事故记录：无 task、有 agent/model/status=failed
+	writeFileSync(
+		join(dirNoTask, "run_fusemweer6ma_jryr.json"),
+		JSON.stringify({
+			id: "run_fusemweer6ma_jryr",
+			agent: "fusion",
+			model: "local-ornith/ornith",
+			status: "failed",
+			startedAt: new Date(Date.now() - 60_000).toISOString(),
+			finishedAt: new Date(Date.now() - 10_000).toISOString(),
+		}),
+		"utf8",
+	);
+	assert.doesNotThrow(() => refreshAsyncPanel(dirNoTask, ui), "缺 task 的记录不得让面板抛（timer 里抛 = 杀会话）");
+	const l = ui.widgets.get("subagent-async");
+	assert.ok(l, "应仍有 widget");
+	assert.ok(
+		l.some((x) => x.includes("run_fusemweer6ma_jryr") && x.includes("(无任务文本)")),
+		`失败卡片应以兜底标签上墙: ${l.join(" | ")}`,
+	);
+}
+
 // ── 失败逐条保留（含 error 尾） ────────────────────────────────────
 {
 	const ui = makeFakeUi();

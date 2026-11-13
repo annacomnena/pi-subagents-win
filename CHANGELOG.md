@@ -1,6 +1,19 @@
 # Changelog
 
 ## [Unreleased]
+### 2026-11-13 — Fix: async 面板被磁盘记录炸死主会话（Item 65）
+
+- **Fix（显示层）**：`shortTaskLabel` 接受 `string|undefined|null` 并走兜底标签（`(无任务文本)` / `(空任务文本)`），
+  `AsyncPanelRecord.task` 声明为可选，失败卡片行以 `r.task ?? r.id` 兜底，`result?.error` 加 `typeof` 守卫。
+  根因：面板读的是磁盘 run json（`JSON.parse` 无字段校验），`task` 缺失 → `task.replace()` 在
+  `Timeout._onTimeout` 里抛 uncaughtException → **整个 pi 退出**（在飞 subagent 连带失主）。
+- **Fix（上游 fusion）**：`trace-fusion/fusion-dispatch.ts` 三处终态 `writeRunRecord`（`:593`/`:621`/`:715`）
+  补写 `task`（此前只有 running 记录带 task，终态重写把 task 抹掉），并把错误同时放进 `result.error` 与顶层 `error`。
+- **Test**：`test:async-panel` 新增反例块 —— 逐字复刻肇事记录 `run_fusemweer6ma_jryr.json`（579 字节，无 `task`）
+  + `assert.doesNotThrow(refreshAsyncPanel)`；`test:async-result-watcher` / `test:no-poll` /
+  `test:trace-fusion-{collect,crosstest,supervisor,launch,gate}` 全 PASS。
+- **纪律**：面板 timer 内异常 = 会话级致命异常；读磁盘/外部记录的显示代码，字段一律按"可能缺失"处理。
+
 
 > 主题：**监管（supervision）默认翻转 —— 从「派发后默认没人管」到「派发即登记」**；只改默认值与一个卡死判据，不改账本形状、不改只读红线、不改 `stagnation` 派生。
 

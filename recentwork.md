@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 65 | P1 | **async 面板被磁盘记录炸死主会话**（显示层 + fusion 终态写入双修）：`shortTaskLabel(undefined).replace()` ⇒ uncaughtException 经 timer 冒出 ⇒ **pi 整个退出** | none | 已落 commit；`test:async-panel` 含逐字事故记录反例；真实重启后长跑未复测 | [↓](#item-65) |
 | 64 | P1 | **steer 空闲 tab 唤醒兜底**（`4093f61`）：目标 `turn !== working` 时 steer 记录**永久 pending**、账本仍刷新 ⇒ 主会话拿「已投递」假象；修法 = 往目标 timer 邮箱投立即到期 nudge 让它自己起 turn（幂等防风暴）+ 顺带修 `join` 未导入致 `ledger-fallback.jsonl` 从未落盘 | none | 已落 commit；`test:steer-idle-wake` 4 组/24 断言；**真实端到端（nudge→pump→新 turn→边界消费）仍未验**；需重启后对新 tab 生效 | [↓](#item-64) |
 | 63 | P1 | **autonomy audit.jsonl 轮转 + 尾部定长窗口读**（`0cfbd59`）：29.4MB/28.4 万行无上限，`/autonomy status` 取尾 5 行要读全文件（123ms 且线性恶化）；修法 = 8MB 阈值 rename 归档（只归档不删）+ `fstat` 定位尾部 64KB 窗口（扩 8x×3 次），实测 **0.39ms vs 123.24ms（313x）** | none | 已落 commit；**真机已验证轮转在生产发生**（`audit-20261030T000837Z.jsonl` 32.5MB 与新生 `audit.jsonl` 并存）；**未闭合**：归档文件无 GC | [↓](#item-63) |
 | 62 | P1 | **第 5 种任务模式 `solo`（零派发）**（`56e5d0b`+`83b02d8`）：`/launch --solo｜-s` 与 `launch-tabs`/`master-dispatch` 的 `mode:"solo"` 双入口；tab 自干严禁派任何 subagent（配额受限时用），前缀 `根据solo进行工作<id>`，收尾必须带自审降级声明 | none | 已完成（两条入口 + README 模式表已同步）；`test:launch` 与 `test:master-dispatch` 16 项全绿 | [↓](#item-62) |
@@ -83,6 +84,20 @@
 | SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
 
 <a id="item-64"></a>
+### Item 65 - async 面板显示层被磁盘记录炸死主会话（2026-11-13）
+
+- **评级**: P1
+- **Status**: ✅ 已落 commit（`test:async-panel` 全绿 + 反例逐字复刻事故记录）；**未闭合** = 重启后长跑未复测（面板 timer 周期触发面）。
+- **现象**：主会话顶栏打印 `pi exiting due to uncaughtException: TypeError: Cannot read properties of undefined (reading 'replace') at shortTaskLabel (extensions/async-panel.ts:101) at refreshAsyncPanel (:193) at Timeout._onTimeout (:243)` ⇒ **整个 pi 退出**，2 个在飞 subagent 连带失去归属会话。
+- **根因（两层，都不是"面板运气不好"）**：
+  1. **显示层假设磁盘记录完整**：`AsyncPanelRecord.task` 在类型上是必填，但记录来自 `JSON.parse(readFileSync(run json))`，**无任何字段校验** ⇒ `task` 缺失直达 `task.replace(...)`。
+  2. **上游写出畸形记录**：`trace-fusion/fusion-dispatch.ts` 的 fusion **终态** `writeRunRecord` 三处（`:593`/`:621`/`:715`）**都不写 `task`** —— 只有 running 记录（`:534`）带 `task: prompt.slice(0,200)`，终态重写把 task 抹掉了。肇事记录 `~/.pi/agent/subagent-runs/run_fusemweer6ma_jryr.json`（579 字节，`agent=fusion`，keys 里**无 `task`**，用顶层 `text` 不放 `result.error`）。
+- **修法**：
+  - 显示层：`shortTaskLabel(task: string|undefined|null)` ⇒ 非字符串返回 `(无任务文本)`，空白返回 `(空任务文本)`；`AsyncPanelRecord.task` 改可选；失败卡片行改用 `r.task ?? r.id`；`result?.error` 加 `typeof` 守卫。
+  - 上游：三处终态写入补 `task: fusion 融合器（<runDir>）`，并把错误同时放进 **`result.error`**（面板读的路径）与顶层 `error`（兼容既有消费者）。
+- **纪律含义**：**面板 timer 里的异常是会话级致命异常**（无 catch 冒到 `Timeout._onTimeout` ⇒ uncaughtException ⇒ pi 退出）。⇒ 凡读磁盘/外部记录的显示代码，**字段一律当"可能缺失"处理**；`async-panel.ts:192` 注释里已有「进度读不到不得让面板崩」的先例，本条把同一纪律推广到**任务文本与错误文本**。
+- **验证**：`npm run test:async-panel` PASS（新增反例块：逐字复刻 `run_fusemweer6ma_jryr.json` 形状 + `assert.doesNotThrow(refreshAsyncPanel)`）；`test:async-result-watcher`、`test:no-poll`、`test:trace-fusion-{collect,crosstest,supervisor,launch,gate}` 全 PASS（逐条实跑，非推断）。
+
 ### Item 64 - steer 空闲 tab 唤醒兜底 + `join` 未导入的静默失败（2026-10-26，`4093f61`）
 
 - **事故（实测）**：`tab-steer` 只把记录写进 steering 队列，消费发生在**活跃 turn 的 tool 边界**。目标 tab 空闲（`turn=idle`，如 `pi -r` 重开或已回完上一轮）时没有 turn ⇒ 永远没有 tool 边界 ⇒ 记录**永久 pending**；而账本 `lastActivityAt`/`heartbeatAt` 仍在刷新 ⇒ `targetTabAlive` 判「活」⇒ sweep 也不置 `undelivered`。主会话因此得到「已投递」的**假象**，实际静默失联（沉默比报错危险）。实测一条消息 pending 超 1h，目标 pid 早已死亡。

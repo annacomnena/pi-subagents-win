@@ -27,6 +27,14 @@ export interface AsyncPanelRecord {
 	id: string;
 	agent?: string;
 	/**
+	 * ⚠️ **运行时不保证存在**：`task` 在类型上是必填，但面板读的是**磁盘上的 run json**，
+	 * `JSON.parse` 不校验字段 ⇒ 缺 `task` 的记录会直接进到这里。
+	 * 实测：`run_fusemweer6ma_jryr.json`（`agent=fusion`，579 字节）**无 `task` 字段**，
+	 * 面板 timer 调 `shortTaskLabel(undefined).replace()` ⇒ uncaughtException **直接杀掉主会话**
+	 * （2026-11-13）。⇒ 类型声明为可选，显示层一律带兜底。
+	 */
+	task?: string;
+	/**
 	 * 派发时解析的模型（`provider/id` 全名）。由 `index.ts:4650` 写入。
 	 *
 	 * ⚠️ 语义边界（已实测）：`if (!record.model)` 守卫 ⇒ **只写一次**，在派发时。
@@ -36,7 +44,6 @@ export interface AsyncPanelRecord {
 	 * 要让这里变成「实际模型」必须先补记录，属于派发链改动，不在本次显示层范围。
 	 */
 	model?: string;
-	task: string;
 	status: "running" | "completed" | "failed" | "cancelled";
 	result?: {
 		text?: string;
@@ -97,8 +104,12 @@ export const ASYNC_DONE_TTL_MS = 30 * 60 * 1000;
  * 后面全是交接纪律废话）；超 36 字符再硬截。解决此前 slice(0,40)
  * 把“完成后不提交，回复…”纪律文本拦腰截断上墙的问题。
  */
-export function shortTaskLabel(task: string): string {
+export function shortTaskLabel(task: string | undefined | null): string {
+	// 显示层不得假设磁盘记录完整：缺 task 时走兜底，绝不 throw。
+	// （本函数曾在面板 timer 里因 task=undefined 抛 TypeError，uncaughtException 杀掉整个主会话。）
+	if (typeof task !== "string") return "(无任务文本)";
 	const first = task.replace(/\s+/g, " ");
+	if (!first.trim()) return "(空任务文本)";
 	const cut = first.search(/[。；！？!?;]/);
 	const base = cut >= 0 ? first.slice(0, cut + 1) : first;
 	return base.length > 36 ? `${base.slice(0, 35)}…` : base;
@@ -189,7 +200,7 @@ export function refreshAsyncPanel(runsDir: string = DEFAULT_RUNS_DIR, ui: Extens
 			const agent = r.agent ?? "subagent";
 			const m = shortModelLabel(r.model);
 			const agentLabel = m ? `${agent}[${m}]` : agent;
-			const err = r.result?.error ? ` — ${r.result.error.slice(0, 30)}` : "";
+			const err = typeof r.result?.error === "string" && r.result.error ? ` — ${r.result.error.slice(0, 30)}` : "";
 			lines.push(`  ✗ ${agentLabel}: ${shortTaskLabel(r.task)} (${r.id})${err}`);
 		}
 		if (doneCount > 0) {

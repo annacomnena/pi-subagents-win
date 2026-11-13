@@ -590,7 +590,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 			// subagent 通道没有 spawn 事件：用「超时 / 正常结束」两态映射，错误由 exitCode!==0 表达
 			outcome = res.timedOut ? "timeout" : "exit";
 		} catch (err) {
-			writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", startedAt, finishedAt: new Date().toISOString(), error: `subagent 通道异常：${(err as Error).message}` });
+			writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", task: `fusion 融合器（${input.runDir}）`, startedAt, finishedAt: new Date().toISOString(), result: { error: `subagent 通道异常：${(err as Error).message}` }, error: `subagent 通道异常：${(err as Error).message}` });
 			return { status: "spawn-error", reason: `subagent 通道异常：${(err as Error).message}`, fusionRunId, zeroModelCall: false };
 		}
 	} else {
@@ -618,7 +618,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		});
 	} catch (err) {
 		if (outFd !== undefined) closeSync(outFd);
-		writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", startedAt, finishedAt: new Date().toISOString(), error: String((err as Error).message) });
+		writeRunRecord(runsDir, fusionRunId, { id: fusionRunId, status: "failed", agent: "fusion", task: `fusion 融合器（${input.runDir}）`, startedAt, finishedAt: new Date().toISOString(), result: { error: String((err as Error).message) }, error: String((err as Error).message) });
 		return { status: "spawn-error", reason: `spawn 失败：${(err as Error).message}`, fusionRunId, zeroModelCall: false };
 	}
 	// S1：登记 pid（kill/身份校验需要）。marker 用 pi CLI 路径（命令行稳定子串）。
@@ -716,6 +716,9 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		id: fusionRunId,
 		status, // 必须终态：停在 running 的账本 watcher 永不通知 ⇒ 静默失效
 		agent: "fusion",
+		// 终态重写**必须带 task**：面板读的是磁盘记录，缺 task 曾让 timer 里的 shortTaskLabel 抛
+		// uncaughtException 直接杀掉主会话（2026-11-13，run_fusemweer6ma_jryr）。
+		task: `fusion 融合器（${input.runDir}）`,
 		model: input.fusionModel,
 		// via（2026-11-04）：区分「headless 子进程」与「真 subagent（runWithFallback）」两条通道
 		via: agentVia,
