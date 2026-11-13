@@ -48,7 +48,7 @@ import { auditSuppression, postInject, preInject, injectFollowUpQuietly, deliver
 // C-3：mailbox 的信自带真 ACK（`ackLetter`）；再加**交付账本**关联（eventId 标记）。
 import { eventMarker } from "./delivery-ack.ts";
 import { appendTrace, ensureEvent, listAcks, listAttempts, listEvents, loadEvent, publishIncident, recordAttempt, terminalRevisionOf, defaultDeliveryDir } from "./delivery-ledger.ts";
-import { releaseInjectionClaim } from "./runtime/receipts.ts";
+import { confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
 import { claimNotified } from "./event-bus.ts";
 import { defaultTabRunsDir } from "./tab-runs.ts";
 import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts";
@@ -503,14 +503,34 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					ackLetter(recipient, frameId!, { mailboxDir });
 					reportPush(report, messageId, "injected");
 				} else if (status === "unconfirmed") {
-					// C-3：**不把返回值当送达**（P3）：不 ackLetter、不 confirm —— 交付是否成立由
-					// `consumed` ACK 决定（见上方闭环）。
-					// 但要与 busy 同构地**释放两处 claim 把信退回 pending**：否则信永久停在 claimed
-					// （本循环只枚举 pending），既不重投也不 ack ＝ 永久停滞（违反「必达」）。
-					// at-least-once 收敛：最坏重投一条，目标端按稳定 messageId 幂等去重；
-					// 一旦 `consumed` ACK 出现，上方闭环立即 ack 并停止重投。
-					releaseInjectionClaim(key, verdict.holder);
-					if (frameId) releaseClaimed(recipient, frameId, holderOf(opts.sessionId), { mailboxDir });
+					// C-3：**不把返回值当送达**（P3）：不 ackLetter —— 交付是否成立由 `consumed` ACK
+					// 决定（见上方闭环）。
+					//
+					// ⚠️ **2026-11-12 修正「同一封信被注入 5-6 次」事故**（与 outbox-bridge.ts 同口径）：
+					// 原实现此处 `releaseClaimed` 把信退回 pending ⇒ 下个 tick（10s）重新 claim 再注入一次。
+					// 但 `unconfirmed` 的真实语义**不是投递失败**：`injectFollowUpQuietly` 恒传
+					// `deliverAs:"followUp"`（injection-gate.ts:196），而 pi 的 followUp 语义是
+					// 「Waits for agent to finish. Delivered only when agent has no more tool calls」
+					// （pi docs/extensions.md:1672）——**忙碌时排队，不 reject**。生产 `sendUserMessage`
+					// 又恒返回 `undefined` ⇒ 每一次发送都落 unconfirmed ⇒ 每次都被当成失败重投。
+					// 实测本事故：6 次 attempt、用户端看到 5 条相同消息。
+					//
+					// 修法（`outbox-bridge.ts:485-500` 的 2026-11-02 既成修法，本处漏落）：
+					// **注入已实际发生就 confirm**（写 injected 收据、删 `.claiming.json`）——
+					// 这与「不写 delivered」不矛盾：injected ≠ delivered，后者仍由 consumed ACK 独享。
+					// confirm 后 `claimInjection` 返回 `injected-already`，任何后续 consumer 都不会重投。
+					//
+					// 「不 release 会不会永久停滞？」——不会，三条出口都已就位：
+					//   ① `sweepClaimedLetters`（本文件 :148）按 consumed ACK 兜底 ack；
+					//   ② B 对账通道过 `deliveryDeadline` ⇒ `failed_delivery` + 持久 incident（可观测）；
+					//   ③ 消费循环入口是 `listLetters(recipient,"pending")`，保持 claimed 不会被
+					//      `claimLetters` 的 10min stale reclaim 重投（stale 分支只在 pending 循环体内被调）。
+					const confirmed = confirmInjection(key, verdict.holder);
+					if (!confirmed) {
+						// claim 已被他人接管/收据已存在：什么都不做，交给对方。
+						reportPush(report, messageId, "skipped", "unconfirmed-confirm-failed");
+						return;
+					}
 					reportPush(report, messageId, "skipped", "attempted-unconfirmed");
 				} else if (status === "busy" || status === "no-injector") {
 					// agent 忙或没有注入通道，消息均未真正注入：不 ack/confirm、不 selfDisable；释放注入互斥

@@ -22,7 +22,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "runtime-cutover-env-"))
 import { masterAddress } from "./runtime/address.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import { attachMaster, readCutover, setCutover } from "./runtime/registry.ts";
-import { deliverLetter } from "./runtime/mailbox.ts";
+import { deliverLetter, listLetters } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { hasNotificationReceipt } from "./runtime/receipts.ts";
 import { isCutoverActive, postInject, preInject, deliveryStrictEnabled } from "./injection-gate.ts";
@@ -103,6 +103,7 @@ try {
 		const sent: string[] = [];
 		const now = new Date().toISOString();
 		deliverLetter(report("tab_c1", now), { mailboxDir: MAILBOX });
+		const c1Id = listLetters(master, undefined, MAILBOX).find((x) => x.frame.frame === "message" && x.frame.subject === "run://tab/tab_c1")!.frame as { id: string };
 		const r = consumeMailboxOnce({
 			sessionId: "sess-A",
 			mailboxDir: MAILBOX,
@@ -115,32 +116,41 @@ try {
 		assert.equal(sent.length, 1, "恰好注入一次（零回归）");
 		assert.ok(sent[0]!.includes("tab_c1"));
 		assert.ok(sent[0]!.includes("busy-poll"), "mailbox 完成信正文应含禁轮询纪律");
-		// C-3：fake send 不 return（= 生产形态）⇒ strict 下为 attempted-unconfirmed：
-		// **不收据、不补 .notified、不 ack**（交付由 ACK 决定）；回滚档位保持旧行为。
+		// C-3：fake send 不 return（= 生产形态）⇒ strict 下为 attempted-unconfirmed。
+		// **2026-11-12 修正**：旧版断言「未确认不得写收据」，真实事故证明那条断言本身是错的——
+		// `deliverAs:"followUp"` 在 pi 侧是**排队**语义（`docs/extensions.md:1672`），
+		// 生产 `sendUserMessage` 恒返回 undefined ⇒ unconfirmed 的真实含义是
+		// 「已交给 pi，只是没有宿主返回确证」，不是「没送进去」。把它当失败 ⇒ 每 10s 重投 ⇒
+		// 实测同一封信注入 5-6 次（见 `_test_c3_mailbox_ack` M3）。
+		// 新口径（与 `outbox-bridge.ts:485-500` 的 2026-11-02 既成修法一致）：
+		//   injected（收据）= 「我们调过 send」，**不等于** delivered（后者仍由 consumed ACK 独享）。
+		// ⇒ 收据**要写**（它同时是跨通道去重键，阻止 event-bus/reports 再发一条）；
+		//   但 `.notified` 仍不补（那是 A 通道自己的进程内去重标记），且**不 ackLetter**
+		//   （交付尚未被 consumed ACK 证实）。
 		if (deliveryStrictEnabled()) {
 			assert.equal(r.consumed[0]!.action, "skipped", "strict：不计 injected（未确认）");
 			assert.equal(r.consumed[0]!.reason, "attempted-unconfirmed", "如实报告尝试但未确认");
-			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), false, "**未确认不得写收据**（P3）");
-			assert.equal(existsSync(join(RUNSDIR, "tab_c1.notified")), false, "未确认不得补 .notified（它不再是交付证明）");
+			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "injected 收据已写（≠ delivered；跨通道去重键需要它）");
+			assert.equal(existsSync(join(RUNSDIR, "tab_c1.notified")), false, "未确认不得补 .notified（A 通道自己的去重标记，不是交付证据）");
 		} else {
 			assert.equal(r.consumed[0]!.action, "injected");
 			assert.equal(hasNotificationReceipt("run-tab_c1-completed"), true, "收据确认");
 			assert.ok(existsSync(join(RUNSDIR, "tab_c1.notified")), ".notified 补认领");
 		}
-		// 重扫（C-3 语义）：strict 下未确认 ⇒ 信已退回 pending ⇒ 下 tick 重投（at-least-once，
-		// 目标端按稳定 messageId 去重）；回滚档位已写收据 ⇒ 不重注。
+		// 重扫（2026-11-12 修正）：strict 下未确认 ⇒ **信保持 claimed**（不 releaseClaimed）
+		// ⇒ 消费循环只枚举 pending，因此下 tick **根本看不到这封信**（零重投）。
+		// 收尾交给：① `sweepClaimedLetters`（consumed ACK 到达后 ack）；② B 对账通道
+		// （过 deliveryDeadline ⇒ failed_delivery + 持久 incident）。两条出口都不静默。
 		const sent2: string[] = [];
 		const r2 = consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: (b) => { sent2.push(b); } });
 		await flush(); // L3：reportPush 在 send 的 .then 微任务（不 flush 读 r2.consumed 会是空数组）
 		assert.equal(r2.consumed.filter((c) => c.action === "injected").length, 0, "无重注");
 		if (deliveryStrictEnabled()) {
-			// D-1（global Master 2026-10-16 裁定）：unconfirmed 采用**有限退避**（5/10/20/40/80s ±20%）
-			// ⇒ 退避窗内的下 tick **不重投**（retry-backoff），信仍 pending（非永久停滞）。
-			assert.equal(sent2.length, 0, "strict + D-1：退避窗内不重投");
-			assert.ok(r2.consumed.some((c) => c.reason === "retry-backoff"), "如实报 retry-backoff（非静默丢）");
-			// 收尾：本块的信仍 pending ⇒ 用真 Promise 路径收敛为 ack，避免污染后续用例
-			consumeMailboxOnce({ sessionId: "sess-A", mailboxDir: MAILBOX, runsDir: RUNSDIR, sendUserMessage: () => Promise.resolve() });
-			await flush();
+			assert.equal(sent2.length, 0, "strict：信已 claimed ⇒ 不在 pending 列表 ⇒ 零重投（**这是事故修复的核心断言**）");
+			const l = listLetters(master, undefined, MAILBOX).find((x) => x.frame.frame === "message" && (x.frame as { id?: string }).id === c1Id.id)!;
+			assert.ok(l === undefined || l.status === "claimed", `信保持 claimed（不退回 pending；实得 ${l?.status}）`);
+			// 收尾：本块的信仍 claimed ⇒ 用真 Promise 路径不会再碰它（已 claimed），
+			// 直接靠 consumed ACK 清扫器收敛，避免污染后续用例。
 		} else {
 			assert.equal(sent2.length, 0, "回滚档位：已写收据 ⇒ 不重注");
 		}
@@ -154,7 +164,6 @@ try {
 		const entry = r.consumed.find((c) => c.reason === "pre-cutover-legacy");
 		assert.ok(entry && entry.action === "skipped", "cutover 前旧信留 legacy");
 		assert.equal(sent.length, 0);
-		const { listLetters } = await import("./runtime/mailbox.ts");
 		const letters = listLetters(master, undefined, MAILBOX);
 		assert.ok(letters.some((l) => l.status === "pending"), "旧信仍 pending（不动）");
 	}
@@ -173,7 +182,6 @@ try {
 		const failed = r2.consumed.find((c) => c.reason === "inject-failed");
 		assert.ok(failed, "注入失败记录");
 		assert.equal(hasNotificationReceipt("run-tab_c2-completed"), false, "失败不确认收据");
-		const { listLetters } = await import("./runtime/mailbox.ts");
 		const letters = listLetters(master, undefined, MAILBOX);
 		const c2 = letters.find((l) => l.frame.frame === "message" && l.frame.subject === "run://tab/tab_c2")!;
 		assert.equal(c2.status, "claimed", "失败信停 claimed（stale 回收重试，不丢）");

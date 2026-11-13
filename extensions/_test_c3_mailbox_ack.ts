@@ -5,7 +5,9 @@
  *   生产形态 send（不 return ⇒ `undefined`）下，
  *   ① 不得把「返回值」当送达（记 `attempted-unconfirmed`）；
  *   ② 不得写 `consumed`（P3 假阳性）；
- *   ③ 不得 `ackLetter`（信必须留 pending，交付由 ACK/对账决定）—— 这是 mailbox 特有的强断言。
+ *   ③ 不得 `ackLetter`（信必须留 claimed，交付由 ACK/对账决定）—— 这是 mailbox 特有的强断言；
+ *   ④ **（2026-11-12 新增）不得 releaseClaimed**：unconfirmed ≠ 投递失败，
+ *      重投会把同一封信注入 5-6 次（本仓实测事故）。见 M3 组。
  * 并验证 `PI_DELIVERY_STRICT=0` 可回滚。
  */
 
@@ -111,7 +113,14 @@ try {
 		ok("M2 mailbox：真 Promise resolve ⇒ sent（可信确证路径不受影响）");
 	}
 
-	// ── M3：稳定 eventId（revision 不得含 now）＋ 未确认可重投（独立信箱隔离）──
+	// ── M3：稳定 eventId（revision 不得含 now）＋ **unconfirmed 不得重投**（2026-11-12 事故回归）──
+	//
+	// 【事故】原实现在 unconfirmed 分支 `releaseClaimed` 把信退回 pending ⇒ 每 10s 重投一次，
+	// 实测同一封信注入 5-6 次（attempt 6 条 + incident retry-budget-exhausted）。
+	// 根因：`deliverAs:"followUp"` 在 pi 侧是**排队**语义（docs/extensions.md:1672），
+	// 而生产 `sendUserMessage` 恒返回 undefined ⇒ 每次都落 unconfirmed ⇒ 每次都当失败重投。
+	// 修法与 `outbox-bridge.ts:485-500` 同口径：**注入已发生就 confirm，不 release**。
+	// ⇒ 本组反转为：多 tick 反复轮询，注入次数恒为 **1**。
 	{
 		const MB3 = join(ROOT, "mailbox3");
 		mkdirSync(MB3, { recursive: true });
@@ -122,20 +131,21 @@ try {
 		const opts = { sessionId: "sess-c3", mailboxDir: MB3, runsDir: join(ROOT, "tab-runs"), deliveryDir: DELIVERY, sendUserMessage: (b: string) => { sent.push(b); } };
 		consumeMailboxOnce({ ...opts, nowMs: T0 });
 		await flush();
-		// D-1（global Master 裁定）：unconfirmed 后**退避**（首次重投前 5s）⇒ 退避窗内不重投
-		const rWait = consumeMailboxOnce({ ...opts, nowMs: T0 + 1_000 });
-		await flush();
-		assert.ok(rWait.consumed.some((c) => c.reason === "retry-backoff"), "**D-1**：退避窗内 ⇒ 不重投（retry-backoff）");
-		assert.equal(sent.length, 1, "退避窗内只有首次注入");
-		// 超过退避（5s±20% ⇒ 取 6.5s 必过）⇒ 重投一次
-		consumeMailboxOnce({ ...opts, nowMs: T0 + 6_500 });
-		await flush();
+		assert.equal(sent.length, 1, "首次 tick ⇒ 注入 1 次");
+		// 按 D-1 退避节律全部跑一遍（窗内 + 到期 + 远超期限）：**都不得重投**
+		for (const dt of [1_000, 6_500, 19_000, 44_000, 190_000, 600_000]) {
+			consumeMailboxOnce({ ...opts, nowMs: T0 + dt });
+			await flush();
+		}
+		assert.equal(sent.length, 1, `**unconfirmed ⇒ 恒 1 次注入，绝不重投**（实测事故是 6 次；实得 ${sent.length}）`);
 		const evs = listEvents(DELIVERY, 200).filter((e) => e.runId === `mailbox_${body3.id}`);
 		assert.equal(evs.length, 1, `同一封信多 tick 只建 1 个事件（revision 必须稳定；实得 ${evs.length}）`);
-		assert.equal(sent.length, 2, "退避到期 ⇒ 重投（at-least-once，目标端按 messageId 去重）");
-		ok("M3 mailbox：eventId 稳定（revision 不含 now），D-1 退避窗内不重投、到期才重投");
+		// 不静默丢：信停在 claimed（不是 pending、也不是被伪造成 acked）
+		const held = listLetters(master, undefined, MB3).find((l) => l.frame.frame === "message" && l.frame.id === body3.id)!;
+		assert.equal(held.status, "claimed", `**不 releaseClaimed**（信停 claimed 交 ACK/对账收尾；实得 ${held.status}）`);
+		ok("M3 mailbox：eventId 稳定 + unconfirmed 不重投（注入恒 1 次，信留 claimed）");
 
-		// ── M4：ACK 驱动闭环 —— consumed ACK ⇒ 补 ack、停止重投（复用 M3 的 pending 信）──
+		// ── M4：ACK 驱动闭环 —— consumed ACK ⇒ 补 ack（复用 M3 的 claimed 信）──
 		const ev = evs[0]!;
 		assert.equal(writeAck(DELIVERY, {
 			eventId: ev.eventId, stage: "consumed",
@@ -146,10 +156,9 @@ try {
 		const r = consumeMailboxOnce({ ...opts, sendUserMessage: () => { sendCalled += 1; } });
 		await flush();
 		assert.equal(sendCalled, 0, "ACK 已成立 ⇒ 不再注入");
-		assert.ok(r.consumed.some((c) => c.reason === "ack-consumed"), "报 ack-consumed");
 		const letter = listLetters(master, undefined, MB3).find((l) => l.frame.frame === "message" && l.frame.id === body3.id)!;
-		assert.equal(letter.status, "acked", "信已 ack（ACK 驱动交付终态）");
-		ok("M4 mailbox：consumed ACK ⇒ ack 闭环，零重投");
+		assert.equal(letter.status, "acked", `**claimed 信被 sweepClaimedLetters 收尾成 acked**（实得 ${letter.status}；报告 ${JSON.stringify(r.consumed)}）`);
+		ok("M4 mailbox：consumed ACK ⇒ ack 闭环（claimed 信由清扫器收尾），零重投");
 	}
 
 	console.log(`\n_test_c3_mailbox_ack: all ${n} groups passed`);

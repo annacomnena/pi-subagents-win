@@ -1,15 +1,27 @@
 /**
  * _test_mailbox_retry_budget.ts — D-1 有限退避（global Master 2026-10-16 裁定）
  *
- * 裁定：mailbox `unconfirmed` **保持释放**（否则永久停滞）**+ 有限退避**：
+ * 裁定：mailbox 未送达的信走「保持释放 + 有限退避」：
  *   重投 ≤5 次；退避 5s→10s→20s→40s→80s（±20% 抖动）；总交付期限 ≤5min；
  *   **到顶 ⇒ `failed_delivery` + incident（绝不静默丢）**。
  *
- * 覆盖：
- *   P1 纯函数 `mailboxRetryGate`：无 attempt ⇒ proceed；退避窗内 ⇒ wait；到期 ⇒ proceed；
- *      重投 ≥5 ⇒ exhausted(budget)；超总期限 ⇒ exhausted(deadline)；抖动上/下界 ±20%。
- *   P2 集成：单封信按退避节律重投，**注入次数 ≤ 6（首次 + 5 次重投）**；第 7 次 tick 到顶 ⇒
- *      `publishIncident` 落盘 + report `retry-budget-exhausted` + **此后不再注入**（绝不静默丢）。
+ * ## 2026-11-12 重大修正（本文件重写 P2 组）
+ *
+ * 【事故】同一封信被注入目标会话 **5-6 次**（attempt 6 条 + `retry-budget-exhausted` incident，
+ * 用户端看到 5 条相同「📬 Tab 已完成」）。根因不是退避阈值，而是**分类错误**：
+ * `injectFollowUpQuietly` 恒传 `deliverAs:"followUp"`（`injection-gate.ts:196`），而 pi 的
+ * followUp 语义是「排队等 agent 空闲」（pi `docs/extensions.md:1672`：*Delivered only when agent
+ * has no more tool calls*）——**忙碌时不 reject**；生产 `sendUserMessage` 又恒返回 `undefined`
+ * ⇒ 每次都落 `unconfirmed` ⇒ 旧代码把它当「投递失败」，`releaseClaimed` 退回 pending ⇒ 重投。
+ *
+ * 【新口径】`unconfirmed` **不释放**（注入已实际发生，与 `outbox-bridge.ts:485-500` 的
+ * 2026-11-02 既成修法同口径）⇒ 这种形态恒 **1 次注入**（见 `_test_c3_mailbox_ack` M3）。
+ *
+ * 【退避门还存在吗】存在，且仍然必要——它服务**真正没送出去**的那些形态：
+ *   - `busy`（send 抛 `already processing`，pi 拒绝而非排队）；
+ *   - `no-injector`（宿主无注入通道）。
+ * 这两种旧代码也是 `releaseClaimed` 退回 pending，需靠退避节流 + 到顶 incident 兜底。
+ * P2 组改用 `busy` 形态覆盖，不再用已不成立的 unconfirmed 形态。
  */
 
 import assert from "node:assert/strict";
@@ -23,7 +35,7 @@ process.env.PI_RUNTIME_DIR = ROOT;
 import { masterAddress } from "./runtime/address.ts";
 import { newEnvelopeId } from "./runtime/ids.ts";
 import { attachMaster, setCutover } from "./runtime/registry.ts";
-import { deliverLetter } from "./runtime/mailbox.ts";
+import { deliverLetter, listLetters } from "./runtime/mailbox.ts";
 import { newMessageFrame } from "./runtime/protocol.ts";
 import { consumeMailboxOnce, mailboxRetryGate, MAILBOX_RETRY_BACKOFF_MS, MAILBOX_RETRY_MAX_RETRIES, MAILBOX_RETRY_TOTAL_MS } from "./mailbox-consumer.ts";
 import { defaultDeliveryDir, listOpenIncidents } from "./delivery-ledger.ts";
@@ -41,6 +53,11 @@ const master = masterAddress();
 // （实测 2026-10-20：`consumed=[{action:"skipped",reason:"pre-cutover-legacy"}]`、sent=0）。
 // 改为以测试启动时刻为基准 ⇒ 与 cutover 时间同源，退避节律断言（纯相对量）不受影响。
 const T0 = Date.now();
+
+/** 生产形态的 busy 拒绝：pi 在**非 followUp 路径**上的原始错误文本（`classifyThrown` 据此判 busy）。 */
+const busyThrow = (): never => {
+	throw new Error("Agent is already processing a prompt");
+};
 
 try {
 	mkdirSync(MAILBOX, { recursive: true });
@@ -69,19 +86,22 @@ try {
 		ok("P1 mailboxRetryGate：首投/窗内/到期/预算/期限/抖动上下界");
 	}
 
-	// ── P2：集成 —— 有界重投 + 到顶 incident（绝不静默丢）──────────────
+	// ── P2：集成 —— `busy` 形态有界重投 + 到顶 incident（绝不静默丢）──────
 	{
-		deliverLetter(newMessageFrame({
+		const body = newMessageFrame({
 			id: newEnvelopeId("msg"), kind: "REPORT", from: "agent://agent_worker_d1", to: master,
 			// sentAt 必须 ≥ cutover.enabledAt（后者是 setCutover 时的真实 now）⇒ 用真实当前时刻，
 			// 否则被判 pre-cutover-legacy 而跳过（原写 iso(T0)，T0 是硬编码过去时刻 ⇒ 时间炸弹）。
 			subject: "run://tab/tab_d1", sentAt: new Date().toISOString(), summary: "D-1 预算", details: { tabRunId: "tab_d1", status: "completed" },
-		}), { mailboxDir: MAILBOX });
+		});
+		deliverLetter(body, { mailboxDir: MAILBOX });
 
-		const sent: string[] = [];
+		let attempts = 0;
 		const opts = {
 			sessionId: "sess-d1", mailboxDir: MAILBOX, runsDir: join(ROOT, "tab-runs"), deliveryDir: DELIVERY,
-			sendUserMessage: (b: string) => { sent.push(b); }, // 生产形态（不 return）⇒ unconfirmed
+			// **busy 形态**（老形态 unconfirmed 已改为不释放，见文件头）：pi 拒绝 ⇒ 消息确实没送进去
+			// ⇒ 释放 + 退避重投才是正确语义。
+			sendUserMessage: (): never => { attempts += 1; return busyThrow(); },
 		};
 		// 退避节律下的 tick 序列（每次都**超过最坏抖动** base×1.2 的累计值 ⇒ 每次都真重投）
 		const ticks = [0, 6_500, 19_000, 44_000, 93_000, 190_000];
@@ -89,12 +109,12 @@ try {
 			consumeMailboxOnce({ ...opts, nowMs: T0 + dt });
 			await flush();
 		}
-		assert.equal(sent.length, MAILBOX_RETRY_MAX_RETRIES + 1, `注入次数 = 首次 + ${MAILBOX_RETRY_MAX_RETRIES} 次重投（实得 ${sent.length}）`);
+		assert.equal(attempts, MAILBOX_RETRY_MAX_RETRIES + 1, `注入尝试 = 首次 + ${MAILBOX_RETRY_MAX_RETRIES} 次重投（实得 ${attempts}）`);
 
 		// 第 7 次 tick：到顶 ⇒ incident + 不再注入
 		const rTop = consumeMailboxOnce({ ...opts, nowMs: T0 + 240_000 });
 		await flush();
-		assert.equal(sent.length, MAILBOX_RETRY_MAX_RETRIES + 1, "**到顶后不再注入**（有界）");
+		assert.equal(attempts, MAILBOX_RETRY_MAX_RETRIES + 1, "**到顶后不再注入**（有界）");
 		assert.ok(rTop.consumed.some((c) => c.reason === "retry-budget-exhausted"), "**如实报 retry-budget-exhausted**（不静默丢）");
 		const open = listOpenIncidents(DELIVERY);
 		assert.equal(open.length, 1, "**incident 已落盘**（failed_delivery 可见）");
@@ -103,11 +123,13 @@ try {
 		// 再退后仍不再注入，且 incident 保持唯一（幂等）
 		const rAfter = consumeMailboxOnce({ ...opts, nowMs: T0 + 600_000 });
 		await flush();
-		assert.equal(sent.length, MAILBOX_RETRY_MAX_RETRIES + 1, "终态后不再注入");
+		assert.equal(attempts, MAILBOX_RETRY_MAX_RETRIES + 1, "终态后不再注入");
 		assert.equal(listOpenIncidents(DELIVERY).length, 1, "incident 唯一（幂等，不重复制造）");
-		assert.ok(rAfter.consumed.some((c) => c.reason === "retry-budget-exhausted") || rAfter.consumed.length >= 0, "终态态可重复观测");
+		assert.ok(rAfter.consumed.length >= 0, "终态态可重复观测");
 		assert.equal(defaultDeliveryDir(), DELIVERY, "隔离生效（账本目录 = 临时目录）");
-		ok("P2 集成：注入 ≤6 次、到顶 incident + 不静默丢 + 幂等");
+		const letter = listLetters(master, undefined, MAILBOX).find((l) => l.frame.frame === "message" && l.frame.id === body.id)!;
+		assert.equal(letter.status, "claimed", `**到顶后保持 claimed**（不退回 pending、也不伪造成 acked；实得 ${letter.status}）`);
+		ok("P2 集成（busy 形态）：尝试 ≤6 次、到顶 incident + 不静默丢 + 幂等");
 	}
 
 	console.log(`\n_test_mailbox_retry_budget: all ${n} groups passed`);
