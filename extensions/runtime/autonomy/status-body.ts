@@ -12,6 +12,7 @@
  *
  * 依赖全部来自 runtime 层（无 pi / pi-tui / typebox）⇒ 可以安全被测试直接 import。
  */
+import { join } from "node:path";
 import { readAuditTail, readAutonomyHeartbeat, readFrontierSnapshot, readWakeGateState, frontierFreshness, listNonOwnerTicks } from "./collect.ts";
 import { journalUnavailableSnapshot } from "../journal.ts";
 import { evaluateAutonomyGating, readKillSwitch } from "./kill-switch.ts";
@@ -20,6 +21,8 @@ import { readAttachment } from "../registry.ts";
 import { masterAddress } from "../address.ts";
 import { summarizeActionsStatus } from "./action/run.ts";
 import { supervisionLedgerLines } from "../supervision.ts";
+import { observeOutbox, observeDelivery, deliveryObservationLines } from "../delivery-observations.ts";
+import { defaultRuntimeDir } from "../journal.ts";
 
 export function buildAutonomyStatusBody(): string {
 	let body: string;
@@ -103,6 +106,14 @@ export function buildAutonomyStatusBody(): string {
 				`wake-gate: ${gate?.lastReason ? `${gate.lastReason} @${gate.lastDecisionAt !== null ? iso(gate.lastDecisionAt) : "?"}` : "(never)"}`,
 				// journal 写入口存活信号（R-2，2026-11-05）：claim 机制坏掉 / 磁盘满 / 权限时
 				// 8 个 journal 写点会**全部静默停写**。这里把它变成可见读数。
+				// P0-c 投递面只读观测（2026-11-10 gen14 排序第 1 步）。
+				// 动机：B 类（`to=pi://tab_xxx` 永不匹配）与 A 类（有 injected 收据但正文没进会话）
+				// 在盘上都有症状，但**没有任何读数面** —— 只能手工挖盘（R-17 家族：产物写到了没人读的地方）。
+				// 本行只报**计数与年龄**，不做终态判断、不写盘、不触发重投；判据与「不证明什么」都写进文案。
+				...deliveryObservationLines({
+					outbox: observeOutbox(join(defaultRuntimeDir(), "state")),
+					delivery: observeDelivery(defaultRuntimeDir()),
+				}),
 				`journal-unavailable: ${(() => {
 					const j = journalUnavailableSnapshot();
 					if (!j.degraded) return "none（全部写点正常）";
