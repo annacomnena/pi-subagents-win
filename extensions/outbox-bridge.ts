@@ -62,13 +62,20 @@ import {
 import { probeTargetSessionLiveness } from "./runtime/outbox-target-liveness.ts";
 import { canSessionBeRescued } from "./runtime/session-resume.ts";
 import { defaultSessionsDir } from "./runtime/transcript.ts";
+// D3（A 类死锁的自愈）：反查「marker 是否真的进了 user 消息」+ 有界放行一次。
+import { probeEventMarkerInUserMessages } from "./runtime/transcript-marker-probe.ts";
+import {
+	decideInjectionRecovery,
+	quarantineReceipt,
+	receiptPathFor,
+} from "./runtime/outbox-injection-recovery.ts";
 import { piSessionAddress } from "./runtime/address.ts";
 import { claimInjection, confirmInjection, releaseInjectionClaim } from "./runtime/receipts.ts";
 import { injectFollowUpQuietly, deliveryStrictEnabled } from "./injection-gate.ts";
 import { isSubagent } from "./identity.ts";
 // C-3：outbox 项也锚到交付真账本（`outbox_<id>`），delivered 终态改由 `consumed` ACK 驱动。
 import { eventMarker } from "./delivery-ack.ts";
-import { appendTrace, defaultDeliveryDir, ensureEvent, listAcks, recordAttempt, terminalRevisionOf } from "./delivery-ledger.ts";
+import { appendTrace, defaultDeliveryDir, ensureEvent, listAcks, listAttempts, recordAttempt, terminalRevisionOf } from "./delivery-ledger.ts";
 
 export interface ConsumeOutboxOptions {
 	sessionId: string;
@@ -417,6 +424,83 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 				// 前一轮已注入但崩溃未回写（收据已存在）。**C-3：收据 ≠ 接收端 consumed 证据**
 				// ⇒ strict 下**不写 delivered**，只记 received 级 journal，留 pending 等上方 ACK 闭环收敛；
 				// 回滚档位保持旧行为（收据回放 ⇒ 补写 delivered，终态守卫防竞态双写）。
+
+				// ── D3（2026-11-10 gen14 裁定）：A 类死锁的有界自愈 ─────────────────
+				//
+				// 【病】`injected` 收据存在但**正文没进会话**（真机 `0a9a85cc`：user 消息里
+				// `[evt:0a9a85cc]` = 0，只在 assistant 回述里出现过）⇒ `consumed` ACK 永不产生
+				// ⇒ 收据把“再试一次”也锁死了 ⇒ 项永久 pending，每次重投撞同一堵墙。
+				//
+				// 【医】在**本来就要 continue** 的这个分支里，先做一次**只读反查**：
+				// 目标会话的 `role==="user"` 消息里到底有没有 `[evt:<eventId>]`。
+				//   found        ⇒ 真进了，收据没错，走旧路径（绝不重投）
+				//   absent       ⇒ 有证据表明没进 ⇒ 收据**隔离改名**（不删，可审计）+ 放行**一次**
+				//   inconclusive ⇒ 没证据（文件缺失/截断）⇒ 不放行，但留 trace
+				//
+				// 【有界性】`decideInjectionRecovery` 里三道闸：只剩 1 次额度、已有 2 次就停、
+				// 距上次注入 <60s 不放行（等会话 JSONL flush）。**无界重投比原缺陷更糟**。
+				//
+				// 【代价】隔离收据确实打破了“收据 = 不可撤销事实”。它的正当性完全建立在
+				// “反查有证据表明没进”上 ⇒ `inconclusive` 一律不放行就是为此（守 R-5）。
+				if (strict && eventId) {
+					try {
+						const dDirForRecovery = opts.deliveryDir ?? defaultDeliveryDir();
+						// 只认「已注入但未确认」的记录 —— 那才是 A 类死锁的形状。
+						const priorAttempts = listAttempts(dDirForRecovery, eventId).filter((a) => a.status === "unconfirmed");
+						if (priorAttempts.length >= 1) {
+							const probe = probeEventMarkerInUserMessages({
+								sessionsDir: opts.sessionsDir ?? defaultSessionsDir(),
+								sessionId: item.sessionId,
+								eventId,
+							});
+							const decision = decideInjectionRecovery({ probe, attempts: priorAttempts, now: Date.parse(now()) });
+							if (decision.action === "release") {
+								// 收据隔离（改名而非 unlink：可审计「曾被认为已注入、后来被判没进」）
+								const receiptsRoot = join(defaultRuntimeDir(), "receipts");
+								const released = quarantineReceipt(receiptPathFor(receiptsRoot, claimKeyFor(item)), Date.parse(now()));
+								appendTrace(dDirForRecovery, {
+									kind: "d3-released-for-retry",
+									source: "outbox-bridge",
+									outboxId: item.id,
+									eventId,
+									reason: decision.reason,
+									unconfirmedAttempts: decision.unconfirmedAttempts,
+									msSinceLastAttempt: decision.msSinceLastAttempt,
+									probeVerdict: probe.verdict,
+									probeScannedBytes: probe.scannedBytes,
+									quarantined: released,
+								});
+								if (released) {
+									// 让路成功：本 tick 不注入（下 tick 重新 claim ⇒ 正好被次数/冷却闸控住）
+									report.consumed.push({ outboxId: item.id, action: "skipped", reason: `d3-release-${decision.reason}` });
+									continue;
+								}
+								// 让路失败（权限/EBUSY）⇒ 保持现状，不谎称已放行
+							} else if (
+								// 只在「本来有资格但被拦住」时落 trace。
+								// `probe-found` 不落：那是**正常路径**（每一项每 tick 都可能走到，落了就把
+								// trace.jsonl 变成又一个 5153 行空转日志 —— 同 C-4 的教训）。
+								// `attempts-exhausted` 不落：那是**已到上限的稳态**，每 tick 重复无信息量。
+								decision.reason !== "probe-found" &&
+								decision.reason !== "attempts-exhausted"
+							) {
+								appendTrace(dDirForRecovery, {
+									kind: "d3-probe-not-released",
+									source: "outbox-bridge",
+									outboxId: item.id,
+									eventId,
+									reason: decision.reason,
+									probeVerdict: probe.verdict,
+									probeError: probe.error,
+									probeTruncated: probe.truncated,
+								});
+							}
+						}
+					} catch {
+						/* 反查/隔离失败一律按现状处理（不重投），不影响正常投递路径 */
+					}
+				}
+
 				if (strict) {
 					appendBridgeJournalEvent("message.received", item, opts, { replayed: true });
 					report.consumed.push({ outboxId: item.id, action: "skipped", reason: "receipt-replayed-await-ack" });
