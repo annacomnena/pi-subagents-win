@@ -249,7 +249,8 @@
     "test:trace-fusion-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_gate.ts",
     "test:delivery-observations": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_observations.ts",
     "test:d3-injection-recovery": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_injection_recovery.ts",
-    "test:d3-bridge-wiring": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_bridge_wiring.ts"
+    "test:d3-bridge-wiring": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_bridge_wiring.ts",
+    "test:trace-transition-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_transition_gate.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"

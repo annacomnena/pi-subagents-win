@@ -64,6 +64,8 @@ import { canSessionBeRescued } from "./runtime/session-resume.ts";
 import { defaultSessionsDir } from "./runtime/transcript.ts";
 // D3（A 类死锁的自愈）：反查「marker 是否真的进了 user 消息」+ 有界放行一次。
 import { probeEventMarkerInUserMessages } from "./runtime/transcript-marker-probe.ts";
+// trace 边沿触发（2026-11-20 实测：稳态 reason 每 tick 落盘 ⇒ 4 天 3945 条同一 item）
+import { shouldLogTraceTransition } from "./runtime/trace-transition-gate.ts";
 import {
 	decideInjectionRecovery,
 	quarantineReceipt,
@@ -477,12 +479,16 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 								}
 								// 让路失败（权限/EBUSY）⇒ 保持现状，不谎称已放行
 							} else if (
-								// 只在「本来有资格但被拦住」时落 trace。
-								// `probe-found` 不落：那是**正常路径**（每一项每 tick 都可能走到，落了就把
-								// trace.jsonl 变成又一个 5153 行空转日志 —— 同 C-4 的教训）。
-								// `attempts-exhausted` 不落：那是**已到上限的稳态**，每 tick 重复无信息量。
+								// `probe-found` 是**正常路径**（已进会话，无事发生）⇒ 不落。
+								// 其余（含 inconclusive / attempt-too-fresh）落盘，但**只在状态转移时**
+								// —— 同 (item, reason) 每 tick 重复是无信息量噪声。
+								//
+								// 这条判据是 2026-11-20 真机实测逼出来的：上一版只排除了
+								// `probe-found` + `attempts-exhausted`，**漏了 `probe-inconclusive`**，
+								// 而它恰恰是**稳态**（超大会话永远 inconclusive）⇒ 4 天里同一个 item
+								// 落了 3945 条，d3 占 trace.jsonl 2.37MB。见 `trace-transition-gate.ts`。
 								decision.reason !== "probe-found" &&
-								decision.reason !== "attempts-exhausted"
+								shouldLogTraceTransition(item.id, decision.reason)
 							) {
 								appendTrace(dDirForRecovery, {
 									kind: "d3-probe-not-released",
