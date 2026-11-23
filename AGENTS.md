@@ -631,10 +631,52 @@ git diff --cached --name-only  # ③ 逐条确认每个文件名都属本次改�
 本仓已有 `.tmp_*`（点前缀），而我的文件叫 `_tmp*`（**下划线前缀**）—— 两条不同规则，没覆盖。
 现已补上 `_tmp*`（`.gitignore` 第 48 行）。**新增临时文件前先看已有规则的前缀，不要假设。**
 
+### R-24 补充（2026-11-20 / 11-23 两次）：**`git checkout HEAD -- <file>` 也是整文件覆盖**
+
+**两次同类事故，都是我：**
+
+| 日期 | 操作 | 后果 |
+|---|---|---|
+| 2026-11-20（`572185f` 期间）| `git checkout HEAD -- package.json` 复原工作树 | 抺掉别人 11-13 未提交的 **16 行** script |
+| 2026-11-23（`f27379e` 期间）| 同上 | 抺掉 **17 行**（多了一行）|
+
+**为什么会这样**：我的流程是「把只有我那一行的版本 `git add` 进暂存区，然后把工作树恢复成
+以待提交版本为准」—— 于是用 `git checkout HEAD -- file` 去“恢复”。但 `HEAD` 是**上提交**，
+里面没有别人那些未提交的行 ⇒ **“恢复”实际是“回滚到 HEAD” ⇒ 抹掉所有未提交改动**。
+
+⇒ **R-1 的“禁止整文件覆盖”不只管 `write`/`>`，也管 `git checkout HEAD --`。**
+它看起来像“恢复”，实际是**单文件 reset**。
+
+**正确顺序（把工作树改动与我自己改动分开）**：
+```bash
+# ① 先抓一个工作树快照（含别人的未提交行）
+cp package.json C:/tmp/pkg_wt_<ts>.json
+# ② 从 HEAD 重建「HEAD + 仅我的一行」，写进文件 → git add
+# ③ **把快照拷回来**（不是 git checkout HEAD）
+cp C:/tmp/pkg_wt_<ts>.json package.json
+```
+**禁止 `git checkout HEAD --` 作用于“含他人未提交改动”的文件。**
+（`git checkout HEAD --` 只允许作用于“工作树本无未提交改动”的文件。）
+
+**为何写进规则而不是只写 commit message**：两次犯时我都知道 R-24，
+但 R-24 四条里**没有一条能拦住 `git checkout HEAD --`** —— 它是“恢复”动作，看起来不属于
+“提交前自查”。⇒ **触发条件漏了一个入口，不是“我又忘了”**。同类：R-1 只写了 `write`/`>`，
+没写 `git checkout`；R-16 只写了递归删除，没写单文件 reset。
+
 ### 与 R-23 的关系
 
 R-23 管「声称做了但没做」；R-24 管「**检查了但检查本身有盲区**」。
 两者同一个后果：**记录与事实不符**，只是前者在言，后者在行。
+
+## 快捷按钮面板（2026-11-20）：agent 侧契约
+
+右栏「按钮」面板按仓库 cwd 隔离。本节只在本仓作为 cwd 的会话里自动进上下文；**其它仓库靠面板上的「让 agent 推荐」按钮**把同样的信息注入那一次会话（不能假设 agent 天生知道这套 schema）。
+
+- **权威配置**：`<agentDir>/gui-shortcuts/<repo-key>.json`；提案放同目录的 `proposals/<32位小写hex>.json`。`repo-key` 与详情由 GUI 面板/GET 给出，不要自己猜绝对路径。
+- **提案阶段只写提案文件，不改主配置**。字段：`{version:1, proposalId, cwd, baseHash, reason, sourceSession, createdAt, ops[]}`；`proposalId` 与文件名相同，`baseHash` 取面板当前 `contentHash`，`sourceSession` 取当前会话 id（批准后的回注要回到这里）。`ops` 三种：`{op:"add",action}` / `{op:"update",targetId,action}` / `{op:"remove",targetId}`。
+- `action.kind` 仅 `url|file|script|process`，分别填 `url` / 仓库内相对 `path` / 仓库内 `.ps1` 相对 `command`+`args` / `matchCommandLine`；危险动作 `confirm:true`。`script` 不需要 shell 或 CLI，服务端按参数数组执行。
+- **批准阶段**会收到一条自包含的 `session.message`（主配置绝对路径 + ops + 改法）。此时才用 `Write`/`Edit` 改主配置：**先重读**（用户可能在你提案后改过），精确编辑，不要整文件覆盖。改完面板 1s poll 按语义 hash 自动折叠为 applied。
+- 没有批准指令时改主配置 = 绕过用户决策；基于旧快照整文件覆盖 = 抹掉他人改动。两条都禁止。
 
 ### 与 R-19 的关系（**两条都要过**）
 
