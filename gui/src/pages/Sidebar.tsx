@@ -8,7 +8,7 @@
  * [无后端支撑]=不渲染项：分组 Tabs、置顶/归档区、拖拽排序、搜索按钮、工作流行、手机活跃标。
  */
 
-import { History, MessageCirclePlus, Settings } from "lucide-react";
+import { BarChart3, History, MessageCirclePlus, Settings } from "lucide-react";
 import { useGui } from "../store";
 import { SessionList } from "./SessionList";
 import { Button } from "../ui/button";
@@ -70,6 +70,22 @@ export function Sidebar() {
 					>
 						<History className="size-4 shrink-0" />
 						<span className="text-ui-base">时间线</span>
+					</Button>
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						aria-current={activeTab === "tokens" ? "page" : undefined}
+						title={activeTab === "tokens" ? "返回会话" : "Token 统计：查看历史 Token 消耗热力图与统计明细"}
+						onClick={() => setActiveTab(activeTab === "tokens" ? "chat" : "tokens")}
+						className={`w-full justify-start gap-2 rounded-lg px-2 ${
+							activeTab === "tokens"
+								? "bg-selected text-foreground hover:bg-selected shadow-[inset_2px_0_0_0_var(--color-accent)]"
+								: "text-foreground-subtle"
+						}`}
+					>
+						<BarChart3 className="size-4 shrink-0" />
+						<span className="text-ui-base">Token 统计</span>
 					</Button>
 				</nav>
 				{/* footer（WorkspaceSidebarFooter.tsx#L217）：头像行不渲染，只留设置钮 → RuntimeOverlay */}

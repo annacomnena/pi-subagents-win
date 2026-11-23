@@ -22,6 +22,7 @@
  *   RR8 formatUsage 含 turns（与 RunsPage 同一格式器）
  *   RR9 反例修复：RunsPage 裸 setInterval → usePoll 门控
  *   RR10 默认展开（≥1280px）+ 内存态（不持久化）+ IA 不变（TabId/PAGES 未改）
+ *   RR11 可拖拽宽度：默认/最小/上限、视口钳制、localStorage 容错、pointer/keyboard 接线
  *
  * 运行：npm run test:gui-right-rail
  */
@@ -48,13 +49,24 @@ function codeOnly(src: string): string {
 
 const railState = await import("./rightRail/railState.ts");
 const {
+	MAIN_MIN_WIDTH,
 	PANEL_DISPATCHED,
+	PANEL_NOTE,
+	RAIL_DEFAULT_WIDTH,
+	RAIL_MAX_WIDTH,
+	RAIL_MIN_WIDTH,
+	RAIL_WIDTH_STORAGE_KEY,
 	RAIL_WIDE_QUERY,
+	SIDEBAR_WIDTH,
 	attributionNotice,
+	clampRailWidth,
+	loadRailWidth,
 	pickDispatchedEmpty,
+	railMaxWidth,
 	railOpenDefault,
 	railPanelById,
 	railPollingEnabled,
+	saveRailWidth,
 } = railState;
 const { formatUsage, runDurationDisplay, fmtDuration, deriveRunDisplay } = await import("./runsView.ts");
 const { normalizeSessionScope, sessionScopeParam } = await import("./api/runsScope.ts");
@@ -341,6 +353,7 @@ const runsResp = (over: Partial<RunsResponse>): RunsResponse => ({
 		runtimeOverlay: null,
 	};
 	assert.equal(railPollingEnabled(base), true, "五条件全满足 ⇒ 轮询");
+	assert.equal(railPollingEnabled({ ...base, railPanel: PANEL_NOTE }), true, "note 面板同样要轮询（放宽门控的正例；反例 other 仍必须 false）");
 	const negatives: [string, Record<string, unknown>][] = [
 		["右栏收起", { railOpen: false }],
 		["当前面板非派发", { railPanel: "other" }],
@@ -366,6 +379,53 @@ const runsResp = (over: Partial<RunsResponse>): RunsResponse => ({
 	assert.ok(!/usePoll\([^)]*,\s*true\s*\)/.test(panelCode), "不得常量开轮询");
 	assert.ok(panelCode.includes("const RAIL_POLL_MS = 5000;"), "档位 5s");
 	ok("RR5b 接线：门控结果进 usePoll 第三参（接口要求 boolean，5s 档）");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RR5c 会话便签面板（2026-11-17 P2）：接线 + 串台防护 + 冲突不覆盖
+// ═══════════════════════════════════════════════════════════════════════
+{
+	const code = codeOnly(read("rightRail/NotePanel.tsx"));
+	assert.ok(code.includes("railPollingEnabled({"), "NotePanel 门控走共享 railPollingEnabled");
+	assert.ok(code.includes("usePoll(refresh, RAIL_POLL_MS, enabled)"), "usePoll 第三参 = enabled（不是常量 true）");
+	assert.ok(!/usePoll\([^)]*,\s*true\s*\)/.test(code), "不得常量开轮询");
+	// 2026-11-18：实现已从 `!dirty` 收紧到 `!editing && saveState !== "conflict"`（刚聚焦未输入
+	// 也不能被轮询换掉光标下文本；冲突态更不能被远端覆盖）。断言跟着真实接线走，仍钉死意图。
+	assert.ok(
+		code.includes('const enabled = railEnabled && !editing && saveState !== "conflict";'),
+		"编辑中/冲突时暂停轮询，避免把草稿冲掉",
+	);
+	assert.ok(code.includes("useGui.getState().chatActiveId !== sid"), "迟到响应必须按 sid 丢弃（切会话不串台）");
+	assert.ok(code.includes("<Markdown text={note.text} />"), "只读态走零依赖 Markdown 渲染（不是纯文本）");
+	assert.ok(code.includes("setEditing(true)"), "点正文/按 Enter 进入编辑态");
+	assert.ok(!code.includes("setTimeout"), "不得自动保存（无 debounce 写盘）");
+	assert.ok(code.includes("onClick={commitSave}"), "写盘必须由显式点击触发");
+	assert.ok(code.includes("e.key === \"Enter\""), "Ctrl+Enter 键盘保存路径存在");
+	assert.ok(code.includes("onClick={() => void sendToSession()}"), "发送按钮接到 sendToSession");
+	assert.ok(code.includes("await save(sid, text, box.note.version, true)"), "发送前必须先落盘（keepEditing）");
+	assert.ok(code.includes("api.sessionMessage(sid, text, undefined, newCommandKey(\"note\"), true)"), "发送走 session.message + 独立 commandKey");
+	assert.ok(code.includes("r.data.status === \"accepted\""), "只认服务端 accepted 回执，不把 HTTP 200 当成功");
+	assert.ok(code.includes("onClick={reload}"), "取消 / 重新载入出口存在");
+	assert.ok(code.includes("r.status === 409"), "冲突分支必须存在");
+	assert.ok(code.includes("setSaveState(\"conflict\")"), "409 显式置冲突态");
+	assert.ok(!/catch\s*\{\s*setDraft\(/.test(code), "冲突不得自动覆盖本地草稿");
+	assert.ok(code.includes("api.sessionNote.save("), "保存走 api.sessionNote（不是自己 fetch）");
+	assert.ok(code.includes("api.sessionNote.get("), "读取走 api.sessionNote");
+	assert.ok(code.includes("data-rail-panel={PANEL_NOTE}"), "面板根节点带可观测的 panel 标记");
+	ok("RR5c NotePanel 接线：只读 Markdown / 手动保存 + 发送到会话 / sid 丢弃 / 409 保留草稿");
+
+	const client = codeOnly(read("api/client.ts"));
+	assert.ok(client.includes("sessionNote:"), "api.client 暴露 sessionNote 命名空间");
+	// ETag cache key 必须带 sid：否则切会话会命中上一个会话的数据（同 runs 的坑）
+	assert.ok(client.includes("const key = `/v1/session-note?sessionId=${encodeURIComponent(sid)}`"), "GET 路径与 ETag key 同一串");
+	assert.ok(client.includes("fetchJson<SessionNoteResponse>(key, undefined, 5000, key)"), "ETag key 传给 fetchJson");
+	assert.ok(client.includes("postJson<SessionNoteResponse>(\"/v1/session-note\""), "保存走 POST 同端点");
+	ok("RR5c2 api.client：sessionNote.get/save 接线 + ETag key 带 sid");
+
+	const panels = codeOnly(read("rightRail/panels.ts"));
+	assert.ok(panels.includes("PANEL_NOTE"), "注册表包含 note 面板 id");
+	assert.ok(panels.includes("render: NotePanel"), "注册表挂的是 NotePanel 组件");
+	ok("RR5c3 注册表：会话便签面板已挂（壳零改动）");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -396,10 +456,17 @@ const runsResp = (over: Partial<RunsResponse>): RunsResponse => ({
 	assert.ok(!/hidden xl:flex|hidden md:flex/.test(shell), "不用 hidden 当唯一手段（必须真卸载，否则仍在轮询）");
 	ok("RR6c 条件挂载：未展开/未选中 ⇒ 面板组件不挂载（不是只 CSS 隐藏）");
 
-	// 折叠范式照左栏
+	// 折叠范式照左栏 + 宽度受控（2026-11-18：固定 w-[320px] → 可拖拽 width）
 	assert.ok(shell.includes("w-0 flex-none pointer-events-none opacity-0"), "折叠 = 宽度归零 + pointer-events-none + opacity-0");
 	assert.ok(shell.includes("transition-[width,opacity]"), "与左栏同一过渡范式");
-	assert.ok(shell.includes("w-[320px]"), "宽 320px");
+	assert.ok(!shell.includes("w-[320px]"), "宽度不再硬编码 320px 类");
+	assert.ok(shell.includes("style={open ? { width:"), "展开宽度走受控 inline style");
+	assert.ok(shell.includes("clampRailWidth(width, viewportWidth)"), "显示宽度经 railState 钳制");
+	assert.ok(shell.includes("data-right-rail-resizer"), "桌面第三列渲染左缘拖拽分隔条");
+	assert.ok(
+		shell.includes('resizing ? "transition-none" : "duration-200 ease-out transition-[width,opacity]"'),
+		"仅在拖拽期间关闭 width 过渡（反例：无条件 transition-none / 三元写反 ⇒ 本行红）",
+	);
 	assert.ok(!/w-\[40px\]|rotate-90/.test(shell), "不做 40px 竖条");
 	ok("RR6d 折叠范式与 Sidebar 一致（320px → 0，非竖条）；窄屏抽屉保留入口");
 }
@@ -508,14 +575,114 @@ const runsResp = (over: Partial<RunsResponse>): RunsResponse => ({
 	assert.ok(app.includes("<RightRail />"), "App 内容行挂右栏");
 	assert.ok(app.indexOf("<Sidebar />") < app.indexOf("<main") && app.indexOf("<main") < app.indexOf("<RightRail />"), "三栏顺序：Sidebar → main → RightRail");
 	assert.ok(app.includes("const PAGES: Record<TabId, () => ReactElement> = {"), "PAGES 未改类型");
-	assert.ok(/chat: ChatPage,\s*\n\ttimeline: TimelinePage,\s*\n\};/.test(app), "PAGES 仍只有 chat|timeline（IA 冻结）");
-	assert.ok(store.includes('export type TabId = "chat" | "timeline";'), "TabId 未扩（验收 13）");
+	// 2026-11-17：工作区 S4「会话为主」已把主路由扩到 workspace/tokens（App.tsx / store.ts），
+	// 与本右栏功能无关。基线随 S4 更新为**恰好四项**（不是放宽成"包含 chat|timeline"）——
+	// 原意图仍是「右栏扩展不通过新增主路由实现」，多出第五项必须红。
+	assert.ok(/chat: ChatPage,\s*\n\ttimeline: TimelinePage,\s*\n\tworkspace: WorkspaceHomePage,\s*\n\ttokens: TokensPage,\s*\n\};/.test(app),
+		"PAGES 恰为 S4 四项（右栏未新增主路由）");
+	assert.ok(store.includes('export type TabId = "chat" | "timeline" | "workspace" | "tokens";'), "TabId 恰为四项");
 	const topbar = codeOnly(read("pages/TopBar.tsx"));
 	assert.ok(topbar.includes('aria-label="右侧面板"'), "顶栏入口 aria-label");
 	assert.ok(topbar.includes("setRailOpen(!railOpen)"), "顶栏入口切换展开态");
 	assert.ok(topbar.includes("railPanelName(railPanel)"), "tooltip 显示当前面板名");
 	assert.equal((topbar.match(/aria-label="右侧面板"/g) ?? []).length, 1, "顶栏只加**一个**图标钮");
 	ok("RR10d IA 不变（无新 TabId / PAGES 不变）+ 顶栏单一入口 + tooltip 显示面板名");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RR11 可拖拽宽度（2026-11-18）：默认/上下限 / 视口钳制 / 存储容错 / 接线
+// ═══════════════════════════════════════════════════════════════════════
+{
+	assert.equal(RAIL_DEFAULT_WIDTH, 320, "默认 320px");
+	assert.equal(RAIL_MIN_WIDTH, 260, "最小 260px");
+	assert.equal(RAIL_MAX_WIDTH, 720, "绝对上限 720px");
+	assert.equal(SIDEBAR_WIDTH, 264, "左栏 264px（与 Sidebar 类一致）");
+	assert.equal(MAIN_MIN_WIDTH, 320, "中央列最小 320px");
+
+	assert.equal(railMaxWidth(1280), 696, "1280 视口上限 = 1280-264-320");
+	assert.equal(railMaxWidth(1440), 720, "1440 视口到绝对上限 720");
+	assert.equal(railMaxWidth(1920), 720, "1920 仍封顶 720");
+	assert.equal(railMaxWidth(800), RAIL_MIN_WIDTH, "窄视口不得算出 <260（下界守卫）");
+	assert.equal(clampRailWidth(320, 700), RAIL_MIN_WIDTH, "极窄视口也守住最小 260");
+	assert.equal(railMaxWidth(Number.NaN), RAIL_MAX_WIDTH, "非法视口 ⇒ 绝对上限（调用方再钳到值域）");
+	for (const vw of [320, 600, 800, 1280, 1920]) {
+		assert.ok(railMaxWidth(vw) >= RAIL_MIN_WIDTH, `任何视口上限都不得低于最小值（${vw}）`);
+	}
+	assert.equal(clampRailWidth(100, 1440), RAIL_MIN_WIDTH, "过窄 → 260");
+	assert.equal(clampRailWidth(9999, 1440), RAIL_MAX_WIDTH, "过宽 → 720");
+	assert.equal(clampRailWidth(700, 1280), 696, "1280 下 700 被视口上限压到 696");
+	assert.equal(clampRailWidth(Number.NaN, 1440), RAIL_DEFAULT_WIDTH, "非数值 → 默认 320");
+	assert.equal(clampRailWidth(320.4, 1440), 320, "取整");
+	ok("RR11a 宽度值域：默认 320 / 最小 260 / 绝对上限 720 / 1280 视口上限 696");
+
+	const mem = new Map<string, string>();
+	const storage = {
+		getItem: (key: string): string | null => mem.get(key) ?? null,
+		setItem: (key: string, value: string): void => {
+			mem.set(key, value);
+		},
+	};
+	assert.equal(loadRailWidth(1440, storage), RAIL_DEFAULT_WIDTH, "无存储值 → 默认");
+	assert.equal(saveRailWidth(500, 1440, storage), 500, "写入返回实际生效宽度");
+	assert.equal(mem.get(RAIL_WIDTH_STORAGE_KEY), "500", "落盘值 = 十进制像素");
+	assert.equal(loadRailWidth(1440, storage), 500, "读回同值");
+	mem.set(RAIL_WIDTH_STORAGE_KEY, "9999");
+	assert.equal(loadRailWidth(1440, storage), RAIL_MAX_WIDTH, "坏大值按视口钳制");
+	mem.set(RAIL_WIDTH_STORAGE_KEY, "not-a-number");
+	assert.equal(loadRailWidth(1440, storage), RAIL_DEFAULT_WIDTH, "坏字符串 → 默认");
+	mem.set(RAIL_WIDTH_STORAGE_KEY, "700");
+	assert.equal(loadRailWidth(1280, storage), 696, "旧视口存 700，换 1280 视口后读回即钳制");
+	ok("RR11b localStorage：无值/回读/坏值/跨视口钳制");
+
+	const throwing = {
+		getItem: (): string | null => {
+			throw new Error("storage denied");
+		},
+		setItem: (): void => {
+			throw new Error("quota");
+		},
+	};
+	assert.equal(loadRailWidth(1440, throwing), RAIL_DEFAULT_WIDTH, "读取异常 → 默认（不抛）");
+	assert.equal(saveRailWidth(500, 1440, throwing), 500, "写入异常静默吞掉，返回生效宽度（不阻断拖拽）");
+	assert.equal(loadRailWidth(1440, null), RAIL_DEFAULT_WIDTH, "无 localStorage（SSR/隐私）→ 默认");
+	ok("RR11c 存储异常/缺失均不抛，回退默认");
+
+	const shell = codeOnly(read("rightRail/RightRail.tsx"));
+	assert.ok(shell.includes("loadRailWidth(currentViewportWidth())"), "初值读持久化宽度");
+	assert.ok(shell.includes("setPointerCapture(e.pointerId)"), "pointerdown 捕获指针（拖出元素也不断线）");
+	assert.ok(shell.includes("releasePointerCapture(drag.pointerId)"), "收尾释放捕获");
+	// 四条 pointer 接线必须逐条钉死：只断言 setPointerCapture 字符串时，删掉 onPointerDown 仍会全绿。
+	assert.ok(shell.includes("onPointerDown={onResizeStart}"), "pointerdown 真的接上");
+	assert.ok(shell.includes("onPointerMove={onResizeMove}"), "pointermove 真的接上");
+	assert.ok(shell.includes("onPointerUp={onResizeEnd}"), "pointerup 真的接上");
+	assert.ok(shell.includes("onPointerCancel={onResizeEnd}"), "pointercancel 真的接上");
+	assert.ok(shell.includes("onLostPointerCapture={onResizeEnd}"), "lostpointercapture 收尾（防拖拽态卡死）");
+	assert.ok(shell.includes('role="separator"') && shell.includes("aria-valuenow={effectiveWidth}"), "分隔条有 separator 语义与当前值");
+	assert.ok(shell.includes("aria-valuemin={RAIL_MIN_WIDTH}") && shell.includes("aria-valuemax={maxWidth}"), "ARIA 上下限接真实值（反例：常量 ⇒ 红）");
+	assert.ok(shell.includes("onDoubleClick={() => applyWidth(RAIL_DEFAULT_WIDTH, true)}"), "双击复位 320 并落盘");
+	assert.ok(shell.includes("onKeyDown={onResizeKeyDown}"), "键盘可调");
+	assert.ok(shell.includes('if (e.key === "ArrowLeft") next = widthRef.current + step;'), "← 变宽");
+	assert.ok(shell.includes('if (e.key === "ArrowRight") next = widthRef.current - step;'), "→ 变窄");
+	assert.ok(shell.includes('if (e.key === "Home") next = RAIL_MIN_WIDTH;'), "Home = 最小（splitter 标准语义）");
+	assert.ok(shell.includes("applyWidth(drag.startWidth + (drag.startX - e.clientX), false)"), "pointermove 只更新内存，不逐帧写盘");
+	assert.ok(shell.includes("saveRailWidth(widthRef.current, currentViewportWidth())"), "pointerup 才落盘");
+	assert.ok(shell.includes('window.addEventListener("resize", onResize)'), "窗口缩放监听真的接上");
+	assert.ok(shell.includes("documentElement.clientWidth"), "视口用 clientWidth（不含滚动条）");
+	assert.ok(shell.includes("clampRailWidth(widthRef.current, vw)"), "resize 后按新视口重新钳制");
+	assert.ok(
+		shell.includes("if (open && !drawer) return;") && shell.includes("[open, drawer]"),
+		"resizer 卸载（收起/跨 1280）时有清理兜底（防 body 光标/禁选卡死）",
+	);
+	assert.ok(shell.includes("drawer ? RAIL_DEFAULT_WIDTH : clampRailWidth(width, viewportWidth)"), "窄屏抽屉固定 320，不参与拖拽");
+	assert.ok(shell.includes("!drawer && open && ("), "分隔条仅桌面第三列渲染");
+	assert.ok(
+		shell.includes('drawer ? "absolute bottom-0 right-0 top-12 z-20 shadow-overlay" : "relative"'),
+		"抽屉 absolute 与非抽屉 relative 互斥（防 CSS 顺序导致抽屉仍在流内）",
+	);
+	// 不能只堵 `"relative min-h-0"` 一种写法：relative 只能来自非抽屉分支，出现第二次即阻断复发。
+	assert.equal((shell.match(/\brelative\b/g) ?? []).length, 1, "relative 恰好一次（仅非抽屉分支）");
+	assert.ok(!shell.includes("w-[320px]"), "壳里不再有硬编码 320px 类");
+	ok("RR11d 接线：pointer 五事件 / 键盘 / 双击 / 仅 pointerup 落盘 / resize 钳制 / 抽屉与 relative 互斥");
 }
 
 console.log(`\n_test_right_rail: all assertions passed (${n} groups)`);

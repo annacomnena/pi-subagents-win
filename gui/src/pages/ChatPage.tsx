@@ -39,6 +39,7 @@ import type { ChatOutboxEntry, StreamingSnapshot, TranscriptRow } from "../api/t
 import type { StreamSubscribeMsg } from "../api/types";
 import { api } from "../api/client";
 import { deltaLabel, isWriteTool, readWriteArgs, splitPath } from "../writeCard";
+import { describeToolCall } from "../toolCallSummary";
 import { WriteCardBody, WriteCheck } from "./WriteCard";
 import {
 	attachmentIds,
@@ -264,11 +265,13 @@ function UserInputRowView({ row, animate }: { row: Extract<TranscriptRow, { kind
 /** assistant 行式正文（#L1512,1518）：0923 2003 正文换 <Markdown>（自研零依赖渲染器，
  *  替换 whitespace-pre-wrap 纯文本；外层 className 布局类保留）+ 注脚。 */
 function AssistantTextRowView({ row, animate }: { row: Extract<TranscriptRow, { kind: "assistantText" }>; animate?: boolean }) {
+	// 2026-11-20：稳定选择器（函数引用不变）⇒ memo 行不会因为预览面板状态变化而重渲染。
+	const openDocPreview = useGui((s) => s.openDocPreview);
 	return (
 		<RowShell rowId={row.rowId} animate={animate} className="group/assistant-row">
 			<div className="w-full text-ui-base">
 				<div className="whitespace-pre-wrap">
-					<Markdown text={row.text} />
+					<Markdown text={row.text} onOpenPath={openDocPreview} />
 				</div>
 				{(row.model !== undefined || row.provider !== undefined) && (
 					<div className="mt-1 font-mono text-ui-xs text-foreground-subtlest">
@@ -292,6 +295,8 @@ function AssistantTextRowView({ row, animate }: { row: Extract<TranscriptRow, { 
 	 *   - Map 保证卸载重挂后展开态还在。
 	 */
 function ReasoningRowView({ row, animate, streaming }: { row: Extract<TranscriptRow, { kind: "reasoning" }>; animate?: boolean; streaming?: boolean }) {
+	// 与正文一致：思考里提到的路径也可点开预览（2026-11-20；稳定选择器不触发额外重渲染）。
+	const openDocPreview = useGui((s) => s.openDocPreview);
 	const [open, setOpen] = useState<boolean>(() => reasoningOpenState.get(row.rowId) ?? false);
 	/** 用户手动点过 → 锁定，不再被自动逻辑抢回（自动只做「默认行为」）。 */
 	const userLockedRef = useRef(false);
@@ -343,7 +348,7 @@ function ReasoningRowView({ row, animate, streaming }: { row: Extract<Transcript
 				<CollapsibleContent className="text-popover-foreground outline-none">
 					<div className="pt-2 text-ui-sm text-foreground-subtle">
 						<div className="whitespace-pre-wrap">
-							<Markdown text={row.text} />
+							<Markdown text={row.text} onOpenPath={openDocPreview} />
 						</div>
 					</div>
 				</CollapsibleContent>
@@ -462,12 +467,24 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 	const isRunning = row.status === "running";
 	const isError = row.status === "error";
 	const statusLabel = isRunning ? "执行中" : isError ? "出错" : "完成";
+	/**
+	 * 折叠态摘要（2026-11-17）：自动折叠/展开原样保留，但**折叠行本身**要说人话 ——
+	 * 从工具入参解析出「搜索了什么 / 读了谁」，用户扫一眼就知道 agent 在干什么。
+	 * 解析不出就返回 null（回落到只有工具名+状态），不编造内容。
+	 */
+	const toolSummary = describeToolCall(row.name, row.arguments);
 	// write 的触发面唯一性判定在函数开头（isWrite：holdOpen 要用）
 	const write = isWrite ? readWriteArgs(row.arguments) : null;
 	const writePath = write && write.path !== "" ? splitPath(write.path) : null;
 
 	return (
-		<RowShell rowId={row.rowId} animate={animate} className="py-0">
+		<RowShell
+			rowId={row.rowId}
+			animate={animate}
+			className="py-0"
+			// 诊断属性：折叠行到底解析出了什么摘要，DevTools 一行可查（与 turn header 同款口径）
+			attrs={{ "data-tool-summary": toolSummary ?? "" }}
+		>
 			<Collapsible
 				open={open}
 				onOpenChange={(next) => {
@@ -500,6 +517,12 @@ function ToolCallRowView({ row, animate }: { row: Extract<TranscriptRow, { kind:
 						>
 							{statusLabel}
 						</span>
+						{/* 折叠态人话摘要：搜索了谁 / 读了谁…；title 留全文，窄栏由 CSS 省略 */}
+						{toolSummary !== null && (
+							<span className="min-w-0 truncate" title={toolSummary}>
+								<span className="opacity-50">·</span> {toolSummary}
+							</span>
+						)}
 					</span>
 					{/* 写完的勾：只在「刚写完」那一拍描边画出 */}
 					{isWrite && !isRunning && !isError && <WriteCheck drawing={settling} />}

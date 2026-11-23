@@ -11,26 +11,33 @@ import { TopBar } from "./pages/TopBar";
 import { Sidebar } from "./pages/Sidebar";
 import { TimelinePage } from "./pages/TimelinePage";
 import { ChatPage } from "./pages/ChatPage";
+import { WorkspaceHomePage } from "./pages/WorkspaceHomePage";
+import { TokensPage } from "./pages/TokensPage";
 import { RuntimeOverlay } from "./pages/RuntimeOverlay";
 import { RightRail } from "./rightRail/RightRail";
 import type { ReactElement } from "react";
 import { useGui, type TabId } from "./store";
 import { usePoll } from "./usePoll";
 import { fmtTime } from "./format";
+import { decideDisconnectBanner } from "./connectionBanner";
 import { TooltipProvider } from "./ui/tooltip";
 
-// 会话为主重构 S4：TabId 收窄 chat|timeline（默认 chat）；master/workstream/attention/runtime
-// 四状态页收进「运行时」全屏覆盖层（RuntimeOverlay，不占主路由）
+// 会话为主重构 S4：TabId 包含 chat | timeline | workspace（仓库主页工作台）；
+// master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（RuntimeOverlay，不占主路由）
 const PAGES: Record<TabId, () => ReactElement> = {
 	chat: ChatPage,
 	timeline: TimelinePage,
+	workspace: WorkspaceHomePage,
+	tokens: TokensPage,
 };
 
 export default function App() {
 	const activeTab = useGui((s) => s.activeTab);
 	const runtimeOverlay = useGui((s) => s.runtimeOverlay);
 	const connection = useGui((s) => s.connection);
+	const downStreak = useGui((s) => s.downStreak);
 	const lastAsOf = useGui((s) => s.lastAsOf);
+	const disconnectBanner = decideDisconnectBanner(connection, downStreak);
 	const lastCommand = useGui((s) => s.lastCommand);
 
 	// 全局轮询（数据不分页停——TopBar 任意页都要活）
@@ -73,9 +80,15 @@ export default function App() {
 		<TooltipProvider delayDuration={0}>
 		<div className="relative flex h-screen flex-col bg-background text-foreground">
 			<TopBar />
-			{connection === "down" && (
+			{disconnectBanner.visible && (
 				<div className="border-b border-warning/30 bg-warning/10 px-4 py-1 text-center text-ui-sm text-warning">
-					与后端服务断开，正在自动重试——以下数据截至 {fmtTime(lastAsOf)}
+					{disconnectBanner.level === "reconnect" ? (
+						<>
+							后端连接持续失败（连续 {downStreak} 次）——若刚重启过运行时（端口会变），请在终端执行 <code className="font-mono">/gui open</code> 重新打开；否则检查 daemon 是否存活。数据截至 {fmtTime(lastAsOf)}
+						</>
+					) : (
+						<>后端响应波动，正在自动重试（连续 {downStreak} 次）——以下数据截至 {fmtTime(lastAsOf)}</>
+					)}
 				</div>
 			)}
 			<div className="flex min-h-0 min-w-[320px] flex-1">

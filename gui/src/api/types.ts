@@ -25,6 +25,26 @@ export interface HostInfo {
 	protocolVersion: number;
 }
 
+// ── GET/POST /v1/session-note（extensions/session-note.ts）──────────
+// 手写契约（version:1 冻结惯例）：三端共享同一份 per-session 旁路便签。
+
+export interface SessionNote {
+	schemaVersion: 1;
+	sessionId: string;
+	text: string;
+	/** 文件不存在的空 note 为 null；写入后恒为 ISO 串。 */
+	updatedAt: string | null;
+	/** 文件不存在 = 0；实际文件从 1 开始，每次成功写 +1。 */
+	version: number;
+}
+
+export interface SessionNoteResponse {
+	ok: boolean;
+	note: SessionNote;
+	/** 409 version-conflict 时带服务端当前版本（客户端保留本地草稿，不静默覆盖）。 */
+	current?: SessionNote;
+}
+
 // ── GET /v1/health（server.ts HealthView）──────────────────────────
 
 export interface MasterAttachmentView {
@@ -360,6 +380,39 @@ export interface UploadResult {
 	path: string;
 	bytes: number;
 	mediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+}
+
+/** 2026-11-20 右栏文档预览：POST /v1/files/read 成功回执。 */
+export interface FilePreviewResult {
+	version: number;
+	/** 服务端解析后的绝对路径。 */
+	path: string;
+	/** 实际使用的相对路径基准（daemon cwd 或传入的会话 cwd）。 */
+	base: string;
+	content: string;
+	/** 文件完整字节数（可能大于 content，见 truncated）。 */
+	size: number;
+	/** 超过预览上限 ⇒ true（内容被截断；完整内容请用默认应用打开）。 */
+	truncated: boolean;
+	/** "utf-8" / "utf-8 (BOM)" / "gb18030"。 */
+	encoding: string;
+	mtimeMs: number;
+}
+
+/** 2026-11-20 POST /v1/files/{open,reveal} 回执。 */
+export interface FileActionResult {
+	version: number;
+	ok: boolean;
+	action: "open" | "reveal";
+	path: string;
+	base: string;
+	launched: boolean;
+}
+
+/** 文件端点统一错误体（FetchErr.body 的形状；hint 面向用户）。 */
+export interface FileEndpointError {
+	error: string;
+	hint?: string;
 }
 
 export type CommandOutcomeBody =
@@ -831,6 +884,47 @@ export interface FrontierSnapshot {
 	baseline: boolean;
 }
 
+// ── 主动性诊断与监管工作状态表：GET /v1/autonomy/diagnostics ──
+
+export interface AutonomyHeartbeatInfo {
+	at: number | null;
+	pid: number | null;
+	sessionId: string | null;
+	tickIntervalMs: number | null;
+	ageMs: number | null;
+}
+
+export interface AutonomyFreshnessInfo {
+	stale: boolean;
+	ageMs: number | null;
+	suspectedDisabled: boolean;
+	heartbeatStale: boolean;
+	clockSkew: boolean;
+}
+
+export interface AutonomySupervisionEntry {
+	runId: string;
+	taskId: string;
+	repoPath: string | null;
+	status: "active" | "paused";
+	setAt: string;
+	pausedAt: string | null;
+	pauseReason: string | null;
+	pushMs: number;
+	optOut: boolean;
+	unreported: boolean;
+}
+
+export interface AutonomyDiagnosticsResponse {
+	raw: string;
+	heartbeat: AutonomyHeartbeatInfo | null;
+	freshness: AutonomyFreshnessInfo;
+	supervision: {
+		total: number;
+		entries: AutonomySupervisionEntry[];
+	};
+}
+
 // ── 2026-10-22 档 A：async subagent run 卡片（GET /v1/runs；server 侧 = subagent-kill.ts RunCard）──
 
 /** async run 记录里的 `status`（与 `RunLiveness` 正交：status 说记录怎么写的，liveness 说进程在不在）。
@@ -935,4 +1029,183 @@ export interface RunsResponse {
 	/** 归属残差计数（`attribution==="partial"` 时看它）。 */
 	attributionDetail: RunAttributionDetail;
 	runs: RunCard[];
+}
+
+/** 仓库任务跟踪项（从 recentwork.md / TODO.md 提取） */
+export interface WorkspaceTaskItem {
+	id: string;
+	title: string;
+	priority: string;
+	status: "active" | "completed" | "fixing" | "warning" | "pending" | "unknown";
+	statusText: string;
+	summary: string;
+}
+
+/** GET /v1/workspace/overview 响应 */
+export interface WorkspaceOverviewResponse {
+	version: 1;
+	asof: string;
+	cwd: string;
+	found: boolean;
+	filePath?: string;
+	fileMtimeMs?: number;
+	tasks: WorkspaceTaskItem[];
+	rawSnippet?: string;
+}
+
+/** Token 统计相关模型（GET /v1/tokens/stats） */
+export interface SessionUsageAggregate {
+	sessionId: string;
+	title?: string;
+	cwd: string | null;
+	startedAt: string | null;
+	lastActiveAt: string | null;
+	model: string;
+	provider: string;
+	turns: number;
+	totalTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	reasoningTokens: number;
+	costUsd: number;
+}
+
+export interface DailyUsageAggregate {
+	date: string; // YYYY-MM-DD
+	totalTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	reasoningTokens: number;
+	costUsd: number;
+	turns: number;
+	sessionsCount: number;
+}
+
+export interface HourlyUsageAggregate {
+	hour: number; // 0..23
+	totalTokens: number;
+	turns: number;
+}
+
+export interface ModelUsageAggregate {
+	model: string;
+	provider: string;
+	turns: number;
+	totalTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	costUsd: number;
+	percent: number;
+}
+
+export interface TokenStatsSummary {
+	totalTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	reasoningTokens: number;
+	estimatedCostUsd: number;
+	totalTurns: number;
+	totalSessions: number;
+	cacheHitRatePercent: number | null;
+	today?: {
+		totalTokens: number;
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadTokens: number;
+		turns: number;
+		costUsd: number;
+	};
+}
+
+export interface TokenStatsResult {
+	version: 1;
+	asOf: string;
+	days: number;
+	since: string;
+	until: string;
+	summary: TokenStatsSummary;
+	daily: DailyUsageAggregate[];
+	hourly: HourlyUsageAggregate[];
+	bySession: SessionUsageAggregate[];
+	byModel: ModelUsageAggregate[];
+}
+
+
+// ── GET /v1/gui/shortcuts（仓库专属快捷按钮，2026-11-20）──────────
+
+export type ShortcutKind = "url" | "file" | "script" | "process";
+
+export interface ShortcutAction {
+	id: string;
+	label: string;
+	kind: ShortcutKind;
+	url?: string;
+	path?: string;
+	command?: string;
+	args?: string[];
+	timeoutMs?: number;
+	matchCommandLine?: string;
+	confirm: boolean;
+}
+
+export interface ShortcutsConfig {
+	version: 1;
+	cwd: string;
+	updatedAt: string | null;
+	actions: ShortcutAction[];
+}
+
+export type ProposalOp =
+	| { op: "add"; action: ShortcutAction }
+	| { op: "update"; targetId: string; action: ShortcutAction }
+	| { op: "remove"; targetId: string };
+
+export interface ShortcutProposal {
+	version: 1;
+	proposalId: string;
+	cwd: string;
+	baseHash: string;
+	reason: string;
+	sourceSession: string;
+	createdAt: string;
+	ops: ProposalOp[];
+}
+
+export type ProposalStatus = "pending" | "approved" | "applied" | "declined" | "expired";
+
+export interface ShortcutDecision {
+	version: 1;
+	proposalId: string;
+	cwd: string;
+	decidedAt: string;
+	decision: "approved" | "declined";
+	baseHash: string;
+	ops: ProposalOp[];
+	injectedAt: string | null;
+	appliedAt: string | null;
+}
+
+export interface ProposalView {
+	proposal: ShortcutProposal;
+	status: ProposalStatus;
+	decision: ShortcutDecision | null;
+}
+
+export interface ShortcutsResponse {
+	ok: boolean;
+	config: ShortcutsConfig;
+	contentHash: string;
+	exists: boolean;
+	proposals: ProposalView[];
+	cwd: string;
+	/** 主配置绝对路径（供「复制指令」降级出口写入自包含消息）。 */
+	configPath?: string | null;
 }

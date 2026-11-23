@@ -11,9 +11,12 @@
 
 import type { FC } from "react";
 import type { LucideIcon } from "lucide-react";
-import { PlayCircle } from "lucide-react";
+import { FileText, PlayCircle, StickyNote, Zap } from "lucide-react";
 import { DispatchedPanel } from "./DispatchedPanel";
-import { PANEL_DISPATCHED } from "./railState";
+import { DocPreviewPanel } from "./DocPreviewPanel";
+import { NotePanel } from "./NotePanel";
+import { ShortcutsPanel } from "./ShortcutsPanel";
+import { PANEL_DISPATCHED, PANEL_DOC, PANEL_NOTE, PANEL_SHORTCUTS } from "./railState";
 
 export interface RailPanel {
 	/** 稳定 id（进 `store.railPanel`；**不持久化**，所以改 id 不会破坏老数据）。 */
@@ -26,9 +29,14 @@ export interface RailPanel {
 	render: FC;
 }
 
-/** 当前只有一块面板：本会话派发的 subagent（P2 才谈第二块）。 */
+/** 四块面板：本会话派发的 subagent + 本会话旁路便签 + 文档预览 + 仓库快捷按钮（2026-11-20）。 */
 export const RAIL_PANELS: RailPanel[] = [
 	{ id: PANEL_DISPATCHED, zh: "派发", icon: PlayCircle, render: DispatchedPanel },
+	{ id: PANEL_NOTE, zh: "便签", icon: StickyNote, render: NotePanel },
+	// 文档预览放在倒数第二：点击回复中的路径会自动切到这块；不改变前两块面板的默认顺序/门控。
+	{ id: PANEL_DOC, zh: "预览", icon: FileText, render: DocPreviewPanel },
+	// 仓库快捷按钮放最后：按当前仓库 cwd 隔离，独立 gate（workspace tab 下也可轮询）。
+	{ id: PANEL_SHORTCUTS, zh: "按钮", icon: Zap, render: ShortcutsPanel },
 ];
 
 /** 顶栏入口 tooltip 用的当前面板名（未知 id 回落第一个，与 `railPanelById` 同口径）。 */
