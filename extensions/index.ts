@@ -15,7 +15,7 @@ import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Editor, fuzzyFilter, Key, Markdown, matchesKey, Spacer, Text, type EditorTheme } from "@earendil-works/pi-tui";
+import { Container, Editor, fuzzyFilter, Key, Markdown, matchesKey, MouseRegion, Spacer, Text, type EditorTheme } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	isExternalCliModel,
@@ -43,6 +43,42 @@ import {
 import { collectRunArtifacts } from "./trace-fusion/artifacts.ts";
 import { cleanTraceRun } from "./trace-fusion/clean.ts";
 import { registerHotspot } from "./hotspot/index.ts";
+import { registerTraceFusion } from "./trace-fusion/trace-fusion-tools.ts";
+import {
+	classifyModelFailure,
+	SAME_MODEL_RETRY,
+	SAME_MODEL_NEVER_RETRY,
+	resolveSameModelRetryMax,
+	retryBackoffMs,
+	sleepAbortable,
+	describeSameModelRetries,
+	formatFailureForMainAgent,
+	isRetryableModelFailure,
+} from "./model-retry.ts";
+import {
+	normalizeModelRef,
+	loadLocalModelCatalog,
+	agentDefaultModel as agentDefaultModelCore,
+	agentDefaultThinking as agentDefaultThinkingCore,
+	resolveCallModel as resolveCallModelCore,
+	displayModelForCall as displayModelForCallCore,
+	type LocalModelEntry,
+} from "./model-catalog.ts";
+
+export {
+	classifyModelFailure,
+	SAME_MODEL_RETRY,
+	SAME_MODEL_NEVER_RETRY,
+	resolveSameModelRetryMax,
+	describeSameModelRetries,
+	isRetryableModelFailure,
+	retryBackoffMs,
+	sleepAbortable,
+	formatFailureForMainAgent,
+	normalizeModelRef,
+	loadLocalModelCatalog,
+};
+export type { LocalModelEntry };
 import { runCrossTest, finishDiagnoseRun } from "./trace-fusion/cross-test.ts";
 import { defaultRunsDir as defaultTraceFusionRunsDir, TRACE_LANES } from "./trace-fusion/types.ts";
 import { resolveWorkerModel as resolveTraceWorkerModel, type AvailableModelRef } from "./trace-fusion/models.ts";
@@ -138,11 +174,13 @@ import {
 } from "./runtime/workstreams.ts";
 import { listProjectedRuns } from "./runtime/state-store.ts";
 import { recordLink, sessionIdentity, listLinks, ownerSessionIdOf, type LinkKind } from "./links.ts";
+// 会话便签（旁路提醒）：TUI/GUI/agent 三端共用同一份纯库（设计稿 plans/20261117_session-note-design.md）
+import { composeNoteInjection, liveNoteSummary, noteFingerprint, NOTE_AUTHORITY_SECTION, readSessionNote, writeSessionNote } from "./session-note.ts";
 import { durableSessionIdentity, getCurrentSessionId, getTabRunId, isMainSession, isSubagent, isTabSession, registerIdentityFlag, sessionScopeKey } from "./identity.ts";
 import { NO_POLL_DISCIPLINE } from "./no-poll.ts";
 import { assertDelegationAllowed, capabilities, isTraceWorker, isWorkflowTab, registerCapabilityFlags } from "./capabilities.ts";
 import { buildTraceWorkerSystemPrompt } from "./trace-worker.ts";
-import { buildPiArgv, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
+import { buildPiArgv, parseAgentTools, resolveEffectiveTools, toolsSupportedForBackend, type RunnerToolsOptions } from "./runner-argv.ts";
 import { resolveForceReplayMount } from "./force-replay-mount.ts";
 import {
 	defaultSessionsRoot,
@@ -436,393 +474,21 @@ function reloadConfig(): AgentConfig {
 	return readConfig();
 }
 
-function isRetryableModelFailure(result: SubagentResult): boolean {
-	if (result.status !== "failed" || !result.error) return false;
-	return classifyModelFailure(result.error, result.requestedModel ?? result.model).retryable;
-}
-
-/**
- * Classify provider/model-layer failures so the main agent can act
- * (fallback chain + explicit "switch main model" guidance).
- *
- * Zhipu/GLM package exhaustion commonly surfaces as bare HTTP 429
- * (not a Chinese "套餐" string) — treat those as USAGE_CAP, not soft rate-limit.
- */
-export function classifyModelFailure(
-	error: string,
-	modelHint?: string,
-): {
-	retryable: boolean;
-	kind: "usage_cap" | "rate_limit" | "auth" | "provider" | "provider_network" | "timeout" | "stall" | "wall_budget" | "other";
-	label: string;
-} {
-	const message = error.toLowerCase();
-	// 墙钟总预算到点（C2）：优先于 timeout/stall 判定（它是调用方显式设的上限，语义最明确）
-	if (/wall-budget-exceeded|wall.?budget/i.test(message)) {
-		return { retryable: false, kind: "wall_budget", label: "WALL_BUDGET" };
-	}
-	const model = (modelHint ?? "").toLowerCase();
-	const isZhipuFamily =
-		/(^|[\/\s_-])(zhipu|glm|智谱)/i.test(model) ||
-		/(zhipu|glm|智谱|bigmodel)/i.test(message);
-
-	// Explicit package / billing wording (CN + EN + common Zhipu codes)
-	//
-	// ⚠ 2026-11-05 事故（R-22）：opendesign-go 返回
-	//   `503 {"code":"database_unavailable","message":"resolve Billing Scope: status 503"}`
-	// 其中 `Billing` 被本正则命中 ⇒ 归类 `usage_cap` ⇒ 主 agent 被要求**换模型**
-	// （而换模型救不了后端 DB 不可用，只是换个 endpoint 继续撞），且重试退避被乘
-	// `usageCapMultiplier`（60s/120s）—— 把一个「几秒就自愈」的瞬时故障当成额度耗尽。
-	//
-	// 修法（两层，各自可独立验）：
-	// ① `billing` 不再单独作为额度证据：要求同时有额度词（quota/credit/额度/套餐…），
-	//    或本身就是 429。/ 光一个 `billing` 出现在路径名/服务名里（`resolve Billing Scope`）
-	//    不算额度耗尽。
-	// ② HTTP 5xx **且带 billing/scope 类字样**时优先于额度判定（见下方护栏）。
-	const usageKeyword =
-		/(用量|额度|套餐|资源包|余量|余额不足|欠费|over.?quota|quota.?exceed|exceeded.{0,40}quota|usage.?limit|limit.?exceed|token.?limit|out of credit|insufficient.?credit|insufficient.?balance|package.?limit|plan.?limit|subscription.?limit|free.?tier|capacity.?exceed|resource.?exhausted|tokens?.{0,20}(用尽|耗尽|上限)|已达上限|到达上限|超出限额|\b1302\b|\b1113\b)/i.test(
-			error,
-		);
-	const bareQuotaCredit = /\b(quota|credit)\b/i.test(message);
-	const usageWording = usageKeyword || bareQuotaCredit;
-
-	const is429 = /\b429\b|too many requests|rate.?limit|throttl/i.test(message);
-
-	// ② 5xx **且带额度类字样**（如 `resolve Billing Scope: status 503`）⇒ 额度词不得抢走 5xx。
-	//  这条只在「两者同时出现」时才介入，**不改变任何其它 5xx 的既有归类**
-	//  （如 `504 gateway timeout` 仍走下方 timeout 规则、`502 bad gateway` 仍走 connectionish）。
-	//  额度耗尽的正常表述是 4xx，不会用 5xx 报；带 5xx 的 billing 字样几乎都是服务内部路径/服务名。
-	const http5xx = /\b50[0-4]\b|service unavailable|bad gateway|internal server error/i.test(message);
-	// ② 唯一生效路径：**`billing` 已不算额度证据**（见上方①）。5xx 里出现 `billing`/`resolve scope`
-	//  这类字样是**服务侧路径名/服务名**，不是额度耗尽。保留下面的显式护栏**只为可读性**：
-	//  它不改变结果（`billing` 已不在 usageKeyword 里），但如果有人以后把 `billing` 加回去，
-	//  这条护栏能先挡住 503 一类的最危险形状。
-	//  注：因为它是冗余的，单独回退它**不会**让测试变红——已实测确认；
-	//  完整的旧行为回退（billing 加回 + 删护栏）才会红。这是有意的冗余。
-	const billingish = /billing|resolve.{0,20}scope/i.test(message);
-	if (http5xx && billingish && !is429) {
-		return { retryable: true, kind: "provider_network", label: "PROVIDER_NETWORK" };
-	}
-
-	// Zhipu: exhausted package almost always returns 429 → USAGE_CAP (switch model).
-	if (usageWording || (is429 && isZhipuFamily)) {
-		return { retryable: true, kind: "usage_cap", label: "USAGE_CAP" };
-	}
-
-	// Non-Zhipu bare 429 without quota wording: still often hard cap on free tiers;
-	// prefer USAGE_CAP guidance so main agent switches model rather than busy-waiting.
-	if (is429) {
-		// "retry-after" / pure overload → soft rate limit; otherwise treat as cap-like.
-		if (/(retry.?after|overloaded|temporarily|try again later)/i.test(message) && !usageWording) {
-			return { retryable: true, kind: "rate_limit", label: "RATE_LIMIT" };
-		}
-		return { retryable: true, kind: "usage_cap", label: "USAGE_CAP" };
-	}
-
-	if (/(api key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i.test(message)) {
-		return { retryable: true, kind: "auth", label: "AUTH" };
-	}
-	// 停顿超时（stall）不是模型/Provider 错误——任务卡住换模型也救不回来，不触发 fallback
-	if (/(stall|no output for|stall-timeout|\bstalled\b)/i.test(message)) {
-		return { retryable: false, kind: "stall", label: "STALL" };
-	}
-	if (/(timeout|\b408\b|timed?\s*out)/i.test(message)) {
-		return { retryable: true, kind: "timeout", label: "TIMEOUT" };
-	}
-	// 连接类（provider/网络抖动，**可自愈**）：socket 关闭 / 5xx 无 body / undici 等。
-	// 为何单列：这些错此前落到 `other`（retryable:false）⇒ `index.ts:959` 的 fatal 门
-	// （`!retryable ⇒ onFatalFailure`）会**立即杀子进程**，零重试、零产出。
-	// 2026-10-16 实测：今日 3 条长跑的 `error==="terminated"`（undici socket 提前关闭）与
-	// `503 status code (no body)` 均为此形；见 `plans/20261016_terminated_provenance_investigation.md`。
-	// 归入 retryable 后：不再 fatal-kill，交由 fallback 链/有界重试处理，终态时明写连接类。
-	// 2026-10-18 补：`Connection error.` 是本仓最常见的异步派发失败文案（pi 内核 fetch 层包装），
-	// 但它此前**两个正则都不匹配** ⇒ 落 `other`（retryable:false）⇒ `onFatalFailure` ⇒ 子进程
-	// 被**立即 SIGTERM，零重试零产出**。实测：同一 argv + 同一 env 手动跑成功、sync 派发成功，
-	// 唯独 async 3 连挂，全部 `turns=1 / input=0`（请求根本没发出去就被杀）。
-	// 归入 retryable 后不再 fatal-kill，交由 fallback 链/有界重试处理。
-	// 注：`fetch failed` 已由下方 `providerish` 命中并归类 `provider`（既有语义，勿动）。
-	const connectionish =
-		/(\bterminated\b|socket hang ?up|other side closed|premature close|undici|socket closed|\bECONNRESET\b|ECONNREFUSED|\bEPIPE\b|EAI_AGAIN|\bETIMEDOUT\b|\b50[0-4]\b|bad gateway|service unavailable|no body|network error|connection error|connection (?:reset|closed|aborted|refused|timed ?out|error))/i.test(
-			error,
-		);
-	if (connectionish) {
-		return { retryable: true, kind: "provider_network", label: "PROVIDER_NETWORK" };
-	}
-	const providerish =
-		/(model.{0,80}(not found|unavailable|may not exist|not exist|no access)|issue with the selected model|provider|\b404\b|econnreset|enotfound|fetch failed|network|service unavailable|cli not found on path|exited with code|agent execution terminated|claude failed|claude error|codex failed|codex error|agy|atomcode|zcode|location is not supported)/i.test(
-			message,
-		);
-	if (providerish) {
-		return { retryable: true, kind: "provider", label: "PROVIDER" };
-	}
-	return { retryable: false, kind: "other", label: "OTHER" };
-}
-
-// ── 同模型有界重试（2026-10-18）────────────────────────────────────
-// 背景：`runWithFallback` 旧逻辑里 `retryable:true` 的唯一语义是「可以试**下一个候选**」，
-// **从不重试同一个模型**。`general` 不在 config.json 的 fallbackModels 里 ⇒ 候选数=1
-// ⇒ `index(0) < 0` 恒 false ⇒ 第一次失败就终止、零重试。而 R-7b 实测的 Cloudflare 封禁
-// 是 **45–60s 自愈**的 ⇒ 不重试就等于把可自愈的瞬时故障当终态上报给用户。
-// 用户裁决：**不给 general 加 fallback 链**，只做「同模型有界重试 + 耗尽转用户」。
-
-/** 同模型有界重试参数（集中一处，便于测试注入/审查）。 */
-export const SAME_MODEL_RETRY = {
-	/** 同模型最多额外重试次数（不含首次）。0 = 关闭（回退旧行为）。 */
-	maxSameModel: 2,
-	/** usage_cap 的退避倍数（额度型错误恢复更慢：60s/120s）。 */
-	usageCapMultiplier: 2,
-	/** 递增退避（毫秒）：第 n 次重试等待 backoffMs(n)。R-7b：同 provider 连败必须冷却 ≥30s。 */
-	backoffMs: (n: number) => Math.min(30_000 * n, 60_000),
-};
-
-/** 永不重试的失败类别（显式黑名单）：wall_budget/stall 换模型也救不回；auth 需要人改凭据。
- *  注意 classifyModelFailure 对 auth 返回 retryable:true（既有语义，勿改），所以这里必须再挡一次。 */
-export const SAME_MODEL_NEVER_RETRY: ReadonlySet<string> = new Set(["wall_budget", "stall", "auth"]);
-
-/**
- * 有效重试上限：`SAME_MODEL_RETRY.maxSameModel`，可被 env `PI_SUBAGENT_RETRY_MAX` 覆盖（测试缝隙，
- * 与 `PI_MODEL_COST_TIERS_PATH` / `PI_COST_TIER_ENFORCE` 同风格：env 只做注入，不改 config.json）。
- * 非法值（空串/非数字/负数）⇒ 忽略并保留常量值（不崩、不静默采用怪值）；结果 clamp 到 [0,4]（禁止无限重试）。
- */
-export function resolveSameModelRetryMax(): number {
-	const clamp = (n: number): number => Math.max(0, Math.min(4, Math.trunc(n)));
-	const raw = process.env.PI_SUBAGENT_RETRY_MAX;
-	if (raw === undefined || raw.trim() === "") return clamp(SAME_MODEL_RETRY.maxSameModel);
-	const n = Number(raw);
-	if (!Number.isFinite(n) || n < 0) return clamp(SAME_MODEL_RETRY.maxSameModel);
-	return clamp(n);
-}
-
-/**
- * 有效退避（毫秒）：默认 `SAME_MODEL_RETRY.backoffMs(n)`（30s/60s，上限 60s）；
- * env `PI_SUBAGENT_RETRY_BACKOFF_MS` 给基准值时 `min(base*n, base*2)`（测试缝隙，非数字/负数/空串忽略）；
- * `usage_cap` 再乘 `usageCapMultiplier`（额度型恢复更慢：60s/120s）。
- */
-function retryBackoffMs(kind: string, n: number): number {
-	let ms: number;
-	const raw = process.env.PI_SUBAGENT_RETRY_BACKOFF_MS;
-	const base = raw !== undefined && raw.trim() !== "" ? Number(raw) : Number.NaN;
-	if (Number.isFinite(base) && base >= 0) {
-		ms = Math.min(base * n, base * 2);
-	} else {
-		ms = SAME_MODEL_RETRY.backoffMs(n);
-	}
-	if (kind === "usage_cap") ms *= SAME_MODEL_RETRY.usageCapMultiplier;
-	return Math.max(0, Math.trunc(ms));
-}
-
-/** 可被 AbortSignal 打断的 sleep：完成返回 true；被 abort 返回 false（监听器必 remove，不泄漏）。 */
-function sleepAbortable(ms: number, signal?: AbortSignal): Promise<boolean> {
-	return new Promise<boolean>((resolve_) => {
-		if (signal?.aborted) {
-			resolve_(false);
-			return;
-		}
-		let done = false;
-		const finish = (ok: boolean) => {
-			if (done) return;
-			done = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-			resolve_(ok);
-		};
-		const onAbort = () => finish(false);
-		const timer = setTimeout(() => finish(true), ms);
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
-}
-
-/**
- * 同模型重试耗尽的终态文案：把每次尝试写进 error（含 `retries=<n>/<max>` 字样，供主 agent 判断）。
- * 接在被包装的原始 error 之后（原始 error 一字不改，只在尾部追加记录块）。
- */
-export function describeSameModelRetries(args: {
-	attempts: Array<{ attempt: number; label: string; error: string }>;
-	retries: number;
-	max: number;
-	label: string;
-	fallbackCount: number;
-}): string {
-	const lines: string[] = [
-		`--- 同模型重试记录 retries=${args.retries}/${args.max}（${args.label}）---`,
-	];
-	for (const a of args.attempts) lines.push(`[${a.attempt}] ${a.error}`);
-	lines.push(
-		`建议：等 30–60s 用同一 model 重派，或改 model= 覆盖（fallback 候选 ${args.fallbackCount} 个）。`,
-	);
-	return lines.join("\n");
-}
-
-/**
- * Build a main-agent-facing failure block: original error + what was tried +
- * explicit instruction to switch the main session model when usage is capped.
- */
-function formatFailureForMainAgent(result: SubagentResult, triedModels?: string[]): string {
-	const err = result.error || result.status || "failed";
-	const model =
-		result.requestedModel ||
-		result.model ||
-		"(unknown model)";
-	const cls = classifyModelFailure(err, model);
-	const tried =
-		triedModels && triedModels.length > 0
-			? triedModels
-			: [model].filter(Boolean);
-	const lines: string[] = [
-		`[subagent-failure kind=${cls.label} retryable=${cls.retryable}]`,
-		`agent=${result.agent ?? "(none)"}`,
-		`failed_model=${model}`,
-		`tried_models=${tried.join(" → ")}`,
-		`error=${err}`,
-	];
-	if (cls.kind === "usage_cap") {
-		lines.push(
-			"",
-			"ACTION_REQUIRED (main agent):",
-			"- This is treated as a package/usage cap (Zhipu/GLM often returns bare HTTP 429 when 套餐用量用尽).",
-			"- Do NOT retry the same model (waiting will not restore package quota).",
-			"- Pick a same-costTier substitute: a model in the SAME costTier that also lies inside this role's [min,max] interval (check layers with /tiers show),",
-			"  then re-run the failed subagent step with model= override or updated /sub-models defaults.",
-			"- Never escalate above max or downgrade below min; if every same-costTier substitute is exhausted → STOP and ask the user.",
-			"- Prefer a model not on the tried_models list above (avoid Zhipu/glm if that is exhausted).",
-		);
-	} else if (cls.retryable) {
-		lines.push(
-			"",
-			"ACTION_REQUIRED (main agent):",
-			"- Provider/model-layer failure after subagent fallback chain (if any).",
-			"- Switch main session model (/model) or pass a different model= override, then retry the step.",
-		);
-	}
-	if (result.text) {
-		lines.push("", "--- partial output ---", result.text);
-	}
-	return lines.join("\n");
-}
-
-/** Normalize free-form model requests into provider/id for pi --model, or cli:<backend> (default model only). */
-function normalizeModelRef(raw?: string | null): string | undefined {
-	if (!raw) return undefined;
-	const input = String(raw).trim();
-	if (!input) return undefined;
-
-	// External CLI harness: cli:claude | cli:codex | cli:agy | cli:atomcode | cli:zcode (always CLI default model)
-	if (isExternalCliModel(input)) {
-		return normalizeExternalCliModel(input);
-	}
-
-	// Already canonical provider/id (or nested provider path).
-	if (input.includes("/")) return input;
-
-	const catalog = loadLocalModelCatalog();
-	if (catalog.length === 0) return input;
-
-	const lower = input.toLowerCase();
-	const compact = lower.replace(/[\s_]+/g, "-");
-	const nosep = lower.replace(/[\s_.\-]+/g, "");
-
-	const score = (entry: { provider: string; id: string; name?: string }): number => {
-		const id = entry.id.toLowerCase();
-		const name = (entry.name ?? "").toLowerCase();
-		const full = `${entry.provider}/${entry.id}`.toLowerCase();
-		const idCompact = id.replace(/[\s_]+/g, "-");
-		const idNosep = id.replace(/[\s_.\-]+/g, "");
-		const nameNosep = name.replace(/[\s_.\-]+/g, "");
-		if (id === lower || name === lower || full === lower) return 100;
-		if (idCompact === compact || idNosep === nosep || nameNosep === nosep) return 90;
-		if (id.startsWith(lower) || idCompact.startsWith(compact)) return 70;
-		if (id.includes(lower) || idCompact.includes(compact) || name.includes(lower)) return 50;
-		if (nosep.length >= 4 && (idNosep.includes(nosep) || nameNosep.includes(nosep))) return 40;
-		return 0;
-	};
-
-	let bestScore = 0;
-	const top: LocalModelEntry[] = [];
-	for (const entry of catalog) {
-		const s = score(entry);
-		if (s < 70) continue;
-		if (s > bestScore) {
-			bestScore = s;
-			top.length = 0;
-			top.push(entry);
-		} else if (s === bestScore) {
-			// Keep unique provider/id only.
-			if (!top.some((e) => e.provider === entry.provider && e.id === entry.id)) top.push(entry);
-		}
-	}
-	// Only auto-expand when a single confident match exists.
-	if (top.length === 1) return `${top[0].provider}/${top[0].id}`;
-	if (top.length > 1) {
-		const options = top.map((e) => `${e.provider}/${e.id}`).join(", ");
-		throw new Error(`Ambiguous model alias "${input}". Use a full provider/id. Candidates: ${options}`);
-	}
-	return input;
-}
-
-interface LocalModelEntry {
-	provider: string;
-	id: string;
-	name?: string;
-}
-
-let cachedModelCatalog: LocalModelEntry[] | null = null;
-
-function loadLocalModelCatalog(): LocalModelEntry[] {
-	if (cachedModelCatalog) return cachedModelCatalog;
-	const paths = [
-		join(homedir(), ".pi", "agent", "models.json"),
-		join(homedir(), ".pi", "models.json"),
-	];
-	const out: LocalModelEntry[] = [];
-	for (const p of paths) {
-		if (!existsSync(p)) continue;
-		try {
-			const raw = JSON.parse(readFileSync(p, "utf8")) as {
-				providers?: Record<string, { models?: Array<{ id?: string; name?: string }> }>;
-			};
-			for (const [provider, def] of Object.entries(raw.providers ?? {})) {
-				for (const m of def.models ?? []) {
-					if (!m?.id) continue;
-					out.push({ provider, id: m.id, name: m.name });
-				}
-			}
-		} catch {
-			/* ignore broken models.json */
-		}
-	}
-	cachedModelCatalog = out;
-	return out;
-}
-
-/** Resolve defaults at the call seam so config changes apply without recreating agents. */
+// ── 模型分类、重试与目录解析（已拆分至 extensions/model-retry.ts 与 extensions/model-catalog.ts）──
 function agentDefaultModel(agent?: AgentDef | null): string | undefined {
-	if (!agent) return undefined;
-	return agent.frontmatterModel ?? readConfig().models[agent.name];
+	return agentDefaultModelCore(agent, readConfig());
 }
 
 function agentDefaultThinking(agent?: AgentDef | null): string | undefined {
-	if (!agent) return undefined;
-	return agent.frontmatterThinking ?? readConfig().thinking[agent.name];
+	return agentDefaultThinkingCore(agent, readConfig());
 }
 
 function resolveCallModel(override?: string, agent?: AgentDef | null): string | undefined {
-	// Call-site model always wins over agent frontmatter / current config defaults.
-	return normalizeModelRef(override) ?? agentDefaultModel(agent);
+	return resolveCallModelCore(override, agent, readConfig());
 }
 
 function displayModelForCall(override: string | undefined, agentName: string | undefined, agent?: AgentDef | null): string {
-	const defaultModel = agentDefaultModel(agent) ?? (agentName ? readConfig().models[agentName] : undefined);
-	let overrideRef: string | undefined;
-	try {
-		overrideRef = normalizeModelRef(override);
-	} catch {
-		// Keep raw override text in TUI if alias is ambiguous.
-		overrideRef = override?.trim() || undefined;
-	}
-	const resolved = overrideRef ?? defaultModel;
-	if (!resolved) return "";
-	if (overrideRef && overrideRef !== defaultModel) return ` override:${resolved}`;
-	return ` ${resolved}`;
+	return displayModelForCallCore(override, agentName, agent, readConfig());
 }
 
 /** Resolve the requested checkout once and use it for both pi and external CLI children. */
@@ -855,7 +521,7 @@ function parseFrontmatter(md: string): { frontmatter: Record<string, unknown>; b
 	return { frontmatter: fm, body: lines.slice(end + 1).join("\n").trim() };
 }
 
-function discoverAgents(): AgentDef[] {
+export function discoverAgents(): AgentDef[] {
 	const dirs = [
 		join(PKG_DIR, "agents"),
 		join(homedir(), ".pi", "agent", "agents"),
@@ -875,12 +541,14 @@ function discoverAgents(): AgentDef[] {
 			// model/thinking 优先级：agent frontmatter > config.json > undefined
 			const fmModel = frontmatter.model as string | undefined;
 			const fmThinking = frontmatter.thinking as string | undefined;
+			let parsedTools: string[] | undefined;
+			if ("tools" in frontmatter) {
+				parsedTools = parseAgentTools(frontmatter.tools, name);
+			}
 			agents.push({
 				name,
 				description: frontmatter.description as string | undefined,
-				tools: frontmatter.tools
-					? String(frontmatter.tools).split(",").map((s) => s.trim())
-					: undefined,
+				tools: parsedTools,
 				frontmatterModel: fmModel,
 				frontmatterThinking: fmThinking,
 				body,
@@ -1209,9 +877,27 @@ async function runSingle(
 	const resolvedModel = model ?? agentDefaultModel(agent);
 	const resolvedThinking = agentDefaultThinking(agent);
 
-	// P2 修订：显式 tools + 外部 CLI 后端 → 快速失败（安全 allowlist 不许被静默忽略）。
-	// 放在外部 CLI 分支之前才能拦住 cli:* 派发。
-	if (!toolsSupportedForBackend(resolvedModel, tools)) {
+	// 工具策略合并：角色工具上限与调用方工具策略
+	let effectiveTools: string[] | undefined;
+	try {
+		effectiveTools = resolveEffectiveTools(agent?.tools, tools, agent?.name);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		onUpdate?.("⛔ tools error", msg);
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: msg,
+			agent: agent?.name,
+			requestedModel: resolvedModel,
+		};
+	}
+
+	// 外部 CLI 后端工具策略守卫（角色 frontmatter 的 tools: 豁免，调用方显式策略仍拒）
+	if (!toolsSupportedForBackend(resolvedModel, effectiveTools, tools)) {
 		onUpdate?.("⛔ tools unsupported", `--tools is not supported for external CLI backend ${resolvedModel}`);
 		return {
 			status: "failed",
@@ -1219,7 +905,7 @@ async function runSingle(
 			usage: emptyUsageSummary(),
 			usageEvents: [],
 			runId: randomUUID(),
-			error: `--tools allowlist is not supported for external CLI backend "${resolvedModel}"; use a normal provider/id model or drop tools`,
+			error: `--tools allowlist is not supported for external CLI backend "${resolvedModel}"; caller-declared tools cannot be enforced on a third-party CLI — drop the caller \`tools\` option (the role's frontmatter \`tools:\` is exempt)`,
 			agent: agent?.name,
 			requestedModel: resolvedModel,
 		};
@@ -1276,15 +962,14 @@ async function runSingle(
 	// 仍用 --no-session 隔离会话；排除 subagent-win 防止递归派发；
 	// 同时排除 launch-tabs 与 timer 管理工具：子 agent 只执行工作，
 	// 不得开新标签页，也不得创建/查询/取消计时器（编排只属于主会话）。
-	// tools/excludeTools 为 per-call opt-in（runner-argv.ts P2 修订）：
-	// 未显式传入时 argv 不含 --tools，与历史行为逐字节一致。
+	// tools 为合并后的 effectiveTools（角色上限与调用方子集）。
 	const argv = buildPiArgv({
 		cliPath,
 		model: resolvedModel,
 		thinking: resolvedThinking,
 		systemPrompt: finalPrompt || undefined,
 		task,
-		tools,
+		tools: effectiveTools,
 		excludeTools,
 	});
 	// force-reasoning-replay 挂载：子 agent 是独立 pi 子进程，不加载项目级扩展；
@@ -1750,6 +1435,39 @@ export async function runWithFallback(
 	}
 	const candidates = [...new Set([primary, ...normalizedFallbacks].filter((value): value is string => Boolean(value)))];
 
+	// 工具策略计算与有效性校验（2026-11-13 优化计划）
+	let effectiveTools: string[] | undefined;
+	try {
+		effectiveTools = resolveEffectiveTools(agent?.tools, opts?.tools, agent?.name);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: msg,
+			agent: agent?.name,
+		};
+	}
+
+	// 外部 CLI 工具策略守卫：显式指定的外部 CLI 主模型 + **调用方显式**工具策略不兼容时直接返回结构化错误。
+	// 2026-11-18 豁免：角色 frontmatter 的 `tools:` 不算策略（第三方 CLI 自带工具系统）⇒ 只看 opts?.tools。
+	if (effectiveTools !== undefined && model !== undefined && isExternalCliModel(model) && opts?.tools !== undefined) {
+		return {
+			status: "failed",
+			text: "",
+			usage: emptyUsageSummary(),
+			usageEvents: [],
+			runId: randomUUID(),
+			error: `--tools allowlist is not supported for external CLI backend "${model}"; caller-declared tools cannot be enforced on a third-party CLI — drop the caller \`tools\` option (the role's frontmatter \`tools:\` is exempt)`,
+			agent: agent?.name,
+			requestedModel: model,
+			triedModels: [],
+		};
+	}
+
 	// costTier 派发门（执行点①）：在候选集展开后、任何 runSingle spawn 之前判定。
 	// table 用 .table（checkDispatchTier 收 ModelCostTiersTable；缺表时 emptyTable 带 present:false）。
 	const __table = loadCostTiers().table;
@@ -1816,6 +1534,17 @@ export async function runWithFallback(
 	let __lastBlockedGate: { model: string; gate: ReturnType<typeof checkDispatchTier> } | undefined;
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
+		// 外部 CLI 工具策略守卫：跳过「调用方显式声明了工具策略」的外部 CLI 候选。
+		// 角色 frontmatter 的 tools: 已豁免（见 toolsSupportedForBackend 注释）。
+		if (!toolsSupportedForBackend(candidate, effectiveTools, opts?.tools)) {
+			priorFailures.push({
+				model: candidate,
+				kind: "EXTERNAL_CLI_TOOLS_UNSUPPORTED",
+				error: `[skip-fallback: candidate "${candidate}" is external CLI and caller declared a tool policy (un enforceable)]`,
+			});
+			onUpdate?.("⚠ 跳过 fallback", `${candidate} 是外部 CLI，不支持工具策略`);
+			continue;
+		}
 		if (index > 0) {
 			// fallback candidate：spawn 前再跑一次门；越界 → 跳过（不 spawn、不记 tried）。
 			// L4 M2：index>0 候选强制 explicitOverride:false ——「用户点名」只覆盖 candidate 0，不覆盖 fallback 链。
@@ -1912,18 +1641,33 @@ export async function runWithFallback(
 		}
 		return withAllAttemptUsage(result, allUsageEvents, dispatchRunId, tried, priorFailures);
 	}
-	if (!__anySpawned && __lastBlockedGate) {
-		// 全部候选在 spawn 前被门跳过（正常情况下的候选 0 已在上游单独判定并直接返回）。
-		const __blocked = __lastBlockedGate;
+	if (!__anySpawned) {
+		if (__lastBlockedGate) {
+			const __blocked = __lastBlockedGate;
+			return {
+				status: "failed",
+				text: "",
+				usage: emptyUsageSummary(),
+				usageEvents: [],
+				runId: dispatchRunId,
+				error: `[subagent-tier-blocked role=${agent?.name ?? "(none)"} model=${__blocked.model} tier=${__blocked.gate.tier} interval=${JSON.stringify(__roleTier[agent?.name ?? ""] ?? null)} side=${__blocked.gate.side ?? "n/a"}] ${__blocked.gate.message}`,
+				agent: agent?.name,
+				requestedModel: __blocked.model,
+				triedModels: tried,
+				priorFailures,
+			};
+		}
+		const noCandMsg = priorFailures.some((p) => p.kind === "EXTERNAL_CLI_TOOLS_UNSUPPORTED")
+			? `[subagent-no-compatible-candidate role=${agent?.name ?? "(none)"}] 无兼容的候选模型：所有候选均为不接受调用方工具策略的外部 CLI 后端`
+			: "no model attempt";
 		return {
 			status: "failed",
 			text: "",
 			usage: emptyUsageSummary(),
-			usageEvents: [],
+			usageEvents: allUsageEvents,
 			runId: dispatchRunId,
-			error: `[subagent-tier-blocked role=${agent?.name ?? "(none)"} model=${__blocked.model} tier=${__blocked.gate.tier} interval=${JSON.stringify(__roleTier[agent?.name ?? ""] ?? null)} side=${__blocked.gate.side ?? "n/a"}] ${__blocked.gate.message}`,
+			error: noCandMsg,
 			agent: agent?.name,
-			requestedModel: __blocked.model,
 			triedModels: tried,
 			priorFailures,
 		};
@@ -1976,7 +1720,7 @@ interface TaskInput {
 	timeoutMs?: number;
 	/** Working directory / git worktree for this task. */
 	cwd?: string;
-	/** per-call 正向 allowlist（P2 修订：显式传入才加 --tools；不读 agent frontmatter）。 */
+	/** per-call 工具列表：只能选择角色工具上限的子集；显式空列表 [] 表示零活动工具；缺省则采用角色工具上限。 */
 	tools?: string[];
 	/** per-call 额外排他列表（叠加到默认防递归列表之后）。 */
 	excludeTools?: string[];
@@ -2086,256 +1830,48 @@ async function runParallel(
 }
 
 // ── 用量记录 ────────────────────────────────────────────────────────────
+import {
+	type DayBounds,
+	type RecordableUsageResult,
+	type UsageBucket,
+	type MainSessionUsage,
+	getUsageDir,
+	DEFAULT_SESSIONS_ROOT,
+	localDayBounds,
+	dailyUsagePath,
+	ensureUsageDir,
+	recordUsage,
+	readUsageRecords,
+	collectSubagentUsage,
+	collectMainSessionUsage,
+	emptyUsage,
+	addUsage,
+	addModelUsage,
+	mergeModelBuckets,
+	modelKey,
+	parseTsMs,
+	inDay,
+	overlappingUtcDates,
+	listJsonlFiles,
+} from "./usage-ledger.ts";
 
-// 测试隔离（1013）：PI_SUBAGENT_USAGE_DIR 可把用量账本改道到临时目录（同 PI_SUBAGENT_RUNS_DIR 模式）；
-// 生产未设该 env → 原 ~/.pi/agent/subagent-usage 语义逐字节不变。模块加载时读一次。
-const USAGE_DIR = process.env.PI_SUBAGENT_USAGE_DIR ?? join(homedir(), ".pi", "agent", "subagent-usage");
-const DEFAULT_SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
+export {
+	type DayBounds,
+	type RecordableUsageResult,
+	type UsageBucket,
+	type MainSessionUsage,
+	getUsageDir,
+	DEFAULT_SESSIONS_ROOT,
+	localDayBounds,
+	dailyUsagePath,
+	ensureUsageDir,
+	recordUsage,
+	readUsageRecords,
+	collectSubagentUsage,
+	collectMainSessionUsage,
+};
 
-interface DayBounds {
-	/** Local calendar day, YYYY-MM-DD */
-	label: string;
-	startMs: number;
-	endMs: number;
-}
-
-/** Local-day window [start, end). Avoids UTC midnight split for CN/other +8 zones. */
-function localDayBounds(now = new Date()): DayBounds {
-	const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-	const end = new Date(start);
-	end.setDate(end.getDate() + 1);
-	const y = start.getFullYear();
-	const m = String(start.getMonth() + 1).padStart(2, "0");
-	const d = String(start.getDate()).padStart(2, "0");
-	return { label: `${y}-${m}-${d}`, startMs: start.getTime(), endMs: end.getTime() };
-}
-
-function dailyUsagePath(dayLabel?: string): string {
-	const day = dayLabel ?? localDayBounds().label;
-	return join(USAGE_DIR, `${day}.jsonl`);
-}
-
-function ensureUsageDir(): void {
-	if (!existsSync(USAGE_DIR)) mkdirSync(USAGE_DIR, { recursive: true });
-}
-
-function recordUsage(agent: string | undefined, result: SubagentResult): void {
-	try {
-		ensureUsageDir();
-		const events = result.usageEvents.length > 0
-			? result.usageEvents
-			: [{
-				id: `${result.runId}:empty`, runId: result.runId, ts: new Date().toISOString(),
-				model: result.requestedModel ?? result.model, usage: result.usage,
-			}];
-		for (const event of events) {
-			const eventDate = new Date(event.ts);
-			const day = Number.isNaN(eventDate.getTime()) ? undefined : localDayBounds(eventDate).label;
-			const line = JSON.stringify({
-				version: 2,
-				id: event.id,
-				runId: event.runId,
-				ts: event.ts,
-				agent: agent ?? null,
-				model: event.model ?? result.requestedModel ?? result.model ?? null,
-				usage: event.usage,
-			});
-			// Attribute each assistant request to its own local calendar day, even if the run ends later.
-			writeFileSync(dailyUsagePath(day), line + "\n", { flag: "a" });
-		}
-	} catch {
-		/* ignore usage write failures */
-	}
-}
-
-interface UsageBucket extends UsageSummary {
-	count: number;
-	/** Per-model breakdown (key = provider/id when available). */
-	byModel: Map<string, UsageBucket>;
-}
-
-function emptyUsage(): UsageBucket {
-	return { ...emptyUsageSummary(), count: 0, byModel: new Map() };
-}
-
-function addUsage(target: UsageBucket, usage: Partial<UsageSummary>, count = 0): void {
-	target.input += usage.input ?? 0;
-	target.output += usage.output ?? 0;
-	target.cacheRead += usage.cacheRead ?? 0;
-	target.cacheWrite += usage.cacheWrite ?? 0;
-	target.cost += usage.cost ?? 0;
-	target.turns += usage.turns ?? 0;
-	target.count += count;
-}
-
-function addModelUsage(target: UsageBucket, model: string, usage: Partial<UsageSummary>, count = 0): void {
-	let bucket = target.byModel.get(model);
-	if (!bucket) {
-		bucket = emptyUsage();
-		target.byModel.set(model, bucket);
-	}
-	addUsage(bucket, usage, count);
-}
-
-function modelKey(provider: unknown, model: unknown): string {
-	if (typeof provider === "string" && provider && typeof model === "string" && model) return `${provider}/${model}`;
-	if (typeof model === "string" && model) return model;
-	return "unknown";
-}
-
-function mergeModelBuckets(target: Map<string, UsageBucket>, source: Map<string, UsageBucket>): void {
-	for (const [model, bucket] of source) {
-		let t = target.get(model);
-		if (!t) {
-			t = emptyUsage();
-			target.set(model, t);
-		}
-		addUsage(t, { input: bucket.input, output: bucket.output, cacheRead: bucket.cacheRead, cacheWrite: bucket.cacheWrite, cost: bucket.cost, turns: bucket.turns }, 0);
-	}
-}
-
-function parseTsMs(value: unknown): number | null {
-	if (typeof value === "number" && Number.isFinite(value)) {
-		// session message.timestamp is ms; some sources may store seconds
-		return value < 1e12 ? value * 1000 : value;
-	}
-	if (typeof value === "string" && value) {
-		const ms = Date.parse(value);
-		return Number.isNaN(ms) ? null : ms;
-	}
-	return null;
-}
-
-function inDay(ms: number | null, day: DayBounds): boolean {
-	return ms !== null && ms >= day.startMs && ms < day.endMs;
-}
-
-/** UTC calendar dates that may overlap a local day (for filename prefilter). */
-function overlappingUtcDates(day: DayBounds): string[] {
-	const dates = new Set<string>();
-	// sample start, mid, and just before end to catch timezone straddles
-	for (const ms of [day.startMs, day.startMs + 12 * 3600_000, day.endMs - 1]) {
-		dates.add(new Date(ms).toISOString().slice(0, 10));
-	}
-	return [...dates];
-}
-
-function listJsonlFiles(dir: string): string[] {
-	if (!existsSync(dir)) return [];
-	const out: string[] = [];
-	const stack = [dir];
-	while (stack.length > 0) {
-		const cur = stack.pop()!;
-		let entries;
-		try { entries = readdirSync(cur, { withFileTypes: true }); } catch { continue; }
-		for (const ent of entries) {
-			const full = join(cur, ent.name);
-			if (ent.isDirectory()) stack.push(full);
-			else if (ent.isFile() && ent.name.endsWith(".jsonl")) out.push(full);
-		}
-	}
-	return out;
-}
-
-/** 逐行解析用量账本（本地日 + UTC legacy 双读；按 id 去重）。供 /today-usage 与 /tiers usage 共用。 */
-export function readUsageRecords(day: { label: string; startMs: number; endMs: number }): Array<{ agent?: string | null; model?: string | null; usage: UsageSummary; runId: string }> {
-	const utcDates = overlappingUtcDates(day);
-	// Read the local format plus UTC-named legacy files that may overlap this local day.
-	const candidates = new Set<string>([
-		dailyUsagePath(day.label),
-		...utcDates.map((d) => join(USAGE_DIR, `${d}.jsonl`)),
-	]);
-	const seenEvents = new Set<string>();
-	const out: Array<{ agent?: string | null; model?: string | null; usage: UsageSummary; runId: string }> = [];
-	for (const filePath of candidates) {
-		if (!existsSync(filePath)) continue;
-		let text: string;
-		try { text = readFileSync(filePath, "utf8"); } catch { continue; }
-		for (const line of text.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const r = JSON.parse(line);
-				if (!inDay(parseTsMs(r.ts), day)) continue;
-				// v2 has a durable event ID. The full old record is a safe legacy fallback key.
-				const eventId = typeof r.id === "string" ? r.id : `legacy:${r.ts}:${line}`;
-				if (seenEvents.has(eventId)) continue;
-				seenEvents.add(eventId);
-				const u = r.usage ?? {};
-				out.push({
-					agent: typeof r.agent === "string" ? r.agent : null,
-					model: typeof r.model === "string" && r.model ? r.model : null,
-					usage: {
-						input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
-						cost: u.cost, turns: u.turns,
-					} as UsageSummary,
-					runId: typeof r.runId === "string" ? r.runId : eventId,
-				});
-			} catch { /* skip bad line */ }
-		}
-	}
-	return out;
-}
-
-function collectSubagentUsage(day: DayBounds): UsageBucket {
-	const total = emptyUsage();
-	const seenRuns = new Set<string>();
-	for (const rec of readUsageRecords(day)) {
-		addUsage(total, rec.usage);
-		addModelUsage(total, rec.model ?? "unknown", rec.usage, 0);
-		seenRuns.add(rec.runId);
-	}
-	total.count = seenRuns.size;
-	return total;
-}
-
-interface MainSessionUsage {
-	total: UsageBucket;
-	sessionCount: number;
-	sessionsWithUsage: number;
-}
-
-function collectMainSessionUsage(day: DayBounds, sessionsRoot = DEFAULT_SESSIONS_ROOT): MainSessionUsage {
-	const total = emptyUsage();
-	let sessionCount = 0;
-	let sessionsWithUsage = 0;
-
-	// Parse JSONL timestamps directly. File names and mtimes are not session semantics and can be stale.
-	for (const filePath of listJsonlFiles(sessionsRoot)) {
-		let text: string;
-		try { text = readFileSync(filePath, "utf8"); } catch { continue; }
-
-		let fileHasUsage = false;
-		let fileTouchedToday = false;
-		for (const line of text.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line);
-				const entryTs = parseTsMs(entry.timestamp) ?? parseTsMs(entry.message?.timestamp);
-				if (inDay(entryTs, day)) fileTouchedToday = true;
-
-				if (entry.type !== "message") continue;
-				const msg = entry.message;
-				if (msg?.role !== "assistant" || !msg.usage) continue;
-
-				const msgTs = parseTsMs(msg.timestamp) ?? entryTs;
-				if (!inDay(msgTs, day)) continue;
-
-				const u = msg.usage;
-				const usagePart = { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, cost: u.cost?.total };
-				addUsage(total, { ...usagePart, turns: 1 });
-				addModelUsage(total, modelKey(msg.provider, msg.model), usagePart, 1);
-				fileHasUsage = true;
-			} catch { /* skip bad line */ }
-		}
-
-		if (fileTouchedToday) {
-			sessionCount++;
-			if (fileHasUsage) sessionsWithUsage++;
-		}
-	}
-
-	return { total, sessionCount, sessionsWithUsage };
-}
+const USAGE_DIR = getUsageDir();
 
 // ── 异步存储 ────────────────────────────────────────────────────────
 
@@ -2860,6 +2396,195 @@ ${notable[0].reason}
 			return "(unknown)";
 		}
 	}
+	// ── /note：本会话旁路便签（agent 提醒人 / 人提醒 agent）─────────────────
+	// ⚠️ 硬约束（pi-coding-agent/docs/tui.md:56-62）：**只有全屏模式**才把鼠标事件路由给组件；
+	// 普通终端鼠标归 terminal scrollback，OSC 8 链接点了只开浏览器。所以 widget 上的
+	// MouseRegion 按钮只是增强，`/note` 键盘命令是唯一在所有终端都可用的入口（G5），两者缺一不可。
+	const NOTE_WIDGET_KEY = "session-note";
+	function noteSidOf(ctx: { sessionManager?: { sessionId?: string } }): string | null {
+		return ownerSessionIdOf(ctx) ?? null;
+	}
+	/**
+	 * 摘要组件：**每次 render 都实时读盘**（2026-11-18 修「widget 永远为空」）。
+	 * 旧实现把 noteSummary 在 session_start 算成死字符串塞进 Text，agent 用 note_write
+	 * 写入后没有任何刷新路径 ⇒ 屏幕永远停在启动那一刻的「空」。setText 自带缓存清理，
+	 * 且只在文本真变时失效，故高频 render 的开销可忽略（R-2：不靠事件推送，无静默失效）。
+	 */
+	class LiveNoteText extends Text {
+		private readonly sid: string;
+		constructor(sid: string) { super("", 0, 0); this.sid = sid; this.setText(liveNoteSummary(sid)); }
+		override render(width: number): string[] {
+			this.setText(liveNoteSummary(this.sid));
+			return super.render(width);
+		}
+	}
+	function refreshNoteWidget(ctx: { ui?: any; sessionManager?: { sessionId?: string } }): void {
+		try {
+			const sid = noteSidOf(ctx);
+			if (sid === null) { ctx.ui?.setWidget?.(NOTE_WIDGET_KEY, undefined); return; }
+			// MouseRegion handler 必须同步返回；实际 IO 放进 void async 调用，不阻塞事件分发。
+			const component = new MouseRegion(new LiveNoteText(sid), (event) => {
+				if (event.type === "click" && event.button === "left") {
+					void openNoteEditor(ctx);
+					return { handled: true };
+				}
+				return undefined;
+			});
+			ctx.ui?.setWidget?.(NOTE_WIDGET_KEY, () => component);
+		} catch { /* 非 TUI（print/json）下 setWidget 可能 no-op：widget 是增强，不能打断会话 */ }
+	}
+	async function openNoteEditor(ctx: { mode?: string; ui?: any; sessionManager?: { sessionId?: string } }): Promise<void> {
+		if (isSubagent()) { ctx.ui?.notify?.("/note: 子 agent 会话不可操作主会话便签", "warning"); return; }
+		if (ctx.mode !== "tui") {
+			ctx.ui?.notify?.("/note 仅在交互式 TUI 可用（非 TUI 模式无编辑器）", "warning");
+			return;
+		}
+		const sid = noteSidOf(ctx);
+		if (sid === null) { ctx.ui?.notify?.("/note: 当前会话没有可用的 pi session id", "warning"); return; }
+		const current = readSessionNote(sid);
+		if (!current.ok) { ctx.ui?.notify?.(`/note: 便签读取失败（${current.reason}），未改动原文件`, "error"); return; }
+		const edited = await ctx.ui.editor("会话 Note（内容可随时改；清空 = 删除全部提醒）", current.note.text);
+		if (edited === undefined || edited === null) return; // 用户取消编辑器
+		const w = writeSessionNote(sid, edited, { expectedVersion: current.note.version });
+		if (!w.ok) { ctx.ui?.notify?.(`/note: 保存失败（${w.reason}），本地未覆盖`, "error"); return; }
+		refreshNoteWidget(ctx);
+		ctx.ui?.notify?.(`会话便签已保存（v${w.note.version}）`, "info");
+	}
+	pi.registerCommand("note", {
+		description: "打开本会话旁路便签：记下 agent 提醒人 / 人提醒 agent 的话；全屏可点 widget 按钮",
+		handler: async (_args, ctx) => { await openNoteEditor(ctx as any); },
+	});
+	pi.on("session_start", (_event, ctx) => { refreshNoteWidget(ctx as any); });
+	// agent 写完 note_write 后主动重挂一次：LiveNoteText.render 已实时读盘，这里只负责
+	// 「即使屏幕此刻没有其它重绘触发，也要让摘要跳出来」（R-2 可见性兜底）。
+	pi.on("agent_end", (_event, ctx) => { refreshNoteWidget(ctx as any); });
+
+	// ── Agent 侧：note_read / note_write + 脏时注入（设计稿 §4.3 方案 D）──────
+	// 五部件：① state custom entry 记上次注入版本 ② 脏判定（干净不返回 message）
+	// ③ 有界摘要注入 ④ 静态 sections 声明「以最新时间戳为准」（不删旧消息，保 prompt cache）
+	// ⑤ session_compact 把 state 写 -1 ⇒ 下一轮强制重注，防 summary 里的旧规则冒充现行。
+	const NOTE_STATE_TYPE = "session-note-state";
+	const noteToolError = (text: string): { content: Array<{ type: "text"; text: string }>; isError: boolean } =>
+		({ content: [{ type: "text", text }], isError: true });
+
+	/**
+	 * 读上次注入的 state entry（version + 正文指纹）。
+	 * 指纹是 2026-11-18 加的：老 entry 没有 fingerprint 字段 ⇒ 返回 null，判据回退比 version，
+	 * 保证升级前的会话不会突然漏注入。version=-1（压缩重注）时指纹一并不可信，返回 null。
+	 */
+	function lastInjectedState(ctx: { sessionManager?: { getEntries?: () => unknown[] } }): { version: number | null; fingerprint: string | null } {
+		try {
+			const entries = ctx?.sessionManager?.getEntries?.();
+			if (!Array.isArray(entries)) return { version: null, fingerprint: null };
+			// 取**最后一条**状态记录：append-only 历史里旧版本必须被最新记录覆盖。
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i] as { type?: string; customType?: string; data?: { version?: unknown; fingerprint?: unknown } } | null;
+				if (e?.type === "custom" && e.customType === NOTE_STATE_TYPE && typeof e.data?.version === "number") {
+					const v = e.data.version;
+					return { version: v, fingerprint: v >= 0 && typeof e.data?.fingerprint === "string" ? e.data.fingerprint : null };
+				}
+			}
+		} catch { /* 状态丢失 ⇒ 当作从未注入（宁可重发，不可漏发；R-5） */ }
+		return { version: null, fingerprint: null };
+	}
+	type NoteInjectCtx = { sessionManager?: { appendCustomEntry?: ((type: string, data: unknown) => void) } };
+	function markNoteInjected(ctx: NoteInjectCtx, version: number, fingerprint: string | null = null): void {
+		try {
+			ctx?.sessionManager?.appendCustomEntry?.(NOTE_STATE_TYPE, { version, fingerprint, injectedAt: new Date().toISOString() });
+		}
+		catch { /* 状态写失败只会导致下轮重发一条，不阻塞 run */ }
+	}
+	pi.registerTool({
+		name: "note_read",
+		label: "Read session note",
+		description: "读取本会话的旁路便签：人给 agent 的规则 / agent 给人列的待人办。返回 text 与 version；写回时必须把 version 作为 expectedVersion。子 agent 会话禁用（避免写串主会话 sid）。",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			if (isSubagent()) return noteToolError("note_read: 子 agent 会话不可读主会话便签");
+			const sid = ownerSessionIdOf(ctx as never);
+			if (sid === undefined) return noteToolError("note_read: 当前会话没有 pi session id");
+			const r = readSessionNote(sid);
+			if (!r.ok) return noteToolError(`note_read: ${r.reason}${r.detail ? ` — ${r.detail}` : ""}`);
+			return {
+				content: [{
+					type: "text",
+					text: `version=${r.note.version}\nupdatedAt=${r.note.updatedAt ?? "null"}\n${r.exists ? r.note.text : "(文件不存在，当前为空便签)"}`,
+				}],
+				details: { note: r.note, exists: r.exists },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "note_write",
+		label: "Write session note",
+		description: "写本会话旁路便签。**必须**先 note_read 拿 version，并原样传 expectedVersion（乐观锁；冲突返回 current，需重读再写）。mode=append 在末尾追加带时间戳的小节，避免覆盖人写的规则；mode=replace 整体覆盖（清空正文 = 发 tombstone）。子 agent 会话禁用。",
+		parameters: Type.Object({
+			expectedVersion: Type.Number({ description: "必填：note_read 返回的 version；不传/错值直接拒绝，禁止裸写" }),
+			text: Type.Optional(Type.String({ description: "replace = 完整正文；append = 要追加的片段（待人办）" })),
+			mode: Type.Optional(Type.String({ description: "replace（默认）| append", enum: ["replace", "append"] })),
+		}),
+		async execute(_id, rawParams, _signal, _onUpdate, ctx) {
+			if (isSubagent()) return noteToolError("note_write: 子 agent 会话不可写主会话便签");
+			const sid = ownerSessionIdOf(ctx as never);
+			if (sid === undefined) return noteToolError("note_write: 当前会话没有 pi session id");
+			const params = rawParams as { expectedVersion?: unknown; text?: unknown; mode?: unknown };
+			if (typeof params.expectedVersion !== "number" || !Number.isSafeInteger(params.expectedVersion) || params.expectedVersion < 0) {
+				return noteToolError("note_write: 必须传非负整数 expectedVersion（先 note_read）；禁止无版本裸写");
+			}
+			const text = typeof params.text === "string" ? params.text : "";
+			const mode = params.mode === "append" ? "append" : "replace";
+			const current = readSessionNote(sid);
+			if (!current.ok) return noteToolError(`note_write: 先读失败（${current.reason}），未覆盖原文件`);
+			if (current.note.version !== params.expectedVersion) {
+				return {
+					content: [{ type: "text", text: `note_write: version-conflict（你基于 v${params.expectedVersion}，当前 v${current.note.version}）；请 note_read 后重试` }],
+					isError: true,
+					details: { reason: "version-conflict", current: current.note },
+				};
+			}
+			const nextText = mode === "append"
+				? `${current.note.text}${current.note.text.length > 0 ? "\n\n" : ""}<!-- agent ${new Date().toISOString()} -->\n- ${text}`
+				: text;
+			const w = writeSessionNote(sid, nextText, { expectedVersion: params.expectedVersion });
+			if (!w.ok) return noteToolError(`note_write: 保存失败（${w.reason}${w.detail ? ` — ${w.detail}` : ""}），本地草稿未生效`);
+			return { content: [{ type: "text", text: `note_write: 已写入 v${w.note.version}（${mode}）` }], details: { note: w.note } };
+		},
+	});
+
+	// 独立 handler（**不要并进**上方既有 config 注入的 handler）：那个 handler 对 trace-worker
+	// 提前 return，且自己返回 config message；多 handler 的 message 会全部进 messages[]，
+	// systemPromptOptions 是同一个可变对象（runner.js:1130-1166），互不覆盖。
+	pi.on("before_agent_start", async (event, ctx) => {
+		// §1.4：子 agent 既禁用 note 工具，也不该看到「请调 note_read」的静态声明
+		// ⇒ 所有 note 相关注入（静态 sections 与动态 message）都必须在 isSubagent 门之后。
+		if (isSubagent()) return;
+		// ④ 静态声明：文本恒定 ⇒ Pi 对 sections 的 diff 只在首次产生一个 patch，之后零 patch，
+		// prompt cache 前缀不动。禁止改成返回整个 systemPrompt（每次变化都 cache miss）。
+		try {
+			const opts = (event as { systemPromptOptions?: { sections?: Record<string, string> } }).systemPromptOptions;
+			if (opts?.sections !== undefined && opts.sections !== null && typeof opts.sections === "object") {
+				opts.sections["session-note-authority"] = NOTE_AUTHORITY_SECTION;
+			}
+		} catch { /* 非标准 ctx：静态声明是优化，不阻塞注入 */ }
+		const sid = ownerSessionIdOf(ctx as never);
+		if (sid === undefined) return;
+		const r = readSessionNote(sid);
+		// 读失败（corrupt/read-failed）本轮不注入、不阻塞 run；可见性由 TUI 摘要/GUI 错误态承担。
+		if (!r.ok) return;
+		// 组合判定抽成纯函数（§8.1b）：node 直载可执行「干净 / 变更 / 清空」全套分支，
+		// 不再只靠源码串断言（AGENTS §4.2：strings 命中 ≠ handler 逻辑正确）。
+		const injected = lastInjectedState(ctx as never);
+		const message = composeNoteInjection(r.note, injected.version, undefined, injected.fingerprint);
+		if (message === null) return; // 干净：零新增 token，旧注入消息继续生效
+		// 记下本次注入的正文指纹：下一轮按内容判脏，version 空转不再触发重复注入。
+		markNoteInjected(ctx as never, r.note.version, noteFingerprint(r.note.text));
+		return { message };
+	});
+
+	// ⑤ 压缩后强制重注：compaction summary 里的旧规则不能长期冒充现行规则（R-3 新鲜度）。
+	pi.on("session_compact", (_event, ctx) => { markNoteInjected(ctx as never, -1); });
+
 	pi.registerCommand("master-status", {
 		description: "查看逻辑 Master 归属：attachment / resolver / cutover / mailbox 积压",
 		handler: async (_args, ctx) => {
@@ -3659,6 +3384,10 @@ ${notable[0].reason}
 		lines.push("Per-call model override: pass `model` on a single call or each parallel task. That value is what actually runs; the list above is only defaults.");
 		lines.push("Canonical form is `provider/id` (example: `Zhipu/glm-5.2`). Short aliases such as `glm-5.2` / `glm5.2` expand from ~/.pi/agent/models.json when unambiguous.");
 		lines.push("External CLI harnesses exist (`cli:claude`, `cli:codex`, `cli:agy`, `cli:atomcode`, `cli:zcode`) but are ONLY used by agents whose config.json default or fallback is set to one (e.g. implementer=`cli:agy`). These spawn local CLIs with each tool's own default model — never pass provider/id or cli:backend/model overrides.");
+		// 工具策略 × 外部 CLI（2026-11-18 业主裁决「tool 声明豁免第三方 CLI」）：
+		// 角色 frontmatter 的 `tools:` **豁免**（第三方 CLI 自带工具系统，pi 的 allowlist 对它无约束力也无意义）；
+		// 只有**调用方显式传的 `tools`**（含 `[]`）才拒——那是本次派发的真实约束，CLI 保证不了。
+		lines.push("⚠ `cli:*` + **caller-declared** tool policy is rejected: passing `tools: [...]` (including `[]`) to an external CLI dispatch fails, because the CLI cannot honor Pi's allowlist and silently ignoring it would mislead the caller. The **role's own frontmatter `tools:` is exempt** (it describes pi-side capability, meaningless to a third-party CLI) — so any role can be routed to `cli:*` as long as you do NOT pass `tools` on the call. Do not pass `tools` when you want `cli:*`; use a normal provider/id model when you actually need a narrowed tool surface.");
 		lines.push("Example: subagent-win({ agent: \"code-reviewer\", model: \"Zhipu/glm-5.2\", task: \"...\" })");
 		lines.push("Model selection priority (follow strictly): (1) DEFAULT — let each agent run its configured default + its fallback chain above; do NOT pass `model` to override. (2) Only override `model` when ONE of these is true: (a) the fallback chain is also unavailable (every default+fallback attempt failed, e.g. USAGE_CAP across the whole chain); (b) the USER explicitly asked for a specific model or agent; (c) the configured model is clearly unsuitable for THIS task (context window too small, or capability mismatch). (3) When overriding, prefer a normal provider/id — do NOT proactively switch to an external CLI (cli:claude/codex/agy/atomcode/zcode) unless that agent's config already uses one or the user explicitly asked. The mere existence of a cli: backend is never a reason to use it.");
 		lines.push("Sync/async decision applies to subagent-win only: DEFAULT ASYNC (`async: true`, non-blocking; products drop to disk with path-first short summary, collected via completion event/watcher/timer); SYNC only when the result is needed this turn (dependent next step, L4 re-verification); PARALLEL (`tasks: [...]`) for independent headless subagents in one batch. Async subagent runId must be checked with `subagent-win({ action: \"status\", runId })`; it is not a tab and does not need set-timer, tab-status, reclaim-tabs, or tab-finish. Use launch-tabs separately only when the main session needs a visible independent tab.");
@@ -4027,7 +3756,7 @@ ${notable[0].reason}
 				cwd: Type.Optional(Type.String({ description: "该 task 的工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 				timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：子 agent 持续无输出/无进展超过该时长才判停；不限制整个任务总时长。长任务只要持续输出就不会被打断；缺省不限。" })),
 				maxWallMs: Type.Optional(Type.Number({ description: "**墙钟总预算**（ms，opt-in，缺省不启用）：自 spawn 起算、与是否有输出无关，到点即终止并落 failed(wall_budget)。与 timeoutMs 并存、谁先到谁生效。注意：未启用时，持续输出的活进程等待**仍是无界的**。" })),
-				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+				tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "调用方工具限制列表：只能选择角色工具上限的子集；显式传空数组 [] 表示零活动工具；缺省则采用角色工具上限（若角色亦未声明则不加 --tools）。外部 CLI 后端**不接受调用方显式工具策略**（含 []），传了会报错；但角色 frontmatter 的 tools: 声明已豁免（第三方 CLI 自带工具系统，Pi 的 allowlist 对其无约束力）" })),
 				excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 			}))),
 			concurrency: Type.Optional(Type.Number({ description: "并行并发数（默认 3；仅 async:false 同步路径有效，异步 fan-out 忽略）" })),
@@ -4045,7 +3774,7 @@ ${notable[0].reason}
 			cwd: Type.Optional(Type.String({ description: "工作目录；指定 git worktree 路径，子 agent 将在此目录运行，而不是主分支" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "停顿超时（ms）：持续无输出/无进展超过该时长才判停；不限制总时长；缺省不限。" })),
 			maxWallMs: Type.Optional(Type.Number({ description: "**墙钟总预算**（ms，opt-in，缺省不启用）：自 spawn 起算、与是否有输出无关，到点即终止并落 failed(wall_budget)。与 timeoutMs 并存、谁先到谁生效。注意：未启用时，持续输出的活进程等待**仍是无界的**。" })),
-			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "per-call 正向 allowlist（仅显式传入才生效）：传入则给子进程加 --tools；缺省不加（pi 默认全量）。pi 内置工具只有 read/bash/edit/write；外部 CLI 后端不支持，显式传入会报错" })),
+			tools: Type.Optional(Type.Array(Type.String({ description: "工具名，如 read / bash / edit / write" }), { description: "调用方工具限制列表：只能选择角色工具上限的子集；显式传空数组 [] 表示零活动工具；缺省则采用角色工具上限（若角色亦未声明则不加 --tools）。外部 CLI 后端**不接受调用方显式工具策略**（含 []），传了会报错；但角色 frontmatter 的 tools: 声明已豁免（第三方 CLI 自带工具系统，Pi 的 allowlist 对其无约束力）" })),
 			excludeTools: Type.Optional(Type.Array(Type.String(), { description: "per-call 额外排他工具列表，叠加到默认防递归排他（subagent-win/launch-tabs/timers/local-master-ensure）之后" })),
 		}),
 
@@ -4619,17 +4348,21 @@ ${notable[0].reason}
 
 			if (p.tasks && Array.isArray(p.tasks) && p.async === false) {
 				const tasks = p.tasks as TaskInput[];
-				const results = await runParallel(tasks, p.concurrency ?? 3, agents, signal,
-					onUpdate
-						? (msg, _d, parallelProgress) =>
-							onUpdate({
-								content: [{ type: "text", text: msg }],
-								details: parallelProgress ? { parallelProgress } : undefined,
-							})
-						: undefined,
-					{ allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession() },
-				);
-				for (const r of results) recordUsage(r.agent, r);
+				let results: SubagentResult[] = [];
+				try {
+					results = await runParallel(tasks, p.concurrency ?? 3, agents, signal,
+						onUpdate
+							? (msg, _d, parallelProgress) =>
+								onUpdate({
+									content: [{ type: "text", text: msg }],
+									details: parallelProgress ? { parallelProgress } : undefined,
+								})
+							: undefined,
+						{ allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession() },
+					);
+				} finally {
+					for (const r of results) recordUsage(r.agent, r);
+				}
 				const parts = results.map(function(r, i) {
 					var icon = r.status === "completed" ? "\u2713" : "\u2717";
 					var rawBody =
@@ -4735,8 +4468,15 @@ ${notable[0].reason}
 				// 事故：未传 maxWallMs 的同步调用被一个「持续输出但永不收敛」的 2B 模型拖住，
 				// stall 计时器被反复重置 ⇒ 主会话锁死 7h42m。这里对显式同步套默认墓钟上限。
 				const syncWall = resolveSyncWallBudget({ async: p.async, maxWallMs: p.maxWallMs });
-				const result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(), maxWallMs: syncWall.ms, maxWallSource: syncWall.source });
-				recordUsage(agentDef?.name, result);
+				let result: SubagentResult | undefined;
+				try {
+					result = await runWithFallback(agentDef, p.task, p.systemPrompt, p.model, p.timeoutMs, signal, cb, { cwd: p.cwd, tools: p.tools, excludeTools: p.excludeTools, allowTierEscalation: p.allowTierEscalation === true, mainCall: isMainSession(), maxWallMs: syncWall.ms, maxWallSource: syncWall.source });
+				} finally {
+					if (result) recordUsage(agentDef?.name, result);
+				}
+				if (!result) {
+					return { content: [{ type: "text", text: "Task execution returned no result" }], isError: true };
+				}
 				const fallbackBits = result.priorFailures?.length
 					? result.priorFailures.map((f) => `${f.model}(${f.kind}: ${String(f.error).replace(/\s+/g, " ").slice(0, 120)})`).join(" | ")
 					: null;
@@ -5283,469 +5023,11 @@ ${notable[0].reason}
 	});
 	}
 
-	// ── trace-fusion 工具（2026-09-17）：主会话 agent 自主触发只读诊断 rollout ──
-	// 与 /trace-fusion-loop 命令同一套 launchTraceRun，但强制 diagnose 模式（零磁盘代价、
-	// 零主仓库写入）；implement（worktree 读写）仅保留给人丁命令。lane tab 看不到本工具
-	// （TRACE_WORKER_EXCLUDE_TOOLS）+ execute 内 capabilities 运行时二次校验。
-	pi.registerTool({
-		name: "trace-fusion",
-		label: "Trace Fusion (diagnose)",
-		description: [
-			"主会话专属：对当前仓库启动三路完全独立的只读诊断 rollout（diagnose 模式 trace-fusion）——三个可见 pi 标签页各自独立诊断同一个任务，产出三份诊断+推进方案（trajectory），完成后自动收集，交本会话融合。",
-			"适用：任务明显困难/根因不明/单一轨迹置信度低/值得 test-time scaling 时主动使用；简单任务勿用。",
-			"成本：三路并行墙钟约 laneWallClockMin（默认 45min），零磁盘零主仓库写入（只读，edit/write 对 lane 禁用）。",
-			"发起后立即可继续其它工作；三路全部完成后系统自动后台收集并通知你，届时读 runDir/lanes/{A,B,C}/trajectory.md 做融合（一致根因→高置信；分歧→仲裁）后单次实现。",
-			"只允许主会话调用；同一时刻仅允许一个 active run（并发启动会被 preflight 拒绝）。",
-		].join(" "),
-		parameters: Type.Object({
-			task: Type.String({ description: "任务描述（各 lane 逐字相同）：要诊断/推进的具体问题，应包含足够上下文让独立诊断可执行" }),
-			model: Type.Optional(Type.String({ description: "per-call 模型（provider/id 或唯一短名）。优先级：本参数 > config.workerModel > lane 默认；非法模型直接报错（不静默回落）" })),
-			workerModelByLane: Type.Optional(Type.Object({
-				A: Type.Optional(Type.String({ description: "TRACE A 的模型" })),
-				B: Type.Optional(Type.String({ description: "TRACE B 的模型" })),
-				C: Type.Optional(Type.String({ description: "TRACE C 的模型" })),
-			}, { description: "per-lane 模型覆盖（2026-11-02）：三路可各用不同模型（异构才有融合价值）。优先级：本参数[lane] > config.workerModelByLane[lane] > model > config.workerModel。未设的 lane 自动回落" })),
-			laneConcurrency: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
-				description: "并发度（缺省沿用 config，通常为 1）：1=严格串行（省共享 KV 池）、2=双路、3=三路全并发。本机 KV 池是共享的，三路并发可能在中等任务上撞池",
-			})),
-			cwd: Type.Optional(Type.String({ description: "per-call 目标仓库（必须是绝对路径；缺省 = 当前目录）。校验沿用 preflight（git 仓库/HEAD/merge 状态），路径先规范化成绝对路径" })),
-		}),
-		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-			if (!capabilities().launchTabs) {
-				return { content: [{ type: "text", text: "trace-fusion 只允许主会话调用。" }], isError: true };
-			}
-			const params = rawParams as {
-				task?: string;
-				model?: unknown;
-				workerModelByLane?: { A?: string; B?: string; C?: string };
-				laneConcurrency?: 1 | 2 | 3;
-				cwd?: unknown;
-			};
-			const task = (params.task ?? "").trim();
-			if (!task) {
-				return { content: [{ type: "text", text: "task 不能为空：给出要诊断的具体问题。" }], isError: true };
-			}
-			// 参数化 ①（2026-10-21）：per-call model 校验**先于任何 spawn/IO**。
-			// 权威来源 = 本次会话的 modelRegistry（审查 B3：本地 models.json 不是 CLI 可用集），
-			// 省略参数时不触碰 registry（保持旧路径零新增依赖）。
-			let workerModel: string | undefined;
-			if (params.model !== undefined) {
-				const available: AvailableModelRef[] = (() => {
-					try {
-						const reg = (ctx as unknown as { modelRegistry?: { getAvailable?: () => unknown } }).modelRegistry;
-						const list = reg?.getAvailable?.();
-						return Array.isArray(list) ? (list as AvailableModelRef[]) : [];
-					} catch {
-						return [];
-					}
-				})();
-				const resolved = resolveTraceWorkerModel(params.model, available);
-				if (!resolved.ok) {
-					return { content: [{ type: "text", text: `trace-fusion: ${resolved.error}` }], isError: true };
-				}
-				workerModel = resolved.model;
-			}
-			// per-lane 模型（2026-11-02）：逐 lane 校验；非法 lane **被放弃**（不回落默认），并在返回里显式告知。
-			let workerModelByLane: Partial<Record<"A" | "B" | "C", string>> | undefined;
-			let droppedLanes: Array<"A" | "B" | "C"> = [];
-			let droppedLaneReasons: string[] = [];
-			if (params.workerModelByLane !== undefined) {
-				const raw = params.workerModelByLane;
-				if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-					return { content: [{ type: "text", text: "trace-fusion: workerModelByLane 必须是 {A?:string,B?:string,C?:string} 对象。" }], isError: true };
-				}
-				const available: AvailableModelRef[] = (() => {
-					try {
-						const reg = (ctx as unknown as { modelRegistry?: { getAvailable?: () => unknown } }).modelRegistry;
-						const list = reg?.getAvailable?.();
-						return Array.isArray(list) ? (list as AvailableModelRef[]) : [];
-					} catch {
-						return [];
-					}
-				})();
-				const acc: Partial<Record<"A" | "B" | "C", string>> = {};
-				const laneModelErrors: string[] = [];
-				for (const lane of ["A", "B", "C"] as const) {
-					const v = (raw as Record<string, unknown>)[lane];
-					if (v === undefined) continue;
-					const r = resolveTraceWorkerModel(v, available);
-					if (!r.ok) {
-						// 2026-11-02 用户裁定：**放弃这一路**，不让一个错模型崩掉整趟 run。
-						// 关键区别（R-2 的真正含义）：不是「静默跳过」而是「移除该 lane 并显式告知」。
-						// 该 lane 会被剔除出 TRACE_LANES 派发集（见下方 requestedLanes），而不是回落成默认模型跑。
-						laneModelErrors.push(`lane ${lane}＝${String(v)}：${r.error}`);
-						continue;
-					}
-					if (r.model) acc[lane] = r.model;
-				}
-				// 三路都非法 ⇒ 等于没给任何有效 lane，必错（否则会白白开一趟 run）
-				if (laneModelErrors.length > 0 && Object.keys(acc).length === 0) {
-					return {
-						content: [{ type: "text", text: ["trace-fusion：所有指定的 lane 模型都不可用。", ...laneModelErrors].join("\n") }],
-						isError: true,
-					};
-				}
-				if (laneModelErrors.length > 0) {
-					droppedLaneReasons = laneModelErrors;
-					droppedLanes = (["A", "B", "C"] as const).filter((l) => (raw as Record<string, unknown>)[l] !== undefined && !(l in acc));
-				}
-				if (Object.keys(acc).length > 0) workerModelByLane = acc;
-			}
-			let wtExe: string | null;
-			let piCli: string;
-			try {
-				wtExe = findWindowsTerminal();
-				piCli = findPiCli();
-			} catch (err) {
-				return { content: [{ type: "text", text: `启动环境不可用：${err instanceof Error ? err.message : String(err)}` }], isError: true };
-			}
-			if (!wtExe) {
-				return { content: [{ type: "text", text: "未找到 Windows Terminal (wt.exe)，无法启动标签页。" }], isError: true };
-			}
-			// 参数化 ②（2026-10-21）：per-call cwd —— 缺省 process.cwd()（向后兼容）；
-			// 显式传入必须规范化成绝对路径且是已存在目录；git 仓库/HEAD/merge 校验交给 preflight（不重写）。
-			let repoRoot = process.cwd();
-			if (params.cwd !== undefined) {
-				if (typeof params.cwd !== "string" || !params.cwd.trim()) {
-					return { content: [{ type: "text", text: "trace-fusion: cwd 必须是非空字符串（绝对路径）。" }], isError: true };
-				}
-				if (!isAbsolute(params.cwd)) {
-					return { content: [{ type: "text", text: `trace-fusion: cwd 必须是绝对路径：${params.cwd}` }], isError: true };
-				}
-				repoRoot = resolve(params.cwd);
-				let cwdIsDir = false;
-				try {
-					cwdIsDir = statSync(repoRoot).isDirectory();
-				} catch {
-					cwdIsDir = false;
-				}
-				if (!cwdIsDir) {
-					return { content: [{ type: "text", text: `trace-fusion: cwd 不存在或不是目录：${repoRoot}` }], isError: true };
-				}
-			}
-			const tfConfig = readTraceFusionConfig();
-			// agent 主动触发永远只读：强制 diagnose，忽略 config 里的 implement 档。
-			// per-call laneConcurrency（2026-11-02）：显式传入 > config；非法值已在 schema 层被 Type.Union 拦掉。
-			const effectiveConfig = {
-				...tfConfig,
-				mode: "diagnose" as const,
-				...(params.laneConcurrency !== undefined ? { laneConcurrency: params.laneConcurrency } : {}),
-			};
-			const result = launchTraceRun({
-				task,
-				repoRoot,
-				wtExe,
-				piCli,
-				config: effectiveConfig,
-				// 参数化 ①：已校验的 per-call 模型（undefined ⇒ 回落 config）
-				workerModel,
-				// per-lane 覆盖：优先级见 workerModelFor（本参数[lane] > config[lane] > workerModel > config.workerModel）
-				workerModelByLane,
-				// 非法 lane 模型已在上层转为「放弃该路」（不回落默认），原因透传给编排与报告
-				skipLanes: droppedLanes.length > 0 ? Object.fromEntries(droppedLanes.map((l) => [l, "模型非法/不可用"])) : undefined,
-				runsDir: defaultTraceFusionRunsDir(),
-			});
-			const lines = result.lines ?? [];
-			if (!result.ok) {
-				return { content: [{ type: "text", text: ["trace-fusion 启动失败：", result.error, ...lines].join("\n") }], isError: true };
-			}
-			try {
-				// 2026-11-02 修正：只为**已实际派发**的 lane 写溯源链接。串行模式下 B/C 此时还在队列里
-				// 没有 tabRunId，写出去就是一行空 targetId 的死账（实测）——lane 完成时
-				// recipientSessionIdFor 查不到归属 ⇒ 落回「先到先得」+ master 影子信件 ⇒ 乱回。
-				// 续发时的真链接由 lane-queue 在拿到 tabRunId 后负全责写。
-				for (const lane of TRACE_LANES) {
-					const tid = result.meta.lanes[lane].tabRunId;
-					if (!tid) continue;
-					recordLink({ sessionId: sessionIdentity(ctx as never), kind: "tab", targetId: tid, detail: `trace-fusion ${result.meta.runId} lane=${lane}` });
-				}
-			} catch { /* 溯源尽力而为 */ }
-			const laneIds = TRACE_LANES.map((l) => `${l}=${result.meta.lanes[l].tabRunId}`).join(", ");
-			const queued = TRACE_LANES.filter((l) => !result.meta.lanes[l].tabRunId && !droppedLanes.includes(l));
-			return { content: [{ type: "text", text: [
-				`✅ trace-fusion diagnose run 已启动：${result.meta.runId}`,
-				...(droppedLanes.length > 0 ? [`⚠ 已放弃 ${droppedLanes.length} 路（不会用默认模型代跑）：`, ...droppedLaneReasons.map((e) => `  - ${e}`)] : []),
-				...lines,
-				`lane tabs: ${laneIds}`,
-				...(queued.length > 0 ? [`待发队列（前行终态后自动派发）：${queued.join(", ")}`] : []),
-				"三路完成后自动后台收集（无需干预）。",
-				`融合对照表（读这个，不要直接读三份全文）：${result.meta.runDir}/cross-test-report.md`,
-				"该报告是确定性抽取（零模型调用）：分歧节优先看；三路都未填的节说明证据不足。",
-			].join("\n") }] };
-		},
+	// ── trace-fusion 工具与专属命令（拆分至 extensions/trace-fusion/trace-fusion-tools.ts）──
+	registerTraceFusion(pi, {
+		findWindowsTerminal,
+		findPiCli,
+		searchableSelect,
+		pkgDir: PKG_DIR,
 	});
-
-	// ── /trace-fusion（2026-11-02 重构：三命令取代四个运维命令）──
-	// 用户裁定（交互角度只需要三件事）：
-	//   ① 模型 —— `/trace-fusion models`（三路 lane 各用哪个模型）
-	//   ② 参数 —— `/trace-fusion config`（并发度/时限/轮数）
-	//   ③ 开始 —— `/trace-fusion <任务>`
-	// 退场：/trace-fusion-status、-collect（运维面，对使用者是噪声；状态靠启动通知+完成事件）。
-	// 保留：/trace-fusion-clean（worktree 占磁盘，必须有手动释放入口）。
-	if (canOrchestrateTabs) {
-		const tfConfigPath = () => join(PKG_DIR, "config.json");
-
-		/** 启动前共用：环境解析 + 失败即告知。 */
-		const resolveLaunchEnv = (ctx: ExtensionCommandContext): { wtExe: string; piCli: string } | null => {
-			let wtExe: string | null;
-			let piCli: string;
-			try {
-				wtExe = findWindowsTerminal();
-				piCli = findPiCli();
-			} catch (err) {
-				ctx.ui.notify(`❌ 启动环境不可用：${err instanceof Error ? err.message : String(err)}`, "error");
-				return null;
-			}
-			if (!wtExe) {
-				ctx.ui.notify("❌ 未找到 Windows Terminal (wt.exe)。", "error");
-				return null;
-			}
-			return { wtExe, piCli };
-		};
-
-		/** ② 参数设置：交互式修改并发度/时限/轮数（read-modify-write 单键 + 备份）。 */
-		const configureParams = async (ctx: ExtensionCommandContext): Promise<void> => {
-			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
-			const cur = normalizeUserSettings(block);
-
-			const concLabels = [
-				`1（严格串行：省 KV 池，墙钟 3×）${cur.laneConcurrency === 1 ? " ✓" : ""}`,
-				`2（双路并发）${cur.laneConcurrency === 2 ? " ✓" : ""}`,
-				`3（三路全并发：快，但共享 KV 池可能不够）${cur.laneConcurrency === 3 ? " ✓" : ""}`,
-			];
-			const picked = await ctx.ui.select("lane 并发度（本机 KV 池是共享的，三路并发可能撞池）:", concLabels);
-			if (!picked) return;
-			const laneConcurrency = (concLabels.indexOf(picked) + 1) as 1 | 2 | 3;
-
-			const timeLabels = ["15 分钟", "30 分钟", "45 分钟（默认）", "60 分钟", "90 分钟"];
-			const timeVals = [15, 30, 45, 60, 90];
-			const pickedT = await ctx.ui.select(`单 lane 墙钟时限（当前 ${cur.maxWallClockPerLaneMin}min）:`, timeLabels);
-			if (!pickedT) return;
-			const maxWallClockPerLaneMin = timeVals[timeLabels.indexOf(pickedT)];
-
-			const r = writeTfBlock(tfConfigPath(), { laneConcurrency, maxWallClockPerLaneMin });
-			if (!r.ok) {
-				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
-				return;
-			}
-			ctx.ui.notify(
-				`✅ 已保存：并发度 ${laneConcurrency}，lane 时限 ${maxWallClockPerLaneMin}min\n备份：${r.backupPath}`,
-				"info",
-			);
-		};
-
-		/** ③ 融合模型：设置面能设，消费链才够得着（2026-11-02）。 */
-		const configureFusionModel = async (ctx: ExtensionCommandContext): Promise<void> => {
-			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
-			const cur = readFusionModels(block).fusionModel;
-			const allModels = ctx.modelRegistry.getAvailable()
-				.slice()
-				.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
-			const labels = ["不使用融合（collect 完成后零动作，报告等人读）", ...allModels.map((m) => `${m.provider}/${m.id}`)];
-			const picked = await ctx.ui.select(`融合模型（当前 ${cur ?? "(未设)"}）：`, labels);
-			if (!picked) return;
-			const patch = picked.startsWith("不使用") ? { fusionModel: undefined } : { fusionModel: picked };
-			const r = writeTfBlock(tfConfigPath(), patch);
-			if (!r.ok) {
-				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
-				return;
-			}
-			ctx.ui.notify(
-				`✅ 融合模型：${picked.startsWith("不使用") ? "已关闭（跳过，零模型调用）" : picked}
-` +
-					`生效范围：下一次 trace-fusion run 的 collect 完成后自动派融合（只读，产物 <runDir>/fusion/fusion.md）。
-` +
-					`备份：${r.backupPath}`,
-				"info",
-			);
-		};
-
-		/** ① 模型设置：三路 lane 分别选（也可以三路同一个）。 */
-		const configureModels = async (ctx: ExtensionCommandContext): Promise<void> => {
-			const block = readTfBlock(JSON.parse(readFileSync(tfConfigPath(), "utf8")) as Record<string, unknown>);
-			const curLanes = readLaneModels(block);
-			const allModels = ctx.modelRegistry.getAvailable()
-				.slice()
-				.sort((a, b) => `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`));
-			if (allModels.length === 0) {
-				ctx.ui.notify("❌ 无可用模型（检查 /model 或 models.json）。", "error");
-				return;
-			}
-
-			const clearLabel = "(用 lane 默认模型)";
-			const modelLabels = [
-				clearLabel,
-				...allModels.map((m) => {
-					const ref = `${m.provider}/${m.id}`;
-					const detail = m.name && m.name !== m.id ? ` — ${m.name}` : "";
-					const ctxW = (m as { contextWindow?: number }).contextWindow;
-					return `${ref}${detail}${ctxW ? ` (ctx ${Math.round(ctxW / 1024)}K)` : ""}`;
-				}),
-			];
-
-			const next: Partial<Record<"A" | "B" | "C", string | undefined>> = {};
-			for (const lane of ["A", "B", "C"] as const) {
-				const current = curLanes[lane];
-				const labeled = modelLabels.map((l) =>
-					l === clearLabel && current ? `${l} [当前: ${current}]` : l === `${current}` ? `${l} ✓` : l,
-				);
-				const picked = await searchableSelect(ctx, `TRACE ${lane} 用哪个模型?`, labeled);
-				if (!picked) break; // 取消 ⇒ 不写入任何已选的（避免半套设置）
-				if (picked.startsWith(clearLabel)) next[lane] = undefined;
-				else next[lane] = picked.replace(/ ✓$/, "").replace(/ \(ctx \d+K\)$/, "").split(" — ")[0].trim();
-			}
-			if (Object.keys(next).length === 0) return;
-
-			const r = writeTfBlock(tfConfigPath(), { workerModelByLane: next });
-			if (!r.ok) {
-				ctx.ui.notify(`❌ 保存失败：${r.error}`, "error");
-				return;
-			}
-			const applied = Object.entries(next)
-				.map(([k, v]) => `${k}=${v ?? "(默认)"}`)
-				.join(" | ");
-			ctx.ui.notify(`✅ lane 模型已保存：${applied}\n备份：${r.backupPath}`, "info");
-		};
-
-		pi.registerCommand("trace-fusion", {
-			description: "三路独立诊断 + 融合：/trace-fusion <任务> 启动 | models 设模型 | config 设参数",
-			handler: async (args, ctx) => {
-				if (!capabilities().launchTabs) {
-					ctx.ui.notify("⛔ 当前会话无 trace-fusion 启动权限（仅主会话）", "error");
-					return;
-				}
-				const text = (args ?? "").trim();
-				const sub = text.split(/\s+/)[0]?.toLowerCase() ?? "";
-
-				if (sub === "models") return configureModels(ctx);
-				if (sub === "config" || sub === "settings") return configureParams(ctx);
-				if (sub === "fusion") return configureFusionModel(ctx);
-
-				// 无参数 或 show：展示当前设置（这是用户「忘了自己设了什么」时的唯一查面）
-				if (!text || sub === "show" || sub === "status") {
-					const lines = renderSettingsSummary(tfConfigPath());
-					ctx.ui.notify(
-						[
-							"🧬 trace-fusion 当前设置",
-							...lines,
-							"",
-							"用法：",
-							"  /trace-fusion <任务>    启动三路诊断",
-							"  /trace-fusion models    设置三路模型",
-							"  /trace-fusion config    设置并发度/时限",
-							"  /trace-fusion fusion  设置融合模型（未设 ⇒ 不融合）",
-						].join("\n"),
-						"info",
-					);
-					return;
-				}
-
-				const env = resolveLaunchEnv(ctx);
-				if (!env) return;
-				const tfConfig = readTraceFusionConfig();
-				const result = launchTraceRun({
-					task: text,
-					repoRoot: process.cwd(),
-					wtExe: env.wtExe,
-					piCli: env.piCli,
-					config: tfConfig,
-					runsDir: defaultTraceFusionRunsDir(),
-				});
-				for (const line of result.lines ?? []) ctx.ui.notify(line, "info");
-				if (!result.ok) {
-					ctx.ui.notify(`❌ trace-fusion 启动失败：${result.error}`, "error");
-					return;
-				}
-				try {
-					for (const lane of TRACE_LANES) {
-						recordLink({
-							sessionId: sessionIdentity(ctx as never),
-							kind: "tab",
-							targetId: result.meta.lanes[lane].tabRunId,
-							detail: `trace-fusion ${result.meta.runId} lane=${lane}`,
-						});
-					}
-				} catch {
-					/* 溯源失败不阻塞 */
-				}
-				ctx.ui.notify(
-					`🧬 run ${result.meta.runId} 已启动：TRACE A/B/C 三路独立求解中。\n` +
-					`lane 时限 ${result.meta.laneWallClockMin}min，超时 lane 判 failed 走 2/3 降级。\n` +
-					`完成时会自动通知；报告在 ${result.meta.runDir}/cross-test-report.md`,
-					"info",
-				);
-			},
-		});
-
-		// ── /trace-fusion-fuse <runId>（2026-11-04，S2/S3）────────────────────
-		// 把「融合」显式拉成一次**同步 subagent 调用**：融合者以 agent="fusion" 出现在本次
-		// tool/命令调用里，结果直接回显（不再是「盘上一个没人读的 json」）。
-		// 自动链（lane 全部终态后由 collect worker 触发）仍是 headless 异步——那是结构约束：
-		// 它发生在事件回调里，同步阻塞会冻住 TUI。本命令是给人手动跑/重跑融合用的。
-		pi.registerCommand("trace-fusion-fuse", {
-			description: "同步跑一次融合（把 trace-fusion run 的三路诊断拼装成推进方案）：/trace-fusion-fuse <runId>",
-			handler: async (args, ctx) => {
-				const runId = (args ?? "").trim();
-				if (!runId) {
-					ctx.ui.notify("用法：/trace-fusion-fuse <runId>；runId 见 ~/.pi/agent/trace-fusion-runs/ 目录名", "error");
-					return;
-				}
-				const meta = readTraceRunMeta(join(defaultTraceFusionRunsDir(), runId));
-				if (!meta) {
-					ctx.ui.notify(`run meta 不可读：${runId}`, "error");
-					return;
-				}
-				const reportPath = join(meta.runDir, "cross-test-report.md");
-				const cfg = readTraceFusionConfig(join(PKG_DIR, "config.json"));
-				if (!cfg.fusionModel) {
-					ctx.ui.notify("未配置 traceFusionLoop.fusionModel ⇒ 融合不启动（不自动挑模型）", "error");
-					return;
-				}
-				ctx.ui.notify(`🧬 融合开始（同步，模型 ${cfg.fusionModel}）…`, "info");
-				const runner = makeSubagentFusionRunner({
-					runWithFallback: (agent, task, systemPrompt, model, timeoutMs, signal, onUpdate, opts2) =>
-						runWithFallback(agent as AgentDef | null, task, systemPrompt, model, timeoutMs, signal, onUpdate as never, opts2 as never) as never,
-					findAgent: (name) => agents.find((a) => a.name === name) ?? null,
-				});
-				const res = await dispatchFusion({
-					runId: meta.runId,
-					runDir: meta.runDir,
-					repoRoot: meta.repoRoot,
-					reportPath,
-					fusionModel: cfg.fusionModel,
-					laneModel: meta.lanes?.A ? undefined : undefined,
-					dispatcherSessionId: meta.dispatcherSessionId,
-					piCli: findPiCli() ?? undefined,
-					runFusionAgent: runner,
-					via: "subagent-runWithFallback(manual)",
-				});
-				ctx.ui.notify(
-					res.status === "completed"
-						? `✅ 融合完成：${res.reportPath}`
-						: `❌ 融合未完成（${res.status}）：${res.reason}`,
-					res.status === "completed" ? "info" : "error",
-				);
-			},
-		});
-
-		pi.registerCommand("trace-fusion-clean", {
-			description: "清理 trace-fusion run 的 worktree 占用（保留 artifact）：/trace-fusion-clean <runId> [--force]",
-			handler: async (args, ctx) => {
-				const raw = (args ?? "").trim();
-				const force = /(^|\s)--force(\s|$)/.test(raw);
-				const runId = raw.replace(/--force/g, "").trim();
-				if (!runId) {
-					ctx.ui.notify("用法：/trace-fusion-clean <runId> [--force]；runId 见 ~/.pi/agent/trace-fusion-runs/ 目录名（/trace-fusion-status 已退场）", "error");
-					return;
-				}
-				const result = cleanTraceRun(runId, { force, runsDir: defaultTraceFusionRunsDir() });
-				for (const line of result.lines) ctx.ui.notify(line, "info");
-				if (!result.ok) {
-					ctx.ui.notify(`清理失败：${result.error}`, "error");
-					return;
-				}
-				ctx.ui.notify(`✅ 清理完成：${result.removedWorktrees.length} 个 worktree 已移除`, "info");
-			},
-		});
-	}
 }

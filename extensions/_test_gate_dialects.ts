@@ -83,4 +83,13 @@ const ZH_HEAD = "# T\n\n## 待办事项 (Todo)\n\n### 任务简报索引\n\n| It
 	assert.equal(readGateStatus(repo("no-active", "# T\n\n## 别的区段\n\n### Task Index\n\n| Item | Priority | Summary |\n"), []), "unknown", "无 Active 区段 → unknown");
 }
 
+// ⑤ 回退列表模式（兼容未维护 Task Index 汇总表、直接平铺 Item 的老仓库，如 GreenCAD / SBS）：
+{
+	const itemAwait = "# T\n\n## Active Tasks\n\n### Item 1 — 标题\n- **任务简报索引**: 描述\n- **状态**: 待宿主验收\n";
+	assert.equal(readGateStatus(repo("item-await", itemAwait), []), "awaiting", "无汇总表但条目含待人工 → awaiting");
+
+	const itemOk = "# T\n\n## Active Tasks\n\n### Item 2 — 标题\n- **任务简报索引**: 描述\n- **状态**: 正常进行中\n";
+	assert.equal(readGateStatus(repo("item-ok", itemOk), []), "ok", "无汇总表且条目无等人工 → ok");
+}
+
 console.log("gate dialects tests passed");

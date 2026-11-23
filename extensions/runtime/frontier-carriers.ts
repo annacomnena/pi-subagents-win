@@ -151,17 +151,25 @@ export function readGateStatus(repoPath: string, warnings: string[]): GateStatus
 			return "unknown";
 		}
 		let sawIndex = false; let colsOk = false; let awaiting = false;
+		let sawItemOrStatus = false;
 		for (const line of section.split("\n")) {
 			if (GATE_INDEX_HEADING.test(line)) { sawIndex = true; continue; }
-			if (GATE_STATUS_LINE.test(line) && GATE_AWAITING.test(line)) awaiting = true;
+			const isStatus = GATE_STATUS_LINE.test(line);
+			if (isStatus || /^###\s+(?:Item\s+\d+|条目\s*\d+)/i.test(line)) {
+				sawItemOrStatus = true;
+			}
+			if (isStatus && GATE_AWAITING.test(line)) awaiting = true;
 			if (sawIndex && !colsOk && line.includes("|")) {
 				const h = line.toLowerCase();
 				colsOk = GATE_HEADER_COLS.every((alias) => alias.some((a) => h.includes(a.toLowerCase())));
 				if (!colsOk) { warn(warnings, `gate 表头漂移降级 unknown: ${basename(repoPath)}`); return "unknown"; }
 			}
 		}
-		if (!sawIndex || !colsOk) return "unknown";
-		return awaiting ? "awaiting" : "ok";
+		// 1. 标准汇总表格模式（有 Task Index 且表头匹配）
+		if (sawIndex && colsOk) return awaiting ? "awaiting" : "ok";
+		// 2. 条目回退模式（兼容未维护 Task Index 汇总表、直接平铺 Item 条目的老旧仓库）
+		if (!sawIndex && sawItemOrStatus) return awaiting ? "awaiting" : "ok";
+		return "unknown";
 	} catch { return "unknown"; }
 }
 

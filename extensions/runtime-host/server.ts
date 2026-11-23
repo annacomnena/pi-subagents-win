@@ -140,8 +140,10 @@ import { readLiveness } from "../runtime/liveness.ts";
 // 2026-10-30 会话存活状态机（S2 探针 + GUI「活跃中」筛选共用单一事实源）
 import {
 	defaultTabRunsDir,
+	isUnconfirmedFallback,
 	listTabDispatches,
 	probeSessionsForDispatch,
+	readTabResultFile,
 	readTabState,
 	sessionBucketForCwd,
 } from "../tab-runs.ts";
@@ -155,11 +157,26 @@ import {
 	type SessionLivenessVerdict,
 } from "../runtime/session-liveness.ts";
 import { readSessionUsage } from "../runtime/session-usage.ts";
+import { collectTokenStats } from "../runtime/token-stats.ts";
 import { gcSessionOwners, probeSessionOwner, readSessionOwner, sessionOwnerDir } from "../runtime/session-owner.ts";
 import { readNotify } from "../runtime/notify-bridge.ts";
 import { ackIncident, deliveryDir } from "../delivery-ledger.ts";
+import { parseWorkspaceOverview } from "./recentwork-parser.ts";
 import { UPLOAD_MAX_BYTES, pruneUploads, saveUpload, uploadsDir } from "./uploads.ts";
-import { executeCommand, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
+// 2026-11-20 GUI 文档预览：路径解析/有界读取/系统打开（纯逻辑在 file-preview.ts，本文件只做薄绑定）
+import { assertResolvedPathInRoots, isDangerousOpenTarget, launchSystemAction, readTextPreview, resolvePreviewPath, deriveWorkspaceRoots, type SystemAction, type SystemActionResult } from "./file-preview.ts";
+// 会话 Note（旁路便签）：共享纯库；三端同源，host 只做薄绑定 + 错误映射（设计稿 §3）
+import { readSessionNote, writeSessionNote } from "../session-note.ts";
+// 2026-11-20 GUI 仓库快捷按钮：配置/提案/决策纯逻辑在 gui-shortcuts.ts，本文件只做鉴权 + 薄绑定
+import {
+	defaultShortcutsDirs, readShortcuts, upsertAction, deleteAction,
+	listProposalViews, decideProposal, applyDecisionOps, proposalApplied, markInjected, repoKey, readProposal,
+} from "../gui-shortcuts.ts";
+// P3 执行器：script/process 运行、进程匹配、取消（纯逻辑在 gui-shortcuts-runner.ts）
+import {
+	runScript, terminateProcess, cancelRun, type RunnerDeps,
+} from "../gui-shortcuts-runner.ts";
+import { executeCommand, RUNTIME_HOST_ISSUER, type TrustedMasterInjectionPolicy } from "../runtime/command-executor.ts";
 // 2026-10-30 S2：向已死会话发消息时拉起它（owner 裁决：GUI 专属、新开可见 WT tab）
 import { canSessionBeRescued, decideSendAction, isSpawnPermitted, readSessionCwdFromFile } from "../runtime/session-resume.ts";
 import { parseObjectAddress } from "../runtime/address.ts";
@@ -200,7 +217,9 @@ import { ChannelSupervisor } from "./channel-supervisor.ts";
 import { startDeliveryReconcilerLoop, type DeliveryReconcilerLoopHandle } from "./delivery-reconciler-loop.ts";
 import { setAutonomyEnabled } from "./autonomy-config.ts";
 import { readAutonomyConfig } from "../runtime/autonomy/config.ts";
-import { readFrontierSnapshot, readWakeGateState } from "../runtime/autonomy/collect.ts";
+import { readFrontierSnapshot, readWakeGateState, readAutonomyHeartbeat, frontierFreshness } from "../runtime/autonomy/collect.ts";
+import { buildAutonomyStatusBody } from "../runtime/autonomy/status-body.ts";
+import { listOpenSupervisionEntries, thresholdsOf } from "../runtime/supervision.ts";
 import { readKillSwitch } from "../runtime/autonomy/kill-switch.ts";
 import { ARTIFACT_REF_RE, startWechatInput } from "./wechat-input.ts";
 import { startWechatReplyWatcher } from "./wechat-reply.ts";
@@ -1778,6 +1797,22 @@ export interface RuntimeHostServerOptions {
 	wechatFetch?: WechatFetch;
 	/** 0923 wechat：QR 轮询节拍 ms（缺省 2500；测试注入加速）。 */
 	wechatPollIntervalMs?: number;
+	/**
+	 * 2026-11-20 文件预览：系统打开动作的注入点（测试用桩，不弹真实资源管理器）。
+	 * 缺省 = file-preview.ts::launchSystemAction（spawn explorer/open/xdg-open）。
+	 */
+	systemActionLauncher?: (action: SystemAction, path: string) => SystemActionResult | Promise<SystemActionResult>;
+	/**
+	 * 文件预览的允许根（测试注入；缺省 = daemon cwd + 所有已知会话 cwd，30s 缓存）。
+	 * 路径超出该集合一律 400 out-of-scope；不接受客户端自报 cwd 扩大范围。
+	 */
+	fileRootsProvider?: () => readonly string[];
+	/** 会话 Note 根目录（缺省 defaultAgentDir()/session-notes；测试注入隔离）。 */
+	agentDir?: string;
+	/** 2026-11-20 仓库快捷按钮根目录（缺省 defaultAgentDir()/gui-shortcuts；测试注入隔离）。 */
+	shortcutsDir?: string;
+	/** P3 执行器依赖注入（测试用假 spawn/枚举/kill；生产不传）。 */
+	shortcutsRunnerDeps?: RunnerDeps;
 }
 
 export interface RuntimeHostHandle {
@@ -2532,6 +2567,400 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 		respondJson(res, 405, { error: "method-not-allowed", hint: "/v1/wechat/*：POST enable | disable | bind/start | bind/cancel | unbind；GET bind/status | bind/qr-image | worker/status | inbox" });
 	};
 
+	/**
+	 * 2026-11-20 GUI 文档预览写端点（POST /v1/files/{read,open,reveal}）。
+	 *
+	 * 鉴权沿用 authorizeCommand（与 /v1/commands、/v1/uploads 同源，不开新面）；
+	 * body 上限 16 KiB（只有 path + cwd 两个字符串），读文件上限见 file-preview.ts。
+	 * 纯逻辑一律去 file-preview.ts，本函数只做：鉴权 → 收 body → 解析 → 错误码映射。
+	 */
+	const FILE_ACTION_BODY_LIMIT = 16 * 1024;
+	/**
+	 * 允许根 = daemon cwd + 所有已知会话 cwd（30s 缓存；listPiSessions 扫 1100+ 会话，不宜每请求跑）。
+	 * **只用于 open（默认应用打开）的范围门禁**，以及 read/reveal 相对路径找文件时的候选基准顺序；
+	 * read/reveal 不因不在允许集而被拒（只读/定位不执行任何东西，按工作区挡会误伤家目录里的正常文档）。
+	 * 索引失败 ⇒ 只剩 daemon cwd。
+	 */
+	let fileRootsCache: { at: number; roots: string[] } | null = null;
+	const derivedFileRoots = (): string[] => {
+		if (fileRootsCache !== null && Date.now() - fileRootsCache.at < 30_000) return fileRootsCache.roots;
+		const cwds: Array<string | null> = [];
+		try {
+			for (const s of listPiSessions(opts.sessionsDir ?? defaultSessionsDir())) cwds.push(s.cwd);
+		} catch { /* 索引失败 ⇒ 只剩 daemon cwd（fail-closed） */ }
+		const roots = deriveWorkspaceRoots(cwds, process.cwd());
+		fileRootsCache = { at: Date.now(), roots };
+		return roots;
+	};
+	const handlePostFileAction = (req: IncomingMessage, res: ServerResponse, action: SystemAction | "read"): void => {
+		if (!authorizeCommand(req)) {
+			respondJson(res, 401, { error: "unauthorized", hint: `POST /v1/files/${action} 需本机 token（同 /v1/commands）` });
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if (presentsGuiCookie(req) && !readGuiEnabled(configPath)) {
+			respondGuiOffClear(res);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if (req.method !== "POST") {
+			respondJson(res, 405, { error: "method-not-allowed", hint: `/v1/files/${action} 仅接受 POST` });
+			return;
+		}
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let responded = false;
+		req.on("data", (c: Buffer) => {
+			if (responded) return;
+			size += c.length;
+			if (size > FILE_ACTION_BODY_LIMIT) {
+				responded = true;
+				respondJson(res, 413, { error: "payload-too-large", hint: `body 限 ${FILE_ACTION_BODY_LIMIT} 字节` });
+				try { req.destroy(); } catch { /* ignore */ }
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("error", () => {
+			if (responded) return;
+			responded = true;
+			respondJson(res, 400, { error: "request-error" });
+		});
+		req.on("end", () => {
+			if (responded) return;
+			responded = true;
+			void (async () => {
+				let input: unknown;
+				try { input = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
+				catch { respondJson(res, 400, { error: "invalid-body" }); return; }
+				if (typeof input !== "object" || input === null) {
+					respondJson(res, 400, { error: "invalid-body", hint: "body 须为 JSON 对象 {path, cwd?}" });
+					return;
+				}
+				const rawPath = (input as { path?: unknown }).path;
+				const rawCwd = (input as { cwd?: unknown }).cwd;
+				if (typeof rawPath !== "string" || (rawCwd !== undefined && rawCwd !== null && typeof rawCwd !== "string")) {
+					respondJson(res, 400, { error: "invalid-body", hint: "path 须为字符串，cwd 须为字符串或 null" });
+					return;
+				}
+				const roots = opts.fileRootsProvider !== undefined ? opts.fileRootsProvider() : derivedFileRoots();
+				// 按动作分级：只有 open（默认应用打开）有执行语义，走 strict 范围门禁；
+				// read（右栏只读预览）/ reveal（资源管理器定位）走 relaxed，不按工作区挡路径。
+				const strict = action === "open";
+				const resolved = resolvePreviewPath(
+					{ path: rawPath, cwd: typeof rawCwd === "string" ? rawCwd : null },
+					process.cwd(), roots, strict ? "strict" : "relaxed",
+				);
+				if (!resolved.ok) {
+					respondJson(res, 400, { error: resolved.error, hint: resolved.hint });
+					return;
+				}
+				// I-2：只有 open 需要 realpath 二次判范围，堵住工作区内 junction/symlink 指向根外的逃逸。
+				// read/reveal 不执行目标、也不按工作区限制，跳过这道门禁。
+				if (strict) {
+					const real = assertResolvedPathInRoots(resolved.path, roots);
+					if (!real.ok) {
+						respondJson(res, 400, { error: real.error, hint: real.hint, path: resolved.path });
+						return;
+					}
+				}
+				if (action === "read") {
+					const preview = readTextPreview(resolved.path);
+					if (!preview.ok) {
+						const status = preview.error === "not-found" ? 404 : preview.error === "too-large" ? 413 : 400;
+						respondJson(res, status, { error: preview.error, hint: preview.hint, path: resolved.path, base: resolved.base });
+						return;
+					}
+					respondJson(res, 200, { version: 1, ...preview, base: resolved.base });
+					return;
+				}
+				// 扩展名门禁放在路由层（而非只放默认 launcher）：注入的 launcher 也必须受同一约束，
+				// 测试才能经真实 HTTP 接线验证「点 .bat 不会执行」。
+				if (action === "open" && isDangerousOpenTarget(resolved.path)) {
+					respondJson(res, 400, {
+						error: "executable-rejected",
+						hint: "仅文档类文件支持默认应用打开（脚本/源码/未知类型可能被系统直接执行，如 .py/.js）；请用「打开文件夹」查看它",
+						path: resolved.path,
+						base: resolved.base,
+					});
+					return;
+				}
+				try {
+					const launcher = opts.systemActionLauncher ?? launchSystemAction;
+					const launched = await launcher(action, resolved.path);
+					if (!launched.ok) {
+						respondJson(res, 400, { error: launched.error, hint: launched.hint, path: resolved.path, base: resolved.base });
+						return;
+					}
+					respondJson(res, 200, { version: 1, ok: true, action, path: resolved.path, base: resolved.base, launched: true });
+				} catch (e) {
+					respondJson(res, 500, { error: "launch-failed", hint: String((e as Error).message ?? e) });
+				}
+			})();
+		});
+	};
+
+	/**
+	 * 2026-11-20 仓库快捷按钮：配置目录（测试注入 opts.shortcutsDir 隔离；缺省 agentDir/gui-shortcuts）。
+	 * agentDir 与 shortcutsDir 都注入时以 shortcutsDir 为准。
+	 */
+	const shortcutsDirs = (): ReturnType<typeof defaultShortcutsDirs> =>
+		opts.shortcutsDir !== undefined ? { root: opts.shortcutsDir } : defaultShortcutsDirs(opts.agentDir);
+
+	/** 收 POST body（有界），返回解析后的对象；失败时已 respond 并返回 null。 */
+	const readJsonBody = (
+		req: IncomingMessage, res: ServerResponse, limit: number,
+	): Promise<Record<string, unknown> | null> => new Promise((resolve) => {
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let responded = false;
+		req.on("data", (c: Buffer) => {
+			if (responded) return;
+			size += c.length;
+			if (size > limit) {
+				responded = true;
+				respondJson(res, 413, { error: "payload-too-large", hint: `body 限 ${limit} 字节` });
+				try { req.destroy(); } catch { /* ignore */ }
+				resolve(null);
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("error", () => {
+			if (responded) return;
+			responded = true;
+			respondJson(res, 400, { error: "request-error" });
+			resolve(null);
+		});
+		req.on("end", () => {
+			if (responded) return;
+			responded = true;
+			let parsed: unknown;
+			try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
+			catch { respondJson(res, 400, { error: "invalid-body" }); resolve(null); return; }
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+				respondJson(res, 400, { error: "invalid-body", hint: "body 须为 JSON 对象" });
+				resolve(null); return;
+			}
+			resolve(parsed as Record<string, unknown>);
+		});
+	});
+
+	/** 把 gui-shortcuts 的写错误映射到 HTTP（与 session-note 同款口径）。 */
+	const respondShortcutWriteError = (res: ServerResponse, r: { reason: string; detail?: string; currentHash?: string }): void => {
+		if (r.reason === "conflict") {
+			respondJson(res, 409, { ok: false, error: "conflict", reason: "config-changed", currentHash: r.currentHash, hint: "配置已在别处更新；请重新载入（本地草稿保留）" });
+		} else if (r.reason === "lock-busy") {
+			try { res.setHeader("retry-after", "1"); } catch { /* ignore */ }
+			respondJson(res, 503, { ok: false, error: "lock-busy", message: r.detail });
+		} else if (r.reason === "invalid-cwd" || r.reason === "invalid-action") {
+			respondJson(res, 400, { ok: false, error: r.reason, message: r.detail });
+		} else if (r.reason === "corrupt" || r.reason === "read-failed") {
+			respondJson(res, 500, { ok: false, error: r.reason, message: r.detail, hint: "配置文件读取失败或已损坏；原文件未被改动" });
+		} else {
+			respondJson(res, 500, { ok: false, error: r.reason, message: r.detail });
+		}
+	};
+
+	/**
+	 * 用户同意后，把「自包含批准指令」回注给提案来源会话（需求 2 的 agent 动手改）。
+	 * 消息含主配置绝对路径 + 完整 ops + 编辑方法，跨 turn/压缩不丢失；agent 用自带
+	 * Write/Edit 工具改配置（不需要 shell/CLI/capability，v4 §4.1）。
+	 * 失败（会话不存在 / master 护栏 / IO）不影响 decide 本身——前端有「复制指令 / 由 host 应用」出口。
+	 * 返回是否成功注入（用于 markInjected 与响应体提示）。
+	 */
+	const injectApprovalToAgent = (
+		req: IncomingMessage,
+		proposal: { proposalId: string; cwd: string; sourceSession: string; ops: unknown },
+		dirs: ReturnType<typeof defaultShortcutsDirs>,
+	): { injected: boolean; reason?: string } => {
+		const sid = proposal.sourceSession;
+		// sid 必须能解析成 pi:// 地址（否则 agent 无从接收）
+		if (typeof sid !== "string" || sid.length === 0 || sid.length > 128 || !/^[A-Za-z0-9_-]+$/.test(sid)) {
+			return { injected: false, reason: "invalid-source-session" };
+		}
+		const key = repoKey(proposal.cwd);
+		if (key === null) return { injected: false, reason: "invalid-cwd" };
+		const shortcutsConfigPath = join(dirs.root, `${key}.json`);
+		const opLines = (proposal.ops as Array<{ op: string; action?: { label?: string; id?: string; kind?: string; command?: string; url?: string; path?: string; matchCommandLine?: string }; targetId?: string }> ?? [])
+			.map((op) => {
+				if (op.op === "add" || op.op === "update") {
+					const a = op.action ?? {};
+					const body = a.kind === "script" ? `${a.command ?? ""}` : a.kind === "url" ? `${a.url ?? ""}` : a.kind === "file" ? `${a.path ?? ""}` : `${a.matchCommandLine ?? ""}`;
+					return `  ${op.op === "add" ? "+" : "~"} ${a.label ?? a.id ?? ""} (${a.kind ?? "?"} ${body})`;
+				}
+				return `  - ${op.targetId ?? ""}`;
+			})
+			.join("\n");
+		const text = [
+			`### 仓库快捷按钮：提案 ${proposal.proposalId} 已获用户批准`,
+			`请用你的文件编辑工具修改这份配置：${shortcutsConfigPath}`,
+			`按以下改动修改 actions 数组（提案基于仓库 cwd=${proposal.cwd}）：`,
+			opLines,
+			"要求：先重新读取该文件（可能已被其他改动更新），用精确编辑修改，不要整文件覆盖；改完回复一句确认。",
+		].join("\n");
+		// 构造 session.message 帧；commandKey 由 proposalId 派生 ⇒ 重复同意不重复注入（幂等）。
+		const commandKey = `gui-shortcut-apply-${proposal.proposalId}`;
+		const frame: import("../runtime/protocol.ts").CommandFrame = {
+			frame: "command", type: "session.message",
+			to: piSessionAddress(sid), issuedBy: RUNTIME_HOST_ISSUER,
+			commandKey, issuedAt: new Date().toISOString(),
+			payload: { text, reason: "gui-shortcut-approval" },
+		};
+		// master 会话护栏：复用与 handlePostCommand 同源的三证据策略。
+		let trusted: import("../runtime/command-executor.ts").TrustedMasterInjectionPolicy | undefined;
+		const att = getMasterStatus().attachment;
+		if (att && att.sessionId === sid) {
+			const tl = checkTrustedLocalChannel(req, hostToken, self.port);
+			trusted = {
+				trustedLocal: tl.ok, guiEnabled: readGuiEnabled(configPath),
+				masterAlive: sessionAlive(opts.timersDir ?? defaultTimersDir(), sid, new Date(), SESSION_HEARTBEAT_GRACE_MS),
+				source: `gui-shortcuts via=${tl.via ?? "none"}`,
+			};
+		}
+		const outcome = executeCommand(frame, {
+			stateDir: opts.stateDir, journalPath: opts.journalPath,
+			configPath, sessionsDir: opts.sessionsDir,
+			uploadsDir: uploadsDir(uploadsRuntimeDir),
+			...(trusted !== undefined ? { trustedMasterInjection: trusted } : {}),
+		});
+		if (outcome.status === "accepted") {
+			markInjected(proposal.proposalId, dirs);
+			return { injected: true };
+		}
+		return { injected: false, reason: outcome.reason ?? String(outcome.status) };
+	};
+
+	/**
+	 * POST /v1/gui/shortcuts 及子路径（decide / host-apply / run / cancel，见 P2/P3）。
+	 * 鉴权沿用 authorizeCommand；GET 读投影在下方 switch（本机只读面，不鉴权）。
+	 */
+	const handlePostShortcuts = async (req: IncomingMessage, res: ServerResponse, u: URL): Promise<void> => {
+		if (!authorizeCommand(req)) {
+			respondJson(res, 401, { error: "unauthorized", hint: "快捷按钮写端点需本机 token（同 /v1/commands）" });
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		if (presentsGuiCookie(req) && !readGuiEnabled(configPath)) {
+			respondGuiOffClear(res);
+			try { req.destroy(); } catch { /* ignore */ }
+			return;
+		}
+		const path = u.pathname;
+		const dirs = shortcutsDirs();
+
+		if (path === "/v1/gui/shortcuts") {
+			const b = await readJsonBody(req, res, 64 * 1024);
+			if (b === null) return;
+			const cwd = b.cwd;
+			const expectedHash = b.expectedHash;
+			if (typeof cwd !== "string" || typeof expectedHash !== "string") {
+				respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { cwd, expectedHash, action }" }); return;
+			}
+			const r = upsertAction(cwd, b.action, expectedHash, dirs);
+			if (!r.ok) { respondShortcutWriteError(res, r); return; }
+			respondJson(res, 200, { ok: true, config: r.config, contentHash: r.contentHash });
+			return;
+		}
+
+		if (path === "/v1/gui/shortcuts/delete") {
+			const b = await readJsonBody(req, res, 16 * 1024);
+			if (b === null) return;
+			const { cwd, id, expectedHash } = b;
+			if (typeof cwd !== "string" || typeof id !== "string" || typeof expectedHash !== "string") {
+				respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { cwd, id, expectedHash }" }); return;
+			}
+			const r = deleteAction(cwd, id, expectedHash, dirs);
+			if (!r.ok) { respondShortcutWriteError(res, r); return; }
+			respondJson(res, 200, { ok: true, config: r.config, contentHash: r.contentHash });
+			return;
+		}
+
+		if (path === "/v1/gui/shortcuts/proposal/decide") {
+			const b = await readJsonBody(req, res, 16 * 1024);
+			if (b === null) return;
+			const { cwd, proposalId, decision } = b;
+			if (typeof cwd !== "string" || typeof proposalId !== "string" || (decision !== "approved" && decision !== "declined")) {
+				respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { cwd, proposalId, decision: approved|declined }" }); return;
+			}
+			const r = decideProposal(cwd, proposalId, decision, dirs);
+			if (!r.ok) {
+				if (r.reason === "stale") respondJson(res, 409, { ok: false, error: "stale", currentHash: r.currentHash, hint: "配置已变化，提案基于的版本过期；请让 agent 重新提案" });
+				else if (r.reason === "lock-busy") { try { res.setHeader("retry-after", "1"); } catch { /* ignore */ } respondJson(res, 503, { ok: false, error: r.reason }); }
+				else respondJson(res, 400, { ok: false, error: r.reason, message: r.detail });
+				return;
+			}
+			// 同意后回注自包含指令给 agent（需求 2 核心）；失败不阻塞 decide，UI 用降级出口。
+			let injected = false;
+			let injectReason: string | undefined;
+			if (decision === "approved") {
+				const proposal = readProposal(proposalId, dirs);
+				if (proposal !== null) {
+					const inj = injectApprovalToAgent(req, proposal, dirs);
+					injected = inj.injected;
+					injectReason = inj.reason;
+				} else { injectReason = "proposal-missing"; }
+			}
+			respondJson(res, 200, { ok: true, decision: r.decision, injected, injectReason });
+			return;
+		}
+
+		if (path === "/v1/gui/shortcuts/host-apply") {
+			const b = await readJsonBody(req, res, 16 * 1024);
+			if (b === null) return;
+			const { cwd, proposalId } = b;
+			if (typeof cwd !== "string" || typeof proposalId !== "string") {
+				respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { cwd, proposalId }" }); return;
+			}
+			const r = applyDecisionOps(cwd, proposalId, dirs);
+			if (!r.ok) { respondShortcutWriteError(res, r); return; }
+			respondJson(res, 200, { ok: true, config: r.config, contentHash: r.contentHash, applied: r.applied });
+			return;
+		}
+
+		if (path === "/v1/gui/shortcuts/run") {
+			const b = await readJsonBody(req, res, 16 * 1024);
+			if (b === null) return;
+			const { cwd, id } = b;
+			if (typeof cwd !== "string" || typeof id !== "string") {
+				respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { cwd, id }" }); return;
+			}
+			// 安全核心：命令内容只从磁盘配置取，绝不相信客户端传来的 command/args/path。
+			const cfg = readShortcuts(cwd, dirs);
+			if (!cfg.ok) { respondJson(res, cfg.reason === "invalid-cwd" ? 400 : 500, { ok: false, error: cfg.reason }); return; }
+			const action = cfg.config.actions.find((a) => a.id === id);
+			if (action === undefined) { respondJson(res, 404, { ok: false, error: "no-action", hint: "配置中没有该按钮" }); return; }
+			if (action.kind !== "script" && action.kind !== "process") {
+				respondJson(res, 400, { ok: false, error: "not-runnable", hint: "只有 script/process 按钮可运行；url/file 请用对应打开动作" }); return;
+			}
+			const root = dirs.root;
+			const deps: RunnerDeps = { ...(opts.shortcutsRunnerDeps ?? {}) };
+			if (action.kind === "script") {
+				const { runId, result } = await runScript(
+					{ cwd, command: action.command!, args: action.args ?? [], timeoutMs: action.timeoutMs ?? 120000 },
+					id, root, deps,
+				);
+				respondJson(res, result.ok ? 200 : 400, { ok: result.ok, runId, ...result });
+			} else {
+				const { runId, result } = terminateProcess(id, cwd, action.matchCommandLine!, root, deps);
+				respondJson(res, result.ok ? 200 : 400, { ok: result.ok, runId, ...result });
+			}
+			return;
+		}
+
+		if (path === "/v1/gui/shortcuts/cancel") {
+			const b = await readJsonBody(req, res, 16 * 1024);
+			if (b === null) return;
+			const { runId } = b;
+			if (typeof runId !== "string") { respondJson(res, 400, { ok: false, error: "invalid-body", hint: "需 { runId }" }); return; }
+			const r = cancelRun(runId, dirs.root, opts.shortcutsRunnerDeps ?? {});
+			respondJson(res, r.ok ? 200 : 400, r);
+			return;
+		}
+
+		respondJson(res, 404, { error: "not-found", hint: `未知快捷按钮端点：${path}` });
+	};
+
 	const onReq = (req: IncomingMessage, res: ServerResponse): void => {
 		let status = 200;
 		let body: unknown;
@@ -2611,6 +3040,12 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				});
 				return;
 			}
+			// 2026-11-20 GUI 文档预览：右栏点击路径后的读/系统打开（鉴权同 commands，body 有界）
+			if (u.pathname === "/v1/files/read" || u.pathname === "/v1/files/open" || u.pathname === "/v1/files/reveal") {
+				const action: SystemAction | "read" = u.pathname === "/v1/files/read" ? "read" : u.pathname === "/v1/files/open" ? "open" : "reveal";
+				handlePostFileAction(req, res, action);
+				return;
+			}
 			if (u.pathname === "/v1/commands") {
 				// 唯一写端点：仅 POST；GET /v1/commands → 405（读投影不含命令）
 				if (req.method === "POST") {
@@ -2618,6 +3053,77 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					return;
 				}
 				throw new HttpError(405, { error: "method-not-allowed", hint: "/v1/commands 仅接受 POST（唯一命令入口）；读投影走其余 GET 端点" });
+			}
+			// 仓库快捷按钮写端点（POST 必须在下方 `req.method !== "GET" → 405` 守卫之前）。
+			// 鉴权沿用 authorizeCommand；GET /v1/gui/shortcuts 落到读投影 switch（本机只读面，不鉴权）。
+			if (u.pathname.startsWith("/v1/gui/shortcuts") && req.method === "POST") {
+				void handlePostShortcuts(req, res, u).catch((e: unknown) => {
+					respondJson(res, 500, { error: "internal-error", message: String((e as Error).message ?? e) });
+				});
+				return;
+			}
+			// 会话 Note 写端点（POST 必须在下方 `req.method !== "GET" → 405` 守卫**之前**；
+			// 塞进读投影 switch 会恒 405 —— 设计稿 §3.2 实测易踩点）。
+			// 鉴权沿用 authorizeCommand（同 /v1/commands / /v1/autonomy/set，不开新鉴权面）；
+			// GET /v1/session-note 不在此处拦截，落到读投影 switch（本机只读面，与 /v1/sessions 一致不鉴权）。
+			if (u.pathname === "/v1/session-note" && req.method === "POST") {
+				if (!authorizeCommand(req)) {
+					respondJson(res, 401, { error: "unauthorized", hint: "POST /v1/session-note 需本机 token（同 /v1/commands）" });
+					try { req.destroy(); } catch { /* ignore */ }
+					return;
+				}
+				const NOTE_BODY_LIMIT = 128 * 1024; // textarea 可能带 Markdown，留余量（库内还有 64 KiB 正文上限）
+				const chunks: Buffer[] = [];
+				let size = 0;
+				let responded = false;
+				req.on("data", (c: Buffer) => {
+					if (responded) return;
+					size += c.length;
+					if (size > NOTE_BODY_LIMIT) {
+						responded = true;
+						respondJson(res, 413, { error: "payload-too-large", hint: `body 限 ${NOTE_BODY_LIMIT} 字节` });
+						try { req.destroy(); } catch { /* ignore */ }
+						return;
+					}
+					chunks.push(c);
+				});
+				req.on("error", () => {
+					if (responded) return;
+					responded = true;
+					respondJson(res, 400, { error: "request-error" });
+				});
+				req.on("end", () => {
+					if (responded) return;
+					responded = true;
+					let body: unknown;
+					try { body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
+					catch { respondJson(res, 400, { error: "invalid-body" }); return; }
+					const b = body as Record<string, unknown>;
+					if (b === null || typeof b !== "object" || Array.isArray(b)
+						|| typeof b.sessionId !== "string" || typeof b.text !== "string"
+						|| (b.expectedVersion !== undefined
+							&& (typeof b.expectedVersion !== "number" || !Number.isSafeInteger(b.expectedVersion) || b.expectedVersion < 0))) {
+						respondJson(res, 400, { error: "invalid-body", hint: "需 { sessionId: string, text: string, expectedVersion?: 非负整数 }" });
+						return;
+					}
+					const r = writeSessionNote(b.sessionId, b.text, {
+						...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
+						...(b.expectedVersion !== undefined ? { expectedVersion: b.expectedVersion as number } : {}),
+					});
+					if (!r.ok) {
+						if (r.reason === "version-conflict") { respondJson(res, 409, { ok: false, error: r.reason, current: r.current }); return; }
+						if (r.reason === "too-large") { respondJson(res, 413, { ok: false, error: r.reason }); return; }
+						if (r.reason === "invalid-session-id") { respondJson(res, 400, { ok: false, error: r.reason }); return; }
+						if (r.reason === "lock-busy") {
+							try { res.setHeader("retry-after", "1"); } catch { /* ignore */ }
+							respondJson(res, 503, { ok: false, error: r.reason, message: r.detail }); return;
+						}
+						// corrupt / read-failed / write-failed：绝不伪装成空 note 或版本冲突（R-2）
+						respondJson(res, 500, { ok: false, error: r.reason, message: r.detail }); return;
+					}
+					respondJson(res, 200, { ok: true, note: r.note });
+				});
+				return;
 			}
 			// ack 一个交付失败 incident（Item 53 未决项：显式 ack 才清——**故意不做自动 ack**，
 			// 设计红线：不能因为 toast/通知发送成功就当作已处理）。
@@ -2634,7 +3140,7 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			// authorizeCommand 链（无/错 → 401，同 /v1/commands 面）；opt-in OFF（enabled!==true）→
 			// 5 个绑定端点 403 wechat-disabled（enable/disable 不受闸限制；GUI「微信连接」入口始终渲染）。
 			// token 永不进任何响应。
-			if (u.pathname === "/v1/autonomy/set" || u.pathname === "/v1/autonomy/status" || u.pathname === "/v1/autonomy/frontier") {
+			if (u.pathname === "/v1/autonomy/set" || u.pathname === "/v1/autonomy/status" || u.pathname === "/v1/autonomy/frontier" || u.pathname === "/v1/autonomy/diagnostics") {
 				if (!authorizeCommand(req)) { respondJson(res, 401, { error: "unauthorized" }); try { req.destroy(); } catch {} return; }
 				if (u.pathname === "/v1/autonomy/set" && req.method === "POST") {
 					let raw = ""; req.setEncoding("utf8");
@@ -2658,6 +3164,55 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 				if (u.pathname === "/v1/autonomy/frontier" && req.method === "GET") {
 					respondJson(res, 200, readFrontierSnapshot({ stateDir: opts.stateDir })); return;
 				}
+				if (u.pathname === "/v1/autonomy/diagnostics" && req.method === "GET") {
+					const raw = buildAutonomyStatusBody();
+					const frontier = readFrontierSnapshot({ stateDir: opts.stateDir });
+					const hb = readAutonomyHeartbeat({ stateDir: opts.stateDir });
+					const fresh = frontierFreshness(frontier, hb);
+					const supervisionEntries = listOpenSupervisionEntries({ stateDir: opts.stateDir });
+					const runsDir = defaultTabRunsDir();
+					const supervision = supervisionEntries.map((e) => {
+						let unreported = false;
+						try {
+							const res = readTabResultFile(runsDir, e.runId);
+							unreported = isUnconfirmedFallback(res);
+						} catch {}
+						return {
+							runId: e.runId,
+							taskId: e.taskId,
+							repoPath: e.repoPath,
+							status: e.status,
+							setAt: e.setAt,
+							pausedAt: e.pausedAt,
+							pauseReason: e.pauseReason,
+							pushMs: thresholdsOf(e).pushMs,
+							optOut: Boolean(e.optOut),
+							unreported,
+						};
+					});
+					respondJson(res, 200, {
+						raw,
+						heartbeat: hb ? {
+							at: hb.at,
+							pid: hb.pid,
+							sessionId: hb.sessionId,
+							tickIntervalMs: hb.tickIntervalMs,
+							ageMs: Math.max(0, Date.now() - hb.at),
+						} : null,
+						freshness: {
+							stale: fresh.stale,
+							ageMs: fresh.ageMs,
+							suspectedDisabled: fresh.suspectedDisabled,
+							heartbeatStale: fresh.heartbeatStale,
+							clockSkew: fresh.clockSkew,
+						},
+						supervision: {
+							total: supervision.length,
+							entries: supervision,
+						},
+					});
+					return;
+				}
 				respondJson(res, 405, { error: "method-not-allowed" }); return;
 			}
 			if (u.pathname.startsWith("/v1/wechat/")) {
@@ -2679,6 +3234,16 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 						runtimeDir: opts.runtimeDir,
 					});
 					break;
+				case "/v1/workspace/overview": {
+					const cwd = u.searchParams.get("cwd") ?? process.cwd();
+					const overview = parseWorkspaceOverview(cwd);
+					respondJson(res, 200, {
+						version: 1,
+						asof: new Date().toISOString(),
+						...overview,
+					});
+					return;
+				}
 				case "/v1/incidents":
 					// 只读：未 ack 的交付失败账本（Item 53 未决项：此前 ackIncident/listOpenIncidents
 					// 全仓零调用 ⇒ 106 条 incident 无任何可见面）。按 R-2.2 带**年龄**。
@@ -2794,6 +3359,84 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 					});
 					body = { version: 1, count: tl.length, timeline: tl };
 					break;
+				}
+				case "/v1/tokens/stats": {
+					const daysRaw = u.searchParams.get("days");
+					const days = daysRaw !== null && /^[0-9]+$/.test(daysRaw) ? parseInt(daysRaw, 10) : 30;
+					const sessDir = opts.sessionsDir ?? defaultSessionsDir();
+					const stats = collectTokenStats({ sessionsDir: sessDir, days });
+					try {
+						const dummySessions = stats.bySession.slice(0, 100).map((s) => ({
+							sessionId: s.sessionId,
+							cwd: s.cwd,
+							startedAt: s.startedAt,
+							parentSession: null,
+							file: "",
+							sizeBytes: 0,
+							mtimeMs: 0,
+						}));
+						const titles = resolveSessionTitles(dummySessions as any, opts.tabRunsDir);
+						for (const s of stats.bySession) {
+							const t = titles.get(s.sessionId);
+							if (t && t.title && t.titleSource !== "id") {
+								s.title = t.title;
+							}
+						}
+					} catch {
+						/* ignore */
+					}
+					body = stats;
+					break;
+				}
+				case "/v1/gui/shortcuts": {
+					// 本机只读面（不鉴权，与 /v1/sessions 同口径）：配置 + 提案视图 + 内容 hash。
+					// agent 直写配置后无需服务端审计：poll 每次重算 hash + 推断 applied（v4 §2.3）。
+					const cwd = u.searchParams.get("cwd");
+					if (cwd === null || cwd.trim() === "") { respondJson(res, 400, { ok: false, error: "bad-cwd" }); return; }
+					const dirs = shortcutsDirs();
+					const r = readShortcuts(cwd, dirs);
+					if (!r.ok) {
+						respondJson(res, r.reason === "invalid-cwd" ? 400 : 500, {
+							ok: false, error: r.reason, message: r.detail,
+						});
+						return;
+					}
+					let proposals = listProposalViews(cwd, dirs);
+					// 对 approved 提案补一次 applied 推断（agent 用 Write/Edit 直写主配置后的状态闭合）。
+					proposals = proposals.map((pv) => {
+						if (pv.status === "approved" && proposalApplied(cwd, pv.proposal.proposalId, dirs)) {
+							return { ...pv, status: "applied" as const };
+						}
+						return pv;
+					});
+					const key = repoKey(cwd);
+					const configPath = key === null ? null : join(dirs.root, `${key}.json`);
+					respondJson(res, 200, {
+						ok: true, config: r.config, contentHash: r.contentHash,
+						exists: r.exists, proposals, cwd, configPath,
+					});
+					return;
+				}
+				case "/v1/session-note": {
+					// 本机只读面：与 /v1/sessions 一样不鉴权；文件不存在 → 200 空 note，
+					// 坏 JSON / I/O 失败 → 明确错误（R-2：不许伪装成空便签）。
+					const sid = u.searchParams.get("sessionId");
+					if (sid === null || sid.length === 0) { respondJson(res, 400, { error: "bad-session-id" }); return; }
+					const r = readSessionNote(sid, opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {});
+					if (!r.ok) {
+						respondJson(res, r.reason === "invalid-session-id" ? 400 : 500, { ok: false, error: r.reason, message: r.detail });
+						return;
+					}
+					const bodyJson = JSON.stringify({ ok: true, note: r.note });
+					const etag = sha1Etag(bodyJson);
+					if (matchEtag(req, etag)) { respondNotModified(res, etag); return; }
+					try {
+						res.writeHead(200, { "content-type": "application/json", etag });
+						res.end(bodyJson);
+					} catch {
+						try { res.destroy(); } catch { /* ignore */ }
+					}
+					return;
 				}
 				case "/v1/sessions": {
 					// G6-P1：pi 会话列表（首行头快读，不全读；startedAt 降序）
@@ -3120,6 +3763,9 @@ export function createRuntimeHostServer(opts: RuntimeHostServerOptions = {}): Pr
 			try {
 				deliveryReconciler = startDeliveryReconcilerLoop({
 					stateDir: outboxStateDirFor(opts),
+					// N-6：与其余 runs 消费点一致走 opts.runsDir；测试注入夹具目录，绝不读真实
+					// ~/.pi/agent/subagent-runs（否则 reconciler 启动即扫生产账本并打 incident 日志）。
+					...(opts.runsDir !== undefined ? { runsDir: opts.runsDir } : {}),
 					...(opts.linksPath !== undefined ? { linksPath: opts.linksPath } : {}),
 					log: (msg: string): void => { try { console.error(msg); } catch { /* ignore */ } },
 				});

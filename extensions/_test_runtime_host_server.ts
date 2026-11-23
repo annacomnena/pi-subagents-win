@@ -181,6 +181,19 @@ try {
 			assert.deepEqual(await hit.json(), snap);
 			rmSync(join(autonomyStateDir, "frontier.json"), { force: true });
 		}
+		// 主动性诊断及监管工作状态表：GET /v1/autonomy/diagnostics
+		{
+			const auth = { "X-Command-Token": h.info.token! };
+			const noAuth = await fetch(`${base}/v1/autonomy/diagnostics`);
+			assert.equal(noAuth.status, 401);
+			const diag = await fetch(`${base}/v1/autonomy/diagnostics`, { headers: auth });
+			assert.equal(diag.status, 200);
+			const d = (await diag.json()) as { raw: string; supervision: { total: number; entries: unknown[] }; freshness: unknown };
+			assert.equal(typeof d.raw, "string");
+			assert.ok(d.raw.includes("autonomy: enabled="));
+			assert.equal(typeof d.supervision.total, "number");
+			assert.ok(Array.isArray(d.supervision.entries));
+		}
 		// W3d read-only reply projection: authorize → wechat gate → aggregate only safe fields.
 		{
 			const noAuth = await fetch(`${base}/v1/wechat/reply/status`);
