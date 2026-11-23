@@ -22,6 +22,9 @@ import { masterAddress } from "../address.ts";
 import { summarizeActionsStatus } from "./action/run.ts";
 import { supervisionLedgerLines } from "../supervision.ts";
 import { observeOutbox, observeDelivery, deliveryObservationLines } from "../delivery-observations.ts";
+// step-0 第 1 步（2026-11-23）：会话占用只读观测 —— 双控风险的真实发生率基线。
+// 判据与边界见 `session-presence.ts` 模块头：**只报计数，不锁、不拦、不告警**。
+import { scanSessionPresence, presenceLines } from "../session-presence.ts";
 import { defaultRuntimeDir } from "../journal.ts";
 
 export function buildAutonomyStatusBody(): string {
@@ -114,6 +117,16 @@ export function buildAutonomyStatusBody(): string {
 					outbox: observeOutbox(join(defaultRuntimeDir(), "state")),
 					delivery: observeDelivery(defaultRuntimeDir()),
 				}),
+				// 会话占用只读观测（step-0 第 1 步）。
+				//
+				// 为什么需要：step-0 实测确认「两个 pi 进程同 --session 文件时 Pi 不拦、
+				// 双写成功，而危险是父链分叉 ⇒ 语义分裂」（`plans/20261123_pi_attach_step0_verification.md`）。
+				// 但**不知真实发生率** —— 在加告警/409 之前先量化，否则会被 tab 场景刷屏
+				//（tab 与用户手开 TUI 在 isTTY 上无法区分，见该报告 §6-2）。
+				//
+				// 成本：一次 PowerShell CIM 枚举实测 ~1.4s。`/autonomy status` 是**人工触发的低频命令**
+				//（不是 tick、不是轮询），故可接受；**不得**把它接进任何周期路径。
+				...presenceLines(scanSessionPresence()),
 				`journal-unavailable: ${(() => {
 					const j = journalUnavailableSnapshot();
 					if (!j.degraded) return "none（全部写点正常）";
