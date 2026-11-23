@@ -1,6 +1,89 @@
 # Changelog
 
 ## [Unreleased]
+### 2026-11-18 — Change: 角色 frontmatter 的 `tools:` 豁免第三方 CLI（业主裁决）
+
+- **改动**：`toolsSupportedForBackend(model, effectiveTools, callerTools?)` 新增第三参。
+  外部 CLI（`cli:*`）现在只拒**调用方显式传入的 `tools`**（含显式空列表 `[]`）；角色 `agents/*.md` frontmatter
+  里声明的 `tools:` **不再算作工具策略**，因此任何角色都能被路由到 `cli:*`。
+- **为什么**（原行为的问题）：`resolveEffectiveTools` 把角色 `tools:` 与调用方 `tools` 合并后判非 undefined，
+  于是 8 个受管角色（searcher/planner/plan-reviewer/implementer/code-reviewer/consultant/general/fusion 全部声明了 `tools:`）
+  **永远无法走 `cli:*`**，只剩 `codex-runner` 一个逃生口 —— 等于把「角色选择」与「后端选择」硬绑死，
+  且 `config.json` 里把 `code-reviewer` 默认设成 `cli:codex` 会变成**永久坏配置**（每次派发先撞一次硬失败再静默降级）。
+- **为什么不干脆全放开**：调用方显式 `tools` 是「本次派发请你限制工具」的真实意图。第三方 CLI 自带工具系统，
+  Pi 的 allowlist 对它**没有约束力**；静默忽略会让调用方以为收窄了而实际没窄（安全误导）⇒ 仍然拒绝。
+  角色 frontmatter 不同：它描述的是「该角色在 pi 里能碰什么」，对第三方 CLI 无意义，豁免不会误导任何人。
+- **接线**：`index.ts` 两处门（`runSingle` 主门 + `runWithFallback` 前置门 + fallback 候选跳过）+ `trace-fusion/fusion-dispatch.ts`
+  全部改传第三参；fusion 的 `fusionTools` 属调用方策略 ⇒ 仍拒。
+- **测试**：`_test_runner_tools.ts` §7 重写为两条分支 + 变异可区分性断言（豁免分支与拒绝分支必须能区分，防恒真）；
+  `_test_subagent_roles_tools.ts` §5 全部改为传调用方 `tools`（否则会真的 spawn 真实 CLI），并新增 5.1b 空列表格。
+  新增探针 `extensions/_probe_cli_tools_exemption.ts`：对 9 个真实角色文件逐角色验证「①仅角色声明→放行 / ②调用方显式→拒绝」，
+  实测 `角色数 9｜判据失败 0`。
+- **工具面文案**：`tools` 参数的 description 与 system prompt 段落同步改写（旧文案「角色声明了 tools 就永远无法走 cli:*」已失效）。
+### 2026-11-16 — Fix: 督管推送在 iLink 出站拒绝上空转（`ret=-2 / prepare failed`）；并撤回一个未获实证的因果说法
+
+- **口径纠正（先说错在哪）**：先前把 `-2` 解释成「每收到业主一条消息 ≈ 只允许回 10 条，业主再发一条就重置」。
+  该因果**被当天数据直接否掉**：2026-11-16 本地 11:09–14:44 业主连发 6 条入站，而 15:39–16:28 的 9 次发送**仍全部 `-2`**；
+  18:44 的 `-2` 距业主 18:02 那条已 42 分钟，并非「第 11 条」形状。仓内既有研究
+  `plans/20261023_wechat_outbound_research.md` 自己写的是 Q2「成功充要条件**未证**，存在未识别变量」、Q5「已验证的保活办法：无」
+  —— 我此前把它的**候选解释**当成了结论，属过度解读。
+  ⇒ 现在只保留可复现的三条：HTTP 200 + 业务码 `-2`；与 token 无关（入站轮询始终 `connected`）；与正文长度无关
+  （17 / 350 / 677 / 1134 / 1367 字符全部同样失败）。**恢复时机不可预测**。
+
+### 2026-11-16 — Fix: 督管推送在 iLink 出站拒绝上不再空转（`ret=-2 / prepare failed`）
+
+- **Fix（不空发）**：`supv-greencad-tick.py` 命中 `-2` ⇒ 自动进配额冷却、**不再空发**（每次空发都是一条失败记录），
+  内容改落 `~/.pi/agent/runtime/state/supv-greencad/undelivered.md`（含时间与失败原因，一条不丢）；
+  冷却**只按时间衰减**（15 分钟一次探测），不再把「新入站」当重置开关。
+- **Fix（自测抓到的真 bug）**：冷却判定原来直接比字符串，而 `snap.at` 是本地 `YYYY-MM-DD HH:MM:SS`、
+  入站时间是 ISO `…T…Z` ⇒ 同日比较恒为「本地 < ISO」（空格 0x20 < 'T' 0x54）⇒ **冷却每轮都被误解除**
+  （等于没有冷却）。改为统一过 `_ts()` 归一成 epoch 再比。反向自测：`failAt` 晚于入站 ⇒ 维持冷却（`QUOTA-COOLDOWN`）；
+  造一条新入站 ⇒ 解除冷却（`QUOTA-RELEASED`）—— 注意该行为随后被**实证否掉并移除**（见上条口径纠正）。
+
+### 2026-11-16 — Feat: GreenCAD 离线督管工具链（`scripts/supv-greencad*.{py,mjs}`）
+
+业主离线期间需要「每 90 分钟自动查一次 GreenCAD local master 的进度，并把任何实质变化推到微信」。
+
+- **`scripts/supv-greencad.py`**（只读快照）：定位近 6 小时内写过的 GreenCAD 会话（**长驻 `--session ...` 与唤醒派生
+  `--tab-run-id ... @launch-prompt` 两种进程形态都要匹配** —— 只按 sessionId 匹配时，唤醒 tab 在跑的被误判为「进程不在」，
+  实测见过一次）；解析会话 JSONL 尾部抽 `assistant/toolCall/toolResult` 三类信号（注意 assistant 消息的工具调用块是 `toolCall` + `arguments`、
+  `toolResult` 消息的 `content` 本身就是数组，两处都踩过）；抽最后一次 `dotnet test` 的 `Failed: N, Passed: M, Total: K`；
+  读各 worktree 的 HEAD/脏文件数；列最新落盘 `plans/*.md`；附带人工维护的待业主拍板清单。
+- **`scripts/supv-greencad-tick.py`**（有状态的一次 tick）：与上次签名比对，**有实质变化才推**（无变化静默，不打扰）；
+  ⚠ 只在「无 node 进程 / 静默 ≥45 分钟 / 静默期失败数上升」三种情形触发（后者必须与静默叠加，否则他自己跑变异实验时
+  预期内的红会每 tick 刷屏 —— 实测踩过一次噪声告警）。状态与待拍板清单落 `~/.pi/agent/runtime/state/supv-greencad/`。
+- **`scripts/notify-wechat.mjs`**：`channel-wechat/send.ts` 的最小 CLI 入口，收件人 = 绑定 owner ∪ `reply.allowOut`；
+  token 只在内存 → Authorization header，输出只含 kind/截断收件人，**永不打印 token/URL/请求体**。
+- **npm scripts**：`supv:gc` / `supv:gc:tick` / `notify:wechat`。
+- **两个踩过的坑写进脚本自身**：① Windows 控制台默认 GBK，中文输出会乱码或抛 `UnicodeEncodeError` ⇒ 脚本开头
+  `sys.stdout.reconfigure(encoding="utf-8")`，不依赖调用方设环境变量；② 该仓 `debug/` 是既有的未跟踪目录、不属于本包，
+  状态文件改落 `~/.pi/agent/runtime/`（只读快照 + 落盘状态分离，脚本不再往仓里写）。
+
+### 2026-11-16 — Fix: 外部 CLI 在 Windows 上参数被 cmd.exe 损坏 + nvm 切版本后静默不可用
+
+- **Fix（根因 1：参数被重解析）**：`agents/*.md` 的 body 经 `-c developer_instructions=` 传给 Codex 时，参数穿过
+  `cmd.exe`（因 PATH 上只有 `.cmd` shim，而 Node ≥18.20.2 对 `.cmd` + `shell:false` 直接 EINVAL ⇒ 旧实现只能 `shell:true`）
+  会被重解析：真换行→字面 `\n`、`C:\Users\x`→`C:\\Users\\x`、**`%PATH%`→展开成整条 PATH（≈4000 字符注入）**、引号被吞。
+  实测现役 `searcher.md`（2747 chars）经 cmd 后读回 2824 chars ⇒ body 已损坏。
+  新增 `extensions/external-cli-resolve.ts`：把 `.cmd/.bat` shim 解析成它真正要跑的入口（`node <js>` 或直接 `.exe`），
+  生产路径一律 `shell:false`。实测同一 body 逐字节无损；端到端模型输出 `E2E_MARK=C:\Users\...` 不再翻倍。
+- **Fix（根因 2：nvm 切版本后裸名静默 ENOENT）**：旧 `commandForSpawn` 在 PATH 全 miss 时**回落裸名** ⇒ 一条无法归因的 spawn ENOENT。
+  现改为完整候选链（`.exe` 优先 → `.cmd`/`.bat` → 裸名）+ 兜底目录（`NVM_SYMLINK` / `%APPDATA%\npm` / `~/.local/bin` / `~/.bun/bin` /
+  `NVM_HOME\v<ver>` 降序），全 miss ⇒ **结构化失败**并给出 `PI_EXTERNAL_CLI_BIN_<BACKEND>` 可操作提示。
+  决定性反例对照测试：PATH 全 miss + `NVM_HOME` 里有 ⇒ 救回（`via: nvm-version:v22.19.0`）；去掉 `NVM_HOME` ⇒ 失败。
+- **Feat（角色）**：新增 `agents/codex-runner.md` —— **故意不声明 `tools:`**。因为 `resolveEffectiveTools` 会把角色 frontmatter
+  的 `tools:` 也算进 `effectiveTools`，而守卫对**任何非 undefined** 工具策略都拒 `cli:*` ⇒ 现役 8 个角色全部无法路由到 CLI。
+  实测 `runWithFallback(codex-runner, cli:codex)` → `completed` / `RUNNER_OK`。守卫契约本身**未放松**（仍不允许 `cli:*` + tools）。
+- **Test**：新增 `test:external-cli-resolve`（12 组）锁定：三类 shim 形状解析、解释器自身永不被当入口、shell 缺省/显式语义、
+  三种失败形态文案、nvm 兜底+反例、生产形态（`command=node / prefixArgs=[codex.js] / shell=false`）、显式 marker 生效。
+  变异验证：把 shim→js 的 `shell:false` 改回 `true` ⇒ 实测变红（`★ 解析到真入口后 shell 必须为 false`），已字节级还原（sha256 前后一致）。
+- **Docs**：README 补「Windows entry resolution」与「role `tools:` 也算工具策略 ⇒ 用 `codex-runner`」；
+  根因/证据/未做项均在 `plans/20261116_cli_codex_param_passing.md`。
+- **未做（具名）**：`cli:*` + 工具策略仍是**待定产品决策**（未放松守卫）；`claude/agy/atomcode/mimo` 未逐个真跑；
+  未跑完整 searcher→planner→implementer→reviewer 全链；未清陈旧 `@openai/codex-win32-x64@0.143.0` alias 残留。
+
+> 主题：**外部 CLI 后端在 Windows 上的入口解析与参数完整性**；只改入口解析层 + 新增角色，不动模型路由与守卫契约。
+
 ### 2026-11-13 — Fix: async 面板被磁盘记录炸死主会话（Item 65）
 
 - **Fix（显示层）**：`shortTaskLabel` 接受 `string|undefined|null` 并走兜底标签（`(无任务文本)` / `(空任务文本)`），

@@ -2,7 +2,7 @@
 
 Windows-native subagent orchestration for [pi](https://github.com/earendil-works/pi-coding-agent): role agents for delegation, visible parallel tabs for long-running work, and a full ultra-long task infrastructure (tab reclaim, auto-push timers, an event bus, and active reporting) on top of it.
 
-**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.7.0
+**Package:** `subagent-win` · **Repo:** `pi-subagents-win` · **Version:** 0.8.0
 
 ---
 
@@ -178,14 +178,38 @@ The point is not "CLIs are cheaper than APIs" — it is that a lot of usable quo
 
 | Model ref | Spawns | Notes |
 |-----------|--------|--------|
-| `cli:claude` | `claude` | stream-json, `--dangerously-skip-permissions`, CLI default model |
-| `cli:codex` | `codex exec --json` | stdin prompt, approvals bypassed, CLI default model |
-| `cli:agy` | `agy` | plain stdout capture, native `--effort`, CLI default model |
+| `cli:claude` | `claude` (native exe) | stream-json, `--dangerously-skip-permissions`, CLI default model |
+| `cli:codex` | `node <codex.js>` → `codex exec --json` | stdin prompt, approvals bypassed, CLI default model |
+| `cli:agy` | `agy` (native exe) | plain stdout capture, native `--effort`, CLI default model |
 | `cli:atomcode` | `atomcode -y -p <prompt>` | headless, no-approval, CLI default model |
 | `cli:zcode` | `node zcode.cjs` | plain stdout capture (-p), GLM-5.3 fixed |
 | `cli:mimo` | `mimo run` | JSON event stream, `--dangerously-skip-permissions`, CLI configured/default model |
 
 **Policy:** never pass `--model` to external harnesses; configure models inside each CLI. Refs like `cli:claude/sonnet` are rejected. Backends are used only when an agent's `config.json` default/fallback selects them — do not override an unrelated agent with one. `cli:zcode` is special: it spawns `zcode.cjs` through `node` and always uses the fixed GLM-5.3 configured in `~/.zcode/cli/config.json`. `cli:mimo` (also accepts the alias `cli:mimocode`) runs `mimo run <prompt> --format json --dangerously-skip-permissions --dir <cwd>`; it discovers `MIMOCODE_BIN`, then `%USERPROFILE%\\.mimocode\\bin\\mimo.exe`, then PATH. The current MimoCode installation must be signed in or configured with a usable provider/model; the harness does not supply credentials.
+
+### Windows entry resolution (`external-cli-resolve.ts`)
+
+On Windows an npm global install only puts a **`.cmd` shim** on PATH, and Node ≥18.20.2 / 20.12.2 **refuses** `spawn(".cmd", …, {shell:false})` (EINVAL, CVE-2024-27980 hardening). The old implementation therefore had to use `shell:true`, and cmd.exe re-parsed every argument:
+
+| Input in `systemPrompt` | Through cmd.exe |
+|---|---|
+| real newline | literal backslash + `n` |
+| `C:\Users\x` | `C:\\Users\\x` (doubled) |
+| **`%PATH%`** | **expanded to the whole PATH (≈4 000 chars)** |
+| `say "hi"` | quotes swallowed |
+
+The resolver now turns every entry into a **shell-free real target**:
+
+| Discovered entry | Spawn target |
+|---|---|
+| `.exe` | the exe itself, `shell:false`, no prefix args |
+| `.cmd`/`.bat` shim → `node_modules/.../x.js` | `node <x.js>`, `shell:false` |
+| `.cmd` shim → `node_modules/.../x.exe` | that exe, `shell:false` |
+| zcode `zcode.cjs` | `node <zcode.cjs>`, `shell:false` |
+
+Search order: explicit override (`PI_EXTERNAL_CLI_BIN_<BACKEND>`, plus the legacy `MIMOCODE_BIN` / `ZCODE_CJS`) → PATH (`.exe` **before** `.cmd`) → fallback dirs (`NVM_SYMLINK`, `%APPDATA%\npm`, `~/.local/bin`, `~/.bun/bin`, `NVM_HOME\v<ver>` in descending version order). If nothing resolves you get a **structured failure** naming the fix — never a bare-name `ENOENT` that is indistinguishable from "not installed".
+
+The `nvm` fallbacks matter because `C:\nvm4w\nodejs` is a junction into `%LOCALAPPDATA%\nvm\v<ver>`: `nvm use` to a version without the CLI makes the shim vanish. With `NVM_HOME` probing the old install is still found (there is a decisive counter-example test for this).
 
 ### Wiring it up
 
@@ -193,12 +217,28 @@ Set the CLI ref as an agent's **default or fallback** in `config.json` (or inter
 
 ```json
 {
-  "models": { "implementer": "cli:agy", "code-reviewer": "openai-codex/gpt-5.6-luna" },
-  "fallbackModels": { "consultant": ["cli:codex"], "implementer": ["openai-codex/gpt-5.6-terra", "cli:zcode"] }
+  "models": { "codex-runner": "cli:agy", "code-reviewer": "openai-codex/gpt-5.6-luna" },
+  "fallbackModels": { "codex-runner": ["cli:codex"], "implementer": ["openai-codex/gpt-5.6-terra"] }
 }
 ```
 
-A CLI ref only routes when it sits in that agent's own default/fallback chain — the dispatcher never sends an unrelated agent to a CLI on a whim, and per-call `model:` overrides **cannot select a CLI backend** (passing `cli:x/...` model refs is rejected outright).
+⚠ 角色 `agents/*.md` frontmatter 里的 `tools:` **不再阻塞** `cli:*` 路由（2026-11-18 业主裁定，
+见 CHANGELOG）。那一行描述的是「该角色在 pi 里能碰什么」，对第三方 CLI 无意义；
+拿它当工具策略会让所有声明了 `tools:` 的角色（仓内 8 个）永久无法路由到 CLI。
+
+**仍然拒绝的是调用方显式传入的 `tools`**（含显式空列表 `[]`）：那是“本次派发请限制工具”
+的真实意图，而第三方 CLI 自带工具系统，Pi 的 allowlist 对它无约束力；静默忽略会让调用方
+误以为已收窄而实际没窄（安全误导）⇒ 直接报错 `EXTERNAL_CLI_TOOLS_UNSUPPORTED`。
+
+```json
+{ "models": { "code-reviewer": "cli:codex" } }   // 现在合法（角色 tools: 已豁免）
+```
+
+A CLI ref routes either from that agent's own default/fallback chain **or** from a per-call `model:` override —
+but a `cli:<backend>/<model>` ref (trying to pick a model *inside* the CLI) is rejected outright.
+Two hard constraints apply to every route: **the caller must not pass an explicit `tools` allowlist**
+(role-frontmatter `tools:` is exempt — see the ⚠ above),
+and the entry must resolve to a real shell-free target (see *Windows entry resolution*).
 
 ### What transfers — and what doesn't
 
@@ -209,6 +249,19 @@ A CLI ref only routes when it sits in that agent's own default/fallback chain �
 | per-call `model` override | ✅ | ❌ — the CLI runs **its own configured/default model**; configure models inside each CLI |
 | per-call `tools` allowlist | ✅ | ❌ — not supported by external harnesses (explicitly passing it errors) |
 | billing | API tokens | the CLI's own plan — subscription, free tier, or discounted dedicated-tool billing |
+
+**⚠ 角色 `agents/*.md` 的 `tools:` frontmatter 曾经也算工具策略 —— 2026-11-18 已改。**
+`resolveEffectiveTools` 会把角色 tools 与调用方 tools 合并；旧守卫只要看到合并结果非 `undefined` 就拒 `cli:*`，
+⇒ 任何声明了 `tools:` 的角色都**根本到不了 spawn**。现在守卫只检**调用方**是否显式传了 `tools`：
+角色声明豁免，调用方显式策略（含 `[]`）仍拒。
+
+```text
+subagent-win({ agent: "code-reviewer", model: "cli:codex", task: "..." })   // 现在可用
+subagent-win({ agent: "code-reviewer", model: "cli:codex", tools: ["read"] }) // 仍报错
+```
+
+因为 CLI 拥有自己的工具系统，Pi 无法收窄它：CLI 的 `sandbox_mode` / approval policy 才是真正的边界。
+只在可信仓库里用 CLI 后端；需要真正可收窄的工具面时，用普通 provider/id 模型 + 调用方 `tools` 白名单。
 
 ### Safety
 
@@ -516,6 +569,37 @@ The WeChat channel is a **Client Plane** endpoint: long-polling against the WeCh
 - **unknown** `/xxx` → **explicitly rejected — never falls back to plain-text injection**.
 
 **Secret hygiene:** `bot_token` never enters logs / GUI / WS / argv; credentials are stored 0600 under `<runtimeDir>/wechat/`; all outbound network goes only to the iLink base URL + allow-listed attachment CDN hosts. Binding (QR) is done from the GUI "WeChat" section, which is always rendered (with an in-page "enable" affordance while the channel is off).
+
+**Unattended supervision (push progress to WeChat while you're away)** — three small CLIs, no daemon changes:
+
+```bash
+npm run supv:gc          # read-only snapshot: process alive? idle min? HEAD/dirty per worktree?
+                         # latest dotnet Failed/Passed/Total, recent tool calls, latest self-report,
+                         # newest plans/*.md, and the pending-owner-decisions list
+npm run supv:gc:tick     # one stateful tick: pushes to WeChat ONLY when the snapshot actually changed
+                         # (or on ⚠: no node process / idle ≥45 min / failures rising while idle)
+npm run notify:wechat -- <textFile>
+```
+
+**WeChat outbound can be rejected with `ret=-2 / prepare failed`, and the cause is `unverified`.** Measured 2026-11-16:
+sends start failing in *runs* — HTTP 200 with a business-code rejection, **not** a token problem (the inbound long-poll
+stayed `connected`, 62k+ polls) and **not** a length or content problem (17 / 350 / 677 / 1134 / 1367-char bodies all
+failed identically). An earlier note here claimed "≈10 replies per inbound message, and another inbound message resets
+the quota" — **that causal claim was disproved by the same day's data**: 6 inbound messages arrived between 11:09 and
+14:44 local time and the 9 sends from 15:39 to 16:28 *still* all returned `-2`, and the 18:44 failure was 42 minutes
+after the last inbound rather than the 11th send. The repo's own research doc says the same: Q2 "success conditions
+**unproven**, unidentified variables", Q5 "no verified keep-alive method". So the tooling no longer pretends to know
+when it will recover: on `-2` it enters a **time-based cooldown** (15-minute probe interval, no inbound-driven reset),
+stops sending, and writes the content to `~/.pi/agent/runtime/state/supv-greencad/undelivered.md` so nothing is lost.
+(The very first version also compared a local `YYYY-MM-DD HH:MM:SS` timestamp against an ISO `…T…Z` one as strings —
+same-day that is always "local < ISO" (0x20 vs `T`), so the cooldown silently released every tick; a self-test caught it
+and both forms are now normalised to epoch.)
+
+Two traps this tooling encodes, both hit for real: (1) a repo's living sessions come in two process shapes — long-lived
+`--session … .jsonl` and wake-spawned `--tab-run-id … @launch-prompt.md` — matching only on sessionId reports the working
+tab as "process gone"; (2) a failure-count alert must be gated on quiet time too, otherwise the target's own mutation
+experiments (expected red) raise a false alarm every tick. State + the owner-decisions file live in
+`~/.pi/agent/runtime/state/supv-greencad/` (never inside the target repo).
 
 ## 11. Autonomy & the global → local dispatch plane
 

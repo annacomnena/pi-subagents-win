@@ -80,7 +80,7 @@ description: 使用 subagent-win 工具编排多步骤工作流（搜索→计�
 ## 核心原则
 
 1. **委派，不要亲自执行** — 搜索、实现、审查交给 subagent；注意：subagent 与可见 tab 是两种不同的派发对象，不能因为都有 runId 就混用管理工具
-2. **Wiki 第一站（术语发现 → 精确定位 → 直接交接）+ codegraph** — 仅新主题查询时，用 `wiki-nav keywords queries=[...]` 查精确术语，exact miss 才用 `semantic-terms` 扩展候选，选词后 grep 定位 Wiki；searcher 一旦确认 `Wiki/path.md#章节`，该地址就是本 workflow 的规范交接物，后续 agent 直接 read，绝不重新术语发现。再按页内 `source_paths` 直达代码，联合 `codegraph explore / query / node / impact` 追溯；**主动维护主题页：过期更新、缺失且已验证的跨任务主题新建、同主题碎片自主合并**
+2. **硬序检索（符号先 CodeGraph → 主题先 Wiki → 直达代码）+ 直接交接** — 已知符号名优先打 `codegraph query/explore` 定位 `file:line`（报陈旧先 sync）；未知符号名的新主题查询才走 `wiki-nav keywords` 查主题页；searcher 一旦确认 `Wiki/path.md#章节`，该地址就是本 workflow 的规范交接物，后续 agent 直接 read，绝不重新术语发现。再按页内 `source_paths` 直达代码，联合 `codegraph node / impact` 追溯；**主动维护主题页：过期更新、缺失且已验证的跨任务主题新建、同主题碎片自主合并**
 3. **任务临时发现不进 Wiki** — 搜索结论走回复或 `plans/*_research.md`；进度走 `recentwork.md`
 4. **正式 Wiki 仅主题/功能页** — 收尾阶段必须对照改动更新**对应功能**正式页；禁止 task/Item 叙事进 Wiki
 5. **积极分派搜索** — 多方向时按 searcher-mode 派发（见下方「searcher 派发模式」）
@@ -181,12 +181,14 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 | 角色 | 工具 | 用途 |
 |------|------|------|
-| `searcher` | read, grep, find, ls, bash, write, edit | **Wiki 第一站**（关键词 → `source_paths` → codegraph）；**主动维护主题页**（过期更新/缺失创建）；回复内交付「代码位置+Wiki 章节」结构化事实 + 维护记录 |
-| `planner` | read, grep, find, ls, write, edit | 先 read 指定 Wiki 章节 + 搜索结论 → 写 `plans/` |
-| `plan-reviewer` | read, grep, find, ls, bash, write, edit | 先 read 指定 Wiki 章节；审查并修订计划 |
-| `implementer` | 全工具 | 先 read 指定 Wiki 章节；按计划实现；长期契约变化更新正式 Wiki |
-| `code-reviewer` | read, grep, find, ls, bash, write, edit | 先 read 指定 Wiki 章节；审查修复；对照计划 |
-| `consultant` | read, grep, find, ls, bash, write, edit | **用户点名模型的咨询/评估**（「请glm来评估一下」「请gpt5.6看看截图仿照设计」）；模型用用户点名模型作 `model` override（短名自动展开），未点名用 config 默认 |
+| `searcher` | read, grep, find, ls, bash, write, edit, wiki-nav, codegraph | 符号与主题检索、核验、维护正式 Wiki 主题页和重建索引；交付结构化事实 + 维护记录 |
+| `planner` | read, grep, find, ls, write, edit, codegraph | 先 read 指定 Wiki 章节 + 搜索结论 → 写 `plans/`（无 bash 权限） |
+| `plan-reviewer` | read, grep, find, ls, write, edit, codegraph | 先 read 指定 Wiki 章节；审查并修订计划（无 bash 权限） |
+| `implementer` | read, grep, find, ls, bash, write, edit, codegraph, wiki-nav | 先 read 指定 Wiki 章节；按计划实现与验证；反例自检；维护受影响的正式 Wiki |
+| `code-reviewer` | read, grep, find, ls, bash, write, edit, codegraph, wiki-nav | 先 read 指定 Wiki 章节；审查修复；断言强度与反例核对；对照计划 |
+| `consultant` | read, grep, find, ls, codegraph | **用户点名模型的咨询/只读核验**（纯只读，无 write/edit/bash 权限） |
+| `general` | read, grep, find, ls, bash, write, edit, codegraph, wiki-nav | lite 链多阶段通用执行者（检索/计划/实现/审查/收尾） |
+| `fusion` | read, write, bash | trace-fusion 融合者，只读仓库写 `fusion.md` |
 
 ## 工作流：完整链路
 
@@ -196,8 +198,8 @@ Wiki 维护记录（searcher 本轮新建/更新/标 stale 的页，供阶段 5 
 
 ```json
 { "tasks": [
-  { "agent": "searcher", "task": "先 read AGENTS.md，再 read Wiki/_index.md（若存在）。Item <NN> 背景搜索：主题 <A>。**以 Wiki 为第一站**：仅对尚未定位的新主题，将任务拆成 1-5 个短语→`wiki-nav keywords queries=[...]` exact-check→仅对 exact miss 用 `semantic-terms` 获取术语候选→选词 grep 定位 Wiki；一旦确认 `Wiki/path.md#章节`，记录它为本 workflow 的规范地址，后续下游直接 read、不可重新猜地址。再读该页 frontmatter 的 `source_paths` 与 Evidence → 按其直达源码（`file#L49` / `file::Symbol`）→ 联合 codegraph node/impact 追溯调用链 → **主动维护主题页**：过期则按源码修正（status: current，更新 source_paths/updated/Evidence，或标 stale）；若某跨任务主题尚无正式页且已源码验证，新建主题命名页。回复必含：①「已验证事实」每条带代码位置+Wiki 章节引用（`Wiki/Modules/xxx.md#章节`，无则 Wiki：无）+校准状态；②「Wiki 章节引用清单」（给主 agent 透传下游，作为直接 read 的规范地址）；③「Wiki 维护记录」（新建/更新/标 stale 的页，无则写无；若有任何页变动，随后必须调 `wiki-nav rebuild` 重建索引）。禁止 Wiki/Explorations 与任务号页；任务发现只进回复或 plans/*_research.md。若结论过长可写入 plans/YYYYMMDD_item<NN>_<topic_a>_research.md。recentwork（如有）追加一行进度。" },
-  { "agent": "searcher", "task": "先 read AGENTS.md，再 read Wiki/_index.md（若存在）。Item <NN> 背景搜索：主题 <B>。同上流程（Wiki 第一站 → source_paths → codegraph → 主动维护主题页）；回复同样含 ①已验证事实（带代码位置+Wiki 章节+校准状态）②Wiki 章节引用清单 ③Wiki 维护记录。" }
+  { "agent": "searcher", "task": "先 read AGENTS.md，再 read Wiki/_index.md（若存在）。Item <NN> 背景搜索：主题 <A>。**检索按硬序走**：已知符号名一律先打 `codegraph query/explore` 定位 `file:line`（报陈旧先 sync）；无符号名按主题查 Wiki（`wiki-nav keywords queries=[...]` exact-check→仅对 exact miss 用 `semantic-terms` 获取术语候选→选词 grep 定位 Wiki）；一旦确认 `Wiki/path.md#章节`，记录它为本 workflow 的规范地址，后续下游直接 read、不可重新猜地址。再读该页 frontmatter 的 `source_paths` 与 Evidence → 按其直达源码（`file#L49` / `file::Symbol`）→ 联合 codegraph node/impact 追溯调用链 → **主动维护主题页**：过期则按源码修正（status: current，更新 source_paths/updated/Evidence，或标 stale）；若某跨任务主题尚无正式页且已源码验证，新建主题命名页。回复必含：①「已验证事实」每条带代码位置+Wiki 章节引用（`Wiki/Modules/xxx.md#章节`，无则 Wiki：无）+校准状态；②「Wiki 章节引用清单」（给主 agent 透传下游，作为直接 read 的规范地址）；③「Wiki 维护记录」（新建/更新/标 stale 的页，无则写无；若有任何页变动，随后必须调 `wiki-nav rebuild` 重建索引）。禁止 Wiki/Explorations 与任务号页；任务发现只进回复或 plans/*_research.md。若结论过长可写入 plans/YYYYMMDD_item<NN>_<topic_a>_research.md。recentwork（如有）追加一行进度。" },
+  { "agent": "searcher", "task": "先 read AGENTS.md，再 read Wiki/_index.md（若存在）。Item <NN> 背景搜索：主题 <B>。同上流程（硬序检索：符号先 codegraph → 主题先 Wiki → source_paths → 主动维护主题页）；回复同样含 ①已验证事实（带代码位置+Wiki 章节+校准状态）②Wiki 章节引用清单 ③Wiki 维护记录。" }
 ], "concurrency": 3 }
 ```
 
