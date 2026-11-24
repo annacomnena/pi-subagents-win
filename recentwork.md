@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 66 | **P0** | **local master → global master 的回报通道是静默黑洞**：`tab-report` 对非 tab 进程硬拒绝（缺陷1）；`recipientSessionIdFor` 不认 `agent://master_*` 地址（缺陷2，实测三种 master 形态全 `undefined`）；**地址解析失败后 `markReportSeen` 已执行且不写 `.notified`** ⇒ 永久丢弃、不报错不打日志（缺陷3，最严重） | none | **待修**（P0 修3 静默 / P1 修1 新 report tool / P2 修2 认 master 地址）；详细报告与本仓探针见 `plans/20261124_report_channel_silent_blackhole.md` + `plans/20261124_report_channel_probe.ts` | [↓](#item-66) |
 | 65 | P1 | **async 面板被磁盘记录炸死主会话**（显示层 + fusion 终态写入双修）：`shortTaskLabel(undefined).replace()` ⇒ uncaughtException 经 timer 冒出 ⇒ **pi 整个退出** | none | 已落 commit；`test:async-panel` 含逐字事故记录反例；真实重启后长跑未复测 | [↓](#item-65) |
 | 64 | P1 | **steer 空闲 tab 唤醒兜底**（`4093f61`）：目标 `turn !== working` 时 steer 记录**永久 pending**、账本仍刷新 ⇒ 主会话拿「已投递」假象；修法 = 往目标 timer 邮箱投立即到期 nudge 让它自己起 turn（幂等防风暴）+ 顺带修 `join` 未导入致 `ledger-fallback.jsonl` 从未落盘 | none | 已落 commit；`test:steer-idle-wake` 4 组/24 断言；**真实端到端（nudge→pump→新 turn→边界消费）仍未验**；需重启后对新 tab 生效 | [↓](#item-64) |
 | 63 | P1 | **autonomy audit.jsonl 轮转 + 尾部定长窗口读**（`0cfbd59`）：29.4MB/28.4 万行无上限，`/autonomy status` 取尾 5 行要读全文件（123ms 且线性恶化）；修法 = 8MB 阈值 rename 归档（只归档不删）+ `fstat` 定位尾部 64KB 窗口（扩 8x×3 次），实测 **0.39ms vs 123.24ms（313x）** | none | 已落 commit；**真机已验证轮转在生产发生**（`audit-20261030T000837Z.jsonl` 32.5MB 与新生 `audit.jsonl` 并存）；**未闭合**：归档文件无 GC | [↓](#item-63) |
@@ -84,6 +85,29 @@
 | SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
 
 <a id="item-64"></a>
+### Item 66 - local master → global master 的回报通道是静默黑洞（2026-11-24）
+
+- **评级**: P0（静默丢失 + 让发送方误判成功；master 之间横向汇报能力当前为零）
+- **Status**: **待修**（三层修复均未落地；报告已交，代码未动）
+- **现象（业主观察）**：GreenCAD 的 local master 要向 global master 汇报离线成果，业主原话「我要求 local master 向你汇报内容而他找不到合适的通道」。
+- **根因（三层，任一层都足以让汇报丢失）**：
+  1. **`tab-report` 对非 tab 进程硬拒绝**（`extensions/tab-runs-runtime.ts#L508-L512`）：`resolveRunId()` 在无 `PI_TAB_RUN_ID` 时返回 `undefined` ⇒ 直接 `isError: true`，**无 fallback**。local master 是主会话，永远用不了这个「唯一文档化的主动回报工具」。
+  2. **`recipientSessionIdFor` 不认 master 地址**（`extensions/report.ts#L74-L88`）：只认 `tab_*`（查 links.jsonl）与纯 hex UUID（`/^[0-9a-f-]{8,}$/i`）。`agent://master_*` 全部返回 `undefined`。**而 `agent://` 恰恰是 master 体系的正式身份形态**。
+  3. **地址解析失败后静默永久丢弃**（`extensions/report.ts#L168-L183`，最严重）：`markReportSeen(id)` 在 `recipient` 判定**之前**执行 ⇒ 解析失败 `return false` 时 ① 不写 `.notified`（`claimReportNotified` 在其后）；② id 已进 `seenReports`，tick 兜底 `!seenReports.has(id)` 守卫跳过；③ 重启时 `snapshotExisting` 又把已存在文件当「已处理」⇒ **第二次判决**。不报错、不打日志、不 toast、无 `.failed` 标记。
+- **实测证据**（`plans/20261124_report_channel_probe.ts`，真实跑过）：
+  ```
+  agent://master_local_GreenCAD    => undefined  <== 永不消费
+  agent://master_default           => undefined  <== 永不消费
+  agent://master_local_Annacomnena => undefined  <== 永不消费
+  tab_mwsyvys2_7zen                => "01a2070a-fbf2-7045-a398-909c365b0630"
+  01a2070a-fbf2-7045-a398-909c365b0630 => 它自己
+  ```
+- **现场（真实发生）**：GreenCAD local master 三次尝试 —— ① `tab-report` 被拒；② 查 master 工具发现 `master-dispatch` 作 local owner 只能派本仓子树、`global-view` 只读、无 global tab 可 steer；③ **自己按信封格式落盘成功** `~/.pi/agent/reports/report_mwucgcad_r1a0.json`（3,351 B），并据「同目录另两份历史 report 都有 `.notified`、本份没有」判断为「等 global 扫到的未消费态」。**该推断合理但结论错**：那份永远不会有 `.notified`。global master 实际从未收到，是靠业主转发才知道。
+- **纪律含义（本缺陷最危险处）**：**一个会报错的通道，agent 会重试或换路；一个静默成功的假通道，agent 会停下来等。** ⇒ 判断异步投递是否送达，必须看**接收侧消费证据**（`.notified`/回执/ack），不能看发送侧文件是否写出。建议对所有用 `~/.pi/agent/reports/` 的 agent 加硬规则：**只有看到 `.notified` 才算送达，没有就换通道，不能等**。
+- **修法（优先级）**：P0 = 把 `markReportSeen` 挪到 recipient 判定之后（或解析失败写 `.unroutable` 可重试态）；**不修这条，其它修了仍有黑洞**。P1 = 新增平级 `report` tool（tab 与主会话都能用，`from` 取 sessionId 而非 `agent://`，零成本立刻打通）。P2 = `recipientSessionIdFor` 认识 `agent://master_*`（数据源直接用既有 `registry/attachments/agent___master_*.json`；需处理「一会话同时持 global+local」的 owner 歧义，`claimReportNotified` 的原子领取已有，可用）。
+- **不建议**：只改文档说「tab-report 只能 tab 用」（真存在 master 横向汇报需求，体系缺通道）；要求 agent 手填 UUID 当 `from`（让调用方替库的实现细节买单，且 agent 从 `master-status` 看到的身份永远是 `agent://`）；把解析失败升级成抛异常（回报是 best-effort 旁路，正确做法是可重试 + 可见）。
+- **详细报告**：`plans/20261124_report_channel_silent_blackhole.md`（含 §5 可复跑步骤与每层验收判据）。
+
 ### Item 65 - async 面板显示层被磁盘记录炸死主会话（2026-11-13）
 
 - **评级**: P1
