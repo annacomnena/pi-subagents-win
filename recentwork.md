@@ -23,6 +23,7 @@
 
 | Item | Priority | Summary | Dependency | Next action | 详情 |
 |---|---|---|---|---|---|
+| 67 | **P0** | **微信出站通道连续 222 次失败零告警**：`sendmessage` 从 2026-11-24 00:30:48 起全失败（`{"ret":-2,"errmsg":"prepare failed"}`），而**收消息的 worker 一直 `status: connected`** ⇒ 从任何面板看都是「微信正常」，**实际只能收不能发**。失败 222 次 / 成功 43 次，分界线极干净（最后成功 00:29:08，首次失败 00:30:48）。 | none | **待修**（代码未改，按业主指令交本仓）；通道当前不可用，需业主重发一条微信重建会话上下文；详细报告 `plans/20261124_wechat_outbound_silent_failure.md` | [↓](#item-67) |
 | 66 | **P0** | **local master → global master 的回报通道是静默黑洞**：`tab-report` 对非 tab 进程硬拒绝（缺陷1）；`recipientSessionIdFor` 不认 `agent://master_*` 地址（缺陷2，实测三种 master 形态全 `undefined`）；**地址解析失败后 `markReportSeen` 已执行且不写 `.notified`** ⇒ 永久丢弃、不报错不打日志（缺陷3，最严重） | none | **待修**（P0 修3 静默 / P1 修1 新 report tool / P2 修2 认 master 地址）；详细报告与本仓探针见 `plans/20261124_report_channel_silent_blackhole.md` + `plans/20261124_report_channel_probe.ts` | [↓](#item-66) |
 | 65 | P1 | **async 面板被磁盘记录炸死主会话**（显示层 + fusion 终态写入双修）：`shortTaskLabel(undefined).replace()` ⇒ uncaughtException 经 timer 冒出 ⇒ **pi 整个退出** | none | 已落 commit；`test:async-panel` 含逐字事故记录反例；真实重启后长跑未复测 | [↓](#item-65) |
 | 64 | P1 | **steer 空闲 tab 唤醒兜底**（`4093f61`）：目标 `turn !== working` 时 steer 记录**永久 pending**、账本仍刷新 ⇒ 主会话拿「已投递」假象；修法 = 往目标 timer 邮箱投立即到期 nudge 让它自己起 turn（幂等防风暴）+ 顺带修 `join` 未导入致 `ledger-fallback.jsonl` 从未落盘 | none | 已落 commit；`test:steer-idle-wake` 4 组/24 断言；**真实端到端（nudge→pump→新 turn→边界消费）仍未验**；需重启后对新 tab 生效 | [↓](#item-64) |
@@ -85,6 +86,33 @@
 | SBS-RUNS-M1 | P1 | GUI「运行」section + `GET /v1/runs` 只读端点（档 A M1：三态判活 alive/dead/unknown） | none | daemon 重启生效；>400 条记录需 tail 分页 | [↓](#sbs-runs-m1) |
 
 <a id="item-64"></a>
+### Item 67 - 微信出站通道连续 222 次失败零告警（2026-11-24）
+
+- **评级**: P0（静默失效 + 让调用方误以为已通知）
+- **Status**: **待修**（本报告只诊断不实现，按业主指令「缺陷交 subagent-win 那边处理」）；**通道当前不可用**，需业主重发一条微信重建会话上下文
+- **现象**：业主指令「有什么进展通过微信通知我」，执行时才发现微信主动推送**已从 11-24 00:30 起完全失效**，此前已连续失败 **222 次**，零告警。
+- **确诊读数**：`HTTP 200` + `{"ret":-2,"errmsg":"prepare failed"}`。`send.ts` 把 `ret=-2` 归类 `protocol`，错误面只暴露数字（**这个设计是对的**，防 errmsg 回显秘密），但调用方只知道「-2」不知道「prepare failed」，诊断成本全转嫁给使用者。
+- **精确时间线**（`~/.pi/agent/runtime/state/wechat-reply-audit.jsonl` 687 行；成功 43 / 失败 222）：
+  | UTC | 本地 | 事件 |
+  |---|---|---|
+  | 11-23T15:56:33Z | 11-23 23:56 | 业主最后一条微信消息入站 |
+  | 11-23T16:19:52Z | 11-24 00:19:52 | ✅ 成功 |
+  | 11-23T16:24:23Z | 11-24 00:24:23 | ✅ 成功 |
+  | 11-23T16:29:08Z | 11-24 **00:29:08** | ✅ **最后一次成功** |
+  | 11-23T16:30:48Z | 11-24 **00:30:48** | ❌ **首次失败** |
+  | →11-24T09:57:51Z | 11-24 17:57 | ❌ 累计 222 次失败 0 成功 |
+  **分界线极干净：成功与失败之间没有交织** ⇒ 不是偶发，是某个条件在 00:30 变了。
+- **二分诊断（排除项）**：① 内容 emoji → 用 9 字符 `zz连通性测试zz` 同样 -2，排除；② `bot_token` 失效 → `receive/state.json` 为 `connected`/`authErrors:0`/`lastError:null`，poll 4851 次正常，排除；③ `client_id` 格式 → 64 hex 合法，排除；④ 收件人 → `ownerOpenId` 与 `reply.allowOut` 同一个值，排除；⑤ 限流 → 无 429 全是 200，排除。
+  ⇒ 剩下最可能：**会话窗口在 00:30 关闭**（业主 23:56 发消息，**34 分钟**后失效）。注：34 分钟不符合「48 小时」常见假设，**窗口长度本仓此前未校准**（Wiki 自述「不证明长期主动推送无限可用」）—— 本次等于把「未校准」变成实测。
+- **为什么 222 次没人发现（本报告主要问题，三层叠加）**：
+  1. **两条路径状态从不汇总**：入站 worker 写 `receive/state.json`（status/counts/lastError）；出站 `notify-wechat.mjs` 直调 `sendMessage`，结果只 `console.log`。`state.json` **无任何出站字段**。实测佐证：`receive/state.json` 的 `transientErrors = 2`，而同期出站已失败 222 次 —— **同一个通道，一个说「基本正常」，一个说「全挂」**。
+  2. **失败只回三值不带可行动信息**：`{kind:"failed", error:"sendmessage 业务失败 ret=-2"}`，使用者无法判断「该重试 / 该等窗口 / 该重新绑定」。
+  3. **没有「连续失败」概念**：单次失败正常，但连续 222 次跨 17 小时应升级为「通道已失效」的显式状态。现无任何跨调用累积计数器。
+- **建议修法**：P0 出站失败要能累积成状态（复用已有 `wechat-reply-audit.jsonl`，维护连续失败次数 + 最后一次成功时间，连续 ≥3 写 `outbound-degraded`）；P1 `/v1/health` 的 `wechat` 段补 `lastSendAt`/`lastSendOk`/`consecutiveSendFailures`/`lastSendErrorCode`（现有 6 个字段全是入站）；P2 `ret=-2` 给可行动分类（不靠 errmsg，靠调用前本地前置检查，如「距最后一条入站 > T」预判窗口问题并给明确提示；T 需校准，本报告给了第一个实测点 34 分钟）；P3 结构性风险：`parser.ts#L9` 把 `context_token` **彻底丢弃**，一旦服务端开始要求它就**没有任何补救路径**，而 `prepare failed`（prepare=准备上下文）高度提示就是这个原因 ⇒ 建议改为加密落凭据面（与 bot_token 同级保护）。
+- **纪律含义（必须写进台账）**：**「收消息正常」不等于「通道正常」。** 双向通道必须两个方向各有健康信号，且任一方向连续失败要能升级成显式状态。只有入站状态的面板，会让「只能收不能发」看起来完全健康。
+- **同类前例**：Item 66（report 通道静默黑洞）—— 那次是「文件写了但没人消费」，这次是「消息发了但服务端拒绝」。**共同点：失败不产生任何可见痕迹，而调用方都以为自己成功了。**
+- **详细报告**：`plans/20261124_wechat_outbound_silent_failure.md`（含 §8 复跑命令与时间线脚本）。
+
 ### Item 66 - local master → global master 的回报通道是静默黑洞（2026-11-24）
 
 - **评级**: P0（静默丢失 + 让发送方误判成功；master 之间横向汇报能力当前为零）
