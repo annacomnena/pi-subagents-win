@@ -68,6 +68,19 @@ export interface MarkerProbeResult {
 	truncated: boolean;
 	/** 读失败原因（不抛，落进这里） */
 	error?: string;
+	/**
+	 * 被扫文件的最后修改时刻（ms epoch；多候选取最大）。**「落盘滞后」判据的输入**。
+	 * 读不到 ⇒ null。
+	 */
+	fileMtimeMs?: number | null;
+	/**
+	 * 扫到的最新一条消息行的 `timestamp`（ms epoch；会话 JSONL 里消息自带该字段）。
+	 *
+	 * ⚠️ **不能用它判「是否已 flush」**：实测注入消息的 timestamp 是**产生时刻**，
+	 * 而它在文件里的位置可能晚于更新的行（QC 实测 line 1533 ts=06:13:26 排在 line 1532
+	 * ts=06:17:32 之后 ⇒ 落后 ≥246s）。这里是诊断读数，判据用 `fileMtimeMs`。
+	 */
+	newestMsgTsMs?: number | null;
 }
 
 /** 缺省尾部预算：8MB（与 `transcript.ts` 的 `SESSION_TAIL_SOFT_CAP_BYTES` 同量级）。 */
@@ -111,6 +124,10 @@ interface ScanOutcome {
 	hit: boolean;
 	bytes: number;
 	truncated: boolean;
+	/** 文件 mtime（ms epoch）；stat 失败 ⇒ null */
+	mtimeMs: number | null;
+	/** 扫到的最大 `timestamp`（ms epoch）；没有/不可解析 ⇒ null */
+	newestMsgTsMs: number | null;
 }
 
 /**
@@ -121,21 +138,26 @@ interface ScanOutcome {
  *   - 命中子串后才解析该行，并要求 `message.role === "user"`；
  *   - `role` 取不到（非 message 行 / 结构异常）⇒ **不算命中**（fail-closed，见模块头）。
  */
+const EMPTY_SCAN: ScanOutcome = { hit: false, bytes: 0, truncated: true, mtimeMs: null, newestMsgTsMs: null };
+
 function scanFileForMarker(file: string, marker: string, tailBytes: number): ScanOutcome {
 	let size = 0;
+	let mtimeMs: number | null = null;
 	try {
-		size = statSync(file).size;
+		const st = statSync(file);
+		size = st.size;
+		mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : null;
 	} catch {
-		return { hit: false, bytes: 0, truncated: true };
+		return EMPTY_SCAN;
 	}
 	const start = size > tailBytes ? size - tailBytes : 0;
 	const want = size - start;
-	if (want <= 0) return { hit: false, bytes: 0, truncated: false };
+	if (want <= 0) return { hit: false, bytes: 0, truncated: false, mtimeMs, newestMsgTsMs: null };
 	let fd: number;
 	try {
 		fd = openSync(file, "r");
 	} catch {
-		return { hit: false, bytes: 0, truncated: true };
+		return { ...EMPTY_SCAN, mtimeMs };
 	}
 	let buf: Buffer;
 	try {
@@ -149,7 +171,7 @@ function scanFileForMarker(file: string, marker: string, tailBytes: number): Sca
 		if (read < want) buf = buf.subarray(0, read);
 	} catch {
 		closeSync(fd);
-		return { hit: false, bytes: 0, truncated: true };
+		return { ...EMPTY_SCAN, mtimeMs };
 	} finally {
 		try { closeSync(fd); } catch { /* ignore */ }
 	}
@@ -160,23 +182,30 @@ function scanFileForMarker(file: string, marker: string, tailBytes: number): Sca
 		const nl = text.indexOf("\n");
 		text = nl >= 0 ? text.slice(nl + 1) : "";
 	}
+	// 最新消息时间戳（诊断用）：只从**命中 marker 的行**取（未命中行不解析 = 性能主因）。
+	// ⇒ 它是下界；只用于诊断展示，**不参与判定**（判据用 mtime，见 probe 函数头）。
+	let newestMsgTsMs: number | null = null;
 	const lines = text.split("\n");
 	for (const line of lines) {
 		if (line.length === 0) continue;
 		if (line.indexOf(marker) < 0) continue;
 		let role: unknown;
+		let ts: unknown;
 		try {
-			const e = JSON.parse(line) as { message?: { role?: unknown }; type?: unknown };
+			const e = JSON.parse(line) as { message?: { role?: unknown; timestamp?: unknown }; type?: unknown; timestamp?: unknown };
 			// 只认 message 行上的 role；toolResult / compaction / 其它 type 一律不认
 			if (e?.type !== "message") continue;
 			role = e?.message?.role;
+			ts = e?.message?.timestamp ?? e?.timestamp;
 		} catch {
 			continue;
 		}
+		const tsMs = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
+		if (Number.isFinite(tsMs) && (newestMsgTsMs === null || tsMs > newestMsgTsMs)) newestMsgTsMs = tsMs;
 		if (role !== "user") continue;
-		return { hit: true, bytes: buf.length, truncated: start > 0 };
+		return { hit: true, bytes: buf.length, truncated: start > 0, mtimeMs, newestMsgTsMs };
 	}
-	return { hit: false, bytes: buf.length, truncated: start > 0 };
+	return { hit: false, bytes: buf.length, truncated: start > 0, mtimeMs, newestMsgTsMs };
 }
 
 /**
@@ -189,6 +218,16 @@ export function probeEventMarkerInUserMessages(opts: {
 	sessionId: string;
 	eventId: string;
 	tailBytes?: number;
+	/**
+	 * 该消息**被注入的时刻**（ms epoch）。提供则启用「落盘滞后」判据（P0-b，2026-11-24）：
+	 * 只有当**文件在注入之后确实被追加过**（`mtime > injectedAtMs`）时，才允许把「扫不到」
+	 * 判成 `absent`；否则降级为 `inconclusive`（`error: "no-flush-since-attempt"`）。
+	 *
+	 * 不提供 ⇒ 保持旧行为（只按截断判据），调用方可逐步接入。
+	 */
+	injectedAtMs?: number;
+	/** 本函数内取「现在」的时刻（测试注入；缺省 `Date.now()`）。 */
+	now?: number;
 }): MarkerProbeResult {
 	const base: MarkerProbeResult = { verdict: "inconclusive", scannedBytes: 0, sessionFile: null, candidateFiles: 0, truncated: false };
 	try {
@@ -198,21 +237,39 @@ export function probeEventMarkerInUserMessages(opts: {
 		const tail = Math.max(1, Math.trunc(opts.tailBytes ?? MARKER_PROBE_TAIL_BYTES));
 		let scanned = 0;
 		let truncated = false;
+		let mtimeMs: number | null = null;
+		let newestMsgTsMs: number | null = null;
 		for (const f of files) {
 			const r = scanFileForMarker(f, marker, tail);
 			scanned += r.bytes;
 			truncated = truncated || r.truncated;
-			if (r.hit) return { verdict: "found", scannedBytes: scanned, sessionFile: f, candidateFiles: files.length, truncated };
+			if (r.mtimeMs !== null && (mtimeMs === null || r.mtimeMs > mtimeMs)) mtimeMs = r.mtimeMs;
+			if (r.newestMsgTsMs !== null && (newestMsgTsMs === null || r.newestMsgTsMs > newestMsgTsMs)) newestMsgTsMs = r.newestMsgTsMs;
+			if (r.hit) {
+				return { verdict: "found", scannedBytes: scanned, sessionFile: f, candidateFiles: files.length, truncated, mtimeMs, newestMsgTsMs };
+			}
 		}
-		// 扫完都没找到：只有**全部文件都未截断**时才有资格说 absent
-		return {
-			verdict: truncated ? "inconclusive" : "absent",
-			scannedBytes: scanned,
-			sessionFile: null,
-			candidateFiles: files.length,
-			truncated,
-			...(truncated ? { error: "truncated-scan" } : {}),
-		};
+		// 扫完都没找到：**两层**条件都满足才有资格说 absent。
+		if (truncated) {
+			return { verdict: "inconclusive", scannedBytes: scanned, sessionFile: null, candidateFiles: files.length, truncated, mtimeMs, newestMsgTsMs, error: "truncated-scan" };
+		}
+		// ── P0-b：「落盘滞后」判据 ────────────────────────────────────────────
+		// 会话 JSONL 的落盘**滞后于 context** 是常态，实测注入消息的行可能晚 ≥246s 才出现
+		// （QC 现场：line 1533 ts=06:13:26 排在 line 1532 ts=06:17:32 之后；D3 在 61s 时扫
+		// 4.16MB，那条行还不存在 ⇒ 判 absent ⇒ 放行重投 ⇒ 同一 item 注入了两次）。
+		// ⇒ 只有「文件在注入之后确实被追加过」才把「扫不到」当证据。
+		//   mtime 是**追加的证据**（与 timestamp 无序性无关：消息 timestamp 是产生时刻，
+		//   在文件里的位置可以乱序 —— QC 实测，故不能用 newestMsgTsMs 判 flush）。
+		if (opts.injectedAtMs !== undefined && Number.isFinite(opts.injectedAtMs)) {
+			if (mtimeMs === null || mtimeMs <= opts.injectedAtMs) {
+				return {
+					verdict: "inconclusive", scannedBytes: scanned, sessionFile: null, candidateFiles: files.length, truncated,
+					mtimeMs, newestMsgTsMs,
+					error: `no-flush-since-attempt(mtime=${mtimeMs === null ? "unknown" : new Date(mtimeMs).toISOString()},injectedAt=${new Date(opts.injectedAtMs).toISOString()})`,
+				};
+			}
+		}
+		return { verdict: "absent", scannedBytes: scanned, sessionFile: null, candidateFiles: files.length, truncated, mtimeMs, newestMsgTsMs };
 	} catch (e) {
 		return { ...base, verdict: "inconclusive", error: e instanceof Error ? e.message : String(e) };
 	}

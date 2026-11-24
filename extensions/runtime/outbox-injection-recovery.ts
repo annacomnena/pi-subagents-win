@@ -25,13 +25,14 @@
  *
  * ⇒ 本模块的判据里**次数上限是第一位的**，反查只是「放行前的证据前提」。
  *
- * ## 三条判据（缺一不可，各有各的理由）
+ * ## 四条判据（缺一不可，各有各的理由）
  *
  * | 判据 | 值 | 为什么需要 |
  * |---|---|---|
  * | 反查结论 | `absent`（且非截断） | `found` ⇒ 其实进了，**不得**重投（2026-11-02 双投的形状）；`inconclusive` ⇒ 没证据 |
+ * | **落盘滞后**（P0-b） | `absent` 要求「文件在注入之后被追加过」 | 探针里实现（`injectedAtMs` + mtime）。扫不到 ≠ 没进：QC 现场注入行滞后 ≥246s |
  * | 已注入未确认次数 | `< 2`（即只剩 1 次额度） | 上限 1 次额外尝试后必须停手（见上） |
- * | 距上次注入的时长 | `>= 60s` | 会话 JSONL 可能还没 flush ⇒ 立刻反查会把「刚写进内存」读成 `absent`（假阴性） |
+ * | 距上次注入的时长 | `>= 300s` | 会话 JSONL 可能还没 flush ⇒ 立刻反查会把「刚写进内存」读成 `absent`（假阴性）。60s 无实测支撑，实测 ACK p90=323.8s ⇒ 2026-11-24 提到 300s |
  *
  * ## 「收据让路」的实现选择：**隔离重命名，不删除**
  *
@@ -56,8 +57,25 @@ import type { MarkerProbeResult } from "./transcript-marker-probe.ts";
 /** D3 允许的**额外**注入次数（1 = 只放行一次；达到上限后一律不放行）。 */
 export const D3_MAX_EXTRA_INJECTIONS = 1;
 
-/** 距上次注入的最小间隔：低于它不反查/不放行（会话 JSONL 可能尚未 flush）。 */
-export const D3_MIN_ATTEMPT_AGE_MS = 60_000;
+/**
+ * 距上次注入的最小间隔：低于它不反查/不放行（会话 JSONL 可能尚未 flush）。
+ *
+ * ## 为什么从 60s 提到 300s（P0-b，2026-11-24）
+ *
+ * 60s 的依据是「会话 JSONL 可能还没 flush」—— 但**没有任何实测支撑**，而且实测方向相反：
+ * QC 现场（`plans/20261124_report_channel_silent_blackhole.md` 同批）6 个 run 的
+ * ACK − terminal 是 `145.2 / 255.2 / 285.6 / 296.7 / 272.5 / 211.9` 秒；
+ * 另一个真实现场里注入消息的**行位置**滞后 ≥246s（line 1533 ts=06:13:26 排在
+ * line 1532 ts=06:17:32 之后）。D3 在 61s 时判 `absent` ⇒ 放行重投 ⇒ 同一 item 注入两次。
+ *
+ * 交付账本侧的分母（141 事件 / 140 个有 consumed ACK）：`p90=323.8s`、`p95=913.8s`。
+ * 300s 覆盖约 89% 的真实确认时延 —— 取它作为「最早可怀疑没进」的下界。
+ *
+ * **两层判据缺一不可**：本常量只管「够不够老」；「是否已 flush」由探针的
+ * `injectedAtMs` + 文件 mtime 判（`no-flush-since-attempt` ⇒ `inconclusive`）。
+ * 只提 age 不提 flush 判据，在「会话完全空闲、什么都没 flush」时仍会假 absent。
+ */
+export const D3_MIN_ATTEMPT_AGE_MS = 300_000;
 
 export type RecoveryAction = "keep" | "release";
 

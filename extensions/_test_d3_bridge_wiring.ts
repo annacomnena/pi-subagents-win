@@ -24,7 +24,7 @@
  * | A7 | role 不加限定（= 真死锁被判已送达） | probe 去掉 `type==="message"` |
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -245,6 +245,26 @@ const main = async (): Promise<void> => {
 		assert.equal(quarantined().length, beforeQ6, "隔离文件数不应增加");
 		const l = traceEntries().filter((t) => t.outboxId === k6 && t.kind === "d3-probe-not-released");
 		assert.equal(l[0]?.reason, "attempt-too-fresh", `应记录 attempt-too-fresh，实际 ${String(l[0]?.reason)}`);
+	});
+
+	// ── A7 【P0-b · 生产形状】落盘滞后 ⇒ 不放行（这条是 QC 假 absent 的直接复刻）──
+	// 盘面：注入发生在 03:00，会话文件最后修改在 02:59（**注入后没有任何追加** = 还没 flush），
+	// 反查时刻 03:06（年龄 360s > 300s 冷却 ⇒ 冷却闸放行，只剩「落盘滞后」这一道闸能拦住）。
+	// 若桥没把 `injectedAtMs` 传给探针（或探针没有这条判据）⇒ 判 absent ⇒ 放行重投 ⇒ 本用例红。
+	const k7 = outboxItemId("wechat:d3-a7");
+	seedItem("d3-a7");
+	const e7 = seedInjectedOnce(k7, new Date("2026-11-10T03:00:00.000Z"));
+	writeSession([assistantLine(`回述 ${eventMarker(e7)}`)]);
+	utimesSync(SESS_FILE, new Date("2026-11-10T02:59:00.000Z"), new Date("2026-11-10T02:59:00.000Z"));
+	const beforeQ7 = quarantined().length;
+	const injected7 = await runBridge(new Date("2026-11-10T03:06:00.000Z"));
+	check("A7 文件 mtime 早于注入时刻（还没 flush）⇒ 不放行（收据保留、零隔离）", () => {
+		assert.equal(injected7, 0, "本轮不得注入");
+		assert.equal(existsSync(join(RECEIPTS, `outbox_${k7}.json`)), true, "收据必须保留（不许放行）");
+		assert.equal(quarantined().length, beforeQ7, "零隔离文件");
+		const l = traceEntries().filter((t) => t.outboxId === k7 && t.kind === "d3-probe-not-released");
+		assert.equal(l[0]?.reason, "probe-inconclusive", `应记 probe-inconclusive（实得 ${String(l[0]?.reason)}）`);
+		assert.equal(l[0]?.probeVerdict, "inconclusive", `probeVerdict 必须是 inconclusive（实得 ${String(l[0]?.probeVerdict)}）`);
 	});
 
 	console.log(`\nd3-wire: ${pass} passed, ${fail} failed`);

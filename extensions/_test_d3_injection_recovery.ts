@@ -27,7 +27,7 @@
  *   ⇒ 必须是 `rename`，且原名消失、新名存在、内容不变。
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eventMarker } from "./delivery-ack.ts";
@@ -172,6 +172,52 @@ const foundProbe = { verdict: "found" as const, scannedBytes: 1, sessionFile: "x
 const absentProbe = { verdict: "absent" as const, scannedBytes: 1, sessionFile: null, candidateFiles: 1, truncated: false };
 const inccProbe = { verdict: "inconclusive" as const, scannedBytes: 1, sessionFile: null, candidateFiles: 1, truncated: true };
 
+// ── ④d 【P0-b 核心】落盘滞后 ⇒ absent 降级为 inconclusive ─────────────
+// QC 现场（2026-11-24）：注入后 61s 扫不到，但消息 246s 后才落盘 ⇒ D3 判 absent
+// ⇒ 放行重投 ⇒ 同一 item 注入两次。判据：**文件在注入之后必须被追加过**（mtime > injectedAt）。
+// 注意不能用消息 timestamp 判 flush —— 消息 timestamp 是产生时刻，在文件里可以乱序
+// （QC 实测 line 1533 ts=06:13:26 排在 line 1532 ts=06:17:32 之后）。
+check("④d 文件 mtime 早于注入时刻（还没 flush）⇒ inconclusive，不是 absent", () => {
+	resetSessions();
+	const f = `2026-01-01T00-00-00-000Z_${SID}.jsonl`;
+	write(f, assistantLine("旧内容，不含 marker"));
+	const now = Date.now();
+	const injectedAtMs = now - 61_000; // 注入发生在 61s 前
+	utimesSync(sessFile(f), new Date(now - 10 * 60_000), new Date(now - 10 * 60_000)); // 文件最后修改在 10 分钟前
+	const r = probe.probeEventMarkerInUserMessages({ sessionsDir: SESSIONS, sessionId: SID, eventId: EID, injectedAtMs, now });
+	assert.equal(r.verdict, "inconclusive", `落盘滞后必须降级为 inconclusive，实际 ${r.verdict}`);
+	assert.ok(String(r.error).includes("no-flush-since-attempt"), `error 须写明原因，实际 ${r.error}`);
+});
+
+check("④e 文件在注入之后被追加过（已 flush）⇒ 仍可判 absent", () => {
+	resetSessions();
+	const f = `2026-01-01T00-00-00-000Z_${SID}.jsonl`;
+	const now = Date.now();
+	const injectedAtMs = now - 61_000;
+	write(f, assistantLine("注入之后的新内容，但确实没有 marker"));
+	utimesSync(sessFile(f), new Date(now), new Date(now)); // mtime = now > injectedAt
+	const r = probe.probeEventMarkerInUserMessages({ sessionsDir: SESSIONS, sessionId: SID, eventId: EID, injectedAtMs, now });
+	assert.equal(r.verdict, "absent", `已 flush 且未命中 ⇒ absent，实际 ${r.verdict}（${r.error ?? ""}）`);
+	assert.ok(typeof r.mtimeMs === "number" && r.mtimeMs > injectedAtMs, "结果带 mtimeMs（判据可复核）");
+});
+
+check("④f 不传 injectedAtMs ⇒ 保持旧行为（只按截断判据，兼容未接入的调用方）", () => {
+	resetSessions();
+	write(`2026-01-01T00-00-00-000Z_${SID}.jsonl`, assistantLine("无 marker"));
+	const r = probe.probeEventMarkerInUserMessages({ sessionsDir: SESSIONS, sessionId: SID, eventId: EID });
+	assert.equal(r.verdict, "absent", "未提供注入时刻 ⇒ 旧口径（absent）");
+});
+
+check("④g 命中优先于滞后判据：marker 在 user 行 ⇒ found（不因 mtime 旧而降级）", () => {
+	resetSessions();
+	const f = `2026-01-01T00-00-00-000Z_${SID}.jsonl`;
+	const now = Date.now();
+	write(f, userLine("正文" + String.fromCharCode(10) + outboxMarker));
+	utimesSync(sessFile(f), new Date(now - 10 * 60_000), new Date(now - 10 * 60_000));
+	const r = probe.probeEventMarkerInUserMessages({ sessionsDir: SESSIONS, sessionId: SID, eventId: EID, injectedAtMs: now - 61_000, now });
+	assert.equal(r.verdict, "found", "命中就是命中，mtime 不影响");
+});
+
 check("⑤ found ⇒ keep（已进会话，不得重投）", () => {
 	const d = rec.decideInjectionRecovery({ probe: foundProbe, attempts: [{ at: atAgo(5 * 60_000) }], now: Date.now() });
 	assert.equal(d.action, "keep");
@@ -213,9 +259,27 @@ check("⑨ 零次已注入未确认 ⇒ keep(no-prior-attempt)（没有『注入
 });
 
 // ── ⑩ 证据齐全 ⇒ release ───────────────────────────────────────
-check("⑩ absent + 1 次 attempt + 已过 60s ⇒ release(absent-evidenced)", () => {
-	const d = rec.decideInjectionRecovery({ probe: absentProbe, attempts: [{ at: atAgo(3 * 60_000) }], now: Date.now() });
-	assert.equal(d.action, "release");
+// P0-b（2026-11-24）：冷却从 60s 提到 300s（实测 ACK p90=323.8s、注入行滞后 ≥246s）。
+// ⇒ 旧用例的 3min 现在**不够老**，会落到 attempt-too-fresh。这里改成三段式：
+//   3min ⇒ keep(too-fresh) / 5min 整 ⇒ keep(too-fresh，边界) / 5min+1s ⇒ release。
+check("⑩ 证据齐全：absent + 1 次 attempt + 年龄 ≥300s ⇒ release(absent-evidenced)", () => {
+	const tooYoung = rec.decideInjectionRecovery({ probe: absentProbe, attempts: [{ at: atAgo(3 * 60_000) }], now: Date.now() });
+	assert.equal(tooYoung.action, "keep", "3min < 300s ⇒ 不得放行（旧 60s 口径会放行 = 假 absent 的来源）");
+	assert.equal(tooYoung.reason, "attempt-too-fresh");
+	assert.equal(rec.D3_MIN_ATTEMPT_AGE_MS, 300_000, "冷却阈值口径写死为 300s（改它必须同时改本断言与注释依据）");
+
+	// 边界必须用**同一个 now**：`atAgo(n)` 与 `now: Date.now()` 是两次取时，差几毫秒，
+	// 会让「恰好 300s」变成 300000+ε ⇒ 假绿/假红（上一版就踩了）。
+	const T = Date.now();
+	// 边界口径：实现是 `msSince < 300s ⇒ too-fresh` ⇒ **恰好 300s 放行**（开区间在下界）。
+	// 这条要写死，因为「边界算不算」是后来人最容易改错的地方。
+	const justUnder = rec.decideInjectionRecovery({ probe: absentProbe, attempts: [{ at: new Date(T - 299_999).toISOString() }], now: T });
+	assert.equal(justUnder.action, "keep", "299.999s < 300s ⇒ too-fresh");
+	const atBoundary = rec.decideInjectionRecovery({ probe: absentProbe, attempts: [{ at: new Date(T - 300_000).toISOString() }], now: T });
+	assert.equal(atBoundary.action, "release", "恰好 300s ⇒ 放行（下界开区间）");
+
+	const d = rec.decideInjectionRecovery({ probe: absentProbe, attempts: [{ at: new Date(T - 400_000).toISOString() }], now: T });
+	assert.equal(d.action, "release", `刚过 300s ⇒ release，实际 ${d.action}/${d.reason}`);
 	assert.equal(d.reason, "absent-evidenced");
 	assert.equal(d.unconfirmedAttempts, 1);
 });

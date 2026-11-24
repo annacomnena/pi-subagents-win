@@ -450,10 +450,16 @@ function consumeOutboxOnceInner(opts: ConsumeOutboxOptions): OutboxConsumeReport
 						// 只认「已注入但未确认」的记录 —— 那才是 A 类死锁的形状。
 						const priorAttempts = listAttempts(dDirForRecovery, eventId).filter((a) => a.status === "unconfirmed");
 						if (priorAttempts.length >= 1) {
+							// P0-b（2026-11-24）：把「该消息被注入的时刻」交给探针，启用**落盘滞后**判据。
+							// 依据（QC 现场）：注入后 61s 扫不到 ≠ 没进 —— 会话 JSONL 落盘滞后实测 ≥246s，
+							// 那次假 absent 直接导致同一 item 被注入两次。下面取**最近一次**注入时刻
+							// （取最早那次会让「mtime 早于最近一次注入」也通过 ⇒ 假 absent 的洞原样保留）。
+							const injectedAtMs = Date.parse(String(priorAttempts.at(-1)?.at ?? "")); // 最近一次注入（listAttempts 已按 at 升序）
 							const probe = probeEventMarkerInUserMessages({
 								sessionsDir: opts.sessionsDir ?? defaultSessionsDir(),
 								sessionId: item.sessionId,
 								eventId,
+								...(Number.isFinite(injectedAtMs) ? { injectedAtMs } : {}),
 							});
 							const decision = decideInjectionRecovery({ probe, attempts: priorAttempts, now: Date.parse(now()) });
 							if (decision.action === "release") {
