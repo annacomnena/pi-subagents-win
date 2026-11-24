@@ -282,6 +282,54 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
 | **B 类：B 补投地址发成 `pi://tab_xxx`，bridge 永不匹配** | **2026-11-10 已修**（`0d73702`）。根因：tab 会话的 `links.sessionId` 是 **tabRunId**，真 UUID 在 `ownerSessionId`（`index.ts:4534-4536` 双身份），而 `resolveDispatcherFromLinks` 只读 `sessionId` ⇒ 补投 `to=pi://tab_xxx`，而 outbox-bridge filter 只认 `pi://<自己的真 sessionId>`（`:288/350`，读 `ctx.sessionManager.sessionId`）⇒ **永不匹配、永停 pending、`events=0/receipt=0` 零痕迹**。分母：1197 条 async link 里 **565（47.2%）** 是 tab 形态。修法：resolver 仅对 `tab_` 前缀优先读 `ownerSessionId`（非 tab 逐字节不变；无 owner ⇒ **fail closed 返回 undefined**）；不可达 ⇒ **不写 outbox、返回 `failed`**（有界重试后 exhausted+incident，不扩 `AttemptStatus` 词表）；**存量 migration** = 幂等命中时就地修正 `to`/`sessionId`（id/dedupeKey 不变、终态不碰）。真机 7+3 条迁移后 `to=tab_*` 归零。**未闭合**：① host pid 25588 启动于 11-09，**代码改动尚未生效**（R-18）⇒ 重启前每条新增仍需手工修 ② 565 条 tab link 里 **471 条无 `ownerSessionId`** ⇒ 补投转 `failed`+incident（不静默但消息仍到不了，无 UUID 可解） ③ **A 通道 `async-result-watcher.ts:163-175` 同样只读 `sessionId`** 未改（它不写 outbox，地址不参与送达） |
 | trace-fusion 融入 adaptive 的**门槛口径未定义** | 未落地。「连续无返修 run」按连续口径现为 0（最新两个 run 是 cancelled/abandoned，且与他仓），按累计口径为 5。建议改用「最近 N 次 qualified 成功率」并把 cancelled/abandoned 排除出分母（见 `plans/20261105_tracefusion_adaptive_gate_metric.md`），**待 gen14 裁定** |
 | trace-fusion **融合者**在所有 UI 面不可见（不是 tab、曾被写进孤岛账本目录） | **2026-11-04 已修账本落点**（见 R-17）；融合者仍是无头子进程，只经 `subagent-runs/run_fuse*.json` + 完成通知呈现，**不会**作为 tab 出现（设计约束） |
+| **回报通道三位黑洞（Item 66）** | **2026-11-24 修了第 3 层（P0）**，第 1/2 层**未修**。已修：`markReportSeen` 移到 recipient 判定之后 + 门之后、解析失败落 `.unroutable`（可重试）+ 指数退避（5s→5min 封顶、**无次数上限**）、`snapshotExisting` 只把有 `.notified` 的算已处理、`already-injected` 收工。**未修的三条**：① `tab-report` 对非 tab 进程硬拒绝（`tab-runs-runtime.ts` 无 fallback）② `recipientSessionIdFor` 不认 `agent://master_*`（**⇒ Item 66 那份 `report_mwucgcad_r1a0` 修后仍送不到 global，只是从「静默」变成「可见 + 无限重试」**；数据源 `runtime/registry/attachments/agent___master_*.json` 有 attachment 可用）③ `.unroutable` **零消费者**（无 `/autonomy status` 行、无 GC，只能人工 `ls` —— R-17 原样） |
+| **`.notified` 的语义是 claim 不是 delivered** | **2026-11-24 登记（未修）**。写序是 `markSeen → claimReportNotified(.notified) → send → postInject(delivered 收据)` ⇒ claim 成功但 send 失败（异步 reject 不可见，`pi.sendUserMessage` wrapper 不 return 底层 Promise）时，重启后该回报被 `snapshotExisting` 当已处理、不再重投。要修需走 `injectFollowUpQuietly(strict)` ⇒ 会把**所有**通知降级 unconfirmed（仓库级裁定，未做） |
+| **回报通道 `selfDisabled` 后整条静默停摆** | **2026-11-24 登记（未修）**。`report.ts` 的 send **同步抛**一次 ⇒ 置 `selfDisabled` ⇒ 本进程每 tick 直接 `return false`，**无日志/无标记/无心跳/无 status 展示**，只能 `/reload` 恢复（R-2 第①态「进程内通道死了」仍不可观测）。`session_start` 也不清它 |
+| **`claimReportNotified` 把任何 IO 失败当「已被消费」** | **2026-11-24 登记（未修）**。`catch { return false }` 丢失 EEXIST / EACCES / ENOSPC 区分 ⇒ 调用点随即 `postInject(true)` 写 delivered 收据（断言一次不存在的注入），并造成「有收据、无 `.notified`」状态 |
+| **`!mySession`（identityless 进程）会放弃目录里所有回报** | **2026-11-24 登记（未修）**。与非本会话共用 `markReportSeen` ⇒ 范围比注释登记的 `tab_*` 更大，无标记 |
+
+## R-25（2026-11-24）：**判断异步投递是否送达，必须看接收侧消费证据**
+
+### 事故（Item 66：master 之间的回报通道是静默黑洞）
+
+GreenCAD 的 local master（`agent://master_local_GreenCAD`）要向 global master 汇报离线解析成果。它三次尝试：
+
+1. `tab-report` → 被拒（非 tab 进程无 `PI_TAB_RUN_ID`）
+2. 查 master 工具 → `master-dispatch` 作 local owner 只能派本仓子树；`global-view` 只读；无 global tab 可 steer
+3. **自己按信封格式落盘成功**（`~/.pi/agent/reports/report_mwucgcad_r1a0.json`，3351 B）
+
+然后它据「同目录另两份历史 report 都有 `.notified`、本份没有」判断为「等 global 扫到」——
+**这个推断合理，但结论错了**：那份永远不会有 `.notified`。
+
+### 根因（三层，任一层都足以让汇报丢失）
+
+| 层 | 机制 | 后果 |
+|---|---|---|
+| 1 | `tab-report` 对非 tab 进程硬拒绝，无 fallback | local master（主会话）永远用不了这个「唯一文档化的主动回报工具」 |
+| 2 | `recipientSessionIdFor` 只认 `tab_*` 与裸 UUID，`agent://master_*` 全部 `undefined` | master 体系自己闭环不了 |
+| 3 | `markReportSeen` 在 recipient 判定**之前**执行 | 解析失败 `return false` 时不写 `.notified`、却已进 `seenReports` ⇒ tick 守卫跳过 ⇒ 重启 `snapshotExisting` 又当已处理 ⇒ **不报错/不打日志/无 toast/无标记** |
+
+### 规则
+
+1. **判断「发出去了没有」必须看接收侧消费证据**（`.notified` / 回执 / ack），
+   **不能看发送侧文件是否写出**。发送侧写成功只证明「我写了文件」。
+2. **一个会报错的通道，agent 会重试或换路；一个静默成功的假通道，agent 会停下来等。**
+   ⇒ 通道失败必须有**可见**（`.unroutable` 一类标记）且**可重试**（不得设次数上限——设上限 = 又造黑洞）。
+3. **`markSeen`/`markDone` 一律放在「所有会让本次处理中止的判定之后」**：
+   recipient 判定、owner 门、注入门。任一瞬时拒绝（attach 晚到、stale claim）被当成「永久已处理」
+   = 与要消灭的缺陷同形（本轮 L4 两轮连续抓到同一形状）。
+4. **启动快照只能用「接收侧消费事实」判已处理**，不能用「文件存在」判。
+   代价是本进程重启会把未消费存量重投一次 —— 取舍同 R-5（宁可重发不可漏发）。
+5. **退避必须落在成本点**（`recipientSessionIdFor` 的全扫 links 实测 2.8–5.2ms，
+   而写标记 <0.05ms）；注释声明的节流若不覆盖真成本，「注释不算实现」（R-20）。
+6. **新增「测试专用导出」时，要一并验证变异能命中**：
+   本轮 `onNewReport(...)===false` 对「有没有 markSeen」**零判别力** ⇒ 删掉 markSeen 仍全绿（假绿）；
+   改用 `_isReportSeen()` 才真红（M9 已验）。
+
+### 为什么它比「找通道」更根本
+
+业主原话是「他找不到合适的通道」，**实际是通道存在、文件写成功、另一端永不消费且不报错**。
+⇒ 症状描述（「找不到通道」）与真因（「通道静默失效」）方向相反；**照症状修（加文档/加命令）不会修好**。
 
 ## R-15（2026-10-19）：不要把「用户本人的操作」误判成 agent 越权
 

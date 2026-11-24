@@ -13,7 +13,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, renameSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, writeSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -123,10 +123,119 @@ function markReportSeen(id: string): void {
 	}
 }
 
-/** 启动时快照：已有报告视为已处理（重启不重复注入）。 */
+/** 启动时快照：**只有已被领取（有 .notified）的才算已处理**。
+ *
+ * 2026-11-24 修正（Item 66 缺陷 3）：旧实现把目录里**所有**已存在文件都标 seen ⇒
+ * 一份从未被领取（无 .notified）的回报，重启后也永远进不了 onNewReport ⇒ **第二判决**。
+ * seenReports 只是本进程的读缓存，`.notified` 才是跨进程事实。
+ * 代价（如实登记）：重启后会把存量「未被领取」的回报重新投递（生产当前 1 份）。
+ *
+ * ⚠ 语义边界（L4 第三轮 A2，**未闭合**）：`.notified` 由 `claimReportNotified`（wx）在
+ * **send 之前**写出 ⇒ 它是「**已有人领取投递权**」= claim，**不是**「已送达」。
+ * 后果：claim 成功但 send 失败（同步抛已覆盖；异步 reject 不可见，见下方未闭合），
+ * 重启后这份会被 snapshotExisting 当已处理，不再重投。本项只修「从未被领取」的黑洞，
+ * 不声称解决「已领取但未送达」。
+ * 取舍方向同 R-5：宁可重发（可见、可忽略），不可漏发（静默丢失）。
+ */
 function snapshotExisting(reportsDir: string): void {
 	seenReports = new Set<string>();
-	for (const id of listReportIds(reportsDir)) markReportSeen(id);
+	for (const id of listReportIds(reportsDir)) {
+		if (existsSync(join(reportsDir, `${id}.notified`))) markReportSeen(id);
+	}
+}
+
+/**
+ * 「解析不到接收方」的**永久可见标记**（可重试态，不写 .notified）。
+ *
+ * 为什么需要：缺陷 3 的根因是"解析失败后既没标记也没重试"，通道静默成功、接收端零痕迹。
+ * 这里落一份 `<id>.unroutable`（扩展名故意不用 .json，避免被 listReportIds 当成回报枚举）：
+ *  - **不写 .notified** ⇒ 仍可重试（recipient 解析能力若在后续版本修好，存量会自动复苏）；
+ *  - 文件本身是**人可见的证据** ⇒ 排查时看得见"谁往这里写了东西但路由不到"。
+ * 用 wx 原子创建 ⇒ 每个 id 只写一次，不随 tick 刷屏。
+ */
+function markUnroutable(reportsDir: string, id: string, record: ReportRecord): void {
+	const path = join(reportsDir, `${id}.unroutable`);
+	if (existsSync(path)) return;
+	try {
+		const fd = openSync(path, "wx");
+		try {
+			writeSync(fd, JSON.stringify({
+				id,
+				from: record.from,
+				at: new Date().toISOString(),
+				reason: "recipient-unresolved",
+				hint: "本回报的 from 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）；未被任何会话消费。修好解析能力后会自动重试（本文件不影响重试）。本文件不是「已送达」的证据。注意：本文件目前**无任何读取方**（只能人工 ls 看到），见 AGENTS.md §10 未闭合项。",
+			}, null, 2) + "\n", "utf8");
+		} catch { /* 诊断信息写入失败不影响主流程 */ } finally { closeSync(fd); }
+	} catch { /* EEXIST：已标记过；其它失败：best-effort */ }
+}
+
+/**
+ * 送达后收尾 `.unroutable`：否则「先解析失败、后解析成功并写 .notified」时，两份文件
+ * 在磁盘上**直接矛盾**（一个说「未被任何会话消费」，一个说「已消费」）—— 会骗人的证据
+ * 比没有证据更坏（L4 A3）。never-throw。
+ */
+function clearUnroutable(reportsDir: string, id: string): void {
+	try { unlinkSync(join(reportsDir, `${id}.unroutable`)); } catch { /* 本来就没有 / 已被清：都算正常 */ }
+}
+
+// ── 「解析不到」的重试节流（L4 A2：否则每 5s tick × 每份无界增长的存量各付一次 listLinks）──
+//
+// 为什么需要：`recipientSessionIdFor` 对 tab_ 形态要 `listLinks()` 全扫 —— 实测 3740 行/934KB 时
+// **热 3.6ms、冷 9.8ms/次**（不是任务书里估的 0.01ms）。而 reports/*.json 无 GC，未解析集合只增不减。
+// 不节流就是「有界输入无界成本」。
+// **但绝不设最大次数**：设上限 = 又造一个静默黑洞（该重试却放弃）。只做指数退避 + 上限封顶。
+const UNROUTABLE_BACKOFF_BASE_MS = 5_000;      // 与 tick 周期同量级起步
+const UNROUTABLE_BACKOFF_CAP_MS = 5 * 60_000;  // 封顶 5 分钟（仍保证「迟早会再试」）
+const unroutableAttempts = new Map<string, { attempts: number; nextAt: number; delayMs: number }>();
+
+/** 该 id 现在该不该把「解析不到」重试一次？命中退避窗口 ⇒ false（跳过一次，省一次 listLinks）。 */
+function unroutableRetryDue(id: string): boolean {
+	const s = unroutableAttempts.get(id);
+	return s === undefined || Date.now() >= s.nextAt;
+}
+
+/** 记一次失败并按指数退避推到下一次。 */
+function noteUnroutableAttempt(id: string): void {
+	const prev = unroutableAttempts.get(id);
+	const attempts = (prev?.attempts ?? 0) + 1;
+	const delayMs = Math.min(UNROUTABLE_BACKOFF_BASE_MS * 2 ** (attempts - 1), UNROUTABLE_BACKOFF_CAP_MS);
+	unroutableAttempts.set(id, { attempts, nextAt: Date.now() + delayMs, delayMs });
+	// 上界：防这份 Map 本身变成无界内存（按 MAX_SEEN_REPORTS 同口径）。
+	if (unroutableAttempts.size > MAX_SEEN_REPORTS) {
+		const first = unroutableAttempts.keys().next().value;
+		if (first !== undefined) unroutableAttempts.delete(first);
+	}
+}
+
+/** 送达后清掉退避状态（该 id 已不是「解析不到」）。 */
+function clearUnroutableAttempt(id: string): void { unroutableAttempts.delete(id); }
+
+/**
+ * 测试专用只读快照 + 退避窗口开关（与 `_resetReportListener` 同性质，生产不调用）。
+ * `_forceUnroutableRetryDue` 只是把 nextAt 推到过去（等价于「等到了」），不重置 attempts
+ * —— 这样才能验证「次数只增不减、延迟指数增长且封顶、但永不放弃」这三条同时成立。
+ */
+export function _unroutableAttemptState(id: string): { attempts: number; delayMs: number } | undefined {
+	const s = unroutableAttempts.get(id);
+	return s === undefined ? undefined : { attempts: s.attempts, delayMs: s.delayMs };
+}
+export function _forceUnroutableRetryDue(id: string): void {
+	const s = unroutableAttempts.get(id);
+	if (s !== undefined) s.nextAt = 0;
+}
+/**
+ * 测试专用：该 id 是否已进本进程的 seenReports。
+ *
+ * 为什么需要这个导出：**「已收工」在外部可观测面上是不可见的** ——
+ * `pollNewReports` 只对 `!seenReports.has(id)` 的 id 调 `onNewReport`，已 seen 的 id
+ * 一次 IO 都不产生、一行审计都不写（L4 实测 `already-injected` 分支 suppressions +0）。
+ * 于是「测 onNewReport(...)===false」对「有没有 markSeen」**没有判别力**（两者都返回 false），
+ * 变异「删掉 markSeen」会**假绿**（实测：M5 第一轮未变红）。
+ * 所以把 seenReports 状态本身作为可断言面暴露给测试专用。
+ */
+export function _isReportSeen(id: string): boolean {
+	return seenReports.has(id);
 }
 
 export interface ReportListenerOptions {
@@ -165,9 +274,9 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	if (seenReports.has(id)) return false;
 	const record = readReportFile(reportsDir, id);
 	if (!record) return false; // 被删/未写完/损坏：不标 seen（下个事件/tick 可重试），与 event-bus 空结果守卫同理
-	markReportSeen(id);
 
 	if (opts.onReport) {
+		markReportSeen(id);
 		opts.onReport(record, id);
 		return true;
 	}
@@ -175,24 +284,87 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	// 会话定位：只消费派发给「当前会话」的回报（不同目录的 identityless 进程不得抢）
 	// links 记录的是派发时身份（sessionIdentity：tab runId 优先）；重启后本进程 scope 可能
 	// 变回 UUID（TUI 重开丢 flag）——双域任一匹配即视为本会话的回报（DOG2 根因，与 event-bus 同族）。
+	//
+	// 2026-11-24 修正（Item 66 缺陷 3）：**`markReportSeen` 必须放在这之后**。
+	// 旧顺序（先 markSeen 再判 recipient）导致解析失败时：不写 .notified、却已进 seenReports
+	// ⇒ tick 兜底的 `!seenReports.has(id)` 守卫跳过 ⇒ 重启时 snapshotExisting 又把它标成已处理
+	// ⇒ **不报错、不打日志、无 toast、无标记的永久静默黑洞**（实测 GreenCAD local master 那份
+	// report_mwucgcad_r1a0：3351B 落盘成功、.notified 永远不存在、global 从未收到）。
+	// 退避前置（L4 A2/S2）：**成本点是解析本身**（tab_ 形态要全扫 links.jsonl，实测 3745 行/957KB
+	// 时热 ~2.8-5.2ms），不是写标记（那里已有 `existsSync` 早退）。所以当这份 id 上次
+	// 解析失败且仍在退避窗口内时，**先直接返回**，不付解析钱（实测 2.81ms → 0.05ms）。
+	// 这是唯一一处「提前 return」：只在「已知解析不出 + 窗口内」时命中，不会遮蔽正常送达。
+	// 窗口到期后完整重走下面全部判定 ⇒ 解析能力恢复时仍能自动复苏（**无次数上限**）。
+	//
+	// 已知代价（L4 第三轮 B4，**刻意接受**）：本函数是 `fs.watch` 回调与 tick 的**同一入口**，
+	// 所以「links 刚补上」这种即时信号也会被窗口挡掉，最坏等一个窗口（封顶 5min）才送达。
+	// 取舍：挡掉的是「短时间内重复做一次 3-5ms 全扫」，换到的是「不会被无界存量把 tick 拖死」；
+	// 且本通道是 best-effort 旁路（不是控制面），分钟级延迟可接受。
+	if (!unroutableRetryDue(id)) return false;
+
 	const recipient = recipientSessionIdFor(record, opts.linksPath);
 	const mySession = sessionScopeKey();
-	if (!recipient || !mySession || (recipient !== mySession && recipient !== getCurrentSessionId())) {
-		return false; // 不是本会话的回报 → 不 claim、不注入（留给真正的编排会话）
+
+	if (!recipient) {
+		// ① 解析不到 ⇒ **可重试态**：不 markSeen（下 tick / 重启都会再试），并落人可见标记。
+		//    这就是"一个会报错的通道 agent 会重试；一个静默的假通道 agent 会停下来等"的正解。
+		markUnroutable(reportsDir, id, record);
+		noteUnroutableAttempt(id);
+		return false;
+	}
+	if (!mySession || (recipient !== mySession && recipient !== getCurrentSessionId())) {
+		// ② 解析成功但**不是本会话** ⇒ 正常分流，本进程永不负责这个 id。
+		//    这里必须 markSeen，否则会每 5s tick 空转重扫同一份别人的邮件（无谓 IO，且永远等不到）。
+		//    重启后新进程若正是该会话，seenReports 已重置 ⇒ 仍能消费（不是第二判决）。
+		//
+		//    已知边界（L4 A1-3，**未闭合**）：若 recipient 恰好是 `tab_*`（tab 进程不注册本监听器）
+		//    或一个永不存在的会话，本进程 markSeen 后该回报在本进程内永久不再尝试，且无标记。
+		//    生产实测这类形状存在（AGENTS.md B 类：565/1197 async link 是 tab 形态）。修它需要
+		//    「谁是活监听者」的外部事实，不在本项（P0）范围内 —— 登记为未闭合，不假装已解决。
+		markReportSeen(id);
+		return false; // 不 claim、不注入（留给真正的编排会话）
 	}
 
 	// Phase 4d 统一注入门（A5 F2/F15/F16）：cutover 未启用时恒 inject:true，零行为变化。
+	//
+	// 2026-11-24（L4 阻断项 2）：`markReportSeen` **不得**放在这道门之前。
+	// 这道门有**瞬时**拒绝理由（`suppressed-not-owner` = cutover 已开但 attach 还没到，正是
+	// R-21 实测的 26 秒竞争窗口；`claimed-by-other` = stale claim 未回收）。瞬时拒绝若被当成
+	// 「永久已处理」（markSeen），tick 守卫就永久跳过 ⇒ **与本项要消灭的缺陷完全同形**。
+	// 所以：gate 返回 inject:false 时**不 markSeen**，下一 tick 还能再试（attach 到达后自动复苏）。
 	let gateCtx: InjectionContext | null = null;
 	{
 		const gate = preInject({ key: `report-${id}`, sessionId: getCurrentSessionId() ?? mySession, path: "legacy-reports" }); // 持久 UUID 域（ownership 同侧）
-		if (!gate.inject) return false;
+		if (!gate.inject) {
+			// 瞬时拒绝 vs 永久终态（L4 S1 + 第三轮 B1）：
+			//  - `suppressed-not-owner` / `claimed-by-other` 都是**瞬时**（后者上界 = receipts staleAfterMs
+			//    10min，到期 CAS 接管）⇒ 不 markSeen，下一 tick 重试（这正是 R-21「attach 晚 26 秒」的正解）。
+			//  - `already-injected` 是**永久终态**（另一实例已写 delivered 收据 = 确实已投递）⇒ 必须收工，
+			//    否则每 5s tick 白试一个无出口分支（实测 5 次 poll 全 0、零审计痕迹）。
+			//    ⚠ 这里**不**附加 `existsSync(.notified)` 条件：本模块的写序是
+			//    markSeen → claimReportNotified(.notified) → send → postInject(delivered 收据)，
+			//    所以正常路径下收据意味着 `.notified` 也在；`.notified` 缺失只可能是被外部删除/
+			//    别的写入方 —— 那种状态下把「有 delivered 收据」当已投递是**更强**的证据，
+			//    而附加该条件反而制造「每 tick 无限重扫」（L4 第三轮实测 5/5 seen=false）。
+			if (gate.reason === "already-injected") markReportSeen(id);
+			return false;
+		}
 		gateCtx = { key: `report-${id}`, sessionId: getCurrentSessionId() ?? mySession, path: "legacy-reports" };
 	}
+	markReportSeen(id);
 	// 跨实例幂等：原子领取消费权（双 watcher/双实例只有第一个注入）
 	if (!claimReportNotified(reportsDir, id)) {
 		if (gateCtx) postInject(gateCtx, true); // legacy 已注证明，回填收据
 		return false; // 已被其他实例消费 → 静默跳过
 	}
+	// 收尾时机（L4 R-3a/A1）：`.unroutable` 是「未被消费」的**唯一反证据**。若在 send **之前**就删，
+	// send 失败时磁盘只剩 `.notified` ⇒ 反向矛盾证据。所以清到 send **未同步抛**之后。
+	//
+	// ⚠ 证据限度（L4 第三轮 A1，**未闭合**）：`pi.sendUserMessage` 生产 wrapper **不 return**
+	// 底层 Promise（injection-gate.ts:190-215 已登记）⇒ 「不抛」**不等于**「已送达」，
+	// 底层异步 reject（如 `already processing`）在这里不可见。要把它变成可见真值必须走
+	// `injectFollowUpQuietly(strict)`，而那会把**所有**通知降级为 unconfirmed（仓库级裁定，
+	// 不属本项）。所以本处只声称「send 未同步抛」，不声称已送达。
 
 	if (opts.toast !== false) {
 		sendWindowsToast({
@@ -208,6 +380,9 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 			{ deliverAs: "followUp" },
 		);
 		if (gateCtx) postInject(gateCtx, true);
+		// 清「未消费」反证据与退避状态。**只在 send 未同步抛时**（不声称已送达，见上方证据限度）。
+		clearUnroutable(reportsDir, id);
+		clearUnroutableAttempt(id);
 	} catch {
 		selfDisabled = true; // 旧实例 stale → 停止注入
 	}
@@ -308,6 +483,7 @@ export function registerReportListener(pi: ExtensionAPI, opts: ReportListenerOpt
 /** 供测试重置内部状态。 */
 export function _resetReportListener(): void {
 	seenReports = new Set<string>();
+	unroutableAttempts.clear();
 	selfDisabled = false;
 	try {
 		watcher?.close();

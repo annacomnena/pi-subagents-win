@@ -251,7 +251,8 @@
     "test:session-presence": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_presence.ts",
     "test:d3-injection-recovery": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_injection_recovery.ts",
     "test:d3-bridge-wiring": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_bridge_wiring.ts",
-    "test:trace-transition-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_transition_gate.ts"
+    "test:trace-transition-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_transition_gate.ts",
+    "test:report-blackhole": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_report_blackhole.ts"
   },
   "dependencies": {
     "usearch": "2.26.0"
