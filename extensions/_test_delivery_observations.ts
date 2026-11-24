@@ -17,7 +17,7 @@
  * ⑥ **「不证明」的文案必须真的写在输出里**（R-23：只给数字会让人自己编归因）。
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -181,6 +181,63 @@ check("⑥ 输出含「不证明什么」的限定语：永不匹配 / 不等于
 	assert.ok(/不等于 A 类|只是\*\*文件名级下界\*\*|文件名级下界/.test(text), `必须写明只是文件名级下界，实际:\n${text}`);
 	// 年龄必须带「前」（R-2 规则 2：只给绝对时间读不出陈旧）
 	assert.ok(/min 前|s 前|h 前/.test(text), `最老 pending 必须给年龄，实际:\n${text}`);
+});
+
+// ── ⑦ P2：`.unroutable` / `.d3-quarantined` 计数 + 最旧年龄（此前零读数）──────
+check("⑦ observeDeadDrops：两类反证据文件计数 + 最旧年龄；目录不存在 ⇒ 0 且 readable", () => {
+	// 注意：**不能**用 join(root,"reports") —— 那正是 ⑧ 要用的 status-body 读盘目录，
+	// ⑦ 在这里造文件会让 ⑧ 的前置「此刻为 0」失败（2026-11-24 实测踩到）。
+	const rep = join(root, "t7-reports");
+	const rec = join(root, "t7-receipts");
+	mkdirSync(rep, { recursive: true });
+	mkdirSync(rec, { recursive: true });
+	const now = Date.now();
+	// 2 个 .unroutable（年龄 10min / 60min）+ 1 个 .json 干扰项（不得计入）
+	writeFileSync(join(rep, "report_a.unroutable"), "{}", "utf8");
+	writeFileSync(join(rep, "report_b.unroutable"), "{}", "utf8");
+	writeFileSync(join(rep, "report_c.json"), "{}", "utf8");
+	utimesSync(join(rep, "report_a.unroutable"), new Date(now - 10 * 60_000), new Date(now - 10 * 60_000));
+	utimesSync(join(rep, "report_b.unroutable"), new Date(now - 60 * 60_000), new Date(now - 60 * 60_000));
+	// 1 个 d3 隔离收据（30min）+ 1 个普通收据（不得计入）
+	writeFileSync(join(rec, "outbox_x.d3-quarantined.20261124T000000000Z.json"), "{}", "utf8");
+	writeFileSync(join(rec, "outbox_y.json"), "{}", "utf8");
+	utimesSync(join(rec, "outbox_x.d3-quarantined.20261124T000000000Z.json"), new Date(now - 30 * 60_000), new Date(now - 30 * 60_000));
+
+	const dd = obs.observeDeadDrops({ reportsDir: rep, receiptsDir: rec, now });
+	assert.equal(dd.readable, true);
+	assert.equal(dd.unroutable, 2, `unroutable 只数 .unroutable（实得 ${dd.unroutable}）`);
+	assert.equal(dd.d3Quarantined, 1, `d3 只数 .d3-quarantined.（实得 ${dd.d3Quarantined}）`);
+	const h1 = Math.round((dd.oldestUnroutableAgeMs ?? 0) / 60_000);
+	assert.ok(h1 >= 59 && h1 <= 61, `最老 unroutable 年龄应 ≈60min（实得 ${h1}min）`);
+	const h2 = Math.round((dd.oldestD3QuarantinedAgeMs ?? 0) / 60_000);
+	assert.ok(h2 >= 29 && h2 <= 31, `最老 d3 年龄应 ≈30min（实得 ${h2}min）`);
+
+	// 目录不存在 ⇒ 0（「从没有过」不是故障）
+	const dd2 = obs.observeDeadDrops({ reportsDir: join(root, "nope1"), receiptsDir: join(root, "nope2"), now });
+	assert.equal(dd2.readable, true, "目录不存在应视为可读");
+	assert.equal(dd2.unroutable, 0);
+	assert.equal(dd2.d3Quarantined, 0);
+	assert.equal(dd2.oldestUnroutableAgeMs, null, "无文件 ⇒ 年龄 null");
+});
+
+// ── ⑧ P2：status body 真实输出必须**读盘**（不是只为测试另写一份、也不是渲染空行）──
+// 关键：造真实文件在**测试运行时目录**下（`PI_RUNTIME_DIR=<root>/runtime` ⇒ reports 在 `<root>/reports`），
+// 然后断言 body 里的**数字**变了。只断言「行存在」时把 status-body 的接线整段删掉仍然全绿
+// （渲染函数自己有 0 缺省）—— 那是 2026-11-24 变异 Q7 实测到的假绿。
+check("⑧ buildAutonomyStatusBody 的 dead-drop 行真的读盘：造 2 个 .unroutable ⇒ 数字变 2", () => {
+	const reportsDirForBody = join(root, "reports");
+	mkdirSync(reportsDirForBody, { recursive: true });
+	assert.equal(obs.observeDeadDrops({ reportsDir: reportsDirForBody, receiptsDir: join(root, "receipts") }).unroutable, 0, "前置：此刻为 0");
+	writeFileSync(join(reportsDirForBody, "report_x.unroutable"), "{}", "utf8");
+	writeFileSync(join(reportsDirForBody, "report_y.unroutable"), "{}", "utf8");
+	const body = buildAutonomyStatusBody();
+	assert.ok(body.includes("dead-drop: unroutable="), `body 必须含 dead-drop 行，实际尾部:\n${body.slice(-600)}`);
+	assert.ok(body.includes("unroutable=2"), `必须真的数到 2 个（实得相关行：${body.split("\n").find((l) => l.includes("dead-drop")) ?? "(无)"}）`);
+	assert.ok(/反证据/.test(body), "必须写明这是反证据（存在 = 有消息没送到）");
+	assert.ok(/不删不改/.test(body), "必须写明本行只报数（删审计面需人批）");
+	// 清理，避免影响后续/重跑
+	rmSync(join(reportsDirForBody, "report_x.unroutable"), { force: true });
+	rmSync(join(reportsDirForBody, "report_y.unroutable"), { force: true });
 });
 
 console.log(`delivery-observations: ${pass} passed, ${fail} failed`);

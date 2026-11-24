@@ -40,7 +40,7 @@
  * 而 `unconfirmed` 这类**内容级**判据留给专门的 A 类诊断（读 JSON）。
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { OutboxItem } from "./message-outbox.ts";
 import { outboxDir } from "./message-outbox.ts";
@@ -211,6 +211,73 @@ export function observeDelivery(runtimeDir?: string): DeliveryObservation {
 	}
 }
 
+/**
+ * 「写出来但没人读」的两类产物（P2，2026-11-24，QC H9）：
+ *
+ * | 产物 | 谁写 | 谁读 |
+ * |---|---|---|
+ * | `<reportsDir>/<id>.unroutable` | `report.ts::markUnroutable`（解析不到收件人） | **此前无人读** |
+ * | `<receiptsDir>/<key>.d3-quarantined.<ts>.json` | `outbox-bridge.ts` 的 D3 让路 | **此前无人读** |
+ *
+ * 两者都是「反证据文件」：它们存在 = 有一条消息**已知没送到**（或曾被判没送到）。
+ * R-17 的形状（产物写到了没人读的地方）⇒ 接进 `/autonomy status` 变成可读数。
+ *
+ * 只报**计数 + 最旧年龄**，不做任何判定/不删文件（删审计面需人批）。
+ * never-throw：目录不存在 ⇒ 0。
+ */
+export interface DeadDropObservation {
+	/** 目录是否可读（false ⇒ 下面数字无意义） */
+	readable: boolean;
+	/** `.unroutable` 文件数（= 解析不到收件人的回报数） */
+	unroutable: number;
+	/** 最老 `.unroutable` 的年龄（ms）；无 ⇒ null */
+	oldestUnroutableAgeMs: number | null;
+	/** `.d3-quarantined.*` 收据数（= D3 曾判「没进」并放行重投的次数） */
+	d3Quarantined: number;
+	/** 最老 d3 隔离收据的年龄（ms）；无 ⇒ null */
+	oldestD3QuarantinedAgeMs: number | null;
+}
+
+export function observeDeadDrops(opts: { reportsDir: string; receiptsDir: string; now?: number }): DeadDropObservation {
+	const now = opts.now ?? Date.now();
+	const out: DeadDropObservation = {
+		readable: true, unroutable: 0, oldestUnroutableAgeMs: null, d3Quarantined: 0, oldestD3QuarantinedAgeMs: null,
+	};
+	const ageOf = (dir: string, name: string): number | null => {
+		try {
+			const st = statSync(join(dir, name));
+			const ms = Number.isFinite(st.mtimeMs) ? now - st.mtimeMs : null;
+			return ms === null ? null : Math.max(0, ms);
+		} catch {
+			return null;
+		}
+	};
+	try {
+		const names = readdirSync(opts.reportsDir);
+		for (const n of names) {
+			if (!n.endsWith(".unroutable")) continue;
+			out.unroutable += 1;
+			const a = ageOf(opts.reportsDir, n);
+			if (a !== null && (out.oldestUnroutableAgeMs === null || a > out.oldestUnroutableAgeMs)) out.oldestUnroutableAgeMs = a;
+		}
+	} catch (e) {
+		// 目录不存在 = 「从没有过」（正常），不是不可读
+		if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") out.readable = false;
+	}
+	try {
+		const names = readdirSync(opts.receiptsDir);
+		for (const n of names) {
+			if (!n.includes(".d3-quarantined.")) continue;
+			out.d3Quarantined += 1;
+			const a = ageOf(opts.receiptsDir, n);
+			if (a !== null && (out.oldestD3QuarantinedAgeMs === null || a > out.oldestD3QuarantinedAgeMs)) out.oldestD3QuarantinedAgeMs = a;
+		}
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") out.readable = false;
+	}
+	return out;
+}
+
 /** 人可读年龄（与 `/autonomy status` 的 `ageTxt` 同口径，避免两处文案漂移）。 */
 export function humanAge(ms: number): string {
 	if (ms < 60_000) return `${Math.round(ms / 1000)}s 前`;
@@ -226,8 +293,13 @@ export function humanAge(ms: number): string {
 export function deliveryObservationLines(opts: {
 	outbox: OutboxObservation;
 	delivery: DeliveryObservation;
+	/** P2：`.unroutable` / `.d3-quarantined` 计数（缺省按 0 显示，便于既有调用方不改）。 */
+	deadDrops?: DeadDropObservation;
 }): string[] {
 	const { outbox: o, delivery: d } = opts;
+	const dd: DeadDropObservation = opts.deadDrops ?? {
+		readable: true, unroutable: 0, oldestUnroutableAgeMs: null, d3Quarantined: 0, oldestD3QuarantinedAgeMs: null,
+	};
 	const outboxLine = !o.readable
 		? "outbox: (目录不可读)"
 		: [
@@ -242,5 +314,11 @@ export function deliveryObservationLines(opts: {
 			`delivery: events=${d.events} attempt=${d.attempts} ack=${d.acks} incident=${d.incidents}（文件数，含历史累计，非活跃数）`,
 			`attempt 但一个 ack 都没有: ${d.attemptWithoutAnyAck}（⚠️ 这只是**文件名级下界**，不等于 A 类死锁：可能 lease 在飞、目标刚重启）`,
 		].join(" | ");
-	return [outboxLine, deliveryLine];
+	const deadLine = !dd.readable
+		? "dead-drop: (目录不可读)"
+		: [
+			`dead-drop: unroutable=${dd.unroutable}${dd.unroutable > 0 ? `（最老 ${dd.oldestUnroutableAgeMs === null ? "?" : humanAge(dd.oldestUnroutableAgeMs)}；= 解析不到收件人的回报，reports/<id>.unroutable）` : ""} | d3-quarantined=${dd.d3Quarantined}${dd.d3Quarantined > 0 ? `（最老 ${dd.oldestD3QuarantinedAgeMs === null ? "?" : humanAge(dd.oldestD3QuarantinedAgeMs)}；= D3 曾判「没进」并放行重投）` : ""}`,
+			`（两者都是**反证据**：存在 = 有一条消息已知没送到或被判没送到；本行只报数，不删不改）`,
+		].join(" | ");
+	return [outboxLine, deliveryLine, deadLine];
 }

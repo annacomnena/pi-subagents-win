@@ -21,7 +21,7 @@ import { readAttachment } from "../registry.ts";
 import { masterAddress } from "../address.ts";
 import { summarizeActionsStatus } from "./action/run.ts";
 import { supervisionLedgerLines } from "../supervision.ts";
-import { observeOutbox, observeDelivery, deliveryObservationLines } from "../delivery-observations.ts";
+import { observeOutbox, observeDelivery, observeDeadDrops, deliveryObservationLines } from "../delivery-observations.ts";
 // step-0 第 1 步（2026-11-23）：会话占用只读观测 —— 双控风险的真实发生率基线。
 // 判据与边界见 `session-presence.ts` 模块头：**只报计数，不锁、不拦、不告警**。
 import { scanSessionPresence, presenceLines } from "../session-presence.ts";
@@ -116,6 +116,12 @@ export function buildAutonomyStatusBody(): string {
 				...deliveryObservationLines({
 					outbox: observeOutbox(join(defaultRuntimeDir(), "state")),
 					delivery: observeDelivery(defaultRuntimeDir()),
+					// P2：两类「写出来但没人读」的反证据产物（`.unroutable` / `.d3-quarantined`）。
+					// 它们存在 = 有消息已知没送到或被判没送到；此前盘上有、status 里零读数（R-17 形状）。
+					deadDrops: observeDeadDrops({
+						reportsDir: join(defaultRuntimeDir(), "..", "reports"),
+						receiptsDir: join(defaultRuntimeDir(), "receipts"),
+					}),
 				}),
 				// 会话占用只读观测（step-0 第 1 步）。
 				//
