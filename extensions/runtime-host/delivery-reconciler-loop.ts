@@ -57,6 +57,7 @@ import { newOutboxItem, outboxDir, outboxItemId, readOutboxItem, writeOutboxItem
 import { piSessionAddress } from "../runtime/address.ts";
 import { eventMarker } from "../delivery-ack.ts";
 import { appendAuditLine } from "../runtime/autonomy/collect.ts";
+import { NO_POLL_HINT } from "../no-poll.ts";
 
 /** 缺省对账节拍（咨询 §6.2：10s 周期对账；与 A 的 10s tick 同频但**不同进程**）。 */
 export const RECONCILE_INTERVAL_MS = 10_000;
@@ -265,15 +266,28 @@ export function resolveDispatcherFromLinks(runId: string, linksPath?: string): s
  *   - 超过上限（`MAX_B_RETRIES_PER_EVENT=2`）不再产生第 3 次，所以不需要第 3 种措辞。
  */
 export function buildReconcileWakeBody(
-	event: { eventId: string; runId: string; terminalAt: string },
+	event: { eventId: string; runId: string; terminalAt: string; terminalSnapshotPath?: string },
 	retryOrdinal?: number,
 ): string {
-	const head = retryOrdinal !== undefined && retryOrdinal >= 2
-		? `⏱ [B 对账补投] async run ${event.runId} 终态交付**仍未确认**（第 ${retryOrdinal} 次补投（第 ${retryOrdinal - 1} 次未确认）；terminalAt=${event.terminalAt}）。`
-		: `⏱ [B 对账补投] async run ${event.runId} 终态交付未确认（terminalAt=${event.terminalAt}）。`;
+	const ordinal = retryOrdinal !== undefined && retryOrdinal >= 2
+		? `（第 ${retryOrdinal} 次补投（第 ${retryOrdinal - 1} 次未确认））`
+		: "";
+	// ① 业务状态置顶：读的人第一眼要知道「任务做完了，别重新派活」。
+	//    兼容性：仍带「终态交付未确认」原文（既有识别/测试靠它），只是不再做**唯一**信息。
+	const head = `⏱ [B 对账补投] async run ${event.runId} 终态交付未确认${ordinal}；但**业务已完成**（terminalAt=${event.terminalAt}）。`;
+	// ② 判据：明确「你不需要做任何事」，并解释为什么**不要**手工 ack。
+	const criteria = "判据: 只有**本地 context 钩子**在正文尾部检出 [evt:...] 标记才算送达 —— 你**不需要**做任何事，也**不要**手工 ack（手工 ack 会把送达退化成模型自述，delivery-ack 头注释已否决）。";
+	// ③ 全文路径：status 预览会被截断，给出盘的绝对路径（避免「以为拿到了全文」）。
+	const fullText = event.terminalSnapshotPath
+		? `全文在: ${event.terminalSnapshotPath}（status 预览只截前 500 字符且会标「已截断」）。`
+		: `全文: 用 subagent-win({ action: "status", runId: "${event.runId}" }) 取（预览截断会标注）。`;
 	return [
 		head,
+		criteria,
+		fullText,
 		`下一步: 用 subagent-win({ action: "status", runId: "${event.runId}" }) 取全文。`,
+		// ④ 禁轮询纪律：QC 反馈「正文让人反复查状态」⇒ 把已有的 NO_POLL_HINT 真的接进来。
+		NO_POLL_HINT,
 		eventMarker(event.eventId),
 	].join("\n");
 }

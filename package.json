@@ -248,6 +248,7 @@
     "test:tab-liveness-nospawn": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_tab_liveness_nospawn.ts",
     "test:trace-fusion-gate": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_trace_fusion_gate.ts",
     "test:delivery-observations": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_observations.ts",
+    "test:delivery-status-line": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_delivery_status_line.ts",
     "test:session-presence": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_session_presence.ts",
     "test:d3-injection-recovery": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_injection_recovery.ts",
     "test:d3-bridge-wiring": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_d3_bridge_wiring.ts",

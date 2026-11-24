@@ -33,6 +33,9 @@ import { maybeAutoCollectTraceRun } from "./trace-fusion/supervisor.ts";
 import { registerLaneBashGuard } from "./trace-fusion/lane-bash-guard.ts";
 import { readTraceFusionConfig } from "./trace-fusion/config.ts";
 import { journalUnavailableSnapshot } from "./runtime/journal.ts";
+// P1（2026-11-24，QC 反馈 #4/#5）：status 的截断标记 + 交付面（接收侧证据）。
+import { deliveryStatusFacts, deliveryStatusLine, truncatePreview } from "./runtime/delivery-status-line.ts";
+import { defaultDeliveryDir } from "./delivery-ledger.ts";
 import {
 	readTfBlock,
 	normalizeUserSettings,
@@ -4390,7 +4393,10 @@ ${notable[0].reason}
 						`Task: ${target.task}`,
 						target.cwd ? `CWD: ${target.cwd}` : null,
 						`Status: ${target.status}`,
-						target.result ? `Output: ${target.result.text.slice(0, 500)}` : null,
+						// P1：截断必须**有声**（旧版 .slice(0,500) 无标记 ⇒ 读的人以为拿到全文）。
+						target.result ? `Output: ${truncatePreview(target.result.text, 500, join(RUNS_DIR, `${target.id}.json`))}` : null,
+						// P1（H5）：交付面 —— 把账本里已有的**接收侧**事实读出来（consumed 才算送达）。
+						deliveryStatusLine(deliveryStatusFacts(defaultDeliveryDir(), target.id, target as unknown as Record<string, unknown>)),
 						target.result?.usage ? `Tokens: ↑${target.result.usage.input} ↓${target.result.usage.output} $${target.result.usage.cost.toFixed(4)}` : null,
 					].filter(Boolean).join("\n") }],
 				};
