@@ -46,6 +46,7 @@ process.env.PI_RUNTIME_DIR = mkdtempSync(join(tmpdir(), "delivery-crash-env-"));
 import { ackConsumed, ackReceived } from "./delivery-ack.ts";
 import {
 	DELIVERY_DEADLINE_MS,
+	DELIVERY_FAIL_DEADLINE_MS,
 	LEASE_MS,
 	defaultDeliveryDir,
 	effectiveStage,
@@ -254,12 +255,13 @@ try {
 		assert.notEqual(attempts2[1].leaseOwner, "A:crashed-pid", "新 holder 换了租约 owner");
 		assert.equal(attempts2[0].leaseOwner, "A:crashed-pid", "崩溃者 attempt 原样保留（可审计）");
 
-		// escalate 不停滞：到期限照样 failed_delivery + incident
+		// escalate 不停滞：到**判死期限**照样 failed_delivery + incident
+		// （P0-a：60s 观测期限不再判死 —— 此处必须用 600s，否则测的是旧口径）
 		const r2 = await reconcileOnce({
-			runsDir: rd, deliverDir: d, now: NOW + DELIVERY_DEADLINE_MS + 1_000,
+			runsDir: rd, deliverDir: d, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000,
 			resolveDispatcher: () => "sess_dispatch", deliver: () => { throw new Error("不应重投（已过期）"); },
 		});
-		assert.equal(r2.results.filter((x) => x.action === "fail_delivery").length, 1, "崩溃窗不耽误 escalate（期限到 ⇒ fail_delivery）");
+		assert.equal(r2.results.filter((x) => x.action === "fail_delivery").length, 1, "崩溃窗不耽误 escalate（判死期限到 ⇒ fail_delivery）");
 		assert.equal(incidentFiles(d).length, 1, "恰好 1 个 incident");
 
 		// ── 全窗共同断言 ──
@@ -269,11 +271,11 @@ try {
 		// ⇒ 过期后重判是 `none/already-failed-delivery`（比“再报一次 fail_delivery”更强的幂等）。
 		const closed = reload(d, ev.eventId);
 		assert.equal(closed.incidentId, listOpenIncidents(d)[0].incidentId, "incidentId 已持久在事件元数据（跨重启可见）");
-		const closedView = stageOf(closed, d, NOW + DELIVERY_DEADLINE_MS + 2_000);
+		const closedView = stageOf(closed, d, NOW + DELIVERY_FAIL_DEADLINE_MS + 2_000);
 		assert.equal(closedView.stage, "failed_delivery", "**D-2 硬约束**：incident 开启 ⇒ 阶段 = failed_delivery（不得报 consumed/成功态）");
-		const rejudge = reconcileDecision(closed, closedView, attempts2, NOW + DELIVERY_DEADLINE_MS + 2_000);
+		const rejudge = reconcileDecision(closed, closedView, attempts2, NOW + DELIVERY_FAIL_DEADLINE_MS + 2_000);
 		assert.equal(rejudge.action, "none", "过期后重判 = none（终态失败不可反复发布）");
-		await reconcileOnce({ runsDir: rd, deliverDir: d, now: NOW + DELIVERY_DEADLINE_MS + 6_000, resolveDispatcher: () => "sess_dispatch" });
+		await reconcileOnce({ runsDir: rd, deliverDir: d, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 6_000, resolveDispatcher: () => "sess_dispatch" });
 		assert.equal(incidentFiles(d).length, 1, "③ 幂等重跑不产生第二个 incident");
 		ok("R7-b 租约已领 + 子进程 SIGKILL：无永久 claimed、租约过期接管、单一 incident、run 不变");
 	}
@@ -298,8 +300,9 @@ try {
 		assert.equal(view.stage, "attempted", "重启后仍是 attempted");
 		assert.equal(isDelivered(view.stage), false, "**不得**当 delivered（sent ≠ 送达）");
 
-		// ── 到 deliveryDeadline ⇒ fail_delivery + incident（不调用模型）──
-		const past = NOW + DELIVERY_DEADLINE_MS + 1_000;
+		// ── 到判死期限 ⇒ fail_delivery + incident（不调用模型）──
+		// P0-a：60s 只记 slowDelivery 观测；判死在 terminalAt+600s
+		const past = NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000;
 		const decision = reconcileDecision(ev, view, listAttempts(d, ev.eventId), past);
 		assert.equal(decision.action, "fail_delivery", "期限到 ⇒ fail_delivery");
 		assert.ok(String(decision.reason).includes("deadline-exceeded"), `原因写明期限（实得 ${String(decision.reason)}）`);
@@ -362,8 +365,9 @@ try {
 		assert.equal(isDelivered(view.stage), false, "**received 不得当 delivered/consumed**");
 		assert.equal(listAcks(d, ev.eventId).filter((a) => a.stage === "consumed").length, 0, "崩溃点确实没有 consumed");
 
-		// ── 期限到 ⇒ failed_delivery + incident；received 回执**保留**（不静默擦除）──
-		const past = NOW + DELIVERY_DEADLINE_MS + 1_000;
+		// ── 判死期限到 ⇒ failed_delivery + incident；received 回执**保留**（不静默擦除）──
+		// P0-a：received 也不是 consumed ⇒ 60s 时仍应「未关单」，只有 600s 才升级
+		const past = NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000;
 		const decision = reconcileDecision(post, view, listAttempts(d, ev.eventId), past);
 		assert.equal(decision.action, "fail_delivery", "received 后期限到 ⇒ fail_delivery（依据 §6.1：只有 consumed 才算成功）");
 		await reconcileOnce({ runsDir: rd, deliverDir: d, now: past, resolveDispatcher: () => "sess_dispatch" });
@@ -410,7 +414,7 @@ try {
 
 		// 不再投递、不再 incident、reconcileDecision 返回 none（**含期限之后**）
 		let deliveries = 0;
-		for (const t of [NOW + 32_000, NOW + DELIVERY_DEADLINE_MS + 1_000, NOW + 10 * 60_000]) {
+		for (const t of [NOW + 32_000, NOW + DELIVERY_DEADLINE_MS + 1_000, NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000, NOW + 20 * 60_000]) {
 			const d1 = reconcileDecision(post, view, listAttempts(d, ev.eventId), t);
 			assert.equal(d1.action, "none", `consumed ⇒ 判 none（now=${t}）`);
 			const r = await reconcileOnce({

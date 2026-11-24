@@ -575,7 +575,8 @@ function consumeMailboxOnceInner(opts: ConsumeOptions): ConsumeReport {
 					//
 					// 「不 release 会不会永久停滞？」——不会，三条出口都已就位：
 					//   ① `sweepClaimedLetters`（本文件 :148）按 consumed ACK 兜底 ack；
-					//   ② B 对账通道过 `deliveryDeadline` ⇒ `failed_delivery` + 持久 incident（可观测）；
+					//   ② B 对账通道过 `deliveryFailDeadline`（terminalAt+600s）⇒ `failed_delivery` + 持久 incident（可观测）；
+					//      （60s 的 `deliveryDeadline` 自 2026-11-24 P0-a 起只落 `B-slow-delivery` 观测，不再判死）
 					//   ③ 消费循环入口是 `listLetters(recipient,"pending")`，保持 claimed 不会被
 					//      `claimLetters` 的 10min stale reclaim 重投（stale 分支只在 pending 循环体内被调）。
 					const confirmed = confirmInjection(key, verdict.holder);

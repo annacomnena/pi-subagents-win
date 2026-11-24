@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DELIVERY_DEADLINE_MS,
+	DELIVERY_FAIL_DEADLINE_MS,
 	LEASE_MS,
 	RECONCILE_FIRST_RETRY_MS,
 	ackIncident,
@@ -19,6 +20,7 @@ import {
 	effectiveStageOf,
 	ensureEvent,
 	eventFileKey,
+	failDeadlineOf,
 	isDelivered,
 	listAcks,
 	listAttempts,
@@ -125,10 +127,10 @@ try {
 		const view = effectiveStage(event, listAttempts(dir, event.eventId), listAcks(dir, event.eventId), NOW + 2000);
 		assert.equal(view.stage, "attempted", "`sent` ⇒ 只到 attempted");
 		assert.equal(isDelivered(view.stage), false, "**`sent` 绝不是 delivered**（P3 核心）");
-		// 且仍会在期限后被判 failed_delivery（不会因 sent 静默消失）
-		const past = NOW + DELIVERY_DEADLINE_MS + 1000;
+		// 且仍会在**判死期限**后被判 failed_delivery（不会因 sent 静默消失）
+		const past = NOW + DELIVERY_FAIL_DEADLINE_MS + 1000;
 		const d = reconcileDecision(event, view, listAttempts(dir, event.eventId), past);
-		assert.equal(d.action, "fail_delivery", "sent 后无 ACK + 过期限 ⇒ 交付失败（可升级）");
+		assert.equal(d.action, "fail_delivery", "sent 后无 ACK + 过判死期限 ⇒ 交付失败（可升级）");
 		ok("D4 P3 回归：sent⇒attempted（非 delivered）；无 ACK 过期即 failed_delivery");
 	}
 
@@ -167,7 +169,7 @@ try {
 		ok("D6 租约：15s 内不重投（防惊群），过期才接管");
 	}
 
-	// ── D7：B 首投阈值 20s + 期限 60s ⇒ failed_delivery ──────────────────
+	// ── D7：B 首投阈值 20s + **期限分级**（60s 观测 / 600s 判死，P0-a 2026-11-24）──
 	{
 		const { event } = ensureEvent(dir, {
 			runId: "run_deadline", terminalRevision: terminalRevisionOf(mkTerminal({ id: "run_deadline" })),
@@ -177,10 +179,100 @@ try {
 		const v = effectiveStage(event, noAttempts, [], NOW);
 		assert.equal(reconcileDecision(event, v, noAttempts, NOW + RECONCILE_FIRST_RETRY_MS - 1000).action, "none", "未到 20s ⇒ 等 A 快通道");
 		assert.equal(reconcileDecision(event, v, noAttempts, NOW + RECONCILE_FIRST_RETRY_MS + 1000).action, "retry", "过 20s ⇒ B 补投");
-		const late = reconcileDecision(event, v, noAttempts, NOW + DELIVERY_DEADLINE_MS + 1);
-		assert.equal(late.action, "fail_delivery", "过 60s 期限 ⇒ failed_delivery");
-		assert.ok(String(late.reason).includes("deadline-exceeded"));
-		ok("D7 阈值：20s 首补投；60s 期限 ⇒ failed_delivery（不 kill、不改 run）");
+
+		// ① 两个期限各有独立字段，且基准都是 terminalAt（不是 observedAt）
+		assert.equal(event.deliveryDeadline, iso(NOW + DELIVERY_DEADLINE_MS), "观测期限 = terminalAt + 60s");
+		assert.equal(event.deliveryFailDeadline, iso(NOW + DELIVERY_FAIL_DEADLINE_MS), "判死期限 = terminalAt + 600s");
+		assert.equal(failDeadlineOf(event), NOW + DELIVERY_FAIL_DEADLINE_MS, "failDeadlineOf 与字段一致");
+
+		// ② **过观测期限但未到判死期限 ⇒ 绝不 fail_delivery**（这是本改动的核心：旧版此处判死）
+		const bRetryCap = { maxBRetries: 2 };
+		const at61 = reconcileDecision(event, v, noAttempts, NOW + DELIVERY_DEADLINE_MS + 1, bRetryCap);
+		assert.notEqual(at61.action, "fail_delivery", "过 60s **不得**判死（实测 140 个已 ACK 事件里 40 个（28.6%）超过 60s）");
+		assert.equal("slowDelivery" in at61 && at61.slowDelivery, true, "过 60s ⇒ 打 slowDelivery 观测标记");
+		assert.equal(at61.action, "retry", "仍可补投（期限分级不得顺手停掉补投）");
+
+		// ③ 未到观测期限 ⇒ 不带 slowDelivery（保持旧行为逐字不变）
+		const at20 = reconcileDecision(event, v, noAttempts, NOW + RECONCILE_FIRST_RETRY_MS + 1000);
+		assert.equal("slowDelivery" in at20, false, "未到 60s ⇒ 不出现 slowDelivery 字段（零行为变化）");
+
+		// ④ 过判死期限 ⇒ fail_delivery，且 reason 同时带两个期限（可审计到底按哪条判的）
+		const late = reconcileDecision(event, v, noAttempts, NOW + DELIVERY_FAIL_DEADLINE_MS + 1);
+		assert.equal(late.action, "fail_delivery", "过判死期限 ⇒ failed_delivery");
+		assert.ok(String(late.reason).includes("deadline-exceeded"), `reason 写明期限（实得 ${String(late.reason)}）`);
+		assert.ok(String(late.reason).includes("observe-deadline="), "reason 带观测期限（区分「晚」与「死」）");
+		ok("D7 期限分级：20s 首补投；60s 只观测 slowDelivery（不判死仍可补投）；600s 才 failed_delivery");
+	}
+
+	// ── D7-b：**存量事件**（无 deliveryFailDeadline 字段）+ **晚发现**（observedAt ≫ terminalAt）──
+	// 两件事必须同时成立，否则 failDeadlineOf 的回退分支是死代码：
+	//   ① 2026-11-24 之前创建的事件元数据里**没有** `deliveryFailDeadline`；
+	//   ② B 通道可能晚很久才第一次扫到某个终态 run（`observedAt ≫ terminalAt`）。
+	// 判据必须锚在 **terminalAt**：若误用 observedAt，晚发现的旧事件会被隐式展期 600s
+	// （违反咨询 §6.5「不隐式展期」）。
+	{
+		const LATE = 30 * 60_000; // 终态之后 30 分钟才被发现
+		const legacy = {
+			eventId: "async:run_legacy:deadbeef", runId: "run_legacy", terminalRevision: "deadbeef",
+			terminalSnapshotPath: "x.json", dispatcherSessionId: "sess_1", recipientGeneration: 1,
+			observedAt: iso(NOW + LATE), terminalAt: iso(NOW),
+			deliveryDeadline: iso(NOW + DELIVERY_DEADLINE_MS),
+			// ⚠️ 刻意**不带** deliveryFailDeadline（存量事件形状）
+		} as unknown as DeliveryEvent;
+		assert.equal(failDeadlineOf(legacy), NOW + DELIVERY_FAIL_DEADLINE_MS, "存量事件：回退按 terminalAt + 600s（不是 observedAt + 600s）");
+		assert.notEqual(failDeadlineOf(legacy), NOW + LATE + DELIVERY_FAIL_DEADLINE_MS, "**不得**用 observedAt 作基准（那是隐式展期）");
+		// 落在「terminalAt+600s 已过、observedAt+600s 未过」的窗口里 ⇒ 必须已判死
+		const inWindow = NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000;
+		assert.ok(inWindow < NOW + LATE + DELIVERY_FAIL_DEADLINE_MS, "夹具自检：确实落在两条基准之间");
+		const legacyView = effectiveStage(legacy, [], [], inWindow);
+		assert.equal(
+			reconcileDecision(legacy, legacyView, [], inWindow).action, "fail_delivery",
+			"晚发现的存量事件：过 terminalAt+600s 即判死（判据锚 terminalAt，不随发现时刻推移）",
+		);
+		// ② 新事件即使 observedAt 远晚于 terminalAt，写盘字段也必须是 terminalAt 基准
+		const { event: lateEvent } = ensureEvent(dir, {
+			runId: "run_late_discovered", terminalRevision: terminalRevisionOf(mkTerminal({ id: "run_late_discovered" })),
+			terminalSnapshotPath: join(root, "f2.json"), dispatcherSessionId: "sess_1",
+			observedAt: iso(NOW + LATE), terminalAt: iso(NOW),
+		});
+		assert.equal(lateEvent.deliveryDeadline, iso(NOW + DELIVERY_DEADLINE_MS), "观测期限锚 terminalAt（晚发现不展期）");
+		assert.equal(lateEvent.deliveryFailDeadline, iso(NOW + DELIVERY_FAIL_DEADLINE_MS), "判死期限锚 terminalAt（晚发现不展期）");
+		ok("D7-b 存量事件 + 晚发现：failDeadlineOf 回退锚 terminalAt（不得用 observedAt ⇒ 不隐式展期）");
+	}
+
+	// ── D7-c：时间基准坏了 ⇒ 既不能判慢也不能判死，但**必须留下可观测痕迹**（R-2）──
+	// 2026-11-24 L4 指出：`no-observed-at` / `no-time-basis` 两个分支以前直接 return none，
+	// trace 里**零痕迹** ⇒ 读者无法区分「没发生」与「看不见」。现在带 `unobservable` 标记。
+	{
+		const bad = {
+			eventId: "async:run_badts:badbadbad0", runId: "run_badts", terminalRevision: "badbadbad0",
+			terminalSnapshotPath: "x.json", dispatcherSessionId: "sess_1", recipientGeneration: 1,
+			observedAt: "not-a-date", terminalAt: "not-a-date", deliveryDeadline: "also-bad",
+		} as unknown as DeliveryEvent;
+		const badView = effectiveStage(bad, [], [], NOW);
+		const dec = reconcileDecision(bad, badView, [], NOW);
+		assert.equal(dec.action, "none", "坏时间戳 ⇒ 不产出任何判定动作（不猜）");
+		assert.equal("unobservable" in dec && typeof dec.unobservable === "string", true, "必须带 unobservable 标记（否则静默）");
+		assert.ok(String((dec as { unobservable?: string }).unobservable).includes("no-observed-at"), "原因写明是哪种缺失");
+
+		// 接线：`reconcileEvent` 真的落一条 B-delivery-unobservable trace（不是只有纯函数字段）
+		const d2 = join(root, "unobs-delivery");
+		mkdirSync(d2, { recursive: true });
+		await reconcileEvent(d2, bad, NOW, {});
+		const lines = (() => {
+			try { return readFileSync(join(d2, "trace.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>); }
+			catch { return [] as Record<string, unknown>[]; }
+		})();
+		const unobs = lines.filter((t) => t.kind === "B-delivery-unobservable");
+		assert.equal(unobs.length, 1, `坏时间戳必须落恰 1 条 B-delivery-unobservable（实得 ${unobs.length}）`);
+		assert.equal(unobs[0].eventId, bad.eventId, "trace 指向该事件（可定位）");
+		assert.ok(String(unobs[0].note).includes("观测缺口"), "文案写明这是观测缺口、不是判定");
+		// 边沿触发：重复 reconcileEvent 不刷屏
+		await reconcileEvent(d2, bad, NOW + 1_000, {});
+		const again = readFileSync(join(d2, "trace.jsonl"), "utf8").split("\n").filter(Boolean)
+			.map((l) => JSON.parse(l) as Record<string, unknown>).filter((t) => t.kind === "B-delivery-unobservable");
+		assert.equal(again.length, 1, "边沿触发：同 (eventId, reason) 只落一次");
+		ok("D7-c 坏时间戳：不判定但**不静默**（unobservable 标记 + B-delivery-unobservable trace，边沿触发）");
 	}
 
 	// ── D8：失败出口 —— incident 跨重启保留、显式 ack 才清 ────────────────
@@ -189,10 +281,10 @@ try {
 			runId: "run_inc", terminalRevision: terminalRevisionOf(mkTerminal({ id: "run_inc" })),
 			terminalSnapshotPath: join(root, "g.json"), dispatcherSessionId: "sess_1", observedAt: iso(NOW),
 		});
-		const inc = publishIncident(dir, event, "deadline-exceeded(stage=attempted)", NOW + DELIVERY_DEADLINE_MS + 1);
+		const inc = publishIncident(dir, event, "deadline-exceeded(stage=attempted)", NOW + DELIVERY_FAIL_DEADLINE_MS + 1);
 		assert.ok(inc.incidentId);
 		// 幂等：再发布不制造新 incident
-		const inc2 = publishIncident(dir, event, "deadline-exceeded(stage=attempted)", NOW + DELIVERY_DEADLINE_MS + 2000);
+		const inc2 = publishIncident(dir, event, "deadline-exceeded(stage=attempted)", NOW + DELIVERY_FAIL_DEADLINE_MS + 2000);
 		assert.equal(inc2.incidentId, inc.incidentId, "同 eventId 的 incident 幂等（不重复制造）");
 		// 跨重启可见：重新 load（模拟新进程）
 		const reopened = loadEvent(dir, event.eventId)!;
@@ -273,7 +365,8 @@ try {
 		for (const f of allEvents) {
 			const raw = JSON.parse(readFileSync(join(dir, f), "utf8")) as DeliveryEvent;
 			const acks = listAcks(dir, raw.eventId);
-			const view = effectiveStage(raw, listAttempts(dir, raw.eventId), acks, NOW + DELIVERY_DEADLINE_MS + 1000);
+			// P0-a：判死已移到 600s ⇒ oracle 也在判死期限之后复算（否则新口径下「未关单」是正常的）
+			const view = effectiveStage(raw, listAttempts(dir, raw.eventId), acks, NOW + DELIVERY_FAIL_DEADLINE_MS + 1000);
 			if (view.stage === "consumed" || view.stage === "failed_delivery") closed += 1;
 			else silent += 1;
 		}

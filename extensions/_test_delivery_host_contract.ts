@@ -26,7 +26,7 @@
  *       两个公开入口各测一次：
  *         入口① `async-result-watcher.ts::onRunFile`（A 快通道；对照 _test_async_result_watcher.ts §15 的 P2 断言）；
  *         入口② `delivery-reconciler.ts::reconcileOnce`（B 对账通道，一次 pass 内 A 抛错、B 照投）。
- *       并断言 R8 行要求的「失败 ≤75s 可见」（terminalAt+75s 内 incident 已落盘）。
+ *       并断言失败出口「可见」——**口径已于 2026-11-24 由 P0-a 改写**（见下方 H3-P2② 注释）。
  *
  * ## 依据
  * plans/20261016_consult_scheduling_and_wake_reliability.md §8.3 R8、§6.2、§6.3.5。
@@ -48,7 +48,7 @@ delete process.env.PI_TAB_RUN_ID;
 
 import { ackConsumed, extractEventIdsFromMessages, eventMarker } from "./delivery-ack.ts";
 import { injectFollowUpQuietly, type InjectionSendStatus } from "./injection-gate.ts";
-import { effectiveStage, ensureEvent, listAcks, listAttempts, listEvents, listOpenIncidents, terminalRevisionOf } from "./delivery-ledger.ts";
+import { DELIVERY_DEADLINE_MS, DELIVERY_FAIL_DEADLINE_MS, effectiveStage, ensureEvent, listAcks, listAttempts, listEvents, listOpenIncidents, terminalRevisionOf } from "./delivery-ledger.ts";
 import { reconcileOnce } from "./delivery-reconciler.ts";
 import { onRunFile, _resetAsyncResultWatcher } from "./async-result-watcher.ts";
 import { setCurrentSessionId } from "./identity.ts";
@@ -316,14 +316,37 @@ try {
 		ackConsumed(dDir, [evB.eventId], { at: NOW + 26_000, evidence: "context-observed" });
 		assert.equal(listAcks(dDir, evB.eventId).filter((x) => x.stage === "consumed").length, 1, "B 正常写 consumed（未被 A 压掉）");
 
-		// A 的失败 ≤75s 可见：terminalAt+75s 内冻结为 failed_delivery + incident（不投递、不调模型）；B 已 consumed ⇒ 无 incident
+		// ⚠️ **SLO 口径变更（2026-11-24，P0-a，显式登记 R-23）**
+		// 旧断言：`terminalAt+75s` 内 A 必须已冻结为 failed_delivery（咨询 §6.5 的「≤75s 可见」行）。
+		// 现在：60s 只是**观测期限**（记 `B-slow-delivery` trace），**判死**在 terminalAt+600s。
+		// 依据（分母 140 个已 ACK 事件）：ACK−terminalAt p50=0.31s / p90=323.8s / p95=913.8s；
+		//   按 60s 判死 ⇒ 40/140 = **28.6%** 的**已送达**事件被判死（并在 ACK 后到造出矛盾终态）。
+		// 代价（显式登记）：真漏发的可见时间由 ≤75s 推到 ≤600s+一 tick。这是本改动**主动放弃**的东西，
+		//   理由：75s 并不能「发现」漏发（它只在 ACK 到达前把一切判死）；28.6% 误判是确定发生的噪声。
+		// ⇒ 断言随之拆成两半，且**两半都验**：60s 不得判死；600s 必须判死。
+		let modelsCalledAtSixty = 0;
+		const rSixty = await reconcileOnce({
+			runsDir: rd, deliverDir: dDir, now: NOW + DELIVERY_DEADLINE_MS + 15_000, // = +75s，旧的断点
+			resolveDispatcher: dispatcher,
+			deliver: () => { modelsCalledAtSixty += 1; return "sent"; },
+		});
+		assert.equal(
+			rSixty.results.filter((x) => x.runId === a && x.action === "fail_delivery").length, 0,
+			"**P0-a 核心断言**：过 60s 观测期限但未到判死期限 ⇒ A **不得**被判 fail_delivery",
+		);
+		assert.equal(
+			listOpenIncidents(dDir).filter((i) => i.runId === a).length, 0,
+			"过 60s 时盘上也不得有 incident（不是只没回调）",
+		);
+		void modelsCalledAtSixty;
+
 		let modelsCalledAtFail = 0;
 		const r2 = await reconcileOnce({
-			runsDir: rd, deliverDir: dDir, now: NOW + 75_000, resolveDispatcher: dispatcher,
+			runsDir: rd, deliverDir: dDir, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 15_000, resolveDispatcher: dispatcher,
 			deliver: () => { modelsCalledAtFail += 1; return "sent"; },
 		});
 		const failA = r2.results.filter((x) => x.runId === a && x.action === "fail_delivery");
-		assert.equal(failA.length, 1, `A 在 terminalAt+75s 判 fail_delivery（≤75s 可见要求）`);
+		assert.equal(failA.length, 1, `A 在判死期限（terminalAt+600s）判 fail_delivery`);
 		assert.ok(failA[0].incidentId, "A 有 incidentId");
 		assert.equal(modelsCalledAtFail, 0, "失败出口不调用模型（deliver 未被调）");
 		assert.equal(r2.results.filter((x) => x.runId === b && x.action !== "none").length, 0, "**B 已 consumed ⇒ 无任何动作**");
@@ -332,14 +355,14 @@ try {
 		assert.equal(listAcks(dDir, evB.eventId).filter((x) => x.stage === "consumed").length, 1, "B 的 consumed 回执保持唯一");
 
 		// 幂等重跑：不产生第二个 incident
-		await reconcileOnce({ runsDir: rd, deliverDir: dDir, now: NOW + 80_000, resolveDispatcher: dispatcher });
+		await reconcileOnce({ runsDir: rd, deliverDir: dDir, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 20_000, resolveDispatcher: dispatcher });
 		assert.equal(listOpenIncidents(dDir).filter((i) => i.runId === a).length, 1, "③ 重跑不产生第二个 incident");
 
 		assert.ok(readFileSync(join(rd, `${a}.json`)).equals(bytesA), "① 原 run A 终态逐字节不变（failed_delivery 不改 run）");
 		assert.ok(readFileSync(join(rd, `${b}.json`)).equals(bytesB), "① 原 run B 终态逐字节不变");
 		assert.equal(listEvents(dDir, 100).filter((e) => e.runId === a).length, 1, "② A 只有一个事件");
 		assert.equal(listEvents(dDir, 100).filter((e) => e.runId === b).length, 1, "② B 只有一个事件");
-		ok("H3-P2② 入口=reconcileOnce：A 抛错不压制 B；A 在 +75s 内 incident 可见（不调模型）");
+		ok("H3-P2② 入口=reconcileOnce：A 抛错不压制 B；60s 不判死、600s 判死 + incident（不调模型）");
 	}
 
 	// ══ H4：接收端标记契约 —— 真链注入的正文可被 context 钩子提取（ACK 的唯一驱动）══

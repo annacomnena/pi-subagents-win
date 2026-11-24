@@ -274,7 +274,7 @@ node plans/pi-corruption-diagnostics/health.mjs <pi包根目录>
 | `config.json` 整文件重写的**机制性防护**（自动校验顶层键） | 未实现（目前靠本文件 R-1 人工遵守） |
 | **`tab-status` 从不读 `heartbeatAt` 判死** | **2026-11-09 已修**（`b618298`）：`tabLivenessVerdict()` 三层判据（pid 探活 ∧ 心跳超龄，或 pid 复用），`phase="stale"` **刻意不进归档集合**（`archiveStaleTabRuns` 零改动）。实测 >7d 非终态账本 **340 个**，`deliverable` 从 **340/340 → 0**；列表全量 **555 项 spawn=0**；`tabNeedsIdleWake` 对死账本返回 `needsWake:false`。**`stale` 是只读侧判定，账本原地保留**（搬走会破坏 `steer` 可见性） |
 | **tab 身份在会话 resume 后丢失**（`PI_TAB_RUN_ID` 不重放） | 未修（需建 `sessionPath → runId` 索引，结构性改动）。后果：workflow-tab 形态的 local master 被 resume 后 `tab-report` 自助回报通道对该进程永久失效，而账本仍显示 `phase=working` |
-| **交付期限 `DELIVERY_DEADLINE_MS=60s` 与真实 ACK 时延量级错配** | **2026-11-05 实测**（分母 442 个交付事件）：328 个发过 incident（**74%**），其中 **14 个在 incident 之后仍收到 consumed ACK** ⇒ 同时存在 `fail_delivery` 与 `consumed` 两个矛盾终态。单例：`run_mw3flr49_7d1z` deadline 19:04:49 判死，ACK 19:11:25（晚 6'36"，是 deadline 的 6.6 倍）。**这不是「只看 ACK 不看队列」的逻辑 bug**（`stage==="consumed"` 早已短路），而是**期限参数太短**：目标会话活着的排队等待就被当成死。修法建议见 `plans/20261105_delivery_deadline_false_death.md`（推荐分级：60s 记 slow-delivery 观测，10min 才 fail） |
+| **交付期限 `DELIVERY_DEADLINE_MS=60s` 与真实 ACK 时延量级错配** | **2026-11-24 已修（P0-a 期限分级）**。旧症状（2026-11-05 实测，分母 442 事件）：328 个发过 incident（**74%**），其中 **14 个在 incident 之后仍收到 consumed ACK** ⇒ 同事件两个矛盾终态；单例 `run_mw3flr49_7d1z` deadline 19:04:49 判死、ACK 19:11:25（晚 6'36"）。**分母复核（2026-11-24，本机 `runtime/delivery` 141 事件 / 140 个有 consumed ACK）**：ACK−terminalAt `p50=0.31s / p90=323.8s / p95=913.8s / p99=2836.9s / max=3005.8s`；按 60s 判死 ⇒ **40/140 = 28.6%** 的**已送达**事件被判死。**修法**：拆成两条独立期限 —— `DELIVERY_DEADLINE_MS=60s` **降级为观测**（过它只落一条 `B-slow-delivery` trace 边沿触发，不判死、不发 incident、不终止补投），新增 `DELIVERY_FAIL_DEADLINE_MS=600s` 才是判死线（`failDeadlineOf()`，基准锚 `terminalAt` 而非 `observedAt` ⇒ 晚发现不隐式展期；存量事件无该字段时按 `terminalAt+600s` 现算）。**代价显式登记（R-23）**：真漏发的可见时间由 ≤75s 推到 ≤600s+一 tick —— 咨询 §6.5 的「failed_delivery ≤75s 可见」行**已被本改动取代**，`_test_delivery_host_contract.ts` H3-P2② 同步改成「60s 不判死 / 600s 判死」两半都验。理由：75s 并不能「发现」漏发（它只在 ACK 到达前把一切判死），28.6% 误判是确定发生的噪声。**教训（R-26）**：一条判据不得兼任「观测」与「判死」两件事（R-20 姊妹）；参数与真实时延量级错配时，先测分母分布再定阈值 |
 | `state/autonomy/non-owner-ticks/` 无 GC（每 sessionId 一文件） | **2026-11-09 已修**（`1ff21a1`）：`gcNonOwnerTicks()` 按年龄（30 天）淘汰，挂在 wake tick 的维护块。判据是**年龄不是文件数**（文件名是 sha256(sid) ⇒ 同会话天然一份），写死数量会删掉「刚挂起还会回来的会话」。真机实测 22 文件 / removed=0 / keptOldestDays=4.7。**未接 `/autonomy status` 展示**（`keptOldestDays` 已备好） |
 | **mailbox `claimed` 卡死：`consumed` ACK 写了但 `ackLetter` 永不执行** | **2026-11-10 已修**（`1a6d760` + `c526f94`）。根因：消费入口只枚举 `pending`（`listLetters(recipient,"pending")`），而 C-3 收尾在循环体内 ⇒ claimed 的信永不进列表 ⇒ 永不 ack ⇒ 每封最多 6 次退避重投后永停（实测 6 封）。修法：`sweepClaimedLetters()` 接在 pending 枚举**之前**，只 ack 有 `consumed` ACK 的（无 ACK 不碰，守 R-5）。真机 `swept=6`，8→0。**性能：readdirSync 从 30 次降到 1 次（95ms→0.8ms）**。**未接 `/autonomy status` 展示**；**无 ACK 的 claimed 信仍会停**（下一项） |
 | **`releaseClaimed` 循环的真实周期（勿再写「高频来回」）** | **2026-11-10 实测（分母 6 封全量）**：每封 attempts 恒 **6**，gaps 实测 `10/20/30/50/80s`。节流点是 **D-1 退避门**（`mailbox-consumer.ts:284-300` `mailboxRetryGate`）：`MAILBOX_RETRY_MAX_RETRIES=5`（首投+5 重投=6）到顶 ⇒ `exhausted` / incident；`MAILBOX_RETRY_BACKOFF_MS=[5s,10s,20s,40s,80s]`（±20% 抖动，`mailboxRetryGate:297`）与 10s 消费 tick（`:702`）**叠加** ⇒ 观察值 `10/20/30/50/80`。**注意：不是单纯的「被 tick 量化」**——纯 ceil 会给出 `10/10/20/40/80`，给不出 30 和 50；30 与 50 来自「抖动的上沿 + 落后一个 tick」的合成（`base=20s` 抖到 24s ⇒ 跨两次 tick ⇒ 30s；`base=40s` 抖到 48s ⇒ 跨一次 ⇒ 50s）。本机 6 封实测全部落在各 base 的「可观察范围」（5s→4~15 / 10s→8~21 / 20s→16~33 / 40s→32~57 / 80s→64~105）。**不是「每 tick 高频来回」**（那时 attempts 应该几十上百）。全程约 190s 到顶。**措辞错了会误导下一个修的人** |
@@ -330,6 +330,42 @@ GreenCAD 的 local master（`agent://master_local_GreenCAD`）要向 global mast
 
 业主原话是「他找不到合适的通道」，**实际是通道存在、文件写成功、另一端永不消费且不报错**。
 ⇒ 症状描述（「找不到通道」）与真因（「通道静默失效」）方向相反；**照症状修（加文档/加命令）不会修好**。
+
+## R-26（2026-11-24）：**一条判据不得兼任「观测」与「判死」**（参数与真实时延量级错配时，先测分母）
+
+### 事故（交付期限 60s：28.6% 的**已送达**事件被判死）
+
+`DELIVERY_DEADLINE_MS = 60_000` 同时承担两件事：
+1. 「这条跑了很久」的**观测**；
+2. 「这条永远到不了」的**判定**。
+
+实测本机 `~/.pi/agent/runtime/delivery`（141 事件 / 140 个有 `consumed` ACK）：
+
+```
+ACK − terminalAt（秒）  p50=0.31  p90=323.8  p95=913.8  p99=2836.9  max=3005.8
+按 60s 判死 ⇒ 40/140 = 28.6% 的已送达事件被判死
+```
+
+后果不是「逻辑 bug」（`stage==="consumed"` 早已短路），而是**同一条判据把「目标会话正常排队」也判成死**。
+历史上已造出 14 个「`fail_delivery` 与 `consumed` 并存」的矛盾终态（单例晚 6'36"）。
+
+### 规则
+
+1. **观测阈值与判定阈值必须分开。** 「慢」用低阈值记读数（`B-slow-delivery` trace，边沿触发），
+   「死」用高于真实分布 p95 的阈值（本仓 600s）。**观测阈值不得触发任何终态/incident/停止重试。**
+2. **定阈值前先测分母，不看单例**（R-11）。`_test_*` 里的「≤75s 可见」这类 SLO 断言，来自咨询文档而非实测分布；
+   实测推翻它时，**改断言并在断言处写明口径变更与代价**（不是悄悄删掉）。
+3. **判据的时间基准锚在事件发生时刻**（`terminalAt`），不是发现时刻（`observedAt`）。
+   晚发现不隐式展期（咨询 §6.5）；存量事件缺字段时按 `terminalAt + 新阈值` 现算，不靠「重新写事件」补。
+4. **改了阈值要连带检查所有把该常量当时间偏移用的测试**（本仓 6 个 `_test_delivery_*` 直接用 `NOW + DELIVERY_DEADLINE_MS`），
+   并**为分档的每一档各写一个能红的断言**——只验「600s 会判死」不验「60s 不判死」，等于没验分档。
+5. **观测必须验「真的落盘且有边沿」**（R-17 家族）：只断言「没发 incident」时，把观测整段删掉仍然全绿。
+   本仓为此加了「`B-slow-delivery` 恰好 1 条 + 连跑两轮不增」两条断言（M5/M6 变异各自命中）。
+
+### 与 R-20 的关系
+
+R-20 说「三态机的注释不算实现，每一态都要有能演示它的输入」；
+R-26 说「一档阈值不能兼任两件事，每一档都要有能红的断言」。同一类错误的两个面：**用一条判据省事**。
 
 ## R-15（2026-10-19）：不要把「用户本人的操作」误判成 agent 越权
 

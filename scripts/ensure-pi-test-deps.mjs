@@ -36,6 +36,14 @@ const packages = [
 	// <repo>/node_modules/@earendil-works/pi-tui/dist/index.js`（导入 index.ts 的测试全红）。
 	["marked", join(piNestedModules, "marked")],
 	["get-east-asian-width", join(piNestedModules, "get-east-asian-width")],
+	// 2026-11-24 补：`pi-tui@1.5.0` 的 `dist/components/markdown.js` 直接 import 了
+	// `marked-cjk-friendly`（声明在它的 dependencies 里）。
+	// 缺失时的现象：`ERR_MODULE_NOT_FOUND: Cannot find package 'marked-cjk-friendly' imported from
+	// <repo>/node_modules/@earendil-works/pi-tui/dist/components/markdown.js`
+	// ⇒ `test:delivery-reconciler-loop` 等**导入 runtime-host 的测试**整组起不来
+	// （报的是依赖错，看起来像「测试失败」，很容易被当成真缺陷或环境噪声放过）。
+	// 本机实测：全局 pi 树里 `marked-cjk-friendly@0.1.2`，与本仓 pi-tui 声明的版本一致。
+	["marked-cjk-friendly", join(piNestedModules, "marked-cjk-friendly")],
 ];
 
 function canonical(path) {

@@ -29,6 +29,8 @@ import {
 	effectiveStageOf,
 	ensureEvent,
 	finalizeExpiredLease,
+	logSlowDelivery as logSlowDeliveryLedger,
+	logUnobservableDelivery as logUnobservableDeliveryLedger,
 	listAcks,
 	listAttempts,
 	listEvents,
@@ -158,6 +160,39 @@ export interface ReconcileOnceOptions {
 }
 
 /**
+ * 慢交付观测（P0-a，2026-11-24）：过**观测期限**（terminalAt+60s）仍未 consumed 时落一条 trace。
+ *
+ * 为什么需要它：旧口径下 60s 就是**判死线** ⇒ 「晚到」与「永不到」被压成同一条判据；
+ * 实测 140 个已 ACK 事件里 40 个（28.6%）超过 60s（p90=323.8s）。拆开后 60s 如果什么都不做，
+ * 就失去了「这条跑了很久」的全部可观测性 ⇒ 必须留下读数（R-2：默不作声的失效不可接受）。
+ *
+ * 只写 trace（**不写** stage、不写 event 元数据、不发 incident、不影响补投次数）：
+ *   - 不写 event 元数据是为了守住「事件创建后不变（除 incident）」的硬约束；
+ *   - 边沿触发（`shouldLogTraceTransition`），不是每 tick 一条 —— 同一个（item, stage）
+ *     只落一次，避免重演 `trace.jsonl` 被稳态噪声灌满（见 trace-transition-gate.ts）。
+ *
+ * ## 上界（「会不会像 d3 那样爆」，2026-11-24 L4 追问后补）
+ * 落盘 population **只包含 60s~600s 窗口内的事件**：`reconcileDecision` 里
+ * `consumed` / `failed_delivery` 两条短路在 `slow` 计算**之前** return ⇒ 已送达或已关单的事件
+ * 永远不会进这个窗口；600s 之后转 `failed_delivery` 即停。
+ * ⇒ 上界 = 「窗口内事件数 × 不同 stage 数 × 进程重启次数」，**不是** item × tick。
+ * 对照真机：`trace.jsonl` 里 d3 那条曾达 3945 条（稳态 `probe-inconclusive`，无窗口截断）；
+ * 本 kind 在引入时是 0 条，量级差两个数量级。
+ *
+ * never-throw。
+ */
+export function logSlowDelivery(dir: string, event: { eventId: string; runId: string; deliveryDeadline: string }, stage: string, now: number): void {
+	// **实现单点在 `delivery-ledger.ts::logSlowDelivery`**：本模块也 import 它（同向依赖，无环）。
+	// 保留本导出只为「B 对账通道的观测入口」有一个本地名字，避免消费方记忆两个路径。
+	logSlowDeliveryLedger(dir, event, stage, now);
+}
+
+/** 「无法观测」的本地入口（实现单点在 `delivery-ledger.ts`；同 `logSlowDelivery` 的理由）。 */
+export function logUnobservableDelivery(dir: string, event: { eventId: string; runId: string; deliveryDeadline?: string }, reason: string, now: number): void {
+	logUnobservableDeliveryLedger(dir, event, reason, now);
+}
+
+/**
  * 跑一轮对账：扫描终态 → ensureEvent（缺则建）→ 判定 → 补投 或 发布 incident。
  *
  * **幂等**：event 已存在的（含已 consumed / 已 failed_delivery）由 `reconcileDecision` 判 none，
@@ -218,6 +253,10 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 			if (opts.armWaker && view.stage !== "consumed" && view.stage !== "failed_delivery" && view.stage !== "expired_dead_lease") {
 				try { opts.armWaker(event); } catch { /* best-effort */ }
 			}
+			// P0-a：过观测期限（terminalAt+60s）仍未 consumed ⇒ 落一条**观测**（不判死、不改任何状态）。
+			// 这一步是旧版"60s 就判死"被拆掉之后 60s 唯一的用途：把"慢"变成可读数。
+			if (decision.slowDelivery === true) logSlowDelivery(opts.deliverDir, event, view.stage, now);
+			if (typeof decision.unobservable === "string") logUnobservableDelivery(opts.deliverDir, event, decision.unobservable, now);
 			results.push({ eventId: event.eventId, runId: run.runId, stage: view.stage, action: "none", dispatched: false });
 			continue;
 		}
@@ -265,6 +304,7 @@ export async function reconcileOnce(opts: ReconcileOnceOptions): Promise<{
 		}
 
 		// retry：B 补投（同 eventId、新 attemptId）
+		if (decision.slowDelivery === true) logSlowDelivery(opts.deliverDir, event, view.stage, now);
 		let status: AttemptStatus = "unconfirmed";
 		let dispatched = false;
 		if (opts.deliver) {

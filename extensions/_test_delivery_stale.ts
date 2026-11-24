@@ -53,6 +53,8 @@ delete process.env.PI_DELIVERY_STALE_FINALIZE;
 
 const {
 	EXPIRED_DEAD_OWNER,
+	DELIVERY_DEADLINE_MS,
+	DELIVERY_FAIL_DEADLINE_MS,
 	LEASE_MS,
 	MAX_B_RETRIES_PER_EVENT,
 	RECONCILE_FIRST_RETRY_MS,
@@ -451,9 +453,15 @@ try {
 		const g3 = { runsDir: join(ROOT, "runs-s4-outbox"), deliverDir: dd, stateDir: st };
 		mkdirSync(g3.runsDir, { recursive: true });
 		writeRun(g3.runsDir, "run_s4_outbox", NOW);
+		// 【夹具修正 2026-11-24】`sess_s4o` 不是 UUID ⇒ `makeOutboxDeliver` 自 **`0022e17`**
+		// （2026-11-10 14:07:16「dispatcher 形状校验（只认 UUID）+ 不可达 fail-fast」）
+		// 起 **fail closed 不写 outbox** ⇒ 本断言自那以后一直是红的（预存在失败，与 P0-a 无关）。
+		// 修夹具而不是放宽实现：「写一条注定到不了的 outbox」正是那次要消灭的行为。
+		// （commit 归属更正：L4 复核指出我最初写的 `0d73702` 早了一个 commit——那是 tab→ownerSessionId 解析。）
+		const S4O_DISPATCHER = "01a1c4d0-0000-7000-8000-000000000ab1";
 		const mkLoop = (nowMs: number) => startDeliveryReconcilerLoop({
 			runsDir: g3.runsDir, deliverDir: g3.deliverDir, stateDir: g3.stateDir,
-			intervalMs: 60_000, limit: 50, now: () => nowMs, resolveDispatcher: () => "sess_s4o",
+			intervalMs: 60_000, limit: 50, now: () => nowMs, resolveDispatcher: () => S4O_DISPATCHER,
 		});
 		const l1 = mkLoop(NOW + RECONCILE_FIRST_RETRY_MS + 1_000);
 		try { await l1.ready; } finally { l1.stop(); }
@@ -623,11 +631,18 @@ try {
 		assert.equal(view.stage, "expired_dead_lease", "S9 前置：已落租约终态");
 		const dPre = reconcileDecision(ev, view, att, NOW + 40_000, { staleLease: () => EXPIRED_DEAD_OWNER });
 		assert.equal(dPre.action, "none", "S9① 期限未到 + 已终态 ⇒ 不再补投（降噪目标不变）");
-		const dPost = reconcileDecision(ev, view, att, NOW + 61_000, { staleLease: () => EXPIRED_DEAD_OWNER });
-		assert.equal(dPost.action, "fail_delivery", "S9② 期限已到 ⇒ 必须升级 fail_delivery（旧顺序在此返回 none = 静默漏发）");
-		// 接线：reconcileOnce 在期限后真的发 incident（不是只看纯函数）
+		// P0-a（2026-11-24）：60s 只是观测期限 ⇒ S9② 的断点必须用**判死期限**
+		const dPost = reconcileDecision(ev, view, att, NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000, { staleLease: () => EXPIRED_DEAD_OWNER });
+		assert.equal(dPost.action, "fail_delivery", "S9② 判死期限已到 ⇒ 必须升级 fail_delivery（旧顺序在此返回 none = 静默漏发）");
+		// 反例（P0-a 新增）：过观测期限但未到判死期限 ⇒ 仍不得升级（期限分级不得被这条路径绕过）
+		assert.equal(
+			reconcileDecision(ev, view, att, NOW + DELIVERY_DEADLINE_MS + 1_000, { staleLease: () => EXPIRED_DEAD_OWNER }).action,
+			"none",
+			"S9②-b 过 60s 观测期限不判死（仍然是 none：租约终态不再补投，但也不升级）",
+		);
+		// 接线：reconcileOnce 在判死期限后真的发 incident（不是只看纯函数）
 		const r2 = await reconcileOnce({
-			runsDir: g.runsDir, deliverDir: g.deliverDir, now: NOW + 61_000,
+			runsDir: g.runsDir, deliverDir: g.deliverDir, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000,
 			resolveDispatcher: () => "sess_s9", deliver: () => "sent",
 			staleLeaseFinalize: true, isPidAlive: () => false,
 		});

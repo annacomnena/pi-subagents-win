@@ -13,7 +13,9 @@
  *   - `eventId = async:<runId>:<terminalRevision>`（revision = 稳定结果字段的 hash，
  *     **不含**通知重试字段 ⇒ 重试不产生新事件，同一 run 的同一终态恒同 eventId）；
  *   - 阶段：`pending → leased → attempted → received → consumed`，
- *     任何未 consumed 且过 `deliveryDeadline` ⇒ `failed_delivery` + incident；
+ *     **过 `deliveryFailDeadline`（= terminalAt + 600s）仍未 consumed ⇒ `failed_delivery` + incident**；
+ *     过 `deliveryDeadline`（= terminalAt + 60s）**只落 `B-slow-delivery` 观测**（不判死、不发 incident、
+ *     不终止补投）—— 两档分开是 2026-11-24 P0-a（实测 140 个已 ACK 事件里 40 个/28.6% 超过 60s）；
  *   - `attempted` 只表示「调过发送」；`received` 需接收端看到带 eventId 的消息；
  *     `consumed` 需该 event 进入本次模型请求的有效 context（由本地关联，不靠 LLM 自述）；
  *   - 租约 15s，**租约不是已送达**；
@@ -37,13 +39,50 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, appendFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./runtime/journal.ts";
+import { shouldLogTraceTransition } from "./runtime/trace-transition-gate.ts";
 
 // ── 常量（口径写死，可被参数覆盖但默认值即规格）──────────────────────
 
 /** 租约（ms）：咨询 §6.4「租约默认 15s」。 */
 export const LEASE_MS = 15_000;
-/** 交付期限（ms）：咨询 §6.4「deliveryDeadline = terminalAt + 60s」。 */
+/**
+ * **观测期限**（ms）= terminalAt + 60s。**不再是判死线**（2026-11-24 P0-a）。
+ *
+ * ## 为什么从「判死线」降级为「观测线」（实测驱动，R-11 分母）
+ *
+ * 旧口径：过 60s 未 consumed ⇒ `fail_delivery` + incident（咨询 §6.4/§6.5）。
+ * 实测本机 `~/.pi/agent/runtime/delivery/` 全部 141 个事件、140 个有 consumed ACK：
+ * ```
+ * ACK − terminalAt（秒）: p50=0.31  p90=323.8  p95=913.8  p99=2836.9  max=3005.8
+ * 分桶: (0,1] 90 | (1,5] 7 | (5,10] 1 | (20,60] 2 | (60,120] 4 | (120,180] 5
+ *       (180,240] 4 | (240,300] 11 | (300,600] 7 | (600,∞] 9
+ * 若按 60s 判死 ⇒ 40/140 = **28.6%** 的**已送达**事件会被判死
+ * ```
+ * 语义后果（旧口径下已实测发生过）：incident 写完、ACK 后到 ⇒ 同一事件同时有
+ * `failed_delivery` 与 `consumed` 两个矛盾终态（442 事件里 14 个；单例 `run_mw3flr49_7d1z`
+ * deadline 19:04:49 判死、ACK 19:11:25 晚 6'36"）。
+ * 根因不是逻辑 bug（`stage==="consumed"` 早已短路），而是**参数与真实时延量级错配**：
+ * 目标会话正忙时消息在队列里排队是常态，60s 内 ACK 根本来不及到。
+ *
+ * ⇒ 60s 保留为**观测价值**：过 60s 记 `B-slow-delivery` trace（不判死、不发 incident、
+ * 不终止补投），把「慢」变成可读数；判死交给 {@link DELIVERY_FAIL_DEADLINE_MS}。
+ *
+ * ## 代价（显式登记，AGENTS R-5）
+ * 「真漏发」的可见时间从 ≤75s 推到 ≤(600s + 一个 tick)。这本是咨询 §6.5 的 SLO 行
+ * （`_test_delivery_host_contract.ts` H3-P2② 断言 ≤75s）——**该行被本改动取代**，
+ * 已同步改断言并写明取舍。理由：60s 并不能发现漏发（它只在 ACK 到达前把一切判死），
+ * 而 28.6% 的误判是**确定发生**的噪声。
+ */
 export const DELIVERY_DEADLINE_MS = 60_000;
+/**
+ * **判死期限**（ms）= terminalAt + 600s。过它仍未 consumed ⇒ `fail_delivery` + incident。
+ *
+ * 取值依据（同上分母）：p99=2836.9s 仍远大于 600s，但 600s 已覆盖 (60,600] 桶里的
+ * **全部 34 个**事件（4+5+4+11+7 = 31 个落在 (60,600]）外加 (0,60] 的 100 个
+ * ⇒ 只剩 9/140（6.4%）超过 600s。再往上（900s ⇒ 7/140）边际收益极小，
+ * 而「真死」的可见性每 100s 都在变差 ⇒ 取 600s（10min）。
+ */
+export const DELIVERY_FAIL_DEADLINE_MS = 600_000;
 /** B 对账通道首投阈值（ms）：咨询 §6.2「超过 20s 仍未 consumed 就补投」。 */
 export const RECONCILE_FIRST_RETRY_MS = 20_000;
 /** incident 重试节流（5s 起、最长 60s）。 */
@@ -162,7 +201,17 @@ export interface DeliveryEvent {
 	/** 接收者世代（迁移接收者时保留 eventId、递增 generation）。 */
 	recipientGeneration: number;
 	observedAt: string;
+	/** 观测期限（terminalAt + 60s）。过它只记 `B-slow-delivery` 观测，**不判死**。 */
 	deliveryDeadline: string;
+	/**
+	 * 判死期限（terminalAt + 600s）。过它仍未 consumed ⇒ `fail_delivery` + incident。
+	 *
+	 * **可选**：存量事件（2026-11-24 之前创建）没有该字段 ⇒ 由
+	 * {@link failDeadlineOf} 按 `terminalAt + DELIVERY_FAIL_DEADLINE_MS` 现算。
+	 * 这是**口径重算**，不是「隐式展期」：基准仍是 `terminalAt`（终态时刻），
+	 * 不随 discovered/observed 时刻推移（见 `terminalAt` 字段注释的「不隐式展期」）。
+	 */
+	deliveryFailDeadline?: string;
 	/** incident 一旦发布即持久（跨重启保留，显式 ack 才清）。 */
 	incidentId?: string;
 	incidentAt?: string;
@@ -193,9 +242,20 @@ export function ensureEvent(
 		dispatcherSessionId: string;
 		recipientGeneration?: number;
 		observedAt?: string;
-		/** 终态发生时刻（缺省回退 observedAt）；期限基准，见 DeliveryEvent.terminalAt。 */
+		/**
+		 * 终态发生时刻（缺省回退 observedAt）；**两个期限的唯一基准**，见 `DeliveryEvent.terminalAt`。
+		 *
+		 * ⚠️ **调用方契约（2026-11-24 L4 实测）**：本函数**不校验**该值的可解析性 ——
+		 * `Date.parse` 得到 NaN 时 `new Date(NaN).toISOString()` 会抛 `RangeError: Invalid time value`。
+		 * 现有 4 个生产调用点（`async-result-watcher.ts` / `mailbox-consumer.ts` ×2 / `outbox-bridge.ts`）
+		 * 与 `reconcileOnce` 都自带 try/catch ⇒ 表现为「该事件不建账」（静默跳过，不回滚）。
+		 * **新增调用点必须同样包 try/catch**；要「坏时间戳也建账」就先在调用方归一化，不要在这里放行。
+		 */
 		terminalAt?: string;
+		/** 观测期限覆盖（测试用；缺省 = DELIVERY_DEADLINE_MS）。 */
 		deliveryDeadlineMs?: number;
+		/** 判死期限覆盖（测试用；缺省 = DELIVERY_FAIL_DEADLINE_MS，基准是 terminalAt）。 */
+		failDeadlineMs?: number;
 	},
 ): { event: DeliveryEvent; created: boolean } {
 	ensureDir(dir);
@@ -205,6 +265,8 @@ export function ensureEvent(
 	const observedAt = input.observedAt ?? new Date().toISOString();
 	const terminalAt = input.terminalAt ?? observedAt;
 	const deadlineMs = input.deliveryDeadlineMs ?? DELIVERY_DEADLINE_MS;
+	const failMs = input.failDeadlineMs ?? DELIVERY_FAIL_DEADLINE_MS;
+	const terminalMs = Date.parse(terminalAt);
 	const event: DeliveryEvent = {
 		eventId,
 		runId: input.runId,
@@ -214,10 +276,34 @@ export function ensureEvent(
 		recipientGeneration: input.recipientGeneration ?? 1,
 		observedAt,
 		terminalAt,
-		deliveryDeadline: new Date(Date.parse(terminalAt) + deadlineMs).toISOString(),
+		deliveryDeadline: new Date(terminalMs + deadlineMs).toISOString(),
+		deliveryFailDeadline: new Date(terminalMs + failMs).toISOString(),
 	};
 	atomicWrite(join(dir, `${eventFileKey(eventId)}.json`), JSON.stringify(event));
 	return { event, created: true };
+}
+
+/**
+ * 判死期限（ms epoch）—— **单一取数点**，消费方一律经它取，禁止各自 `Date.parse`。
+ *
+ * 存量事件没有 `deliveryFailDeadline` 字段（本字段 2026-11-24 才引入）⇒ 按
+ * `terminalAt + DELIVERY_FAIL_DEADLINE_MS` 现算。基准是 `terminalAt`（终态时刻，**不是**
+ * `observedAt`/`now`）⇒ 晚发现的旧事件**不会**被挤到将来的期限（不隐式展期）。
+ *
+ * @returns 非有限值 ⇒ `null`（调用方据此跳过判死，不猜）
+ */
+export function failDeadlineOf(event: DeliveryEvent): number | null {
+	const explicit = Date.parse(String(event.deliveryFailDeadline ?? ""));
+	if (Number.isFinite(explicit)) return explicit;
+	const base = Date.parse(String(event.terminalAt ?? event.observedAt ?? ""));
+	if (!Number.isFinite(base)) return null;
+	return base + DELIVERY_FAIL_DEADLINE_MS;
+}
+
+/** 观测期限（ms epoch）= terminalAt + 60s；存量/缺失一律经 `deliveryDeadline`。 */
+export function observeDeadlineOf(event: DeliveryEvent): number | null {
+	const d = Date.parse(String(event.deliveryDeadline ?? ""));
+	return Number.isFinite(d) ? d : null;
 }
 
 export function listEvents(dir: string, limit = 500): DeliveryEvent[] {
@@ -570,8 +656,15 @@ export function effectiveStage(
 }
 
 export type ReconcileAction =
-	| { action: "none"; reason: string }
-	| { action: "retry"; reason: string; attemptId: string; /** P-3：这是第几次 B 补投（从 1 开始）。 */ retryOrdinal: number }
+	/**
+	 * `slowDelivery: true` = 已过**观测期限**（terminalAt+60s）但仍未 consumed。
+	 * 这不影响判定（不判死、不终止补投），只让调用方落一条观测（P0-a）。
+	 *
+	 * `unobservable` = 该事件**连时间基准都没有**（时间戳坏了），因此「慢/死」都无法判定。
+	 * 这类事件以前在 trace 里**完全不存在**（R-2：默不作声）⇒ 现在给一条独立的 kind。
+	 */
+	| { action: "none"; reason: string; slowDelivery?: true; unobservable?: string }
+	| { action: "retry"; reason: string; attemptId: string; /** P-3：这是第几次 B 补投（从 1 开始）。 */ retryOrdinal: number; slowDelivery?: true }
 	| { action: "fail_delivery"; reason: string }
 	/**
 	 * P-1：租约过期的持有者进程已死 ⇒ 不补投，落终态（由调用方写审计行 + 终态记录）。
@@ -591,8 +684,8 @@ export type ReconcileAction =
  *     `failed_delivery` 升级（后者是持久 incident，不是会话注入）；
  *   - 活目标仍能得到 **首次投递（A）+ 至多 2 次补投（B）**，比原来的「限期内每 15s 一次」
  *     只减少了**对同一 eventId 的重复播发次数**，没有减少「至少一次」的可能性；
- *   - 超过上限后事件**不是**静默丢弃：`reconcileDecision` 返回 `none`，到
- *     `deliveryDeadline` 仍会 `fail_delivery` + 持久 incident 可见（不静默）。
+ *   - 超过上限后事件**不是**静默丢弃：`reconcileDecision` 返回 `none`，过
+ *     `deliveryFailDeadline`（terminalAt+600s）仍会 `fail_delivery` + 持久 incident 可见（不静默）。
  *   - 真正的“漏发”风险窗口在：2 次补投都未到达。这与原设计一致（原来也只是反复重试，
  *     并非无限久）——期限 60s 内的重试次数从 ~3 次降到 2 次，量级不变。
  */
@@ -601,18 +694,26 @@ export const MAX_B_RETRIES_PER_EVENT = 2;
 /**
  * 对账判定（纯函数）。
  *
- * 规则（咨询 §6.4/§6.2，行号指修改后）：
+ * 规则（咨询 §6.4/§6.2 + **2026-11-24 P0-a 期限分级**）：
  *   0. **P-1**：最近 attempt 的租约已过期 ∧ 持有者 pid 已死 ⇒ `finalize_expired_lease`（不补投）；
- *   1. 已 consumed / 已 failed_delivery → none；已 expired_dead_lease → 期限前 none（不再补投），
- *      **期限一到照旧升级 fail_delivery**（见下方顺序注释）；
- *   2. 过 `deliveryDeadline` 仍未 consumed → **fail_delivery**（不 kill、不改进程、不改 run）；
- *   3. 超过 `RECONCILE_FIRST_RETRY_MS` 仍未 consumed → retry（B 通道补投，同 eventId、新 attemptId）；
+ *   1. 已 consumed / 已 failed_delivery → none；已 expired_dead_lease → 判死期限前 none（不再补投），
+ *      **判死期限一到照旧升级 fail_delivery**（见下方顺序注释）；
+ *   2. 过 **判死期限**（`failDeadlineOf`，缺省 terminalAt+600s）仍未 consumed →
+ *      **fail_delivery**（不 kill、不改进程、不改 run）；
+ *   3. 过 **观测期限**（terminalAt+60s）仍未 consumed → 与 2/4 **并行**的观测标记 `slowDelivery`
+ *      （只记读数，不判死、不终止补投 —— 旧口径在此判死是实测 28.6% 误判的来源）；
+ *   4. 超过 `RECONCILE_FIRST_RETRY_MS` 仍未 consumed → retry（B 通道补投，同 eventId、新 attemptId）；
  *      但 **P-3**：已补投次数 ≥ `MAX_B_RETRIES_PER_EVENT` ⇒ none（不再向会话播发）；
- *   4. 距上次尝试不足 15s（租约）→ none（不惊群）。
+ *   5. 距上次尝试不足 15s（租约）→ none（不惊群）。
  *
- * 顺序说明（P-1 为何在 deadline 之后判 fail_delivery 之前）：
+ * 顺序说明（P-1 为何在判死之后判 fail_delivery 之前）：
  *   `fail_delivery` 是更强的终态（发 incident，跨重启可见）；让期限优先保证
- *   「该升级的照升级」。P-1 只在期限未到时接住「本来还要补投」的那些路径。
+ *   「该升级的照升级」。P-1 只在判死期限未到时接住「本来还要补投」的那些路径。
+ *
+ * **期限分级的历史（R-11/R-20：同一条判据不得兼管两件事）**：
+ *   旧版把「60s 应该到了」与「这条永远到不了」压成同一条判据 ⇒ 目标会话正常排队等待
+ *   也被判死（实测 140 个已 ACK 事件中 40 个（28.6%）超过 60s；p90=323.8s）。
+ *   现在拆成两条：60s = 「慢」的**观测**，600s = 「死」的**判定**。
  */
 export function reconcileDecision(
 	event: DeliveryEvent,
@@ -634,18 +735,30 @@ export function reconcileDecision(
 	if (view.stage === "consumed") return { action: "none", reason: "consumed" };
 	if (view.stage === "failed_delivery") return { action: "none", reason: "already-failed-delivery" };
 
-	// **顺序硬要求（2026-11-03 L4 审查实测驱动）**：deadline 必须在 `expired_dead_lease` 短路**之前**判。
+	// **顺序硬要求（2026-11-03 L4 审查实测驱动）**：判死必须在 `expired_dead_lease` 短路**之前**判。
 	// 旧顺序（expired 短路在前）会把「租约终态」变成**整个事件的永久静默**：不再补投、
 	// 且期限到了也不发 incident ⇒ 漏发不可见。本仓取舍（AGENTS.md R-5）是「宁可重发，不可漏发」，
 	// R-2 又禁止静默失效 ⇒ 停投只能降噪，**不得**顺手取消期限升级。
-	const deadlineMs = Date.parse(event.deliveryDeadline);
-	if (Number.isFinite(deadlineMs) && now >= deadlineMs) {
-		return { action: "fail_delivery", reason: `deadline-exceeded(deadline=${event.deliveryDeadline},stage=${view.stage})` };
+	//
+	// 2026-11-24（P0-a）：这里改判 **判死期限**（terminalAt+600s），不再用观测期限（+60s）。
+	// 60s 的观测价值由下游 `slowDelivery` 标记保留 —— 「晚到」与「永不到」必须分开（R-20）。
+	const failMs = failDeadlineOf(event);
+	if (failMs !== null && now >= failMs) {
+		return {
+			action: "fail_delivery",
+			reason: `deadline-exceeded(deadline=${new Date(failMs).toISOString()},observe-deadline=${event.deliveryDeadline},stage=${view.stage})`,
+		};
 	}
+	// 观测期限：过 60s 仍未 consumed ⇒ 打标记（不判死、不终止补投）。
+	// 默认 false ⇒ 不到 60s 时**行为与旧版逐字相同**（不改变任何判定动作）。
+	const observeMs = observeDeadlineOf(event);
+	const slow: true | undefined = observeMs !== null && now >= observeMs ? true : undefined;
 	// 租约终态（P-1）且期限未到 ⇒ 不再补投。**代价显式登记**：若目标进程后来复活，
 	// 该事件不会再被投递（at-most-once 面）；由期限到点的 fail_delivery incident 兜住可见性。
 	if (view.stage === "expired_dead_lease") {
-		return { action: "none", reason: "already-expired-dead-lease(escalate-at-deadline)" };
+		return slow !== undefined
+			? { action: "none", reason: "already-expired-dead-lease(escalate-at-fail-deadline)", slowDelivery: slow }
+			: { action: "none", reason: "already-expired-dead-lease(escalate-at-fail-deadline)" };
 	}
 
 	// 期限未到：先看是否该落租约终态（P-1）——这是「本来要补投」的分支上的拦截。
@@ -664,11 +777,18 @@ export function reconcileDecision(
 	const observed = Date.parse(event.terminalAt ?? event.observedAt);
 	const firstRetryMs = opts.reconcileFirstRetryMs ?? RECONCILE_FIRST_RETRY_MS;
 	const leaseMs = opts.leaseMs ?? LEASE_MS;
-	if (!Number.isFinite(observed)) return { action: "none", reason: "no-observed-at" };
+	// 时间基准缺失 ⇒ 既不能判「慢」也不能判「死」。**不得静默**（R-2）：带上 unobservable 标记，
+	// 由调用方落一条 `B-delivery-unobservable` trace（否则坏时间戳的事件在 trace 里零痕迹，
+	// 「看不见」与「没发生」无法区分 —— 2026-11-24 L4 指出）。
+	if (!Number.isFinite(observed)) {
+		return { action: "none", reason: "no-observed-at", unobservable: "no-observed-at(terminalAt/observedAt 不可解析)" };
+	}
 
 	const last = attempts.at(-1);
 	const baseMs = last ? Date.parse(last.at) : observed;
-	if (!Number.isFinite(baseMs)) return { action: "none", reason: "no-time-basis" };
+	if (!Number.isFinite(baseMs)) {
+		return { action: "none", reason: "no-time-basis", unobservable: `no-time-basis(last-attempt.at=${String(last?.at)})` };
+	}
 
 	// 租约内不重复投（防 A/B 惊群）
 	if (now - baseMs < leaseMs) return { action: "none", reason: "within-lease" };
@@ -686,11 +806,15 @@ export function reconcileDecision(
 	const bRetries = attempts.filter((a) => a.channel === "B" && a.status !== EXPIRED_DEAD_OWNER && a.status !== "failed" && a.status !== "no-injector").length;
 	const maxB = opts.maxBRetries ?? MAX_B_RETRIES_PER_EVENT;
 	if (bRetries >= maxB) {
-		return { action: "none", reason: `b-retry-cap-reached(${bRetries}/${maxB})` };
+		return slow !== undefined
+			? { action: "none", reason: `b-retry-cap-reached(${bRetries}/${maxB})`, slowDelivery: slow }
+			: { action: "none", reason: `b-retry-cap-reached(${bRetries}/${maxB})` };
 	}
 
 	const attemptId = `${event.eventId}@${now}@${Math.random().toString(36).slice(2, 8)}`;
-	return { action: "retry", reason: last ? `retry-after-${view.stage}` : "first-retry", attemptId, retryOrdinal: bRetries + 1 };
+	return slow !== undefined
+		? { action: "retry", reason: last ? `retry-after-${view.stage}` : "first-retry", attemptId, retryOrdinal: bRetries + 1, slowDelivery: slow }
+		: { action: "retry", reason: last ? `retry-after-${view.stage}` : "first-retry", attemptId, retryOrdinal: bRetries + 1 };
 }
 
 // ── incident（跨重启保留；仅显式 ack 才清）───────────────────────────
@@ -863,6 +987,16 @@ export async function reconcileEvent(
 	const view = effectiveStageOf({ event, attempts, acks }, { incidentId: event.incidentId, incidentAt: event.incidentAt }, now);
 	const action = reconcileDecision(event, view, attempts, now, opts);
 
+	// P0-a：与 reconcileOnce 同口径（本入口只在测试用，但观测必须两边一致，否则“看不看到”取决于走哪条）。
+	// `fail_delivery` / `finalize_expired_lease` 的联合成员**根本没有** `slowDelivery` 字段，
+	// 且那两条分支在 `reconcileDecision` 里已提前 return（`slow` 尚未计算）⇒ 不需要额外排除。
+	if ("slowDelivery" in action && action.slowDelivery === true) {
+		logSlowDelivery(dir, event, view.stage, now);
+	}
+	if ("unobservable" in action && typeof action.unobservable === "string") {
+		logUnobservableDelivery(dir, event, action.unobservable, now);
+	}
+
 	if (action.action === "finalize_expired_lease") {
 		const target = attempts.find((a) => a.attemptId === action.attemptId);
 		// **盘上事实驱动（2026-11-03 L4 第 2 轮实测驱动）**：旧版无视写入结果 ⇒ 写失败时仍然
@@ -917,6 +1051,51 @@ export async function reconcileEvent(
 	}
 
 	return { eventId: event.eventId, stage: view.stage, action };
+}
+
+/**
+ * 慢交付观测（P0-a，2026-11-24），与 `delivery-reconciler.ts` 的同名导出同源。
+ *
+ * 本文件导出它是为了 `reconcileEvent`（ledger 自己的对账入口）能写同一形状的 trace，
+ * 避免「同一条规则两个入口各写一种痕迹」。reconciler 的同名函数**委托到这里**（单一实现）。
+ *
+ * 边沿触发（`shouldLogTraceTransition`）而不是每 tick 一条：同 (eventId, stage) 只落一次。
+ */
+export function logSlowDelivery(dir: string, event: { eventId: string; runId: string; deliveryDeadline: string }, stage: string, now: number): void {
+	try {
+		if (!shouldLogTraceTransition(`slow-delivery:${event.eventId}`, stage)) return;
+		appendTrace(dir, {
+			kind: "B-slow-delivery",
+			eventId: event.eventId,
+			runId: event.runId,
+			observeDeadline: event.deliveryDeadline,
+			stage,
+			overdueMs: now - Date.parse(event.deliveryDeadline),
+			note: "仅观测：未发 incident、未终止补投；判死看 deliveryFailDeadline(terminalAt+600s)",
+		});
+	} catch { /* best-effort：观测不得影响判定 */ }
+}
+
+/**
+ * 「无法观测」落盘（P0-a 附带，2026-11-24 L4 指出）：事件时间戳坏了 ⇒ 「慢/死」都判不了。
+ *
+ * 以前这类事件在 trace 里**完全不存在**，读者无法区分「没发生」与「看不见」（R-2 / R-20）。
+ * 现在落一条独立 kind（**不是** `B-slow-delivery`，避免把「坏数据」误读成「慢」）。
+ *
+ * 边沿触发同上；never-throw。**不写 stage、不改事件、不发 incident**。
+ */
+export function logUnobservableDelivery(dir: string, event: { eventId: string; runId: string; deliveryDeadline?: string }, reason: string, now: number): void {
+	try {
+		if (!shouldLogTraceTransition(`slow-delivery:${event.eventId}`, `unobservable:${reason}`)) return;
+		appendTrace(dir, {
+			kind: "B-delivery-unobservable",
+			eventId: event.eventId,
+			runId: event.runId,
+			reason,
+			observeDeadline: event.deliveryDeadline,
+			note: "时间戳不可解析 ⇒ 既不能判慢也不能判死；这是观测缺口，不是判定",
+		});
+	} catch { /* best-effort */ }
 }
 
 /**

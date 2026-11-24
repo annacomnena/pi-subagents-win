@@ -48,7 +48,7 @@ import {
 	readDeliveryReconcilerState,
 	RECONCILER_STALE_AFTER_MS,
 } from "./runtime-host/delivery-reconciler-loop.ts";
-import { listEvents, listAcks, listAttempts, listOpenIncidents } from "./delivery-ledger.ts";
+import { DELIVERY_FAIL_DEADLINE_MS, listEvents, listAcks, listAttempts, listOpenIncidents } from "./delivery-ledger.ts";
 import { listOutboxItems, outboxDir } from "./runtime/message-outbox.ts";
 
 let n = 0;
@@ -160,16 +160,25 @@ try {
 			assert.equal(items[0]!.sessionId, "01a1bbbb-0000-0000-0000-000000000002", "唤醒寻址 = 派发者会话（不是别的会话）");
 			assert.ok(items[0]!.text.includes(ev!.eventId), "唤醒正文**必带 eventId 标记**（receiver context 才能 ACK）");
 
-			// ④ 升级：过 deliveryDeadline ⇒ fail_delivery + 持久 incident（不调用模型）
+			// ④ 升级：过**判死期限** ⇒ fail_delivery + 持久 incident（不调用模型）
+			// P0-a（2026-11-24）：+75s 只过观测期限（60s），不再判死 ⇒ 必须先断言「75s 时零 incident」，
+			// 再在判死期限（600s）后断言升级。两半都验，才证明期限分级真的接线了。
 			clock = NOW + 75_000;
 			await loop.runOnce();
+			assert.equal(
+				listOpenIncidents(g.deliverDir).filter((i) => i.runId === runId).length, 0,
+				"E1④-a 仅过观测期限（75s）⇒ **不得**发 incident（P0-a：60s 只观测）",
+			);
+			const tickAfterObserve = loop.status().tickCount;
+			clock = NOW + DELIVERY_FAIL_DEADLINE_MS + 15_000; // = +615s
+			await loop.runOnce();
 			const open = listOpenIncidents(g.deliverDir).filter((i) => i.runId === runId);
-			assert.equal(open.length, 1, "E1④ 期限到 ⇒ 持久 incident 恰 1 条（升级出口）");
+			assert.equal(open.length, 1, "E1④-b 判死期限到 ⇒ 持久 incident 恰 1 条（升级出口）");
 			assert.ok(open[0]!.reason.includes("deadline-exceeded"), `incident 原因写明期限（实得 ${open[0]!.reason}）`);
 			const st = loop.status();
 			assert.equal(st.running, true, "升级后循环仍在跑（never-throw）");
 			assert.equal(st.lastError, null, "无 lastError");
-			assert.equal(st.tickCount, 2, "两轮对账各自 tickCount +1");
+			assert.equal(st.tickCount, tickAfterObserve + 1, "每跑一轮 tickCount +1（共三轮：补投 / 观测 / 升级）");
 		} finally {
 			loop.stop();
 		}
@@ -302,7 +311,7 @@ try {
 		process.env.PI_DELIVERY_RECONCILER = "0";
 		const loop = startDeliveryReconcilerLoop({
 			runsDir: g.runsDir, deliverDir: g.deliverDir, stateDir: g.stateDir,
-			intervalMs: 30, limit: 50, now: () => NOW + 75_000, // 期限早过：若被忽略，必产 incident
+			intervalMs: 30, limit: 50, now: () => NOW + DELIVERY_FAIL_DEADLINE_MS + 15_000, // 判死期限已过：若被忽略，必产 incident
 			resolveDispatcher: () => "sess_e4",
 		});
 		try {
@@ -329,13 +338,20 @@ try {
 			writeRun(gNeg.runsDir, "run_e4_neg", NOW);
 			const bypass = startDeliveryReconcilerLoop({
 				runsDir: gNeg.runsDir, deliverDir: gNeg.deliverDir, stateDir: gNeg.stateDir,
-				intervalMs: 60_000, limit: 50, now: () => NOW + 75_000,
+				// 反例必须取**判死期限之后**：只过 60s 观测期限时按 P0-a 不产 incident，
+				// ⇒ 旧写法（NOW+75s）的「incident 已发」断言自 2026-11-24 起恒假 = 失去判别力
+				// （2026-11-24 L4 指出，本处已改；断言消息也一并改成与事实一致）。
+				intervalMs: 60_000, limit: 50, now: () => NOW + DELIVERY_FAIL_DEADLINE_MS + 15_000,
 				killSwitch: true, // 变异：无视外部关闭意图，直接放行
 				resolveDispatcher: () => "sess_e4_neg",
 			});
 			try { await bypass.ready; } finally { bypass.stop(); }
 			assert.equal(existsSync(deliveryReconcilerStatePath(gNeg.stateDir)), true, "E4 反例：放行 ⇒ 状态文件已写（关闸断言在该情形必红）");
-			assert.ok(listEvents(gNeg.deliverDir, 100).length > 0, "E4 反例：放行 ⇒ 事件已建 + incident 已发（零动作断言必红）");
+			assert.ok(listEvents(gNeg.deliverDir, 100).length > 0, "E4 反例：放行 ⇒ 事件已建（零动作断言必红）");
+			assert.equal(
+				listOpenIncidents(gNeg.deliverDir).length, 1,
+				"E4 反例：放行 + 判死期限已过 ⇒ incident 恰 1 条（这条才是 old `NOW+75s` 企图证明的东西）",
+			);
 		}
 		ok("E4 kill switch 关 ⇒ 零 interval / 零事件 / 零 incident / 零 outbox / 零状态文件；反例：放行即留痕");
 	}

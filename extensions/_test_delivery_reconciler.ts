@@ -12,11 +12,14 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
 	DELIVERY_DEADLINE_MS,
+	DELIVERY_FAIL_DEADLINE_MS,
+	effectiveStage,
 	listAcks,
 	listAttempts,
 	listEvents,
 	listOpenIncidents,
 	loadEvent,
+	reconcileDecision,
 	writeAck,
 	terminalRevisionOf,
 } from "./delivery-ledger.ts";
@@ -139,8 +142,10 @@ try {
 		const lastAttempt = listAttempts(d, ev.eventId).at(-1)!;
 		writeAck(d, { eventId: ev.eventId, stage: "consumed", attemptId: lastAttempt.attemptId, recipientGeneration: 1, at: iso(NOW + 26_000), evidence: "context-assoc:msg_1" });
 		await reconcileOnce({ ...opts, now: NOW + 30_000 });
+		// 两个期限之后都要验证（观测 60s / 判死 600s）—— consumed 是更强终态，与期限无关
 		await reconcileOnce({ ...opts, now: NOW + DELIVERY_DEADLINE_MS + 10_000 });
-		assert.equal(deliveries, 1, "consumed 后不再补投");
+		await reconcileOnce({ ...opts, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 10_000 });
+		assert.equal(deliveries, 1, "consumed 后不再补投（含判死期限之后）");
 		assert.equal(incidents, 0, "consumed 后不得再发 incident（交付已成功）");
 		const v = listAcks(d, ev.eventId).filter((a) => a.stage === "consumed").length;
 		assert.equal(v, 1, "consumed ACK 唯一且保留");
@@ -160,16 +165,51 @@ try {
 			onIncident: (inc: { eventId: string; reason: string; incidentId?: string }) => { seen.push(inc.reason); if (inc.incidentId) seenIds.add(inc.incidentId); },
 		};
 		await reconcileOnce({ ...opts, now: NOW + 25_000 }); // 先补投一次（attempted）
-		const r = await reconcileOnce({ ...opts, now: NOW + DELIVERY_DEADLINE_MS + 1_000 });
+		// ① **过观测期限（60s）不得发 incident**（P0-a：那是 28.6% 误判的来源）
+		await reconcileOnce({ ...opts, now: NOW + DELIVERY_DEADLINE_MS + 1_000 });
+		assert.equal(seen.length, 0, "过 60s **不得**发 incident（只记 B-slow-delivery 观测）");
+		assert.equal(listOpenIncidents(d).length, 0, "盘上无 incident（不是只没回调）");
+		// ①-b **观测真的落盘了**（R-17：判据不读消费面 = 「写进去了」不等于「看得见」）。
+		// 这段断言是 M5 变异（删掉 reconcileOnce 里的 logSlowDelivery 调用）的唯一杀手：
+		// 只断言「没发 incident」的话，把观测整段删掉也是绿的 —— 那等于 60s 完全无声。
+		const traceLines = (() => {
+			try {
+				return readFileSync(join(d, "trace.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+			} catch { return [] as Record<string, unknown>[]; }
+		})();
+		const slow = traceLines.filter((t) => t.kind === "B-slow-delivery");
+		assert.equal(slow.length, 1, `过 60s 必须落**恰好 1 条** B-slow-delivery trace（实得 ${slow.length}）`);
+		assert.ok(String(slow[0].note).includes("仅观测"), "trace 必须写明「仅观测」（读者才知道它不是判死）");
+		assert.ok(Number(slow[0].overdueMs) > 0, "trace 带 overdueMs（超期多少毫秒，可读数）");
+		// 边沿触发：同一 (eventId, stage) 再跑一轮**不得**新增（否则重演 trace 被稳态噪声灌满）。
+		// ⚠️ 这一点必须**构造上**保证仍走 slow 分支，否则断言 vacuous。
+		// 实测（2026-11-24 L4 复核）：attempt 在 `+25s`、leaseUntil `+40s` ⇒ 租约窗口是 `[25s, 40s]`，
+		// 所以「+65s 落在租约内」是**错的**（+65s 早已出窗）。正确的构造依据是：
+		//   +61s 这一轮会**新记一条 attempt**（at=+61s, leaseUntil=+76s）⇒ 下一轮必须 > `+76s`。
+		// 取 `+77s`。并且下面用 `reconcileDecision` **自证**它确实带 slowDelivery（不靠人工推理）。
+		const T_NEXT = NOW + DELIVERY_DEADLINE_MS + 16_000; // = +76s+1s
+		const evForProbe = loadEvent(d, listEvents(d, 100).find((e) => e.runId === "run_b6")!.eventId)!;
+		const probeView = effectiveStage(evForProbe, listAttempts(d, evForProbe.eventId), listAcks(d, evForProbe.eventId), T_NEXT);
+		const probeDecision = reconcileDecision(evForProbe, probeView, listAttempts(d, evForProbe.eventId), T_NEXT);
+		assert.equal(
+			"slowDelivery" in probeDecision && probeDecision.slowDelivery === true, true,
+			`夹具自检：+77s 这一点必须仍在 slow 分支（否则下面的「不新增」断言 vacuous）；实得 ${JSON.stringify(probeDecision)}`,
+		);
+		await reconcileOnce({ ...opts, now: T_NEXT });
+		const slow2 = readFileSync(join(d, "trace.jsonl"), "utf8").split("\n").filter(Boolean)
+			.map((l) => JSON.parse(l) as Record<string, unknown>).filter((t) => t.kind === "B-slow-delivery");
+		assert.equal(slow2.length, 1, "边沿触发：同 (eventId, stage) 只落一次（不是每 tick 一条）");
+		// ② 过判死期限（600s）⇒ incident（不调用模型）
+		const r = await reconcileOnce({ ...opts, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 1_000 });
 		assert.equal(r.results.length >= 1, true);
-		assert.ok(seen.length >= 1, "超过 60s 期限 ⇒ incident 发布（不调用模型）");
+		assert.ok(seen.length >= 1, "超过判死期限 ⇒ incident 发布（不调用模型）");
 		assert.ok(seen[0].includes("deadline-exceeded"), `incident 原因写明期限（实得 ${seen[0]}）`);
 		// 独立 oracle：从原始文件复算 —— 事件应为 failed_delivery（已关单，不是 silent）
 		const ev = loadEvent(d, listEvents(d, 100).find((e) => e.runId === "run_b6")!.eventId)!;
 		assert.ok(ev.incidentId, "事件元数据持久 incidentId（跨重启可见）");
 		assert.equal(listOpenIncidents(d).filter((i) => i.eventId === ev.eventId).length, 1, "未 ack 的 incident 恰好 1 条（不重复制造）");
 		// 幂等语义：incident **只有一条**（可被重新通知，但不得制造多个 incident）
-		await reconcileOnce({ ...opts, now: NOW + DELIVERY_DEADLINE_MS + 5_000 });
+		await reconcileOnce({ ...opts, now: NOW + DELIVERY_FAIL_DEADLINE_MS + 5_000 });
 		assert.equal(listOpenIncidents(d).filter((i) => i.eventId === ev.eventId).length, 1, "incident 幂等：只有一条（重跑不制造新 incident）");
 		assert.equal(seenIds.size, 1, `重跑时通知出口可重试，但 incidentId 必须唯一（实得 ${[...seenIds].join(",")}）`);
 		ok("B6 期限到 ⇒ incident（幂等 + 跨重启可见 + 不调用模型）");
