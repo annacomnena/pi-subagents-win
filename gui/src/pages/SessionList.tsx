@@ -60,6 +60,9 @@ function isAllTabGroup(g: WorkspaceGroup): boolean {
 export function SessionList() {
 	const chatSessions = useGui((s) => s.chatSessions);
 	const activeId = useGui((s) => s.chatActiveId);
+	const activeTab = useGui((s) => s.activeTab);
+	const activeWorkspaceCwd = useGui((s) => s.activeWorkspaceCwd);
+	const setActiveWorkspace = useGui((s) => s.setActiveWorkspace);
 	const outboxMap = useGui((s) => s.chatOutbox);
 	// 【2026-11-04 新增】强制拉起反馈（列表行提示用；按 sessionId 存）
 	const resumeResults = useGui((s) => s.resumeSessionResult);
@@ -82,7 +85,12 @@ export function SessionList() {
 		return set;
 	}, [outboxMap]);
 
-	const filtered = useMemo(() => chatSessions.filter((s) => matchesSessionFilter(s, filter)), [chatSessions, filter]);
+	const filtered = useMemo(() => {
+		return chatSessions.filter((s) => {
+			if (sortBy === "active" && s.activity !== "active") return false;
+			return matchesSessionFilter(s, filter);
+		});
+	}, [chatSessions, filter, sortBy]);
 	// 置顶区（列表最上方独立「置顶」行）：全局 master 会话（服务端权威 isMaster，与 masterProtected 同源）。
 	// 过滤仍适用（与「过滤后空组整组隐藏」一致）；pinnedTop 非空 ⇒ 其所在组必然非空 ⇒ 不会与空态冲突。
 	const pinnedTop = useMemo(() => filtered.filter((s) => s.isMaster === true), [filtered]);
@@ -284,11 +292,11 @@ export function SessionList() {
 					placeholder="过滤会话（标题 / ID / 仓库名）"
 					className="h-7 min-w-0 flex-1"
 				/>
-				<div className="flex h-7 shrink-0 overflow-hidden rounded-lg border border-border" role="group" aria-label="组内排序">
+				<div className="flex h-7 shrink-0 overflow-hidden rounded-lg border border-border" role="group" aria-label="会话过滤模式">
 					{(
 						[
 							["updated", "最近更新"],
-							["created", "按创建"],
+							["active", "活跃中"],
 						] as const
 					).map(([value, label]) => (
 						<button
@@ -321,7 +329,11 @@ export function SessionList() {
 				)}
 				{groups.length === 0 ? (
 					<div className="px-2.5 py-2 text-ui-sm text-foreground-subtlest">
-						{chatSessions.length === 0 ? "暂无会话（等待列表数据）" : "无匹配会话"}
+						{chatSessions.length === 0
+							? "暂无会话（等待列表数据）"
+							: sortBy === "active"
+								? "暂无活跃中的仓库与 Agent"
+								: "无匹配会话"}
 					</div>
 				) : (
 					groups.map((g) => {
@@ -331,41 +343,67 @@ export function SessionList() {
 						// 组内显示模型（L3 三件套 1/2/3）：置顶行永远可见；非置顶默认前 3；全 tab 组默认收起
 						const overflowOpen = overflow[g.key] === true;
 						const display = buildGroupDisplay(g, overflowOpen);
+						const isWorkspaceActive = activeTab === "workspace" && g.cwd !== null && activeWorkspaceCwd === g.cwd;
 						return (
 							<Collapsible key={g.key} open={open} onOpenChange={(o) => toggleGroup(g, o)}>
-								{/* 组头（WorkspaceSidebarItem.tsx#L780 同款刻度）：h-8 整行 CollapsibleTrigger；
-									Folder/FolderOpen 16px + basename + 计数 badge（bg-tag，暗色 #363636；
-									zcode bg-tag 语义 2026-09-30 落地，替代亮色残留 bg-neutral-200/70）
-									+ 无 chevron + title=全路径 tooltip；未分组灰显 Inbox */}
-								<CollapsibleTrigger asChild>
-									<div
-										role="button"
-										tabIndex={0}
-										title={g.tooltip}
-										className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg pl-2.5 pr-1 hover:bg-hover"
+								{/* 组头交互解耦（2026-11-13）：
+									1. 左侧文件夹图标：专职负责折叠/展开（CollapsibleTrigger，阻断冒泡）；
+									2. 中间文字区：专职负责激活仓库主页（setActiveWorkspace，具备独立高亮选中态）；
+									3. 右侧：错误红点 + 计数 Badge。 */}
+								<div
+									className={`group/group-header flex h-8 items-center gap-1 rounded-lg pl-1 pr-1.5 transition-colors ${
+										isWorkspaceActive
+											? "bg-selected text-foreground shadow-[inset_2px_0_0_0_var(--color-accent)] font-medium"
+											: "text-foreground-subtle hover:bg-hover"
+									}`}
+								>
+									{/* 折叠/展开控制钮 */}
+									<CollapsibleTrigger asChild>
+										<button
+											type="button"
+											title={open ? "收起会话列表" : "展开会话列表"}
+											aria-label={open ? "收起会话列表" : "展开会话列表"}
+											onClick={(e) => e.stopPropagation()}
+											className="flex size-6 shrink-0 items-center justify-center rounded hover:bg-surface-elevated text-foreground-subtle hover:text-foreground transition-colors"
+										>
+											{g.ungrouped ? (
+												<Inbox className="size-4 shrink-0 text-foreground-subtlest" />
+											) : open ? (
+												<FolderOpen className="size-4 shrink-0 text-foreground-subtle" />
+											) : (
+												<Folder className="size-4 shrink-0 text-foreground-subtle" />
+											)}
+										</button>
+									</CollapsibleTrigger>
+
+									{/* 激活仓库主页文字区 */}
+									<button
+										type="button"
+										title={g.tooltip ? `打开 ${g.label} 仓库主页 (${g.tooltip})` : `打开 ${g.label} 仓库主页`}
+										onClick={() => {
+											if (g.cwd) {
+												setActiveWorkspace(g.cwd);
+											}
+										}}
+										className="min-w-0 flex-1 truncate text-left text-ui-base transition-colors hover:text-foreground"
 									>
-										{g.ungrouped ? (
-						<Inbox className="size-4 shrink-0 text-foreground-subtlest" />
-					) : open ? (
-						<FolderOpen className="size-4 shrink-0 text-foreground-subtle" />
-					) : (
-						<Folder className="size-4 shrink-0 text-foreground-subtle" />
-					)}
-										{/* 组头 label 统一 subtle 档（对齐 ZCode 组头 label text-foreground-subtle）；未分组灰显行由图标（Inbox + text-foreground-subtlest）承载差异 */}
-										<span className="min-w-0 flex-1 truncate text-ui-base text-foreground-subtle">{g.label}</span>
-										{/* 组内失败红点（数据源=failedSessions 聚合）；蓝点（未读）无数据源不渲染 */}
-										{g.hasError && (
-											<span
-												data-group-error-indicator="true"
-												className="h-1.5 w-1.5 shrink-0 rounded-full bg-destructive"
-												title="该组内有发送失败/过期/被拒消息的会话"
-											/>
-										)}
-										<span className="shrink-0 rounded-full bg-tag px-1.5 text-ui-sm text-foreground-subtle">
-											{g.count}
-										</span>
-									</div>
-								</CollapsibleTrigger>
+										{g.label}
+									</button>
+
+									{/* 组内失败红点 */}
+									{g.hasError && (
+										<span
+											data-group-error-indicator="true"
+											className="h-1.5 w-1.5 shrink-0 rounded-full bg-destructive"
+											title="该组内有发送失败/过期/被拒消息的会话"
+										/>
+									)}
+
+									{/* 计数 Badge */}
+									<span className="shrink-0 rounded-full bg-tag px-1.5 text-ui-sm text-foreground-subtle">
+										{g.count}
+									</span>
+								</div>
 								<CollapsibleContent className="pl-0.5">
 									<ul className="space-y-0.5">
 										{/* 组内置顶行（scope master；L3 三件套 1/3）：永远可见，不受 3 个截断影响 */}

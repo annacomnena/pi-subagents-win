@@ -1119,6 +1119,28 @@ body {
 	font-size: 0.86em;
 	white-space: pre-wrap;
 }
+/* 2026-11-20：可点击的文件路径（由 Markdown 在传入 onOpenPath 时产出）。
+   button 复位浏览器默认外观，只保留 code 的视觉；虚线下划线提示可点，hover/focus 用 accent 文字色。 */
+button.md-inline-code {
+	display: inline;
+	margin: 0;
+	line-height: inherit;
+	color: inherit;
+	cursor: pointer;
+	text-decoration: underline dotted transparent;
+	text-underline-offset: 2px;
+	transition: color 120ms ease, border-color 120ms ease, text-decoration-color 120ms ease;
+}
+button.md-inline-code:hover,
+button.md-inline-code:focus-visible {
+	color: var(--color-accent-text);
+	border-color: var(--color-accent);
+	text-decoration-color: currentColor;
+}
+button.md-inline-code:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 1px;
+}
 .md-table-wrap { overflow-x: auto; margin: 0.5em 0; }
 .md-table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
 .md-th, .md-td { border: 1px solid var(--color-border); padding: 0.35em 0.7em; text-align: left; }

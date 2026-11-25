@@ -8,6 +8,7 @@
 
 import type {
 	AttentionResponse,
+	AutonomyDiagnosticsResponse,
 	CommandFrameInput,
 	CommandOutcomeBody,
 	EventsResponse,
@@ -24,6 +25,7 @@ import type {
 	TimelineResponse,
 	TranscriptBody,
 	SessionUsageBody,
+	SessionNoteResponse,
 	NotifyResponseBody,
 	UploadResult,
 	WechatBindStartBody,
@@ -31,6 +33,12 @@ import type {
 	WechatQrImageBody,
 	WechatToggleBody,
 	WechatUnbindBody,
+	WorkspaceOverviewResponse,
+	TokenStatsResult,
+	FilePreviewResult,
+	FileActionResult,
+	ShortcutsResponse,
+	ShortcutAction,
 } from "./types";
 import { sessionScopeParam } from "./runsScope";
 
@@ -137,6 +145,55 @@ export function newCommandKey(prefix: string): string {
 
 /** 6 端点封装 + 命令工厂。全部 never-throw。 */
 export const api = {
+	/**
+	 * 会话便签（旁路文本）：GET 走 ETag 缓存（304 ⇒ 同引用，稳态零重渲染），
+	 * POST 走 authorizeCommand 同链、带 expectedVersion 乐观锁；409 由面板自己处理。
+	 * ETag cache key 必须带 sid，否则切会话会命中上一个会话的数据。
+	 */
+	sessionNote: {
+		get: (sid: string): Promise<FetchResult<SessionNoteResponse>> => {
+			const key = `/v1/session-note?sessionId=${encodeURIComponent(sid)}`;
+			return fetchJson<SessionNoteResponse>(key, undefined, 5000, key);
+		},
+		save: (input: { sid: string; text: string; expectedVersion?: number }): Promise<FetchResult<SessionNoteResponse>> =>
+			postJson<SessionNoteResponse>("/v1/session-note", {
+				sessionId: input.sid,
+				text: input.text,
+				...(input.expectedVersion !== undefined ? { expectedVersion: input.expectedVersion } : {}),
+			}),
+	},
+
+	/**
+	 * 仓库专属快捷按钮（2026-11-20）。GET 只读不鉴权，带 cwd 作用域名；
+	 * POST 写沿用 authorizeCommand，用 contentHash 做乐观锁（冲突 409）。
+	 * 面板按 1s poll 调 get；切仓库时 cwd 变化 → 用不同 key，绝不串台。
+	 */
+	shortcuts: {
+		get: (cwd: string): Promise<FetchResult<ShortcutsResponse>> => {
+			const key = `/v1/gui/shortcuts?cwd=${encodeURIComponent(cwd)}`;
+			return fetchJson<ShortcutsResponse>(key, undefined, 5000, key);
+		},
+		save: (input: { cwd: string; expectedHash: string; action: ShortcutAction }): Promise<FetchResult<{ ok: boolean; config: ShortcutsResponse["config"]; contentHash: string }>> =>
+			postJson("/v1/gui/shortcuts", input),
+		remove: (input: { cwd: string; id: string; expectedHash: string }): Promise<FetchResult<{ ok: boolean; config: ShortcutsResponse["config"]; contentHash: string }>> =>
+			postJson("/v1/gui/shortcuts/delete", input),
+		decide: (input: { cwd: string; proposalId: string; decision: "approved" | "declined" }): Promise<FetchResult<{ ok: boolean; decision: unknown; injected?: boolean; injectReason?: string }>> =>
+			postJson("/v1/gui/shortcuts/proposal/decide", input),
+		hostApply: (input: { cwd: string; proposalId: string }): Promise<FetchResult<{ ok: boolean; config: ShortcutsResponse["config"]; contentHash: string; applied: boolean }>> =>
+			postJson("/v1/gui/shortcuts/host-apply", input),
+		/**
+		 * P3：运行 script/process 按钮。命令内容只从服务端配置取，客户端只传 cwd+id。
+		 *
+		 * ⚠️ 服务端是**同步执行**（runScript 等脚本结束才回，默认 120s、上限 600s），
+		 * 必须显式传 timeoutMs 覆盖默认 5s，否则编译类长脚本必然在客户端假超时、
+		 * 结果永远丢失（L4 复审新阻断）。超时给服务端上限再留 5s 余量。
+		 */
+		run: (input: { cwd: string; id: string; timeoutMs?: number }): Promise<FetchResult<{ ok: boolean; runId: string; status: string; exitCode: number | null; outputTail: string; error?: string; hint?: string }>> =>
+			postJson("/v1/gui/shortcuts/run", { cwd: input.cwd, id: input.id }, Math.min((input.timeoutMs ?? 120_000) + 5_000, 605_000)),
+		cancel: (runId: string): Promise<FetchResult<{ ok: boolean; error?: string; hint?: string }>> =>
+			postJson("/v1/gui/shortcuts/cancel", { runId }),
+	},
+
 	health: (): Promise<FetchResult<HealthView>> => fetchJson<HealthView>("/v1/health"),
 
 	snapshot: (): Promise<FetchResult<RuntimeSnapshot>> => fetchJson<RuntimeSnapshot>("/v1/snapshot", undefined, 8000, "/v1/snapshot"),
@@ -184,6 +241,23 @@ export const api = {
 
 	/** 2026-09-30 主动性设置页：GET /v1/autonomy/frontier（完整 FrontierSnapshot；快照缺失 → null）。 */
 	autonomyFrontier: (): Promise<FetchResult<FrontierSnapshot | null>> => fetchJson<FrontierSnapshot | null>("/v1/autonomy/frontier"),
+
+	/** 主动性诊断与监管工作状态表：GET /v1/autonomy/diagnostics */
+	autonomyDiagnostics: (): Promise<FetchResult<AutonomyDiagnosticsResponse>> => fetchJson<AutonomyDiagnosticsResponse>("/v1/autonomy/diagnostics"),
+
+	/** 2026-11-13 仓库主页工作台：GET /v1/workspace/overview?cwd= */
+	workspaceOverview: (cwd?: string): Promise<FetchResult<WorkspaceOverviewResponse>> =>
+		fetchJson<WorkspaceOverviewResponse>(`/v1/workspace/overview${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`),
+
+	/** 2026-11-20 右栏文档预览：读文本（512 KiB 上限；二进制/大文件返回 hint）。 */
+	fileRead: (path: string, cwd?: string | null): Promise<FetchResult<FilePreviewResult>> =>
+		postJson<FilePreviewResult>("/v1/files/read", { path, cwd: cwd ?? null }),
+	/** 用 OS 默认应用打开文件（daemon 侧 spawn，不经过浏览器协议）。 */
+	fileOpen: (path: string, cwd?: string | null): Promise<FetchResult<FileActionResult>> =>
+		postJson<FileActionResult>("/v1/files/open", { path, cwd: cwd ?? null }),
+	/** 在资源管理器中定位文件（Windows explorer /select,）。 */
+	fileReveal: (path: string, cwd?: string | null): Promise<FetchResult<FileActionResult>> =>
+		postJson<FileActionResult>("/v1/files/reveal", { path, cwd: cwd ?? null }),
 
 	/** limit 尾窗 + G5.2 before=（排他上界历史翻页；undefined/空串 = 不启用）。 */
 	timeline: (limit = 200, before?: string): Promise<FetchResult<TimelineResponse>> =>
@@ -425,6 +499,12 @@ export const api = {
 	/** POST /v1/wechat/enable（写 config channels.wechat.enabled=true；幂等；回执 = 当前 enabled）。 */
 	wechatEnable: (): Promise<FetchResult<WechatToggleBody>> =>
 		postJson<WechatToggleBody>("/v1/wechat/enable", {}),
+
+	/**
+	 * GET /v1/tokens/stats?days=<number>：一定时间段内的 Token 历史消耗统计与热力图数据
+	 */
+	tokenStats: (days = 30): Promise<FetchResult<TokenStatsResult>> =>
+		fetchJson<TokenStatsResult>(`/v1/tokens/stats?days=${encodeURIComponent(days)}`, undefined, 10000),
 
 	/** POST /v1/wechat/disable（写 false；幂等；回执 = 当前 enabled）。 */
 	wechatDisable: (): Promise<FetchResult<WechatToggleBody>> =>

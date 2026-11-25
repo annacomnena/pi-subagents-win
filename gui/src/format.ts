@@ -65,6 +65,10 @@ export function fmtTokens(v: number | null | undefined): string {
 		// 100k 以上不要小数（259.7k 反而更长）；以下保留一位并去掉 .0
 		return `${k >= 100 ? Math.round(k) : Math.round(k * 10) / 10}k`;
 	}
+	if (v >= 1_000_000_000) {
+		const b = v / 1_000_000_000;
+		return `${Math.round(b * 100) / 100}B`;
+	}
 	const m = v / 1_000_000;
 	return `${Math.round(m * 100) / 100}M`;
 }

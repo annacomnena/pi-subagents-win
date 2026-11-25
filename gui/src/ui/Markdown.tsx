@@ -21,6 +21,10 @@
  */
 
 import { useMemo, type ReactElement, type ReactNode } from "react";
+import { filePathInCode } from "../filePath";
+
+/** 内联 code 识别为文件路径后的回调（2026-11-20：右栏文档预览）。 */
+export type OpenPathHandler = (path: string) => void;
 
 // ── 行内解析（手扫：取最早出现的构造；未闭合 → 字面文本）─────────────────
 
@@ -77,7 +81,7 @@ function findClose(text: string, i: number, end: string): number {
 	return -1;
 }
 
-function renderInline(text: string, keyBase: string): ReactNode[] {
+function renderInline(text: string, keyBase: string, openPath?: OpenPathHandler): ReactNode[] {
 	const out: ReactNode[] = [];
 	let i = 0;
 	let k = 0;
@@ -90,7 +94,25 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 		if (c === "`") {
 			const close = findClose(text, i + 1, "`");
 			if (close > i) {
-				out.push(<code key={`${keyBase}c${k++}`} className="md-inline-code">{text.slice(i + 1, close)}</code>);
+				const raw = text.slice(i + 1, close);
+				const filePath = openPath !== undefined ? filePathInCode(raw) : null;
+				if (filePath !== null) {
+					// 可点路径：button 而非 <a href>（不走导航/协议白名单，只调回调）。
+					// 保留 md-inline-code 外观，额外加 md-path-link 供 hover/焦点提示。
+					out.push(
+						<button
+							key={`${keyBase}c${k++}`}
+							type="button"
+							className="md-inline-code md-path-link"
+							title={`在右侧栏预览：${filePath}`}
+							onClick={() => openPath?.(filePath)}
+						>
+							{raw}
+						</button>,
+					);
+				} else {
+					out.push(<code key={`${keyBase}c${k++}`} className="md-inline-code">{raw}</code>);
+				}
 				i = close + 1;
 				continue;
 			}
@@ -106,6 +128,7 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 					const key = `${keyBase}a${k++}`;
 					out.push(
 						<a key={key} href={link.url} target="_blank" rel="noopener noreferrer">
+							{/* 交互内容不得嵌套在 <a> 内：否则点路径会连带跳外链（L4 N1）。 */}
 							{renderInline(link.text, key)}
 						</a>,
 					);
@@ -125,7 +148,7 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 			const close = findClose(text, i + 2, c + c);
 			if (close > i) {
 				const key = `${keyBase}b${k++}`;
-				out.push(<strong key={key}>{renderInline(text.slice(i + 2, close), key)}</strong>);
+				out.push(<strong key={key}>{renderInline(text.slice(i + 2, close), key, openPath)}</strong>);
 				i = close + 2;
 				continue;
 			}
@@ -135,7 +158,7 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 			const close = findClose(text, i + 2, "~~");
 			if (close > i) {
 				const key = `${keyBase}d${k++}`;
-				out.push(<del key={key}>{renderInline(text.slice(i + 2, close), key)}</del>);
+				out.push(<del key={key}>{renderInline(text.slice(i + 2, close), key, openPath)}</del>);
 				i = close + 2;
 				continue;
 			}
@@ -145,7 +168,7 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 			const close = findClose(text, i + 1, c);
 			if (close > i + 1) {
 				const key = `${keyBase}e${k++}`;
-				out.push(<em key={key}>{renderInline(text.slice(i + 1, close), key)}</em>);
+				out.push(<em key={key}>{renderInline(text.slice(i + 1, close), key, openPath)}</em>);
 				i = close + 1;
 				continue;
 			}
@@ -185,16 +208,16 @@ function splitTableRow(line: string): string[] {
 	return t.split("|").map((s) => s.trim());
 }
 
-function renderParagraph(lines: string[], keyBase: string): ReactElement {
+function renderParagraph(lines: string[], keyBase: string, openPath?: OpenPathHandler): ReactElement {
 	const parts: ReactNode[] = [];
 	lines.forEach((ln, idx) => {
 		if (idx > 0) parts.push(<br key={`${keyBase}br${idx}`} />);
-		parts.push(...renderInline(ln, `${keyBase}p${idx}`));
+		parts.push(...renderInline(ln, `${keyBase}p${idx}`, openPath));
 	});
 	return <p key={keyBase} className="md-p">{parts}</p>;
 }
 
-function renderTable(header: string, bodyLines: string[], keyBase: string): ReactElement {
+function renderTable(header: string, bodyLines: string[], keyBase: string, openPath?: OpenPathHandler): ReactElement {
 	const headCells = splitTableRow(header);
 	const rows: string[][] = bodyLines.map(splitTableRow);
 	return (
@@ -204,7 +227,7 @@ function renderTable(header: string, bodyLines: string[], keyBase: string): Reac
 					<tr>
 						{headCells.map((c, i) => (
 							<th key={i} className="md-th">
-								{renderInline(c, `${keyBase}th${i}`)}
+								{renderInline(c, `${keyBase}th${i}`, openPath)}
 							</th>
 						))}
 					</tr>
@@ -214,7 +237,7 @@ function renderTable(header: string, bodyLines: string[], keyBase: string): Reac
 						<tr key={ri}>
 							{r.map((c, ci) => (
 								<td key={ci} className="md-td">
-									{renderInline(c, `${keyBase}td${ri}-${ci}`)}
+									{renderInline(c, `${keyBase}td${ri}-${ci}`, openPath)}
 								</td>
 							))}
 						</tr>
@@ -282,13 +305,13 @@ function parseListItems(lines: string[], start: number, baseIndent: number): { i
 	return { items, next: i };
 }
 
-function renderListItem(item: ListItem, keyBase: string): ReactNode {
+function renderListItem(item: ListItem, keyBase: string, openPath?: OpenPathHandler): ReactNode {
 	const content: ReactNode[] = [
 		<span key={`${keyBase}t`} className="md-li-text">
-			{renderInline(item.text, `${keyBase}t`)}
+			{renderInline(item.text, `${keyBase}t`, openPath)}
 		</span>,
 	];
-	if (item.children.length > 0) content.push(renderList(item.children, `${keyBase}sub`));
+	if (item.children.length > 0) content.push(renderList(item.children, `${keyBase}sub`, openPath));
 	return (
 		<li key={keyBase} className="md-li">
 			{content}
@@ -297,16 +320,16 @@ function renderListItem(item: ListItem, keyBase: string): ReactNode {
 }
 
 /** 列表（类型由首 item 决定：嵌套子列表各自保型）。 */
-function renderList(items: ListItem[], keyBase: string): ReactElement {
-	const body = items.map((it, i) => renderListItem(it, `${keyBase}i${i}`));
+function renderList(items: ListItem[], keyBase: string, openPath?: OpenPathHandler): ReactElement {
+	const body = items.map((it, i) => renderListItem(it, `${keyBase}i${i}`, openPath));
 	const ordered = items[0]?.ordered === true;
 	if (ordered) return <ol key={keyBase} className="md-ol">{body}</ol>;
 	return <ul key={keyBase} className="md-ul">{body}</ul>;
 }
 
 /** 标题（1-6 级显式分支；# 后无内容 = 标题，空内容 = 空标题）。 */
-function renderHeading(level: number, text: string, key: string): ReactElement {
-	const content = renderInline(text, key);
+function renderHeading(level: number, text: string, key: string, openPath?: OpenPathHandler): ReactElement {
+	const content = renderInline(text, key, openPath);
 	switch (level) {
 		case 1:
 			return <h1 key={key} className="md-h1">{content}</h1>;
@@ -324,7 +347,7 @@ function renderHeading(level: number, text: string, key: string): ReactElement {
 }
 
 /** 块级入口：按行扫描（代码块/表格/列表/引用为整体消费，段落按空行切分）。 */
-export function renderBlocks(src: string): ReactNode[] {
+export function renderBlocks(src: string, openPath?: OpenPathHandler): ReactNode[] {
 	const lines: string[] = src.replace(/\r\n?/g, "\n").split("\n");
 	const out: ReactNode[] = [];
 	let i = 0;
@@ -332,7 +355,7 @@ export function renderBlocks(src: string): ReactNode[] {
 	let para: string[] = [];
 	const flushPara = (): void => {
 		if (para.length === 0) return;
-		out.push(renderParagraph(para, `p${kb++}`));
+		out.push(renderParagraph(para, `p${kb++}`, openPath));
 		para = [];
 	};
 	while (i < lines.length) {
@@ -369,7 +392,7 @@ export function renderBlocks(src: string): ReactNode[] {
 		if (h !== null) {
 			flushPara();
 			const key = `h${kb++}`;
-			out.push(renderHeading(h[1].length, h[2], key));
+			out.push(renderHeading(h[1].length, h[2], key, openPath));
 			i += 1;
 			continue;
 		}
@@ -390,7 +413,7 @@ export function renderBlocks(src: string): ReactNode[] {
 				body.push(lines[i]);
 				i += 1;
 			}
-			out.push(renderTable(header, body, `t${kb++}`));
+			out.push(renderTable(header, body, `t${kb++}`, openPath));
 			continue;
 		}
 		// 引用（连续 > 行，内部递归块解析；支持 >> 嵌套）
@@ -405,7 +428,7 @@ export function renderBlocks(src: string): ReactNode[] {
 			}
 			out.push(
 				<blockquote key={`q${kb++}`} className="md-quote">
-					{renderBlocks(buf.join("\n"))}
+					{renderBlocks(buf.join("\n"), openPath)}
 				</blockquote>,
 			);
 			continue;
@@ -415,7 +438,7 @@ export function renderBlocks(src: string): ReactNode[] {
 		if (lm !== null) {
 			flushPara();
 			const { items, next } = parseListItems(lines, i, lm[1].length);
-			out.push(renderList(items, `l${kb++}`));
+			out.push(renderList(items, `l${kb++}`, openPath));
 			i = next;
 			continue;
 		}
@@ -429,8 +452,9 @@ export function renderBlocks(src: string): ReactNode[] {
 
 // ── 组件 ─────────────────────────────────────────────────────────
 
-/** assistant/reasoning 正文 markdown 渲染（0923 2003：替换 whitespace-pre-wrap 纯文本）。 */
-export function Markdown({ text }: { text: string }): ReactElement {
-	const blocks = useMemo(() => renderBlocks(text), [text]);
+/** assistant/reasoning 正文 markdown 渲染（0923 2003：替换 whitespace-pre-wrap 纯文本）。
+ *  2026-11-20：可选 onOpenPath —— 传入后，形如 `plans/xxx/report.md` 的内联 code 变成可点按钮。 */
+export function Markdown({ text, onOpenPath }: { text: string; onOpenPath?: OpenPathHandler }): ReactElement {
+	const blocks = useMemo(() => renderBlocks(text, onOpenPath), [text, onOpenPath]);
 	return <div className="md-prose">{blocks}</div>;
 }

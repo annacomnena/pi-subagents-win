@@ -31,14 +31,16 @@ import type {
 	StreamingSnapshot,
 	TranscriptHead,
 	TranscriptRow,
+	TokenStatsResult,
 } from "./api/types";
 import type { StreamServerFrame, StreamState } from "./useEventStream";
 import { toast } from "./ui/toast";
-import { PANEL_DISPATCHED, railOpenDefault } from "./rightRail/railState";
+import { PANEL_DISPATCHED, PANEL_DOC, railOpenDefault } from "./rightRail/railState";
 
-/** 主视图 Tab（会话为主重构 S4 收窄）：chat=永久默认主视图；timeline=次级全页（排障刚需）。
+/** 主视图 Tab（会话为主重构 S4 收窄）：chat=永久默认主视图；timeline=次级全页（排障刚需）；
+ *  workspace=仓库主页工作台（以项目为一等实体的聚合驾驶舱）。
  *  原 master/workstream/attention/runtime 四状态页收进「运行时」全屏覆盖层（runtimeOverlay）。 */
-export type TabId = "chat" | "timeline";
+export type TabId = "chat" | "timeline" | "workspace" | "tokens";
 
 /** 「运行时」全屏覆盖层（仿 zcode WorkspaceSettingsLayer absolute inset-0；0923 2003 遮挡修复后
  *  根层叠 z-30，见 RuntimeOverlay.tsx 头注）：
@@ -138,6 +140,9 @@ interface GuiState {
 	// UI
 	activeTab: TabId;
 	setActiveTab: (t: TabId) => void;
+	/** 当前选中的仓库主页 cwd（null 表示未选中任何仓库主页） */
+	activeWorkspaceCwd: string | null;
+	setActiveWorkspace: (cwd: string) => void;
 	/** 左栏折叠（ZCode 1:1 第 3 步）：折叠 = 宽度动画到 0 + opacity-0 + pointer-events-none。 */
 	sidebarCollapsed: boolean;
 	setSidebarCollapsed: (v: boolean) => void;
@@ -152,6 +157,16 @@ interface GuiState {
 	/** 右栏当前面板 id（`rightRail/panels.ts::RAIL_PANELS` 的 `id`；未知 id 由壳回落第一个）。 */
 	railPanel: string;
 	setRailPanel: (id: string) => void;
+	/**
+	 * 右栏文档预览（2026-11-20）：点击 assistant 回复里的文件路径后填入。
+	 * `docPreviewCwd` 是点选时**当场**从活动会话/工作区解析出的 cwd（相对路径的基准），
+	 * 之后切会话不跟着变——预览的是当时那条消息指向的文件。
+	 */
+	docPreviewPath: string | null;
+	docPreviewCwd: string | null;
+	/** cwdHint 用于从预览文档里再点相对路径（以当前文件所在目录为基准）。 */
+	openDocPreview: (path: string, cwdHint?: string | null) => void;
+	closeDocPreview: () => void;
 	runtimeOverlay: RuntimeOverlaySection | null;
 	setRuntimeOverlay: (s: RuntimeOverlaySection | null) => void;
 
@@ -159,6 +174,8 @@ interface GuiState {
 	connection: ConnState;
 	/** 最近一次任一端点成功响应时刻（「数据 as-of」横幅）。 */
 	lastAsOf: string | null;
+	/** 连续失败计数：markUp 清零，markDown +1。横幅去抖用（单次失败不打扰）。 */
+	downStreak: number;
 	markUp: (at: string) => void;
 	/** 置 down；at 仅存档不写入 lastAsOf（失败时刻 ≠ 数据新鲜度）。 */
 	markDown: (_at: string) => void;
@@ -198,6 +215,13 @@ interface GuiState {
 	pollTimeline: () => Promise<void>;
 	/** G5.2：before= 历史翻页（加载更早；幂等可重按，end 后 no-op）。 */
 	loadEarlierTimeline: () => Promise<void>;
+
+	// ── Token 消耗统计与热力图 ──
+	tokenStats: TokenStatsResult | null;
+	tokenStatsLoading: boolean;
+	tokenStatsDays: number;
+	fetchTokenStats: (days?: number) => Promise<void>;
+	setTokenStatsDays: (days: number) => void;
 
 	// ── G6-P1 会话页（chat slice，第 6 页；既有五页轮询零改动）──
 	chatSessions: SessionSummary[];
@@ -401,6 +425,8 @@ function initialRailOpen(): boolean {
 export const useGui = create<GuiState>((set, get) => ({
 	activeTab: "chat",
 	setActiveTab: (t) => set({ activeTab: t }),
+	activeWorkspaceCwd: null,
+	setActiveWorkspace: (cwd) => set({ activeWorkspaceCwd: cwd, activeTab: "workspace" }),
 	sidebarCollapsed: false,
 	setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
 	// 右栏（P1B）：展开态按挂载时视口求值；面板 id 用常量而不是字符串字面量（避免两处漂移）。
@@ -408,13 +434,28 @@ export const useGui = create<GuiState>((set, get) => ({
 	setRailOpen: (v) => set({ railOpen: v }),
 	railPanel: PANEL_DISPATCHED,
 	setRailPanel: (id) => set({ railPanel: id }),
+	// 文档预览：初值 null（空态引导文案）；cwd 在点选时解析一次，之后不随会话切换漂移。
+	docPreviewPath: null,
+	docPreviewCwd: null,
+	openDocPreview: (path, cwdHint) => {
+		const s = get();
+		const sessionCwd = s.chatSessions.find((x) => x.sessionId === s.chatActiveId)?.cwd ?? null;
+		set({
+			docPreviewPath: path,
+			docPreviewCwd: cwdHint ?? sessionCwd ?? s.activeWorkspaceCwd ?? null,
+			railPanel: PANEL_DOC,
+			railOpen: true,
+		});
+	},
+	closeDocPreview: () => set({ docPreviewPath: null, docPreviewCwd: null }),
 	runtimeOverlay: null,
 	setRuntimeOverlay: (s) => set({ runtimeOverlay: s }),
 
 	connection: "down",
 	lastAsOf: null,
-	markUp: (at) => set({ connection: "up", lastAsOf: at }),
-	markDown: (_at) => set({ connection: "down" }),
+	downStreak: 0,
+	markUp: (at) => set({ connection: "up", lastAsOf: at, downStreak: 0 }),
+	markDown: (_at) => set((s) => ({ connection: "down", downStreak: s.downStreak + 1 })),
 
 	health: null,
 	snapshot: null,
@@ -561,6 +602,26 @@ export const useGui = create<GuiState>((set, get) => ({
 		});
 		get().markUp(r.at);
 	},
+
+	// ── Token 统计与热力图 ──
+	tokenStats: null,
+	tokenStatsLoading: false,
+	tokenStatsDays: 30,
+	setTokenStatsDays: (days: number) => {
+		set({ tokenStatsDays: days });
+		get().fetchTokenStats(days);
+	},
+	fetchTokenStats: async (days) => {
+		const targetDays = days ?? get().tokenStatsDays;
+		set({ tokenStatsLoading: true });
+		const r = await api.tokenStats(targetDays);
+		if (r.ok) {
+			set({ tokenStats: r.data, tokenStatsLoading: false });
+		} else {
+			set({ tokenStatsLoading: false });
+		}
+	},
+
 	// ── G6-P1 会话页实现 ────────────────────────────────────────
 
 	chatSessions: [],
@@ -1036,7 +1097,7 @@ export const useGui = create<GuiState>((set, get) => ({
 	},
 
 	openChatSession: async (id) => {
-		set({ chatActiveId: id });
+		set({ chatActiveId: id, activeTab: "chat" });
 		await get().reloadChatSession(id);
 		// 用量与 transcript 同源，同频拉一次（不单独轮询）
 		void get().refreshChatUsage(id);

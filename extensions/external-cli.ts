@@ -16,12 +16,16 @@
  *
  * Spawns the local CLI harness instead of pi --mode json.
  * Windows-aware: resolves .exe/.cmd, process-group kill only on non-Windows.
+ *
+ * ⚠ Windows 入口解析已抽到 `external-cli-resolve.ts`（2026-11-16）。原因见该文件头注释：
+ *   PATH 上的 npm 全局包只有 `.cmd` shim ⇒ 旧实现必须 `shell:true` ⇒ 参数经 cmd.exe 被重解析
+ *   （真换行→字面 `\n`、反斜杠翻倍、**`%VAR%` 被展开成整条 PATH**），且 nvm 切版本后回落裸名静默 ENOENT。
+ *   现改为「解析到真实入口 + shell:false」，参数逐字节无损。
  */
 
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { resolveExternalSpawnTarget, resolveSpawnShell, type ExternalSpawnTarget } from "./external-cli-resolve.ts";
 
 // ── public types (kept compatible with index.ts SubagentResult) ────────────
 
@@ -162,80 +166,35 @@ export function listExternalCliModelOptions(): Array<{ ref: string; label: strin
 export function detectAvailableBackends(): Record<ExternalBackend, boolean> {
 	const out = { claude: false, codex: false, agy: false, atomcode: false, zcode: false, mimo: false } as Record<ExternalBackend, boolean>;
 	for (const b of EXTERNAL_BACKENDS) {
-		out[b] = Boolean(resolveExternalCommand(b));
+		out[b] = Boolean(resolveSpawnTargetCached(b));
 	}
 	return out;
 }
 
 // ── command resolution (Windows-aware) ─────────────────────────────────────
 
-const commandCache = new Map<ExternalBackend, string | undefined>();
+/** 解析结果缓存：命中/未命中都缓存；`clearExternalCliCache()` 统一失效（gc-cleaner 周期性调用）。 */
+const spawnTargetCache = new Map<ExternalBackend, ExternalSpawnTarget | { error: string }>();
 
 export function clearExternalCliCache(): void {
-	commandCache.clear();
+	spawnTargetCache.clear();
 	winInetCache.clear();
 }
 
-function resolveExternalCommand(backend: ExternalBackend): string | undefined {
-	if (commandCache.has(backend)) return commandCache.get(backend);
-	// Special case: zcode is a Node.js script (zcode.cjs), not a standalone
-	// executable — run it through node. The script's absolute path is appended
-	// by buildZcodeArgs/runZcode.
-	if (backend === "zcode") {
-		commandCache.set(backend, "node");
-		return "node";
-	}
-	if (backend === "mimo") {
-		// MimoCode's Windows installer keeps its executable outside PATH by
-		// default. Allow an explicit override, then probe the local install
-		// location before falling back to normal PATH resolution.
-		const configured = process.env.MIMOCODE_BIN?.trim();
-		if (configured && existsSync(configured)) {
-			commandCache.set(backend, configured);
-			return configured;
-		}
-		const localInstall = process.env.USERPROFILE
-			? join(process.env.USERPROFILE, ".mimocode", "bin", "mimo.exe")
-			: undefined;
-		if (localInstall && existsSync(localInstall)) {
-			commandCache.set(backend, localInstall);
-			return localInstall;
-		}
-	}
-
-	const candidates =
-		backend === "mimo"
-			? process.platform === "win32" ? ["mimo.exe", "mimo.cmd", "mimo"] : ["mimo"]
-			: process.platform === "win32"
-			? backend === "claude"
-				? [`${backend}.exe`, backend]
-				: [`${backend}.cmd`, `${backend}.exe`, backend]
-			: [backend];
-
-	for (const name of candidates) {
-		try {
-			const found = execFileSync(process.platform === "win32" ? "where" : "which", [name], {
-				encoding: "utf8",
-				shell: process.platform === "win32",
-			})
-				.split(/\r?\n/)
-				.map((s) => s.trim())
-				.find((s) => s && existsSync(s));
-			if (found) {
-				commandCache.set(backend, found);
-				return found;
-			}
-		} catch {
-			/* try next */
-		}
-	}
-	// PATH lookup failed — still return bare name so spawn error is clear
-	commandCache.set(backend, undefined);
-	return undefined;
+/** 带缓存的目标解析（成功与失败都缓存；失败保留可操作的 error 文本）。 */
+export function resolveSpawnTargetCached(backend: ExternalBackend): ExternalSpawnTarget | { error: string } {
+	const cached = spawnTargetCache.get(backend);
+	if (cached) return cached;
+	const resolved = resolveExternalSpawnTarget(backend);
+	const value = resolved.ok ? resolved.target : { error: resolved.error };
+	spawnTargetCache.set(backend, value);
+	return value;
 }
 
-function commandForSpawn(backend: ExternalBackend): string {
-	return resolveExternalCommand(backend) ?? backend;
+/** 后端是否已解析到「不经 shell 的真实入口」。 */
+export function isBackendResolved(backend: ExternalBackend): boolean {
+	const target = resolveSpawnTargetCached(backend);
+	return "command" in target;
 }
 
 // ── proxy environment ──────────────────────────────────────────────────────
@@ -696,17 +655,17 @@ async function runZcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const promptParts = [ctx.systemPrompt, ctx.task].filter(Boolean);
 	const taskPrompt = promptParts.join("\n\n");
 
-	// Command: node "D:\Software\zcode\resources\glm\zcode.cjs" -p "<prompt>" --cwd "<cwd>"
-	// ctx.command is "node" (resolveExternalCommand special case), so args must
-	// carry the zcode.cjs script path.
-	const zcodeScript = "D:\\Software\\zcode\\resources\\glm\\zcode.cjs";
-	const args = [zcodeScript, ...buildZcodeArgs(taskPrompt), "--cwd", ctx.cwd];
+	// 入口由 `external-cli-resolve` 解析（zcode 是本机 Node 脚本，固定 GLM-5.3）：
+	//   shell:false + `node <zcode.cjs> -p <prompt> --cwd <cwd>`（prompt 逐字节无损）。
+	const args = [...ctx.target.prefixArgs, ...buildZcodeArgs(taskPrompt), "--cwd", ctx.cwd];
 
 	const outcome = await spawnStreaming({
 		backend: "zcode",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
+		command: ctx.target.command,
 		args,
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs ?? 600000, // default 10 minutes
 		maxWallMs: ctx.maxWallMs,
@@ -772,8 +731,10 @@ async function runMimo(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const outcome = await spawnStreaming({
 		backend: "mimo",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
-		args: buildMimoArgs(taskPrompt, ctx.cwd),
+		command: ctx.target.command,
+		args: [...ctx.target.prefixArgs, ...buildMimoArgs(taskPrompt, ctx.cwd)],
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
 		maxWallMs: ctx.maxWallMs,
@@ -805,6 +766,17 @@ export interface StreamRunOptions {
 	backend: ExternalBackend;
 	command: string;
 	args: string[];
+	/**
+	 * spawn 的 shell 开关（缺省时按历史行为推导：Windows 上 `.cmd`/`.bat` ⇒ true）。
+	 *
+	 * ⚠ 生产路径**总是显式传** `shell:false`：入口已在 `external-cli-resolve.ts` 解析成
+	 * 真实 exe / `node <js>`，走 `shell:true` 会让 cmd.exe 重解析参数
+	 * （真换行→字面 `\n`、反斜杠翻倍、`%VAR%` 被展开）。旧行为只为「绕过 Node 对
+	 * `.cmd` + shell:false 的 EINVAL 拒绝」而存在，已不再是正常入口。
+	 */
+	shell?: boolean;
+	/** action=kill 的归属 marker（必须真的出现在子进程命令行）。缺省取 `command`。 */
+	marker?: string;
 	/** If set, written to stdin then closed. */
 	stdinText?: string;
 	cwd: string;
@@ -842,18 +814,21 @@ export interface StreamRunOutcome {
 export function spawnStreaming(opts: StreamRunOptions): Promise<StreamRunOutcome> {
 	return new Promise((resolve) => {
 		const isWin = process.platform === "win32";
+		const shell = resolveSpawnShell(opts.command, opts.shell, process.platform);
+		const marker = (opts.marker ?? opts.command).trim() || opts.command;
 		const child = spawn(opts.command, opts.args, {
 			cwd: opts.cwd,
 			env: buildExternalCliEnv(),
 			stdio: opts.stdinText !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
-			// shell needed on Windows for .cmd wrappers (codex)
-			shell: isWin && opts.command.toLowerCase().endsWith(".cmd"),
+			// Windows 上 `.cmd`/`.bat` 只能经 shell 启动（Node ≥18.20.2 对 .cmd + shell:false 直接 EINVAL）。
+			// 生产路径不会走到这里：入口已被解析成真实 exe / `node <js>` ⇒ shell:false。
+			shell,
 			detached: !isWin,
 			windowsHide: true,
 		});
 		// 直接 kill 支持：登记外部 CLI 子进程 pid + 命令 marker（供 action=kill 校验）。
 		if (child.pid && opts.onChildSpawn) {
-			try { opts.onChildSpawn({ pid: child.pid, marker: opts.command }); } catch { /* 登记失败不阻塞派发 */ }
+			try { opts.onChildSpawn({ pid: child.pid, marker }); } catch { /* 登记失败不阻塞派发 */ }
 		}
 
 		const stderrBuffer = createBoundedBuffer(MAX_STDERR_CHARS);
@@ -1052,30 +1027,41 @@ export async function runExternalCli(params: RunExternalCliParams): Promise<Exte
 	base.requestedModel = parsed.canonical;
 	base.model = parsed.canonical;
 	const cwd = params.cwd ?? process.cwd();
-	const command = commandForSpawn(backend);
 	params.onUpdate?.(`🤖 ${parsed.canonical}`, "starting...");
 
+	// 入口解析失败（未安装 / shim 不可解析 / override 指向不存在）⇒ **结构化失败**。
+	// 绝不回落裸名 spawn：那会变成一条与「没装 CLI」难以区分的 ENOENT，且掩盖真实原因。
+	const resolved = resolveSpawnTargetCached(backend);
+	if (!("command" in resolved)) {
+		base.status = "failed";
+		base.error = resolved.error;
+		return base;
+	}
+	const target = resolved;
+	params.onUpdate?.(`🤖 ${parsed.canonical}`, `entry: ${target.command}${target.prefixArgs.length ? ` ${target.prefixArgs.join(" ")}` : ""} (${target.kind}, shell:${target.shell})`);
+
 	if (backend === "claude") {
-		return runClaude({ ...params, backend, command, cwd, runId, base });
+		return runClaude({ ...params, backend, target, cwd, runId, base });
 	}
 	if (backend === "codex") {
-		return runCodex({ ...params, backend, command, cwd, runId, base });
+		return runCodex({ ...params, backend, target, cwd, runId, base });
 	}
 	if (backend === "agy") {
-		return runAgy({ ...params, backend, command, cwd, runId, base });
+		return runAgy({ ...params, backend, target, cwd, runId, base });
 	}
 	if (backend === "zcode") {
-		return runZcode({ ...params, backend, command, cwd, runId, base });
+		return runZcode({ ...params, backend, target, cwd, runId, base });
 	}
 	if (backend === "mimo") {
-		return runMimo({ ...params, backend, command, cwd, runId, base });
+		return runMimo({ ...params, backend, target, cwd, runId, base });
 	}
-	return runAtomcode({ ...params, backend, command, cwd, runId, base });
+	return runAtomcode({ ...params, backend, target, cwd, runId, base });
 }
 
 interface BackendRunCtx extends RunExternalCliParams {
 	backend: ExternalBackend;
-	command: string;
+	/** 已解析的真实 spawn 目标（command + prefixArgs + shell:false + marker）。 */
+	target: ExternalSpawnTarget;
 	cwd: string;
 	runId: string;
 	base: ExternalSubagentResult;
@@ -1112,8 +1098,10 @@ async function runClaude(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const outcome = await spawnStreaming({
 		backend: "claude",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
-		args,
+		command: ctx.target.command,
+		args: [...ctx.target.prefixArgs, ...args],
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		stdinText: ctx.task,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
@@ -1157,8 +1145,10 @@ async function runCodex(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const outcome = await spawnStreaming({
 		backend: "codex",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
-		args,
+		command: ctx.target.command,
+		args: [...ctx.target.prefixArgs, ...args],
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		stdinText: ctx.task,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
@@ -1206,8 +1196,10 @@ async function runAgy(ctx: BackendRunCtx): Promise<ExternalSubagentResult> {
 	const outcome = await spawnStreaming({
 		backend: "agy",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
-		args,
+		command: ctx.target.command,
+		args: [...ctx.target.prefixArgs, ...args],
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
 		maxWallMs: ctx.maxWallMs,
@@ -1239,8 +1231,10 @@ async function runAtomcode(ctx: BackendRunCtx): Promise<ExternalSubagentResult> 
 	const outcome = await spawnStreaming({
 		backend: "atomcode",
 		onChildSpawn: ctx.onChildSpawn,
-		command: ctx.command,
-		args: buildAtomcodeArgs(taskPrompt),
+		command: ctx.target.command,
+		args: [...ctx.target.prefixArgs, ...buildAtomcodeArgs(taskPrompt)],
+		shell: ctx.target.shell,
+		marker: ctx.target.marker,
 		cwd: ctx.cwd,
 		timeoutMs: ctx.timeoutMs,
 		maxWallMs: ctx.maxWallMs,

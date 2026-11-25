@@ -17,7 +17,7 @@ export const STORAGE_KEY = "saw-ws-sort";
 export const DEFAULT_SORT_BY: SessionSortBy = "updated";
 
 function isSessionSortBy(value: unknown): value is SessionSortBy {
-	return value === "updated" || value === "created";
+	return value === "updated" || value === "created" || value === "active";
 }
 
 /** 读取组内排序维度；无数据/坏 JSON/非合法值 → 默认 updated（不抛）。 */

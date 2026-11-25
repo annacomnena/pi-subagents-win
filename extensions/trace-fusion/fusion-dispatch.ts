@@ -28,8 +28,9 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
-import { buildPiArgv } from "../runner-argv.ts";
+import { buildPiArgv, toolsSupportedForBackend } from "../runner-argv.ts";
 import { recordLink } from "../links.ts";
+import { recordUsage, type RecordableUsageResult } from "../usage-ledger.ts";
 // 账本落点必须与 async subagent 同源（2026-11-04 实测缺陷：此前用 APPDATA 拼路径，
 // 在本机是 C:\Users\<u>\AppData\Roaming\pi\agent\subagent-runs，与真实的 ~/.pi/agent/subagent-runs
 // 是两个互不相关的目录 ⇒ run_fuse*.json 成孤岛，registerAsyncResultWatcher 永远监听不到，
@@ -156,6 +157,8 @@ export interface FusionDispatchInput {
 	registerRunProcess?: (runsDir: string, runId: string, info: { pid: number; marker: string }) => void;
 	clearRunProcess?: (runId: string) => void;
 	notifyCompletion?: (rec: { id: string; agent?: string; task?: string; status: "completed" | "failed"; startedAt: string; result?: { error?: string } }) => void;
+	/** 用量账本记录 seam（2026-11-13）。缺省调 usage-ledger 的 recordUsage。 */
+	recordUsage?: (agent: string | undefined, result: RecordableUsageResult) => void;
 	runsDir?: string;
 	linksPath?: string;
 	now?: () => number;
@@ -515,6 +518,12 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		repoRoot: input.repoRoot,
 		repair: input.repair,
 	});
+	const fusionTools = ["read", "write", "bash"];
+	// fusion 这条路径的 fusionTools 是**调用方显式策略**（不是角色 frontmatter）⇒ 作为第三个参数传入，
+	// 才能让 cli:* 仍然是拒的（角色声明豁免不适用于它）。
+	if (!toolsSupportedForBackend(input.fusionModel, fusionTools, fusionTools)) {
+		return { status: "spawn-error", reason: `--tools allowlist is not supported for external CLI backend "${input.fusionModel}" in fusion runner`, zeroModelCall: false, reportPath: outputPath };
+	}
 	const argv = buildPiArgv({
 		cliPath: input.piCli,
 		model: input.fusionModel,
@@ -522,6 +531,7 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 		// 导致它与 makeSubagentFusionRunner 的系统提示不一致）。未传 ⇒ 旧行为不变。
 		...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
 		task: prompt,
+		tools: fusionTools,
 		excludeTools: FUSION_EXCLUDE_TOOLS,
 	});
 	// 融合者标记（2026-11-03 首跑实测）：它被排除了 write/edit，于是用 bash 自己写报告，
@@ -749,6 +759,39 @@ export async function dispatchFusion(input: FusionDispatchInput): Promise<Fusion
 			});
 		} catch { /* 通知尽力 */ }
 	}
+	// S1 / 用量闭环（2026-11-13）：融合用量必须入当日账本（消灭 100% 漏记漏洞）
+	if (usage && (usage.input > 0 || usage.output > 0 || usage.cacheRead > 0 || usage.cost > 0)) {
+		const recordFn = input.recordUsage ?? recordUsage;
+		try {
+			recordFn("fusion", {
+				runId: fusionRunId,
+				requestedModel: input.fusionModel,
+				model: input.fusionModel,
+				usage: {
+					input: usage.input,
+					output: usage.output,
+					cacheRead: usage.cacheRead,
+					cacheWrite: usage.cacheWrite,
+					cost: usage.cost,
+					turns: usage.turns,
+				},
+				usageEvents: [{
+					id: `${fusionRunId}:0`,
+					runId: fusionRunId,
+					ts: finishedAt,
+					model: input.fusionModel,
+					usage: {
+						input: usage.input,
+						output: usage.output,
+						cacheRead: usage.cacheRead,
+						cacheWrite: usage.cacheWrite,
+						cost: usage.cost,
+						turns: usage.turns,
+					},
+				}],
+			});
+		} catch { /* 用量记录尽力 */ }
+	}
 	return {
 		status,
 		reason,
@@ -787,6 +830,7 @@ export async function runFusionStep(opts: {
 	registerRunProcess?: FusionDispatchInput["registerRunProcess"];
 	clearRunProcess?: FusionDispatchInput["clearRunProcess"];
 	notifyCompletion?: FusionDispatchInput["notifyCompletion"];
+	recordUsage?: FusionDispatchInput["recordUsage"];
 }): Promise<FusionDispatchResult> {
 	const dispatch = opts.dispatch ?? dispatchFusion;
 	let res: FusionDispatchResult;
@@ -808,6 +852,7 @@ export async function runFusionStep(opts: {
 			registerRunProcess: opts.registerRunProcess,
 			clearRunProcess: opts.clearRunProcess,
 			notifyCompletion: opts.notifyCompletion,
+			recordUsage: opts.recordUsage,
 		});
 	} catch (err) {
 		res = { status: "spawn-error", reason: `融合步骤异常：${(err as Error).message}`, zeroModelCall: false };
@@ -852,6 +897,7 @@ export async function runFusionStep(opts: {
 				registerRunProcess: opts.registerRunProcess,
 				clearRunProcess: opts.clearRunProcess,
 				notifyCompletion: opts.notifyCompletion,
+				recordUsage: opts.recordUsage,
 				// 幂等门：主模型那次**已经写过 fusion.claim**（在任何 spawn 之前就写了），
 				// 所以 fallback 这一轮必然撞 claim 门 ⇒ 必须带 `repair` 才能绕过
 				// （`repair` 在 dispatchFusion 里是「跳过 claim 检查」的既有语义）。

@@ -15,8 +15,8 @@ import type { SessionSummary } from "./api/types";
 /** null cwd 的组键（未分组，恒垫底）。 */
 export const UNGROUPED_KEY = "__ungrouped__";
 
-/** 组内排序维度：updated = mtimeMs 降序（默认）；created = startedAt 降序。 */
-export type SessionSortBy = "updated" | "created";
+/** 组内排序/筛选维度：updated = mtimeMs 降序（默认）；active = 仅活跃中；created = startedAt 降序（兼容）。 */
+export type SessionSortBy = "updated" | "created" | "active";
 
 /** cwd → 分组键：反斜杠→正斜杠、Windows（含 UNC）全路径小写、去尾斜杠；null/空 → UNGROUPED_KEY。 */
 export function normalizeCwdKey(cwd: string | null): string {
