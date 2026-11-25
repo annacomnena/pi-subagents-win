@@ -17,6 +17,11 @@ source_paths:
 
 ## 页面导航
 
+### 开发（Development）
+
+- [[实施门]] — **强制约束**：A4/A5/A6/A7 的前置条件与当前 BLOCKED 状态（`status: current`）
+- [[当前路线]] — S0.1 约束入库 → S0.2 运行可观测性 → S0.3 Frontier 归属 → S1 状态捕捉 …（`status: current`）
+
 ### 决策（Decisions）
 
 - [[审批门策略]] — D1–D4、D11–D13（`status: proposed`，未实现）

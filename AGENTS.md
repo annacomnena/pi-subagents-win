@@ -13,6 +13,32 @@
 
 ---
 
+## 0.5 实施门：动自主能力前必须先读（2026-11-25 新增）
+
+**实现或修改任何涉及 Global Master 自主行为的功能之前，必须先读：**
+
+1. `Wiki/Development/Implementation-Gates.md`（**强制门**：前置条件 + 当前 BLOCKED 状态）
+2. `Wiki/Development/Current-Roadmap.md`（**当前实施顺序**：S0.1 → S0.2 → S0.3 → S1 …）
+
+**A4 / A5 / A6 / A7 当前全部 BLOCKED。** 禁止在前置未通过验收时：
+
+- 接通生产环境 Global Autonomous Turn 调度；
+- 扩展未经批准的自主行动执行路径；
+- 绕过宿主归属、身份验证或审批门。
+
+**允许**：隔离只读实验（`isolated-replay`）、测试夹具（`test-fixture`）、决策回放（`decision-replay`）。
+
+**`plans/` 里的文件都是非权威草稿**。**任何正式约束不得仅存在于 `plans/`** ——
+`plans/` 被 `.gitignore` 忽略（实测入库只有 6 个历史文件），写在里面等于只对本机成立。
+
+**校验**：`npm run check:dev-contracts`（检查门定义合法、文档引用的仓库内路径存在、
+`Wiki/Development/` 页面确实被 `Wiki/_index.md` 导航 —— 防「写进去了但没人读」）。
+
+> 为什么这条与 §0「证据优先」并列：一个约束如果 clone 后读不到，就等于不存在；
+> 而一个功能如果分不清「没行动」与「链路没工作」，就无法验收。
+
+---
+
 ## 1. 配置文件：**禁止整文件重写**（R-1，2026-10-17 事故）
 
 ### 事故

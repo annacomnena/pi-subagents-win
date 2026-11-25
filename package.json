@@ -237,6 +237,7 @@
     "test:resident-lms-needsuser": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_resident_lms_needsuser.ts",
     "test:runtime-autonomy": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_runtime_autonomy.ts",
     "test:runtime-graph": "node --experimental-strip-types ./extensions/_test_runtime_graph.ts",
+    "check:dev-contracts": "node ./scripts/check-development-contracts.mjs",
     "test:runtime-host-restart": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_runtime_host_restart.ts",
     "test:status-isolation": "node --experimental-strip-types ./extensions/_test_status_isolation.ts",
     "test:steer-takeover-worker": "node --experimental-strip-types ./extensions/_test_steer_takeover_worker.ts",
