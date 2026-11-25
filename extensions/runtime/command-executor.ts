@@ -287,12 +287,18 @@ function commandPayloadOk(frame: CommandFrame): boolean {
 }
 
 /**
- * session.message payload 白名单（G6-P2）：必需 text（string，1..8000 UTF-8 字节），
+ * session.message payload 白名单（G6-P2）：必需 text（string，1..16384 UTF-8 字节），
  * 可选 reason（string ≤512 字节，同 message body.summary 预算纪律）；多余字段拒绝。
  * 恶意输入面：空文本 / 超长 / 控制字符（C0 除 \t\n\r 外 + DEL）一律拒绝——\t\n\r 是
  * 正常聊天换行/缩进，保留。
+ *
+ * 上限变更（2026-11-25，业主指令「放开到 16k」）：8000 → 16*1024。
+ *   原 8000 是**本常量的历史值**，不是 runtime-host 的 body 上限
+ *   （那个是 runtime-host/commands.ts:22 的 COMMAND_BODY_LIMIT_BYTES = 64 KiB，含 JSON 包装）。
+ *   16 KiB 正文 + JSON 包装仍远低于 64 KiB body 限。
+ *   下游已评估：注入走 sendUserMessage(text)，16 KiB 中文约 5–8K token，模型上下文 200K+ 可容。
  */
-export const SESSION_MESSAGE_TEXT_MAX_BYTES = 8000;
+export const SESSION_MESSAGE_TEXT_MAX_BYTES = 16 * 1024;
 
 function sessionMessageTextOk(text: string): boolean {
 	if (text.length === 0) return false;

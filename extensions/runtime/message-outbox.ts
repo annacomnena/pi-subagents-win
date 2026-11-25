@@ -57,7 +57,7 @@ export interface OutboxItem {
 	to: ObjectAddress;
 	/** 目标会话 id（冗余 to 的 value，桥匹配用）。 */
 	sessionId: string;
-	/** 消息正文（1..8000 UTF-8 字节；校验在 executor payload 白名单）。 */
+	/** 消息正文（1..16384 UTF-8 字节；校验在 executor payload 白名单）。 */
 	text: string;
 	/**
 	 * 【2026-11-04 新增】用户**显式要求**拉起目标会话（GUI「拉起」按钮 ⇒ payload.forceResume）。

@@ -715,7 +715,7 @@ try {
 		assert.equal(smDir("sm-empty", { text: "" }).reason, "invalid-payload", "空文本拒绝");
 		assert.equal(smDir("sm-missing-text", {}).reason, "invalid-payload", "缺 text 拒绝");
 		assert.equal(smDir("sm-num", { text: 42 }).reason, "invalid-payload", "text 非字符串拒绝");
-		assert.equal(smDir("sm-long", { text: "x".repeat(8001) }).reason, "invalid-payload", "超长（8001 字节）拒绝");
+		assert.equal(smDir("sm-long", { text: "x".repeat(16385) }).reason, "invalid-payload", "超长（16385 字节）拒绝");
 		assert.equal(smDir("sm-ctrl", { text: "a\u0000b" }).reason, "invalid-payload", "控制字符 NUL 拒绝");
 		assert.equal(smDir("sm-esc", { text: "a\u001bb" }).reason, "invalid-payload", "控制字符 ESC 拒绝");
 		assert.equal(smDir("sm-extra", { text: "hi", extra: 1 }).reason, "invalid-payload", "多余字段拒绝");
@@ -723,11 +723,11 @@ try {
 		assert.equal(outboxCount(), 0, "恶意输入零 outbox 盘面");
 
 		// G6-P2 L4 补矩阵：多字节字节上限 / DEL / 全量 C0（保留 \t\n\r）/ 结构拒绝不占幂等键
-		assert.equal(smDir("sm-mb-over", { text: "中".repeat(2667) }).reason, "invalid-payload", "多字节 8001 字节拒绝（UTF-8 字节上限非字符数）");
-		assert.equal(smDir("sm-mb-mixed", { text: "中".repeat(2666) + "abc" }).reason, "invalid-payload", "混合 8001 字节拒绝");
+		assert.equal(smDir("sm-mb-over", { text: "中".repeat(5462) }).reason, "invalid-payload", "多字节 16386 字节拒绝（UTF-8 字节上限非字符数）");
+		assert.equal(smDir("sm-mb-mixed", { text: "中".repeat(5461) + "abc" }).reason, "invalid-payload", "混合 16386 字节拒绝");
 		{
-			const rMbOk = smDir("sm-mb-ok", { text: "中".repeat(2666) + "a" });
-			assert.ok(rMbOk.status === "accepted", `恰 7999 字节多字节放行（2666×3+1）：${JSON.stringify(rMbOk)}`);
+			const rMbOk = smDir("sm-mb-ok", { text: "中".repeat(5461) + "a" });
+			assert.ok(rMbOk.status === "accepted", `恰 16384 字节多字节放行（5461×3+1，恰在边界）：${JSON.stringify(rMbOk)}`);
 		}
 		assert.equal(smDir("sm-del", { text: "a\u007fb" }).reason, "invalid-payload", "DEL 拒绝");
 		for (let code = 1; code <= 31; code++) {
@@ -741,9 +741,13 @@ try {
 			assert.ok(rReuse.status === "accepted" && rReuse.replayed === false, "结构拒绝不占幂等键：同键 valid 全新执行");
 		}
 
-		// 边界放行：8000 字节整 / \t\n\r 保留 / reason 512 字节
-		const r8000 = smDir("sm-8000", { text: "y".repeat(8000) });
-		assert.ok(r8000.status === "accepted", "8000 字节整 → accepted");
+		// 边界放行：16384 字节整 / \t\n\r 保留 / reason 512 字节
+		// 2026-11-25 业主指令「放开到 16k」：上限 8000 -> 16384，边界值随之更新。
+		// 必须同时验「恰在边界」与「边界 +1」，否则这个测试就不再是边界测试。
+		const rMax = smDir("sm-max", { text: "y".repeat(16384) });
+		assert.ok(rMax.status === "accepted", "16384 字节整 -> accepted（恰在边界）");
+		const rOver = smDir("sm-over", { text: "y".repeat(16385) });
+		assert.ok(rOver.status === "rejected" && rOver.reason === "invalid-payload", "16385 字节 -> rejected invalid-payload（边界 +1）");
 		const rWs = smDir("sm-wschars", { text: "line1\nline2\ttab\rcr" });
 		assert.ok(rWs.status === "accepted", "\t\n\r 放行");
 		const itemWs = listOutboxItems(obDir).find((it) => it.commandKey === "sm-wschars")!;
