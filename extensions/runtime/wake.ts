@@ -84,6 +84,19 @@ export interface WakeOptions {
 	inFlightWindowMs?: number;
 	/** test-only：autonomy config.json 注入（同 now/inFlightWindowMs 先例；生产不传，gate 读包根缺省） */
 	autonomyConfigPath?: string;
+	/**
+	 * S0.2 观测回调（可选；不传 = 零行为变化）。
+	 *
+	 * 为什么要回调而不能「外面再判一次」：同一道门判两次必然漂移（R-26 反面）。
+	 * 判定只在这里做一次，观测方被动收结果。
+	 */
+	observe?: (o: WakeObservation) => void;
+}
+
+/** 一次评估中要报给控制面的东西（门结果 + 计数）。 */
+export interface WakeObservation {
+	gate?: { stage: "owner" | "cutover" | "autonomy" | "actions"; passed: boolean; reason: string };
+	detail?: { workstreams?: number; triggers?: number; candidates?: number; started?: number; note?: string };
 }
 
 export interface WakeState {
@@ -102,25 +115,61 @@ const auditedSkip = new Set<string>();
 
 export function evaluateWakes(opts: WakeOptions): WakeDecision[] {
 	const now = opts.now ?? Date.now();
+	const observe = opts.observe;
 	const cutover = readCutover();
-	if (!cutover?.enabled) return []; // 与消费端同门：未切换零动作零审计
+	if (!cutover?.enabled) {
+		// 与消费端同门：未切换零动作零审计 —— **但 S0.2 要告诉观测方“为什么没动”**。
+		// 注意：同一行对两条链效果不同：消费链（mailboxOwnerEligible）在 cutover 未开时
+		// 回退 legacy-main-session（**不关**），而唤醒链在这里**直接 return**。
+		observe?.({ gate: { stage: "cutover", passed: false, reason: "cutover-disabled" } });
+		return [];
+	}
+	observe?.({ gate: { stage: "cutover", passed: true, reason: "ok" } });
 	const attachment = readAttachment(masterAddress());
-	if (!attachment || !opts.sessionId || opts.sessionId !== attachment.sessionId) return [];
+	if (!attachment || !opts.sessionId || opts.sessionId !== attachment.sessionId) {
+		// 这是**第二道 owner 判定**（与 mailbox-consumer 的 mailboxOwnerEligible 不同源）；
+		// 两处都报 owner 门，便于区分“哪一层判你非 owner”。
+		observe?.({ gate: { stage: "owner", passed: false, reason: "wake-owner-mismatch" } });
+		return [];
+	}
+	observe?.({ gate: { stage: "owner", passed: true, reason: "ok" } });
 
 	const stateDir = opts.stateDir ?? join(defaultRuntimeDir(), "state");
 	const mailboxDir = opts.mailboxDir ?? defaultMailboxDir();
 	// v2 autonomy 总门（Task 2006 L2，D-A/D-E）：owner 门后、ws 遍历前；传已解析 stateDir。
 	// enabled!==true → 完全旁路（零行为零写盘）；enabled → kill/collect fail-closed 压制 legacy fire。
 	const autonomyGate = evaluateAutonomyWakeGate({ stateDir, configPath: opts.autonomyConfigPath, now });
-	if (autonomyGate.engaged && !autonomyGate.proceed) return [];
+	if (autonomyGate.engaged && !autonomyGate.proceed) {
+		observe?.({ gate: { stage: "autonomy", passed: false, reason: autonomyGate.reason } });
+		return [];
+	}
+	observe?.({ gate: { stage: "autonomy", passed: true, reason: autonomyGate.reason } });
 	// P1 可回滚动作面（设计 D2 批准）：autonomy gate 块后 +1 个 never-throw 调用。
 	// actions.enabled 默认 false ⇒ 除一次 config 读外零 IO、零新文件（独立 fail-closed，
 	// 与 wake 面 fail-open 不混淆）；不搭 legacy 唤醒 spawn 通道（§1.4 结构性防火墙）；
 	// 只写自有 namespace <stateDir>/autonomy/actions/**。
-	runAutonomyActions({ stateDir, configPath: opts.autonomyConfigPath, sessionId: opts.sessionId, now });
+	const act = runAutonomyActions({ stateDir, configPath: opts.autonomyConfigPath, sessionId: opts.sessionId, now });
+	if (observe) {
+		// actions 门只在「动作面被显式关闭」时算失败；其余结果会成 detail（counters）
+		if (act.outcome === "actions-disabled") {
+			observe({ gate: { stage: "actions", passed: false, reason: "actions-disabled" } });
+		} else {
+			observe({ gate: { stage: "actions", passed: true, reason: act.outcome } });
+		}
+		observe({
+			detail: {
+				triggers: act.triggers,
+				candidates: act.candidates,
+				started: act.started,
+				...(act.outcome === "no-snapshot" ? { note: "no-frontier-snapshot" } : {}),
+			},
+		});
+	}
 	const decisions: WakeDecision[] = [];
 
-	for (const ws of listWorkstreams(stateDir)) {
+	const workstreams = listWorkstreams(stateDir);
+	observe?.({ detail: { workstreams: workstreams.length } });
+	for (const ws of workstreams) {
 		const d = evaluateOne(ws, { ...opts, now, stateDir, mailboxDir });
 		decisions.push(d);
 	}

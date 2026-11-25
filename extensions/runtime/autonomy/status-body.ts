@@ -20,6 +20,8 @@ import { readAutonomyConfig } from "./config.ts";
 import { readAttachment } from "../registry.ts";
 import { masterAddress } from "../address.ts";
 import { summarizeActionsStatus } from "./action/run.ts";
+// S0.2：自主控制面状态（独立于心跳 —— 心跳只证明进程活着）
+import { controlPlaneLine, readControlPlane } from "./control-plane.ts";
 import { supervisionLedgerLines } from "../supervision.ts";
 import { observeOutbox, observeDelivery, observeDeadDrops, deliveryObservationLines } from "../delivery-observations.ts";
 // step-0 第 1 步（2026-11-23）：会话占用只读观测 —— 双控风险的真实发生率基线。
@@ -145,6 +147,9 @@ export function buildAutonomyStatusBody(): string {
 				// ⇒ 整个 status **永远**只返回「autonomy status: (状态不可读)」。
 				// 这正是 L4 说「诊断层无回归网」的另一面：它根本没跑通过，所以没人发现。
 				...supervisionLedgerLines({}),
+				// S0.2（2026-11-25）：控制面状态 —— 回答「自主链路实际处于什么状态」，
+				// 而不是「进程还活着吗」。必须放在心跳/快照行之后（它是对它们的「为什么」）。
+				controlPlaneLine(readControlPlane()),
 				`audit (最近 ${tail.length} 行):`,
 				...(tail.length ? tail.map((l) => `  ${l}`) : ["  (空)"]),
 				...actionsLines,

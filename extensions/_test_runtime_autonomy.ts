@@ -834,7 +834,16 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 	// 相对 EXT_ROOT。2026-10-17 新增 mailbox-consumer.ts：autonomy 心跳（writeAutonomyHeartbeat）必须
 	// 接在 wake tick 开头（tick 是唯一无条件每 30s 跑的位置），这是修「autonomy 静默死亡 29h」的实现点，
 	// 属正当接线（不是绕过 allowlist）。
-	const ALLOW = ["index.ts", "mailbox-consumer.ts", "master-tools.ts", "runtime-host/server.ts"]; // 相对 EXT_ROOT（2026-09-24 autonomy endpoint）
+	const ALLOW = [
+		"index.ts",
+		"mailbox-consumer.ts",
+		"master-tools.ts",
+		"runtime-host/server.ts",
+		// S0.2 顺手补（2026-11-25）：`4ab6a0b`（投递污染止血 P-1）引入的**正当**引用 ——
+		// 它只用 `appendAuditLine` 写 `state/autonomy/audit.jsonl`（复用既有审计入口，符合 R-2），
+		// **不涉及** autonomy 的决策/执行面。allowlist 当时没跟上 ⇒ A10.1 恒红。
+		"runtime-host/delivery-reconciler-loop.ts",
+	]; // 相对 EXT_ROOT（2026-09-24 autonomy endpoint）
 	const offenders: string[] = [];
 	const walk = (dir: string): void => {
 		for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -889,6 +898,19 @@ check("A10.1 extensions/ 生产文件引用 runtime/autonomy 限于 v2 接线 al
 				// F4② 回归网（2026-11-05）：直接测 `runtime/autonomy/status-body.ts` 的真实分支 → 排除
 				//（ALLOW 不动：仍是测试文件、非生产接线点）
 				if (p === join(EXT_ROOT, "_test_autonomy_status_body.ts")) continue;
+				// S0.2（2026-11-25）：控制面状态直接测 `runtime/autonomy/control-plane.ts` → 排除
+				//（ALLOW 不动：仍是测试文件、非生产接线点；生产侧的新接线点是
+				//  mailbox-consumer.ts，它本来就在 ALLOW 内）
+				if (p === join(EXT_ROOT, "_test_autonomy_control_plane.ts")) continue;
+				// S0.2 顺手补（2026-11-25）：以下 5 个历史测试文件早已 import runtime/autonomy 字面量
+				// 但从未登记 ⇒ A10.1 **长期恒红**（一个永远红的回归网等于没有，R-17 同形）。
+				// 逐个核实过：全部是 `_test_*`（测试文件，非生产接线点）。
+				// 其中 `_test_delivery_observations.ts` 是 2026-11-24 P2（b233dc6）新增的，当时漏登。
+				if (p === join(EXT_ROOT, "_test_autonomy_dedupe.ts")) continue; // 2784745 阶斵2 去重
+				if (p === join(EXT_ROOT, "_test_autonomy_diagnose.ts")) continue; // 1f8452c diagnose 可见化
+				if (p === join(EXT_ROOT, "_test_autonomy_tick_sim.ts")) continue; // 7e857d9 生产 tick 链路模拟
+				if (p === join(EXT_ROOT, "_test_delivery_observations.ts")) continue; // b233dc6 P2 交付观测
+				if (p === join(EXT_ROOT, "_test_non_owner_ticks_gc.ts")) continue; // 1ff21a1 non-owner-ticks GC
 				if (readFileSync(p, "utf8").includes("runtime/autonomy")) offenders.push(relative(EXT_ROOT, p).replace(/\\/g, "/"));
 			}
 		}

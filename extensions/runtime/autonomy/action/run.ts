@@ -84,25 +84,54 @@ function newActionId(now: number): string {
 export type RunOneOutcome = "started" | "denied" | "skipped";
 
 /**
+ * 动作面本 tick 的结果（S0.2：给控制面计数用；调用方可忽略）。
+ *
+ * 为什么要返回：旧实现 `void` ⇒ 外面无法区分「动作面关了」与「没有触发」与「全被 policy 拒」
+ * ⇒ 无法回答「链路是否真正评估过」（S0.2 的核心缺口）。
+ */
+export interface RunActionsResult {
+	/**
+	 * - actions-disabled：配置未开（`enabled !== true` 或 `actions.enabled !== true`）
+	 * - no-snapshot：读不到 frontier 快照（无法观测）
+	 * - no-triggers：有快照但无候选 trigger（评估过，无需行动）
+	 * - denied：有候选但全被 policy 拒（证据不足/预算/陷阱）
+	 * - started：本 tick 启动了 1 个动作（maxNewPerTick）
+	 */
+	outcome: "actions-disabled" | "no-snapshot" | "no-triggers" | "denied" | "started";
+	/** frontier 里的全部 trigger 数 */
+	triggers: number;
+	/** 过了 allowlist 的候选数 */
+	candidates: number;
+	/** 实际启动数（0 或 1） */
+	started: number;
+}
+
+const EMPTY_RESULT: RunActionsResult = { outcome: "actions-disabled", triggers: 0, candidates: 0, started: 0 };
+
+/**
  * 动作面总入口（never-throw 总包裹）。
  * `actions.enabled !== true` ⇒ 除一次 config 读外零 IO、零新文件（默认关闭零行为）。
+ * 返回值仅供观测；旧调用点忽略返回值时行为逐字节不变。
  */
-export function runAutonomyActions(opts: RunActionsOpts): void {
+export function runAutonomyActions(opts: RunActionsOpts): RunActionsResult {
 	try {
 		const cfg = readAutonomyConfig({ configPath: opts.configPath });
-		if (cfg.enabled !== true || cfg.actions?.enabled !== true) return; // 双层合取；任一未严格开启即零行为
+		if (cfg.enabled !== true || cfg.actions?.enabled !== true) return { ...EMPTY_RESULT };
 
 		const now = opts.now ?? Date.now();
 		const stateDir = opts.stateDir;
 
 		// 读 frontier 快照（不重算、不改 gate 签名；只消费已落盘快照）
 		const snap = readFrontierSnapshot({ stateDir });
-		if (!snap) return; // 无快照 → 无触发 → 无动作
+		const totalTriggers = snap ? snap.triggers.length : 0;
+		if (!snap) return { outcome: "no-snapshot", triggers: 0, candidates: 0, started: 0 };
 
 		// 候选 = trigger × class（allowlist 双维；§4）。maxNewPerTick=1 ⇒ 同一 incident 的
 		// report/notify 分两 tick 落（≤30s 间隔；见阶段二要点 ②）。
 		const candidateTriggers = snap.triggers.filter((t) => TRIGGER_ALLOWLIST.has(t.rule));
-		if (candidateTriggers.length === 0) return;
+		if (candidateTriggers.length === 0) {
+			return { outcome: "no-triggers", triggers: totalTriggers, candidates: 0, started: 0 };
+		}
 
 		const ctx: RunActionsOpts & { now: number; frontier: FrontierSnapshot } = { ...opts, now, frontier: snap };
 		for (const t of candidateTriggers) {
@@ -110,12 +139,18 @@ export function runAutonomyActions(opts: RunActionsOpts): void {
 			const classesForRule = TRIGGER_CLASS_MAP[t.rule] ?? [];
 			for (const clsName of classesForRule) {
 				const outcome = runOneAction(t, clsName, ctx);
-				if (outcome === "started") return; // 每 tick 最多 1 个新动作（budget）达成
+				if (outcome === "started") {
+					// 每 tick 最多 1 个新动作（budget）达成
+					return { outcome: "started", triggers: totalTriggers, candidates: candidateTriggers.length, started: 1 };
+				}
 				// denied / skipped → 继续下一候选（其自身判据独立）
 			}
 		}
+		// 有候选但一个都没启动
+		return { outcome: "denied", triggers: totalTriggers, candidates: candidateTriggers.length, started: 0 };
 	} catch {
 		/* never-throw 总包裹：动作面任何异常不得影响唤醒循环 */
+		return { ...EMPTY_RESULT };
 	}
 }
 

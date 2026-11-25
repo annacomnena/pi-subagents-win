@@ -60,6 +60,7 @@ import { isMainSession, isSubagent, durableSessionIdentity } from "./identity.ts
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { classifyForCoalesce, composeFlushBody, letterToItem, oversizeItemIds, planFlushBatches, readBusyGate, shouldForceFlush, type ReadBusyGateOptions } from "./coalesce.ts";
 import { auditWakeSpawnFailed, confirmWakeSpawn, evaluateWakes, type WakeDecision } from "./runtime/wake.ts";
+import { recordControlPlane } from "./runtime/autonomy/control-plane.ts";
 import { gcNonOwnerTicks, writeAutonomyHeartbeat, writeNonOwnerTick } from "./runtime/autonomy/collect.ts";
 import {
 	auditScopeWakeSpawnFailed,
@@ -1065,92 +1066,130 @@ export function registerWakeLoop(
 		const sid = ctx?.sessionManager?.sessionId;
 		interval = setInterval(() => {
 			if (closed()) return;
-			// ⚠ R-21 修复（2026-11-05，L4 F1 P1）：心跳**不能**在 owner 门之前无条件写。
-			//
-			// 实测反例（L4 reviewer 用真实 registerWakeLoop→session_start→interval 隔离复现）：
-			//   先写 owner 的 1h 前心跳，再只启动 nonowner 的 wake loop（owner loop 不跑）：
-			//     before: { stale:true, suspectedDisabled:false, heartbeatStale:true }  ← 正确：tick 死
-			//     after : { stale:true, suspectedDisabled:true,  heartbeatStale:false } ← 错误：报「被关」
-			// ⇒ 「owner tick 已停」被显示成「tick 活着，autonomy 很可能被关」。
-			//
-			// `heartbeat.json` 只有**一个槽位**，tmp+rename 只保证单次写入完整，不解决多写者最后覆盖。
-			// 所以：**共享心跳只由 owner 写**（owner 门之后），语义仍是「owner 的 wake 链活着」。
-			// 这不妨碍晚 attach：interval 一直在，下一次 owner 门通过就开始写 + 消费。
-			// 非 owner 会话的存活另有 per-session 心跳（writeNonOwnerTick），不与 owner 槽位混用。
-			// tick 层精判（与旧语义逐字一致，只是从注册层搬下来）
-			const gate = mailboxOwnerEligible(sid);
-			if (gate.eligible) {
-				// 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）：每次 tick 无论后续是否
-				// 被 autonomy 门旁路，都写一份 heartbeat。为什么需要：`gate.ts:73` `enabled !== true`
-				// 是「零 IO / 零审计 / 零写盘」的完全旁路 ⇒ 一旦 enabled 被误关（如整文件重写 config
-				// 丢键），整链静默死亡且**无任何痕迹**，只能靠人偶然发现 frontier 陈旧。
-				// never-throw：写失败不影响唤醒循环。
+			// ── S0.2 观测（2026-11-25）：观测点必须在 **owner 门之前**，
+			// 否则非 owner 进程的自主链状态永远不可见（本机实测：8 个 master attachment 并存）。
+			// 用 try/finally 保证 **所有提前 return 路径都能记录**（方案 §5.4 核心要求）。
+			const observedGates: Array<{ stage: "owner" | "cutover" | "autonomy" | "actions"; passed: boolean; reason: string }> = [];
+			const observedDetail: { workstreams?: number; triggers?: number; candidates?: number; started?: number; note?: string } = {};
+			let recorded = false;
+			const flushControlPlane = (): void => {
+				if (recorded) return;
+				recorded = true;
 				try {
-					writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
+					// 固定门顺序（subagent 恒通过：能走到 tick 就说明不是子 agent —— 子 agent 在注册层就被排除）
+					const order = ["owner", "cutover", "autonomy", "actions"] as const;
+					const gates = [
+						{ stage: "subagent" as const, passed: true, reason: "not-subagent" },
+						...order.map((s) => observedGates.find((g) => g.stage === s)).filter((g): g is NonNullable<typeof g> => Boolean(g)),
+					];
+					recordControlPlane({
+						stateDir: opts.stateDir,
+						sessionId: sid ?? null,
+						intervalMs: opts.intervalMs ?? 30_000,
+						gates,
+						detail: observedDetail,
+					});
 				} catch {
-					/* 心跳永不破坏会话 */
+					/* 观测绝不破坏唤醒循环 */
 				}
-			} else {
-				// 非 owner：写 per-session 心跳，只回答「本会话的 timer 活着」，绝不占 owner 槽位
-				try {
-					writeNonOwnerTick({ stateDir: opts.stateDir, sessionId: sid, reason: gate.reason, tickIntervalMs: opts.intervalMs ?? 30_000 });
-				} catch {
-					/* 同上 */
-				}
-				return;
-			}
-			// 2026-10-31 邮箱维护（接上两个一直“写了但没人调”的函数）：
-			//   `expireSweep`  —— 非终态且过 TTL → expired（此前**零调用**，TTL 形同虚设）
-			//   `archiveTerminalLetters` —— 超龄终态信 → `<recipient>/_archive-YYYY-MM/`
-			// 实证代价：`agent___master_default` 目录涨到 164 项，其中 162 封已 ack
-			// （最早 2026-09-17，垮 1.5 个月）；每拍 `mailboxBacklog`/`scanMailboxLetters`
-			// 都要 readdir + 逐封 stat。与 audit.jsonl 涨到 30MB 是同一类缺陷。
-			//
-			// 为什么挂在 tick 而不是单独定时器：这里本来就有 30s 心跳，多一个 interval
-			// 只增加竞态面。为什么每 30s 都跑：两个函数都是 never-throw + 无变化时只做
-			// readdir/stat（实测单 recipient 162 文件 <5ms）；归档后文件数单调下降。
-			// 仍然只写自有 namespace 外的 mailbox 自身目录，不动任何别的状态。
+			};
 			try {
-				expireSweep(undefined, { mailboxDir: opts.mailboxDir });
-				archiveTerminalLetters({ mailboxDir: opts.mailboxDir });
-			} catch {
-				/* 维护永不破坏唤醒循环 */
-			}
-			// 2026-11-09：`state/autonomy/non-owner-ticks/` 的 GC（R-21 修复的副作用，当时漏配）。
-			// 为什么不单独起一个 interval：这里本来每 30s 就有一拍，多一条独立的定时器
-			// 只增加竞态面。为什么不每次全扫：按语义规则只删「超龄」条目（见 gcNonOwnerTicks
-			// 注释），稳态下每拍只做 readdir + 逐文件 stat，实测 22 个文件 <1ms。
-			// never-throw：GC 永不破坏唤醒循环。
-			try {
-				gcNonOwnerTicks({ stateDir: opts.stateDir });
-			} catch {
-				/* GC 永不破坏唤醒循环 */
-			}
-			try {
-				const decisions = evaluateWakes({
-					sessionId: sid,
-					mailboxDir: opts.mailboxDir,
-					stateDir: opts.stateDir,
-					runsDir: opts.runsDir,
-				});
-				for (const d of decisions) {
-					if (!d.fire) continue;
+				// ⚠ R-21 修复（2026-11-05，L4 F1 P1）：心跳**不能**在 owner 门之前无条件写。
+				//
+				// 实测反例（L4 reviewer 用真实 registerWakeLoop→session_start→interval 隔离复现）：
+				//   先写 owner 的 1h 前心跳，再只启动 nonowner 的 wake loop（owner loop 不跑）：
+				//     before: { stale:true, suspectedDisabled:false, heartbeatStale:true }  ← 正确：tick 死
+				//     after : { stale:true, suspectedDisabled:true,  heartbeatStale:false } ← 错误：报「被关」
+				// ⇒ 「owner tick 已停」被显示成「tick 活着，autonomy 很可能被关」。
+				//
+				// `heartbeat.json` 只有**一个槽位**，tmp+rename 只保证单次写入完整，不解决多写者最后覆盖。
+				// 所以：**共享心跳只由 owner 写**（owner 门之后），语义仍是「owner 的 wake 链活着」。
+				// 这不妨碍晚 attach：interval 一直在，下一次 owner 门通过就开始写 + 消费。
+				// 非 owner 会话的存活另有 per-session 心跳（writeNonOwnerTick），不与 owner 槽位混用。
+				// tick 层精判（与旧语义逐字一致，只是从注册层搬下来）
+				const gate = mailboxOwnerEligible(sid);
+				observedGates.push({ stage: "owner", passed: gate.eligible, reason: gate.reason });
+				if (gate.eligible) {
+					// 2026-10-17 心跳（INC：autonomy 静默死亡 29h 无任何信号）：每次 tick 无论后续是否
+					// 被 autonomy 门旁路，都写一份 heartbeat。为什么需要：`gate.ts:73` `enabled !== true`
+					// 是「零 IO / 零审计 / 零写盘」的完全旁路 ⇒ 一旦 enabled 被误关（如整文件重写 config
+					// 丢键），整链静默死亡且**无任何痕迹**，只能靠人偶然发现 frontier 陈旧。
+					// never-throw：写失败不影响唤醒循环。
 					try {
-						const tabRunId = opts.spawn(d, sid);
-						confirmWakeSpawn(d.workstreamId, tabRunId, {
-							stateDir: opts.stateDir,
-							mailboxDir: opts.mailboxDir,
-							sessionId: sid!,
-						});
-					} catch (e) {
-						auditWakeSpawnFailed(d.workstreamId, e instanceof Error ? e.message : String(e), {
-							stateDir: opts.stateDir,
-							sessionId: sid,
-						});
+						writeAutonomyHeartbeat({ stateDir: opts.stateDir, sessionId: sid, tickIntervalMs: opts.intervalMs ?? 30_000 });
+					} catch {
+						/* 心跳永不破坏会话 */
 					}
+				} else {
+					// 非 owner：写 per-session 心跳，只回答「本会话的 timer 活着」，绝不占 owner 槽位
+					try {
+						writeNonOwnerTick({ stateDir: opts.stateDir, sessionId: sid, reason: gate.reason, tickIntervalMs: opts.intervalMs ?? 30_000 });
+					} catch {
+						/* 同上 */
+					}
+					return;
 				}
-			} catch {
-				/* 唤醒循环永不破坏会话 */
+				// 2026-10-31 邮箱维护（接上两个一直“写了但没人调”的函数）：
+				//   `expireSweep`  —— 非终态且过 TTL → expired（此前**零调用**，TTL 形同虚设）
+				//   `archiveTerminalLetters` —— 超龄终态信 → `<recipient>/_archive-YYYY-MM/`
+				// 实证代价：`agent___master_default` 目录涨到 164 项，其中 162 封已 ack
+				// （最早 2026-09-17，垮 1.5 个月）；每拍 `mailboxBacklog`/`scanMailboxLetters`
+				// 都要 readdir + 逐封 stat。与 audit.jsonl 涨到 30MB 是同一类缺陷。
+				//
+				// 为什么挂在 tick 而不是单独定时器：这里本来就有 30s 心跳，多一个 interval
+				// 只增加竞态面。为什么每 30s 都跑：两个函数都是 never-throw + 无变化时只做
+				// readdir/stat（实测单 recipient 162 文件 <5ms）；归档后文件数单调下降。
+				// 仍然只写自有 namespace 外的 mailbox 自身目录，不动任何别的状态。
+				try {
+					expireSweep(undefined, { mailboxDir: opts.mailboxDir });
+					archiveTerminalLetters({ mailboxDir: opts.mailboxDir });
+				} catch {
+					/* 维护永不破坏唤醒循环 */
+				}
+				// 2026-11-09：`state/autonomy/non-owner-ticks/` 的 GC（R-21 修复的副作用，当时漏配）。
+				// 为什么不单独起一个 interval：这里本来每 30s 就有一拍，多一条独立的定时器
+				// 只增加竞态面。为什么不每次全扫：按语义规则只删「超龄」条目（见 gcNonOwnerTicks
+				// 注释），稳态下每拍只做 readdir + 逐文件 stat，实测 22 个文件 <1ms。
+				// never-throw：GC 永不破坏唤醒循环。
+				try {
+					gcNonOwnerTicks({ stateDir: opts.stateDir });
+				} catch {
+					/* GC 永不破坏唤醒循环 */
+				}
+				try {
+					const decisions = evaluateWakes({
+						sessionId: sid,
+						mailboxDir: opts.mailboxDir,
+						stateDir: opts.stateDir,
+						runsDir: opts.runsDir,
+						// S0.2：判定仍单点（在 evaluateWakes 内），这里只被动收结果
+						observe: (o) => {
+							if (o.gate) observedGates.push(o.gate);
+							if (o.detail) Object.assign(observedDetail, o.detail);
+						},
+					});
+					for (const d of decisions) {
+						if (!d.fire) continue;
+						try {
+							const tabRunId = opts.spawn(d, sid);
+							confirmWakeSpawn(d.workstreamId, tabRunId, {
+								stateDir: opts.stateDir,
+								mailboxDir: opts.mailboxDir,
+								sessionId: sid!,
+							});
+						} catch (e) {
+							auditWakeSpawnFailed(d.workstreamId, e instanceof Error ? e.message : String(e), {
+								stateDir: opts.stateDir,
+								sessionId: sid,
+							});
+						}
+					}
+				} catch {
+					/* 唤醒循环永不破坏会话 */
+				}
+			} finally {
+				// S0.2：无论上面从哪条路径返回（正常/非 owner/异常/提前 return），都要记一笔
+				flushControlPlane();
 			}
 		}, opts.intervalMs ?? 30_000);
 		interval.unref?.();
