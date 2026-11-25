@@ -47,7 +47,7 @@ source_paths:
 
 ---
 
-## S0.2 运行可观测性 —— **下一步**
+## S0.2 运行可观测性 —— **已完成（2026-11-25，commit d9b5370）**
 
 **目标**：**即使功能关闭，也能观察自主运行链路的真实状态。**
 这是本路线中优先级最高的工程问题。
@@ -108,15 +108,34 @@ NO_ACTION_NEEDED   已评估，当前无需行动
 明确标注「本数据随 `state/` 清理丢失，不可作长期审计证据」。
 不允许让读者以为拿到了权威历史（R-26 家族）。
 
+**实现位置**
+- `extensions/runtime/autonomy/control-plane.ts`（三载体 + 6 态 + 六门）
+- `extensions/runtime/wake.ts`（`evaluateWakes` 可选 `observe`，判定仍单点）
+- `extensions/runtime/autonomy/action/run.ts`（`runAutonomyActions` 返回 `RunActionsResult`）
+- `extensions/mailbox-consumer.ts`（tick `try/finally`，观测点在 owner 门**之前**）
+- `extensions/runtime/autonomy/status-body.ts`（`/autonomy status` 新增「自主控制面」行）
+- 测试：`test:autonomy-control-plane`（60 checks，含 ⑦ evaluateWakes 与 ⑧ tick 两层**真实接线**）
+
 **验收**
-- [ ] Cutover 文件不存在 ⇒ 可观测地报告阻塞 + 零实际动作
-- [ ] Cutover 长时间关闭 ⇒ 可统计**评估次数**，不产生海量重复审计
-- [ ] 自主调度器**完全未运行** ⇒ 可通过独立监测发现（不是靠心跳）
-- [ ] 非 owner 进程也能看到自己的门状态
+- [x] Cutover 文件不存在 ⇒ 可观测地报告阻塞 + 零实际动作
+- [x] Cutover 长时间关闭 ⇒ 可统计**评估次数**，不产生海量重复审计（边沿触发验证）
+- [x] 自主调度器**完全未运行** ⇒ 可通过独立监测发现（`inferNotScheduled` 快照超龄推断）
+- [x] 非 owner 进程也能看到自己的门状态（观测点在 owner 门之前）
+
+**已验证的两个架构事实**
+1. `NOT_SCHEDULED` **不能**由 tick 内产出 —— tick 无法自证「没被调用」，只能由观测侧推断（测试已钉死）
+2. `cutover` 对读取、唤醒两条链效果**不同**：消费链在 cutover 未开时回退 `legacy-main-session`（不关），
+   而唤醒链在 `wake.ts:106` 直接 return（旧版本零审计）
+
+**仍未闭合**
+- metrics 仍在 `state/` 下，**随清理/重装丢失**（不许当长期审计证据；本页已登记）
+- 只落 6 态；S3/S4 的 5 态留待真正产生 Action Intent 时再加
+- `/autonomy status` 这行未接入 GUI
+- 运行中 daemon 跑旧码 ⇒ 真实读数需重启才生效（R-18）
 
 ---
 
-## S0.3 Frontier 归属与 fencing
+## S0.3 Frontier 归属与 fencing —— **下一步**
 
 **目标**：消除多写者覆盖及过期证据问题。
 
