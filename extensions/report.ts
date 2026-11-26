@@ -546,7 +546,13 @@ export function healContradictoryMarkers(reportsDir: string): string[] {
 	for (const n of names) {
 		if (!n.endsWith(".unroutable")) continue;
 		const id = n.slice(0, -`.unroutable`.length);
-		if (!existsSync(join(reportsDir, `${id}.notified`))) continue;
+		// **不再用纯存在性判断**（L4 P1-2，2026-11-26）：
+		// 原来只要 `.notified` 存在就删，而 `.notified` 可能是「claim 成功但 send 失败」——
+		// 那时 `.unroutable` 是**唯一可见的失败证据**，删掉就等于把真未送达变成“看起来送达”。
+		// 实测（2026-11-26）：142 份 `.notified` **全部 0 字节** ⇒ 存量一律“不可知” ⇒ **不删**。
+		// ⇒ 本函数从此只对「新码 claim 过、且 send 确实成功（ok:"sent"）」的报生效；
+		//   存量并存会留下 —— 这是刻意的：宁可多留一个标记，不可删掉不可恢复的证据。
+		if (!notifiedProvesSent(reportsDir, id)) continue;
 		try {
 			unlinkSync(join(reportsDir, n));
 			healed.push(id);
@@ -646,8 +652,57 @@ export interface ReportListenerOptions {
 export function claimReportNotified(reportsDir: string, id: string): boolean {
 	try {
 		const fd = openSync(join(reportsDir, `${id}.notified`), "wx");
-		try { closeSync(fd); } catch { /* ignore */ }
+		try {
+			// **写内容**（L4 P1-2，2026-11-26）：原来是 0 字节，只能表达 1 bit；
+			// 而这里需要区分两个阶段 ——「已 claim」与「send 已成功」。
+			// 压平的后果是：claim 成功但 send 失败时，`.notified` 存在 ⇒ 看起来已送达
+			// ⇒ 而 `healContradictoryMarkers` 会把唯一可见的失败证据（`.unroutable`）删掉。
+			writeSync(fd, JSON.stringify({ claimedAt: new Date().toISOString(), ok: "claim-only" }, null, 2) + "\n", "utf8");
+		} catch { /* 内容写失败也保留文件本身（existsSync 语义仍成立） */ } finally { closeSync(fd); }
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * send 未同步抛后，把 `.notified` 升级为 `ok:"sent"`（原子写）。
+ *
+ * 为什么不直接改 `claimReportNotified`：claim 的语义是「抢消费权」（双 watcher 只有第一个注入），
+ * 而「send 成功」是它之后的另一个事实 —— 两个事实必须分开写。
+ * never-throw：这是收尾动作，失败不应该影响已完成的注入。
+ */
+function markReportSent(reportsDir: string, id: string): void {
+	const path = join(reportsDir, `${id}.notified`);
+	const tmp = `${path}.tmp`;
+	try {
+		let claimedAt = new Date().toISOString();
+		try {
+			const prev = JSON.parse(readFileSync(path, "utf8"));
+			if (prev && typeof prev.claimedAt === "string") claimedAt = prev.claimedAt;
+		} catch { /* 0 字节/坏 JSON（2026-11-26 前的存量）⇒ 用现在 */ }
+		writeFileSync(tmp, JSON.stringify({ claimedAt, sentAt: new Date().toISOString(), ok: "sent" }, null, 2) + "\n", "utf8");
+		renameSync(tmp, path);
+	} catch { /* best-effort：升级失败 ⇒ heal 会当作“不可知”而不删证据，这是安全的 */ }
+}
+
+/**
+ * `.notified` 是否**能证明 send 已成功**。
+ *
+ * 三态语义（fail open）：
+ *   - 文件不存在 ⇒ false（没人 claim 过）
+ *   - 0 字节 / 坏 JSON / 无 `ok:"sent"`（含 2026-11-26 前的全部存量）⇒ **false（不可知）**
+ *   - `ok === "sent"` ⇒ true
+ *
+ * ⇒ 不可知一律返回 false ⇒ `heal` **不删**。取舍理由与 `detectFromMismatch` 的时间锚同构：
+ *   **删掉的证据不可恢复，而留下一个多余的标记只让人多看一眼。**
+ */
+function notifiedProvesSent(reportsDir: string, id: string): boolean {
+	const p = join(reportsDir, `${id}.notified`);
+	if (!existsSync(p)) return false;
+	try {
+		const raw = JSON.parse(readFileSync(p, "utf8"));
+		return Boolean(raw && typeof raw === "object" && (raw as { ok?: unknown }).ok === "sent");
 	} catch {
 		return false;
 	}
@@ -796,6 +851,10 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 		// 清「未消费」反证据与退避状态。**只在 send 未同步抛时**（不声称已送达，见上方证据限度）。
 		clearUnroutable(reportsDir, id);
 		clearUnroutableAttempt(id);
+		// 同时把 `.notified` 升级为 ok:"sent"（L4 P1-2）：不升级的话，`heal` 永远无法证明
+		// “已送达”，于是并存永远不会被清（存量的 142 份 0 字节就是这种状态）。
+		// 两件事同一时机、各自独立：clearUnroutable 清本进程看到的证据，markReportSent 留可核状态。
+		markReportSent(reportsDir, id);
 	} catch {
 		selfDisabled = true; // 旧实例 stale → 停止注入
 	}

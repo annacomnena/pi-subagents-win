@@ -35,7 +35,7 @@ const tmp = mkdtempSync(join(tmpdir(), "report-upward-"));
 const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
 process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
-const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion, detectStaleContext } = await import("./report.ts");
+const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion, detectStaleContext, claimReportNotified } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 const { workReportLogic, registerWorkReportTool } = await import("./work-report.ts");
 const { setCurrentSessionId } = await import("./identity.ts");
@@ -226,12 +226,30 @@ try {
 
 		// ⑦b 存量自愈：已经并存的文件 ⇒ healContradictoryMarkers 删掉 unroutable
 		writeFileSync(join(reportsDir, "report_mutex_b.json"), JSON.stringify({ ...rec7, id: "report_mutex_b" }), "utf8");
-		writeFileSync(join(reportsDir, "report_mutex_b.notified"), "", "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_b.notified"), "{\"ok\":\"sent\"}", "utf8");
 		writeFileSync(join(reportsDir, "report_mutex_b.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
 		const healed = healContradictoryMarkers(reportsDir);
 		ok(healed.includes("report_mutex_b"), "⑦b 自愈命中并发的 id");
 		eq(existsSync(join(reportsDir, "report_mutex_b.unroutable")), false, "⑦b 自愈删掉了矛盾的 .unroutable");
 		eq(existsSync(join(reportsDir, "report_mutex_b.notified")), true, "⑦b `.notified`（更强证据）保留");
+
+		// ⑯（L4 P1-2）claim-only / 0 字节存量 ⇒ **不得删** unroutable
+		{
+			// claim 成功但 send 失败 ⇒ ok:"claim-only"
+			writeFileSync(join(reportsDir, "report_claimonly.json"), JSON.stringify({ ...rec7, id: "report_claimonly" }), "utf8");
+			writeFileSync(join(reportsDir, "report_claimonly.notified"), JSON.stringify({ claimedAt: new Date().toISOString(), ok: "claim-only" }), "utf8");
+			writeFileSync(join(reportsDir, "report_claimonly.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
+			// 存量形态：0 字节 .notified（2026-11-26 前的 142 份全部如此）
+			writeFileSync(join(reportsDir, "report_legacy0.json"), JSON.stringify({ ...rec7, id: "report_legacy0" }), "utf8");
+			writeFileSync(join(reportsDir, "report_legacy0.notified"), "", "utf8");
+			writeFileSync(join(reportsDir, "report_legacy0.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
+
+			const healed2 = healContradictoryMarkers(reportsDir);
+			ok(!healed2.includes("report_claimonly"), "⑯a claim-only（send 可能失败）⇒ **不得**删 unroutable（唯一可见失败证据）");
+			eq(existsSync(join(reportsDir, "report_claimonly.unroutable")), true, "⑯a claim-only 的 unroutable 仍在");
+			ok(!healed2.includes("report_legacy0"), "⑯b 0 字节存量 ⇒ 状态不可知 ⇒ **不得**删（fail open）");
+			eq(existsSync(join(reportsDir, "report_legacy0.unroutable")), true, "⑯b 存量 unroutable 仍在");
+		}
 
 		// ⑦c 自愈**不得**误删真的没送达的（只有 unroutable、无 notified）
 		writeFileSync(join(reportsDir, "report_mutex_c.json"), JSON.stringify({ ...rec7, id: "report_mutex_c" }), "utf8");
@@ -696,6 +714,27 @@ try {
 		ok(!("envSessionId" in (written as object)), "⑮ **work-report 落盘不得带 envSessionId**（否则是 tautology 假材料）");
 	}
 
+	// ⑯ claim 写入内容必须是 ok:"claim-only"（微型测试）
+	//
+	// 为什么需要：我写了 ⑯a/⑯b 两条断言验 healer 的**读**行为，
+	// 但 fixture 是**手写**的 `.notified` 文件 ⇒ 变异 `claimReportNotified` 写入的字符串**全绿**（M37 实测）。
+	// ⇒ 写入内容必须自己有一条断言，否则它是“实现了但没接线”的又一例。
+	{
+		const dir = join(tmp, "reports-claim");
+		mkdirSync(dir, { recursive: true });
+		const cid = "report_claim_probe";
+		writeFileSync(join(dir, cid + ".json"), JSON.stringify({ id: cid, from: "tab_x", message: "m", at: new Date().toISOString(), pid: 1 }), "utf8");
+		eq(claimReportNotified(dir, cid), true, "⑯ 前置：claim 成功");
+		const raw = readFileSync(join(dir, cid + ".notified"), "utf8");
+		let parsed = null;
+		try { parsed = JSON.parse(raw); } catch { parsed = null; }
+		ok(parsed !== null, "⑯ `.notified` 必须是可解析的 JSON（不是 0 字节）");
+		eq(parsed?.ok, "claim-only", "⑯ **claim 阶段必须写 claim-only**（写 sent 就是假证据）");
+		ok(typeof parsed?.claimedAt === "string", "⑯ 带 claimedAt");
+		// 双向：重复 claim 必须失败（wx 排他）
+		eq(claimReportNotified(dir, cid), false, "⑯ 重复 claim ⇒ false（wx 排他仍生效）");
+	}
+
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。
 	{
@@ -706,7 +745,7 @@ try {
 			JSON.stringify({ id: "report_wire_1", from: "tab_notfound", message: "x", at: new Date().toISOString() }),
 			"utf8",
 		);
-		writeFileSync(join(reportsDir, "report_wire_1.notified"), "", "utf8");
+		writeFileSync(join(reportsDir, "report_wire_1.notified"), "{\"ok\":\"sent\"}", "utf8");
 		writeFileSync(join(reportsDir, "report_wire_1.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
 		_resetReportListener();
 		_resetHealThrottle();
