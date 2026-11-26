@@ -60,6 +60,36 @@ export interface ReportRecord {
 	summary?: string;
 	at: string;
 	pid: number;
+	/**
+	 * 发送进程的工作目录（2026-11-26）。
+	 *
+	 * 为什么加：`from` 是**纯字符串参数**，零成本就能写别人的地址。实测事故：我在
+	 * `G:/code/GreenCAD` 的 cwd 里跑脚本、`from` 写 `agent://master_local_GreenCAD` ⇒
+	 * global master 收到的报带着 `from=GreenCAD` 但 `pid=117808`（**我的**脚本进程，不是
+	 * GreenCAD 的 30212）。它当场指出「这条不能证明 GreenCAD 能发」—— 完全正确。
+	 *
+	 * ⚠ 强度限定：`cwd` 也不是不可伪造的（脚本可 `process.chdir()`），它只是把伪造成本
+	 * 从「传个字符串」抬到「主动 chdir」。真正的不可伪造身份是 OS 层的 pid+命令行。
+	 *
+	 * ⚠ 类型补登（L4 B3，2026-11-26）：本字段早已在写入/`Pick`/读三处使用，但 interface 当时
+	 * **漏声明**（本仓无 tsc 脚本 ⇒ 静默）。现在补上。
+	 */
+	cwd?: string;
+	/**
+	 * 发送方声称/继承的会话 id，用于与 `from` 的 attachment `sessionId` 比对（`detectFromMismatch`）。
+	 *
+	 * 两种来源（优先级从高到低）：
+	 *  ① `sendReportToMain({ sessionId })` —— **调用方显式提供**（`work-report` 传 `getCurrentSessionId()`）；
+	 *  ② `process.env.PI_SESSION_ID` —— 仅当调用方没传时回退（脚本入口靠它，子进程从会话继承）。
+	 *
+	 * ⚠ 为什么必须有"显式提供"这条路（L4 §5.2，2026-11-26 实测确认）：
+	 * `scripts/boot-resume-master.ps1:93` 在启动 master 时**主动清掉** `PI_SESSION_ID`
+	 * ⇒ boot 出来的 master 宿主进程**很可能没有这个环境变量**。若只读 env，
+	 * `work-report`（旗舰入口）写出的报就永远没有 `envSessionId` ⇒ 冒充检测永不触发。
+	 *
+	 * ⚠ 强度限定：`envSessionId` 也能人为设置（`PI_SESSION_ID=x node …`）⇒ 抬高成本，不是不可伪造。
+	 */
+	envSessionId?: string;
 }
 
 export function defaultReportsDir(agentDir: string = join(homedir(), ".pi", "agent")): string {
@@ -68,7 +98,7 @@ export function defaultReportsDir(agentDir: string = join(homedir(), ".pi", "age
 
 /** 写一份回报（原子：tmp + rename）。由 tab 侧调用。 */
 export function sendReportToMain(
-	opts: { from: string; message: string; taskId?: string; summary?: string; to?: string },
+	opts: { from: string; message: string; taskId?: string; summary?: string; to?: string; sessionId?: string },
 	reportsDir: string = defaultReportsDir(),
 ): string {
 	const id = `report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -82,7 +112,12 @@ export function sendReportToMain(
 		at: new Date().toISOString(),
 		pid: process.pid,
 		cwd: process.cwd(),
-		...(process.env.PI_SESSION_ID ? { envSessionId: process.env.PI_SESSION_ID } : {}),
+		...((): { envSessionId?: string } => {
+			// 显式 sessionId 优先（`work-report` 的旗舰路径：宿主进程可能没有 PI_SESSION_ID，
+			// 见 interface 注释与 L4 §5.2）；否则回退继承的 env（脚本路径）。
+			const sid = opts.sessionId?.trim() || process.env.PI_SESSION_ID?.trim();
+			return sid ? { envSessionId: sid } : {};
+		})(),
 	};
 	if (!existsSync(reportsDir)) mkdirSync(reportsDir, { recursive: true });
 	const file = join(reportsDir, `${id}.json`);
@@ -223,7 +258,7 @@ export interface FromMismatch {
 	envSessionId: string;
 }
 
-export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessionId">): FromMismatch | null {
+export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessionId" | "at">): FromMismatch | null {
 	// ⚠ 判别力登记（R-22 第 4 条，2026-11-26 实测）：本函数对**自家脚本路径恒为 null**。
 	// `scripts/report_to_master.mjs` 的 `from` 就是 `findAttachmentBySession(PI_SESSION_ID)`
 	// 反查出来的 ⇒ `from` 是 `envSessionId` 的**函数**，两者构造上必然一致。
@@ -238,6 +273,21 @@ export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessi
 	const att = readAttachment(from);
 	if (!att || typeof att.sessionId !== "string") return null;
 	if (att.sessionId === record.envSessionId) return null;
+	// ── 时间锚（L4 B1，2026-11-26）：**没有它就是一个会永久拒收合法报的缺陷** ──
+	// `attachment.sessionId` 会被**正规交接**改变：`registry.ts` 的 `attachMaster` 在 token 交接 /
+	// `forceStale` 接管时写新 sessionId 并 bump generation。
+	// ⇒ 一份在**交接前**发出、尚未被消费的报（无 `.notified`），其 `envSessionId` 是**旧 owner**；
+	//   不带上时间锚就会把它判成「冒充」—— **错误归因 + 永久不投递**，
+	//   而在汇报报表上表现为「没人汇报」（与「懒得报」同形，无法区分）。
+	// ⇒ 判据：只有报的发出时刻 **不早于**当前 attachment 的 attach 时刻，两者不一致才说明
+	//   「它发的时候已经不是该地址的 owner」。时间不可解析时**不入罪**（fail open，宁可放过）。
+	const recAt = Date.parse(record.at);
+	const attAt = Date.parse(att.attachedAt);
+	// 时间不可解析 ⇒ **无法证明它是在交接后发的** ⇒ 不入罪（fail open）。
+	// 取舍理由：拒收是**永久终态**（误拒 = 合法报永久不投递 + 错误归因），
+	// 而放过的代价只是「一份可能过期的报被投递」——后者可恢复，前者不可。
+	if (!Number.isFinite(recAt) || !Number.isFinite(attAt)) return null;
+	if (recAt < attAt) return null;
 	return { declared: from, attachmentSessionId: att.sessionId, envSessionId: record.envSessionId };
 }
 
@@ -248,6 +298,10 @@ export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessi
 function markFromMismatch(reportsDir: string, id: string, record: ReportRecord, mm: FromMismatch): void {
 	const path = join(reportsDir, `${id}.from-mismatch`);
 	if (existsSync(path)) return;
+	// `.notified` 守卫（L4 N3，2026-11-26）：已送达的报不得被后来的进程写成「永久拒收」。
+	// 不守卫就会在已送达的报上造出「已送达 + 已拒收」并存 —— 正是本项 ⑦a 要消灭的那个形状，
+	// 只不过换了一对文件（`.from-mismatch` 而不是 `.unroutable`）。
+	if (existsSync(join(reportsDir, `${id}.notified`))) return;
 	try {
 		const fd = openSync(path, "wx");
 		try {
@@ -272,6 +326,8 @@ function markFromMismatch(reportsDir: string, id: string, record: ReportRecord, 
 function markSuspicious(reportsDir: string, id: string, record: ReportRecord, s: Suspicion): void {
 	const path = join(reportsDir, `${id}.suspicious`);
 	if (existsSync(path)) return;
+	// 同 N3：已送达的报不再补写辅助标记（否则会在「已送达」旁边长期挂一个「可疑」）。
+	if (existsSync(join(reportsDir, `${id}.notified`))) return;
 	try {
 		const fd = openSync(path, "wx");
 		try {
@@ -377,7 +433,7 @@ function markUnroutable(reportsDir: string, id: string, record: ReportRecord): v
 				from: record.from,
 				at: new Date().toISOString(),
 				reason: "recipient-unresolved",
-				hint: "本回报的 from/to 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）。注意：**本文件存在不代表未送达** —— 仍在跑旧码的进程会把它写回**已送达**的报（实测 8 个 master 进程启动时间全部早于修复，且不会自己停）；而自愈有 60s 节流，所以矛盾标记最长存在 60 秒。⇒ **重投前必须自己再查一次同名 `.notified`，不能只信本文件存在**。将来若实现「扫描 .unroutable 自动重投」，必须先跳过已存在同名 `.notified` 的 id。本文件当前无自动读取方（只能人工 ls 看到）。见 AGENTS.md §10。",
+				hint: "本回报的 from/to 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）。注意：**本文件存在不代表未送达** —— 仍在跑旧码的进程会把它写回**已送达**的报（实测 8 个 master 进程启动时间全部早于修复，且不会自己停）。⇒ **重投前必须自己再查一次同名 `.notified`，不能只信本文件存在**。关于自愈时机（L4 B4，2026-11-26 实测校正）：**仅当存在一个跑新码、且通过 owner 门的消费者进程时**，并存才在它的一个节流窗口（60s 量级）内被清；若没有这样的进程（旧码进程不会自愈），**并存会一直留着** —— 实测 7 份并存持续 20 分钟以上，不是「60 秒后自动消失」。**将来若实现「扫描 .unroutable 自动重投」，必须先跳过已存在同名 `.notified` 的 id。** 本文件当前无自动读取方。见 AGENTS.md §10。",
 			}, null, 2) + "\n", "utf8");
 		} catch { /* 诊断信息写入失败不影响主流程 */ } finally { closeSync(fd); }
 	} catch { /* EEXIST：已标记过；其它失败：best-effort */ }

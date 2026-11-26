@@ -38,6 +38,7 @@ process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 const { workReportLogic, registerWorkReportTool } = await import("./work-report.ts");
+const { setCurrentSessionId } = await import("./identity.ts");
 
 /** 写一份 attachment（测试夹具必须贴近真实形状 —— 见 AGENTS.md §5） */
 function writeAttachment(addr: string, sessionId: string | null, extra: Record<string, unknown> = {}) {
@@ -275,7 +276,8 @@ try {
 		const MY_SID = "01a1a56a-4f9b-7485-9978-b789a9004df2";
 		writeAttachment(GC, GC_SID);
 
-		const mm = detectFromMismatch({ from: GC, envSessionId: MY_SID });
+		const FUT = "2099-01-01T00:00:00.000Z"; // 晚于 attachment 的 attachedAt ⇒ 时间锚放行这一侧
+		const mm = detectFromMismatch({ from: GC, envSessionId: MY_SID, at: FUT });
 		ok(mm !== null, "⑧a from≠envSessionId ⇒ 检出冒充");
 		eq(mm?.attachmentSessionId, GC_SID, "⑧a 报出 attachment 的权威 sessionId");
 		eq(mm?.envSessionId, MY_SID, "⑧a 报出进程实际继承的 sessionId");
@@ -450,6 +452,97 @@ try {
 		const legacy = readReportFile(dir, "report_legacy_noid");
 		eq(legacy?.id, undefined, "⑪b 存量无 id 仍可读（向后兼容，不报错）");
 		ok(legacy?.message === "old", "⑪b 存量记录正文不受影响");
+	}
+
+	// ── ⑫ L4 阻断项回归（2026-11-26，独立审查 B1/B3/L4-M5/L4-M6）──
+	{
+		const dir = join(tmp, "reports-l4");
+		mkdirSync(dir, { recursive: true });
+		const HO = "agent://master_local_HandedOver";
+		const OLD_SID = "01a1aaaa-0000-4000-8000-000000000001";
+		const NEW_SID = "01a1bbbb-0000-4000-8000-000000000002";
+
+		// 交接：attachment 现在属于 NEW_SID，且 attachedAt 晚于旧报
+		const hoPath = attachmentPathFor(HO);
+		mkdirSync(join(hoPath, ".."), { recursive: true });
+		writeFileSync(
+			hoPath,
+			JSON.stringify({ agentAddress: HO, sessionId: NEW_SID, generation: 2, attachedAt: "2026-11-26T10:00:00.000Z", lastHeartbeatAt: "2026-11-26T10:00:00.000Z", attemptId: "t" }),
+			"utf8",
+		);
+
+		// ⑫a **B1 核心**：交接前发出的合法报 ⇒ 不得判冒充（否则永久不投递 + 错误归因）
+		eq(
+			detectFromMismatch({ from: HO, envSessionId: OLD_SID, at: "2026-11-26T09:00:00.000Z" }),
+			null,
+			"⑫a 交接**前**发出的报（envSessionId=旧 owner）⇒ 不判冒充（时间锚）",
+		);
+
+		// ⑫b 交接后旧 owner 继续发 ⇒ 才是冒充
+		ok(
+			detectFromMismatch({ from: HO, envSessionId: OLD_SID, at: "2026-11-26T11:00:00.000Z" }) !== null,
+			"⑫b 交接**后**旧 owner 仍发 ⇒ 判冒充（时间锚不放行这一侧）",
+		);
+
+		// ⑫c 时间不可解析 ⇒ fail open（不因坏时间戳入罪）
+		eq(
+			detectFromMismatch({ from: HO, envSessionId: OLD_SID, at: "not-a-date" }),
+			null,
+			"⑫c 坏时间戳 ⇒ 不判冒充（fail open，宁可放过）",
+		);
+
+		// ⑫d L4-N3：已送达的报不得被补写永久「拒收」标记
+		{
+			const d2 = join(tmp, "reports-l4-n3");
+			mkdirSync(d2, { recursive: true });
+			const nid = "report_n3_delivered";
+			writeFileSync(join(d2, nid + ".json"), JSON.stringify({ id: nid, from: HO, envSessionId: OLD_SID, at: "2026-11-26T11:00:00.000Z", message: "x", pid: 1 }), "utf8");
+			writeFileSync(join(d2, nid + ".notified"), "", "utf8"); // 已送达
+			_resetReportListener();
+			onNewReport(d2, nid, { sendUserMessage: () => {}, linksPath: LINKS });
+			eq(existsSync(join(d2, nid + ".from-mismatch")), false, "⑫d 已送达（有 .notified）⇒ 不写 .from-mismatch");
+		}
+
+		// ⑫e L4-M5：`index.ts` 真的注册了 work-report（删掉真实注册调用必须红）
+		{
+			const idxPath = join(process.cwd(), "extensions", "index.ts");
+			const idxSrc = readFileSync(idxPath, "utf8");
+			ok(idxSrc.includes("registerWorkReportTool(pi)"), "⑫e 接线：extensions/index.ts 必须真的调用 registerWorkReportTool(pi)");
+			ok(idxSrc.includes('from "./work-report.ts"'), "⑫e 接线：index.ts 必须 import work-report");
+		}
+
+		// ⑫f L4-M6：**只标不拒** —— 可疑但收件人就是本会话 ⇒ 仍然注入
+		{
+			const d3 = join(tmp, "reports-l4-m6");
+			mkdirSync(d3, { recursive: true });
+			const MY = "01a1a56a-4f9b-7485-9978-b789a9004df2";
+			const sid3 = "report_m6_suspicious_delivered";
+			writeFileSync(
+				join(d3, sid3 + ".json"),
+				JSON.stringify({
+					id: sid3,
+					from: HO,
+					to: MY,
+					envSessionId: NEW_SID, // 与 attachment 一致 ⇒ 不是 mismatch
+					cwd: "C:\\tmp", // 但 scope=HandedOver 不在 cwd 里 ⇒ 可疑
+					message: "可疑但要照常投递",
+					at: "2026-11-26T11:00:00.000Z",
+					pid: 1,
+				}),
+				"utf8",
+			);
+			setCurrentSessionId(MY);
+			_resetReportListener();
+			const injected: string[] = [];
+			try {
+				const fired = onNewReport(d3, sid3, { sendUserMessage: (b: string) => injected.push(b), linksPath: LINKS });
+				eq(fired, true, "⑫f 可疑的报仍必须投递（fired=true）");
+				ok(injected.length > 0, "⑫f **只标不拒**：可疑仍注入正文（变异成拒收必须红）");
+				eq(existsSync(join(d3, sid3 + ".suspicious")), true, "⑫f 同时落了 .suspicious 标记");
+			} finally {
+				setCurrentSessionId(undefined);
+			}
+		}
 	}
 
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──

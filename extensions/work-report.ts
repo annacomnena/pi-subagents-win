@@ -83,6 +83,10 @@ export function workReportLogic(input: WorkReportInput): WorkReportOutcome {
 			message: input.message,
 			...(input.summary ? { summary: input.summary } : {}),
 			...(input.taskId ? { taskId: input.taskId } : {}),
+			// **显式传会话 id**（L4 §5.2）：宿主进程可能没有 `PI_SESSION_ID`
+			//（`scripts/boot-resume-master.ps1:93` 启动 master 时会主动清掉它），
+			// 而 `getCurrentSessionId()` 是 pi 上下文注入的，在进程内一定可用。
+			sessionId: sid,
 		},
 		input.reportsDir,
 	);
