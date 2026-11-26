@@ -257,6 +257,10 @@ try {
 			? readFileSync(join(reportsDir, "report_mutex_d.unroutable"), "utf8")
 			: "";
 		ok(newText.includes("必须先跳过已存在同名"), "⑦d 新写入的 .unroutable 必须警告将来的重投器先查 .notified");
+		// ⑦d2（global master 2026-11-26 提）：文案必须说清「文件存在 ≠ 未送达」——
+		// 因为旧码进程会把它写回已送达的报，而自愈有 60s 节流 ⇒ 重投器若只信文件存在就会重发。
+		ok(newText.includes("本文件存在不代表未送达"), "⑦d2 文案必须写「文件存在不代表未送达」");
+		ok(newText.includes("重投前必须自己再查一次同名"), "⑦d2 文案必须要求重投器自查 .notified（不只信文件存在）");
 		ok(!newText.includes("本文件目前**无任何读取方**"), "⑦d 旧自述（会变谎话的那句）已移除");
 		ok(unroutableText.length > 0, "⑦d 对照：旧文件仍可读（不追溯改写存量）");
 	}

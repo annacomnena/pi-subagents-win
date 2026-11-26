@@ -282,7 +282,7 @@ function markUnroutable(reportsDir: string, id: string, record: ReportRecord): v
 				from: record.from,
 				at: new Date().toISOString(),
 				reason: "recipient-unresolved",
-				hint: "本回报的 from/to 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）；未被任何会话消费。修好解析能力后会自动重试（本文件不影响重试）。本文件不是「已送达」的证据。注意（2026-11-26 改）：本文件当前**无自动读取方**（只能人工 ls 看到）；**将来若实现「扫描 .unroutable 自动重投」，必须先跳过已存在同名 `.notified` 的 id** —— 否则会把已送达的回报重投一次（本模块写本文件前已检查该互斥条件，但那只对新码写入者成立）。见 AGENTS.md §10。",
+				hint: "本回报的 from/to 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）。注意：**本文件存在不代表未送达** —— 仍在跑旧码的进程会把它写回**已送达**的报（实测 8 个 master 进程启动时间全部早于修复，且不会自己停）；而自愈有 60s 节流，所以矛盾标记最长存在 60 秒。⇒ **重投前必须自己再查一次同名 `.notified`，不能只信本文件存在**。将来若实现「扫描 .unroutable 自动重投」，必须先跳过已存在同名 `.notified` 的 id。本文件当前无自动读取方（只能人工 ls 看到）。见 AGENTS.md §10。",
 			}, null, 2) + "\n", "utf8");
 		} catch { /* 诊断信息写入失败不影响主流程 */ } finally { closeSync(fd); }
 	} catch { /* EEXIST：已标记过；其它失败：best-effort */ }
