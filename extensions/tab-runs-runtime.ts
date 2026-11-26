@@ -498,12 +498,15 @@ export function registerTabTelemetry(
 		description: [
 			"（标签页内部工具）主动向主会话回报消息：写入 ~/.pi/agent/reports/，主会话感知后注入用户消息被模型处理。",
 			"用于工作完成、需要主会话决策/关注、或重要进展时主动联系主会话（不必等主会话轮询）。",
-			"参数：message（回报内容）、可选 taskId / summary。from 取自本标签页 runId。",
+			"参数：message（回报内容）、可选 taskId / summary / to。from 取自本标签页 runId。",
+			"to（2026-11-25）：显式指定接收方（agent://master_* / 会话 UUID / tab_*）。",
+			"不传 to = 旧行为（发给派发本标签页的主会话）；横向/跨层汇报请**显式**给 to。",
 		].join(" "),
 		parameters: Type.Object({
 			message: Type.String({ description: "回报消息（注入主会话的内容，≤1000 字符）" }),
 			taskId: Type.Optional(Type.String({ description: "关联任务号" })),
 			summary: Type.Optional(Type.String({ description: "简短摘要（≤200 字符）" })),
+			to: Type.Optional(Type.String({ description: "显式接收方（agent://master_* / UUID / tab_*）；不传=派发方" })),
 		}),
 		renderCall(args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("tab-report"))} ${theme.fg("accent", `→main`)} ${theme.fg("dim", String(args.message ?? "").slice(0, 40))}`, 0, 0);
@@ -517,7 +520,7 @@ export function registerTabTelemetry(
 			if (!runId) {
 				return { content: [{ type: "text", text: "当前进程不是标签页（无 tab-run-id）" }], isError: true };
 			}
-			const p = rawParams as { message?: string; taskId?: string; summary?: string };
+			const p = rawParams as { message?: string; taskId?: string; summary?: string; to?: string };
 			const raw = (p.message ?? "").trim();
 			if (!raw) {
 				return { content: [{ type: "text", text: "message 必填" }], isError: true };
@@ -551,6 +554,7 @@ export function registerTabTelemetry(
 			try {
 				sendReportToMain({
 					from: runId,
+					...((p.to ?? "").trim() ? { to: String(p.to).trim() } : {}),
 					message,
 					taskId: p.taskId,
 					summary: p.summary?.slice(0, 200),

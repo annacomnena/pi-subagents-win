@@ -239,6 +239,7 @@
     "test:runtime-graph": "node --experimental-strip-types ./extensions/_test_runtime_graph.ts",
     "check:dev-contracts": "node ./scripts/check-development-contracts.mjs",
     "test:autonomy-control-plane": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_autonomy_control_plane.ts",
+    "test:report-upward": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_report_upward.ts",
     "test:runtime-host-restart": "node --experimental-strip-types --import ./extensions/runtime-host/pi-deps-loader.mjs ./extensions/_test_runtime_host_restart.ts",
     "test:status-isolation": "node --experimental-strip-types ./extensions/_test_status_isolation.ts",
     "test:steer-takeover-worker": "node --experimental-strip-types ./extensions/_test_steer_takeover_worker.ts",

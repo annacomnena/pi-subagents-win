@@ -26,8 +26,20 @@ import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
-	/** 回报方身份：tab_<runId> 或 sessionId。 */
+	/** 回报方身份：tab_<runId> 或 sessionId（或 agent:// 地址）。 */
 	from: string;
+	/**
+	 * 【2026-11-25 新增】**显式接收方**。
+	 *
+	 * 为什么需要：旧实现只从 `from` 推导接收方（`from` 是 tab ⇒ 查 links 拿**派发方**），
+	 * 这个语义只回答了「谁派我去的」，**无法表达横向汇报**（local master → global master）。
+	 * 若强行把 `from = agent://master_local_X` 解析成它自己的 sessionId，
+	 * 结果是**自环**（report 被注入回发送方自己）。
+	 *
+	 * ⇒ 横向汇报必须**显式**给出 `to`，不从 `from` 猜。
+	 * 支持：`agent://master_*`（读 registry/attachments 拿 sessionId）、UUID、`tab_*`。
+	 */
+	to?: string;
 	/** 回报消息（注入主会话的用户消息内容）。 */
 	message: string;
 	taskId?: string;
@@ -42,12 +54,13 @@ export function defaultReportsDir(agentDir: string = join(homedir(), ".pi", "age
 
 /** 写一份回报（原子：tmp + rename）。由 tab 侧调用。 */
 export function sendReportToMain(
-	opts: { from: string; message: string; taskId?: string; summary?: string },
+	opts: { from: string; message: string; taskId?: string; summary?: string; to?: string },
 	reportsDir: string = defaultReportsDir(),
 ): string {
 	const id = `report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 	const record: ReportRecord = {
 		from: opts.from,
+		...(opts.to ? { to: opts.to } : {}),
 		message: opts.message,
 		taskId: opts.taskId,
 		summary: opts.summary,
@@ -61,29 +74,63 @@ export function sendReportToMain(
 	return id;
 }
 
-/**
- * 回报的预期接收会话 UUID：
- *   - from 为 tab runId → 查 links.jsonl（kind=tab，targetId=from）拿派发方会话；
- *   - from 本身是 sessionId → 直接视为接收方；
- *   - 解析不到 → undefined（不消费：宁可留在 reports/ 等人工 / 编排会话处理）。
- *
- * 修复 2026-08-11：此前任何 identityless 进程都能抢回报（.notified 只去重不定位），
- * 导致 task 238 的回报落到无关目录的会话。
- */
-export function recipientSessionIdFor(record: Pick<ReportRecord, "from">, linksPath: string = defaultLinksPath()): string | undefined {
-	const from = record.from;
-	if (!from) return undefined;
-	if (!from.startsWith("tab_")) {
-		// sessionId 形态：直接作为接收方
-		return /^[0-9a-f-]{8,}$/i.test(from) ? from : undefined;
-	}
-	// tab runId：找最近一次派发记录
+/** UUID 形态（会话 id）判定：小写十六进制 + 连字符，≥ 8 位。 */
+function isUuidLike(s: string): boolean {
+	return /^[0-9a-f-]{8,}$/i.test(s);
+}
+
+/** tab runId 形态 ⇒ 查 links.jsonl 拿**派发方**（= 子→父汇报的接收方）。 */
+function dispatchSessionForTab(tabRunId: string, linksPath: string): string | undefined {
 	for (const link of listLinks(linksPath)) {
-		if (link.kind === "tab" && link.targetId === from && link.sessionId && link.sessionId !== "unknown") {
+		if (link.kind === "tab" && link.targetId === tabRunId && link.sessionId && link.sessionId !== "unknown") {
 			return link.sessionId;
 		}
 	}
 	return undefined;
+}
+
+/**
+ * `agent://*` 地址 ⇒ 会话 sessionId（读 `registry/attachments/<addr>.json`）。
+ *
+ * **fail closed**：无 attachment / 读失败 / sessionId 不合法 ⇒ `undefined`（不猜）。
+ * 这是 Item 66 第 2 层（2026-11-25）：此前 `recipientSessionIdFor` 不认 `agent://`，
+ * 导致 `report_mwucgcad_r1a0`（from=`agent://master_local_GreenCAD`）永不消费。
+ */
+function sessionIdForAgentAddress(addr: string): string | undefined {
+	try {
+		const att = readAttachment(addr as Parameters<typeof readAttachment>[0]);
+		if (!att || typeof att.sessionId !== "string" || !isUuidLike(att.sessionId)) return undefined;
+		return att.sessionId;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * 回报的预期接收会话 UUID：
+ *   - **有 `to` ⇒ 按 `to` 解析**（2026-11-25 新增；横向汇报唯一正确入口）；
+ *   - 无 `to` ⇒ 旧逻辑**逐字节不变**：`from` 是 tab runId ⇒ 查 links 拿派发方；
+ *     `from` 本身是 sessionId ⇒ 直接视为接收方；解析不到 ⇒ undefined。
+ *
+ * 修复 2026-08-11：此前任何 identityless 进程都能抢回报（.notified 只去重不定位），
+ * 导致 task 238 的回报落到无关目录的会话。
+ */
+export function recipientSessionIdFor(record: Pick<ReportRecord, "from" | "to">, linksPath: string = defaultLinksPath()): string | undefined {
+	// ① 显式 to 优先：不从 from 推导（避免 `agent://` 自环）
+	if (record.to) {
+		const t = record.to;
+		if (t.startsWith("agent://")) return sessionIdForAgentAddress(t);
+		if (t.startsWith("tab_")) return dispatchSessionForTab(t, linksPath);
+		return isUuidLike(t) ? t : undefined;
+	}
+	// ② 旧逻辑逐字保留
+	const from = record.from;
+	if (!from) return undefined;
+	if (!from.startsWith("tab_")) {
+		// sessionId 形态：直接作为接收方
+		return isUuidLike(from) ? from : undefined;
+	}
+	return dispatchSessionForTab(from, linksPath);
 }
 
 /** 读取一份回报；缺失/损坏返回 null。 */
