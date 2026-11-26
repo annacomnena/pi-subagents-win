@@ -156,18 +156,34 @@ function autoContext() {
 			let untracked = 0;
 			let staged = 0;
 			let modified = 0;
+			const dirtyNames = [];
 			for (const l of lines) {
 				const x = l[0] ?? " ";
 				const y = l[1] ?? " ";
-				if (x === "?" && y === "?") { untracked++; continue; }
+				// `l.slice(3)` 去掉 `XY ` 前缀（重命名形态 `R  old -> new` 保留原样，可接受）
+				const p = l.slice(3).replace(/^"|"$/g, "");
+				if (x === "?" && y === "?") { untracked++; dirtyNames.push(p); continue; }
 				if (x !== " " && x !== "?") staged++;
 				if (y !== " " && y !== "?") modified++;
+				dirtyNames.push(p);
 			}
 			counters = ` modified=${modified} staged=${staged} untracked=${untracked}`;
+			// global master 2026-11-26 建议：计数只回答「脏不脏」，**文件名回答「脏在哪」**。
+			// 而只有后者能让人做判断 —— 尤其 `staged=1` 若不给名字，**事后不可核**
+			// （那个文件一经提交就消失了，看到「1 个 staged」的人永远查不到它是谁）。
+			if (dirtyNames.length) {
+				const shown = dirtyNames.slice(0, 3).join(", ");
+				const more = dirtyNames.length > 3 ? ` +${dirtyNames.length - 3}` : "";
+				counters += ` files=[${shown}${more}]`;
+			}
 		} catch {
 			counters = " modified=? staged=? untracked=?";
 		}
-		return `[auto] at=${at} cwd=${cwd} repo=${toplevel} head=${head} branch=${branch}${counters}`;
+		// ⚠ `at` 的语义必须写清（global master 2026-11-26）：
+		// 它是**本脚本读取 git 状态的时刻**（≈ 落盘时刻），**不是投递时刻、也不是到达时刻**。
+		// 判别：若拿它与「收到时」的差去诊断延迟，那个差里混了两件事（发送侧 vs 投递侧），
+		// 而两者的正确处置完全相反 ⇒ 不要用它归因延迟。
+		return `[auto] read_at=${at} cwd=${cwd} repo=${toplevel} head=${head} branch=${branch}${counters}`;
 	} catch {
 		return `[auto] at=${at} cwd=${cwd} repo=(not a git repo)`;
 	}
