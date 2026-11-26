@@ -35,7 +35,7 @@ const tmp = mkdtempSync(join(tmpdir(), "report-upward-"));
 const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
 process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
-const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle } = await import("./report.ts");
+const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 
 /** 写一份 attachment（测试夹具必须贴近真实形状 —— 见 AGENTS.md §5） */
@@ -246,11 +246,72 @@ try {
 		writeFileSync(join(reportsDir, "report_mutex_d.json"), JSON.stringify({ ...rec7, id: "report_mutex_d" }), "utf8");
 		_resetReportListener();
 		onNewReport(reportsDir, "report_mutex_d", { sendUserMessage: () => {}, linksPath: LINKS });
-		const newText = readFileSync(join(reportsDir, "report_mutex_d.unroutable"), "utf8");
+		// 前置断言：解析不出的报**必须**落 unroutable。少了这条，若将来某改动让它不落，
+		// 下面的 readFileSync 会以 ENOENT **崩溃**而不是给出清晰断言（实测踩过：M11 崩在这里）。
+		ok(
+			existsSync(join(reportsDir, "report_mutex_d.unroutable")),
+			"⑦d 前置：解析不出的报必须落 unroutable",
+		);
+		const newText = existsSync(join(reportsDir, "report_mutex_d.unroutable"))
+			? readFileSync(join(reportsDir, "report_mutex_d.unroutable"), "utf8")
+			: "";
 		ok(newText.includes("必须先跳过已存在同名"), "⑦d 新写入的 .unroutable 必须警告将来的重投器先查 .notified");
 		ok(!newText.includes("本文件目前**无任何读取方**"), "⑦d 旧自述（会变谎话的那句）已移除");
 		ok(unroutableText.length > 0, "⑦d 对照：旧文件仍可读（不追溯改写存量）");
 	}
+
+	// ── ⑧ from-mismatch：「谁发的」可核（global master 用 pid 揭穿我的探测后补）──
+	//
+	// 事故：我在 GreenCAD 的 cwd 里跑脚本、`from` 写 GreenCAD ⇒ 收到的报带 pid=我的脚本进程。
+	// `from` 是自报；可核的是「attachment 的 sessionId」与「进程继承的 PI_SESSION_ID」。
+	{
+		const GC = "agent://master_local_GreenCAD";
+		const GC_SID = "01a1d371-1a49-73df-8fe1-b5c774018815";
+		const MY_SID = "01a1a56a-4f9b-7485-9978-b789a9004df2";
+		writeAttachment(GC, GC_SID);
+
+		const mm = detectFromMismatch({ from: GC, envSessionId: MY_SID });
+		ok(mm !== null, "⑧a from≠envSessionId ⇒ 检出冒充");
+		eq(mm?.attachmentSessionId, GC_SID, "⑧a 报出 attachment 的权威 sessionId");
+		eq(mm?.envSessionId, MY_SID, "⑧a 报出进程实际继承的 sessionId");
+
+		eq(detectFromMismatch({ from: GC, envSessionId: GC_SID }), null, "⑧b from 与 envSessionId 一致 ⇒ 通过");
+		eq(detectFromMismatch({ from: GC }), null, "⑧c 无 envSessionId（存量报）⇒ 跳过检查（向后兼容）");
+		eq(detectFromMismatch({ from: "tab_abc123", envSessionId: MY_SID }), null, "⑧d tab_* ⇒ 不做此检查");
+
+		{
+			const dir = join(tmp, "reports-mismatch");
+			mkdirSync(dir, { recursive: true });
+			const bid = "report_mismatch_1";
+			writeFileSync(
+				join(dir, bid + ".json"),
+				JSON.stringify({ id: bid, from: GC, to: "agent://master_default", envSessionId: MY_SID, message: "冒充", at: new Date().toISOString(), pid: 1 }),
+				"utf8",
+			);
+			_resetReportListener();
+			const injected = [];
+			onNewReport(dir, bid, { sendUserMessage: (b) => injected.push(b), linksPath: LINKS });
+			eq(existsSync(join(dir, bid + ".from-mismatch")), true, "⑧e 接线：冒充 ⇒ 落 .from-mismatch 标记");
+			eq(injected.length, 0, "⑧e 冒充的报**不得**注入本会话（哪怕路由能解析）");
+			eq(existsSync(join(dir, bid + ".unroutable")), false, "⑧e 冒充**不是** unroutable（拒收 vs 不知道怎么送）");
+		}
+
+		{
+			const dir = join(tmp, "reports-ident");
+			const prevSid = process.env.PI_SESSION_ID;
+			process.env.PI_SESSION_ID = MY_SID;
+			try {
+				const iid = sendReportToMain({ from: "tab_abc123", message: "ident" }, dir);
+				const r = readReportFile(dir, iid);
+				eq(r?.envSessionId, MY_SID, "⑧f envSessionId 自动从 PI_SESSION_ID 写入");
+				ok(typeof r?.cwd === "string" && r.cwd.length > 0, "⑧f cwd 自动写入（OS 事实，不是参数）");
+			} finally {
+				if (prevSid === undefined) delete process.env.PI_SESSION_ID;
+				else process.env.PI_SESSION_ID = prevSid;
+			}
+		}
+	}
+
 
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。

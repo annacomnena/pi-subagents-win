@@ -24,7 +24,7 @@
  * 必须走受守卫的控制入口，不可对外直接使用底层原语。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimeDir } from "./journal.ts";
 import { isObjectAddress, masterAddress, type ObjectAddress } from "./address.ts";
@@ -90,7 +90,34 @@ export function readAttachment(agent: ObjectAddress = masterAddress()): MasterAt
 	}
 }
 
-// ── attach（显式）───────────────────────────────────────────────────
+/**
+ * 按 sessionId 反查该会话自己的 agent 地址（2026-11-26）。
+ *
+ * 用途：让发送方**自动取自己的身份**而不是手写 `from`。事故：我在 GreenCAD 的 cwd 里跑脚本
+ * 却手写 `from=agent://master_local_GreenCAD`（实际是我这个会话的进程）⇒ global 用一个 pid 核查
+ * 就揭穿了。手工填 from 的形状本身就鼓励撒谎 ⇒ 提供这个查法让调用方无法填错。
+ *
+ * 同一 sessionId 可能持多个地址（实测：`master_default` 与 `master_local_Annacomnena`
+ * 同属 01a2070a）⇒ 优先返回非 global 的那个（local 更具体），否则第一个命中。never-throw。
+ */
+export function findAttachmentBySession(sessionId: string): MasterAttachment | null {
+	if (!sessionId) return null;
+	let names: string[];
+	try { names = readdirSync(attachmentsDir()); } catch { return null; }
+	let firstHit: MasterAttachment | null = null;
+	for (const n of names) {
+		if (!n.endsWith(".json")) continue;
+		try {
+			const a = JSON.parse(readFileSync(join(attachmentsDir(), n), "utf8")) as MasterAttachment;
+			if (!a || a.sessionId !== sessionId || !isObjectAddress(a.agentAddress)) continue;
+			if (a.agentAddress.startsWith("agent://master_local_")) return a;
+			if (!firstHit) firstHit = a;
+		} catch { /* 单文件坏不影响其它 */ }
+	}
+	return firstHit;
+}
+
+// ── attach（显式）─────────────────────────────────────────────
 
 export interface AttachInput {
 	sessionId: string;

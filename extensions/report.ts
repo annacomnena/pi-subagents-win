@@ -66,6 +66,8 @@ export function sendReportToMain(
 		summary: opts.summary,
 		at: new Date().toISOString(),
 		pid: process.pid,
+		cwd: process.cwd(),
+		...(process.env.PI_SESSION_ID ? { envSessionId: process.env.PI_SESSION_ID } : {}),
 	};
 	if (!existsSync(reportsDir)) mkdirSync(reportsDir, { recursive: true });
 	const file = join(reportsDir, `${id}.json`);
@@ -131,6 +133,66 @@ export function recipientSessionIdFor(record: Pick<ReportRecord, "from" | "to">,
 		return isUuidLike(from) ? from : undefined;
 	}
 	return dispatchSessionForTab(from, linksPath);
+}
+
+/**
+ * `from` 冒充检测（2026-11-26，由 global master 的现场核查触发）。
+ *
+ * 事故：我在 `G:/code/GreenCAD` 的 cwd 里跑脚本、`from` 写 `agent://master_local_GreenCAD`，
+ * global 收到的报带 `pid=117808`（**我的**脚本进程，不是 GreenCAD 的 30212）⇒ 它指出：
+ * 「这条不能证明 GreenCAD 能发」——正确。**`from` 是自报，什么都不证明。**
+ *
+ * 判据（三者一致性）：
+ *   ① `from` 的 attachment `sessionId`（权威，由 attach 流程写入）
+ *   ② 报里继承的 `envSessionId`（`PI_SESSION_ID`，由子进程从会话进程继承）
+ *   ③ `from` 自己声明的地址
+ * ①≠② ⇒ 这份报不是「②那个会话」能合法represent的 ⇒ **拒收**。
+ *
+ * 强度限定（不得超额声称）：
+ *  - `envSessionId` 也能人为设置（`PI_SESSION_ID=x node script.mjs`）⇒ 它抬高伪造成本（需主动设 env），
+ *    但**不是不可伪造**。真正不可伪造的是 OS 层 pid+命令行，且必须在 pid 存活时核。
+ *  - 只对 `agent://` 形态检查：`tab_*` 没有 attachment（tab 不是 agent 地址），不能误拒。
+ *  - 缺 `envSessionId`（2026-11-26 之前的存量报）⇒ 跳过（向后兼容，不是拒收）。
+ */
+export interface FromMismatch {
+	declared: string;
+	attachmentSessionId: string;
+	envSessionId: string;
+}
+
+export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessionId">): FromMismatch | null {
+	const from = record.from;
+	if (!from || !from.startsWith("agent://")) return null;
+	if (!record.envSessionId) return null;
+	const att = readAttachment(from);
+	if (!att || typeof att.sessionId !== "string") return null;
+	if (att.sessionId === record.envSessionId) return null;
+	return { declared: from, attachmentSessionId: att.sessionId, envSessionId: record.envSessionId };
+}
+
+/**
+ * 冒充标记：<id>.from-mismatch（与 .unroutable 分开 —— 两者语义不同：
+ * unroutable = 「不知道怎么送」可重试；from-mismatch = 「送了你也不该信」永久终态）。
+ */
+function markFromMismatch(reportsDir: string, id: string, record: ReportRecord, mm: FromMismatch): void {
+	const path = join(reportsDir, `${id}.from-mismatch`);
+	if (existsSync(path)) return;
+	try {
+		const fd = openSync(path, "wx");
+		try {
+			writeSync(fd, JSON.stringify({
+				id,
+				declaredFrom: mm.declared,
+				attachmentSessionId: mm.attachmentSessionId,
+				envSessionId: mm.envSessionId,
+				pid: record.pid,
+				cwd: record.cwd,
+				at: new Date().toISOString(),
+				reason: "from-mismatch",
+				hint: "`from` 声明的地址与该进程继承的 PI_SESSION_ID（=附件里的 sessionId）不一致 ⇒ 发送者不是它声称的那个会话。本文件是**拒收**证据（不是重试队列）：冒充不会自愈，不要写重投器处理它。",
+			}, null, 2) + "\n", "utf8");
+		} catch { /* 诊断写入失败不影响主流程 */ } finally { closeSync(fd); }
+	} catch { /* EEXIST / 其它：best-effort */ }
 }
 
 /** 读取一份回报；缺失/损坏返回 null。 */
@@ -383,6 +445,18 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	// 取舍：挡掉的是「短时间内重复做一次 3-5ms 全扫」，换到的是「不会被无界存量把 tick 拖死」；
 	// 且本通道是 best-effort 旁路（不是控制面），分钟级延迟可接受。
 	if (!unroutableRetryDue(id)) return false;
+
+	// 冒充检测**必须先于路由**（2026-11-26）：否则一份「from 写别人、内容却进了真接收方」的报
+	// 会被当正常度过 —— 路由成功恰恰是冒充的目的。且它是**永久终态**（冒充不会自愈）⇒
+	// markSeen 是正确处置（与 unroutable 的可重试态相反）。
+	{
+		const mm = detectFromMismatch(record);
+		if (mm) {
+			markFromMismatch(reportsDir, id, record, mm);
+			markReportSeen(id);
+			return false;
+		}
+	}
 
 	const recipient = recipientSessionIdFor(record, opts.linksPath);
 	const mySession = sessionScopeKey();
