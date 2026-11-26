@@ -32,6 +32,7 @@
     ]
   },
   "scripts": {
+    "test": "bash scripts/_run_all_tests.sh /tmp/all-tests.log",
     "prepare:test-deps": "node ./scripts/ensure-pi-test-deps.mjs",
     "smoke:wiki-nav": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_nav.ts",
     "smoke:wiki-semantic": "node ./scripts/ensure-pi-test-deps.mjs && node --experimental-strip-types ./extensions/_smoke_wiki_semantic.ts",
