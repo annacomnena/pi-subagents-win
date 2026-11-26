@@ -292,12 +292,17 @@ try {
 			const bid = "report_mismatch_1";
 			writeFileSync(
 				join(dir, bid + ".json"),
-				JSON.stringify({ id: bid, from: GC, to: "agent://master_default", envSessionId: MY_SID, message: "冒充", at: new Date().toISOString(), pid: 1 }),
+				JSON.stringify({ id: bid, from: GC, to: MY_SID, envSessionId: MY_SID, message: "冒充", at: "2099-01-01T00:00:00.000Z", pid: 1 }),
 				"utf8",
 			);
 			_resetReportListener();
 			const injected = [];
-			onNewReport(dir, bid, { sendUserMessage: (b) => injected.push(b), linksPath: LINKS });
+			setCurrentSessionId(MY_SID);
+			try {
+				onNewReport(dir, bid, { sendUserMessage: (b) => injected.push(b), linksPath: LINKS });
+			} finally {
+				setCurrentSessionId(undefined);
+			}
 			eq(existsSync(join(dir, bid + ".from-mismatch")), true, "⑧e 接线：冒充 ⇒ 落 .from-mismatch 标记");
 			eq(injected.length, 0, "⑧e 冒充的报**不得**注入本会话（哪怕路由能解析）");
 			eq(existsSync(join(dir, bid + ".unroutable")), false, "⑧e 冒充**不是** unroutable（拒收 vs 不知道怎么送）");
@@ -348,8 +353,11 @@ try {
 		eq(r3.details.reason, "no-session-id", "⑨c 拒绝理由明确");
 
 		// ⑨d 空正文 ⇒ 拒绝
-		const r4 = workReportLogic({ message: "   ", sessionId: SID, reportsDir: dir });
+		// ⚠ 必须传 to（L4 P2-3，2026-11-26）：不传时 recipient 恒 undefined
+		// ⇒ `ok = Boolean(recipient)` 恒 false ⇒ 断言恒真（删掉空正文检查也绿）。传了才能区分两者。
+		const r4 = workReportLogic({ message: "   ", to: "agent://master_default", sessionId: SID, reportsDir: dir });
 		eq(r4.ok, false, "⑨d 空正文 ⇒ 拒绝");
+		eq(r4.details.reason, "empty-message", "⑨d 拒绝理由必须是 empty-message（不是「路不通」）");
 
 		// ⑨e **接线**：注册函数真的把这个工具注册给 pi（否则工具永远不存在）
 		{
