@@ -16,6 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, writeSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { getCurrentSessionId, isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
@@ -346,6 +347,64 @@ function markSuspicious(reportsDir: string, id: string, record: ReportRecord, s:
 	} catch { /* EEXIST / 其它：best-effort */ }
 }
 
+/**
+ * 内容陈旧检测（global master 2026-11-26 要求，并给了删除性判据）。
+ *
+ * 定位（不得超额声称）：
+ *   这是**否定式判据的自动化** —— 只报「它说的和现在不一样」，
+ *   **不报「它是对的」**。一致时什么都不输出，因为「一致」只证明有人读过那个仓，
+ *   不证明是谁发的（实测：在别的仓里 `git -C <某仓> rev-parse` 也能读到同一个值）。
+ *
+ * 「一致也打一行 OK」会制造**假证据** —— global master 明确要求不要那么做。
+ *
+ * 输入：报正文首行的 `[auto] at=… repo=… head=…`（由 `scripts/report_to_master.mjs` 注入）。
+ * 无 auto 行的报（tab 报、手工写 JSON、旧脚本）⇒ 不检查。
+ */
+export interface StaleContext {
+	reportedHead: string;
+	actualHead: string;
+	repo: string;
+}
+
+export function detectStaleContext(record: Pick<ReportRecord, "message">): StaleContext | null {
+	const first = (record.message ?? "").split("\n")[0] ?? "";
+	if (!first.startsWith("[auto] ")) return null;
+	const head = /\bhead=([0-9a-f]{4,40})\b/.exec(first)?.[1];
+	const repo = /\brepo=([^\s]+)/.exec(first)?.[1];
+	if (!head || !repo || repo.startsWith("(")) return null;
+	try {
+		const actual = execFileSync("git", ["-C", repo, "rev-parse", "--short", "HEAD"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 5000,
+		}).trim();
+		if (!actual || actual === head) return null; // 一致 ⇒ 什么都不说
+		return { reportedHead: head, actualHead: actual, repo };
+	} catch {
+		return null; // 读不到 ⇒ 不知道（不制造假信号）
+	}
+}
+
+/** `<id>.stale`：只在**不一致**时写（一致时不写任何东西）。 */
+function markStale(reportsDir: string, id: string, record: ReportRecord, s: StaleContext): void {
+	const path = join(reportsDir, `${id}.stale`);
+	if (existsSync(path)) return;
+	try {
+		const fd = openSync(path, "wx");
+		try {
+			writeSync(fd, JSON.stringify({
+				id,
+				repo: s.repo,
+				reportedHead: s.reportedHead,
+				actualHead: s.actualHead,
+				at: new Date().toISOString(),
+				reason: "stale-context",
+				hint: "报里声明的 HEAD 与当前仓的 HEAD 不一致 ⇒ **这条报的内容已过时**（不是「是伪造」）。注意这是**否定式判据**：本文件**存在**有意义，**不存在不代表内容正确**（一致时本模块不写任何东西，以免制造假证据）。",
+			}, null, 2) + "\n", "utf8");
+		} catch { /* 诊断写入失败不影响主流程 */ } finally { closeSync(fd); }
+	} catch { /* EEXIST / 其它：best-effort */ }
+}
+
 /** 读取一份回报；缺失/损坏返回 null。 */
 export function readReportFile(reportsDir: string, id: string): ReportRecord | null {
 	const file = join(reportsDir, `${id}.json`);
@@ -607,6 +666,14 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 			markReportSeen(id);
 			return false;
 		}
+	}
+
+	// 内容陈旧检测（global master 2026-11-26）：**只标记不拒收**，且**一致时什么都不写**。
+	// 定位是否定式判据 —— 存在的 .stale 说明「内容过时」，不存在的 .stale **什么都不说明**。
+	// 节流：标记已存在就不再跑 git（它是幂等的，但 git 调用有成本）。
+	if (!existsSync(join(reportsDir, `${id}.stale`))) {
+		const stale = detectStaleContext(record);
+		if (stale) markStale(reportsDir, id, record, stale);
 	}
 
 	// 辅助可疑信号：**只标记不拒收**（2026-11-26）。与上面 from-mismatch 的区别：

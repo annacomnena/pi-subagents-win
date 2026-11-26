@@ -35,7 +35,7 @@ const tmp = mkdtempSync(join(tmpdir(), "report-upward-"));
 const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
 process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
-const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion } = await import("./report.ts");
+const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion, detectStaleContext } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 const { workReportLogic, registerWorkReportTool } = await import("./work-report.ts");
 const { setCurrentSessionId } = await import("./identity.ts");
@@ -539,6 +539,84 @@ try {
 				eq(fired, true, "⑫f 可疑的报仍必须投递（fired=true）");
 				ok(injected.length > 0, "⑫f **只标不拒**：可疑仍注入正文（变异成拒收必须红）");
 				eq(existsSync(join(d3, sid3 + ".suspicious")), true, "⑫f 同时落了 .suspicious 标记");
+			} finally {
+				setCurrentSessionId(undefined);
+			}
+		}
+	}
+
+	// ── ⑬ 内容陈旧检测（否定式判据的自动化）──
+	//
+	// global master 2026-11-26 的判据：**不一致 ⇒ 报 STALE；一致 ⇒ 什么都不说。**
+	// 「一致也打一行 OK」会制造假证据 —— 因为「一致」只证明有人读过这个仓，不证明是谁发的。
+	{
+		const { execFileSync } = await import("node:child_process");
+		const REPO = process.cwd();
+		const nowHead = execFileSync("git", ["-C", REPO, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+
+		const mk = (head) => ({ message: `[auto] at=2026-11-26T01:00:00Z cwd=x repo=${REPO} head=${head} branch=b modified=0 staged=0 untracked=0` + String.fromCharCode(10) + String.fromCharCode(10) + "body" });
+
+		// ⑬a **一致 ⇒ null**（不得输出任何"已验证"）
+		eq(detectStaleContext(mk(nowHead)), null, "⑬a 一致 ⇒ 什么都不说（禁止制造假证据）");
+
+		// ⑬b 陈旧 ⇒ 同时报出两个值（只报不一致这一侧）
+		const st = detectStaleContext(mk("deadbeef"));
+		ok(st !== null, "⑬b 不一致 ⇒ 报 STALE");
+		eq(st?.reportedHead, "deadbeef", "⑬b 报出「它说的」");
+		eq(st?.actualHead, nowHead, "⑬b 报出「现在的」");
+
+		// ⑬c 无 auto 行 ⇒ 不检查（tab 报 / 手工 JSON / 旧脚本）
+		eq(detectStaleContext({ message: "普通正文" }), null, "⑬c 无 auto 行 ⇒ 不检查");
+
+		// ⑬d repo 读不到 ⇒ 不知道（不制造假信号）
+		eq(detectStaleContext({ message: "[auto] repo=C:/no/such/repo head=deadbeef" }), null, "⑬d 读不到仓 ⇒ 不知道，不造假信号");
+
+		// ⑬e **接线 + 只标不拒**：陈旧报仍投递，但落 .stale
+		{
+			const dir = join(tmp, "reports-stale");
+			mkdirSync(dir, { recursive: true });
+			const sid = "report_stale_1";
+			writeFileSync(
+				join(dir, sid + ".json"),
+				JSON.stringify({
+					id: sid, from: "tab_stale", to: "01a1a56a-4f9b-7485-9978-b789a9004df2",
+					message: `[auto] at=2026-11-26T01:00:00Z cwd=x repo=${REPO} head=deadbeef branch=b modified=0 staged=0 untracked=0` + String.fromCharCode(10) + String.fromCharCode(10) + "过时正文",
+					at: new Date().toISOString(), pid: 1,
+				}),
+				"utf8",
+			);
+			setCurrentSessionId("01a1a56a-4f9b-7485-9978-b789a9004df2");
+			_resetReportListener();
+			const inj = [];
+			try {
+				const fired = onNewReport(dir, sid, { sendUserMessage: (b) => inj.push(b), linksPath: LINKS });
+				eq(fired, true, "⑬e 陈旧的报仍必须投递（只标不拒）");
+				ok(inj.length > 0, "⑬e 正文确实注入");
+				eq(existsSync(join(dir, sid + ".stale")), true, "⑬e 同时落 .stale 标记");
+			} finally {
+				setCurrentSessionId(undefined);
+			}
+		}
+
+		// ⑬f **一致 ⇒ 不得落 .stale**（否则等于「验证通过」的假证据）
+		{
+			const dir = join(tmp, "reports-fresh");
+			mkdirSync(dir, { recursive: true });
+			const sid = "report_fresh_1";
+			writeFileSync(
+				join(dir, sid + ".json"),
+				JSON.stringify({
+					id: sid, from: "tab_fresh", to: "01a1a56a-4f9b-7485-9978-b789a9004df2",
+					message: `[auto] at=2026-11-26T01:00:00Z cwd=x repo=${REPO} head=${nowHead} branch=b modified=0 staged=0 untracked=0` + String.fromCharCode(10) + String.fromCharCode(10) + "新鲜正文",
+					at: new Date().toISOString(), pid: 1,
+				}),
+				"utf8",
+			);
+			setCurrentSessionId("01a1a56a-4f9b-7485-9978-b789a9004df2");
+			_resetReportListener();
+			try {
+				onNewReport(dir, sid, { sendUserMessage: () => {}, linksPath: LINKS });
+				eq(existsSync(join(dir, sid + ".stale")), false, "⑬f 一致 ⇒ **不得**写任何标记（不制造假证据）");
 			} finally {
 				setCurrentSessionId(undefined);
 			}
