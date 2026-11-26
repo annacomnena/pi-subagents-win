@@ -436,6 +436,22 @@ try {
 		}
 	}
 
+	// ⑪ 记录正文必须含自己的 id（global master 2026-11-26 指出）
+	//
+	// 旧行为：id 只存于**文件名** ⇒ 正文无法标识自己；而 `.unroutable` 侧车**有** `id`
+	// ⇒ 两个文件字段集不一致，且缺的正是主文件那个。
+	{
+		const dir = join(tmp, "reports-id");
+		const rid = sendReportToMain({ from: "tab_abc123", message: "with id" }, dir);
+		const rec = readReportFile(dir, rid);
+		eq(rec?.id, rid, "⑪a 正文里的 id 必须等于文件名");
+		// →反向：只靠文件名的记录，一旦复制出去就丢身份
+		writeFileSync(join(dir, "report_legacy_noid.json"), JSON.stringify({ from: "tab_x", message: "old", at: new Date().toISOString(), pid: 1 }), "utf8");
+		const legacy = readReportFile(dir, "report_legacy_noid");
+		eq(legacy?.id, undefined, "⑪b 存量无 id 仍可读（向后兼容，不报错）");
+		ok(legacy?.message === "old", "⑪b 存量记录正文不受影响");
+	}
+
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。
 	{

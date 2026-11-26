@@ -26,6 +26,20 @@ import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
 
 export interface ReportRecord {
+	/**
+	 * 记录自己的 id（= 文件名去扩展名）。
+	 *
+	 * **2026-11-26 新增**（global master 指出）：此前 id 只存于**文件名**。
+	 * ⇒ 后果：一份 report 的**正文无法标识自己** —— 谁引用它、转发它、在文档里贴它，
+	 * id 就丢了；而 `.unroutable` 侧车里**有** `id`，两个文件字段集不一致，且缺的正是主文件那个。
+	 *
+	 * 判据：**任何落盘的记录，其正文必须含自己的标识；只靠文件名标识的记录，
+	 * 一旦被复制出去就失去身份。**
+	 *
+	 * 可选是为了兼容 2026-11-26 之前的存量记录（它们确实没有），不是给新写入留口子 ——
+	 * `sendReportToMain` **总是**写。
+	 */
+	id?: string;
 	/** 回报方身份：tab_<runId> 或 sessionId（或 agent:// 地址）。 */
 	from: string;
 	/**
@@ -59,6 +73,7 @@ export function sendReportToMain(
 ): string {
 	const id = `report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 	const record: ReportRecord = {
+		id,
 		from: opts.from,
 		...(opts.to ? { to: opts.to } : {}),
 		message: opts.message,
