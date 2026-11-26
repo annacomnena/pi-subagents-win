@@ -37,6 +37,7 @@ process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
 const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
+const { workReportLogic, registerWorkReportTool } = await import("./work-report.ts");
 
 /** 写一份 attachment（测试夹具必须贴近真实形状 —— 见 AGENTS.md §5） */
 function writeAttachment(addr: string, sessionId: string | null, extra: Record<string, unknown> = {}) {
@@ -312,6 +313,51 @@ try {
 		}
 	}
 
+
+	// ── ⑨ work-report 工具入口：pid 必须是**会话进程**（脚本入口永远做不到）──
+	//
+	// global master 的判据：「pid 必须是会话进程（如 GreenCAD 30212）」。
+	// 实测脚本入口永远不满足：GreenCAD 那份报 pid=31244（子进程，已退出），会话是 30212。
+	// 工具在会话进程内执行 ⇒ process.pid 天然就是会话 pid。
+	{
+		const dir = join(tmp, "reports-tool");
+		const SID = "01a1a56a-4f9b-7485-9978-b789a9004df2";
+		writeAttachment("agent://master_local_subagent-win", SID);
+
+		// ⑨a 有 attachment ⇒ 发送成功，from = 自己的地址（不是参数）
+		const r1 = workReportLogic({ message: "hello global", to: "agent://master_default", sessionId: SID, reportsDir: dir });
+		eq(r1.ok, true, "⑨a 有 attachment ⇒ 发送成功");
+		eq(r1.details.from, "agent://master_local_subagent-win", "⑨a from 由会话反查，不是调用方传的");
+		eq(r1.details.pid, process.pid, "⑨a **pid === process.pid（会话进程）** —— 这是收方可核的关键");
+		ok(typeof r1.details.reportId === "string", "⑨a 落盘返回 reportId");
+
+		// ⑨b 无 attachment ⇒ 拒绝（不猜身份、不冒充）
+		const r2 = workReportLogic({ message: "x", sessionId: "ffffffff-0000-4000-8000-000000000000", reportsDir: dir });
+		eq(r2.ok, false, "⑨b 无 attachment ⇒ 拒绝发送");
+		eq(r2.details.reason, "no-attachment", "⑨b 拒绝理由明确");
+
+		// ⑨c 无 sessionId ⇒ 拒绝
+		const r3 = workReportLogic({ message: "x", sessionId: "", reportsDir: dir });
+		eq(r3.ok, false, "⑨c 拿不到会话 id ⇒ 拒绝发送");
+		eq(r3.details.reason, "no-session-id", "⑨c 拒绝理由明确");
+
+		// ⑨d 空正文 ⇒ 拒绝
+		const r4 = workReportLogic({ message: "   ", sessionId: SID, reportsDir: dir });
+		eq(r4.ok, false, "⑨d 空正文 ⇒ 拒绝");
+
+		// ⑨e **接线**：注册函数真的把这个工具注册给 pi（否则工具永远不存在）
+		{
+			const names: string[] = [];
+			const fakePi = {
+				registerTool(t: { name: string }) {
+					names.push(t.name);
+				},
+			};
+			registerWorkReportTool(fakePi as never);
+			eq(names.includes("work-report"), true, "⑨e 接线：registerWorkReportTool 真的注册了 work-report");
+			eq(names.length, 1, "⑨e 只注册一个工具（不误注册其它）");
+		}
+	}
 
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。

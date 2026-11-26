@@ -106,6 +106,7 @@ import { registerSteerConsumer } from "./steer-consumer.ts";
 import { registerSteerTools } from "./steer-runtime.ts";
 import { registerSupervisionTools } from "./supervision-runtime.ts";
 import { registerTabTelemetry, registerTabStatusTools } from "./tab-runs-runtime.ts";
+import { registerWorkReportTool } from "./work-report.ts";
 import { localAgentFromCwd, localMasterEnsureGate, masterStatusLogic, masterTransferLogic, registerMasterTools, type DispatchTab } from "./master-tools.ts";
 import {
 	LOCAL_OWNER_GATE_TEXT,
@@ -3330,6 +3331,11 @@ ${notable[0].reason}
 	};
 
 	registerMasterTools(pi, { spawnSuccessor, masterSuccession: () => readConfig().masterSuccession, dispatchTab, ensureLocalMasterTab });
+
+	// work-report：会话进程内的主动回报（横向 master→master）。
+	// 与 tab-report 分工：tab-report 按 tab 身份发给派发方（硬要求 PI_TAB_RUN_ID，防伪造）；
+	// work-report 按**本会话自己的 master attachment** 发送，from 不可传参 ⇒ pid 天然是会话进程。
+	registerWorkReportTool(pi);
 
 	// wiki-nav：渐进式 Wiki 导航查询工具（按层级调取附近节点，避免一次读整个 _navigation.json）
 	registerWikiNav(pi);
