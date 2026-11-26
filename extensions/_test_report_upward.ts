@@ -623,6 +623,39 @@ try {
 		}
 	}
 
+	// ── ⑭ tool 协议：`execute` 必须返回 `content`（L4 P0-2）──
+	//
+	// 事故：`work-report` 的 execute 只返回 `details` ⇒ pi 靠 `content` 把结果交给模型，
+	// ⇒ **工具能跑、有 ok，但模型看不到任何返回** = 新功能对模型静默失效。
+	// 这是「实现了但没接线」的典型：测试可以直接调 `workReportLogic` 而绕过协议。
+	// ⇒ 本组断言必须经过**真实 execute 签名**，不能只调 logic。
+	{
+		const dir = join(tmp, "reports-exec");
+		mkdirSync(dir, { recursive: true });
+		const MY_SID2 = "01a1a56a-4f9b-7485-9978-b789a9004df2";
+		writeAttachment("agent://master_local_subagent-win", MY_SID2);
+
+		let captured = null;
+		const fakePi = { registerTool(t) { captured = t; } };
+		registerWorkReportTool(fakePi, { reportsDir: dir });
+		ok(captured !== null, "⑭ 前置：registerWorkReportTool 捕获到工具定义");
+		eq(captured?.name, "work-report", "⑭ 工具名正确");
+		ok(typeof captured?.execute === "function", "⑭ 有 execute");
+
+		setCurrentSessionId(MY_SID2);
+		let res;
+		try {
+			res = await captured.execute("tc1", { message: "hello via tool", to: "agent://master_default" });
+		} finally {
+			setCurrentSessionId(undefined);
+		}
+		ok(Array.isArray(res?.content), "⑭ **execute 必须返回 content 数组**（否则模型收到空结果）");
+		eq(res?.content?.[0]?.type, "text", "⑭ content[0].type === 'text'");
+		ok(typeof res?.content?.[0]?.text === "string" && res.content[0].text.length > 0, "⑭ content[0].text 非空");
+		ok(String(res.content[0].text).includes("work-report"), "⑭ 正文包含可读信息（不是空串）");
+		ok(res?.details && typeof res.details === "object", "⑭ details 仍然保留（渲染层用）");
+	}
+
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。
 	{

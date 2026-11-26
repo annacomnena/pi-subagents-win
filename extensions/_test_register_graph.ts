@@ -98,6 +98,10 @@ for (const n of flagNames) console.log(`  ${n}`);
 // 同批修复存量漂移（补 local-master-ensure，index.ts 0923 后注册的本地 master 工具，此前被 tool 断言漏项遮挡）。
 // 2026-11-02：补**存量漂移**——`codegraph` 工具 ← 引入于 `735dd50`（2026-10-31「把 codegraph 注册成 pi 工具」），
 // 该提交未同步本快照 ⇒ toolNames 断言恒红（与本轮 laneConcurrency 改动无关，已用 stash 前后对跑证实）。
+// 2026-11-26：补 `work-report` ← 引入于 `4d564b5`（Item 66 / S1 会话内主动回报工具，work-report.ts）。
+// ⚠ 这一条是我自己造成的回归：加工具时没跑本套件，而独立 L4 把它挖出来了（P0-1）。
+// 教训：**新增/删除任何 tool 或 command 注册都必须跑本套件** —— 它是仓内唯一守“注册面形状”的网，
+// 而我当时只跑了 test:report*（自认为“这轮只改 report”）。
 assert.deepEqual(toolNames, [
 	"cancel-timer",
 	"codegraph",
@@ -128,6 +132,7 @@ assert.deepEqual(toolNames, [
 	"tab-steer",
 	"trace-fusion",
 	"wiki-nav",
+	"work-report",
 ]);
 
 // 命令快照（按名排序；2026-08-19 冻结，2026-08-25 补 lite / sub-presets，

@@ -13,10 +13,24 @@
  *     global master）→ 显式收件地址。`from` **不可传参**，由当前会话反查自己的地址。
  *   - `scripts/report_to_master.mjs`：非 pi 进程 / 应急用；身份弱（见上），仅作旁路。
  *
- * 身份强度（不得超额声称）：
- *   `from` 由 `findAttachmentBySession(当前会话 sessionId)` 反查 ⇒ 调用方无法自填别人的地址；
- *   `pid` 是**本进程**（= 会话进程）⇒ 收方可以在它存活时用 OS 核对命令行；
- *   `cwd` 是本进程工作目录。这三样一起，才构成「这条是那个会话发的」的可核证据链。
+ * 身份强度（不得超额声称 —— 2026-11-26 由独立 L4 P1-1 纠正过一次）：
+ *
+ *   ① `pid` = **本进程（= 会话进程）** —— 这是本工具**唯一真正强**的证据，
+ *      ！注意它不是永远可核：进程退出后就查不到了；但会话进程**长期存活**，所以可事后核。
+ *   ② `cwd` = 本进程工作目录（需主动 `chdir` 才能伪，弱）。
+ *   ③ `envSessionId` = 由 `getCurrentSessionId()` **显式传参**写入 ——
+ *      **它与 `from` 同源，因此不增加任何信息**（两者构造上必然一致）。
+ *
+ *   ⚠ 为什么 ③ 仍是 tautology（实测依据，勿再当成“三项一致”吹）：
+ *   pi **不会**给会话进程本身设 `PI_SESSION_ID` ——
+ *   `dist/core/tools/bash.js:159-168` 先 `delete env.PI_SESSION_ID`，
+ *   只在 spawn **shell 子进程**时才注入。
+ *   ⇒ 会话进程内只能拿 `getCurrentSessionId()`（pi 上下文）。
+ *   ⇒ 而 `from` 也是用同一个 sessionId 反查的 ⇒ 两者必然一致。
+ *
+ *   ⇒ 因此：**本工具做的是“内容相关性核验 + pid 可事后核”，不是身份认证。**
+ *     要真正把“谁发的”做成可验，需要 `attachment` 里带 `pid` + `attachedAt`
+ *     并与进程启动时间对账（已登记为后续，本轮未做）。
  */
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -118,7 +132,14 @@ export function workReportLogic(input: WorkReportInput): WorkReportOutcome {
 	};
 }
 
-export function registerWorkReportTool(pi: ExtensionAPI): void {
+/**
+ * 注册 work-report 工具。
+ *
+ * `opts.reportsDir` 仅用于**测试注入**（生产不传 ⇒ 用 `defaultReportsDir()`）。
+ * 为什么要开这个口子：`execute` 里写盘，若不能重定向，任何“调 execute”的测试都会
+ * 真的往 `~/.pi/agent/reports` 写一份报 —— 而那正是我 2026-11-26 因为“测试产物被投递后删”吃过教训的地方。
+ */
+export function registerWorkReportTool(pi: ExtensionAPI, opts: { reportsDir?: string } = {}): void {
 	pi.registerTool({
 		name: "work-report",
 		label: "Work Report",
@@ -151,8 +172,17 @@ export function registerWorkReportTool(pi: ExtensionAPI): void {
 				...(p.to ? { to: p.to } : {}),
 				...(p.summary ? { summary: p.summary } : {}),
 				...(p.taskId ? { taskId: p.taskId } : {}),
+				...(opts.reportsDir ? { reportsDir: opts.reportsDir } : {}),
 			});
-			return { ...outcome, details: { ...outcome.details, text: outcome.text } };
+			// ⚠ 必须返回 `content`（L4 P0-2，2026-11-26）：pi 的工具协议靠 `content` 把结果交给模型，
+			// `details` 只给渲染层（`renderResult`）看。只返回 `details` ⇒ **工具能跑、有 ok，
+			// 但模型看不到任何返回** ⇒ 新功能对模型静默失效。
+			// 这是“实现了但没接线”的典型形态 —— 比“没实现”更难发现，因为测试可以直接调函数而绕过协议。
+			return {
+				content: [{ type: "text", text: outcome.text }],
+				details: { ...outcome.details, text: outcome.text },
+				...(outcome.ok ? {} : { isError: true }),
+			};
 		},
 	});
 }
