@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { sendWindowsToast } from "./notify-windows.ts";
 import { getCurrentSessionId, isMainSession, isSubagent, sessionScopeKey, setCurrentSessionId } from "./identity.ts";
 import { masterAddress } from "./runtime/address.ts";
-import { readAttachment, readCutover } from "./runtime/registry.ts";
+import { readAttachment, readCutover, findAttachmentBySession } from "./runtime/registry.ts";
 import { postInject, preInject, type InjectionContext } from "./injection-gate.ts";
 import { NO_POLL_HINT } from "./no-poll.ts";
 import { defaultLinksPath, listLinks } from "./links.ts";
@@ -136,6 +136,54 @@ export function recipientSessionIdFor(record: Pick<ReportRecord, "from" | "to">,
 }
 
 /**
+ * **独立**可疑信号（2026-11-26，把 global master 的三步判据变成可跑的代码）。
+ *
+ * 为什么需要：`detectFromMismatch` 对自家脚本恒 null（tautology，已在那里登记）。
+ * 真正的**独立**证据只有两条：
+ *   ① `envSessionId` 不在任何 master attachment 里 ⇒ 这个会话根本没登记过（`unknown-session`）
+ *   ② `from` 是 `agent://master_local_<scope>` 而 `cwd` 里**不含 scope** ⇒ 它在别的目录里替该 scope 发
+ *      （`cwd-scope-mismatch`）
+ *
+ * 注意它**不管**的事（否则会误报）：
+ *  - `agent://master_default`（global）没有 scope ⇒ 跳过 ②。
+ *  - 无 `cwd` / 无 `envSessionId` 的存量报 ⇒ 不报。
+ *  - **只标不拒**：替别的仓发是合法场景（global master 实测就这么干）。
+ *
+ * 强度限定：两条都靠 `envSessionId`/`cwd`，而它们都是进程序可写的 ⇒ 抬高了「随手发错」的
+ * 门槛，但**挡不住有意伪造**。不可伪造的仍是 OS 层 pid + 命令行。
+ */
+export interface Suspicion {
+	reasons: Array<"unknown-session" | "cwd-scope-mismatch">;
+	detail: Record<string, unknown>;
+}
+
+export function detectSuspicion(record: Pick<ReportRecord, "from" | "cwd" | "envSessionId">): Suspicion | null {
+	const reasons: Suspicion["reasons"] = [];
+	const detail: Record<string, unknown> = {};
+
+	// ① 会话未登记
+	if (record.envSessionId) {
+		if (!findAttachmentBySession(record.envSessionId)) {
+			reasons.push("unknown-session");
+			detail.envSessionId = record.envSessionId;
+		}
+	}
+
+	// ② cwd 不含它自报的 local scope
+	const from = record.from;
+	if (from && from.startsWith("agent://master_local_") && record.cwd) {
+		const scope = from.slice("agent://master_local_".length);
+		if (scope && !record.cwd.toLowerCase().includes(scope.toLowerCase())) {
+			reasons.push("cwd-scope-mismatch");
+			detail.declaredScope = scope;
+			detail.cwd = record.cwd;
+		}
+	}
+
+	return reasons.length ? { reasons, detail } : null;
+}
+
+/**
  * `from` 冒充检测（2026-11-26，由 global master 的现场核查触发）。
  *
  * 事故：我在 `G:/code/GreenCAD` 的 cwd 里跑脚本、`from` 写 `agent://master_local_GreenCAD`，
@@ -161,6 +209,14 @@ export interface FromMismatch {
 }
 
 export function detectFromMismatch(record: Pick<ReportRecord, "from" | "envSessionId">): FromMismatch | null {
+	// ⚠ 判别力登记（R-22 第 4 条，2026-11-26 实测）：本函数对**自家脚本路径恒为 null**。
+	// `scripts/report_to_master.mjs` 的 `from` 就是 `findAttachmentBySession(PI_SESSION_ID)`
+	// 反查出来的 ⇒ `from` 是 `envSessionId` 的**函数**，两者构造上必然一致。
+	// 实测：`findAttachmentBySession(01a1d371…)` 得 `agent://master_local_GreenCAD`，再送进本函数
+	// ⇒ 恒 null。⇒ 「from 与 envSessionId 所属仓不符」这一判据**在新脚本路径下是 tautology**。
+	//
+	// 它仍有判别力的场景（不要删）：① 手工写 JSON / 旧脚本 / 其它工具；② 有人显式传 from。
+	// 真正的**独立**信号是 `detectSuspicion()`（envSessionId 是否在白名单 + cwd 是否含 scope）。
 	const from = record.from;
 	if (!from || !from.startsWith("agent://")) return null;
 	if (!record.envSessionId) return null;
@@ -190,6 +246,30 @@ function markFromMismatch(reportsDir: string, id: string, record: ReportRecord, 
 				at: new Date().toISOString(),
 				reason: "from-mismatch",
 				hint: "`from` 声明的地址与该进程继承的 PI_SESSION_ID（=附件里的 sessionId）不一致 ⇒ 发送者不是它声称的那个会话。本文件是**拒收**证据（不是重试队列）：冒充不会自愈，不要写重投器处理它。",
+			}, null, 2) + "\n", "utf8");
+		} catch { /* 诊断写入失败不影响主流程 */ } finally { closeSync(fd); }
+	} catch { /* EEXIST / 其它：best-effort */ }
+}
+
+/**
+ * 可疑标记：<id>.suspicious（**只标记不拒收**，与 from-mismatch 的区别在第三节）。
+ */
+function markSuspicious(reportsDir: string, id: string, record: ReportRecord, s: Suspicion): void {
+	const path = join(reportsDir, `${id}.suspicious`);
+	if (existsSync(path)) return;
+	try {
+		const fd = openSync(path, "wx");
+		try {
+			writeSync(fd, JSON.stringify({
+				id,
+				from: record.from,
+				cwd: record.cwd,
+				envSessionId: record.envSessionId,
+				pid: record.pid,
+				at: new Date().toISOString(),
+				reasons: s.reasons,
+				detail: s.detail,
+				hint: "辅助信号，**不代表伪造**：「替别的仓发」是合法场景。本文件只回答「这条报里各个字段彼此对不上」，不回答「谁有权限」。不要拿它自动拒收。",
 			}, null, 2) + "\n", "utf8");
 		} catch { /* 诊断写入失败不影响主流程 */ } finally { closeSync(fd); }
 	} catch { /* EEXIST / 其它：best-effort */ }
@@ -456,6 +536,14 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 			markReportSeen(id);
 			return false;
 		}
+	}
+
+	// 辅助可疑信号：**只标记不拒收**（2026-11-26）。与上面 from-mismatch 的区别：
+	// mismatch = 自相矛盾（同一个会话既说是 X 又是 Y）⇒ 拒收；
+	// suspicion = 字段彼此对不上但**有合法解释**（替别的仓发）⇒ 标记后照常投递。
+	{
+		const sus = detectSuspicion(record);
+		if (sus) markSuspicious(reportsDir, id, record, sus);
 	}
 
 	const recipient = recipientSessionIdFor(record, opts.linksPath);

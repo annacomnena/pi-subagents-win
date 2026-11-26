@@ -35,7 +35,7 @@ const tmp = mkdtempSync(join(tmpdir(), "report-upward-"));
 const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
 process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
-const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch } = await import("./report.ts");
+const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle, detectFromMismatch, detectSuspicion } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 const { workReportLogic, registerWorkReportTool } = await import("./work-report.ts");
 
@@ -360,6 +360,79 @@ try {
 			registerWorkReportTool(fakePi as never);
 			eq(names.includes("work-report"), true, "⑨e 接线：registerWorkReportTool 真的注册了 work-report");
 			eq(names.length, 1, "⑨e 只注册一个工具（不误注册其它）");
+		}
+	}
+
+	// ── ⑩ 独立可疑信号（global master 的三步判据，只标记不拒收）──
+	//
+	// 为什么需要：`detectFromMismatch` 对自家脚本恒 null（`from` 由 envSessionId 反查 ⇒ 构造上必然一致）。
+	// 真正独立的两条：① envSessionId 不在白名单 ② from 的 local scope 不在 cwd 里。
+	{
+		const dir = join(tmp, "reports-sus");
+		mkdirSync(dir, { recursive: true });
+		const GSID = "01a2070a-fbf2-7045-a398-909c365b0630";
+		writeAttachment("agent://master_default", GSID);
+
+		// ⑩a 构造性再说一遍：from 由 envSessionId 反查 ⇒ detectFromMismatch 恒 null（不是遗漏，是 tautology）
+		eq(
+			detectFromMismatch({ from: "agent://master_local_subagent-win", envSessionId: "01a1a56a-4f9b-7485-9978-b789a9004df2" }),
+			null,
+			"⑩a 自家脚本路径下 detectFromMismatch 恒 null（判别力登记）",
+		);
+
+		// ⑩b envSessionId 不在任何 attachment ⇒ unknown-session
+		const s1 = detectSuspicion({ from: "agent://master_local_x", cwd: "C:\\tmp", envSessionId: "deadbeef-0000-4000-8000-000000000000" });
+		ok(s1 !== null, "⑩b 未登记会话 ⇒ 报可疑");
+		ok(s1?.reasons.includes("unknown-session"), "⑩b 理由是 unknown-session");
+
+		// ⑩c cwd 不含它自报的 scope ⇒ cwd-scope-mismatch（这正是 global 自己那份探针的形状）
+		const s2 = detectSuspicion({ from: "agent://master_local_GreenCAD", cwd: "C:\\tmp", envSessionId: GSID });
+		ok(s2 !== null, "⑩c 在 C:/tmp 里替 GreenCAD 发 ⇒ 报可疑");
+		ok(s2?.reasons.includes("cwd-scope-mismatch"), "⑩c 理由是 cwd-scope-mismatch");
+		eq(s2?.detail.declaredScope, "GreenCAD", "⑩c 报出它声称的 scope");
+
+		// ⑩d 一致（cwd 含 scope）⇒ 不报
+		eq(
+			detectSuspicion({ from: "agent://master_local_GreenCAD", cwd: "G:\\code\\GreenCAD\\sub", envSessionId: GSID }),
+			null,
+			"⑩d cwd 含 scope（含子目录）⇒ 不报",
+		);
+
+		// ⑩e global 没有 local scope ⇒ 跳过 ②（不得误报）
+		eq(
+			detectSuspicion({ from: "agent://master_default", cwd: "C:\\tmp", envSessionId: GSID }),
+			null,
+			"⑩e agent://master_default 无 scope ⇒ 不做 cwd 比对（不误报）",
+		);
+
+		// ⑩f 存量报（无 cwd / 无 envSessionId）⇒ 不报
+		eq(detectSuspicion({ from: "agent://master_local_GreenCAD" }), null, "⑩f 无 cwd/envSessionId ⇒ 不报（向后兼容）");
+
+		// ⑩g **接线 + 只标不拒**：可疑的报**仍会被正常投递**（不 return）
+		{
+			const d2 = join(tmp, "reports-sus-wire");
+			mkdirSync(d2, { recursive: true });
+			const sid = "report_sus_wire_1";
+			writeFileSync(
+				join(d2, sid + ".json"),
+				JSON.stringify({
+					id: sid,
+					from: "agent://master_local_GreenCAD",
+					to: "agent://master_default",
+					cwd: "C:\\tmp",
+					envSessionId: GSID,
+					message: "替 GreenCAD 发但 cwd 不对",
+					at: new Date().toISOString(),
+					pid: 1,
+				}),
+				"utf8",
+			);
+			writeAttachment("agent://master_local_GreenCAD", GSID); // 让它可路由
+			_resetReportListener();
+			// 本进程不是接收方（接收方是 GSID 的 default），所以走分流分支；关键看标记
+			onNewReport(d2, sid, { sendUserMessage: () => {}, linksPath: LINKS });
+			eq(existsSync(join(d2, sid + ".suspicious")), true, "⑩g 接线：可疑 ⇒ 落 .suspicious 标记");
+			eq(existsSync(join(d2, sid + ".from-mismatch")), false, "⑩g 可疑**不是** from-mismatch（语义不同：辅助信号 vs 自相矛盾）");
 		}
 	}
 
