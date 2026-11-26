@@ -93,31 +93,60 @@ if (explicit) {
  * 自动注入可核事实（global master 的硬要求「正文必须带 HEAD 与 cwd」的自动化版）。
  *
  * 为什么自动而不是让人手写：手写的字段和 `from` 一样不可信 —— 会写错、会忘记、会复制上一次的。
- * 脚本在哪个 cwd 跑就读哪个仓的 HEAD，至少保证「它真的在那个目录读过 git」。
  *
- * ⚠ 不得超额声称：`HEAD` **零身份证明力** —— 任何进程都能
- * `git -C <别人的仓> rev-parse HEAD` 读到（实测：我在 subagent-win 里读到了 GreenCAD 的 f9c8c0cf）。
- * 它证明的是「发这条的人读过那个仓」，不是「那个仓的人发的」。
- * 真正可核的身份只有 pid(存活时) + OS 命令行，或 work-report 工具（pid = 会话进程）。
+ * **为什么这几格比 `from` 有判别力（global master 2026-11-26 的洞察，已实测复核）**：
+ *   `from` 是**常量** —— 写一次永远「对」（也永远不证明任何东西）；
+ *   `head`/`branch`/`changed`/`at` 是**状态采样，会变**（实测该仓每小时变几次 HEAD）
+ *   ⇒ **一个陈旧的值在几分钟内就会被核出来**。
+ *
+ * ⚠ 判别力边界（**否定式判据**，不得说成“可证身份”）：
+ *   - 报里的 `head` 与当前**不一致** ⇒ 证明「这条报是旧的 / 错的」（**有判别力**）；
+ *   - 报里的 `head` 与当前**一致** ⇒ 只证明「有人在这个仓读过 git」，
+ *     **不证明「是那个会话发的」**（任何进程都能 `git -C <别人的仓> rev-parse` 读到）。
+ *   所以它回答的是「**它说的那个仓在那个时刻是不是这个状态**」，不是「谁发的」。
+ *   对监督用途，否定式已经够 —— 需要的正是「发现它报了过时状态」的能力。
+ *
+ * 拆分 `changed`（global master 建议①）：`45 changed` 可能是「45 个修改」也可能是
+ * 「44 个未跟踪 + 1 个修改」，两种意义不同（前者在工作，后者是新产物没清理）。
+ * 带 `at`（global master 建议②）：`head` 的价值完全依赖「在哪个时刻读的」——
+ * 没有时间戳的 head 是常量，带时间戳的 head 是可推算的证据（正文被转发时 record.at 会丢）。
  */
 function autoContext() {
 	const cwd = process.cwd();
 	const NL = String.fromCharCode(10);
+	const at = new Date().toISOString();
 	try {
 		const git = (args) =>
 			execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim();
 		const head = git(["rev-parse", "--short", "HEAD"]);
 		const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
 		const toplevel = git(["rev-parse", "--show-toplevel"]);
-		let dirty = "?";
+		let counters = "";
 		try {
-			dirty = `${git(["status", "--porcelain"]).split(NL).filter(Boolean).length} changed`;
+			// ⚠ 不能走上面的 `git()`：它对整体输出 `.trim()`，而 `status --porcelain`
+			// 的**首行前导空格有意义**（` M` = 未暂存修改，`M ` = 已暂存）。
+			// 实测踩到：trim 后 ` M` 变 `M` ⇒ 把「未暂存」报成「已暂存」。
+			const raw = execFileSync("git", ["status", "--porcelain"], {
+				cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+			});
+			const lines = raw.split(NL).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)).filter((l) => l.length >= 2);
+			let untracked = 0;
+			let staged = 0;
+			let modified = 0;
+			for (const l of lines) {
+				const x = l[0] ?? " ";
+				const y = l[1] ?? " ";
+				if (x === "?" && y === "?") { untracked++; continue; }
+				if (x !== " " && x !== "?") staged++;
+				if (y !== " " && y !== "?") modified++;
+			}
+			counters = ` modified=${modified} staged=${staged} untracked=${untracked}`;
 		} catch {
-			dirty = "?";
+			counters = " modified=? staged=? untracked=?";
 		}
-		return `[auto] cwd=${cwd} repo=${toplevel} head=${head} branch=${branch} ${dirty}`;
+		return `[auto] at=${at} cwd=${cwd} repo=${toplevel} head=${head} branch=${branch}${counters}`;
 	} catch {
-		return `[auto] cwd=${cwd} repo=(not a git repo)`;
+		return `[auto] at=${at} cwd=${cwd} repo=(not a git repo)`;
 	}
 }
 
