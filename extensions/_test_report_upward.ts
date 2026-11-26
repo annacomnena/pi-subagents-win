@@ -664,6 +664,38 @@ try {
 		ok(res?.details && typeof res.details === "object", "⑭ details 仍然保留（渲染层用）");
 	}
 
+	// ⑮ 反向断言：`work-report` 落盘**不得**带 `envSessionId`（global master 2026-11-26 警告）
+	//
+	// 为什么要「反向」守：我曾为了修 P1-1 而把 `envSessionId` 设成会话 id，
+	// 而那是 **tautology**（`from` 也是用同一个 sessionId 反查的）。
+	// 恒真的检查比恒假的更危险（恒假红了有人查，恒真绿了没人查）。
+	// ⇒ 宁可让它**缺失**（`detectFromMismatch` 显式跳过），也不留一份看起来能比对的假材料。
+	{
+		const dir = join(tmp, "reports-noenv");
+		const RID = "01a1a56a-4f9b-7485-9978-b789a9004df2";
+		writeAttachment("agent://master_local_subagent-win", RID);
+		// ⚠ 必须先清掉 `PI_SESSION_ID`：否则 `sendReportToMain` 会回退读它（测试进程继承自 bash），
+		// 而**生产的会话进程没有这个 env**（`dist/core/tools/bash.js:159` 先 delete，只给 shell 子进程设）。
+		// ⇒ 不清的话，这条断言在测试里永远不成立，而它反映的又不是生产行为。
+		const prevEnvSid = process.env.PI_SESSION_ID;
+		delete process.env.PI_SESSION_ID;
+		let outcome;
+		try {
+			outcome = workReportLogic({
+				message: "no-env-session",
+				to: "agent://master_default",
+				sessionId: RID,
+				reportsDir: dir,
+			});
+		} finally {
+			if (prevEnvSid !== undefined) process.env.PI_SESSION_ID = prevEnvSid;
+		}
+		ok(outcome.ok, "⑮ 前置：work-report 成功落盘");
+		const written = readReportFile(dir, String(outcome.details.reportId));
+		ok(written !== null, "⑮ 前置：能读回刚写的报");
+		ok(!("envSessionId" in (written as object)), "⑮ **work-report 落盘不得带 envSessionId**（否则是 tautology 假材料）");
+	}
+
 	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
 	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。
 	{

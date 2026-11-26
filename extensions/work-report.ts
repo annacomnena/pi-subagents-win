@@ -97,10 +97,21 @@ export function workReportLogic(input: WorkReportInput): WorkReportOutcome {
 			message: input.message,
 			...(input.summary ? { summary: input.summary } : {}),
 			...(input.taskId ? { taskId: input.taskId } : {}),
-			// **显式传会话 id**（L4 §5.2）：宿主进程可能没有 `PI_SESSION_ID`
-			//（`scripts/boot-resume-master.ps1:93` 启动 master 时会主动清掉它），
-			// 而 `getCurrentSessionId()` 是 pi 上下文注入的，在进程内一定可用。
-			sessionId: sid,
+			// ⚠ **不传 `sessionId`**（2026-11-26 晚，global master 警告后改）：
+			//
+			// 我曾传 `getCurrentSessionId()`，理由是「宿主进程可能没有 `PI_SESSION_ID`」。
+			// 那个事实成立（`scripts/boot-resume-master.ps1:93` 确实会清掉它），
+			// 但用它填 `envSessionId` **是一个 tautology**：
+			//   `from` = `findAttachmentBySession(getCurrentSessionId())`  ← 从 attachment 反查
+			//   `envSessionId` = 同一个 `getCurrentSessionId()`
+			//   `att.sessionId` = 反查的来源
+			// ⇒ `detectFromMismatch` 比的是「从 att 派生的值」与「att 本身」⇒ **恒相等**。
+			//
+			// ⇒ 恒真的检查比恒假的更危险（恒假红了有人查，恒真绿了没人查）。
+			// ⇒ 所以宁可让 `envSessionId` **缺失**（`detectFromMismatch` 显式跳过），
+			//   也不留一份看起来能比对、实际必然一致的假材料。
+			// ⇒ 进程内路径**结构上无法自证身份**：它唯一能拿到的会话 id 就来自它要校验的那个 attachment。
+			//   要真验必须引入**独立来源**（OS 观测：attachment 带 `pid` + `attachedAt`，已登记未做）。
 		},
 		input.reportsDir,
 	);
