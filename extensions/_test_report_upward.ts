@@ -35,7 +35,7 @@ const tmp = mkdtempSync(join(tmpdir(), "report-upward-"));
 const prevRuntimeDir = process.env.PI_RUNTIME_DIR;
 process.env.PI_RUNTIME_DIR = join(tmp, "runtime");
 
-const { recipientSessionIdFor, sendReportToMain, readReportFile } = await import("./report.ts");
+const { recipientSessionIdFor, sendReportToMain, readReportFile, onNewReport, _resetReportListener, healContradictoryMarkers, pollNewReports, _resetHealThrottle } = await import("./report.ts");
 const { attachmentPathFor } = await import("./runtime/registry.ts");
 
 /** 写一份 attachment（测试夹具必须贴近真实形状 —— 见 AGENTS.md §5） */
@@ -190,6 +190,88 @@ try {
 		const id2 = sendReportToMain({ from: "tab_abc123", message: "legacy" }, reportsDir);
 		const rec2 = readReportFile(reportsDir, id2);
 		ok(rec2 !== null && !("to" in (rec2 as object)), "⑥ 不传 to ⇒ record 里无 to 键（旧格式零变化）");
+	}
+	// ── ⑦ 互斥：`.notified` 与 `.unroutable` **不得并存**（2026-11-26 多 master 事故）──
+	//
+	// 现场（report_mwwtqazm_jo06）：08:38:18 新码进程消费成功 → 领 `.notified` + 清标记；
+	// 08:38:26 一个**仍跑旧码**的 master 进程 tick 又写回 `.unroutable`（旧码不认 to）。
+	// ⇒ 「已送达」与「待重试」两个互斥状态被同时写进磁盘，而人工排查只看得到失败那个。
+	{
+		const reportsDir = join(tmp, "reports-mutex");
+		mkdirSync(reportsDir, { recursive: true });
+
+		// ⑦a 源头守卫：已有 `.notified` 时 **禁止**写 `.unroutable`
+		writeAttachment("agent://master_default", GLOBAL_SID); // 已在上文建立，幂等
+		const rec7 = {
+			id: "report_mutex_a",
+			from: "agent://master_local_x",
+			message: "已送达但被旧码进程误判的回投",
+			at: new Date().toISOString(),
+		};
+		writeFileSync(join(reportsDir, "report_mutex_a.json"), JSON.stringify(rec7), "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_a.notified"), "", "utf8"); // 已被领
+		_resetReportListener();
+		// from=agent:// 且无 to ⇒ 解析不出 ⇒ 旧行为会写 unroutable
+		onNewReport(reportsDir, "report_mutex_a", {
+			sendUserMessage: () => {},
+			linksPath: LINKS,
+		});
+		eq(
+			existsSync(join(reportsDir, "report_mutex_a.unroutable")),
+			false,
+			"⑦a 已有 .notified ⇒ **不得**写 .unroutable（源头阻止互斥状态并存）",
+		);
+
+		// ⑦b 存量自愈：已经并存的文件 ⇒ healContradictoryMarkers 删掉 unroutable
+		writeFileSync(join(reportsDir, "report_mutex_b.json"), JSON.stringify({ ...rec7, id: "report_mutex_b" }), "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_b.notified"), "", "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_b.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
+		const healed = healContradictoryMarkers(reportsDir);
+		ok(healed.includes("report_mutex_b"), "⑦b 自愈命中并发的 id");
+		eq(existsSync(join(reportsDir, "report_mutex_b.unroutable")), false, "⑦b 自愈删掉了矛盾的 .unroutable");
+		eq(existsSync(join(reportsDir, "report_mutex_b.notified")), true, "⑦b `.notified`（更强证据）保留");
+
+		// ⑦c 自愈**不得**误删真的没送达的（只有 unroutable、无 notified）
+		writeFileSync(join(reportsDir, "report_mutex_c.json"), JSON.stringify({ ...rec7, id: "report_mutex_c" }), "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_c.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
+		healContradictoryMarkers(reportsDir);
+		eq(
+			existsSync(join(reportsDir, "report_mutex_c.unroutable")),
+			true,
+			"⑦c 只有 unroutable（真未送达）⇒ **必须保留**（自愈不能变成「抹掉失败证据」）",
+		);
+
+		// ⑦d 文案不得再自称「无任何读取方」（一旦有人写重投器就变谎话）
+		const unroutableText = readFileSync(join(reportsDir, "report_mutex_c.unroutable"), "utf8");
+		writeFileSync(join(reportsDir, "report_mutex_d.json"), JSON.stringify({ ...rec7, id: "report_mutex_d" }), "utf8");
+		_resetReportListener();
+		onNewReport(reportsDir, "report_mutex_d", { sendUserMessage: () => {}, linksPath: LINKS });
+		const newText = readFileSync(join(reportsDir, "report_mutex_d.unroutable"), "utf8");
+		ok(newText.includes("必须先跳过已存在同名"), "⑦d 新写入的 .unroutable 必须警告将来的重投器先查 .notified");
+		ok(!newText.includes("本文件目前**无任何读取方**"), "⑦d 旧自述（会变谎话的那句）已移除");
+		ok(unroutableText.length > 0, "⑦d 对照：旧文件仍可读（不追溯改写存量）");
+	}
+
+	// ── ⑦e **接线**：`pollNewReports` 真的调了自愈（否则删掉那行仍全绿 = 假绿）──
+	// AGENTS.md §4：变异必须变异**真实接线**，不能只变异函数体。
+	{
+		const reportsDir = join(tmp, "reports-wiring");
+		mkdirSync(reportsDir, { recursive: true });
+		writeFileSync(
+			join(reportsDir, "report_wire_1.json"),
+			JSON.stringify({ id: "report_wire_1", from: "tab_notfound", message: "x", at: new Date().toISOString() }),
+			"utf8",
+		);
+		writeFileSync(join(reportsDir, "report_wire_1.notified"), "", "utf8");
+		writeFileSync(join(reportsDir, "report_wire_1.unroutable"), JSON.stringify({ reason: "recipient-unresolved" }), "utf8");
+		_resetReportListener();
+		_resetHealThrottle();
+		pollNewReports(reportsDir, { sendUserMessage: () => {}, linksPath: LINKS });
+		eq(
+			existsSync(join(reportsDir, "report_wire_1.unroutable")),
+			false,
+			"⑦e 接线：pollNewReports（tick 入口）必须真的调自愈，否则并存会永久留在磁盘",
+		);
 	}
 } finally {
 	if (prevRuntimeDir === undefined) delete process.env.PI_RUNTIME_DIR;

@@ -202,6 +202,15 @@ function snapshotExisting(reportsDir: string): void {
  */
 function markUnroutable(reportsDir: string, id: string, record: ReportRecord): void {
 	const path = join(reportsDir, `${id}.unroutable`);
+	// 2026-11-26（多 master 并存实测事故）：`.notified` 是「已被某个会话领取」的事实。
+	// 它存在时，「解析不出接收方」就不再是「未被消费」的证据 —— 写 `.unroutable` 会制造
+	// `.notified` + `.unroutable` **并存**，把「已送达」与「待重试」两个互斥状态同时写进磁盘。
+	//
+	// 现场读数（report_mwwtqazm_jo06）：08:38:18 新码进程解析成功 → 领 `.notified` + 清标记；
+	// 08:38:26 一个**仍跑旧码**的 master 进程 tick 又写回 `.unroutable`（旧码不认 to ⇒ 判 undefined）。
+	// ⇒ 并存不是「同一进程写序错」，而是**多进程版本不一致**；但无论哪种成因，
+	//    「两个互斥状态用两个文件表达」都必须从**源头**阻止，不能只靠事后清（clearUnroutable）。
+	if (existsSync(join(reportsDir, `${id}.notified`))) return;
 	if (existsSync(path)) return;
 	try {
 		const fd = openSync(path, "wx");
@@ -211,10 +220,36 @@ function markUnroutable(reportsDir: string, id: string, record: ReportRecord): v
 				from: record.from,
 				at: new Date().toISOString(),
 				reason: "recipient-unresolved",
-				hint: "本回报的 from 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）；未被任何会话消费。修好解析能力后会自动重试（本文件不影响重试）。本文件不是「已送达」的证据。注意：本文件目前**无任何读取方**（只能人工 ls 看到），见 AGENTS.md §10 未闭合项。",
+				hint: "本回报的 from/to 形态解析不出接收会话（recipientSessionIdFor 返回 undefined）；未被任何会话消费。修好解析能力后会自动重试（本文件不影响重试）。本文件不是「已送达」的证据。注意（2026-11-26 改）：本文件当前**无自动读取方**（只能人工 ls 看到）；**将来若实现「扫描 .unroutable 自动重投」，必须先跳过已存在同名 `.notified` 的 id** —— 否则会把已送达的回报重投一次（本模块写本文件前已检查该互斥条件，但那只对新码写入者成立）。见 AGENTS.md §10。",
 			}, null, 2) + "\n", "utf8");
 		} catch { /* 诊断信息写入失败不影响主流程 */ } finally { closeSync(fd); }
 	} catch { /* EEXIST：已标记过；其它失败：best-effort */ }
+}
+
+/**
+ * 存量自愈：`.notified` 与 `.unroutable` **并存**时删掉 `.unroutable`。
+ *
+ * 为什么需要（不只是「多一个文件」）：`markUnroutable` 的守卫只管**新写入**，已经并存的文件仍在
+ * 磁盘上，而它会骗两类读者：
+ *  - 人工排查（看到 `.unroutable` 以为没送达，实际 `.notified` 在 —— 我 2026-11-26 就因此
+ *    连续两次差点误判「修复无效」）；
+ *  - 将来任何「扫 `.unroutable` 重投」的实现（会把已送达的回报再投一次）。
+ * ⇒ `.notified` 是**更强**的证据（跨进程原子领取 `wx`），并存时它赢。never-throw。
+ */
+export function healContradictoryMarkers(reportsDir: string): string[] {
+	const healed: string[] = [];
+	let names: string[];
+	try { names = readdirSync(reportsDir); } catch { return healed; }
+	for (const n of names) {
+		if (!n.endsWith(".unroutable")) continue;
+		const id = n.slice(0, -`.unroutable`.length);
+		if (!existsSync(join(reportsDir, `${id}.notified`))) continue;
+		try {
+			unlinkSync(join(reportsDir, n));
+			healed.push(id);
+		} catch { /* best-effort：下轮再试 */ }
+	}
+	return healed;
 }
 
 /**
@@ -436,8 +471,25 @@ export function onNewReport(reportsDir: string, id: string, opts: ReportListener
 	return true;
 }
 
+/** 自愈节流：并存是罕见状态，没必要每 5s tick 都扫一次目录两次（readdir 是 O(文件数)）。 */
+let lastHealAt = 0;
+const HEAL_INTERVAL_MS = 60_000;
+
+/** 仅供测试：重置自愈节流，否则同一进程内第二次 pollNewReports 会被 60s 窗口挡掉。 */
+export function _resetHealThrottle(): void {
+	lastHealAt = 0;
+}
+
 /** 扫描目录里所有新回报（tick 兜底）。返回处理的 id 列表。 */
 export function pollNewReports(reportsDir: string, opts: ReportListenerOptions): string[] {
+	// 存量自愈（2026-11-26）：`.notified` + `.unroutable` 并存时清掉后者。
+	// 放在 listReportIds **之前**：否则并存的 `.unroutable` 会先骗过人工排查（我是第二个被骗的）。
+	// 节流 60s —— 这个状态只为「修好路由能力之前的历史存量」而存在，不是热路径。
+	const now = Date.now();
+	if (now - lastHealAt >= HEAL_INTERVAL_MS) {
+		lastHealAt = now;
+		healContradictoryMarkers(reportsDir);
+	}
 	const fired: string[] = [];
 	for (const id of listReportIds(reportsDir)) {
 		if (!seenReports.has(id) && onNewReport(reportsDir, id, opts)) fired.push(id);
